@@ -4,10 +4,10 @@
 //! raw segments are, how big the overview index is, which block dominates,
 //! and what adding chart series would cost.
 
-use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
+use kronika_layout::{DataRoot, LayoutLimits, SegmentArtifacts};
 use kronika_reader::{BlockKind, FactFileReader, FactStore, LIMIT, PgmUnit, SegmentContext};
 
 /// Stored/decoded sizes of one fact-file block.
@@ -50,10 +50,12 @@ pub(crate) struct Report {
 /// Builds fact files for every sealed segment under `segments` and measures
 /// both sides.
 pub(crate) fn measure(segments: &Path, chart_series: u32) -> Result<Report> {
+    let root = DataRoot::open(segments)
+        .with_context(|| format!("open segments data root {}", segments.display()))?;
     let store = FactStore::new(segments);
     let mut reports = Vec::new();
-    for pgm_path in sealed_segments(segments)? {
-        reports.push(measure_segment(&store, &pgm_path)?);
+    for segment in sealed_segments(&root)? {
+        reports.push(measure_segment(&root, &store, segment)?);
     }
     ensure!(
         !reports.is_empty(),
@@ -67,34 +69,25 @@ pub(crate) fn measure(segments: &Path, chart_series: u32) -> Result<Report> {
     })
 }
 
-/// Sealed segment files, name-ordered; `active.parts` is not a segment.
-fn sealed_segments(segments: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    let entries = std::fs::read_dir(segments)
-        .with_context(|| format!("list segments under {}", segments.display()))?;
-    for entry in entries {
-        let path = entry.context("read a segments directory entry")?.path();
-        if path.extension().is_some_and(|ext| ext == "pgm") {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
+/// Sealed segments in numeric `SegmentId` order; `active.parts` is not a segment.
+fn sealed_segments(root: &DataRoot) -> Result<Vec<SegmentArtifacts>> {
+    let snapshot = root
+        .scan(LayoutLimits::default())
+        .context("scan the segments data root")?;
+    Ok(snapshot.segments)
 }
 
-fn measure_segment(store: &FactStore, pgm_path: &Path) -> Result<SegmentReport> {
-    let name = pgm_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .with_context(|| format!("segment name is not UTF-8: {}", pgm_path.display()))?
-        .to_owned();
-    let pgm_bytes = std::fs::metadata(pgm_path)
-        .with_context(|| format!("stat {}", pgm_path.display()))?
-        .len();
-
-    let file = File::open(pgm_path).with_context(|| format!("open {}", pgm_path.display()))?;
-    let unit = PgmUnit::open(file).with_context(|| format!("parse {}", pgm_path.display()))?;
-    let context = SegmentContext::new(name.clone()).context("build the segment context")?;
+fn measure_segment(
+    root: &DataRoot,
+    store: &FactStore,
+    segment: SegmentArtifacts,
+) -> Result<SegmentReport> {
+    let name = segment.address.pgm_name();
+    let file = root
+        .open_pgm(segment.address)
+        .with_context(|| format!("open segment {name}"))?;
+    let unit = PgmUnit::open(file).with_context(|| format!("parse segment {name}"))?;
+    let context = SegmentContext::new(segment.address);
     let load = store
         .load_or_build(&unit, &context, &LIMIT)
         .with_context(|| format!("build facts for {name}"))?;
@@ -103,12 +96,14 @@ fn measure_segment(store: &FactStore, pgm_path: &Path) -> Result<SegmentReport> 
     }
 
     let facts = load.facts();
-    let ovf_path = pgm_path.with_extension("ovf");
-    let ovf_bytes = std::fs::metadata(&ovf_path)
-        .with_context(|| format!("stat {}", ovf_path.display()))?
+    let ovf_file = root
+        .open_ovf(segment.address)
+        .with_context(|| format!("open facts for {name}"))?
+        .with_context(|| format!("facts for {name} were not published"))?;
+    let ovf_bytes = ovf_file
+        .metadata()
+        .with_context(|| format!("stat facts for {name}"))?
         .len();
-
-    let ovf_file = File::open(&ovf_path).with_context(|| format!("open {}", ovf_path.display()))?;
     let reader = FactFileReader::open(ovf_file, facts.identity(), &LIMIT)
         .map_err(|error| anyhow::anyhow!("read the fact file for {name}: {error:?}"))?;
     let blocks = reader
@@ -126,7 +121,7 @@ fn measure_segment(store: &FactStore, pgm_path: &Path) -> Result<SegmentReport> 
 
     Ok(SegmentReport {
         name,
-        pgm_bytes,
+        pgm_bytes: segment.pgm_bytes,
         ovf_bytes,
         blocks,
     })
@@ -425,10 +420,21 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_uses_the_same_stem_as_its_segment() {
+    fn segment_address_names_pgm_and_ovf_with_the_same_id() {
+        let address = kronika_layout::SegmentAddress::new(
+            kronika_layout::SegmentId::new(1_722_470_400_000_000)
+                .expect("fixture SegmentId is valid"),
+        )
+        .expect("fixture address is valid");
         assert_eq!(
-            Path::new("143000.pgm").with_extension("ovf"),
-            PathBuf::from("143000.ovf")
+            address.pgm_name(),
+            "1722470400000000.pgm",
+            "PGM name contains the fixture SegmentId"
+        );
+        assert_eq!(
+            address.ovf_name(),
+            "1722470400000000.ovf",
+            "OVF is the sibling for the same fixture SegmentId"
         );
     }
 

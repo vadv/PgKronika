@@ -13,7 +13,6 @@
 
 mod block;
 mod bytes;
-mod cache_owner;
 mod container;
 mod descriptors;
 mod dictionary;
@@ -52,7 +51,7 @@ pub use dictionary::{
 };
 pub use event_facts::EventFactsBlock;
 pub use factkey::{FactBuildKey, FactKey, FileKind};
-pub use facts::{BuildError, SegmentContext, SegmentContextError, SegmentFacts, SourceError};
+pub use facts::{BuildError, SegmentContext, SegmentFacts, SourceError};
 pub use fallback::{
     DEFAULT_FALLBACK_BYTES, DEFAULT_FALLBACK_SEGMENT_HOURS, FallbackConfig, FallbackConfigError,
     FallbackStats, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS,

@@ -134,7 +134,7 @@ source_tar() {
     cd "$root"
     git ls-files -co --exclude-standard -z -- "$@" \
       | LC_ALL=C sort -z \
-      | tar --no-xattrs --null -T - -cf -
+      | COPYFILE_DISABLE=1 tar --no-xattrs --null -T - -cf -
   )
 }
 

@@ -3,13 +3,15 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use kronika_analytics::overview::CoverageSpan;
-use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
+use kronika_format::{PartMeta, SectionInput, build_part};
+use kronika_layout::{FileIdentity, SegmentId};
 use kronika_reader::{
     FactBuildKey, FactKey, LIMIT, LiveBuilder, PgmUnit, SealedLocator, SegmentDescriptor,
     lineage_from_catalog,
 };
 use kronika_registry::Section;
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+use kronika_store::CatalogSummary;
 use tower::ServiceExt as _;
 
 use super::{assert_problem, capture_json, test_metrics_handle, write_bgwriter_segment};
@@ -59,8 +61,25 @@ fn synthetic_entries(
         .map(|offset| {
             let ordinal = ordinal_base.checked_add(offset).expect("synthetic ordinal");
             let file_name = format!("synthetic-{source_id}-{ordinal}.pgm");
-            let locator = SealedLocator::from_file_name_bytes(file_name.as_bytes());
-            let descriptor = SegmentDescriptor::from_catalog(locator, unit.catalog());
+            let locator =
+                SealedLocator::from_segment_id(crate::test_layout::named_address(&file_name).id);
+            let summary = CatalogSummary::from_catalog(
+                unit.catalog(),
+                u32::try_from(unit.catalog().encoded_len()).expect("catalog length"),
+            );
+            let descriptor = SegmentDescriptor::from_summary(
+                locator,
+                FileIdentity {
+                    device: 1,
+                    inode: u64::try_from(ordinal).unwrap_or(u64::MAX),
+                    len: unit.source_file_len(),
+                    mtime_seconds: 0,
+                    mtime_nanoseconds: 0,
+                    ctime_seconds: 0,
+                    ctime_nanoseconds: 0,
+                },
+                &summary,
+            );
             let lineage = lineage_from_catalog(unit.catalog(), unit.source_descriptor())
                 .expect("catalog has one entry");
             DescriptorEntry::new(
@@ -319,13 +338,11 @@ fn live_parts_are_not_counted_as_sealed_segments() {
             source_id: 7,
         },
     );
-    let mut framed = FrameHeader {
-        part_len: u64::try_from(part.len()).expect("part length"),
-    }
-    .encode()
-    .to_vec();
-    framed.extend_from_slice(&part);
-    std::fs::write(dir.path().join("active.parts"), framed).expect("write active journal");
+    crate::test_layout::write_journal(
+        dir.path(),
+        SegmentId::new(0).expect("fixture segment id"),
+        &[&part],
+    );
 
     let state = state_with_limit(dir.path(), 1);
     let plan = state

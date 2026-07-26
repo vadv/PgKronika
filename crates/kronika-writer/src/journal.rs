@@ -1,55 +1,128 @@
-//! File-backed `active.parts` journal.
+//! Version-1 file-backed `active.parts` journal.
 //!
-//! `kronika-format` defines frame bytes and damage classification. This module
-//! validates appends, syncs the file, scans it on open, truncates an incomplete
-//! final frame, and reads parts for merging.
-//!
-//! Recovery policy:
-//!
-//! - an incomplete final frame is normal after a crash: the file is truncated
-//!   to the last valid frame and writing continues;
-//! - damage in the middle of the file, or damage at the end that is not a
-//!   partial write, is reported in [`OpenReport`];
-//! - damaged bytes that cannot be repaired stay on disk, and new frames are
-//!   appended after them.
-//!
-//! Recovery streams frame by frame. Peak memory is one part, its decoded
-//! catalog, a small resynchronization window, and 16 bytes per recovered frame.
-//! [`JournalError::Full`] tells the caller to merge early and reset.
+//! The checksummed root header persists the exact [`SegmentId`] independently
+//! of the PGM catalogs carried by its frames. A fresh journal always contains a
+//! valid empty header; zero-length and headerless frame-only files are rejected
+//! without modification.
 
 use std::error::Error;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kronika_format::{
-    DEFAULT_RESYNC_CHUNK, DamageKind, DamageRegion, FRAME_HEADER_LEN, FrameHeader, JournalLimits,
-    PartError, PartRef, ScanReport, scan_journal_streaming, validate_part,
+    DamageRegion, FRAME_HEADER_LEN, FrameHeader, JOURNAL_HEADER_LEN, JournalHeader,
+    JournalHeaderError, JournalLimits, JournalScanError, JournalState, MAX_JOURNAL_LEN,
+    MAX_JOURNAL_PARTS, MAX_PART_LEN, PartError, PartRef, RESET_MARKER_LEN, ResetMarker,
+    scan_journal_streaming_strict_from, validate_part,
 };
+use kronika_layout::{LayoutError, SegmentId, WriterLease, WriterOwner};
 
-/// Default cap for the whole journal file, bytes.
-///
-/// A starting value. [`Journal::append`] returns [`JournalError::Full`] when
-/// this cap is reached. The first frame after open/reset is exempt, so a tiny
-/// cap cannot wedge an empty journal.
-pub const DEFAULT_MAX_JOURNAL_LEN: usize = 1024 * 1024 * 1024;
+static NEXT_JOURNAL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalFaultPoint {
+    OpenRootSync,
+    AppendHeaderWrite,
+    AppendFrameHeaderWrite,
+    AppendFrameBodyWrite,
+    AppendSync,
+    ResetMarkerWrite,
+    ResetMarkerSync,
+    ResetEmptyHeaderWrite,
+    ResetEmptyHeaderSync,
+    ResetTruncate,
+    ResetFinalSync,
+    RollbackTruncate,
+    RollbackHeaderWrite,
+    RollbackSync,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static JOURNAL_FAULTS:
+        std::cell::RefCell<std::collections::VecDeque<(JournalFaultPoint, i32)>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+struct JournalFaultGuard;
+
+#[cfg(test)]
+impl JournalFaultGuard {
+    fn assert_consumed(self) {
+        JOURNAL_FAULTS.with(|faults| {
+            let faults = faults.borrow();
+            assert!(
+                faults.is_empty(),
+                "journal fault plan was not fully exercised: {faults:?}"
+            );
+        });
+        drop(self);
+    }
+}
+
+#[cfg(test)]
+impl Drop for JournalFaultGuard {
+    fn drop(&mut self) {
+        JOURNAL_FAULTS.with(|faults| faults.borrow_mut().clear());
+    }
+}
+
+#[cfg(test)]
+fn arm_journal_faults(
+    faults: impl IntoIterator<Item = (JournalFaultPoint, i32)>,
+) -> JournalFaultGuard {
+    JOURNAL_FAULTS.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        assert!(armed.is_empty());
+        armed.extend(faults);
+    });
+    JournalFaultGuard
+}
+
+#[cfg(test)]
+fn inject_journal_fault(point: JournalFaultPoint) -> std::io::Result<()> {
+    JOURNAL_FAULTS.with(|faults| {
+        let mut faults = faults.borrow_mut();
+        let Some(&(armed, raw_os_error)) = faults.front() else {
+            return Ok(());
+        };
+        if armed != point {
+            return Ok(());
+        }
+        faults.pop_front();
+        Err(std::io::Error::from_raw_os_error(raw_os_error))
+    })
+}
+
+macro_rules! journal_failpoint {
+    ($point:ident) => {
+        #[cfg(test)]
+        inject_journal_fault(JournalFaultPoint::$point)?;
+    };
+}
 
 /// Configuration of one journal file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalConfig {
     /// Frame-level limits shared with the scanner.
     pub limits: JournalLimits,
-    /// Cap for the whole journal file, bytes.
+    /// Cap for the complete journal file, including its versioned header.
     pub max_journal_len: usize,
+    /// Cap for valid frames retained in one active generation.
+    pub max_parts: usize,
 }
 
 impl Default for JournalConfig {
     fn default() -> Self {
         Self {
             limits: JournalLimits::default(),
-            max_journal_len: DEFAULT_MAX_JOURNAL_LEN,
+            max_journal_len: MAX_JOURNAL_LEN,
+            max_parts: MAX_JOURNAL_PARTS,
         }
     }
 }
@@ -59,6 +132,84 @@ impl Default for JournalConfig {
 pub enum JournalError {
     /// The underlying file operation failed.
     Io(std::io::Error),
+    /// The data-root capability rejected an unsafe or inaccessible object.
+    Layout(LayoutError),
+    /// The configured file cap is outside the version-1 admission range.
+    InvalidMaxJournalLen {
+        /// Configured cap.
+        value: usize,
+        /// Smallest accepted cap.
+        minimum: usize,
+        /// Largest accepted cap.
+        maximum: usize,
+    },
+    /// The configured part-count cap is outside the version-1 admission range.
+    InvalidMaxParts {
+        /// Configured cap.
+        value: usize,
+        /// Smallest accepted cap.
+        minimum: usize,
+        /// Largest accepted cap.
+        maximum: usize,
+    },
+    /// The configured part-body cap is outside the version-1 admission range.
+    InvalidMaxPartLen {
+        /// Configured cap.
+        value: u64,
+        /// Smallest accepted cap.
+        minimum: u64,
+        /// Largest accepted cap.
+        maximum: u64,
+    },
+    /// An existing canonical journal exceeds its configured file cap.
+    JournalTooLarge {
+        /// Existing file length.
+        len: u64,
+        /// Configured cap.
+        max: usize,
+    },
+    /// An existing or appended frame would exceed the configured part-count cap.
+    TooManyParts {
+        /// Configured cap.
+        max: usize,
+    },
+    /// A zero-length, headerless, or differently versioned journal was found.
+    UnsupportedJournalFormat,
+    /// The file ends before the complete version-1 header.
+    TornHeader {
+        /// Actual file length.
+        len: u64,
+    },
+    /// The complete header failed a state or checksum check.
+    InvalidHeader(JournalHeaderError),
+    /// The header's recorded frame length differs from the physical tail.
+    BodyLengthMismatch {
+        /// Length recorded in the header.
+        recorded: u64,
+        /// Physical bytes after the header.
+        actual: u64,
+    },
+    /// An empty header has trailing frame bytes.
+    EmptyWithFrames {
+        /// Physical frame-tail length.
+        body_len: u64,
+    },
+    /// An active header has no complete first frame.
+    ActiveWithoutFirstFrame,
+    /// A version-1 body contains torn or damaged frame bytes.
+    DamagedBody {
+        /// Damage reported by the bounded frame scanner.
+        damages: Vec<DamageRegion>,
+    },
+    /// The stored raw identity cannot be represented by the calendar layout.
+    InvalidSegmentId(LayoutError),
+    /// An append attempted to mix two segment identities.
+    SegmentIdMismatch {
+        /// Identity persisted in the journal.
+        expected: SegmentId,
+        /// Identity supplied by the append.
+        got: SegmentId,
+    },
     /// The part is larger than the configured frame limit.
     PartTooLarge {
         /// Length of the rejected part, bytes.
@@ -66,51 +217,126 @@ pub enum JournalError {
         /// The configured limit, bytes.
         max: u64,
     },
-    /// Appending would grow the journal past
-    /// [`JournalConfig::max_journal_len`].
-    ///
-    /// This is flow control, not corruption: the caller should merge the
-    /// journal into a segment early and [`Journal::reset`] it.
+    /// Appending would grow the journal past its configured cap.
     Full {
-        /// Current journal size, bytes.
+        /// Current journal length, bytes.
         len: usize,
-        /// The configured cap, bytes.
+        /// Configured cap, bytes.
         max: usize,
     },
     /// The part is not a valid PGM part.
-    ///
-    /// Writing it would make the next recovery scan classify the frame as
-    /// damaged and skip the part.
     InvalidPart(PartError),
-    /// The part reference does not point into the current journal, e.g.
-    /// it was kept across a [`Journal::reset`].
+    /// The reference no longer points inside the current journal generation.
     StalePartRef {
         /// Offset of the rejected reference.
         offset: usize,
-        /// Length of the rejected reference, bytes.
+        /// Length of the rejected reference.
         len: usize,
     },
+    /// A failed write could not be rolled back to the preceding durable state.
+    RollbackFailed {
+        /// Error from the original write or synchronization.
+        operation: std::io::Error,
+        /// Error encountered while restoring the old file.
+        rollback: std::io::Error,
+    },
+    /// A committed reset marker could not be reduced to the canonical empty file.
+    ResetIncomplete(std::io::Error),
+    /// A previous operation left the open journal in an indeterminate state.
+    Poisoned,
 }
 
 impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(err) => write!(f, "journal io: {err}"),
+            Self::Io(error) => write!(f, "journal I/O: {error}"),
+            Self::Layout(error) => write!(f, "journal layout: {error}"),
+            Self::InvalidMaxJournalLen {
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                f,
+                "journal length cap {value} is outside {minimum}..={maximum}"
+            ),
+            Self::InvalidMaxParts {
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                f,
+                "journal part-count cap {value} is outside {minimum}..={maximum}"
+            ),
+            Self::InvalidMaxPartLen {
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                f,
+                "journal part-body cap {value} is outside {minimum}..={maximum} bytes"
+            ),
+            Self::JournalTooLarge { len, max } => {
+                write!(
+                    f,
+                    "active.parts length {len} exceeds the configured cap of {max}"
+                )
+            }
+            Self::TooManyParts { max } => {
+                write!(f, "active.parts exceeds the configured cap of {max} parts")
+            }
+            Self::UnsupportedJournalFormat => {
+                f.write_str("active.parts is not a version-1 journal")
+            }
+            Self::TornHeader { len } => {
+                write!(f, "active.parts has a torn header of {len} bytes")
+            }
+            Self::InvalidHeader(error) => write!(f, "invalid active.parts header: {error}"),
+            Self::BodyLengthMismatch { recorded, actual } => write!(
+                f,
+                "active.parts header records {recorded} body bytes, but the file contains {actual}"
+            ),
+            Self::EmptyWithFrames { body_len } => {
+                write!(f, "empty active.parts header has {body_len} trailing bytes")
+            }
+            Self::ActiveWithoutFirstFrame => {
+                f.write_str("active active.parts has no complete first frame")
+            }
+            Self::DamagedBody { damages } => write!(
+                f,
+                "active.parts contains {} damaged frame region(s)",
+                damages.len()
+            ),
+            Self::InvalidSegmentId(error) => {
+                write!(f, "active.parts stores an invalid segment id: {error}")
+            }
+            Self::SegmentIdMismatch { expected, got } => write!(
+                f,
+                "active.parts belongs to segment {expected}, not supplied segment {got}"
+            ),
             Self::PartTooLarge { len, max } => {
                 write!(f, "part of {len} bytes exceeds the frame limit of {max}")
             }
-            Self::Full { len, max } => {
-                write!(
-                    f,
-                    "journal of {len} bytes would exceed the cap of {max}; merge and reset first"
-                )
-            }
-            Self::InvalidPart(err) => write!(f, "part is not a valid PGM part: {err}"),
+            Self::Full { len, max } => write!(
+                f,
+                "journal of {len} bytes would exceed the cap of {max}; seal and reset first"
+            ),
+            Self::InvalidPart(error) => write!(f, "part is not a valid PGM part: {error}"),
             Self::StalePartRef { offset, len } => {
-                write!(
-                    f,
-                    "part reference {offset}+{len} points outside the journal"
-                )
+                write!(f, "part reference {offset}+{len} is outside active.parts")
+            }
+            Self::RollbackFailed {
+                operation,
+                rollback,
+            } => write!(
+                f,
+                "journal write failed ({operation}) and rollback also failed ({rollback})"
+            ),
+            Self::ResetIncomplete(error) => write!(
+                f,
+                "journal reset was committed but requires restart recovery: {error}"
+            ),
+            Self::Poisoned => {
+                f.write_str("journal is poisoned after an incomplete persistence operation")
             }
         }
     }
@@ -119,133 +345,236 @@ impl fmt::Display for JournalError {
 impl Error for JournalError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io(err) => Some(err),
-            Self::InvalidPart(err) => Some(err),
-            Self::PartTooLarge { .. } | Self::Full { .. } | Self::StalePartRef { .. } => None,
+            Self::Io(error) | Self::ResetIncomplete(error) => Some(error),
+            Self::Layout(error) | Self::InvalidSegmentId(error) => Some(error),
+            Self::InvalidHeader(error) => Some(error),
+            Self::InvalidPart(error) => Some(error),
+            Self::RollbackFailed { operation, .. } => Some(operation),
+            Self::UnsupportedJournalFormat
+            | Self::InvalidMaxJournalLen { .. }
+            | Self::InvalidMaxParts { .. }
+            | Self::InvalidMaxPartLen { .. }
+            | Self::JournalTooLarge { .. }
+            | Self::TooManyParts { .. }
+            | Self::TornHeader { .. }
+            | Self::BodyLengthMismatch { .. }
+            | Self::EmptyWithFrames { .. }
+            | Self::ActiveWithoutFirstFrame
+            | Self::DamagedBody { .. }
+            | Self::SegmentIdMismatch { .. }
+            | Self::PartTooLarge { .. }
+            | Self::Full { .. }
+            | Self::StalePartRef { .. }
+            | Self::Poisoned => None,
         }
     }
 }
 
 impl From<std::io::Error> for JournalError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
-/// Result of opening and scanning a journal file.
-///
-/// Recovered parts are not duplicated here; [`Journal::parts`] stores the part
-/// directory. The report carries only the damage findings.
-#[derive(Debug)]
-pub struct OpenReport {
-    /// Damaged regions found during recovery, in journal order.
-    pub damages: Vec<DamageRegion>,
-    /// Whether recovery truncated an incomplete final frame.
-    pub truncated_torn_tail: bool,
+impl From<LayoutError> for JournalError {
+    fn from(error: LayoutError) -> Self {
+        Self::Layout(error)
+    }
 }
 
-impl OpenReport {
-    /// Return whether recovery found no damage of any kind.
+/// Opaque reference to one part in a specific in-process journal generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalPartRef {
+    raw: PartRef,
+    generation: u64,
+}
+
+impl JournalPartRef {
+    const fn new(raw: PartRef, generation: u64) -> Self {
+        Self { raw, generation }
+    }
+
+    /// Offset of the part body in `active.parts`.
     #[must_use]
-    pub const fn is_clean(&self) -> bool {
-        self.damages.is_empty()
+    pub const fn offset(self) -> usize {
+        self.raw.offset
     }
 
-    /// Return whether recovery found damage other than an incomplete final frame.
+    /// Length of the part body, bytes.
     #[must_use]
-    pub fn has_media_damage(&self) -> bool {
-        self.damages
-            .iter()
-            .any(|damage| damage.kind != DamageKind::TornTail)
+    pub const fn len(self) -> usize {
+        self.raw.len
+    }
+
+    /// Whether the referenced part body is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.raw.len == 0
     }
 }
 
-/// Open `active.parts` file.
-///
-/// Each appended frame is written and synced before [`Journal::append`] returns.
+/// Open active journal owned by exactly one collector process.
 #[derive(Debug)]
 pub struct Journal {
+    _owner_lease: WriterLease,
     file: File,
-    /// Append position: either the end of the last valid frame or the end of a
-    /// damaged final region kept for diagnostics.
     end: usize,
     config: JournalConfig,
-    parts: Vec<PartRef>,
+    parts: Vec<JournalPartRef>,
+    generation: u64,
+    segment_id: Option<SegmentId>,
+    poisoned: bool,
 }
 
 impl Journal {
-    /// Open or create the journal at `path`, then scan it for recovery.
+    /// Opens or initializes the root journal through a writer-owner capability.
     ///
-    /// An incomplete final frame is truncated immediately. Other damaged
-    /// regions are reported but left on disk; new frames are appended after
-    /// them.
+    /// Existing files are validated without truncation or repair. A newly
+    /// created file receives and synchronizes the canonical empty header before
+    /// its root directory entry is synchronized.
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::Io`] if the file cannot be opened, read,
-    /// truncated, or synced.
-    pub fn open(path: &Path, config: JournalConfig) -> Result<(Self, OpenReport), JournalError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        sync_parent_dir(path)?;
+    /// Returns a typed format, consistency, layout, or I/O error.
+    pub fn open(owner: &WriterOwner, config: JournalConfig) -> Result<Self, JournalError> {
+        validate_config(config)?;
+        let owner_lease = owner.try_clone_lease()?;
+        let (mut file, created) = owner.open_or_create_journal()?;
+        if created {
+            write_header(&mut file, JournalHeader::EMPTY)?;
+            file.set_len(JOURNAL_HEADER_LEN as u64)?;
+            file.sync_data()?;
+        }
 
-        let file_len = usize::try_from(file.metadata()?.len()).map_err(|_overflow| {
+        let mut file_len = file.metadata()?.len();
+        let max_journal_len = u64::try_from(config.max_journal_len).unwrap_or(u64::MAX);
+        if file_len > max_journal_len {
+            return Err(JournalError::JournalTooLarge {
+                len: file_len,
+                max: config.max_journal_len,
+            });
+        }
+        if recover_committed_reset(&mut file, file_len, config)? {
+            file_len = JOURNAL_HEADER_LEN as u64;
+        }
+        if file_len == 0 {
+            return Err(JournalError::UnsupportedJournalFormat);
+        }
+        if file_len < JOURNAL_HEADER_LEN as u64 {
+            return Err(JournalError::TornHeader { len: file_len });
+        }
+        let mut header_bytes = [0_u8; JOURNAL_HEADER_LEN];
+        file.read_exact_at(&mut header_bytes, 0)?;
+        let header = JournalHeader::decode(header_bytes).map_err(|error| match error {
+            JournalHeaderError::UnsupportedMagic { .. }
+            | JournalHeaderError::UnsupportedVersion { .. } => {
+                JournalError::UnsupportedJournalFormat
+            }
+            other => JournalError::InvalidHeader(other),
+        })?;
+        let actual_body_len = file_len - JOURNAL_HEADER_LEN as u64;
+        if header.body_len != actual_body_len {
+            return Err(JournalError::BodyLengthMismatch {
+                recorded: header.body_len,
+                actual: actual_body_len,
+            });
+        }
+
+        let (segment_id, parts) = match header.state {
+            JournalState::Empty => {
+                if actual_body_len != 0 {
+                    return Err(JournalError::EmptyWithFrames {
+                        body_len: actual_body_len,
+                    });
+                }
+                (None, Vec::new())
+            }
+            JournalState::Active { segment_id } => {
+                let segment_id =
+                    SegmentId::new(segment_id).map_err(JournalError::InvalidSegmentId)?;
+                let scan = scan_journal_streaming_strict_from(
+                    &file,
+                    JOURNAL_HEADER_LEN as u64,
+                    config.limits,
+                    config.max_parts,
+                )
+                .map_err(map_scan_error)?;
+                if scan.parts.is_empty() {
+                    return Err(JournalError::ActiveWithoutFirstFrame);
+                }
+                if !scan.damages.is_empty()
+                    || u64::try_from(scan.valid_len).unwrap_or(u64::MAX) != file_len
+                {
+                    return Err(JournalError::DamagedBody {
+                        damages: scan.damages,
+                    });
+                }
+                (Some(segment_id), scan.parts)
+            }
+        };
+        let end = usize::try_from(file_len).map_err(|_overflow| {
             JournalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "journal does not fit the address space",
+                "active.parts does not fit the address space",
             ))
         })?;
-        let mut scan = scan_file(&file, file_len, config.limits, DEFAULT_RESYNC_CHUNK)?;
-        // The directory is the only per-frame state kept after recovery;
-        // dropping the push-growth slack keeps it at exactly 16 B per part.
-        scan.parts.shrink_to_fit();
-
-        let has_incomplete_final_frame = scan
-            .damages
-            .last()
-            .is_some_and(|damage| damage.kind == DamageKind::TornTail);
-        let end = if has_incomplete_final_frame {
-            file.set_len(scan.valid_len as u64)?;
-            file.sync_data()?;
-            scan.valid_len
-        } else {
-            file_len
-        };
-
-        let journal = Self {
+        // A preceding create may have synchronized the file but failed while
+        // synchronizing its root entry. EEXIST alone is not durability proof.
+        journal_failpoint!(OpenRootSync);
+        owner.sync_root()?;
+        let generation = next_journal_generation();
+        let parts = parts
+            .into_iter()
+            .map(|raw| JournalPartRef::new(raw, generation))
+            .collect();
+        Ok(Self {
+            _owner_lease: owner_lease,
             file,
             end,
             config,
-            parts: scan.parts,
-        };
-        let report = OpenReport {
-            damages: scan.damages,
-            truncated_torn_tail: has_incomplete_final_frame,
-        };
-        Ok((journal, report))
+            parts,
+            generation,
+            segment_id,
+            poisoned: false,
+        })
     }
 
-    /// Bytes currently occupying the journal file, including damaged regions.
-    ///
-    /// The collector compares this raw frame length with its segment byte cap
-    /// before packing the segment.
+    /// Complete file size, including the versioned header.
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.end
     }
 
-    /// Append one part as a frame and sync the file.
+    /// Identity of the active segment, or `None` for the empty header.
+    #[must_use]
+    pub const fn segment_id(&self) -> Option<SegmentId> {
+        self.segment_id
+    }
+
+    /// Appends one PGM part under the exact active segment identity.
+    ///
+    /// The first append writes the identity header and first frame before one
+    /// shared synchronization boundary. Later appends reject another identity.
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError`] when the part is too large, invalid, the
-    /// journal is full, or the file write/sync fails. On error, in-memory
-    /// state is unchanged.
-    pub fn append(&mut self, part: &[u8]) -> Result<PartRef, JournalError> {
+    /// Returns a validation, capacity, identity, or I/O error. A transient I/O
+    /// error is rolled back to the preceding valid generation. A failed
+    /// rollback permanently poisons this handle.
+    pub fn append(
+        &mut self,
+        segment_id: SegmentId,
+        part: &[u8],
+    ) -> Result<JournalPartRef, JournalError> {
+        self.ensure_healthy()?;
+        if let Some(expected) = self.segment_id
+            && expected != segment_id
+        {
+            return Err(JournalError::SegmentIdMismatch {
+                expected,
+                got: segment_id,
+            });
+        }
         let part_len = part.len() as u64;
         if part_len > self.config.limits.max_part_len {
             return Err(JournalError::PartTooLarge {
@@ -253,150 +582,394 @@ impl Journal {
                 max: self.config.limits.max_part_len,
             });
         }
-        // The cap decides when the writer must merge; the first frame is
-        // always allowed so that a tiny cap cannot wedge an empty journal.
-        let frame_len = FRAME_HEADER_LEN + part.len();
-        if self.end > 0 && self.end + frame_len > self.config.max_journal_len {
+        if self.parts.len() >= self.config.max_parts {
+            return Err(JournalError::TooManyParts {
+                max: self.config.max_parts,
+            });
+        }
+        validate_part(part).map_err(JournalError::InvalidPart)?;
+        let frame_len = FRAME_HEADER_LEN
+            .checked_add(part.len())
+            .ok_or(JournalError::Full {
+                len: self.end,
+                max: self.config.max_journal_len,
+            })?;
+        let next_end = self.end.checked_add(frame_len).ok_or(JournalError::Full {
+            len: self.end,
+            max: self.config.max_journal_len,
+        })?;
+        let reset_end = next_end
+            .checked_add(RESET_MARKER_LEN)
+            .ok_or(JournalError::Full {
+                len: self.end,
+                max: self.config.max_journal_len,
+            })?;
+        if reset_end > self.config.max_journal_len {
             return Err(JournalError::Full {
                 len: self.end,
                 max: self.config.max_journal_len,
             });
         }
-        // An invalid body would be framed and synced, but the next recovery
-        // scan would report the frame as damage and skip it. Treat that as a
-        // writer bug and fail before writing.
-        validate_part(part).map_err(JournalError::InvalidPart)?;
 
-        let header = FrameHeader { part_len }.encode();
-        if let Err(err) = self.write_frame(&header, part) {
-            // Roll the file back so a half-written frame from a transient
-            // I/O error does not remain on disk where later appends would
-            // push it into the middle of the journal.
-            // If truncation also fails, the next open truncates the
-            // incomplete frame.
-            self.file.set_len(self.end as u64).ok();
-            return Err(err.into());
+        let frame_header = FrameHeader { part_len }.encode();
+        let old_header = self.current_header();
+        let body_len = u64::try_from(next_end - JOURNAL_HEADER_LEN).map_err(|_overflow| {
+            JournalError::Full {
+                len: self.end,
+                max: self.config.max_journal_len,
+            }
+        })?;
+        let new_header = JournalHeader {
+            state: JournalState::Active {
+                segment_id: segment_id.get(),
+            },
+            body_len,
+        };
+        let write_result = (|| -> std::io::Result<()> {
+            if self.parts.is_empty() {
+                journal_failpoint!(AppendHeaderWrite);
+                write_header(&mut self.file, new_header)?;
+                self.write_frame(self.end, &frame_header, part)?;
+            } else {
+                self.write_frame(self.end, &frame_header, part)?;
+                journal_failpoint!(AppendHeaderWrite);
+                write_header(&mut self.file, new_header)?;
+            }
+            journal_failpoint!(AppendSync);
+            self.file.sync_data()
+        })();
+        if let Err(error) = write_result {
+            return match rollback(&mut self.file, self.end, old_header) {
+                Ok(()) => Err(JournalError::Io(error)),
+                Err(rollback) => {
+                    self.poisoned = true;
+                    Err(JournalError::RollbackFailed {
+                        operation: error,
+                        rollback,
+                    })
+                }
+            };
         }
 
-        let part_ref = PartRef {
-            offset: self.end + FRAME_HEADER_LEN,
-            len: part.len(),
-        };
-        self.end += frame_len;
+        let part_ref = JournalPartRef::new(
+            PartRef {
+                offset: self.end + FRAME_HEADER_LEN,
+                len: part.len(),
+            },
+            self.generation,
+        );
+        self.end = next_end;
         self.parts.push(part_ref);
+        self.segment_id = Some(segment_id);
         Ok(part_ref)
     }
 
-    /// The raw write sequence of one frame, separated so that the error
-    /// path of [`Journal::append`] can roll the file back.
-    fn write_frame(&mut self, header: &[u8], part: &[u8]) -> Result<(), std::io::Error> {
-        self.file.seek(SeekFrom::Start(self.end as u64))?;
+    fn write_frame(&mut self, at: usize, header: &[u8], part: &[u8]) -> Result<(), std::io::Error> {
+        self.file.seek(SeekFrom::Start(at as u64))?;
+        journal_failpoint!(AppendFrameHeaderWrite);
         self.file.write_all(header)?;
-        self.file.write_all(part)?;
-        self.file.sync_data()
+        journal_failpoint!(AppendFrameBodyWrite);
+        self.file.write_all(part)
     }
 
-    /// Return valid parts known to this journal, in journal order.
+    fn current_header(&self) -> JournalHeader {
+        JournalHeader {
+            state: self
+                .segment_id
+                .map_or(JournalState::Empty, |segment_id| JournalState::Active {
+                    segment_id: segment_id.get(),
+                }),
+            body_len: u64::try_from(self.end - JOURNAL_HEADER_LEN).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Valid frame bodies in journal order.
     #[must_use]
-    pub fn parts(&self) -> &[PartRef] {
+    pub fn parts(&self) -> &[JournalPartRef] {
         &self.parts
     }
 
-    /// Read one part body back.
+    /// Reads one referenced part body.
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::StalePartRef`] if the reference does not
-    /// point inside the current journal (e.g. it was kept across a
-    /// [`Journal::reset`]). Returns [`JournalError::Io`] if the read fails.
-    pub fn read_part(&self, part: PartRef) -> Result<Vec<u8>, JournalError> {
-        let in_bounds = part.offset >= FRAME_HEADER_LEN
+    /// Returns [`JournalError::StalePartRef`] for a reference from another
+    /// generation, or an I/O error.
+    pub fn read_part(&self, part: JournalPartRef) -> Result<Vec<u8>, JournalError> {
+        self.ensure_healthy()?;
+        let minimum = JOURNAL_HEADER_LEN + FRAME_HEADER_LEN;
+        let is_member = part.generation == self.generation
+            && self
+                .parts
+                .binary_search_by_key(&part.raw.offset, |candidate| candidate.raw.offset)
+                .is_ok_and(|index| self.parts[index] == part);
+        let in_bounds = part.raw.offset >= minimum
             && part
+                .raw
                 .offset
-                .checked_add(part.len)
+                .checked_add(part.raw.len)
                 .is_some_and(|end| end <= self.end);
-        if !in_bounds {
+        if !is_member || !in_bounds {
             return Err(JournalError::StalePartRef {
-                offset: part.offset,
-                len: part.len,
+                offset: part.raw.offset,
+                len: part.raw.len,
             });
         }
-        let mut body = vec![0_u8; part.len];
-        self.file.read_exact_at(&mut body, part.offset as u64)?;
+        let mut body = vec![0_u8; part.raw.len];
+        self.file.read_exact_at(&mut body, part.raw.offset as u64)?;
         Ok(body)
     }
 
-    /// Empty the journal after a segment has been completed successfully.
+    /// Commits a reset marker, then reduces the journal to the synchronized
+    /// canonical empty version-1 header.
+    ///
+    /// A crash after the marker sync is completed by [`open`](Self::open).
+    /// Until that marker is durable, a failed write is rolled back to the
+    /// preceding active generation.
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::Io`] if truncation or sync fails.
+    /// Returns an I/O error. In-memory state changes only after persistence.
     pub fn reset(&mut self) -> Result<(), JournalError> {
-        self.file.set_len(0)?;
-        self.file.sync_data()?;
-        self.end = 0;
+        self.ensure_healthy()?;
+        if self.parts.is_empty() {
+            return Ok(());
+        }
+        let Some(segment_id) = self.segment_id else {
+            self.poisoned = true;
+            return Err(JournalError::Poisoned);
+        };
+        let next_generation = next_journal_generation();
+        let marker_len = u64::try_from(self.end).map_err(|_overflow| JournalError::Full {
+            len: self.end,
+            max: self.config.max_journal_len,
+        })?;
+        if self
+            .end
+            .checked_add(RESET_MARKER_LEN)
+            .is_none_or(|marker_end| marker_end > self.config.max_journal_len)
+        {
+            return Err(JournalError::Full {
+                len: self.end,
+                max: self.config.max_journal_len,
+            });
+        }
+        let old_header = self.current_header();
+        let Some(marker) = ResetMarker::new(marker_len, segment_id.get()) else {
+            self.poisoned = true;
+            return Err(JournalError::Poisoned);
+        };
+        let marker = marker.encode();
+
+        let marker_result = (|| -> std::io::Result<()> {
+            self.file.seek(SeekFrom::Start(self.end as u64))?;
+            journal_failpoint!(ResetMarkerWrite);
+            self.file.write_all(&marker)?;
+            journal_failpoint!(ResetMarkerSync);
+            self.file.sync_data()
+        })();
+        if let Err(error) = marker_result {
+            return match rollback(&mut self.file, self.end, old_header) {
+                Ok(()) => Err(JournalError::Io(error)),
+                Err(rollback) => {
+                    self.poisoned = true;
+                    Err(JournalError::RollbackFailed {
+                        operation: error,
+                        rollback,
+                    })
+                }
+            };
+        }
+
+        if let Err(error) = finish_committed_reset(&mut self.file) {
+            self.poisoned = true;
+            return Err(JournalError::ResetIncomplete(error));
+        }
+        self.end = JOURNAL_HEADER_LEN;
         self.parts.clear();
+        self.generation = next_generation;
+        self.segment_id = None;
         Ok(())
     }
 
-    /// Return the current journal size in bytes.
+    /// Complete journal length, including the header.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.end
     }
 
-    /// Return whether the journal holds no frames.
+    /// Whether the journal is in its canonical empty state.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.end == 0
+        self.parts.is_empty()
+    }
+
+    /// Whether a partial persistence failure made further use unsafe.
+    #[must_use]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    const fn ensure_healthy(&self) -> Result<(), JournalError> {
+        if self.poisoned {
+            Err(JournalError::Poisoned)
+        } else {
+            Ok(())
+        }
     }
 }
 
-/// Stream the recovery scan over the file by delegating to
-/// `kronika_format::scan_journal_streaming`.
-fn scan_file(
-    file: &File,
-    _file_len: usize,
-    limits: JournalLimits,
-    resync_chunk: usize,
-) -> Result<ScanReport, std::io::Error> {
-    scan_journal_streaming(file, limits, resync_chunk)
+fn write_header(file: &mut File, header: JournalHeader) -> Result<(), std::io::Error> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header.encode())
 }
 
-/// Sync the directory entry after creating the journal file.
-fn sync_parent_dir(path: &Path) -> Result<(), JournalError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        File::open(parent)?.sync_all()?;
+fn rollback(file: &mut File, end: usize, header: JournalHeader) -> Result<(), std::io::Error> {
+    journal_failpoint!(RollbackTruncate);
+    file.set_len(end as u64)?;
+    journal_failpoint!(RollbackHeaderWrite);
+    write_header(file, header)?;
+    journal_failpoint!(RollbackSync);
+    file.sync_data()
+}
+
+const fn validate_config(config: JournalConfig) -> Result<(), JournalError> {
+    if config.max_journal_len < JOURNAL_HEADER_LEN || config.max_journal_len > MAX_JOURNAL_LEN {
+        return Err(JournalError::InvalidMaxJournalLen {
+            value: config.max_journal_len,
+            minimum: JOURNAL_HEADER_LEN,
+            maximum: MAX_JOURNAL_LEN,
+        });
+    }
+    if config.max_parts == 0 || config.max_parts > MAX_JOURNAL_PARTS {
+        return Err(JournalError::InvalidMaxParts {
+            value: config.max_parts,
+            minimum: 1,
+            maximum: MAX_JOURNAL_PARTS,
+        });
+    }
+    if config.limits.max_part_len == 0 || config.limits.max_part_len > MAX_PART_LEN {
+        return Err(JournalError::InvalidMaxPartLen {
+            value: config.limits.max_part_len,
+            minimum: 1,
+            maximum: MAX_PART_LEN,
+        });
     }
     Ok(())
 }
 
+fn next_journal_generation() -> u64 {
+    NEXT_JOURNAL_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("journal generation counter exhausted")
+}
+
+fn map_scan_error(error: JournalScanError) -> JournalError {
+    match error {
+        JournalScanError::Io(error) => JournalError::Io(error),
+        JournalScanError::PartLimitExceeded { limit } => JournalError::TooManyParts { max: limit },
+    }
+}
+
+struct PrefixReader<'a> {
+    file: &'a File,
+    len: u64,
+}
+
+impl kronika_format::ReadAt for PrefixReader<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        let requested = u64::try_from(buf.len())
+            .map_err(|_overflow| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        if offset
+            .checked_add(requested)
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        FileExt::read_exact_at(self.file, buf, offset)
+    }
+
+    fn byte_len(&self) -> std::io::Result<u64> {
+        Ok(self.len)
+    }
+}
+
+fn finish_committed_reset(file: &mut File) -> Result<(), std::io::Error> {
+    journal_failpoint!(ResetEmptyHeaderWrite);
+    write_header(file, JournalHeader::EMPTY)?;
+    journal_failpoint!(ResetEmptyHeaderSync);
+    file.sync_data()?;
+    journal_failpoint!(ResetTruncate);
+    file.set_len(JOURNAL_HEADER_LEN as u64)?;
+    journal_failpoint!(ResetFinalSync);
+    file.sync_data()
+}
+
+fn recover_committed_reset(
+    file: &mut File,
+    file_len: u64,
+    config: JournalConfig,
+) -> Result<bool, JournalError> {
+    let minimum = (JOURNAL_HEADER_LEN + RESET_MARKER_LEN) as u64;
+    if file_len < minimum {
+        return Ok(false);
+    }
+    let marker_at = file_len - RESET_MARKER_LEN as u64;
+    let mut bytes = [0_u8; RESET_MARKER_LEN];
+    file.read_exact_at(&mut bytes, marker_at)?;
+    let Some(marker) = ResetMarker::decode(bytes) else {
+        return Ok(false);
+    };
+    if marker.previous_len != marker_at
+        || marker.previous_len > u64::try_from(config.max_journal_len).unwrap_or(u64::MAX)
+        || SegmentId::new(marker.previous_segment_id).is_err()
+    {
+        return Ok(false);
+    }
+    let Some(_expected_header) = marker.expected_previous_header() else {
+        return Ok(false);
+    };
+    let mut header_bytes = [0_u8; JOURNAL_HEADER_LEN];
+    file.read_exact_at(&mut header_bytes, 0)?;
+    if marker.classify_header_transition(header_bytes).is_none() {
+        return Ok(false);
+    }
+    let previous = PrefixReader {
+        file,
+        len: marker.previous_len,
+    };
+    let scan = scan_journal_streaming_strict_from(
+        &previous,
+        JOURNAL_HEADER_LEN as u64,
+        config.limits,
+        config.max_parts,
+    )
+    .map_err(map_scan_error)?;
+    if scan.parts.is_empty()
+        || !scan.damages.is_empty()
+        || u64::try_from(scan.valid_len).unwrap_or(u64::MAX) != marker.previous_len
+    {
+        return Ok(false);
+    }
+    finish_committed_reset(file)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use kronika_format::{
-        Catalog, Entry, FORMAT_VERSION, FRAME_MAGIC, MAGIC, crc32c, scan_journal,
-    };
+    use std::os::unix::fs::FileExt as _;
+
+    use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, crc32c};
+    use kronika_layout::{DataRoot, LayoutLimits, OwnerKind};
 
     use super::*;
 
-    const fn small_limits() -> JournalLimits {
-        JournalLimits { max_part_len: 4096 }
-    }
-
-    const fn small_config() -> JournalConfig {
-        JournalConfig {
-            limits: small_limits(),
-            max_journal_len: 1 << 20,
-        }
-    }
-
-    fn sample_part() -> Vec<u8> {
-        let section = *b"data";
+    fn sample_part_with_section(section: &[u8]) -> Vec<u8> {
         let mut part = Vec::new();
         part.extend_from_slice(&MAGIC);
-        part.extend_from_slice(&section);
+        part.extend_from_slice(section);
         let catalog = Catalog {
             entries: vec![Entry {
                 type_id: 1_006_001,
@@ -404,7 +977,7 @@ mod tests {
                 offset: 4,
                 len: section.len() as u64,
                 rows: 1,
-                crc32c: crc32c(&section),
+                crc32c: crc32c(section),
             }],
             min_ts: 1,
             max_ts: 2,
@@ -412,307 +985,847 @@ mod tests {
             format_version: FORMAT_VERSION,
         };
         part.extend_from_slice(&catalog.encode());
+        assert!(validate_part(&part).is_ok());
         part
     }
 
-    fn frame(part: &[u8]) -> Vec<u8> {
-        let mut out = FrameHeader {
-            part_len: part.len() as u64,
-        }
-        .encode()
-        .to_vec();
-        out.extend_from_slice(part);
-        out
+    fn sample_part() -> Vec<u8> {
+        sample_part_with_section(b"data")
     }
 
-    fn temp_journal_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
-        dir.path().join("active.parts")
+    fn owner(directory: &tempfile::TempDir) -> WriterOwner {
+        DataRoot::open(directory.path())
+            .unwrap()
+            .acquire_writer(LayoutLimits::default())
+            .unwrap()
     }
 
-    /// The streaming scanner must report exactly what the in-memory scanner
-    /// reports, for every chunk size including degenerate ones.
-    fn assert_stream_matches_buffer(bytes: &[u8]) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("journal");
-        std::fs::write(&path, bytes).expect("write");
-        let file = File::open(&path).expect("open");
-
-        let expected = scan_journal(bytes, small_limits());
-        for chunk in [1, 2, 3, 5, 16, 1024] {
-            let streamed =
-                scan_file(&file, bytes.len(), small_limits(), chunk).expect("streaming scan");
-            assert_eq!(streamed, expected, "chunk size {chunk}");
-        }
+    fn id(value: i64) -> SegmentId {
+        SegmentId::new(value).unwrap()
     }
 
-    #[test]
-    fn streaming_scan_matches_the_buffer_scan() {
-        let part = sample_part();
-        let one = frame(&part);
+    fn rejected_config(config: JournalConfig) -> JournalError {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let error = Journal::open(&owner, config).unwrap_err();
+        assert!(!directory.path().join("active.parts").exists());
+        error
+    }
 
-        // Clean journals.
-        assert_stream_matches_buffer(&[]);
-        assert_stream_matches_buffer(&one);
-        let mut two = one.clone();
-        two.extend_from_slice(&one);
-        assert_stream_matches_buffer(&two);
-
-        // Truncation at every offset of a two-frame journal.
-        for cut in 0..two.len() {
-            assert_stream_matches_buffer(&two[..cut]);
-        }
-
-        // A final frame with an intact header but corrupted body: the
-        // resync finds nothing after it, and the implied frame end at EOF
-        // classifies it as a torn write, not unrecoverable trailing damage.
-        let mut torn_body = two.clone();
-        let last = torn_body.len() - 1;
-        torn_body[last] ^= 0x01;
-        assert_stream_matches_buffer(&torn_body);
-
-        // A trailing header with a valid CRC but an absurd length claim:
-        // unrecoverable trailing damage.
-        let mut absurd = one.clone();
-        absurd.extend_from_slice(
-            &FrameHeader {
-                part_len: small_limits().max_part_len + 1,
+    fn injected_operation_raw_os_error(error: &JournalError) -> Option<i32> {
+        match error {
+            JournalError::Io(source) | JournalError::ResetIncomplete(source) => {
+                source.raw_os_error()
             }
-            .encode(),
-        );
-        assert_stream_matches_buffer(&absurd);
-
-        // A decoy magic 3 bytes before the real frame: damaged bytes ending in
-        // "PGM" followed by the real frame's "PGMP" creates overlapping
-        // magic occurrences, and the scanner must advance by one byte, not
-        // by a whole magic length, after the decoy fails.
-        let mut decoy = one.clone();
-        decoy.extend_from_slice(&[0xEE_u8; 21]);
-        decoy.extend_from_slice(b"PGM");
-        decoy.extend_from_slice(&one);
-        assert_stream_matches_buffer(&decoy);
-
-        // A corrupted byte in the middle frame of three, in the header and
-        // in the body.
-        let mut three = two.clone();
-        three.extend_from_slice(&one);
-        for target in [one.len(), one.len() + FRAME_HEADER_LEN + 5] {
-            let mut corrupted = three.clone();
-            corrupted[target] ^= 0x01;
-            assert_stream_matches_buffer(&corrupted);
+            _ => None,
         }
-
-        // A long damaged region followed by a valid frame: the sliding
-        // search must cross many chunk boundaries to find it.
-        let mut damaged_then_frame = one.clone();
-        damaged_then_frame.extend_from_slice(&[0xAB_u8; 257]);
-        damaged_then_frame.extend_from_slice(&one);
-        assert_stream_matches_buffer(&damaged_then_frame);
-
-        // Damaged bytes that contain stray FRAME_MAGIC bytes positioned to span
-        // chunk boundaries.
-        let mut tricky = one.clone();
-        let mut damaged = vec![0xCD_u8; 64];
-        damaged[6..10].copy_from_slice(&FRAME_MAGIC);
-        damaged[31..35].copy_from_slice(&FRAME_MAGIC);
-        tricky.extend_from_slice(&damaged);
-        tricky.extend_from_slice(&one);
-        assert_stream_matches_buffer(&tricky);
     }
 
     #[test]
-    fn append_read_reopen_roundtrip() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = temp_journal_path(&dir);
-        let part = sample_part();
-
-        let (mut journal, report) = Journal::open(&path, small_config()).expect("open");
-        assert!(report.is_clean());
-        let first = journal.append(&part).expect("append");
-        let second = journal.append(&part).expect("append");
-        assert_eq!(journal.parts(), &[first, second]);
-        assert_eq!(journal.read_part(first).expect("read"), part);
-
-        // Reopen: the recovery scan finds both parts, clean.
-        drop(journal);
-        let (journal, report) = Journal::open(&path, small_config()).expect("reopen");
-        assert!(report.is_clean());
-        assert!(!report.truncated_torn_tail);
-        assert_eq!(journal.parts().len(), 2);
-        assert_eq!(journal.read_part(second).expect("read"), part);
-    }
-
-    #[test]
-    fn incomplete_final_frame_is_truncated_on_open() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = temp_journal_path(&dir);
-        let part = sample_part();
-
-        let (mut journal, _) = Journal::open(&path, small_config()).expect("open");
-        journal.append(&part).expect("append");
-        let valid_len = journal.len();
-        drop(journal);
-
-        // Simulate a crash mid-append: a complete header, half a body.
-        let mut file = OpenOptions::new().append(true).open(&path).expect("raw");
-        let partial_frame_header = FrameHeader {
-            part_len: part.len() as u64,
-        }
-        .encode();
-        file.write_all(&partial_frame_header).expect("write");
-        file.write_all(&part[..part.len() / 2]).expect("write");
-        drop(file);
-
-        let (journal, report) = Journal::open(&path, small_config()).expect("recover");
-        assert!(report.truncated_torn_tail);
-        assert!(!report.has_media_damage());
-        assert_eq!(journal.parts().len(), 1);
-        assert_eq!(journal.len(), valid_len);
-        assert_eq!(
-            std::fs::metadata(&path).expect("metadata").len(),
-            valid_len as u64,
-            "the incomplete frame is gone from disk"
-        );
-    }
-
-    #[test]
-    fn damaged_final_region_is_preserved_and_appendable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = temp_journal_path(&dir);
-        let part = sample_part();
-
-        let (mut journal, _) = Journal::open(&path, small_config()).expect("open");
-        journal.append(&part).expect("append");
-        drop(journal);
-
-        // Media damage at the end: a full frame with a corrupted header,
-        // not a truncation.
-        let mut bad_header = FrameHeader {
-            part_len: part.len() as u64,
-        }
-        .encode();
-        bad_header[0] ^= 0xFF;
-        let mut file = OpenOptions::new().append(true).open(&path).expect("raw");
-        file.write_all(&bad_header).expect("write");
-        file.write_all(&part).expect("write");
-        drop(file);
-        let damaged_len = std::fs::metadata(&path).expect("metadata").len();
-
-        let (mut journal, report) = Journal::open(&path, small_config()).expect("recover");
-        assert!(report.has_media_damage());
-        assert!(!report.truncated_torn_tail);
-        assert_eq!(report.damages[0].kind, DamageKind::QuarantinedTail);
-        assert_eq!(journal.parts().len(), 1);
-        assert_eq!(
-            std::fs::metadata(&path).expect("metadata").len(),
-            damaged_len,
-            "damaged bytes stay on disk for diagnostics"
-        );
-
-        // New frames are appended after the damaged region and found on the
-        // next recovery scan.
-        let appended = journal.append(&part).expect("append after damage");
-        drop(journal);
-        let (journal, report) = Journal::open(&path, small_config()).expect("rescan");
-        assert!(report.has_media_damage());
-        assert_eq!(journal.parts().len(), 2);
-        assert_eq!(journal.read_part(appended).expect("read"), part);
-    }
-
-    #[test]
-    fn reset_empties_the_journal() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = temp_journal_path(&dir);
-
-        let (mut journal, _) = Journal::open(&path, small_config()).expect("open");
-        journal.append(&sample_part()).expect("append");
-        journal.reset().expect("reset");
+    fn fresh_journal_has_a_durable_empty_v1_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
         assert!(journal.is_empty());
-        assert_eq!(journal.parts().len(), 0);
-        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
-        // Idempotent.
-        journal.reset().expect("reset again");
+        assert_eq!(journal.len(), JOURNAL_HEADER_LEN);
+        let bytes = std::fs::read(directory.path().join("active.parts")).unwrap();
+        assert_eq!(
+            JournalHeader::decode(bytes.try_into().unwrap()).unwrap(),
+            JournalHeader::EMPTY
+        );
     }
 
     #[test]
-    fn full_journal_rejects_appends_until_reset() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = temp_journal_path(&dir);
-        let part = sample_part();
-        let frame_len = FRAME_HEADER_LEN + part.len();
+    fn existing_journal_retries_root_sync_after_initialization_sync_failure() {
+        const FIRST_ERROR: i32 = 5;
+        const RETRY_ERROR: i32 = 116;
 
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let path = directory.path().join("active.parts");
+
+        let first_faults = arm_journal_faults([(JournalFaultPoint::OpenRootSync, FIRST_ERROR)]);
+        let first_error = Journal::open(&owner, JournalConfig::default())
+            .expect_err("the initial root sync failure must reject open");
+        assert_eq!(
+            injected_operation_raw_os_error(&first_error),
+            Some(FIRST_ERROR)
+        );
+        first_faults.assert_consumed();
+        assert_eq!(
+            JournalHeader::decode(std::fs::read(&path).unwrap().try_into().unwrap()).unwrap(),
+            JournalHeader::EMPTY,
+            "the file was initialized before its root sync failed"
+        );
+
+        let retry_faults = arm_journal_faults([(JournalFaultPoint::OpenRootSync, RETRY_ERROR)]);
+        let retry_error = Journal::open(&owner, JournalConfig::default())
+            .expect_err("an existing valid journal must retry the root sync");
+        assert_eq!(
+            injected_operation_raw_os_error(&retry_error),
+            Some(RETRY_ERROR)
+        );
+        retry_faults.assert_consumed();
+
+        let journal = Journal::open(&owner, JournalConfig::default())
+            .expect("the next retry proves root-entry durability");
+        assert!(journal.is_empty());
+    }
+
+    #[test]
+    fn invalid_length_config_is_rejected_before_creating_the_journal() {
+        assert!(matches!(
+            rejected_config(JournalConfig {
+                max_journal_len: JOURNAL_HEADER_LEN - 1,
+                ..JournalConfig::default()
+            }),
+            JournalError::InvalidMaxJournalLen {
+                value,
+                minimum: JOURNAL_HEADER_LEN,
+                maximum: MAX_JOURNAL_LEN,
+            } if value == JOURNAL_HEADER_LEN - 1
+        ));
+        assert!(matches!(
+            rejected_config(JournalConfig {
+                max_journal_len: MAX_JOURNAL_LEN + 1,
+                ..JournalConfig::default()
+            }),
+            JournalError::InvalidMaxJournalLen {
+                value,
+                minimum: JOURNAL_HEADER_LEN,
+                maximum: MAX_JOURNAL_LEN,
+            } if value == MAX_JOURNAL_LEN + 1
+        ));
+    }
+
+    #[test]
+    fn invalid_part_count_config_is_rejected_before_creating_the_journal() {
+        assert!(matches!(
+            rejected_config(JournalConfig {
+                max_parts: 0,
+                ..JournalConfig::default()
+            }),
+            JournalError::InvalidMaxParts {
+                value: 0,
+                minimum: 1,
+                maximum: MAX_JOURNAL_PARTS,
+            }
+        ));
+        assert!(matches!(
+            rejected_config(JournalConfig {
+                max_parts: MAX_JOURNAL_PARTS + 1,
+                ..JournalConfig::default()
+            }),
+            JournalError::InvalidMaxParts {
+                value,
+                minimum: 1,
+                maximum: MAX_JOURNAL_PARTS,
+            } if value == MAX_JOURNAL_PARTS + 1
+        ));
+    }
+
+    #[test]
+    fn invalid_part_length_config_is_rejected_before_creating_the_journal() {
+        assert!(matches!(
+            rejected_config(JournalConfig {
+                limits: JournalLimits { max_part_len: 0 },
+                ..JournalConfig::default()
+            }),
+            JournalError::InvalidMaxPartLen {
+                value: 0,
+                minimum: 1,
+                maximum: MAX_PART_LEN,
+            }
+        ));
+        assert!(matches!(
+            rejected_config(JournalConfig {
+                limits: JournalLimits {
+                    max_part_len: MAX_PART_LEN + 1,
+                },
+                ..JournalConfig::default()
+            }),
+            JournalError::InvalidMaxPartLen {
+                value,
+                minimum: 1,
+                maximum: MAX_PART_LEN,
+            } if value == MAX_PART_LEN + 1
+        ));
+    }
+
+    #[test]
+    fn exact_header_length_cap_admits_only_an_empty_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
         let config = JournalConfig {
-            limits: small_limits(),
-            // Room for one frame, not two.
-            max_journal_len: frame_len + frame_len / 2,
+            max_journal_len: JOURNAL_HEADER_LEN,
+            ..JournalConfig::default()
         };
-        let (mut journal, _) = Journal::open(&path, config).expect("open");
-        journal.append(&part).expect("the first frame always fits");
+        let mut journal = Journal::open(&owner, config).unwrap();
+        assert!(journal.is_empty());
         assert!(matches!(
-            journal.append(&part),
-            Err(JournalError::Full { .. })
+            journal.append(id(1_000), &sample_part()),
+            Err(JournalError::Full {
+                len: JOURNAL_HEADER_LEN,
+                max: JOURNAL_HEADER_LEN
+            })
         ));
         assert_eq!(
-            journal.parts().len(),
-            1,
-            "a rejected append changes nothing"
+            std::fs::metadata(directory.path().join("active.parts"))
+                .unwrap()
+                .len(),
+            JOURNAL_HEADER_LEN as u64
         );
-
-        // After the merge resets the journal, appends work again.
-        journal.reset().expect("reset");
-        journal.append(&part).expect("append after reset");
     }
 
     #[test]
-    fn oversized_part_is_rejected_without_writing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = temp_journal_path(&dir);
-
-        let (mut journal, _) = Journal::open(&path, small_config()).expect("open");
-        let huge = vec![0_u8; 4097];
-        assert!(matches!(
-            journal.append(&huge),
-            Err(JournalError::PartTooLarge { .. })
-        ));
-        assert!(journal.is_empty());
-        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
-    }
-
-    #[test]
-    fn invalid_part_is_rejected_without_writing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = temp_journal_path(&dir);
-
-        let (mut journal, _) = Journal::open(&path, small_config()).expect("open");
-        // A valid-by-size but invalid body would be framed and synced, then
-        // reported as damage and skipped by the next recovery scan.
-        assert!(matches!(
-            journal.append(b""),
-            Err(JournalError::InvalidPart(_))
-        ));
-        assert!(matches!(
-            journal.append(b"not a PGM part at all, just bytes of the right size"),
-            Err(JournalError::InvalidPart(_))
-        ));
-        assert!(journal.is_empty());
-        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
-    }
-
-    #[test]
-    fn stale_part_ref_is_rejected_after_reset() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = temp_journal_path(&dir);
+    fn first_append_persists_identity_and_frame_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let segment_id = id(1_709_164_800_000_000);
         let part = sample_part();
+        let part_ref = journal.append(segment_id, &part).unwrap();
+        assert_eq!(journal.segment_id(), Some(segment_id));
+        assert_eq!(journal.read_part(part_ref).unwrap(), part);
+        drop(journal);
 
-        let (mut journal, _) = Journal::open(&path, small_config()).expect("open");
-        let stale = journal.append(&part).expect("append");
-        journal.reset().expect("reset");
+        let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        assert_eq!(journal.segment_id(), Some(segment_id));
+        assert_eq!(journal.parts().len(), 1);
+    }
+
+    #[test]
+    fn every_first_append_write_and_sync_fault_reopens_as_empty() {
+        const INJECTED_EIO: i32 = 5;
+        for point in [
+            JournalFaultPoint::AppendHeaderWrite,
+            JournalFaultPoint::AppendFrameHeaderWrite,
+            JournalFaultPoint::AppendFrameBodyWrite,
+            JournalFaultPoint::AppendSync,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = owner(&directory);
+            let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+            let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+            let faults = arm_journal_faults([(point, INJECTED_EIO)]);
+
+            let error = journal
+                .append(id(1_000), &sample_part())
+                .expect_err("an injected append fault cannot report success");
+            assert_eq!(
+                injected_operation_raw_os_error(&error),
+                Some(INJECTED_EIO),
+                "{point:?} must preserve the injected I/O error"
+            );
+            assert!(!journal.is_poisoned(), "{point:?} rollback must succeed");
+            faults.assert_consumed();
+            drop(journal);
+
+            assert_eq!(
+                std::fs::read(directory.path().join("active.parts")).unwrap(),
+                before,
+                "{point:?} must restore the exact empty journal"
+            );
+            let reopened = Journal::open(&owner, JournalConfig::default()).unwrap();
+            assert!(reopened.is_empty(), "{point:?} invented an active append");
+        }
+    }
+
+    #[test]
+    fn every_later_append_write_and_sync_fault_preserves_the_previous_generation() {
+        const INJECTED_EIO: i32 = 5;
+        for point in [
+            JournalFaultPoint::AppendFrameHeaderWrite,
+            JournalFaultPoint::AppendFrameBodyWrite,
+            JournalFaultPoint::AppendHeaderWrite,
+            JournalFaultPoint::AppendSync,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = owner(&directory);
+            let first = sample_part();
+            let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+            journal.append(id(1_000), &first).unwrap();
+            let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+            let faults = arm_journal_faults([(point, INJECTED_EIO)]);
+
+            let error = journal
+                .append(id(1_000), &sample_part_with_section(b"later"))
+                .expect_err("an injected append fault cannot report success");
+            assert_eq!(
+                injected_operation_raw_os_error(&error),
+                Some(INJECTED_EIO),
+                "{point:?} must preserve the injected I/O error"
+            );
+            assert!(!journal.is_poisoned(), "{point:?} rollback must succeed");
+            faults.assert_consumed();
+            drop(journal);
+
+            assert_eq!(
+                std::fs::read(directory.path().join("active.parts")).unwrap(),
+                before,
+                "{point:?} must restore the exact previous generation"
+            );
+            let reopened = Journal::open(&owner, JournalConfig::default()).unwrap();
+            assert_eq!(reopened.parts().len(), 1);
+            assert_eq!(reopened.read_part(reopened.parts()[0]).unwrap(), first);
+        }
+    }
+
+    #[test]
+    fn rollback_faults_poison_the_handle_and_reopen_never_accepts_a_partial_append() {
+        const INJECTED_EIO: i32 = 5;
+        const INJECTED_ENOSPC: i32 = 28;
+        for rollback_point in [
+            JournalFaultPoint::RollbackTruncate,
+            JournalFaultPoint::RollbackHeaderWrite,
+            JournalFaultPoint::RollbackSync,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = owner(&directory);
+            let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+            let canonical_empty = std::fs::read(directory.path().join("active.parts")).unwrap();
+            let faults = arm_journal_faults([
+                (JournalFaultPoint::AppendFrameBodyWrite, INJECTED_EIO),
+                (rollback_point, INJECTED_ENOSPC),
+            ]);
+
+            let error = journal
+                .append(id(1_000), &sample_part())
+                .expect_err("a failed rollback cannot report success");
+            assert!(
+                matches!(
+                    &error,
+                    JournalError::RollbackFailed {
+                        operation,
+                        rollback,
+                    } if operation.raw_os_error() == Some(INJECTED_EIO)
+                        && rollback.raw_os_error() == Some(INJECTED_ENOSPC)
+                ),
+                "{rollback_point:?} returned {error:?}"
+            );
+            assert!(journal.is_poisoned());
+            faults.assert_consumed();
+            let interrupted = std::fs::read(directory.path().join("active.parts")).unwrap();
+            drop(journal);
+
+            let reopened = Journal::open(&owner, JournalConfig::default());
+            if rollback_point == JournalFaultPoint::RollbackSync {
+                let reopened = reopened.expect("the restored old bytes remain a valid journal");
+                assert!(reopened.is_empty());
+                assert_eq!(interrupted, canonical_empty);
+            } else {
+                assert!(
+                    matches!(reopened, Err(JournalError::BodyLengthMismatch { .. })),
+                    "{rollback_point:?} must diagnose, not accept, the interrupted append"
+                );
+                assert_eq!(
+                    std::fs::read(directory.path().join("active.parts")).unwrap(),
+                    interrupted,
+                    "{rollback_point:?} reopen must preserve the damaged evidence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reference_is_stale_after_reset_even_when_raw_location_is_reused() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let segment_id = id(1_000);
+        let stale = journal.append(segment_id, &sample_part()).unwrap();
+        journal.reset().unwrap();
+
+        let replacement = sample_part_with_section(b"more");
+        let fresh = journal.append(segment_id, &replacement).unwrap();
+        assert_eq!(stale.offset(), fresh.offset());
+        assert_eq!(stale.len(), fresh.len());
+        assert_ne!(stale.generation, fresh.generation);
         assert!(matches!(
             journal.read_part(stale),
             Err(JournalError::StalePartRef { .. })
         ));
+        assert_eq!(journal.read_part(fresh).unwrap(), replacement);
+    }
 
-        // A fresh ref works again after new appends.
-        let fresh = journal.append(&part).expect("append");
-        assert_eq!(journal.read_part(fresh).expect("read"), part);
+    #[test]
+    fn a_reference_from_a_previous_open_is_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let part = sample_part();
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let stale = journal.append(id(1_000), &part).unwrap();
+        drop(journal);
+
+        let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let current = journal.parts()[0];
+        assert_eq!(stale.offset(), current.offset());
+        assert_eq!(stale.len(), current.len());
+        assert_ne!(stale.generation, current.generation);
+        assert!(matches!(
+            journal.read_part(stale),
+            Err(JournalError::StalePartRef { .. })
+        ));
+        assert_eq!(journal.read_part(current).unwrap(), part);
+    }
+
+    #[test]
+    fn a_fabricated_in_bounds_reference_is_rejected_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let genuine = journal.append(id(1_000), &sample_part()).unwrap();
+        let fabricated = JournalPartRef::new(
+            PartRef {
+                offset: genuine.offset() + 1,
+                len: genuine.len() - 1,
+            },
+            journal.generation,
+        );
+        assert!(fabricated.offset() + fabricated.len() <= journal.len());
+        assert!(matches!(
+            journal.read_part(fabricated),
+            Err(JournalError::StalePartRef { .. })
+        ));
+        assert!(journal.read_part(genuine).is_ok());
+    }
+
+    #[test]
+    fn another_segment_id_is_rejected_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        journal.append(id(1_000), &sample_part()).unwrap();
+        let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+        assert!(matches!(
+            journal.append(id(2_000), &sample_part()),
+            Err(JournalError::SegmentIdMismatch { .. })
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn reset_writes_an_empty_header_instead_of_truncating_to_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        journal.append(id(1_000), &sample_part()).unwrap();
+        journal.reset().unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path().join("active.parts"))
+                .unwrap()
+                .len(),
+            JOURNAL_HEADER_LEN as u64
+        );
+        assert_eq!(journal.segment_id(), None);
+    }
+
+    #[test]
+    fn every_reset_write_truncate_and_sync_fault_reopens_as_old_or_empty() {
+        const INJECTED_EIO: i32 = 5;
+        for (point, committed) in [
+            (JournalFaultPoint::ResetMarkerWrite, false),
+            (JournalFaultPoint::ResetMarkerSync, false),
+            (JournalFaultPoint::ResetEmptyHeaderWrite, true),
+            (JournalFaultPoint::ResetEmptyHeaderSync, true),
+            (JournalFaultPoint::ResetTruncate, true),
+            (JournalFaultPoint::ResetFinalSync, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = owner(&directory);
+            let part = sample_part();
+            let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+            journal.append(id(1_000), &part).unwrap();
+            let active_before = std::fs::read(directory.path().join("active.parts")).unwrap();
+            let faults = arm_journal_faults([(point, INJECTED_EIO)]);
+
+            let error = journal
+                .reset()
+                .expect_err("an injected reset fault cannot report success");
+            assert_eq!(
+                injected_operation_raw_os_error(&error),
+                Some(INJECTED_EIO),
+                "{point:?} must preserve the injected I/O error"
+            );
+            assert_eq!(
+                journal.is_poisoned(),
+                committed,
+                "{point:?} poison state must follow the reset commit boundary"
+            );
+            faults.assert_consumed();
+            drop(journal);
+
+            let reopened = Journal::open(&owner, JournalConfig::default()).unwrap();
+            if committed {
+                assert!(reopened.is_empty(), "{point:?} lost a committed reset");
+                assert_eq!(reopened.len(), JOURNAL_HEADER_LEN);
+            } else {
+                assert_eq!(
+                    std::fs::read(directory.path().join("active.parts")).unwrap(),
+                    active_before,
+                    "{point:?} must restore the exact active generation"
+                );
+                assert_eq!(reopened.parts().len(), 1);
+                assert_eq!(reopened.read_part(reopened.parts()[0]).unwrap(), part);
+            }
+        }
+    }
+
+    #[test]
+    fn open_completes_a_reset_committed_before_the_final_truncate() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let segment_id = id(1_000);
+        journal.append(segment_id, &sample_part()).unwrap();
+        let previous_len = journal.end as u64;
+        let marker = ResetMarker::new(previous_len, segment_id.get())
+            .unwrap()
+            .encode();
+        journal
+            .file
+            .write_all_at(&marker, previous_len)
+            .expect("write committed marker");
+        journal.file.sync_data().expect("commit reset marker");
+        drop(journal);
+
+        let recovered = Journal::open(&owner, JournalConfig::default()).unwrap();
+        assert!(recovered.is_empty());
+        assert_eq!(recovered.len(), JOURNAL_HEADER_LEN);
+    }
+
+    #[test]
+    fn open_completes_a_reset_after_the_root_header_was_partly_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let segment_id = id(1_000);
+        journal.append(segment_id, &sample_part()).unwrap();
+        let previous_len = journal.end as u64;
+        let marker = ResetMarker::new(previous_len, segment_id.get())
+            .unwrap()
+            .encode();
+        journal
+            .file
+            .write_all_at(&marker, previous_len)
+            .expect("write committed marker");
+        journal.file.sync_data().expect("commit reset marker");
+        journal
+            .file
+            .write_all_at(&JournalHeader::EMPTY.encode()[..17], 0)
+            .expect("simulate interrupted root-header replacement");
+        journal.file.sync_data().expect("persist interrupted state");
+        drop(journal);
+
+        let recovered = Journal::open(&owner, JournalConfig::default()).unwrap();
+        assert!(recovered.is_empty());
+        assert_eq!(recovered.len(), JOURNAL_HEADER_LEN);
+    }
+
+    #[test]
+    fn a_marker_with_an_inconsistent_previous_header_is_not_a_reset_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let segment_id = id(1_000);
+        journal.append(segment_id, &sample_part()).unwrap();
+        let previous_len = journal.end as u64;
+        let forged = ResetMarker {
+            previous_len,
+            previous_segment_id: segment_id.get(),
+            previous_header_crc: 0,
+        }
+        .encode();
+        journal.file.write_all_at(&forged, previous_len).unwrap();
+        journal.file.sync_data().unwrap();
+        let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+        drop(journal);
+
+        assert!(Journal::open(&owner, JournalConfig::default()).is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_valid_marker_does_not_reset_an_unrelated_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let segment_id = id(1_000);
+        journal.append(segment_id, &sample_part()).unwrap();
+        let previous_len = journal.end as u64;
+        let marker = ResetMarker::new(previous_len, segment_id.get())
+            .unwrap()
+            .encode();
+        journal.file.write_all_at(&marker, previous_len).unwrap();
+        journal.file.write_all_at(b"NOT-V1!!", 0).unwrap();
+        journal.file.sync_data().unwrap();
+        let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+        drop(journal);
+
+        assert!(matches!(
+            Journal::open(&owner, JournalConfig::default()),
+            Err(JournalError::UnsupportedJournalFormat)
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_valid_marker_does_not_reset_a_damaged_previous_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let segment_id = id(1_000);
+        journal.append(segment_id, &sample_part()).unwrap();
+        let previous_len = journal.end as u64;
+        let marker = ResetMarker::new(previous_len, segment_id.get())
+            .unwrap()
+            .encode();
+        journal.file.write_all_at(&marker, previous_len).unwrap();
+        let section_at = journal.parts()[0].offset() as u64 + MAGIC.len() as u64;
+        journal.file.write_all_at(&[0xFF], section_at).unwrap();
+        journal.file.sync_data().unwrap();
+        let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+        drop(journal);
+
+        assert!(Journal::open(&owner, JournalConfig::default()).is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn configured_length_cap_rejects_an_existing_larger_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        journal.append(id(1_000), &sample_part()).unwrap();
+        let len = journal.len();
+        drop(journal);
+        let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+        let config = JournalConfig {
+            max_journal_len: len - 1,
+            ..JournalConfig::default()
+        };
+
+        assert!(matches!(
+            Journal::open(&owner, config),
+            Err(JournalError::JournalTooLarge { .. })
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn physical_length_cap_is_checked_before_committed_reset_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        let segment_id = id(1_000);
+        journal.append(segment_id, &sample_part()).unwrap();
+        let previous_len = journal.len() as u64;
+        let marker = ResetMarker::new(previous_len, segment_id.get())
+            .unwrap()
+            .encode();
+        journal.file.write_all_at(&marker, previous_len).unwrap();
+        journal.file.sync_data().unwrap();
+        drop(journal);
+
+        let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+        let config = JournalConfig {
+            max_journal_len: before.len() - 1,
+            ..JournalConfig::default()
+        };
+        assert!(matches!(
+            Journal::open(&owner, config),
+            Err(JournalError::JournalTooLarge { len, max })
+                if len == before.len() as u64 && max == before.len() - 1
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn configured_length_cap_applies_to_the_first_and_later_appends() {
+        let part = sample_part();
+        let one_frame_len = JOURNAL_HEADER_LEN + FRAME_HEADER_LEN + part.len();
+        let reset_peak_len = one_frame_len + RESET_MARKER_LEN;
+
+        let first_directory = tempfile::tempdir().unwrap();
+        let first_owner = owner(&first_directory);
+        let first_config = JournalConfig {
+            max_journal_len: reset_peak_len - 1,
+            ..JournalConfig::default()
+        };
+        let mut first = Journal::open(&first_owner, first_config).unwrap();
+        assert!(matches!(
+            first.append(id(1_000), &part),
+            Err(JournalError::Full { .. })
+        ));
+        assert_eq!(first.len(), JOURNAL_HEADER_LEN);
+
+        let later_directory = tempfile::tempdir().unwrap();
+        let later_owner = owner(&later_directory);
+        let later_config = JournalConfig {
+            max_journal_len: reset_peak_len,
+            ..JournalConfig::default()
+        };
+        let mut later = Journal::open(&later_owner, later_config).unwrap();
+        later.append(id(1_000), &part).unwrap();
+        let before = std::fs::read(later_directory.path().join("active.parts")).unwrap();
+        assert!(matches!(
+            later.append(id(1_000), &part),
+            Err(JournalError::Full { .. })
+        ));
+        assert_eq!(
+            std::fs::read(later_directory.path().join("active.parts")).unwrap(),
+            before
+        );
+        later.reset().unwrap();
+        assert_eq!(later.len(), JOURNAL_HEADER_LEN);
+        assert_eq!(
+            std::fs::metadata(later_directory.path().join("active.parts"))
+                .unwrap()
+                .len(),
+            JOURNAL_HEADER_LEN as u64
+        );
+    }
+
+    #[test]
+    fn part_count_cap_applies_to_append_and_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let config = JournalConfig {
+            max_parts: 2,
+            ..JournalConfig::default()
+        };
+        let mut journal = Journal::open(&owner, config).unwrap();
+        let part = sample_part();
+        journal.append(id(1_000), &part).unwrap();
+        journal.append(id(1_000), &part).unwrap();
+        let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+        assert!(matches!(
+            journal.append(id(1_000), &part),
+            Err(JournalError::TooManyParts { max: 2 })
+        ));
+        drop(journal);
+
+        let strict = JournalConfig {
+            max_parts: 1,
+            ..JournalConfig::default()
+        };
+        assert!(matches!(
+            Journal::open(&owner, strict),
+            Err(JournalError::TooManyParts { max: 1 })
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn journal_keeps_writer_ownership_after_the_original_owner_is_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_root = DataRoot::open(directory.path()).unwrap();
+        let second_root = DataRoot::open(directory.path()).unwrap();
+        let owner = first_root.acquire_writer(LayoutLimits::default()).unwrap();
+        let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        drop(owner);
+
+        assert!(matches!(
+            second_root.acquire_writer(LayoutLimits::default()),
+            Err(LayoutError::OwnerContended {
+                owner: OwnerKind::Writer
+            })
+        ));
+        drop(journal);
+        second_root.acquire_writer(LayoutLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn zero_length_and_headerless_journals_are_rejected_without_mutation() {
+        for bytes in [Vec::new(), b"PGMPheaderless".to_vec()] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("active.parts"), &bytes).unwrap();
+            let owner = owner(&directory);
+            assert!(matches!(
+                Journal::open(&owner, JournalConfig::default()),
+                Err(JournalError::UnsupportedJournalFormat | JournalError::TornHeader { .. })
+            ));
+            assert_eq!(
+                std::fs::read(directory.path().join("active.parts")).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn fabricated_v2_journal_identities_are_rejected_without_mutation() {
+        let canonical = JournalHeader::EMPTY.encode();
+        let mut magic_v2 = canonical;
+        magic_v2[..8].copy_from_slice(b"PGKJNL2\0");
+        let magic_v2_crc = crc32c(&magic_v2[..32]);
+        magic_v2[32..].copy_from_slice(&magic_v2_crc.to_le_bytes());
+
+        let mut version_v2 = canonical;
+        version_v2[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        let version_v2_crc = crc32c(&version_v2[..32]);
+        version_v2[32..].copy_from_slice(&version_v2_crc.to_le_bytes());
+
+        for bytes in [magic_v2, version_v2] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("active.parts");
+            std::fs::write(&path, bytes).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let owner = owner(&directory);
+
+            assert!(matches!(
+                Journal::open(&owner, JournalConfig::default()),
+                Err(JournalError::UnsupportedJournalFormat)
+            ));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "unsupported pre-release journal identities must not trigger fallback or migration"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_header_checksum_is_fatal_and_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        drop(journal);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("active.parts"))
+            .unwrap();
+        file.write_all_at(&[0xAA], 16).unwrap();
+        let before = std::fs::read(directory.path().join("active.parts")).unwrap();
+        assert!(matches!(
+            Journal::open(&owner, JournalConfig::default()),
+            Err(JournalError::InvalidHeader(
+                JournalHeaderError::BadChecksum { .. }
+            ))
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            before
+        );
     }
 }

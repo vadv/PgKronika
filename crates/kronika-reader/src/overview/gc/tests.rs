@@ -10,7 +10,7 @@ use super::*;
 use crate::overview::{FactStore, FallbackConfig, FileKind, SegmentContext, SegmentFacts};
 
 fn context(stem: &str) -> SegmentContext {
-    SegmentContext::new(format!("{stem}.pgm")).expect("valid direct-child PGM name")
+    SegmentContext::new(crate::test_layout::named_address(stem))
 }
 
 fn lifecycle_pgm(source_id: u64) -> Vec<u8> {
@@ -80,8 +80,7 @@ fn published(
 ) -> (SegmentFacts, SegmentContext, std::path::PathBuf) {
     let bytes = lifecycle_pgm(source_id);
     let context = context(stem);
-    std::fs::write(directory.path().join(context.pgm_file_name()), &bytes)
-        .expect("write sibling PGM");
+    crate::test_layout::write_pgm(directory.path(), context.address(), &bytes);
     let facts = facts(&bytes);
     let path = store
         .publish(&facts, &context, &LIMIT)
@@ -90,19 +89,33 @@ fn published(
 }
 
 #[test]
-fn publication_uses_one_flat_same_stem_sidecar() {
+fn publication_uses_one_same_day_same_id_sidecar() {
     let directory = TempDir::new().expect("data directory");
-    std::fs::write(directory.path().join("active.parts"), b"active view")
-        .expect("write active view");
+    let active = crate::test_layout::write_empty_journal(directory.path());
     let store = store(directory.path(), immediate_config(128));
 
-    let (_facts, _context, sidecar) = published(&store, &directory, 1, "1721916000000000");
+    let (_facts, context, sidecar) = published(&store, &directory, 1, "segment");
+    let source = crate::test_layout::file_path(
+        directory.path(),
+        context.address(),
+        kronika_layout::FileKind::Pgm,
+    );
+    let expected_sidecar = crate::test_layout::file_path(
+        directory.path(),
+        context.address(),
+        kronika_layout::FileKind::Ovf,
+    );
 
-    assert_eq!(sidecar, directory.path().join("1721916000000000.ovf"));
-    assert!(directory.path().join("active.parts").is_file());
-    assert!(directory.path().join("1721916000000000.pgm").is_file());
-    assert!(directory.path().join("1721916000000000.ovf").is_file());
-    assert!(directory.path().join(OWNER_LOCK_NAME).is_file());
+    assert_eq!(sidecar, expected_sidecar);
+    assert!(active.is_file());
+    assert!(source.is_file());
+    assert!(sidecar.is_file());
+    assert!(
+        directory
+            .path()
+            .join(kronika_layout::OVERVIEW_OWNER_LOCK_NAME)
+            .is_file()
+    );
     assert!(
         !directory.path().join("overview").exists(),
         "publication must not create a cache tree"
@@ -113,7 +126,12 @@ fn publication_uses_one_flat_same_stem_sidecar() {
 fn two_scans_of_one_generation_do_not_satisfy_generation_grace() {
     let directory = TempDir::new().expect("data directory");
     let store = store(directory.path(), immediate_config(128));
-    let (_facts, _context, path) = published(&store, &directory, 2, "segment");
+    let (_facts, context, path) = published(&store, &directory, 2, "segment");
+    let source = crate::test_layout::file_path(
+        directory.path(),
+        context.address(),
+        kronika_layout::FileKind::Pgm,
+    );
     let mark = GcMark::authoritative(7, []);
 
     let first = store.collect_garbage(&mark);
@@ -127,10 +145,7 @@ fn two_scans_of_one_generation_do_not_satisfy_generation_grace() {
     let second_generation = store.collect_garbage(&GcMark::authoritative(8, []));
     assert_eq!(second_generation.deleted_sidecars, 1);
     assert!(!path.exists());
-    assert!(
-        directory.path().join("segment.pgm").is_file(),
-        "retention never removes source PGM files"
-    );
+    assert!(source.is_file(), "retention never removes source PGM files");
 }
 
 #[test]
@@ -176,27 +191,37 @@ fn bounded_scan_fails_closed_without_advancing_grace() {
 }
 
 #[test]
-fn source_entries_and_symlinks_are_never_followed_or_removed() {
+fn a_sidecar_symlink_makes_gc_fail_closed_without_removing_sources() {
     let directory = TempDir::new().expect("data directory");
     let store = store(directory.path(), immediate_config(256));
-    let (_facts, _context, path) = published(&store, &directory, 5, "segment");
-    let active = directory.path().join("active.parts");
-    std::fs::write(&active, b"active view").expect("write active view");
-    let linked = directory.path().join("linked.ovf");
-    symlink(directory.path().join("segment.pgm"), &linked).expect("create sidecar-shaped symlink");
+    let (_facts, context, path) = published(&store, &directory, 5, "segment");
+    let source = crate::test_layout::file_path(
+        directory.path(),
+        context.address(),
+        kronika_layout::FileKind::Pgm,
+    );
+    let active = crate::test_layout::write_empty_journal(directory.path());
+    let linked_address = crate::test_layout::named_address("linked");
+    let linked = crate::test_layout::file_path(
+        directory.path(),
+        linked_address,
+        kronika_layout::FileKind::Ovf,
+    );
+    symlink(&source, &linked).expect("create sidecar-shaped symlink");
+    let active_before = std::fs::read(&active).expect("read active journal");
 
-    let _ = store.collect_garbage(&GcMark::authoritative(1, []));
     let outcome = store.collect_garbage(&GcMark::authoritative(2, []));
 
-    assert_eq!(outcome.deleted_sidecars, 1);
-    assert!(!path.exists());
+    assert_eq!(outcome.skip_reason, Some(GcSkipReason::ScanError));
+    assert_eq!(outcome.deleted, 0);
+    assert!(path.is_file());
     assert_eq!(
-        std::fs::read(directory.path().join("segment.pgm")).expect("source survives"),
+        std::fs::read(&source).expect("source survives"),
         lifecycle_pgm(5)
     );
     assert_eq!(
         std::fs::read(&active).expect("active view survives"),
-        b"active view"
+        active_before
     );
     assert!(
         std::fs::symlink_metadata(&linked)
@@ -210,9 +235,15 @@ fn source_entries_and_symlinks_are_never_followed_or_removed() {
 fn stale_publisher_artifacts_and_invalid_sidecars_are_removed() {
     let directory = TempDir::new().expect("data directory");
     let store = store(directory.path(), immediate_config(256));
-    let (facts, _context, path) = published(&store, &directory, 6, "segment");
-    let temporary = directory.path().join(".pgkronika-overview.tmp-12-34");
-    let invalid = directory.path().join("stale.ovf");
+    let (facts, context, path) = published(&store, &directory, 6, "segment");
+    let day = crate::test_layout::day_path(directory.path(), context.address());
+    let temporary = day.join(format!("{}.ovf.12.34.tmp", context.address().id));
+    let stale_address = crate::test_layout::named_address("stale");
+    let invalid = crate::test_layout::file_path(
+        directory.path(),
+        stale_address,
+        kronika_layout::FileKind::Ovf,
+    );
     std::fs::write(&temporary, b"temporary").expect("write publisher artifact");
     std::fs::write(&invalid, b"invalid sidecar").expect("write invalid sidecar");
 
@@ -245,9 +276,9 @@ fn quota_accounts_only_derived_files_in_the_owned_data_directory() {
     let facts = facts(&bytes);
     let encoded_len =
         u64::try_from(facts.encode(&LIMIT).expect("encode facts").len()).expect("encoded size");
-    std::fs::write(directory.path().join("segment.pgm"), &bytes).expect("write source PGM");
-    std::fs::write(directory.path().join("active.parts"), vec![0_u8; 64 * 1024])
-        .expect("write active view");
+    let context = context("segment");
+    crate::test_layout::write_pgm(directory.path(), context.address(), &bytes);
+    crate::test_layout::write_empty_journal(directory.path());
     let config = GcConfig::new(
         128,
         2,
@@ -260,15 +291,15 @@ fn quota_accounts_only_derived_files_in_the_owned_data_directory() {
     let store = store(directory.path(), config);
 
     let path = store
-        .publish(&facts, &context("segment"), &LIMIT)
+        .publish(&facts, &context, &LIMIT)
         .expect("PGM and active view do not consume the derived-file quota");
     let outcome = store.collect_garbage(&GcMark::authoritative(1, [key(&facts)]));
 
     assert!(path.is_file());
     assert!(!outcome.quota_exceeded);
     assert_eq!(outcome.usage.sidecars.files, 1);
-    assert_eq!(outcome.usage.locks.files, 1);
-    assert_eq!(outcome.usage.total_files(), 2);
+    assert_eq!(outcome.usage.locks.files, 0);
+    assert_eq!(outcome.usage.total_files(), 1);
 }
 
 #[test]
@@ -276,18 +307,32 @@ fn optional_quota_blocks_publication_without_touching_the_source() {
     let directory = TempDir::new().expect("data directory");
     let bytes = lifecycle_pgm(9);
     let facts = facts(&bytes);
-    let source = directory.path().join("segment.pgm");
-    std::fs::write(&source, &bytes).expect("write source PGM");
-    let config = GcConfig::new(128, 2, Duration::ZERO, Duration::ZERO, None, Some(1))
-        .expect("one-file quota");
+    let context = context("segment");
+    let source = crate::test_layout::write_pgm(directory.path(), context.address(), &bytes);
+    let encoded_len =
+        u64::try_from(facts.encode(&LIMIT).expect("encode facts").len()).expect("encoded size");
+    let config = GcConfig::new(
+        128,
+        2,
+        Duration::ZERO,
+        Duration::ZERO,
+        Some(encoded_len - 1),
+        None,
+    )
+    .expect("undersized byte quota");
     let store = store(directory.path(), config);
 
     assert_eq!(
-        store.publish(&facts, &context("segment"), &LIMIT),
+        store.publish(&facts, &context, &LIMIT),
         Err(crate::PersistError::QuotaExceeded)
     );
     assert_eq!(std::fs::read(&source).expect("source survives"), bytes);
-    assert!(!directory.path().join("segment.ovf").exists());
+    let sidecar = crate::test_layout::file_path(
+        directory.path(),
+        context.address(),
+        kronika_layout::FileKind::Ovf,
+    );
+    assert!(!sidecar.exists());
 }
 
 #[test]

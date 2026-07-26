@@ -2,11 +2,13 @@
 //!
 //! `KRONIKA_COLLECTOR_BIN` points to the binary built into the Docker image.
 
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use kronika_layout::{DataRoot, FileKind, LayoutLimits, SegmentAddress};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader, Lines};
@@ -20,6 +22,75 @@ const COLLECTOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 type ChildLines = Lines<BufReader<ChildStdout>>;
 
+/// One sealed segment identified by its data root and verified layout address.
+#[derive(Debug, Clone)]
+pub(crate) struct SealedSegment {
+    data_root: PathBuf,
+    address: SegmentAddress,
+    diagnostic_path: PathBuf,
+}
+
+impl SealedSegment {
+    pub(crate) fn from_address(data_root: &Path, address: SegmentAddress) -> Result<Self> {
+        let root = DataRoot::open(data_root).context("open sealed segment data root")?;
+        let snapshot = root
+            .scan(LayoutLimits::default())
+            .context("scan sealed segment data root")?;
+        ensure!(
+            snapshot
+                .segments
+                .iter()
+                .any(|segment| segment.address == address),
+            "sealed segment address {address:?} is absent from the strict tree"
+        );
+        Ok(Self {
+            data_root: data_root.to_owned(),
+            address,
+            diagnostic_path: root.diagnostic_file_path(address, FileKind::Pgm),
+        })
+    }
+
+    fn from_announcement(data_root: &Path, announced: &Path) -> Result<Self> {
+        let root = DataRoot::open(data_root).context("open collector data root")?;
+        let snapshot = root
+            .scan(LayoutLimits::default())
+            .context("scan collector data root after seal")?;
+        let segment = snapshot
+            .segments
+            .into_iter()
+            .find(|segment| root.diagnostic_file_path(segment.address, FileKind::Pgm) == announced)
+            .with_context(|| {
+                format!(
+                    "collector announced a segment outside the strict tree: {}",
+                    announced.display()
+                )
+            })?;
+        Self::from_address(data_root, segment.address)
+    }
+
+    pub(crate) fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+
+    pub(crate) const fn address(&self) -> SegmentAddress {
+        self.address
+    }
+}
+
+impl AsRef<Path> for SealedSegment {
+    fn as_ref(&self) -> &Path {
+        &self.diagnostic_path
+    }
+}
+
+impl Deref for SealedSegment {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.diagnostic_path
+    }
+}
+
 pub(crate) struct Collector {
     child: Child,
     lines: ChildLines,
@@ -31,8 +102,10 @@ pub(crate) struct Collector {
     stderr_task: JoinHandle<()>,
     /// Keep the output directory alive until the harness retains it for the scenario.
     out_dir: Option<tempfile::TempDir>,
+    /// Holds the default `PostgreSQL` log-tail state outside the data root.
+    _control_dir: tempfile::TempDir,
     /// Segments the collector sealed on startup from a recovered journal.
-    recovered_seals: Vec<PathBuf>,
+    recovered_seals: Vec<SealedSegment>,
 }
 
 impl Collector {
@@ -55,9 +128,15 @@ impl Collector {
     ) -> Result<Self> {
         let bin =
             std::env::var("KRONIKA_COLLECTOR_BIN").context("KRONIKA_COLLECTOR_BIN is not set")?;
+        let control_dir =
+            tempfile::tempdir().context("create collector control directory outside data root")?;
         let mut cmd = Command::new(&bin);
         cmd.env("KRONIKA_PG_DSN", cluster.conn_string())
             .env("KRONIKA_OUT_DIR", out_dir.path())
+            .env(
+                "KRONIKA_LOG_STATE_PATH",
+                control_dir.path().join("pg-log.state"),
+            )
             // Scenarios drive collection through signals; the internal timer
             // stays off unless a scenario turns it on explicitly.
             .env("KRONIKA_INTERVAL_S", "0");
@@ -89,10 +168,9 @@ impl Collector {
             if line == "ready" {
                 break;
             }
-            recovered_seals.push(
-                parse_sealed(&line)
-                    .with_context(|| format!("expected 'ready' or a seal, got {line:?}"))?,
-            );
+            let path = parse_sealed(&line)
+                .with_context(|| format!("expected 'ready' or a seal, got {line:?}"))?;
+            recovered_seals.push(SealedSegment::from_announcement(out_dir.path(), &path)?);
         }
         Ok(Self {
             child,
@@ -100,11 +178,12 @@ impl Collector {
             stderr,
             stderr_task,
             out_dir: Some(out_dir),
+            _control_dir: control_dir,
             recovered_seals,
         })
     }
 
-    pub(crate) async fn snapshot(&mut self) -> Result<PathBuf> {
+    pub(crate) async fn snapshot(&mut self) -> Result<SealedSegment> {
         let raw = self.child.id().context("collector already exited")?;
         let pid = Pid::from_raw(i32::try_from(raw).context("collector pid out of range")?);
         kill(pid, Signal::SIGUSR2).context("send SIGUSR2 to the collector")?;
@@ -113,13 +192,18 @@ impl Collector {
 
     /// Wait for the collector to announce the next sealed segment on its own,
     /// without sending a signal — the internal-timer path.
-    pub(crate) async fn wait_sealed(&mut self) -> Result<PathBuf> {
+    pub(crate) async fn wait_sealed(&mut self) -> Result<SealedSegment> {
         let line = next_line(&mut self.lines).await?;
-        parse_sealed(&line)
+        let path = parse_sealed(&line)?;
+        let out_dir = self
+            .out_dir
+            .as_ref()
+            .context("collector output directory was already taken")?;
+        SealedSegment::from_announcement(out_dir.path(), &path)
     }
 
     /// Segments the collector sealed on startup from a recovered journal.
-    pub(crate) fn recovered_seals(&self) -> &[PathBuf] {
+    pub(crate) fn recovered_seals(&self) -> &[SealedSegment] {
         &self.recovered_seals
     }
 
@@ -127,7 +211,9 @@ impl Collector {
     pub(crate) fn journal_len(&self) -> u64 {
         self.out_dir
             .as_ref()
-            .and_then(|dir| std::fs::metadata(dir.path().join("active.parts")).ok())
+            .and_then(|dir| DataRoot::open(dir.path()).ok())
+            .and_then(|root| root.open_active_journal().ok().flatten())
+            .and_then(|journal| journal.metadata().ok())
             .map_or(0, |meta| meta.len())
     }
 
@@ -192,7 +278,9 @@ fn parse_sealed(line: &str) -> Result<PathBuf> {
     let (path, _reason) = rest
         .rsplit_once(" reason=")
         .with_context(|| format!("seal announcement without a reason: {line:?}"))?;
-    Ok(PathBuf::from(path))
+    let path = PathBuf::from(path);
+    ensure!(path.is_absolute(), "seal announcement path is not absolute");
+    Ok(path)
 }
 
 async fn next_line(lines: &mut ChildLines) -> Result<String> {

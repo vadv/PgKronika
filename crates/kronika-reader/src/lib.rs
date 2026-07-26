@@ -10,9 +10,9 @@
 //!
 //! Section queries join registered layout versions under one logical name,
 //! filter by source and time, order rows by the registry contract, and return
-//! coverage gaps plus an opaque cursor. [`QueryLimits`] bounds returned rows
-//! and materialized cells; format, catalog, section, row-group, and row-count
-//! ceilings are checked before or during decode.
+//! coverage gaps plus an opaque cursor. [`QueryLimits`] bounds returned rows,
+//! materialization, and request-wide read work; format, catalog, section,
+//! row-group, and row-count ceilings are checked before or during decode.
 //!
 //! Counter folds preserve reset, gap, first-point, invalid-interval, and
 //! collection-disabled states as distinct [`Reason`] values. A zero rate is
@@ -24,6 +24,8 @@ mod overview;
 mod query;
 mod refresh;
 mod snapshot;
+#[cfg(test)]
+mod test_layout;
 mod unit;
 
 // criterion and mimalloc are used only by the `serving` bench; anchored for the
@@ -51,16 +53,17 @@ pub use overview::{
     LiveView, LossCoverageBlock, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS,
     ManifestEntryDescriptor, PersistError, PersistFailureClass, PersistMode, PersistModeSnapshot,
     PersistenceProbeOutcome, ResetMarker, ResetMarkersBlock, ResolvedPattern, SealOutcome,
-    SegmentContext, SegmentContextError, SegmentFacts, SourceDescriptor, SourceError,
-    SourceManifestBlock, StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats,
-    dictionary_context_id, lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
+    SegmentContext, SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock,
+    StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id,
+    lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
-    OutRow, QueryError, QueryLimits, SectionPage, SeriesDiff, SeriesValues, SourceSummary,
-    SourceSummaryError, SourceSummaryLimits, SourceSummaryResource, Value, apply_collection_gating,
-    apply_gating, diff_section, gate_readings, gauge_section, latest_section_row, logical_section,
-    section, section_with_limits, sections, sections_with_limits, select_gate, source_summaries,
+    OutRow, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SectionPage, SeriesDiff,
+    SeriesValues, SourceSummary, SourceSummaryError, SourceSummaryLimits, SourceSummaryResource,
+    Value, apply_collection_gating, apply_gating, diff_section, gate_readings, gauge_section,
+    latest_section_row, logical_section, section, section_with_limits, sections,
+    sections_with_limits, select_gate, source_summaries,
 };
 pub use refresh::{
     ByteRange, CatalogDigest, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor,

@@ -1,6 +1,6 @@
 //! Bounded query decoding and mapping of reader failures to API problems.
 
-use kronika_reader::{Cursor, QueryError};
+use kronika_reader::{Cursor, QueryError, QueryWorkResource};
 
 use crate::problem::{
     ApiProblem, ExpectedValue, InvalidParameterLocation, LimitResource, QueryParameter, count_u64,
@@ -257,6 +257,19 @@ pub(crate) fn query_error_response(error: &QueryError) -> ApiProblem {
         }
         QueryError::MaterializedBytesTooLarge { max_bytes } => {
             ApiProblem::query_limit_exceeded(LimitResource::Bytes, count_u64(*max_bytes), None)
+        }
+        QueryError::WorkLimitExceeded {
+            resource,
+            limit,
+            observed,
+        } => {
+            let resource = match resource {
+                QueryWorkResource::Units => LimitResource::Units,
+                QueryWorkResource::CatalogBytes | QueryWorkResource::DictionaryBytes => {
+                    LimitResource::Bytes
+                }
+            };
+            ApiProblem::query_limit_exceeded(resource, *limit, Some(*observed))
         }
     }
 }

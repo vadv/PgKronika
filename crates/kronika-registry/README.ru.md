@@ -405,9 +405,9 @@ blk_read_time при допустимых чтениях track_io_timing:
 | Задача | Где настраивается |
 | --- | --- |
 | Частота `pg_stat_activity`, `pg_stat_database`, ОС и других источников | `*_INTERVAL_S` в [`pg_kronika-collector`](../../bins/pg_kronika-collector/README.ru.md#расписание). |
-| Top-N таблиц, индексов, запросов и планов | `KRONIKA_PG_MAX_TABLES`, `KRONIKA_PG_MAX_INDEXES`, `KRONIKA_PG_MAX_STATEMENTS` и `KRONIKA_PG_MAX_PLANS` в [ограничениях коллектора](../../bins/pg_kronika-collector/README.ru.md#ограничения-cardinality-и-хранения). |
+| Top-N таблиц, индексов, запросов и планов | `KRONIKA_PG_MAX_TABLES`, `KRONIKA_PG_MAX_INDEXES`, `KRONIKA_PG_MAX_STATEMENTS` и `KRONIKA_PG_MAX_PLANS` в [ограничениях коллектора](../../bins/pg_kronika-collector/README.ru.md#ограничения-кардинальности-и-хранения). |
 | Тайм-ауты, исключённые базы и бюджет цикла | `KRONIKA_PG_STATEMENT_TIMEOUT_MS`, `KRONIKA_PG_LOCK_TIMEOUT_MS`, `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS`, `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`, `KRONIKA_PG_EXCLUDE_DATABASES` и `KRONIKA_CYCLE_DB_BUDGET_MS` в [настройках подключений](../../bins/pg_kronika-collector/README.ru.md#подключения-и-ограничения-запросов). |
-| Ротация открытого сегмента и предел журнала | `KRONIKA_SEGMENT_MAX_BYTES` — порог по сырым байтам `active.parts` после добавления окна; `KRONIKA_SEGMENT_MAX_AGE_S` — возраст; `KRONIKA_JOURNAL_MAX_BYTES` — жёсткий предел журнала. См. [ограничения коллектора](../../bins/pg_kronika-collector/README.ru.md#ограничения-cardinality-и-хранения). |
+| Ротация открытого сегмента и предел журнала | `KRONIKA_SEGMENT_MAX_BYTES` — порог по сырым байтам `active.parts` после добавления окна; `KRONIKA_SEGMENT_MAX_AGE_S` — возраст; `KRONIKA_JOURNAL_MAX_BYTES` — жёсткий предел журнала. См. [ограничения коллектора](../../bins/pg_kronika-collector/README.ru.md#ограничения-кардинальности-и-хранения). |
 | Окно, шаг и порог поиска аномалий | [Параметры запросов `pg_kronika-web`](../kronika-analytics/README.ru.md#аномалии-и-инциденты). |
 
 `BytesPool` — ограниченный пул переиспользуемых входных буферов, не кэширует

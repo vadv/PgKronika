@@ -9,25 +9,47 @@ sealed files and live journal parts, and exposes bounded logical queries used by
 ## Units and snapshots
 
 `PgmUnit<R: ReadAt>` is the common decode path for a sealed `File` and an
-in-memory active part. It opens the end catalog first, validates format version
-and bounds, reads section bytes on demand, checks CRC, then invokes the registry
-codec. `Segment` is the sealed-file convenience wrapper.
+in-memory active part. It reads catalog entries in chunks of at most 64 KiB,
+validates format version, CRC, and bounds, and retains the decoded `Catalog`
+without a second raw catalog copy. Section bodies are read on demand, checked
+against their CRC, and only then passed to the registry codec. `Segment` is the
+sealed-file convenience wrapper.
 
 `kronika-store::LocalDir` scans `active.parts` first and then lists sealed units;
 those operations do not capture one atomic combined view. `LocalDirSnapshot`
-returns the observed sealed units first, followed by live parts. A live part is
-suppressed only when its catalog exactly matches a sealed unit; overlapping
-time ranges do not prove identity. Store warnings and journal damage remain
-available to callers.
+returns the observed sealed units first, followed by live parts. It suppresses
+all live parts for one `SegmentId` only when their catalogs, aggregated with
+the same section relocation used by finalization, exactly match the sealed unit
+for that `SegmentId`. It never suppresses only a matching prefix. Overlapping
+time ranges, a match for only one part of a multi-part journal, or equal content
+under another `SegmentId` do not prove identity. Store warnings and journal
+damage remain available to callers.
 
-A writer may seal or reset `active.parts` after a snapshot captured a part
-reference. This yields `ReadError::StaleSnapshot`. Query helpers refresh a
-bounded number of times and surface a gap if the unit remains unstable.
+Sealed discovery retains an exact `FileIdentity` plus an `Arc<CatalogSummary>`
+for each PGM, not its complete entry table. The store checks the opened file
+identity before and after deriving the summary. Opening a selected unit repeats
+the identity check around the lazy full-catalog read and compares the resulting
+summary with the pinned value. Cloned snapshots share the sealed-unit collection,
+its summaries, and the sealed descriptor baseline through `Arc`; they do not
+duplicate section bodies.
 
-`LiveBuilder`, `LiveView`, and seal reconciliation provide bounded overview
-fold and handoff primitives. The production web refresh owner retains one
-builder, folds only newly completed journal parts, and reconciles a live
-generation with its exact sealed descriptor before publishing an immutable
+An `active.parts` scan is accepted only when the journal identity remains
+unchanged across the attempt. The reader makes at most two scan attempts, and
+makes the second only after the device, inode, length, or filesystem timestamps
+changed. Stable corruption remains an error. A valid durable journal-v1 reset
+marker is checked together with the old frames and treated as one complete,
+logically empty journal state. PgKronika has not had a public release: journal
+v1 is the first and only journal format, with no migration path.
+
+A writer may finalize or reset the journal after a snapshot captured a part
+reference. Opening that reference yields `ReadError::StaleSnapshot`. Query
+helpers refresh a bounded number of times and surface a gap if the unit remains
+unstable.
+
+`LiveBuilder`, `LiveView`, and finalization reconciliation provide bounded
+overview fold and handoff primitives. The production web refresh owner retains
+one builder, folds only newly completed journal parts, and reconciles a live
+generation with its exact finalized descriptor before publishing an immutable
 timeline view. Ordinary logical-section requests continue to query
 `LocalDirSnapshot`.
 
@@ -47,8 +69,26 @@ materialization ceiling. `section_with_limits` and `sections_with_limits` let
 an adapter spend a smaller request-wide cell budget. Exceeding it returns
 `QueryError::ResultTooLarge` before retaining another row.
 
+`QueryLimits::with_work_limits(QueryWorkLimits::new(...))` adds aggregate
+request ceilings. `max_units` counts units inspected after source/time
+filtering, `max_catalog_read_bytes` counts stored bytes admitted to open
+candidate catalogs, and `max_dictionary_read_bytes` counts stored
+dictionary-body bytes admitted after catalog confirmation. The defaults are
+500,000 units, 64 MiB of catalog reads, and 64 MiB of dictionary reads. Before
+admitting work over a ceiling, the query returns
+`QueryError::WorkLimitExceeded { resource, limit, observed }`; a stale-open
+retry is charged again.
+
 The cursor pins the last returned key and source contract. A malformed or
 cross-source cursor is rejected rather than treated as an offset.
+
+The compact summary's 512-bit Bloom filter can rule out a section type with
+non-zero rows without opening that PGM. It has no false negatives, but may
+produce false positives. Every positive candidate is therefore opened and
+confirmed against the real catalog before it contributes data. The
+`source_summaries` path performs this work under typed `units`, `rows`, and
+`bytes` limits and returns `LimitExceeded` without a partial result when a limit
+is exhausted.
 
 ## Gauge and counter semantics
 
@@ -83,17 +123,19 @@ CRC-checks only selected block bodies. `FactReadStats` exposes the resulting
 read calls and byte counts.
 
 All PGKOVF constructors and decoders enforce the absolute `LIMIT` values before
-large allocations. PgKronika owns the whole data directory and uses one
-same-stem sidecar for each sealed segment:
+large allocations. PgKronika owns the whole data directory. The journal and
+owner locks are root-level objects; each sealed segment and its same-stem
+sidecar are siblings in the UTC day derived from `SegmentId`:
 
 ```text
 /data/active.parts
-/data/N.pgm
-/data/N.ovf
+/data/YYYY/MM/DD/N.pgm
+/data/YYYY/MM/DD/N.ovf
 ```
 
-`FactStore` derives the sidecar name only by replacing the exact `.pgm`
-extension with `.ovf`. The PGKOVF header stores the `FactKey`,
+`FactStore` receives a verified `SegmentAddress` and resolves `N.ovf` through
+the owned calendar tree; request strings cannot select another path. The
+PGKOVF header stores the `FactKey`,
 `SegmentLineageId`, exact `SourceDescriptor`, source metadata, and the schema,
 extractor, registry, and source-format versions. Every read validates those
 fields against the selected PGM. A missing, stale, incompatible, corrupt, or
@@ -120,15 +162,15 @@ filename or directory key. Before any mutation, `FactStore` takes
 lease. Another independently constructed store or process may read valid
 sidecars but cannot publish or collect them while the owner is alive.
 
-`GcConfig` bounds each direct scan of the data directory. The defaults allow
-100,000 entries, require two distinct authoritative GC generations and
+`GcConfig` bounds each traversal of the owned calendar tree. The defaults allow
+100,000 visited entries, require two distinct authoritative GC generations and
 120 seconds since the first absent observation, and retain recognized
 publication temporary files for 600 seconds. An unavailable live set, a scan
 error, or an entry-cap hit authorizes no deletion and does not advance grace.
-GC admits a same-stem `.ovf` only after validating its PGKOVF header against
-the corresponding live descriptor. It never follows symlinks or removes PGM
-sources, `active.parts`, or the owner lock. A sidecar unlink also takes the
-publication gate and checks the opened inode and device again.
+GC admits a same-day, same-stem `.ovf` only after validating its PGKOVF header
+against the corresponding live descriptor. It never follows symlinks or
+removes PGM sources, `active.parts`, or the owner lock. A sidecar unlink also
+takes the publication gate and checks the opened inode and device again.
 
 Logical-byte and file-count ceilings are optional and disabled by default.
 When configured, admission counts only recognized sidecars, publication

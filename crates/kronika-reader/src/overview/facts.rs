@@ -12,7 +12,6 @@
 
 use std::collections::{BTreeMap, BTreeSet as DictionaryIdSet};
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 
 use kronika_analytics::overview::{
     Applicability, BoundaryQuality, CounterSample, Coverage, CoverageSpan, CoverageState,
@@ -23,6 +22,7 @@ use kronika_analytics::overview::{
     SourcePopulation, query_bounded,
 };
 use kronika_format::ReadAt;
+use kronika_layout::SegmentAddress;
 
 use crate::unit::PgmUnit;
 use crate::{PgmBodyReadStats, ReadError};
@@ -50,63 +50,35 @@ use super::observations::EventObservationsBlock;
 /// Filesystem address of one sealed PGM and its sibling overview sidecar.
 #[derive(Debug, Clone)]
 pub struct SegmentContext {
+    address: SegmentAddress,
     pgm_file_name: OsString,
     sidecar_file_name: OsString,
 }
 
-/// Invalid direct-child PGM filename for a sibling sidecar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SegmentContextError {
-    /// The value is not one direct-child filename ending in `.pgm`.
-    InvalidPgmFileName,
-}
-
-impl std::fmt::Display for SegmentContextError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidPgmFileName => {
-                f.write_str("PGM filename must be one direct child ending in .pgm")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SegmentContextError {}
-
 impl SegmentContext {
-    /// Derives the sibling `.ovf` name from one direct-child `.pgm` name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SegmentContextError`] unless the value is a safe direct-child
-    /// filename with a non-empty stem and exact `.pgm` extension.
-    pub fn new(pgm_file_name: impl Into<OsString>) -> Result<Self, SegmentContextError> {
-        let pgm_file_name = pgm_file_name.into();
-        let bytes = pgm_file_name.as_bytes();
-        if bytes.len() <= 4
-            || !bytes.ends_with(b".pgm")
-            || bytes.contains(&b'/')
-            || bytes.contains(&0)
-            || bytes == b"."
-            || bytes == b".."
-        {
-            return Err(SegmentContextError::InvalidPgmFileName);
+    /// Constructs sibling artifact names from one verified layout address.
+    #[must_use]
+    pub fn new(address: SegmentAddress) -> Self {
+        Self {
+            address,
+            pgm_file_name: OsString::from(address.pgm_name()),
+            sidecar_file_name: OsString::from(address.ovf_name()),
         }
-        let mut sidecar = bytes[..bytes.len() - 4].to_vec();
-        sidecar.extend_from_slice(b".ovf");
-        Ok(Self {
-            pgm_file_name,
-            sidecar_file_name: OsString::from_vec(sidecar),
-        })
     }
 
-    /// Direct-child PGM filename.
+    /// Returns the verified source and sidecar address.
+    #[must_use]
+    pub const fn address(&self) -> SegmentAddress {
+        self.address
+    }
+
+    /// PGM leaf filename inside the verified UTC day directory.
     #[must_use]
     pub fn pgm_file_name(&self) -> &OsStr {
         &self.pgm_file_name
     }
 
-    /// Direct-child sibling OVF filename with the same stem.
+    /// Sibling OVF leaf filename with the same stem.
     #[must_use]
     pub fn sidecar_file_name(&self) -> &OsStr {
         &self.sidecar_file_name

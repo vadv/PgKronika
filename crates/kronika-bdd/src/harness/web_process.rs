@@ -7,9 +7,8 @@
 //! before its atomic rename; no timing sleeps or polling retries participate in
 //! readiness, crash, contention, or shutdown assertions.
 
-use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -25,10 +24,12 @@ use http_body_util::{BodyExt as _, Empty};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use kronika_format::crc32c;
+use kronika_layout::{DataRoot, FileKind, LayoutLimits, SegmentAddress, TemporaryKind};
 use kronika_reader::{
     FactFile, LIMIT, PgmUnit, QUALIFICATION_PUBLISH_BARRIER_ENV,
     QUALIFICATION_PUBLISH_BARRIER_READY, QUALIFICATION_PUBLISH_BARRIER_RELEASE, SegmentFacts,
 };
+use kronika_writer::{Journal, JournalConfig};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use pg_kronika_web::qualification::PROCESS_READY_PREFIX;
@@ -325,43 +326,75 @@ fn captured_stderr(bytes: &Mutex<Vec<u8>>) -> String {
 pub(crate) struct WebCase {
     #[allow(dead_code, reason = "keeps the owned scenario tree alive")]
     root: TempDir,
-    data_dir: PathBuf,
-    segment: PathBuf,
+    data_root: DataRoot,
+    address: SegmentAddress,
     source_id: u64,
     from_us: i64,
     to_us: i64,
-    sources_before: BTreeMap<OsString, Vec<u8>>,
+    sources_before: SourceArtifacts,
 }
 
 impl WebCase {
-    /// Copy one sealed PGM and an optional active journal into a fresh tree.
-    pub(crate) fn from_segment(segment: &Path, label: &str) -> Result<Self> {
-        ensure!(
-            segment.extension() == Some(OsStr::new("pgm")),
-            "lifecycle fixture is not a sealed PGM: {}",
-            segment.display()
-        );
+    /// Copy one sealed PGM and an optional version-1 journal into a fresh tree.
+    pub(crate) fn from_segment(
+        segment: &crate::collector::SealedSegment,
+        label: &str,
+    ) -> Result<Self> {
+        let source_root =
+            DataRoot::open(segment.data_root()).context("open lifecycle fixture data root")?;
+        let mut source_pgm = source_root
+            .open_pgm(segment.address())
+            .context("open lifecycle fixture PGM")?;
+        let source_journal = source_root
+            .open_active_journal()
+            .context("open lifecycle fixture journal")?;
         let root = tempfile::Builder::new()
             .prefix(&format!("pgkronika-web-{label}-"))
             .tempdir()
             .context("create owned web lifecycle directory")?;
         let data_dir = root.path().join("data");
         fs::create_dir(&data_dir).context("create owned web data directory")?;
-        let filename = segment
-            .file_name()
-            .context("sealed fixture has no filename")?;
-        let copied = data_dir.join(filename);
-        fs::copy(segment, &copied)
-            .with_context(|| format!("copy sealed fixture {}", segment.display()))?;
-        if let Some(parent) = segment.parent() {
-            let active = parent.join("active.parts");
-            if active.is_file() {
-                fs::copy(&active, data_dir.join("active.parts"))
-                    .context("copy active.parts fixture")?;
-            }
+        let destination = DataRoot::open(&data_dir).context("open owned web data root")?;
+        let owner = destination
+            .acquire_writer(LayoutLimits::default())
+            .context("acquire lifecycle fixture writer")?;
+        let mut temporary = owner
+            .create_pgm_temp(segment.address())
+            .context("create lifecycle PGM temporary")?;
+        std::io::copy(&mut source_pgm, temporary.file_mut())
+            .context("copy lifecycle PGM through layout capabilities")?;
+        temporary
+            .file_mut()
+            .sync_all()
+            .context("sync lifecycle PGM fixture")?;
+        temporary
+            .publish()
+            .context("publish lifecycle PGM fixture")?;
+        drop(temporary);
+        if let Some(mut source_journal) = source_journal {
+            let (mut target, _created) = owner
+                .open_or_create_journal()
+                .context("create lifecycle journal fixture")?;
+            target
+                .set_len(0)
+                .context("truncate lifecycle journal target")?;
+            target
+                .seek(SeekFrom::Start(0))
+                .context("rewind lifecycle journal target")?;
+            std::io::copy(&mut source_journal, &mut target).context("copy lifecycle journal v1")?;
+            target.sync_all().context("sync lifecycle journal v1")?;
+            drop(target);
+            Journal::open(&owner, JournalConfig::default())
+                .context("validate copied lifecycle journal v1")?;
         }
-        let unit = PgmUnit::open(File::open(&copied).context("open copied PGM")?)
-            .context("open copied PGM catalog")?;
+        drop(owner);
+        let data_root = DataRoot::open(&data_dir).context("reopen owned web data root")?;
+        let unit = PgmUnit::open(
+            data_root
+                .open_pgm(segment.address())
+                .context("open copied PGM")?,
+        )
+        .context("open copied PGM catalog")?;
         let source_id = unit.catalog().source_id;
         let from_us = unit.catalog().min_ts;
         let to_us = unit
@@ -370,11 +403,11 @@ impl WebCase {
             .checked_add(1)
             .context("fixture maximum timestamp cannot form a half-open range")?;
         ensure!(from_us < to_us, "fixture timeline range is empty");
-        let sources_before = source_artifacts(&data_dir)?;
+        let sources_before = source_artifacts(&data_root, segment.address())?;
         Ok(Self {
             root,
-            data_dir,
-            segment: copied,
+            data_root,
+            address: segment.address(),
             source_id,
             from_us,
             to_us,
@@ -383,11 +416,12 @@ impl WebCase {
     }
 
     pub(crate) fn data_dir(&self) -> &Path {
-        &self.data_dir
+        self.data_root.diagnostic_path()
     }
 
     pub(crate) fn sidecar(&self) -> PathBuf {
-        self.segment.with_extension("ovf")
+        self.data_root
+            .diagnostic_file_path(self.address, FileKind::Ovf)
     }
 
     pub(crate) const fn source_id(&self) -> u64 {
@@ -403,47 +437,103 @@ impl WebCase {
     }
 
     pub(crate) async fn spawn(&self, extra_env: &[(&str, &str)]) -> Result<WebProcess> {
-        WebProcess::spawn(&self.data_dir, extra_env).await
+        WebProcess::spawn(self.data_dir(), extra_env).await
     }
 
     pub(crate) fn seed_sidecar(&self, bytes: &[u8]) -> Result<()> {
-        fs::write(self.sidecar(), bytes).context("seed lifecycle OVF")
+        let owner = self
+            .data_root
+            .acquire_overview(LayoutLimits::default())
+            .context("acquire lifecycle overview fixture owner")?;
+        let mut temporary = owner
+            .create_ovf_temp(self.address)
+            .context("create lifecycle OVF temporary")?;
+        temporary
+            .file_mut()
+            .write_all(bytes)
+            .context("write lifecycle OVF")?;
+        temporary
+            .file_mut()
+            .sync_all()
+            .context("sync lifecycle OVF")?;
+        temporary.publish().context("publish lifecycle OVF fixture")
     }
 
     /// Require all collector-owned source bytes to remain exactly unchanged.
     pub(crate) fn assert_sources_preserved(&self) -> Result<()> {
         ensure!(
-            source_artifacts(&self.data_dir)? == self.sources_before,
+            source_artifacts(&self.data_root, self.address)? == self.sources_before,
             "web lifecycle changed a PGM or active.parts source artifact"
         );
         Ok(())
     }
 
     /// Validate the committed sibling through the production reader admission.
+    #[allow(
+        clippy::verbose_file_reads,
+        reason = "the harness must read the sidecar through the descriptor-relative layout API"
+    )]
     pub(crate) fn admitted_sidecar(&self) -> Result<Vec<u8>> {
-        let pgm = PgmUnit::open(File::open(&self.segment).context("open lifecycle PGM")?)
-            .context("open lifecycle PGM catalog")?;
+        let pgm = PgmUnit::open(
+            self.data_root
+                .open_pgm(self.address)
+                .context("open lifecycle PGM")?,
+        )
+        .context("open lifecycle PGM catalog")?;
         let (identity, lineage) =
             SegmentFacts::provenance(&pgm).context("derive lifecycle PGM provenance")?;
-        let bytes = fs::read(self.sidecar()).context("read lifecycle sibling OVF")?;
+        let mut sidecar = self
+            .data_root
+            .open_ovf(self.address)
+            .context("open lifecycle sibling OVF")?
+            .context("lifecycle sibling OVF is absent")?;
+        let mut bytes = Vec::new();
+        sidecar
+            .read_to_end(&mut bytes)
+            .context("read lifecycle sibling OVF")?;
         FactFile::admit(&bytes, &identity, &lineage, &LIMIT)
             .context("admit lifecycle sibling OVF")?;
         Ok(bytes)
     }
 
     pub(crate) fn publisher_artifacts(&self) -> Result<Vec<PathBuf>> {
-        let mut artifacts = fs::read_dir(&self.data_dir)
-            .context("scan lifecycle data directory")?
-            .filter_map(std::result::Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name();
-                name.to_string_lossy()
-                    .starts_with(".pgkronika-overview.tmp-")
-                    .then_some(entry.path())
+        let snapshot = self
+            .data_root
+            .scan(LayoutLimits::default())
+            .context("scan lifecycle data directory")?;
+        let mut artifacts = snapshot
+            .temporaries
+            .iter()
+            .filter(|temporary| {
+                temporary.address == self.address && temporary.kind == TemporaryKind::Ovf
             })
+            .map(|temporary| self.day_dir().join(temporary.file_name()))
             .collect::<Vec<_>>();
         artifacts.sort();
         Ok(artifacts)
+    }
+
+    pub(crate) fn seed_temporary(&self, bytes: &[u8]) -> Result<PathBuf> {
+        let name = format!("{}.ovf.{}.999999.tmp", self.address.id, std::process::id());
+        let path = self.temporary_path(&name)?;
+        fs::write(&path, bytes).context("seed lifecycle OVF temporary")?;
+        Ok(path)
+    }
+
+    pub(crate) fn temporary_path(&self, name: &str) -> Result<PathBuf> {
+        ensure!(
+            canonical_ovf_temporary_address(name) == Some(self.address),
+            "publication barrier named an invalid layout temporary {name:?}"
+        );
+        Ok(self.day_dir().join(name))
+    }
+
+    fn day_dir(&self) -> PathBuf {
+        self.data_root
+            .diagnostic_path()
+            .join(self.address.day.year_component())
+            .join(self.address.day.month_component())
+            .join(self.address.day.day_component())
     }
 
     pub(crate) fn control_path(&self, name: &str) -> Result<PathBuf> {
@@ -453,21 +543,34 @@ impl WebCase {
     }
 }
 
-fn source_artifacts(directory: &Path) -> Result<BTreeMap<OsString, Vec<u8>>> {
-    let mut sources = BTreeMap::new();
-    for entry in fs::read_dir(directory).context("scan source artifacts")? {
-        let entry = entry.context("read source artifact entry")?;
-        let name = entry.file_name();
-        let is_source = Path::new(&name).extension() == Some(OsStr::new("pgm"))
-            || name == OsStr::new("active.parts");
-        if is_source {
-            sources.insert(
-                name,
-                fs::read(entry.path()).context("read source artifact bytes")?,
-            );
-        }
-    }
-    Ok(sources)
+#[derive(Debug, PartialEq, Eq)]
+struct SourceArtifacts {
+    pgm: Vec<u8>,
+    journal: Option<Vec<u8>>,
+}
+
+#[allow(
+    clippy::verbose_file_reads,
+    reason = "source preservation must read the exact files opened by the descriptor-relative layout API"
+)]
+fn source_artifacts(root: &DataRoot, address: SegmentAddress) -> Result<SourceArtifacts> {
+    let mut pgm = Vec::new();
+    root.open_pgm(address)
+        .context("open lifecycle source PGM")?
+        .read_to_end(&mut pgm)
+        .context("read lifecycle source PGM")?;
+    let journal = root
+        .open_active_journal()
+        .context("open lifecycle source journal")?
+        .map(|mut journal| {
+            let mut bytes = Vec::new();
+            journal
+                .read_to_end(&mut bytes)
+                .context("read lifecycle source journal")?;
+            Ok::<_, anyhow::Error>(bytes)
+        })
+        .transpose()?;
+    Ok(SourceArtifacts { pgm, journal })
 }
 
 /// Stable Linux identity used to prove a restart did not rewrite a sidecar.
@@ -565,8 +668,8 @@ impl PublishBarrierLease {
             .context("publication barrier sent the wrong message")?
             .to_owned();
         ensure!(
-            temporary_name.starts_with(".pgkronika-overview.tmp-"),
-            "publication barrier named an unexpected artifact {temporary_name:?}"
+            canonical_ovf_temporary_address(&temporary_name).is_some(),
+            "publication barrier named an invalid layout temporary {temporary_name:?}"
         );
         Ok(Self {
             stream: reader.into_inner(),
@@ -584,6 +687,26 @@ impl PublishBarrierLease {
             .await
             .context("close publication barrier")
     }
+}
+
+fn canonical_ovf_temporary_address(name: &str) -> Option<SegmentAddress> {
+    let components = name.split('.').collect::<Vec<_>>();
+    let [id, "ovf", raw_pid, raw_sequence, "tmp"] = components.as_slice() else {
+        return None;
+    };
+    let segment_id = id.parse::<i64>().ok()?;
+    if segment_id.to_string() != *id {
+        return None;
+    }
+    let pid = raw_pid.parse::<u64>().ok()?;
+    if pid.to_string() != *raw_pid {
+        return None;
+    }
+    let sequence = raw_sequence.parse::<u64>().ok()?;
+    if sequence.to_string() != *raw_sequence {
+        return None;
+    }
+    SegmentAddress::new(kronika_layout::SegmentId::new(segment_id).ok()?).ok()
 }
 
 /// Header identity classes used by stale-sidecar lifecycle cases.
@@ -725,5 +848,23 @@ mod tests {
             captured_stderr(&Mutex::new(bytes))
                 .ends_with("[stderr capture capped at 1048576 bytes]")
         );
+    }
+
+    #[test]
+    fn publication_barrier_accepts_only_closed_layout_temporary_names() {
+        let address = canonical_ovf_temporary_address("1722470400000000.ovf.42.7.tmp")
+            .expect("canonical OVF temporary");
+        assert_eq!(address.id.get(), 1_722_470_400_000_000);
+        for invalid in [
+            ".pgkronika-overview.tmp-42",
+            "1722470400000000.ovf.042.7.tmp",
+            "1722470400000000.ovf.probe.42.7.tmp",
+            "1722470400000000.pgm.42.7.tmp",
+        ] {
+            assert!(
+                canonical_ovf_temporary_address(invalid).is_none(),
+                "{invalid:?} is not an OVF publisher temporary"
+            );
+        }
     }
 }

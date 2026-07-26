@@ -12,6 +12,7 @@ repository.workspace = true
 kronika-registry = { path = "../kronika-registry" }
 kronika-reader = { path = "../kronika-reader", features = ["qualification"] }
 kronika-format = { path = "../kronika-format" }
+kronika-layout = { path = "../kronika-layout" }
 kronika-writer = { path = "../kronika-writer" }
 pg_kronika-web = { path = "../../bins/pg_kronika-web", features = ["qualification"] }
 axum = "0.8"

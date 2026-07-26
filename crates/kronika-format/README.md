@@ -21,24 +21,34 @@ kronika-registry encodes typed rows as section bodies
 kronika-writer builds a self-contained PGM part
         |
         v
-active.parts --seal--> <first_timestamp>.pgm
-                              |
-                              v
-                kronika-store / kronika-reader
-                              |
-                              v
-                       pg_kronika-web
+$KRONIKA_OUT_DIR/active.parts
+        |
+        | seal()
+        v
+$KRONIKA_OUT_DIR/YYYY/MM/DD/N.pgm
+        |
+        v
+kronika-store / kronika-reader
+        |
+        v
+pg_kronika-web
 ```
 
-The `active.parts` journal and finished `.pgm` files are direct children of
-`KRONIKA_OUT_DIR`. For example:
+The journal is always `$KRONIKA_OUT_DIR/active.parts`. Finished PGM files use
+the strict UTC calendar tree:
 
 ```text
 $KRONIKA_OUT_DIR/
 |-- active.parts
-|-- <first_timestamp>.pgm
-`-- <next_first_timestamp>.pgm
+`-- YYYY/
+    `-- MM/
+        `-- DD/
+            `-- N.pgm
 ```
+
+`N` is the decimal [`SegmentId`](../kronika-layout/src/time.rs): Unix
+microseconds of the first collection window successfully appended to the
+segment. `YYYY/MM/DD` is the UTC day derived from that id.
 
 There are no separate files for string values. While a segment is open,
 dictionary bodies live in the PGM parts inside `active.parts`. On completion,
@@ -54,8 +64,9 @@ does not own:
   [`kronika-writer`](../kronika-writer/README.md);
 - collection intervals, rotation, and source limits: those belong to
   [`pg_kronika-collector`](../../bins/pg_kronika-collector/README.md);
-- filesystem discovery, typed queries, HTTP, retention, encryption, or remote
-  storage.
+- data-directory paths, strict discovery, and ownership:
+  [`kronika-layout`](../kronika-layout/);
+- typed queries, HTTP, retention, encryption, or remote storage.
 
 ## From a collection window to a segment
 
@@ -122,7 +133,7 @@ format offset; readers locate every body through the catalog.
 Completing the segment removes the individual part framing:
 
 ```text
-active.parts                         <first_timestamp>.pgm
+active.parts                         YYYY/MM/DD/N.pgm
 
 PGMP [part for window #1]             "PGM1"
 PGMP [part for window #2] -- seal() -> bodies from window #1, including its dictionaries
@@ -311,7 +322,7 @@ physical file as follows. Parquet contents are shown after decoding; unrelated
 bodies are omitted:
 
 ```text
-$KRONIKA_OUT_DIR/<first_timestamp>.pgm  (one file)
+$KRONIKA_OUT_DIR/YYYY/MM/DD/N.pgm  (one file)
 
 [ "PGM1" ]
 [ pg_stat_activity Parquet body, type_id=1_001_003
@@ -433,50 +444,69 @@ they do not remove physical copies from the PGM.
 
 ## `active.parts` and crash recovery
 
-`active.parts` is the durable journal of an unfinished segment. Each frame has
-a 16-byte header followed by one complete PGM part:
+`active.parts` is the root-level durable journal of an unfinished segment.
+Journal version 1 starts with a checksummed 36-byte header:
+
+```text
+"PGKJNL1\0" | version: u32 | state: u8 | id_present: u8 | reserved: u16
+             | segment_id: i64 | body_len: u64 | header_crc32c: u32
+```
+
+The header records an empty state or the exact `SegmentId` of the active
+segment and the number of frame bytes that follow. Every frame then has a
+16-byte header followed by one complete PGM part:
 
 ```text
 "PGMP" | part_len: u64 | header_crc32c: u32 | PGM part
 ```
 
-The header checksum covers its first 12 bytes. The PGM part has its own
-`PGM1`, bodies, catalog, and tail, so a frame can be validated before it is
-accepted.
+The journal-header checksum covers its first 32 bytes; each frame-header
+checksum covers its first 12 bytes. The PGM part has its own `PGM1`, bodies,
+catalog, and tail, so a frame can be validated before it is accepted. A
+canonical empty journal is the 36-byte empty header, never a zero-length file.
 
-For a clean journal with `P` frames, `N` total section entries, and `B` total
-body bytes:
+For a clean active journal with `P` frames, `N` total section entries, and `B`
+total body bytes:
 
 ```text
-active_parts_bytes = B + 32*N + 68*P
+active_parts_bytes = 36 + B + 32*N + 68*P
 sealed_pgm_bytes   = B + 32*N + 52
-seal_saves         = 68*P - 52
+completion_saves   = 68*P - 16
 ```
 
-This saving is only framing. With 70 windows it is 4,708 bytes; the Parquet
+This saving is only framing. With 70 windows it is 4,744 bytes; the Parquet
 bodies and all `N` catalog entries still remain.
 
-The default maximum accepted part is 64 MiB. The streaming recovery scanner
-keeps one PGM part body of at most `max_part_len` plus a resynchronization
-window in memory. The default resynchronization window is 1 MiB and is a
-separate scanner argument, not a `JournalLimits` field.
+Version 1 has three absolute admission limits: one PGM part is at most 64 MiB,
+one journal contains at most 1,000,000 frames, and the physical journal file is
+at most 1 GiB including the temporary reset marker. Runtime configuration may
+only lower these limits. The production streaming scanner keeps one bounded
+PGM part body plus the returned frame references in memory. It stops at the
+first damaged frame and does not search damaged bytes for another frame magic.
+The resynchronizing in-memory scanner is a diagnostic API, not a recovery
+policy.
 
-Recovery classifies malformed regions instead of treating all damage alike:
+`Journal::open` is fail-closed for version 1. It validates the complete header,
+the recorded body length, and every frame. A zero-length or headerless file,
+another version, a torn header, a length mismatch, or any torn or damaged
+frame returns an error and leaves the file unchanged. The low-level scanner's
+damage classifications are diagnostic data, not a repair policy for this
+journal. Version 1 is the first and only supported journal format. PgKronika
+has not had a public release, and there is no alternate journal format or
+migration path.
 
-| Classification | Meaning | `Journal::open` | Collector startup |
-| --- | --- | --- | --- |
-| `TornTail` | The final frame is incomplete, or its valid header and declared length end exactly at EOF but the inner PGM fails validation. | Truncates to the last valid boundary. At most the final part is lost. | Processes valid preceding parts under the recovery rule below. |
-| `Middle { resumed_at }` | A malformed region is followed by another valid frame. | Preserves the bytes for diagnostics and reports valid parts on both sides. | If any valid parts were reported, processes them and then resets the entire journal. |
-| `QuarantinedTail` | A malformed terminal region has no later valid frame. | Preserves the bytes and reports valid earlier parts. | If any valid parts were reported, processes them and then resets the entire journal. |
+On collector startup, a valid active journal is completed under its stored
+`SegmentId` and published at `YYYY/MM/DD/N.pgm`. Only successful publication
+allows reset. Reset first persists a commit marker. It then writes
+`JournalHeader::EMPTY` and calls `sync_data` while the marker and frame body
+remain, truncates the file to 36 bytes, and calls `sync_data` again. If the
+process exits after the marker is durable, the next `Journal::open` validates
+it and completes the reset.
 
-On collector startup, recovered parts containing timestamped data are sealed
-immediately. Parts without any timestamped data are discarded by resetting the
-journal without creating a PGM. A successful seal resets the whole journal,
-including damaged bytes that `Journal::open` preserved. If the seal fails, the
-collector logs the failure, also resets the journal, and starts collecting
-fresh data. If recovery finds no valid part, no recovery PGM is created:
-`TornTail` has already been truncated, while other damaged bytes remain and
-new frames can be appended after them.
+The reset marker is 32 bytes and records the previous journal length,
+`SegmentId`, and header checksum. The configured journal cap is a literal
+physical-file limit: the writer reserves those 32 bytes before every append,
+including the first frame.
 
 ## Where the bytes go
 
@@ -544,7 +574,7 @@ after completing the segment (`seal`):
 
 The current segment-completion operation (`seal`) keeps both dictionary
 records and both self-contained `pg_stat_activity` bodies. The researched
-future in-place seal contract instead looks like:
+in-place implementation instead looks like:
 
 ```text
 PGM header (single current internal identity)
@@ -591,10 +621,9 @@ not part of that distribution. The full-segment sample contains only three
 files; it does not support an hourly retention projection.
 
 The recommendation replaces the existing PGM internals in place while keeping
-the PGM name and `N.pgm` path. A future implementation has one writer, one
-reader, and one current contract. It has no legacy reader, migration, fallback,
-feature flag, or offline rewrite. Production behavior is unchanged by this
-research documentation.
+the canonical `YYYY/MM/DD/N.pgm` address. Because PgKronika has not shipped a
+release, the proposed format would become the sole writer and reader contract.
+Production behavior is unchanged by this research documentation.
 
 ## Parameters that affect file size
 
@@ -609,7 +638,7 @@ amount and grouping of collected data through `pg_kronika-collector`:
 | `KRONIKA_PG_PLAN_TEXT_BUDGET` | 8 MiB | Total plan-text budget per read; zero disables plan text. |
 | `KRONIKA_SEGMENT_MAX_BYTES` | 64 MiB | Seals after this many raw `active.parts` bytes; zero seals every window. It changes file granularity, not Parquet compression. |
 | `KRONIKA_SEGMENT_MAX_AGE_S` | 900 s | Maximum age of an open segment. It mainly changes time span and file count. |
-| `KRONIKA_JOURNAL_MAX_BYTES` | 1 GiB | Before every append except the first frame, exceeding this threshold causes an early seal. It is not a target PGM size. |
+| `KRONIKA_JOURNAL_MAX_BYTES` | 1 GiB | Hard physical `active.parts` limit, including the reserved 32-byte reset marker. Every frame must fit; exhaustion causes an early seal. It is not a target PGM size. |
 
 Changing source limits trades observability for disk use. Changing only segment
 age or rotation size does not remove repeated per-window footers or dictionary

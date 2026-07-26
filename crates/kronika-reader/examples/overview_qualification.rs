@@ -7,6 +7,7 @@
 //! page cache honestly.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -17,6 +18,9 @@ use arrow_schema as _;
 use criterion as _;
 use kronika_analytics::overview::{CountLimits, CoverageSpan, OracleLimits, RawOracle};
 use kronika_format::{PartMeta, SectionInput, build_part};
+use kronika_layout::{
+    DataRoot, FileKind as LayoutFileKind, LayoutLimits, SegmentAddress, SegmentId,
+};
 use kronika_reader::{
     BlockKind, FactFile, FactOrigin, FactStore, LIMIT, PgmUnit, SegmentContext, SegmentFacts,
 };
@@ -39,6 +43,7 @@ const SAMPLES: usize = 720;
 const CADENCE_US: i64 = 5_000_000;
 const ITERATIONS: usize = 20;
 const CONCURRENT_WORKERS: usize = 16;
+const FIRST_WINDOW_US: i64 = 1_000_000;
 
 const ORACLE_LIMITS: OracleLimits = OracleLimits {
     max_observations: 65_536,
@@ -190,16 +195,15 @@ fn main() {
     let fact_bytes: Arc<[u8]> = fact_bytes.into();
     let catalog = Arc::new(catalog);
     let context = Arc::new(context);
-    let full_range = CoverageSpan::new(1_000_000, dense_end()).expect("dense full range");
+    let full_range = CoverageSpan::new(FIRST_WINDOW_US, dense_end()).expect("dense full range");
     let restart_root = runtime_root.join("restart-warm");
     fs::create_dir_all(&restart_root).expect("create restart-warm data directory");
-    fs::write(restart_root.join(context.pgm_file_name()), pgm.as_ref())
-        .expect("write restart-warm PGM");
+    publish_fixture_pgm(&restart_root, context.address(), pgm.as_ref());
     FactStore::new(&restart_root)
         .publish(raw.as_ref(), context.as_ref(), &LIMIT)
         .expect("seed restart-warm fact file");
     assert!(
-        restart_root.join(context.sidecar_file_name()).is_file(),
+        layout_file_path(&restart_root, context.address(), LayoutFileKind::Ovf).is_file(),
         "restart-warm publication did not create the sibling sidecar"
     );
 
@@ -214,8 +218,7 @@ fn main() {
             "derived-cold data directory must start absent"
         );
         fs::create_dir(&data_dir).expect("create derived-cold data directory");
-        fs::write(data_dir.join(context.pgm_file_name()), pgm.as_ref())
-            .expect("write derived-cold PGM");
+        publish_fixture_pgm(&data_dir, context.address(), pgm.as_ref());
         let unit = PgmUnit::open(pgm.as_ref()).expect("open cold PGM");
         let loaded = FactStore::new(&data_dir)
             .load_or_build(&unit, context.as_ref(), &LIMIT)
@@ -241,7 +244,7 @@ fn main() {
             "derived-cold extraction diverged from the admitted fixture"
         );
         assert!(
-            data_dir.join(context.sidecar_file_name()).is_file(),
+            layout_file_path(&data_dir, context.address(), LayoutFileKind::Ovf).is_file(),
             "derived-cold publication did not create the sibling sidecar"
         );
         let pgm = loaded.pgm_body_read_stats();
@@ -298,8 +301,11 @@ fn main() {
     modes.push(measure("range-cold/facts-warm", ITERATIONS, || {
         let offset = i64::try_from(range_counter.get() % 60).expect("offset fits") * CADENCE_US;
         range_counter.set(range_counter.get() + 1);
-        let range = CoverageSpan::new(1_000_000 + offset, 1_000_000 + offset + 300_000_000)
-            .expect("range-warm interval");
+        let range = CoverageSpan::new(
+            FIRST_WINDOW_US + offset,
+            FIRST_WINDOW_US + offset + 300_000_000,
+        )
+        .expect("range-warm interval");
         std::hint::black_box(raw.query(range, ORACLE_LIMITS).expect("range-warm query"));
         Work {
             successful_responses: 1,
@@ -357,7 +363,8 @@ fn main() {
         for worker in 0..CONCURRENT_WORKERS {
             let facts = Arc::clone(&raw);
             workers.push(std::thread::spawn(move || {
-                let start = 1_000_000 + i64::try_from(worker).expect("worker fits") * 30_000_000;
+                let start =
+                    FIRST_WINDOW_US + i64::try_from(worker).expect("worker fits") * 30_000_000;
                 let range = CoverageSpan::new(start, start + 30_000_000).expect("disjoint range");
                 facts.query(range, ORACLE_LIMITS).expect("disjoint query")
             }));
@@ -458,11 +465,40 @@ fn runtime_root(output: Option<&Path>) -> PathBuf {
 }
 
 fn dense_end() -> i64 {
-    1_000_000 + i64::try_from(SAMPLES).expect("sample count fits") * CADENCE_US
+    FIRST_WINDOW_US + i64::try_from(SAMPLES).expect("sample count fits") * CADENCE_US
 }
 
 fn context() -> SegmentContext {
-    SegmentContext::new("dense-hour.pgm").expect("qualification context")
+    SegmentContext::new(qualification_address())
+}
+
+fn qualification_address() -> SegmentAddress {
+    let segment_id = SegmentId::new(FIRST_WINDOW_US).expect("qualification segment id");
+    SegmentAddress::new(segment_id).expect("qualification segment address")
+}
+
+fn publish_fixture_pgm(root: &Path, address: SegmentAddress, bytes: &[u8]) -> PathBuf {
+    let data_root = DataRoot::open(root).expect("open qualification data root");
+    let owner = data_root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire qualification writer");
+    let mut temporary = owner
+        .create_pgm_temp(address)
+        .expect("create qualification PGM");
+    temporary
+        .file_mut()
+        .write_all(bytes)
+        .expect("write qualification PGM");
+    temporary.publish().expect("publish qualification PGM");
+    owner
+        .root()
+        .diagnostic_file_path(address, LayoutFileKind::Pgm)
+}
+
+fn layout_file_path(root: &Path, address: SegmentAddress, kind: LayoutFileKind) -> PathBuf {
+    DataRoot::open(root)
+        .expect("open qualification data root")
+        .diagnostic_file_path(address, kind)
 }
 
 fn storage_profile(context: &SegmentContext) -> StorageProfile {
@@ -484,7 +520,7 @@ fn dense_hour_pgm() -> Vec<u8> {
             let index = i64::try_from(index).expect("sample index fits");
             let index_f64 = f64::from(i32::try_from(index).expect("dense fixture index fits i32"));
             PgStatDatabaseV1 {
-                ts: Ts(1_000_000 + index * CADENCE_US),
+                ts: Ts(FIRST_WINDOW_US + index * CADENCE_US),
                 datid: 16_384,
                 datname: None,
                 numbackends: Some(10 + i32::try_from(index % 5).expect("modulo fits")),
@@ -526,7 +562,7 @@ fn dense_hour_pgm() -> Vec<u8> {
         })
         .collect();
     let reset = [ResetMetadata {
-        ts: Ts(1_000_000),
+        ts: Ts(FIRST_WINDOW_US),
         postmaster_start_time: Ts(1),
         pg_stat_database_reset_max_at: None,
         pg_stat_statements_reset_at: None,
@@ -565,7 +601,7 @@ fn dense_hour_pgm() -> Vec<u8> {
             },
         ],
         PartMeta {
-            min_ts: 1_000_000,
+            min_ts: FIRST_WINDOW_US,
             max_ts: dense_end() - CADENCE_US,
             source_id: 7,
         },

@@ -2,11 +2,12 @@
 
 [Русская версия](README.ru.md)
 
-`pg_kronika-web` serves a local PGM directory through an embedded UI, JSON API,
-and Prometheus endpoint. It opens sealed segments and valid `active.parts`
-frames through `LocalDirSnapshot`, maintains a source-scoped timeline index,
-refreshes the published store view every second, and never connects to
-PostgreSQL. One retained writer folds journal deltas, promotes exactly matched
+`pg_kronika-web` serves a local PgKronika data root through an embedded UI,
+JSON API, and Prometheus endpoint. It opens sealed segments from the
+`YYYY/MM/DD` tree and valid root-level `active.parts` frames through
+`LocalDirSnapshot`, maintains a source-scoped timeline index, refreshes the
+published store view every second, and never connects to PostgreSQL. One
+retained writer folds journal deltas, promotes exactly matched
 sealed segments, and atomically publishes immutable descriptor and live
 views. Sealed fact bodies are loaded only for admitted timeline requests.
 
@@ -14,7 +15,7 @@ views. Sealed fact bodies are loaded only for admitted timeline requests.
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `KRONIKA_WEB_DIR` | required | PgKronika-owned directory containing `active.parts`, sealed `.pgm` files, and same-stem `.ovf` sidecars. |
+| `KRONIKA_WEB_DIR` | required | PgKronika-owned data root containing `active.parts`, owner locks, and same-day `YYYY/MM/DD/N.pgm` plus optional `N.ovf`. |
 | `KRONIKA_WEB_ADDR` | required | Listen address in `host:port` form. |
 | `KRONIKA_WEB_BASIC_AUTH` | unset | `user:password`; when absent, UI and `/v1/*` are open. |
 | `KRONIKA_WEB_STALE_AFTER_S` | `10` | `/readyz` returns `503` when the last successful refresh is older than this. |
@@ -94,20 +95,32 @@ startup before the listener binds.
 
 ## Sibling fact sidecars
 
-`KRONIKA_WEB_DIR` is one exclusively PgKronika-owned data directory and requires
-no additional storage address or identifier. A sealed segment and its derived
-facts have the same stem:
+`KRONIKA_WEB_DIR` is one exclusively PgKronika-owned data root and requires no
+additional storage address or identifier. A sealed segment and its derived
+facts have the same stem and UTC day:
 
 ```text
 /data/active.parts
-/data/N.pgm
-/data/N.ovf
+/data/.pgkronika-overview.owner.lock
+/data/YYYY/MM/DD/N.pgm
+/data/YYYY/MM/DD/N.ovf
 ```
 
-The first `FactStore` to acquire `.pgkronika-overview.owner.lock` holds the
-only mutation right for the directory during its lifetime. Other processes
-using the same directory may read admitted sidecars; publication and GC report
-contention, and newly built facts remain in the bounded process-local fallback.
+`N` is the `SegmentId`, the Unix timestamp in microseconds of the first
+collection window successfully appended to the source segment. The UTC day is
+derived from that id, not from the query range or file timestamps. A segment
+that crosses midnight remains in its starting-day directory.
+
+The first `FactStore` to acquire the root-level
+`.pgkronika-overview.owner.lock` holds the only OVF mutation right for the data
+root during its lifetime. Other processes using the same root may read
+admitted sidecars; publication and GC report contention, and newly built facts
+remain in the bounded process-local fallback.
+
+Every inventory is a strict bounded traversal. Root-level PGM/OVF files,
+symbolic links, unknown entries, malformed dates, and a segment stored under
+the wrong UTC day fail the inventory instead of producing a partial view. This
+is the first supported layout in the unreleased project.
 
 The web writer requests GC after every 60 successful timeline publications.
 The generation grace advances only on distinct, complete, authoritative GC
@@ -115,7 +128,7 @@ scans, not on ordinary refreshes. With the defaults, deletion also requires
 120 seconds since the first scan that found a final non-live; the wall grace
 can therefore require a later scan. Any unavailable sealed source, scan error,
 or entry-cap hit authorizes no deletion and does not advance grace. GC scans
-the owned directory directly with a hard entry bound. It admits a same-stem
+the owned tree directly with a hard entry bound. It admits a same-stem
 `.ovf` only after validating the PGKOVF header against its PGM, never follows
 symlinks, and never removes PGM, `active.parts`, or the owner lock.
 

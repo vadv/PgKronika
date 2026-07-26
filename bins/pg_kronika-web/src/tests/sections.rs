@@ -74,7 +74,7 @@ fn write_archiver_segment(
             source_id: source,
         },
     );
-    std::fs::write(dir.join(file), &bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir, file, &bytes);
 }
 
 #[tokio::test]
@@ -305,7 +305,7 @@ async fn sections_batch_returns_a_page_per_name() {
             source_id: 7,
         },
     );
-    std::fs::write(dir.path().join("1000.pgm"), &bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir.path(), "1000.pgm", &bytes);
 
     let (status, body) = serve(
         dir.path(),

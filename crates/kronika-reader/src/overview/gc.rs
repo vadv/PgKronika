@@ -1,21 +1,22 @@
 //! Fail-closed retention and accounting for sibling overview sidecars.
 //!
 //! The collector scans the PgKronika-owned data directory without following
-//! symlinks. It recognizes `.ovf` sidecars and publisher artifacts directly in
-//! that directory, completes a bounded inventory, and only then advances grace
-//! or unlinks anything.
+//! symlinks. It recognizes `.ovf` sidecars and publisher artifacts only in
+//! their verified `YYYY/MM/DD` directories, completes a bounded inventory, and
+//! only then advances grace or unlinks anything.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{self, Read as _};
+use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::time::{Duration, SystemTime};
 
 use kronika_analytics::overview::SegmentLineageId;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use kronika_layout::{
+    LayoutError, LayoutLimits, OverviewOwner, SegmentAddress, TemporaryKind, TemporaryObject,
+    UtcDay,
+};
 
-use super::cache_owner::{OWNER_LOCK_NAME, open_file_at};
 use super::container::{FactFileReader, HeaderIdentity};
 use super::descriptors::SourceDescriptor;
 use super::factkey::{FactBuildKey, FactKey};
@@ -231,7 +232,7 @@ impl GcCategoryUsage {
     }
 }
 
-/// Complete derived-file accounting from one successful flat inventory.
+/// Complete derived-file accounting from one successful bounded tree scan.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcUsage {
     /// Header-admitted sibling `.ovf` files.
@@ -290,7 +291,7 @@ pub struct GcOutcome {
     pub unlinked_logical_bytes: u64,
     /// Allocated bytes measured from those same unlinked inodes.
     pub unlinked_allocated_bytes: u64,
-    /// Whether the entire flat inventory completed.
+    /// Whether the complete owned-tree scan finished.
     pub scan_complete: bool,
     /// Whether an authoritative mark permitted destructive work.
     pub sweep_authorized: bool,
@@ -307,12 +308,43 @@ pub(super) struct GcState {
     pending: HashMap<FactBuildKey, PendingEntry>,
     recently_published: HashMap<FactBuildKey, SystemTime>,
     last_authoritative_mark: Option<GcMark>,
+    quota: Option<QuotaState>,
 }
 
 impl GcState {
-    pub(super) fn record_publication(&mut self, key: FactBuildKey, now: SystemTime) {
+    pub(super) fn record_cache_hit(&mut self, key: FactBuildKey, now: SystemTime) {
         self.pending.remove(&key);
         self.recently_published.insert(key, now);
+    }
+
+    pub(super) fn record_publication(
+        &mut self,
+        address: SegmentAddress,
+        key: FactBuildKey,
+        usage: FileUsage,
+        now: SystemTime,
+    ) {
+        self.record_cache_hit(key, now);
+        let Some(quota) = self.quota.as_mut() else {
+            return;
+        };
+        if let Some(previous) = quota.sidecars.remove(&address) {
+            quota
+                .usage
+                .sidecars
+                .remove(previous.logical_bytes, previous.allocated_bytes);
+        }
+        if let Some(previous) = quota.invalid_overviews.remove(&address) {
+            quota
+                .usage
+                .temporary
+                .remove(previous.logical_bytes, previous.allocated_bytes);
+        }
+        quota
+            .usage
+            .sidecars
+            .add(usage.logical_bytes, usage.allocated_bytes);
+        quota.sidecars.insert(address, usage);
     }
 
     pub(super) fn last_authoritative_mark(&self) -> Option<GcMark> {
@@ -331,28 +363,69 @@ struct PendingEntry {
 struct Inventory {
     scanned: u64,
     usage: GcUsage,
+    days: Vec<UtcDay>,
     sidecars: Vec<SidecarCandidate>,
     artifacts: Vec<ArtifactCandidate>,
 }
 
+impl Inventory {
+    fn quota_state(&self) -> QuotaState {
+        let sidecars = self
+            .sidecars
+            .iter()
+            .map(|candidate| (candidate.address, candidate.usage))
+            .collect();
+        let invalid_overviews = self
+            .artifacts
+            .iter()
+            .filter_map(|candidate| match candidate.location {
+                ArtifactLocation::Overview(address) => Some((address, candidate.usage)),
+                ArtifactLocation::Temporary(_) => None,
+            })
+            .collect();
+        QuotaState {
+            usage: self.usage,
+            sidecars,
+            invalid_overviews,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SidecarCandidate {
-    name: CString,
+    address: SegmentAddress,
     key: FactBuildKey,
     device: u64,
     inode: u64,
-    logical_bytes: u64,
-    allocated_bytes: u64,
+    usage: FileUsage,
 }
 
 #[derive(Debug)]
 struct ArtifactCandidate {
-    name: CString,
+    location: ArtifactLocation,
     device: u64,
     inode: u64,
-    logical_bytes: u64,
-    allocated_bytes: u64,
+    usage: FileUsage,
     modified: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+enum ArtifactLocation {
+    Overview(SegmentAddress),
+    Temporary(TemporaryObject),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct FileUsage {
+    pub(super) logical_bytes: u64,
+    pub(super) allocated_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct QuotaState {
+    usage: GcUsage,
+    sidecars: HashMap<SegmentAddress, FileUsage>,
+    invalid_overviews: HashMap<SegmentAddress, FileUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,7 +442,7 @@ pub(super) enum GcAdmissionError {
 
 /// Performs one bounded mark/sweep under the caller's owner and publication gate.
 pub(super) fn collect(
-    directory: &File,
+    owner: &OverviewOwner,
     mark: &GcMark,
     state: &mut GcState,
     config: GcConfig,
@@ -388,7 +461,7 @@ pub(super) fn collect(
         };
     }
 
-    let inventory = match scan_directory(directory, config.max_entries) {
+    let inventory = match scan_directory(owner, config.max_entries) {
         Ok(inventory) => inventory,
         Err((ScanError::Capped, scanned)) => {
             return GcOutcome {
@@ -406,6 +479,8 @@ pub(super) fn collect(
         }
     };
 
+    let mut quota = inventory.quota_state();
+    let prune_days = inventory_days(&inventory);
     state.last_authoritative_mark = Some(mark.clone());
     let mut outcome = GcOutcome {
         scanned: inventory.scanned,
@@ -415,7 +490,7 @@ pub(super) fn collect(
         ..GcOutcome::default()
     };
 
-    delete_stale_artifacts(directory, &inventory, config, now, &mut outcome);
+    delete_stale_artifacts(owner, &inventory, config, now, &mut outcome, &mut quota);
 
     let seen: HashSet<_> = inventory
         .sidecars
@@ -453,7 +528,7 @@ pub(super) fn collect(
             continue;
         }
 
-        match delete_sidecar(directory, candidate) {
+        match delete_sidecar(owner, candidate) {
             Ok(Some((logical_bytes, allocated_bytes))) => {
                 outcome.deleted = outcome.deleted.saturating_add(1);
                 outcome.deleted_sidecars = outcome.deleted_sidecars.saturating_add(1);
@@ -466,6 +541,8 @@ pub(super) fn collect(
                     .usage
                     .sidecars
                     .remove(logical_bytes, allocated_bytes);
+                quota.usage.sidecars.remove(logical_bytes, allocated_bytes);
+                quota.sidecars.remove(&candidate.address);
                 state.pending.remove(&candidate.key);
             }
             Ok(None) | Err(()) => outcome.pending = outcome.pending.saturating_add(1),
@@ -473,21 +550,59 @@ pub(super) fn collect(
     }
 
     outcome.quota_exceeded = exceeds_quota(outcome.usage, config, 0, 0);
+    quota.usage = outcome.usage;
+    state.quota = Some(quota);
+    for day in prune_days {
+        owner.prune_empty_day(day).ok();
+    }
     outcome
 }
 
-/// Completes exact derived-file accounting and checks publication peak usage.
+fn inventory_days(inventory: &Inventory) -> HashSet<UtcDay> {
+    inventory
+        .days
+        .iter()
+        .copied()
+        .chain(
+            inventory
+                .sidecars
+                .iter()
+                .map(|candidate| candidate.address.day),
+        )
+        .chain(
+            inventory
+                .artifacts
+                .iter()
+                .map(|candidate| match &candidate.location {
+                    ArtifactLocation::Overview(address) => address.day,
+                    ArtifactLocation::Temporary(temporary) => temporary.address.day,
+                }),
+        )
+        .collect()
+}
+
+/// Initializes quota accounting once per owner lifetime and checks the
+/// temporary-file publication peak.
 pub(super) fn admit_publication(
-    directory: &File,
+    owner: &OverviewOwner,
+    state: &mut GcState,
     config: GcConfig,
     incoming_logical_bytes: u64,
 ) -> Result<(), GcAdmissionError> {
-    let inventory =
-        scan_directory(directory, config.max_entries).map_err(|(error, _scanned)| match error {
-            ScanError::Capped => GcAdmissionError::Capped,
-            ScanError::Io => GcAdmissionError::Incomplete,
-        })?;
-    if exceeds_quota(inventory.usage, config, incoming_logical_bytes, 1) {
+    if state.quota.is_none() {
+        let inventory =
+            scan_directory(owner, config.max_entries).map_err(|(error, _scanned)| match error {
+                ScanError::Capped => GcAdmissionError::Capped,
+                ScanError::Io => GcAdmissionError::Incomplete,
+            })?;
+        state.quota = Some(inventory.quota_state());
+    }
+    let usage = state
+        .quota
+        .as_ref()
+        .expect("quota inventory was initialized")
+        .usage;
+    if exceeds_quota(usage, config, incoming_logical_bytes, 1) {
         Err(GcAdmissionError::Capped)
     } else {
         Ok(())
@@ -501,9 +616,15 @@ fn exceeds_quota(
     additional_files: u64,
 ) -> bool {
     let logical = usage
-        .total_logical_bytes()
+        .sidecars
+        .logical_bytes
+        .saturating_add(usage.temporary.logical_bytes)
         .checked_add(additional_logical_bytes);
-    let files = usage.total_files().checked_add(additional_files);
+    let files = usage
+        .sidecars
+        .files
+        .saturating_add(usage.temporary.files)
+        .checked_add(additional_files);
     config
         .max_logical_bytes
         .is_some_and(|limit| logical.is_none_or(|value| value > limit))
@@ -512,69 +633,95 @@ fn exceeds_quota(
             .is_some_and(|limit| files.is_none_or(|value| value > limit))
 }
 
-fn scan_directory(directory: &File, max_entries: usize) -> Result<Inventory, (ScanError, u64)> {
+fn scan_directory(
+    owner: &OverviewOwner,
+    max_entries: usize,
+) -> Result<Inventory, (ScanError, u64)> {
+    let limits = LayoutLimits {
+        max_visited_entries: max_entries,
+        max_entries_per_day: max_entries,
+        max_segments: max_entries,
+        ..LayoutLimits::default()
+    };
+    let snapshot = owner
+        .root()
+        .scan(limits)
+        .map_err(|error| (scan_error(&error), 0))?;
     let mut inventory = Inventory {
-        scanned: 0,
+        scanned: u64::try_from(snapshot.visited_entries).unwrap_or(u64::MAX),
         usage: GcUsage::default(),
+        days: snapshot.days,
         sidecars: Vec::new(),
         artifacts: Vec::new(),
     };
-    let entries = directory_entries(directory).map_err(|error| (error, 0))?;
-    for entry in entries {
-        let entry = entry.map_err(|_error| (ScanError::Io, inventory.scanned))?;
-        let name = entry.file_name();
-        if is_dot_entry(name) {
-            continue;
-        }
-        inventory.scanned = inventory.scanned.saturating_add(1);
-        if inventory.scanned > u64::try_from(max_entries).unwrap_or(u64::MAX) {
-            return Err((ScanError::Capped, inventory.scanned));
-        }
-        let stat = stat_entry(directory, name).map_err(|error| (error, inventory.scanned))?;
-        if name.to_bytes() == OWNER_LOCK_NAME.as_bytes() {
-            account(&mut inventory.usage.locks, &stat);
-            continue;
-        }
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            continue;
-        }
 
-        if is_sidecar_name(name) {
-            match validate_sidecar(directory, name) {
-                Ok(candidate) => {
-                    inventory
-                        .usage
-                        .sidecars
-                        .add(candidate.logical_bytes, candidate.allocated_bytes);
-                    inventory.sidecars.push(candidate);
-                }
-                Err(()) => {
-                    if let Ok(candidate) = validate_artifact(directory, name) {
-                        inventory
-                            .usage
-                            .temporary
-                            .add(candidate.logical_bytes, candidate.allocated_bytes);
-                        inventory.artifacts.push(candidate);
-                    }
-                }
-            }
+    for segment in snapshot.segments {
+        if segment.ovf_bytes.is_none() {
             continue;
         }
-        if is_publisher_artifact(name)
-            && let Ok(candidate) = validate_artifact(directory, name)
-        {
-            inventory
-                .usage
-                .temporary
-                .add(candidate.logical_bytes, candidate.allocated_bytes);
+        let file = owner
+            .root()
+            .open_ovf(segment.address)
+            .map_err(|_error| (ScanError::Io, inventory.scanned))?
+            .ok_or((ScanError::Io, inventory.scanned))?;
+        if let Ok(candidate) = validate_sidecar(file, segment.address) {
+            inventory.usage.sidecars.add(
+                candidate.usage.logical_bytes,
+                candidate.usage.allocated_bytes,
+            );
+            inventory.sidecars.push(candidate);
+        } else {
+            let file = owner
+                .root()
+                .open_ovf(segment.address)
+                .map_err(|_error| (ScanError::Io, inventory.scanned))?
+                .ok_or((ScanError::Io, inventory.scanned))?;
+            let candidate = validate_artifact(&file, ArtifactLocation::Overview(segment.address))
+                .map_err(|()| (ScanError::Io, inventory.scanned))?;
+            inventory.usage.temporary.add(
+                candidate.usage.logical_bytes,
+                candidate.usage.allocated_bytes,
+            );
             inventory.artifacts.push(candidate);
         }
     }
+
+    for address in snapshot.orphan_overviews {
+        let file = owner
+            .root()
+            .open_ovf(address)
+            .map_err(|_error| (ScanError::Io, inventory.scanned))?
+            .ok_or((ScanError::Io, inventory.scanned))?;
+        let candidate = validate_artifact(&file, ArtifactLocation::Overview(address))
+            .map_err(|()| (ScanError::Io, inventory.scanned))?;
+        inventory.usage.temporary.add(
+            candidate.usage.logical_bytes,
+            candidate.usage.allocated_bytes,
+        );
+        inventory.artifacts.push(candidate);
+    }
+
+    for temporary in snapshot.temporaries {
+        if temporary.kind == TemporaryKind::Pgm {
+            continue;
+        }
+        let file = owner
+            .root()
+            .open_temporary(&temporary)
+            .map_err(|_error| (ScanError::Io, inventory.scanned))?;
+        let candidate = validate_artifact(&file, ArtifactLocation::Temporary(temporary))
+            .map_err(|()| (ScanError::Io, inventory.scanned))?;
+        inventory.usage.temporary.add(
+            candidate.usage.logical_bytes,
+            candidate.usage.allocated_bytes,
+        );
+        inventory.artifacts.push(candidate);
+    }
+
     Ok(inventory)
 }
 
-fn validate_sidecar(directory: &File, name: &CStr) -> Result<SidecarCandidate, ()> {
-    let mut file = open_regular_at(directory, name).map_err(|_error| ())?;
+fn validate_sidecar(mut file: File, address: SegmentAddress) -> Result<SidecarCandidate, ()> {
     let metadata = file.metadata().map_err(|_error| ())?;
     let mut header = [0_u8; HEADER_LEN];
     file.read_exact(&mut header).map_err(|_error| ())?;
@@ -583,34 +730,32 @@ fn validate_sidecar(directory: &File, name: &CStr) -> Result<SidecarCandidate, (
     let admitted = reader.header().identity;
     let key = FactBuildKey::new(admitted.fact_key, admitted.segment_lineage_id);
     Ok(SidecarCandidate {
-        name: name.to_owned(),
+        address,
         key,
         device: metadata.dev(),
         inode: metadata.ino(),
-        logical_bytes: metadata.len(),
-        allocated_bytes: metadata.blocks().saturating_mul(512),
+        usage: file_usage(&metadata),
     })
 }
 
-fn validate_artifact(directory: &File, name: &CStr) -> Result<ArtifactCandidate, ()> {
-    let file = open_regular_at(directory, name).map_err(|_error| ())?;
+fn validate_artifact(file: &File, location: ArtifactLocation) -> Result<ArtifactCandidate, ()> {
     let metadata = file.metadata().map_err(|_error| ())?;
     Ok(ArtifactCandidate {
-        name: name.to_owned(),
+        location,
         device: metadata.dev(),
         inode: metadata.ino(),
-        logical_bytes: metadata.len(),
-        allocated_bytes: metadata.blocks().saturating_mul(512),
+        usage: file_usage(&metadata),
         modified: metadata.modified().map_err(|_error| ())?,
     })
 }
 
 fn delete_stale_artifacts(
-    directory: &File,
+    owner: &OverviewOwner,
     inventory: &Inventory,
     config: GcConfig,
     now: SystemTime,
     outcome: &mut GcOutcome,
+    quota: &mut QuotaState,
 ) {
     for artifact in &inventory.artifacts {
         let old_enough =
@@ -618,20 +763,19 @@ fn delete_stale_artifacts(
         if !old_enough {
             continue;
         }
-        let Ok(file) = open_regular_at(directory, &artifact.name) else {
-            continue;
+        let removed = match &artifact.location {
+            ArtifactLocation::Overview(address) => {
+                owner.remove_ovf_if_identity(*address, artifact.device, artifact.inode)
+            }
+            ArtifactLocation::Temporary(temporary) => {
+                owner.remove_temporary_if_identity(temporary, artifact.device, artifact.inode)
+            }
         };
-        let Ok(metadata) = file.metadata() else {
-            continue;
-        };
-        if metadata.dev() != artifact.device || metadata.ino() != artifact.inode {
+        if !matches!(removed, Ok(true)) {
             continue;
         }
-        if rustix::fs::unlinkat(directory, &artifact.name, AtFlags::empty()).is_err() {
-            continue;
-        }
-        let logical_bytes = metadata.len();
-        let allocated_bytes = metadata.blocks().saturating_mul(512);
+        let logical_bytes = artifact.usage.logical_bytes;
+        let allocated_bytes = artifact.usage.allocated_bytes;
         outcome.deleted = outcome.deleted.saturating_add(1);
         outcome.deleted_artifacts = outcome.deleted_artifacts.saturating_add(1);
         outcome.unlinked_logical_bytes =
@@ -643,78 +787,55 @@ fn delete_stale_artifacts(
             .usage
             .temporary
             .remove(logical_bytes, allocated_bytes);
+        quota.usage.temporary.remove(logical_bytes, allocated_bytes);
+        if let ArtifactLocation::Overview(address) = &artifact.location {
+            quota.invalid_overviews.remove(address);
+        }
     }
 }
 
 fn delete_sidecar(
-    directory: &File,
+    owner: &OverviewOwner,
     candidate: &SidecarCandidate,
 ) -> Result<Option<(u64, u64)>, ()> {
-    let reopened = validate_sidecar(directory, &candidate.name)?;
+    let file = owner
+        .root()
+        .open_ovf(candidate.address)
+        .map_err(|_error| ())?
+        .ok_or(())?;
+    let reopened = validate_sidecar(file, candidate.address)?;
     if reopened.key != candidate.key
         || reopened.device != candidate.device
         || reopened.inode != candidate.inode
     {
         return Ok(None);
     }
-    let file = open_regular_at(directory, &candidate.name).map_err(|_error| ())?;
-    let metadata = file.metadata().map_err(|_error| ())?;
-    if metadata.dev() != candidate.device || metadata.ino() != candidate.inode {
+    if !owner
+        .remove_ovf_if_identity(candidate.address, candidate.device, candidate.inode)
+        .map_err(|_error| ())?
+    {
         return Ok(None);
     }
-    rustix::fs::unlinkat(directory, &candidate.name, AtFlags::empty()).map_err(|_error| ())?;
-    directory.sync_all().map_err(|_error| ())?;
     Ok(Some((
-        metadata.len(),
-        metadata.blocks().saturating_mul(512),
+        candidate.usage.logical_bytes,
+        candidate.usage.allocated_bytes,
     )))
 }
 
-fn directory_entries(
-    directory: &File,
-) -> Result<impl Iterator<Item = rustix::io::Result<rustix::fs::DirEntry>>, ScanError> {
-    rustix::fs::Dir::read_from(directory).map_err(|_error| ScanError::Io)
-}
-
-fn stat_entry(directory: &File, name: &CStr) -> Result<rustix::fs::Stat, ScanError> {
-    rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_error| ScanError::Io)
-}
-
-fn account(category: &mut GcCategoryUsage, stat: &rustix::fs::Stat) {
-    let logical_bytes = u64::try_from(stat.st_size).unwrap_or(0);
-    let blocks = u64::try_from(stat.st_blocks).unwrap_or(0);
-    category.add(logical_bytes, blocks.saturating_mul(512));
-}
-
-fn is_dot_entry(name: &CStr) -> bool {
-    matches!(name.to_bytes(), b"." | b"..")
-}
-
-fn is_sidecar_name(name: &CStr) -> bool {
-    let bytes = name.to_bytes();
-    bytes.len() > 4 && bytes.ends_with(b".ovf")
-}
-
-fn is_publisher_artifact(name: &CStr) -> bool {
-    let bytes = name.to_bytes();
-    bytes.starts_with(b".pgkronika-overview.tmp-")
-        || bytes.starts_with(b".pgkronika-overview.probe-")
-}
-
-fn open_regular_at<P: rustix::path::Arg>(directory: &File, name: P) -> io::Result<File> {
-    let file = open_file_at(
-        directory,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "overview sidecar candidate is not a regular file",
-        ));
+const fn scan_error(error: &LayoutError) -> ScanError {
+    match error {
+        LayoutError::InvalidLimits { .. } | LayoutError::TraversalLimitExceeded { .. } => {
+            ScanError::Capped
+        }
+        _ => ScanError::Io,
     }
-    Ok(file)
+}
+
+fn file_usage(metadata: &std::fs::Metadata) -> FileUsage {
+    FileUsage {
+        logical_bytes: metadata.len(),
+        allocated_bytes: metadata.blocks().saturating_mul(512),
+    }
 }
 
 fn identity_from_header(header: &[u8; HEADER_LEN]) -> Option<HeaderIdentity> {

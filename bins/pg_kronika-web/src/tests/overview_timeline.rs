@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use kronika_analytics::overview::MetricFactor;
-use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
+use kronika_format::{PartMeta, SectionInput, build_part};
+use kronika_layout::SegmentId;
 use kronika_reader::LocalDirSnapshot;
 use kronika_registry::pg_log::{PgLogErrorV1, PgLogLifecycleV1};
 use kronika_registry::pg_stat_database::PgStatDatabaseV1;
@@ -60,7 +61,7 @@ fn write_panic_segment_for(
             source_id: source,
         },
     );
-    std::fs::write(dir.join(file), &bytes).expect("write panic segment");
+    crate::test_layout::write_named_pgm(dir, file, &bytes);
 }
 
 fn database_metric_row(ts_us: i64, deadlocks: i64) -> PgStatDatabaseV1 {
@@ -159,10 +160,10 @@ fn write_database_metric_segment(dir: &std::path::Path) {
             source_id: 7,
         },
     );
-    std::fs::write(dir.join("database-metrics.pgm"), bytes).expect("write metric segment");
+    crate::test_layout::write_named_pgm(dir, "database-metrics.pgm", &bytes);
 }
 
-fn framed_lifecycle_part(ts_us: i64) -> Vec<u8> {
+fn lifecycle_part(ts_us: i64) -> Vec<u8> {
     let rows = [PgLogLifecycleV1 {
         ts: Ts(ts_us),
         kind: 0,
@@ -174,7 +175,7 @@ fn framed_lifecycle_part(ts_us: i64) -> Vec<u8> {
         dict_dropped_fields: 0,
     }];
     let body = PgLogLifecycleV1::encode(&rows).expect("encode lifecycle");
-    let part = build_part(
+    build_part(
         &[SectionInput {
             type_id: 1_028_001,
             rows: 1,
@@ -185,14 +186,7 @@ fn framed_lifecycle_part(ts_us: i64) -> Vec<u8> {
             max_ts: ts_us,
             source_id: 7,
         },
-    );
-    let mut framed = FrameHeader {
-        part_len: u64::try_from(part.len()).expect("part length"),
-    }
-    .encode()
-    .to_vec();
-    framed.extend_from_slice(&part);
-    framed
+    )
 }
 
 #[tokio::test]
@@ -256,26 +250,20 @@ async fn overview_returns_a_digest_over_a_valid_range() {
 }
 
 #[tokio::test]
-async fn timeline_meta_publishes_the_exact_incomplete_active_tail() {
+async fn timeline_meta_has_no_pending_tail_for_a_complete_active_journal() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut journal = framed_lifecycle_part(10);
-    let from_offset = u64::try_from(journal.len()).expect("journal offset");
-    let pending = FrameHeader { part_len: 128 }.encode();
-    journal.extend_from_slice(&pending[..4]);
-    let to_offset = u64::try_from(journal.len()).expect("pending offset");
-    std::fs::write(dir.path().join("active.parts"), journal).expect("write active journal");
+    let part = lifecycle_part(10);
+    crate::test_layout::write_journal(
+        dir.path(),
+        SegmentId::new(10).expect("fixture segment id"),
+        &[&part],
+    );
 
     let state = state_for_dir(dir.path());
     let (status, body) = serve_state(state, "/v1/timeline/events?source=7&from=0&to=100").await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["meta"]["tail_pending"],
-        json!({
-            "from_offset_bytes": from_offset,
-            "to_offset_bytes": to_offset,
-        })
-    );
+    assert_eq!(body["meta"]["tail_pending"], json!(null));
     assert_eq!(body["events"].as_array().map(Vec::len), Some(1));
 }
 
@@ -511,11 +499,11 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
 )]
 async fn all_supported_factor_families_reach_every_timeline_endpoint() {
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(
-        dir.path().join("all-families.pgm"),
-        kronika_reader::qualification_all_family_pgm(),
-    )
-    .expect("write all-family fixture");
+    crate::test_layout::write_named_pgm(
+        dir.path(),
+        "all-families.pgm",
+        &kronika_reader::qualification_all_family_pgm(),
+    );
     let state = state_for_dir(dir.path());
     let query = "source=7&from=10&to=41";
 

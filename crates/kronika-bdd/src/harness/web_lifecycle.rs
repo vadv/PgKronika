@@ -1,10 +1,10 @@
 //! End-to-end sibling-index lifecycle assertions over real web processes.
 
-use std::fs;
-
 use anyhow::{Context, Result, ensure};
 use kronika_reader::{FallbackConfig, QUALIFICATION_PUBLISH_FAULT_ENV};
 use serde_json::Value;
+
+use crate::collector::SealedSegment;
 
 use super::web_process::{
     PublishBarrier, SidecarMismatch, WebCase, WebClient, corrupt_sidecar, fingerprint, metric,
@@ -29,7 +29,7 @@ struct TimelineResponses {
 
 /// Missing sibling → cold build → graceful restart → durable zero-PGM hit.
 pub(crate) async fn establish_restart_baseline(
-    segment: &std::path::Path,
+    segment: &SealedSegment,
 ) -> Result<TimelineBaseline> {
     let case = WebCase::from_segment(segment, "missing-restart")?;
     ensure!(
@@ -86,7 +86,7 @@ pub(crate) async fn establish_restart_baseline(
 
 /// Corrupt committed sibling is rejected, rebuilt atomically, then reused.
 pub(crate) async fn assert_corrupt_recovery(
-    segment: &std::path::Path,
+    segment: &SealedSegment,
     baseline: &TimelineBaseline,
 ) -> Result<()> {
     let case = WebCase::from_segment(segment, "corrupt-recovery")?;
@@ -124,7 +124,7 @@ pub(crate) async fn assert_corrupt_recovery(
 
 /// Every current header identity axis is rejected under its production class.
 pub(crate) async fn assert_stale_identity_recovery(
-    segment: &std::path::Path,
+    segment: &SealedSegment,
     baseline: &TimelineBaseline,
 ) -> Result<()> {
     for mismatch in SidecarMismatch::ALL {
@@ -162,13 +162,11 @@ pub(crate) async fn assert_stale_identity_recovery(
 /// A process killed at the pre-rename barrier leaves no admitted partial OVF;
 /// a new process ignores both that residue and a pre-existing foreign residue.
 pub(crate) async fn assert_interrupted_publication_recovery(
-    segment: &std::path::Path,
+    segment: &SealedSegment,
     baseline: &TimelineBaseline,
 ) -> Result<()> {
     let case = WebCase::from_segment(segment, "interrupted-publication")?;
-    let preexisting = case.data_dir().join(".pgkronika-overview.tmp-preexisting");
-    fs::write(&preexisting, b"not an admitted sidecar")
-        .context("seed interrupted-publication residue")?;
+    let preexisting = case.seed_temporary(b"not an admitted sidecar")?;
     let barrier = PublishBarrier::bind(case.control_path("publication.sock")?)?;
     let environment = barrier.environment();
     let process = case.spawn(&[environment]).await?;
@@ -176,7 +174,7 @@ pub(crate) async fn assert_interrupted_publication_recovery(
     let target = overview_target(&case);
     let pending = tokio::spawn(async move { client.get_json(&target).await });
     let lease = barrier.arrive().await?;
-    let generated = case.data_dir().join(&lease.temporary_name);
+    let generated = case.temporary_path(&lease.temporary_name)?;
     ensure!(
         generated.is_file(),
         "barrier announced no synced temporary sidecar"
@@ -219,7 +217,7 @@ pub(crate) async fn assert_interrupted_publication_recovery(
 /// later process publishes durably, and the following process is a cold restart
 /// hit with zero PGM body work.
 pub(crate) async fn assert_publication_failure_recovery(
-    segment: &std::path::Path,
+    segment: &SealedSegment,
     baseline: &TimelineBaseline,
 ) -> Result<()> {
     let case = WebCase::from_segment(segment, "publication-failure")?;
@@ -296,7 +294,7 @@ pub(crate) async fn assert_publication_failure_recovery(
 /// A cursor is process-local and becomes the public 410 `cursor_expired`
 /// problem after restart, while all ordinary timeline payloads stay equal.
 pub(crate) async fn assert_cursor_restart_contract(
-    segment: &std::path::Path,
+    segment: &SealedSegment,
     baseline: &TimelineBaseline,
 ) -> Result<()> {
     let case = WebCase::from_segment(segment, "cursor-restart")?;
@@ -344,7 +342,7 @@ pub(crate) async fn assert_cursor_restart_contract(
 /// honestly into bounded fallback, reports deterministic `busy` contention,
 /// and never corrupts the first process's eventual atomic publication.
 pub(crate) async fn assert_writer_contention(
-    segment: &std::path::Path,
+    segment: &SealedSegment,
     baseline: &TimelineBaseline,
 ) -> Result<()> {
     let case = WebCase::from_segment(segment, "writer-contention")?;

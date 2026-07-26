@@ -8,6 +8,7 @@
     reason = "criterion_group!/criterion_main! expand to undocumented public items; a bench binary has no public API"
 )]
 
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -16,6 +17,7 @@ use axum::http::Request;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use http_body_util::BodyExt;
 use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
+use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId};
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
@@ -36,6 +38,7 @@ use bytes as _;
 use form_urlencoded as _;
 use kronika_analytics as _;
 use kronika_reader as _;
+use kronika_store as _;
 use metrics as _;
 use rust_embed as _;
 #[cfg(feature = "qualification")]
@@ -192,6 +195,10 @@ const SNAPSHOTS_PER_SEGMENT: i64 = 60;
     reason = "the end-to-end resource fixture keeps every encoded section and its provenance visible"
 )]
 fn build_fixture(dir: &Path) {
+    let root = DataRoot::open(dir).expect("open benchmark data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire benchmark writer");
     let per_segment = usize::try_from(SERIES * SNAPSHOTS_PER_SEGMENT).expect("fixture fits");
     let plan_rows_per_segment =
         usize::try_from(i64::from(PLAN_SERIES) * SNAPSHOTS_PER_SEGMENT).expect("plan fixture fits");
@@ -366,7 +373,15 @@ fn build_fixture(dir: &Path) {
                 source_id: SOURCE,
             },
         );
-        std::fs::write(dir.join(format!("{min_ts}.pgm")), &part).expect("write part");
+        let address = SegmentAddress::new(
+            SegmentId::new(min_ts).expect("representable benchmark segment id"),
+        )
+        .expect("benchmark segment address");
+        let mut temp = owner
+            .create_pgm_temp(address)
+            .expect("create PGM temporary");
+        temp.file_mut().write_all(&part).expect("write PGM");
+        temp.publish().expect("publish PGM");
     }
 }
 

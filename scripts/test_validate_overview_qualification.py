@@ -115,35 +115,84 @@ class DeploymentBudgetValidationTests(unittest.TestCase):
 
 
 class StorageValidationTests(unittest.TestCase):
-    def test_owned_directory_uses_same_stem_siblings(self) -> None:
+    @staticmethod
+    def valid_storage() -> dict[str, object]:
+        segment_id = 1_709_164_800_000_000
+        return {
+            "model": "owned-data-directory-sibling-sidecars-v1",
+            "active_journal_name": "active.parts",
+            "pgm_file_name": f"{segment_id}.pgm",
+            "sidecar_file_name": f"{segment_id}.ovf",
+            "pgm_relative_path": f"2024/02/29/{segment_id}.pgm",
+            "sidecar_relative_path": f"2024/02/29/{segment_id}.ovf",
+            "same_stem": True,
+        }
+
+    def assert_invalid_storage(self, storage: dict[str, object]) -> None:
         failures: list[str] = []
-        VALIDATOR.validate_storage(
-            {
-                "model": "owned-data-directory-sibling-sidecars-v1",
-                "active_journal_name": "active.parts",
-                "pgm_file_name": "dense-hour.pgm",
-                "sidecar_file_name": "dense-hour.ovf",
-                "same_stem": True,
-            },
+        VALIDATOR.validate_storage(storage, failures)
+        self.assertIn(
+            (
+                "qualification files are not canonical UTC YYYY/MM/DD/N.pgm "
+                "and matching N.ovf siblings"
+            ),
             failures,
         )
+
+    def test_owned_directory_uses_same_stem_siblings(self) -> None:
+        failures: list[str] = []
+        VALIDATOR.validate_storage(self.valid_storage(), failures)
         self.assertEqual(failures, [])
 
     def test_different_stems_are_rejected(self) -> None:
+        storage = self.valid_storage()
+        storage["sidecar_file_name"] = "1709164800000001.ovf"
+        storage["sidecar_relative_path"] = "2024/02/29/1709164800000001.ovf"
+        storage["same_stem"] = False
+        self.assert_invalid_storage(storage)
+
+    def test_flat_segment_path_is_rejected(self) -> None:
+        storage = self.valid_storage()
+        storage["pgm_relative_path"] = storage["pgm_file_name"]
+        self.assert_invalid_storage(storage)
+
+    def test_misbucketed_segment_path_is_rejected(self) -> None:
+        storage = self.valid_storage()
+        storage["pgm_relative_path"] = "2024/02/28/1709164800000000.pgm"
+        storage["sidecar_relative_path"] = "2024/02/28/1709164800000000.ovf"
+        self.assert_invalid_storage(storage)
+
+    def test_path_and_reported_basename_must_match(self) -> None:
+        storage = self.valid_storage()
+        storage["pgm_file_name"] = "1709164800000001.pgm"
+        self.assert_invalid_storage(storage)
+
+    def test_noncanonical_segment_id_is_rejected(self) -> None:
+        storage = self.valid_storage()
+        storage["pgm_file_name"] = "01709164800000000.pgm"
+        storage["sidecar_file_name"] = "01709164800000000.ovf"
+        storage["pgm_relative_path"] = "2024/02/29/01709164800000000.pgm"
+        storage["sidecar_relative_path"] = "2024/02/29/01709164800000000.ovf"
+        self.assert_invalid_storage(storage)
+
+    def test_negative_microsecond_uses_previous_utc_day(self) -> None:
+        storage = self.valid_storage()
+        storage["pgm_file_name"] = "-1.pgm"
+        storage["sidecar_file_name"] = "-1.ovf"
+        storage["pgm_relative_path"] = "1969/12/31/-1.pgm"
+        storage["sidecar_relative_path"] = "1969/12/31/-1.ovf"
         failures: list[str] = []
-        VALIDATOR.validate_storage(
-            {
-                "model": "owned-data-directory-sibling-sidecars-v1",
-                "active_journal_name": "active.parts",
-                "pgm_file_name": "dense-hour.pgm",
-                "sidecar_file_name": "other.ovf",
-                "same_stem": False,
-            },
-            failures,
-        )
-        self.assertIn(
-            "qualification files are not same-stem PGM/OVF siblings", failures
-        )
+        VALIDATOR.validate_storage(storage, failures)
+        self.assertEqual(failures, [])
+
+    def test_segment_id_outside_i64_is_rejected(self) -> None:
+        storage = self.valid_storage()
+        segment_id = 1 << 63
+        storage["pgm_file_name"] = f"{segment_id}.pgm"
+        storage["sidecar_file_name"] = f"{segment_id}.ovf"
+        storage["pgm_relative_path"] = f"2262/04/11/{segment_id}.pgm"
+        storage["sidecar_relative_path"] = f"2262/04/11/{segment_id}.ovf"
+        self.assert_invalid_storage(storage)
 
 
 def valid_work(mode: str) -> dict[str, int]:
@@ -199,8 +248,8 @@ def valid_work(mode: str) -> dict[str, int]:
             source_builds=1,
             completed_active_parts=1,
             visibility_lag_us=100_000,
-            tail_pending_from_offset_bytes=100,
-            tail_pending_to_offset_bytes=104,
+            damaged_journal_rejections=1,
+            damaged_journal_preserved=1,
         )
     elif mode == "concurrent-identical":
         work.update(
@@ -421,14 +470,20 @@ class ModeValidationTests(unittest.TestCase):
             "memory-only fallback or recovered restart read PGM bodies", failures
         )
 
-    def test_live_pending_tail_must_be_the_exact_exposed_range(self) -> None:
-        rows = [mode_row(mode) for mode in VALIDATOR.MODES]
-        rows[4]["samples"][0]["work"]["tail_pending_to_offset_bytes"] = 105
-        failures: list[str] = []
-        VALIDATOR.validate_modes(rows, False, failures)
-        self.assertIn(
-            "live did not retain the exact four-byte incomplete tail", failures
-        )
+    def test_live_damaged_journal_must_be_rejected_and_preserved(self) -> None:
+        for field in (
+            "damaged_journal_rejections",
+            "damaged_journal_preserved",
+        ):
+            with self.subTest(field=field):
+                rows = [mode_row(mode) for mode in VALIDATOR.MODES]
+                rows[4]["samples"][0]["work"][field] = 0
+                failures: list[str] = []
+                VALIDATOR.validate_modes(rows, False, failures)
+                self.assertIn(
+                    "live did not reject and preserve exactly one damaged version-1 journal",
+                    failures,
+                )
 
 
 class CompactPerformanceValidationTests(unittest.TestCase):

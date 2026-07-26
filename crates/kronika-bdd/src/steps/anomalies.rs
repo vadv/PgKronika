@@ -30,9 +30,7 @@ async fn diff_column_points(
     column: &str,
 ) -> Result<Vec<serde_json::Value>> {
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     let source = web::only_source(dir).await?;
     let diff = web::section_diff(dir, section, source).await?;
     let series = diff["series"]
@@ -201,9 +199,7 @@ async fn web_reports_anomaly_episode(
     column: String,
 ) -> Result<()> {
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     let (source, min_ts, max_ts) = web::source_span(dir).await?;
     let period = max_ts - min_ts;
     // A sixth of the period: four-five points per window over a ~30-snapshot

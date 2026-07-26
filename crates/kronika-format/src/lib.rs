@@ -32,7 +32,9 @@ use proptest as _;
 #[cfg(test)]
 use tempfile as _;
 
-pub use catalog::{Catalog, DecodeError, ENTRY_LEN, Entry, META_LEN, TAIL_INDEX_LEN, TailIndex};
+pub use catalog::{
+    Catalog, CatalogView, DecodeError, ENTRY_LEN, Entry, META_LEN, TAIL_INDEX_LEN, TailIndex,
+};
 pub use crc::{Crc32c, crc32c};
 pub use dictionary::{
     BlobEntry, DEFAULT_BLOB_THRESHOLD, DEFAULT_MAX_TOTAL_BYTES, DEFAULT_TRUNCATE_LIMIT, DictError,
@@ -40,10 +42,12 @@ pub use dictionary::{
 };
 pub use dictionary::{EntrySnapshot, HotMark, Placement};
 pub use parts::{
-    DEFAULT_MAX_PART_LEN, DEFAULT_RESYNC_CHUNK, DamageKind, DamageRegion, FRAME_HEADER_LEN,
-    FRAME_MAGIC, FrameError, FrameHeader, JournalLimits, PartError, PartMeta, PartRef, ScanReport,
-    SectionInput, build_part, scan_journal, scan_journal_streaming, scan_journal_streaming_from,
-    validate_part, validate_part_catalog,
+    DamageKind, DamageRegion, FRAME_HEADER_LEN, FRAME_MAGIC, FrameError, FrameHeader,
+    JOURNAL_HEADER_LEN, JOURNAL_MAGIC, JOURNAL_VERSION, JournalHeader, JournalHeaderError,
+    JournalLimits, JournalScanError, JournalState, MAX_JOURNAL_LEN, MAX_JOURNAL_PARTS,
+    MAX_PART_LEN, PartError, PartMeta, PartRef, RESET_MARKER_LEN, RESET_MARKER_MAGIC,
+    ResetHeaderTransition, ResetMarker, ScanReport, SectionInput, build_part, scan_journal,
+    scan_journal_streaming_strict_from, validate_part, validate_part_catalog,
 };
 pub use read_at::ReadAt;
 pub use str_id::StrId;
