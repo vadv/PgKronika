@@ -75,11 +75,11 @@ Feature: The scheduler paces sources by their own intervals
     Then timer segment 1 has section pg_stat_activity.pg14_18
 
   @pg16 @serial
-  Scenario: a full journal seals the open segment instead of wedging
+  Scenario: a size boundary seals the open segment instead of wedging
     Given a fresh database on PostgreSQL 16
     And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
     And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "0"
-    And the collector runs with env "KRONIKA_JOURNAL_MAX_BYTES" = "1"
+    And the collector runs with env "KRONIKA_SEGMENT_MAX_BYTES" = "1"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "3600"
     When the collector runs on its own timer until 2 segments are sealed
     Then timer segment 1 has section pg_stat_activity.pg14_18

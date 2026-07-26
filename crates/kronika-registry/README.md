@@ -37,13 +37,14 @@ PostgreSQL / Linux / cgroup / PostgreSQL log
 typed rows from kronika-registry
         |
         | Section::encode
-        | exact Arrow schema -> sort -> Parquet + Zstd-3
+        | exact Arrow schema -> complete canonical order -> Parquet + Zstd-3
         v
-section body
+collection-window section body
         |
-        | kronika-writer adds a catalog entry and dictionaries
+        | kronika-writer journals parts, coalesces each type, normalizes dictionaries
+        | complete canonical order -> PLAIN Parquet + Zstd-6
         v
-active.parts / completed PGM
+one compact body per present type in completed PGM
         |
         | catalog: type_id, offset, len, rows, CRC32C
         | CRC32C -> contract lookup -> schema check -> decode
@@ -399,8 +400,9 @@ layouts. The linter does not currently enforce a relationship between a
 ## What can be configured
 
 `kronika-registry` has no CLI, environment variables, or configuration file.
-An operator cannot change `type_id` values, schemas, column roles, keys,
-Zstd-3, or codec limits at runtime.
+An operator cannot change `type_id` values, schemas, column roles, keys, the
+collection-window Zstd-3 profile, the sealed PLAIN/Zstd-6 profile, or codec
+limits at runtime.
 
 | Task | Where it is configured |
 | --- | --- |

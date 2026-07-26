@@ -1,13 +1,14 @@
 //! File-backed `active.parts` journal.
 //!
 //! `kronika-format` defines frame bytes and damage classification. This module
-//! validates appends, syncs the file, scans it on open, truncates an incomplete
+//! validates appends, syncs the file, scans it on open, truncates a recoverable
 //! final frame, and reads parts for merging.
 //!
 //! Recovery policy:
 //!
-//! - an incomplete final frame is normal after a crash: the file is truncated
-//!   to the last valid frame and writing continues;
+//! - an incomplete final frame, or a complete terminal frame whose valid
+//!   header ends at EOF but whose PGM body fails validation, is recoverable:
+//!   the file is truncated to the last valid frame and writing continues;
 //! - damage in the middle of the file, or damage at the end that is not a
 //!   partial write, is reported in [`OpenReport`];
 //! - damaged bytes that cannot be repaired stay on disk, and new frames are
@@ -29,6 +30,7 @@ use kronika_format::{
     PartError, PartRef, ScanReport, scan_journal_streaming, validate_part,
 };
 
+use crate::io_error::parent_directory;
 use crate::{FilesystemError, FilesystemOperation};
 
 /// Default cap for the whole journal file, bytes.
@@ -174,7 +176,7 @@ impl From<FilesystemError> for JournalError {
 pub struct OpenReport {
     /// Damaged regions found during recovery, in journal order.
     pub damages: Vec<DamageRegion>,
-    /// Whether recovery truncated an incomplete final frame.
+    /// Whether recovery truncated a recoverable final frame.
     pub truncated_torn_tail: bool,
 }
 
@@ -185,7 +187,7 @@ impl OpenReport {
         self.damages.is_empty()
     }
 
-    /// Return whether recovery found damage other than an incomplete final frame.
+    /// Return whether recovery found damage other than a recoverable final frame.
     #[must_use]
     pub fn has_media_damage(&self) -> bool {
         self.damages
@@ -211,7 +213,7 @@ pub struct Journal {
 impl Journal {
     /// Open or create the journal at `path`, then scan it for recovery.
     ///
-    /// An incomplete final frame is truncated immediately. Other damaged
+    /// A recoverable final frame is truncated immediately. Other damaged
     /// regions are reported but left on disk; new frames are appended after
     /// them.
     ///
@@ -254,11 +256,11 @@ impl Journal {
             });
         }
 
-        let has_incomplete_final_frame = scan
+        let has_recoverable_final_frame = scan
             .damages
             .last()
             .is_some_and(|damage| damage.kind == DamageKind::TornTail);
-        let end = if has_incomplete_final_frame {
+        let end = if has_recoverable_final_frame {
             file.set_len(scan.valid_len as u64)
                 .map_err(|error| journal_io(FilesystemOperation::Truncate, path, error))?;
             file.sync_data()
@@ -277,7 +279,7 @@ impl Journal {
         };
         let report = OpenReport {
             damages: scan.damages,
-            truncated_torn_tail: has_incomplete_final_frame,
+            truncated_torn_tail: has_recoverable_final_frame,
         };
         Ok((journal, report))
     }
@@ -492,16 +494,12 @@ fn scan_file(
 
 /// Sync the directory entry after creating the journal file.
 fn sync_parent_dir(path: &Path) -> Result<(), JournalError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        let directory = File::open(parent)
-            .map_err(|error| journal_io(FilesystemOperation::Open, parent, error))?;
-        directory
-            .sync_all()
-            .map_err(|error| journal_io(FilesystemOperation::SyncDirectory, parent, error))?;
-    }
-    Ok(())
+    let parent = parent_directory(path);
+    let directory =
+        File::open(parent).map_err(|error| journal_io(FilesystemOperation::Open, parent, error))?;
+    directory
+        .sync_all()
+        .map_err(|error| journal_io(FilesystemOperation::SyncDirectory, parent, error))
 }
 
 fn journal_io(operation: FilesystemOperation, path: &Path, source: std::io::Error) -> JournalError {

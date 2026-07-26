@@ -22,13 +22,15 @@ use kronika_format::{
 use kronika_registry::{
     Bytes, COMPACTION_MEMORY_LIMIT, COMPACTION_PAGE_BYTES, CodecError, ColumnType,
     DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
-    READ_WORK_MEMORY_LIMIT, VerifiedSection, canonicalize_batches, compact_section_bound,
-    compaction_memory_bound, decode_any, dictionary_schema_matches, encode_compact_ordered_batch,
+    READ_WORK_MEMORY_LIMIT, VerifiedSection, canonicalize_batches, compact_parquet_profile_matches,
+    compact_section_bound, compact_unregistered_bound, compaction_memory_bound, decode_any,
+    dictionary_schema_matches, encode_compact_ordered_batch, read_work_memory,
     read_work_memory_bound, registry,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::dict::DictSection;
+use crate::io_error::parent_directory;
 use crate::{DEFAULT_MAX_JOURNAL_LEN, FilesystemError, FilesystemOperation, Journal, JournalError};
 
 /// Maximum catalog entries accepted from one seal input by default.
@@ -301,10 +303,17 @@ struct TypePlan {
     list_values: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DictionaryPlan {
+    rows: usize,
+    column_uncompressed_bytes: Vec<usize>,
+}
+
 /// Incremental collector-side admission for the future compact seal.
 #[derive(Debug, Clone, Default)]
 pub struct SealAdmission {
     types: BTreeMap<u32, TypePlan>,
+    dictionaries: BTreeMap<u32, DictionaryPlan>,
     dictionary_rows: usize,
     dictionary_bytes: usize,
     input_sections: usize,
@@ -346,9 +355,32 @@ impl SealAdmission {
         for entry in &catalog.entries {
             let body = section(part, entry)?;
             if is_dictionary(entry.type_id) {
-                let decoded = inspect_dictionary(body, entry)?;
-                self.dictionary_rows = add(self.dictionary_rows, decoded.0, "dictionary rows")?;
-                self.dictionary_bytes = add(self.dictionary_bytes, decoded.1, "dictionary bytes")?;
+                let inspected = inspect_dictionary(body, entry)?;
+                self.dictionary_rows =
+                    add(self.dictionary_rows, inspected.rows, "dictionary rows")?;
+                self.dictionary_bytes = add(
+                    self.dictionary_bytes,
+                    inspected.decoded_bytes,
+                    "dictionary bytes",
+                )?;
+                let plan = self.dictionaries.entry(entry.type_id).or_default();
+                plan.rows = add(plan.rows, inspected.rows, "dictionary rows per type")?;
+                if plan.column_uncompressed_bytes.is_empty() {
+                    plan.column_uncompressed_bytes
+                        .resize(inspected.column_uncompressed_bytes.len(), 0);
+                } else if plan.column_uncompressed_bytes.len()
+                    != inspected.column_uncompressed_bytes.len()
+                {
+                    return Err(CodecError::SchemaMismatch.into());
+                }
+                for (total, bytes) in plan
+                    .column_uncompressed_bytes
+                    .iter_mut()
+                    .zip(inspected.column_uncompressed_bytes)
+                {
+                    *total = add(*total, bytes, "dictionary column bytes")?;
+                }
+                admit_dictionary(plan)?;
                 continue;
             }
             let inspected = inspect_data(body, entry)?;
@@ -559,26 +591,50 @@ fn inspect_data(body: &[u8], entry: &Entry) -> Result<DataInspection, SealError>
     Ok(DataInspection { rows, list_values })
 }
 
-fn inspect_dictionary(body: &[u8], entry: &Entry) -> Result<(usize, usize), SealError> {
+#[derive(Debug)]
+struct DictionaryInspection {
+    rows: usize,
+    decoded_bytes: usize,
+    column_uncompressed_bytes: Vec<usize>,
+}
+
+fn inspect_dictionary(body: &[u8], entry: &Entry) -> Result<DictionaryInspection, SealError> {
     let builder = section_builder(body, entry)?;
     if !dictionary_schema_matches(builder.schema(), entry.type_id) {
         return Err(CodecError::SchemaMismatch.into());
     }
     let rows = entry.rows as usize;
-    let bytes = builder
+    let columns = builder
         .metadata()
-        .row_groups()
-        .iter()
-        .flat_map(parquet::file::metadata::RowGroupMetaData::columns)
-        .try_fold(0_usize, |total, column| {
+        .file_metadata()
+        .schema_descr()
+        .num_columns();
+    let mut column_uncompressed_bytes = vec![0_usize; columns];
+    for row_group in builder.metadata().row_groups() {
+        if row_group.columns().len() != columns {
+            return Err(CodecError::SchemaMismatch.into());
+        }
+        for (index, column) in row_group.columns().iter().enumerate() {
             let raw = column.uncompressed_size();
-            add(
-                total,
-                usize::try_from(raw).map_err(|_error| CodecError::InvalidDecodedSize { raw })?,
+            let bytes =
+                usize::try_from(raw).map_err(|_error| CodecError::InvalidDecodedSize { raw })?;
+            column_uncompressed_bytes[index] = add(
+                column_uncompressed_bytes[index],
+                bytes,
                 "dictionary decoded bytes",
-            )
+            )?;
+        }
+    }
+    let decoded_bytes = column_uncompressed_bytes
+        .iter()
+        .try_fold(0_usize, |total, &bytes| {
+            add(total, bytes, "dictionary decoded bytes")
         })?;
-    Ok((rows, bytes))
+    Ok(DictionaryInspection {
+        rows,
+        decoded_bytes,
+        column_uncompressed_bytes,
+    })
 }
 
 fn section_builder(
@@ -618,6 +674,9 @@ fn section_builder(
         }
         .into());
     }
+    if is_dictionary(entry.type_id) && !compact_parquet_profile_matches(builder.metadata()) {
+        return Err(CodecError::SchemaMismatch.into());
+    }
     Ok(builder)
 }
 
@@ -641,6 +700,25 @@ fn admit_type(type_id: u32, plan: &TypePlan) -> Result<(), SealError> {
             bound.plain_body_bytes,
             bound.plain_body_bytes,
         )? as u64,
+        READ_WORK_MEMORY_LIMIT as u64,
+    )
+}
+
+fn admit_dictionary(plan: &DictionaryPlan) -> Result<(), SealError> {
+    let bound = compact_unregistered_bound(plan.rows, &plan.column_uncompressed_bytes)?;
+    admit(
+        SealResource::ColumnPage,
+        bound.max_column_page_bytes as u64,
+        COMPACTION_PAGE_BYTES as u64,
+    )?;
+    admit(
+        SealResource::SectionBody,
+        bound.plain_body_bytes as u64,
+        MAX_SECTION_BYTES as u64,
+    )?;
+    admit(
+        SealResource::ReaderMemory,
+        read_work_memory(bound.plain_body_bytes, bound.decoded_arrow_bytes)? as u64,
         READ_WORK_MEMORY_LIMIT as u64,
     )
 }
@@ -844,7 +922,7 @@ struct NormalizedDictionary {
 
 impl NormalizedDictionary {
     fn ingest(&mut self, body: &[u8], entry: &Entry) -> Result<(), SealError> {
-        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(body))?;
+        let builder = section_builder(body, entry)?;
         if !dictionary_schema_matches(builder.schema(), entry.type_id) {
             return Err(CodecError::SchemaMismatch.into());
         }
@@ -1163,17 +1241,11 @@ fn files_equal(left_path: &Path, right_path: &Path) -> Result<bool, SealError> {
 }
 
 fn sync_parent(path: &Path) -> Result<(), SealError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(path);
-    if parent != path {
-        File::open(parent)
-            .map_err(|error| io_error(FilesystemOperation::Open, parent, error))?
-            .sync_all()
-            .map_err(|error| io_error(FilesystemOperation::SyncDirectory, parent, error))?;
-    }
-    Ok(())
+    let parent = parent_directory(path);
+    File::open(parent)
+        .map_err(|error| io_error(FilesystemOperation::Open, parent, error))?
+        .sync_all()
+        .map_err(|error| io_error(FilesystemOperation::SyncDirectory, parent, error))
 }
 
 fn remove(path: &Path) -> Result<(), SealError> {
@@ -1323,9 +1395,14 @@ impl Drop for Artifacts {
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::{PartMeta, SectionInput, build_part};
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema};
+    use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
 
     use super::*;
     use crate::{JournalConfig, SectionBuffers};
@@ -1456,6 +1533,80 @@ mod tests {
             Err(SealError::Codec(CodecError::UnknownType {
                 type_id: 4_000_000
             }))
+        ));
+    }
+
+    #[test]
+    fn dictionary_page_growth_is_rejected_during_admission() {
+        let mut interner =
+            crate::Interner::new(DictLimits::new(2_048, 2_048).expect("dictionary limits"));
+        for ordinal in 0_u64..1_024 {
+            let mut value = vec![b'x'; 1_024];
+            value[1_016..].copy_from_slice(&ordinal.to_le_bytes());
+            interner.intern(&value).expect("intern unique value");
+        }
+        let sections = crate::dict::encode(interner.window()).expect("encode dictionary");
+        let inputs = sections
+            .iter()
+            .map(|section| SectionInput {
+                type_id: section.type_id,
+                rows: section.rows,
+                body: &section.body,
+            })
+            .collect::<Vec<_>>();
+        let part = build_part(
+            &inputs,
+            PartMeta {
+                min_ts: i64::MAX,
+                max_ts: i64::MIN,
+                source_id: 0,
+            },
+        );
+        assert!(matches!(
+            SealAdmission::default().with_part(&part, SealLimits::default()),
+            Err(SealError::Resource {
+                resource: SealResource::ColumnPage,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parquet_dictionary_encoded_input_is_rejected_during_admission() {
+        let repeated = vec![b'x'; 8 * 1024];
+        let ids = UInt64Array::from_iter_values(1_u64..=512);
+        let values = BinaryArray::from_iter_values((0..512).map(|_ordinal| repeated.as_slice()));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("str_id", DataType::UInt64, false),
+            Field::new("bytes", DataType::Binary, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(values)])
+                .expect("dictionary batch");
+        let mut body = Vec::new();
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut body, schema, Some(properties)).expect("Parquet writer");
+        writer.write(&batch).expect("write dictionary batch");
+        writer.close().expect("close dictionary body");
+        let part = build_part(
+            &[SectionInput {
+                type_id: DICT_STRINGS_TYPE_ID,
+                rows: 512,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: i64::MAX,
+                max_ts: i64::MIN,
+                source_id: 0,
+            },
+        );
+
+        assert!(matches!(
+            SealAdmission::default().with_part(&part, SealLimits::default()),
+            Err(SealError::Codec(CodecError::SchemaMismatch))
         ));
     }
 }

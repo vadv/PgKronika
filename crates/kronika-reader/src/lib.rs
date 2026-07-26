@@ -99,7 +99,8 @@ use arrow_array::{
 use kronika_format::{Catalog, DecodeError, Entry};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS,
-    MAX_SECTION_ROWS, READ_WORK_MEMORY_LIMIT, dictionary_schema_matches, read_work_memory,
+    MAX_SECTION_ROWS, READ_WORK_MEMORY_LIMIT, compact_parquet_profile_matches,
+    dictionary_schema_matches, read_work_memory,
 };
 use kronika_store::StoreError;
 
@@ -444,6 +445,11 @@ pub(crate) fn decode_dictionary_selected(
         }
         Err(_) => return Err(CodecError::InvalidRowCount { raw: claimed }),
     };
+    if !dictionary_schema_matches(builder.schema(), type_id)
+        || !compact_parquet_profile_matches(builder.metadata())
+    {
+        return Err(CodecError::SchemaMismatch);
+    }
     let mut declared_decoded_bytes = 0_u64;
     for row_group in builder.metadata().row_groups() {
         for column in row_group.columns() {
@@ -478,10 +484,6 @@ pub(crate) fn decode_dictionary_selected(
             max: READ_WORK_MEMORY_LIMIT,
         });
     }
-    if !dictionary_schema_matches(builder.schema(), type_id) {
-        return Err(CodecError::SchemaMismatch);
-    }
-
     let value_column = if is_blob { "stored_bytes" } else { "bytes" };
     let mut out = Vec::new();
     let mut rows_scanned = 0_u64;
@@ -639,8 +641,12 @@ mod tests {
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::{
-        CodecError, DICT_STRINGS_TYPE_ID, Section, encode_compact_ordered_batch,
+        Bytes, CodecError, DICT_STRINGS_TYPE_ID, Section, compact_parquet_profile_matches,
+        encode_compact_ordered_batch,
     };
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::properties::WriterProperties;
 
     use super::{ReadError, Resolved, Segment};
 
@@ -799,6 +805,41 @@ mod tests {
                 max: kronika_registry::READ_WORK_MEMORY_LIMIT,
                 ..
             }))
+        ));
+    }
+
+    #[test]
+    fn parquet_dictionary_encoded_dictionary_is_rejected_before_expansion() {
+        let repeated = vec![b'x'; 8 * 1024];
+        let ids = UInt64Array::from_iter_values(1_u64..=512);
+        let values = BinaryArray::from_iter_values((0..512).map(|_ordinal| repeated.as_slice()));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("str_id", DataType::UInt64, false),
+            Field::new("bytes", DataType::Binary, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(values)])
+                .expect("dictionary batch");
+        let mut body = Vec::new();
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut body, schema, Some(properties)).expect("Parquet writer");
+        writer.write(&batch).expect("write dictionary batch");
+        writer.close().expect("close dictionary body");
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(&body))
+            .expect("dictionary metadata");
+        assert!(
+            !compact_parquet_profile_matches(metadata.metadata()),
+            "fixture must carry a Parquet dictionary"
+        );
+
+        let (_dir, path) = segment_with(&body, DICT_STRINGS_TYPE_ID, 512);
+        let segment = Segment::open(&path).expect("catalog is admitted");
+        assert!(matches!(
+            segment.dictionary(),
+            Err(ReadError::Codec(CodecError::SchemaMismatch))
         ));
     }
 }

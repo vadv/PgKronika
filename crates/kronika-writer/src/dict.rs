@@ -118,7 +118,7 @@ fn encode_blobs(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, CodecE
     section(DICT_BLOBS_TYPE_ID, &batch)
 }
 
-/// Write `batch` to a capped zstd Parquet body.
+/// Write `batch` with the capped final PLAIN/Zstd-6 Parquet profile.
 fn section(type_id: u32, batch: &RecordBatch) -> Result<DictSection, CodecError> {
     if batch.num_rows() > MAX_SECTION_ROWS {
         return Err(CodecError::TooManyRows {

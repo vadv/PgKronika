@@ -366,7 +366,7 @@ pub struct PartMeta {
     pub min_ts: i64,
     /// Maximal timestamp across the part's rows, unix microseconds.
     pub max_ts: i64,
-    /// `str_id` of `{cluster_id}/{pg_system_identifier}`; 0 = not set.
+    /// Opaque source identifier; 0 = not set.
     pub source_id: u64,
 }
 
@@ -610,6 +610,8 @@ pub fn scan_journal_streaming<R: ReadAt>(
 /// # Errors
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] when `resync_chunk` is zero.
+/// Returns [`io::ErrorKind::UnexpectedEof`] when `start_at` is past the
+/// current source length, as can happen after a concurrent journal reset.
 /// Returns an I/O error if `reader` fails on any read or on `byte_len`.
 pub fn scan_journal_streaming_from<R: ReadAt>(
     reader: &R,
@@ -642,6 +644,12 @@ pub fn scan_journal_streaming_from<R: ReadAt>(
             "start_at does not fit the address space",
         )
     })?;
+    if pos > total_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "start_at is past the current source length",
+        ));
+    }
 
     let mut report = ScanReport {
         valid_len: pos,
@@ -761,7 +769,7 @@ fn streaming_resync<R: ReadAt>(
     let overlap = FRAME_MAGIC.len() - 1;
     let mut window = vec![0_u8; chunk_len + overlap];
     let mut base = damaged_at + 1;
-    while base + FRAME_HEADER_LEN <= total_len {
+    while total_len.saturating_sub(base) >= FRAME_HEADER_LEN {
         let take = (total_len - base).min(window.len());
         reader.read_exact_at(&mut window[..take], base as u64)?;
 
@@ -952,6 +960,15 @@ mod streaming_tests {
             buf.len(),
             "valid_len stays at the start offset when nothing follows"
         );
+    }
+
+    #[test]
+    fn streaming_from_past_a_concurrently_reset_journal_is_unexpected_eof() {
+        let empty: &[u8] = b"";
+        let err =
+            scan_journal_streaming_from(&empty, 1, JournalLimits::default(), DEFAULT_RESYNC_CHUNK)
+                .expect_err("a reset journal is shorter than the previous valid offset");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

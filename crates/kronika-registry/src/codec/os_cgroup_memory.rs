@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        crate::assert_roundtrips(&[row(Some(2048)), row(None)]);
+        crate::assert_roundtrips(&[row(None), row(Some(2048))]);
     }
 
     #[test]

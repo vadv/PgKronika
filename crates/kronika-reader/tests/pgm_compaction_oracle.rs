@@ -23,7 +23,7 @@ use kronika_format::{PartMeta, SectionInput, StrId, try_build_part};
 use kronika_reader::{PgmUnit, Resolved};
 use kronika_registry::{
     ColumnClass, ColumnType, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_ROWS,
-    TypeContract, arrow_schema, canonicalize_batches, registry,
+    TypeContract, arrow_schema, canonicalize_batches, encode_compact_ordered_batch, registry,
 };
 use kronika_writer::{Journal, JournalConfig, Publication, seal};
 use parquet::arrow::ArrowWriter;
@@ -446,12 +446,12 @@ fn dictionary_bodies() -> TestResult<Vec<(u32, u32, Vec<u8>)>> {
         (
             DICT_STRINGS_TYPE_ID,
             u32::try_from(string_batch.num_rows())?,
-            encode_collection_batch(&string_batch)?,
+            encode_compact_ordered_batch(&string_batch)?,
         ),
         (
             DICT_BLOBS_TYPE_ID,
             u32::try_from(blob_batch.num_rows())?,
-            encode_collection_batch(&blob_batch)?,
+            encode_compact_ordered_batch(&blob_batch)?,
         ),
     ])
 }

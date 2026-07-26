@@ -948,6 +948,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incremental_scan_drops_stale_parts_when_reset_moves_eof_before_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        let local = LocalDir::open(dir.path()).unwrap();
+        let previous_part = part(2_000, 7);
+        let previous = ActivePart {
+            part: kronika_format::PartRef {
+                offset: FRAME_HEADER_LEN,
+                len: previous_part.len(),
+            },
+            catalog: validate_part_catalog(&previous_part).unwrap(),
+        };
+        let mut warnings = Vec::new();
+        let (active, damages, valid_len) = local
+            .scan_journal_reader_from(&&b""[..], 1, vec![previous], &journal_path, &mut warnings)
+            .expect("concurrent reset is a recoverable scan race");
+
+        assert!(active.is_empty(), "stale active parts must be discarded");
+        assert!(damages.is_empty());
+        assert_eq!(valid_len, 1);
+        assert!(
+            warnings.iter().any(|warning| warning.path == journal_path),
+            "the concurrent reset must remain observable"
+        );
+    }
+
     // scan_journal_reader stays non-fatal when the streaming scan hits
     // UnexpectedEof on a LATER frame's body (a second frame whose body extends
     // past the shrunken journal): the streaming-scan error is caught, a warning

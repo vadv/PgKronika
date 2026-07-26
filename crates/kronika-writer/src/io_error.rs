@@ -3,7 +3,18 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Parent directory whose entry records a file name.
+///
+/// A bare relative path belongs to the current directory. Returning `.` for
+/// that case keeps directory synchronization identical for absolute, nested,
+/// and bare destination names.
+pub(crate) fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
 
 /// Filesystem operation that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,5 +90,25 @@ impl fmt::Display for FilesystemError {
 impl Error for FilesystemError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::parent_directory;
+
+    #[test]
+    fn parent_directory_covers_bare_relative_and_nested_names() {
+        assert_eq!(parent_directory(Path::new("segment.pgm")), Path::new("."));
+        assert_eq!(
+            parent_directory(Path::new("segments/segment.pgm")),
+            Path::new("segments")
+        );
+        assert_eq!(
+            parent_directory(Path::new("/var/lib/pgkronika/segment.pgm")),
+            Path::new("/var/lib/pgkronika")
+        );
     }
 }

@@ -12,7 +12,8 @@ use arrow_array::RecordBatch;
 use arrow_select::concat::concat_batches;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::codec::{
@@ -156,6 +157,43 @@ pub(crate) fn compact_section_bound_for_contract(
     })
 }
 
+/// Bound a compact section whose schema is validated outside the registry.
+///
+/// Dictionary schemas are part of PGM but are not `TypeContract` entries.
+/// Their input Parquet metadata supplies a conservative uncompressed byte
+/// count per physical column. Summing those counts across journal parts cannot
+/// underestimate the normalized output: duplicate removal can only reduce
+/// rows and value bytes. Page and body framing are added with the same
+/// allowances as registered sections.
+///
+/// # Errors
+///
+/// Returns [`CodecError::TooManyRows`] above the section cap or
+/// [`CodecError::SectionTooLarge`] when checked arithmetic overflows.
+pub fn compact_unregistered_bound(
+    rows: usize,
+    column_uncompressed_bytes: &[usize],
+) -> Result<CompactSectionBound, CodecError> {
+    check_row_cap(rows)?;
+    let mut decoded_arrow_bytes = 0_usize;
+    let mut plain_body_bytes = add(
+        BODY_FRAMING_BYTES,
+        mul(column_uncompressed_bytes.len(), BODY_COLUMN_FRAMING_BYTES)?,
+    )?;
+    let mut max_column_page_bytes = 0_usize;
+    for &column_bytes in column_uncompressed_bytes {
+        decoded_arrow_bytes = add(decoded_arrow_bytes, column_bytes)?;
+        let page = add(column_bytes, PAGE_FRAMING_BYTES)?;
+        max_column_page_bytes = max_column_page_bytes.max(page);
+        plain_body_bytes = add(plain_body_bytes, page)?;
+    }
+    Ok(CompactSectionBound {
+        decoded_arrow_bytes,
+        plain_body_bytes,
+        max_column_page_bytes,
+    })
+}
+
 /// Bound one section decode before Arrow arrays are allocated.
 ///
 /// `declared_uncompressed_bytes` is the checked sum from Parquet column-chunk
@@ -197,6 +235,37 @@ pub(crate) fn read_work_memory_bound_for_contract(
 /// Returns [`CodecError::SectionTooLarge`] if the estimate overflows.
 pub fn read_work_memory(stored_bytes: usize, decoded_bytes: usize) -> Result<usize, CodecError> {
     add(add(stored_bytes, mul(decoded_bytes, 2)?)?, 1024 * 1024)
+}
+
+/// Whether metadata matches the current compact Parquet profile.
+///
+/// Dictionary section values are already the PGM dictionary. Allowing Parquet
+/// dictionary pages around them would let the declared uncompressed size count
+/// one value plus indexes while Arrow materializes that value once per row.
+/// Current collection and final dictionary writers both use this same compact
+/// profile, including one row group, Zstandard, no statistics or page indexes,
+/// and no embedded Arrow metadata.
+#[must_use]
+pub fn compact_parquet_profile_matches(metadata: &ParquetMetaData) -> bool {
+    let file = metadata.file_metadata();
+    metadata.num_row_groups() == 1
+        && file.created_by() == Some("")
+        && file.key_value_metadata().is_none_or(Vec::is_empty)
+        && metadata
+            .row_groups()
+            .iter()
+            .flat_map(parquet::file::metadata::RowGroupMetaData::columns)
+            .all(|column| {
+                matches!(column.compression(), Compression::ZSTD(_))
+                    && column.statistics().is_none()
+                    && column.column_index_length().is_none()
+                    && column.offset_index_length().is_none()
+                    && column.encodings().contains(&Encoding::PLAIN)
+                    && column
+                        .encodings()
+                        .iter()
+                        .all(|encoding| matches!(encoding, Encoding::PLAIN | Encoding::RLE))
+            })
 }
 
 /// Parquet properties for every final data and dictionary section.
@@ -363,7 +432,6 @@ fn add(left: usize, right: usize) -> Result<usize, CodecError> {
 #[cfg(test)]
 mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use parquet::basic::Encoding;
 
     use super::*;
     use crate::pg_stat_archiver::PgStatArchiver;
@@ -408,7 +476,7 @@ mod tests {
 
     #[test]
     fn compact_profile_has_one_group_plain_values_and_no_page_indexes() {
-        let batch = archiver_batch(&[PgStatArchiver {
+        let row = PgStatArchiver {
             ts: Ts(7),
             archived_count: 2,
             last_archived_wal: None,
@@ -417,7 +485,18 @@ mod tests {
             last_failed_wal: None,
             last_failed_time: None,
             stats_reset: None,
-        }]);
+        };
+        let collection_body =
+            PgStatArchiver::encode(std::slice::from_ref(&row)).expect("collection body");
+        let collection =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(collection_body))
+                .expect("collection metadata");
+        assert!(
+            !compact_parquet_profile_matches(collection.metadata()),
+            "the collection profile is not a final compact dictionary body"
+        );
+
+        let batch = archiver_batch(&[row]);
         let body = encode_compact_batch(1_008_001, &batch).expect("compact");
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(body)).expect("metadata");
@@ -435,6 +514,7 @@ mod tests {
                 "Parquet dictionaries stay disabled"
             );
         }
+        assert!(compact_parquet_profile_matches(builder.metadata()));
     }
 
     #[test]
@@ -488,5 +568,21 @@ mod tests {
         )
         .expect("checked hostile work");
         assert!(hostile > READ_WORK_MEMORY_LIMIT);
+    }
+
+    #[test]
+    fn unregistered_dictionary_bound_uses_the_same_page_and_reader_ceiling() {
+        let ordinary = compact_unregistered_bound(1_024, &[8_192, 65_536]).expect("bound");
+        assert!(ordinary.max_column_page_bytes <= COMPACTION_PAGE_BYTES);
+        assert!(ordinary.plain_body_bytes <= MAX_SECTION_BYTES);
+        assert!(
+            read_work_memory(ordinary.plain_body_bytes, ordinary.decoded_arrow_bytes)
+                .expect("read work")
+                <= READ_WORK_MEMORY_LIMIT
+        );
+
+        let oversized_page =
+            compact_unregistered_bound(1_024, &[COMPACTION_PAGE_BYTES]).expect("bound");
+        assert!(oversized_page.max_column_page_bytes > COMPACTION_PAGE_BYTES);
     }
 }

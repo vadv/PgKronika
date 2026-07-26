@@ -68,7 +68,7 @@ pub struct Catalog {
     pub min_ts: i64,
     /// Maximal timestamp of the segment, unix microseconds.
     pub max_ts: i64,
-    /// `str_id` of `{cluster_id}/{pg_system_identifier}`; 0 = not set.
+    /// Opaque source identifier; 0 = not set.
     pub source_id: u64,
     /// Container format version, [`crate::FORMAT_VERSION`] for new files.
     pub format_version: u32,

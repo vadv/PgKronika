@@ -47,8 +47,8 @@ impl SegmentState {
 
 /// Why the open segment must seal now, or `None` to keep collecting.
 ///
-/// Forced ticks seal immediately, `max_bytes = 0` keeps the legacy one-tick
-/// segment mode, and otherwise the raw journal size or segment age closes the
+/// Forced ticks seal immediately, `max_bytes = 0` selects one segment per
+/// collection window, and otherwise raw journal size or segment age closes the
 /// segment.
 pub(crate) const fn seal_reason(
     forced: bool,

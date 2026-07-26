@@ -190,12 +190,9 @@ bodies are ordered by ascending `type_id`.
 | 32 | `crc32c` | `u32` | CRC32C of entries and metadata with this field zeroed. |
 | 36 | `reserved` | `u32` | Reserved; current writers store zero. |
 
-The low-level `Catalog` and `PartMeta` APIs historically document `source_id`
-as the `StrId` of `{cluster_id}/{pg_system_identifier}`. The current collector
-instead copies an arbitrary `KRONIKA_SOURCE_ID` into the field and does not
-guarantee a matching `dict.strings` record. Readers of current collector output
-must therefore treat `source_id` as an opaque identifier, not a resolvable
-string reference.
+The collector copies `KRONIKA_SOURCE_ID` into this field and does not require a
+matching `dict.strings` record. Readers treat `source_id` as an opaque
+identifier, not a resolvable string reference.
 
 ### Tail index: 8 bytes
 
@@ -522,7 +519,7 @@ amount and grouping of collected data through `pg_kronika-collector`:
 | `KRONIKA_PG_PLAN_TEXT_BUDGET` | 8 MiB | Total plan-text budget per read; zero disables plan text. |
 | `KRONIKA_SEGMENT_MAX_BYTES` | 64 MiB | Seals after this many raw `active.parts` bytes; zero seals every window. It changes file granularity, not Parquet compression. |
 | `KRONIKA_SEGMENT_MAX_AGE_S` | 900 s | Maximum age of an open segment. It mainly changes time span and file count. |
-| `KRONIKA_JOURNAL_MAX_BYTES` | 1 GiB | Before every append except the first frame, exceeding this threshold causes an early seal. It is not a target PGM size. |
+| `KRONIKA_JOURNAL_MAX_BYTES` | 1 GiB | Hard cap checked before every append. If an open segment exists, the collector seals it before retrying the candidate; one window larger than the cap is rejected. It is not a target PGM size. |
 
 Changing source limits trades observability for disk use. Segment age and
 rotation size change how many windows are compacted into each PGM; they do not

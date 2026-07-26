@@ -1915,29 +1915,15 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_cross_part_dictionary_placement_rebuilds_exactly() {
+    fn cross_part_dictionary_placement_conflict_fails_the_seal() {
         let value = b"same normalized pattern";
         let limits = DictLimits::new(64, 1_024).expect("dictionary limits");
-        let (first_bytes, first_sections) = error_part(value, limits, false, 1_000);
-        let (second_bytes, second_sections) = error_part(value, limits, true, 2_000);
-        let mut sealed_sections = first_sections;
-        sealed_sections.extend(second_sections);
-        let sealed_bytes = seal_sections(&sealed_sections, 1_000, 2_000);
-        let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
-        let context = sealed_context();
-        let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold rebuild");
-
-        let mut builder = live_builder();
-        fold_bytes(
-            &mut builder,
-            &[first_bytes.as_slice(), second_bytes.as_slice()],
-        );
-
-        let (_cache_dir, store) = store(&sealed_bytes);
-        let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT)
-            .expect("reconcile");
-        assert!(!outcome.was_promoted());
-        assert_eq!(outcome.facts().observations(), rebuilt.observations());
+        let (first_bytes, _first_sections) = error_part(value, limits, false, 1_000);
+        let (second_bytes, _second_sections) = error_part(value, limits, true, 2_000);
+        assert!(matches!(
+            try_seal_part_bytes(&[first_bytes, second_bytes]),
+            Err(SealError::Codec(CodecError::SchemaMismatch))
+        ));
     }
 
     #[test]
@@ -1967,28 +1953,12 @@ mod tests {
     }
 
     #[test]
-    fn source_zero_parts_rebuild_after_dictionary_compaction() {
-        let (dictionary_bytes, sections) = dictionary_only_part();
-        let sealed_bytes = seal_sections_for_source(&sections, 0, 0, 0);
-        let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed dictionary");
-        let mut builder = LiveBuilder::new(LIMIT).expect("valid live builder");
-        fold_bytes(&mut builder, &[dictionary_bytes.as_slice()]);
-
-        let (_cache_dir, store) = store(&sealed_bytes);
-        let outcome = reconcile_seal(
-            &builder.publish(),
-            &sealed_unit,
-            &sealed_context(),
-            &store,
-            &LIMIT,
-        )
-        .expect("reconcile");
-
-        assert!(!outcome.was_promoted());
-        assert!(
-            outcome.persist_error().is_none(),
-            "an empty timestamp envelope remains durably admissible"
-        );
+    fn dictionary_only_parts_do_not_publish_a_segment() {
+        let (dictionary_bytes, _sections) = dictionary_only_part();
+        assert!(matches!(
+            try_seal_part_bytes(&[dictionary_bytes]),
+            Err(SealError::Empty)
+        ));
     }
 
     #[test]

@@ -55,7 +55,8 @@ pub use codec::{
 };
 pub use compaction::{
     COMPACTION_MEMORY_LIMIT, COMPACTION_PAGE_BYTES, COMPACTION_ZSTD_LEVEL, CompactSectionBound,
-    READ_WORK_MEMORY_LIMIT, canonicalize_batches, compact_section_bound, compaction_memory_bound,
+    READ_WORK_MEMORY_LIMIT, canonicalize_batches, compact_parquet_profile_matches,
+    compact_section_bound, compact_unregistered_bound, compaction_memory_bound,
     encode_compact_batch, encode_compact_ordered_batch, read_work_memory, read_work_memory_bound,
 };
 // Only the in-crate derive and tests need the shared section-body entry points.

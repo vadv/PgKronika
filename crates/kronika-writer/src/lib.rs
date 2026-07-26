@@ -6,16 +6,17 @@
 //! values retain their bytes, while flushed values retain only identity and
 //! placement metadata for deduplication.
 //!
-//! [`Journal`] appends self-contained PGM parts as synchronized `PGMP` frames
-//! in `active.parts`. Opening a journal truncates only a torn final frame;
-//! middle or terminal media damage remains in [`OpenReport`].
+//! [`Journal`] appends self-contained PGM parts as synchronized journal frames
+//! in `active.parts`. Opening a journal truncates only a recoverable final
+//! frame; middle or non-recoverable terminal damage remains in [`OpenReport`].
 //! [`JournalConfig::max_journal_len`] is the hard growth bound, reported as
 //! [`JournalError::Full`] so the collector can seal early.
 //!
-//! [`seal`] streams one journal part at a time into a sibling temporary file,
-//! writes and synchronizes the end catalog, and publishes the result without
-//! overwriting an existing destination. It never resets the journal; the
-//! caller does so only after a successful seal.
+//! [`seal`] validates the journal, normalizes its exact dictionary, creates
+//! bounded sorted runs, and writes one compact body per present registered
+//! type. It synchronizes a sibling temporary and publishes it without
+//! overwriting an existing destination. It never resets the journal; the caller
+//! does so only after a successful seal.
 
 mod buffer;
 pub mod dict;

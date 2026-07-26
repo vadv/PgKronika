@@ -8,7 +8,8 @@ use std::collections::hash_map::Entry as MapEntry;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kronika_format::{
-    Catalog, Crc32c, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c,
+    Catalog, Crc32c, ENTRY_LEN, Entry, FORMAT_VERSION, MAGIC, META_LEN, TAIL_INDEX_LEN, TailIndex,
+    crc32c,
 };
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
@@ -17,8 +18,6 @@ use kronika_registry::{
 
 use crate::{Dictionary, ReadError, Stored, decode_dictionary};
 
-/// Upper bound on the catalog block, checked before allocation.
-const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 const SCRUB_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Completed PGM section-body I/O performed by one open unit.
@@ -393,8 +392,23 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
     let bad_len = || ReadError::BadCatalogLen {
         catalog_len: tail.catalog_len,
     };
-    if catalog_len > MAX_CATALOG_BYTES {
+    let entry_bytes = catalog_len
+        .checked_sub(META_LEN as u64)
+        .ok_or_else(bad_len)?;
+    if !entry_bytes.is_multiple_of(ENTRY_LEN as u64) {
         return Err(bad_len());
+    }
+    let claimed_entries =
+        usize::try_from(entry_bytes / ENTRY_LEN as u64).map_err(|_error| bad_len())?;
+    let max_entries = registry()
+        .len()
+        .checked_add(2)
+        .ok_or(ReadError::CounterOverflow)?;
+    if claimed_entries > max_entries {
+        return Err(ReadError::TooManyCatalogEntries {
+            entries: claimed_entries,
+            max: max_entries,
+        });
     }
     let catalog_at = tail_at.checked_sub(catalog_len).ok_or_else(bad_len)?;
     if catalog_at < MAGIC.len() as u64 {
@@ -415,10 +429,6 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
             version: catalog.format_version,
         });
     }
-    let max_entries = registry()
-        .len()
-        .checked_add(2)
-        .ok_or(ReadError::CounterOverflow)?;
     if catalog.entries.len() > max_entries {
         return Err(ReadError::TooManyCatalogEntries {
             entries: catalog.entries.len(),
@@ -499,6 +509,47 @@ mod tests {
                 source_id: 1,
             },
         )
+    }
+
+    fn one_row_body() -> Vec<u8> {
+        BgwriterCheckpointer::encode(&[BgwriterCheckpointer {
+            ts: kronika_registry::Ts(1),
+            checkpoints_timed: 0,
+            checkpoints_req: 0,
+            checkpoint_write_time: 0.0,
+            checkpoint_sync_time: 0.0,
+            buffers_checkpoint: 0,
+            restartpoints_timed: None,
+            restartpoints_req: None,
+            restartpoints_done: None,
+            buffers_clean: 0,
+            maxwritten_clean: 0,
+            buffers_backend: None,
+            buffers_backend_fsync: None,
+            buffers_alloc: 0,
+            bgwriter_stats_reset: kronika_registry::Ts(1),
+            checkpointer_stats_reset: None,
+        }])
+        .expect("section")
+    }
+
+    fn container(entries: Vec<Entry>, bodies: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        for body in bodies {
+            bytes.extend_from_slice(body);
+        }
+        bytes.extend_from_slice(
+            &Catalog {
+                entries,
+                min_ts: 1,
+                max_ts: 1,
+                source_id: 0,
+                format_version: FORMAT_VERSION,
+            }
+            .try_encode()
+            .expect("catalog"),
+        );
+        bytes
     }
 
     #[test]
@@ -597,44 +648,7 @@ mod tests {
 
     #[test]
     fn duplicate_unknown_and_unpacked_catalogs_fail_at_open() {
-        let body = BgwriterCheckpointer::encode(&[BgwriterCheckpointer {
-            ts: kronika_registry::Ts(1),
-            checkpoints_timed: 0,
-            checkpoints_req: 0,
-            checkpoint_write_time: 0.0,
-            checkpoint_sync_time: 0.0,
-            buffers_checkpoint: 0,
-            restartpoints_timed: None,
-            restartpoints_req: None,
-            restartpoints_done: None,
-            buffers_clean: 0,
-            maxwritten_clean: 0,
-            buffers_backend: None,
-            buffers_backend_fsync: None,
-            buffers_alloc: 0,
-            bgwriter_stats_reset: kronika_registry::Ts(1),
-            checkpointer_stats_reset: None,
-        }])
-        .expect("section");
-
-        let container = |entries: Vec<Entry>, bodies: &[&[u8]]| {
-            let mut bytes = MAGIC.to_vec();
-            for body in bodies {
-                bytes.extend_from_slice(body);
-            }
-            bytes.extend_from_slice(
-                &Catalog {
-                    entries,
-                    min_ts: 1,
-                    max_ts: 1,
-                    source_id: 0,
-                    format_version: FORMAT_VERSION,
-                }
-                .try_encode()
-                .expect("catalog"),
-            );
-            bytes
-        };
+        let body = one_row_body();
         let len = u64::try_from(body.len()).expect("body length");
         let first = Entry {
             type_id: 1_006_001,
@@ -683,6 +697,36 @@ mod tests {
         assert!(matches!(
             PgmUnit::open(unpacked.as_slice()),
             Err(ReadError::Codec(CodecError::SchemaMismatch))
+        ));
+    }
+
+    #[test]
+    fn too_many_catalog_entries_fail_before_catalog_allocation() {
+        let body = one_row_body();
+        let len = u64::try_from(body.len()).expect("body length");
+        let max_entries = registry().len() + 2;
+        let mut offset = MAGIC.len() as u64;
+        let entries = (0..=max_entries)
+            .map(|index| {
+                let entry = Entry {
+                    type_id: u32::try_from(index + 1).expect("test type id"),
+                    flags: 0,
+                    offset,
+                    len,
+                    rows: 1,
+                    crc32c: crc32c(&body),
+                };
+                offset += len;
+                entry
+            })
+            .collect();
+        let bodies = vec![body.as_slice(); max_entries + 1];
+        let too_many = container(entries, &bodies);
+
+        assert!(matches!(
+            PgmUnit::open(too_many.as_slice()),
+            Err(ReadError::TooManyCatalogEntries { entries, max })
+                if entries == max_entries + 1 && max == max_entries
         ));
     }
 }

@@ -31,11 +31,13 @@ const RULES: &[(&str, &[&str])] = &[
     (
         "pg_kronika-web",
         // No source-*: the PostgreSQL client and /proc readers must not
-        // enter the web process.
+        // enter the web process. Writer is optional and used only by the
+        // exact-head qualification executable.
         &[
             "kronika-format",
             "kronika-derive",
             "kronika-registry",
+            "kronika-writer",
             "kronika-reader",
             "kronika-analytics",
             "kronika-store",
