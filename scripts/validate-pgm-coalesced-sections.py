@@ -46,14 +46,6 @@ def require_git_oid(value: Any, name: str) -> str:
     return value
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(64 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def main() -> None:
     report_path = Path(sys.argv[1]) if len(sys.argv) == 2 else DEFAULT_REPORT
     if len(sys.argv) > 2:

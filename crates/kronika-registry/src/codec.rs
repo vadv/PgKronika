@@ -147,6 +147,12 @@ pub enum CodecError {
     /// A variable-width dictionary section uses Parquet dictionary encoding,
     /// whose index expansion is not bounded by encoded page sizes.
     DictionaryEncodingUnsupported,
+    /// A page declares an encoding outside the admitted profile; delta and
+    /// stream-split encodings materialize more bytes than the pages declare.
+    UnsupportedPageEncoding {
+        /// The raw Parquet encoding id.
+        encoding: i32,
+    },
     /// A column required by the contract is absent from the decoded file.
     MissingColumn {
         /// The missing column name.
@@ -244,6 +250,9 @@ impl fmt::Display for CodecError {
             Self::DictionaryEncodingUnsupported => {
                 f.write_str("Parquet dictionary encoding is not admitted for dictionary sections")
             }
+            Self::UnsupportedPageEncoding { encoding } => {
+                write!(f, "Parquet page encoding {encoding} is outside the profile")
+            }
             Self::MissingColumn { name } => write!(f, "decoded section lacks column {name:?}"),
             Self::ColumnType { name } => write!(f, "decoded column {name:?} has the wrong type"),
             Self::NullInRequiredColumn { name } => {
@@ -290,6 +299,7 @@ impl Error for CodecError {
             | Self::TooManyRowGroups { .. }
             | Self::InvalidPageLayout
             | Self::DictionaryEncodingUnsupported
+            | Self::UnsupportedPageEncoding { .. }
             | Self::MissingColumn { .. }
             | Self::ColumnType { .. }
             | Self::NullInRequiredColumn { .. }

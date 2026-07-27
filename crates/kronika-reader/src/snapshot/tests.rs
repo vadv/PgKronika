@@ -1977,6 +1977,51 @@ fn repeated_identity_churn_is_bounded() {
 }
 
 #[test]
+fn stale_proof_retry_succeeds_after_one_interruption() {
+    let attempts = std::cell::Cell::new(0_usize);
+
+    let value = retry_stale_proof(|| {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() == 1 {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "stale proof"))
+        } else {
+            Ok(attempts.get())
+        }
+    })
+    .expect("the proof settles on the second attempt");
+
+    assert_eq!(value, 2);
+}
+
+#[test]
+fn stale_proof_retry_is_bounded() {
+    let attempts = std::cell::Cell::new(0_usize);
+
+    let error = retry_stale_proof(|| -> io::Result<()> {
+        attempts.set(attempts.get() + 1);
+        Err(io::Error::new(io::ErrorKind::Interrupted, "stale proof"))
+    })
+    .expect_err("a persistently changing journal is reported");
+
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(attempts.get(), MAX_CONSISTENT_SCAN_ATTEMPTS);
+}
+
+#[test]
+fn stale_proof_retry_keeps_other_errors_unretried() {
+    let attempts = std::cell::Cell::new(0_usize);
+
+    let error = retry_stale_proof(|| -> io::Result<()> {
+        attempts.set(attempts.get() + 1);
+        Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt sealed"))
+    })
+    .expect_err("corruption is not retried");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(attempts.get(), 1);
+}
+
+#[test]
 fn non_journal_corruption_is_not_retried_during_journal_churn() {
     let identity_reads = std::cell::Cell::new(0_usize);
     let attempts = std::cell::Cell::new(0_usize);

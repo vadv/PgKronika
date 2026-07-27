@@ -325,16 +325,16 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be opened or scanned.
     pub fn open(root: &Path) -> io::Result<Self> {
         let dir = LocalDir::open(root)?;
-        let (scan, journal_identity, journal_prefix_digest) = full_scan_consistent(&dir, &[])?;
+        let (scan, journal_identity, journal_prefix_digest, sealed_active_generation_match) =
+            retry_stale_proof(|| {
+                let (scan, identity, prefix_digest) = full_scan_consistent(&dir, &[])?;
+                let matched =
+                    prove_sealed_generation_matches_active(&dir, &scan, identity, prefix_digest)?;
+                Ok((scan, identity, prefix_digest, matched))
+            })?;
         let last_valid_len = scan.valid_len;
         let journal_descriptors_complete = journal_descriptors_complete(&scan);
         let tail_pending = tail_pending(journal_identity, last_valid_len);
-        let sealed_active_generation_match = prove_sealed_generation_matches_active(
-            &dir,
-            &scan,
-            journal_identity,
-            journal_prefix_digest,
-        )?;
         Ok(Self {
             dir,
             scan,
@@ -367,9 +367,10 @@ impl LocalDirSnapshot {
     ///
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh(&mut self) -> io::Result<()> {
-        let (scan, identity, transition, prefix_digest) = self.scan_full_consistent()?;
-        self.install_baseline(scan, identity, prefix_digest, transition)?;
-        Ok(())
+        retry_stale_proof(|| {
+            let (scan, identity, transition, prefix_digest) = self.scan_full_consistent()?;
+            self.install_baseline(scan, identity, prefix_digest, transition)
+        })
     }
 
     /// Re-scan the store incrementally, reading only the journal tail.
@@ -387,9 +388,10 @@ impl LocalDirSnapshot {
     ///
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh_incremental(&mut self) -> io::Result<()> {
-        let (scan, identity, transition, prefix_digest) = self.scan_incremental_consistent()?;
-        self.install_baseline(scan, identity, prefix_digest, transition)?;
-        Ok(())
+        retry_stale_proof(|| {
+            let (scan, identity, transition, prefix_digest) = self.scan_incremental_consistent()?;
+            self.install_baseline(scan, identity, prefix_digest, transition)
+        })
     }
 
     /// Re-scan incrementally and report the semantic delta of the scan.
@@ -406,6 +408,10 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be re-scanned or if a
     /// generation counter would overflow.
     pub fn refresh_incremental_delta(&mut self) -> io::Result<RefreshDelta> {
+        retry_stale_proof(|| self.refresh_incremental_delta_attempt())
+    }
+
+    fn refresh_incremental_delta_attempt(&mut self) -> io::Result<RefreshDelta> {
         let previous_valid_len = self.last_valid_len;
         let previous_sealed = Arc::clone(&self.scan.sealed);
         let previous_view_generation = self.view_generation;
@@ -1651,6 +1657,19 @@ fn with_stable_journal_identity<T>(
             "active.parts changed during {MAX_CONSISTENT_SCAN_ATTEMPTS} consecutive scan attempts"
         ),
     ))
+}
+
+/// Retries an `Interrupted` scan-plus-proof up to
+/// `MAX_CONSISTENT_SCAN_ATTEMPTS` times: the sealed/active equivalence proof
+/// races with seal→reset and must observe a settled journal.
+fn retry_stale_proof<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for _attempt in 1..MAX_CONSISTENT_SCAN_ATTEMPTS {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+    operation()
 }
 
 fn journal_prefix_digest(dir: &LocalDir, valid_len: u64) -> io::Result<JournalPrefixDigest> {

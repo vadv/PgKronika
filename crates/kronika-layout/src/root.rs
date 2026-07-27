@@ -3327,8 +3327,7 @@ fn evidence_name(nonce: u64, slot: u8) -> String {
 
 fn available_evidence_name(root: &File, nonce: u64, _current_name: &CStr) -> Option<CString> {
     (0..MAX_ROOT_COLLISION_SLOTS).find_map(|slot| {
-        let candidate = CString::new(evidence_name(nonce, slot))
-            .expect("bounded evidence names contain no NUL");
+        let candidate = CString::new(evidence_name(nonce, slot)).ok()?;
         match stat_no_follow_name(root, &candidate) {
             Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 Some(candidate)

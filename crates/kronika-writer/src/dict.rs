@@ -8,7 +8,7 @@ use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, RecordBatch, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
-use kronika_format::{EntrySnapshot, Placement, SegmentDicts};
+use kronika_format::{DictLimits, EntrySnapshot, Placement, SegmentDicts};
 use kronika_registry::{
     CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
     SEALED_DATA_PAGE_BYTES, SealedPlainColumnSize, sealed_plain_body_bound,
@@ -112,6 +112,17 @@ pub(crate) fn encode_sealed_entries<'a>(
         sealed_dictionary_body_bound(Placement::Blobs, blob_rows, blob_bytes, truncated_blobs)?;
     }
     encode_entries_with_properties(entries, &SEALED_DICT_WRITER_PROPS)
+}
+
+/// Proves that every value the limits admit can also be sealed.
+///
+/// # Errors
+///
+/// Returns [`CodecError::PlainPageTooLarge`] when `truncate_limit` admits a
+/// single stored value that cannot fit the sealed one-page budget.
+pub fn validate_dict_limits_for_seal(limits: DictLimits) -> Result<(), CodecError> {
+    sealed_dictionary_body_bound(Placement::Strings, 1, limits.truncate_limit(), 0)?;
+    sealed_dictionary_body_bound(Placement::Blobs, 1, limits.truncate_limit(), 1).map(drop)
 }
 
 /// Prove one normalized dictionary body's PLAIN page and encoded-size bounds.
@@ -308,6 +319,16 @@ mod tests {
 
     use super::encode;
     use crate::Interner;
+
+    #[test]
+    fn seal_compatible_limits_are_validated_at_configuration() {
+        use super::validate_dict_limits_for_seal;
+
+        validate_dict_limits_for_seal(DictLimits::new(4096, 64 * 1024).expect("collector limits"))
+            .expect("collector limits fit the sealed page budget");
+        let oversized = DictLimits::new(4096, 1024 * 1024).expect("valid but unsealable limits");
+        assert!(validate_dict_limits_for_seal(oversized).is_err());
+    }
 
     #[test]
     fn an_empty_window_encodes_no_sections() {

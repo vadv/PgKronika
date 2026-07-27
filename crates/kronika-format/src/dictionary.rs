@@ -9,7 +9,10 @@
 //!
 //! The core invariants are:
 //!
-//! - every issued [`StrId`] resolves inside the same [`SegmentDicts`];
+//! - every issued [`StrId`] resolves inside the same [`SegmentDicts`]; a
+//!   segment replayed from a damaged journal may violate this when the frame
+//!   carrying an id's dictionary entry was lost — readers treat such ids as
+//!   unresolvable rather than failing;
 //! - one id is never stored in both `dict.strings` and `dict.blobs`;
 //! - `dict.hot_strings` is always a subset of `dict.strings`;
 //! - truncated values keep `str_id`, `full_len`, and `full_sha256` for the

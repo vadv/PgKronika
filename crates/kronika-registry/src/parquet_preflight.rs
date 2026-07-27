@@ -1,6 +1,6 @@
 //! Allocation-safe Parquet footer and page admission before Arrow decode.
 
-use parquet::format::{FileMetaData, PageHeader, PageType};
+use parquet::format::{Encoding, FileMetaData, PageHeader, PageType};
 use parquet::thrift::TSerializable;
 use thrift::protocol::{
     TFieldIdentifier, TInputProtocol, TListIdentifier, TMapIdentifier, TMessageIdentifier,
@@ -40,7 +40,8 @@ pub fn validate_parquet_decode_work(
 /// # Errors
 ///
 /// Returns [`CodecError::DictionaryEncodingUnsupported`] when the footer
-/// declares a dictionary page, or the same bounded-layout errors as
+/// declares a dictionary page, [`CodecError::UnsupportedPageEncoding`] for a
+/// page encoding outside PLAIN/RLE, or the same bounded-layout errors as
 /// [`validate_parquet_decode_work`].
 pub fn validate_plain_parquet_decode_work(
     body: &[u8],
@@ -272,6 +273,7 @@ fn validate_file_metadata(
                 compressed,
                 &mut data_values,
                 &mut saw_dictionary,
+                allow_dictionary,
             )?;
             offset = offset
                 .checked_add(header_len)
@@ -294,12 +296,37 @@ fn validate_file_metadata(
     Ok(())
 }
 
+fn validate_data_encoding(encoding: Encoding, allow_dictionary: bool) -> Result<(), CodecError> {
+    let admitted = encoding == Encoding::PLAIN
+        || encoding == Encoding::RLE
+        || (allow_dictionary
+            && (encoding == Encoding::PLAIN_DICTIONARY || encoding == Encoding::RLE_DICTIONARY));
+    if admitted {
+        Ok(())
+    } else {
+        Err(CodecError::UnsupportedPageEncoding {
+            encoding: encoding.0,
+        })
+    }
+}
+
+fn validate_level_encoding(encoding: Encoding) -> Result<(), CodecError> {
+    if encoding == Encoding::RLE || encoding == Encoding::BIT_PACKED {
+        Ok(())
+    } else {
+        Err(CodecError::UnsupportedPageEncoding {
+            encoding: encoding.0,
+        })
+    }
+}
+
 fn validate_page_header(
     header: &PageHeader,
     uncompressed: usize,
     compressed: usize,
     data_values: &mut usize,
     saw_dictionary: &mut bool,
+    allow_dictionary: bool,
 ) -> Result<(), CodecError> {
     match header.type_ {
         PageType::DATA_PAGE => {
@@ -312,6 +339,9 @@ fn validate_page_header(
                         && header.index_page_header.is_none()
                 })
                 .ok_or(CodecError::InvalidPageLayout)?;
+            validate_data_encoding(page.encoding, allow_dictionary)?;
+            validate_level_encoding(page.definition_level_encoding)?;
+            validate_level_encoding(page.repetition_level_encoding)?;
             add_page_values(data_values, page.num_values)?;
         }
         PageType::DATA_PAGE_V2 => {
@@ -324,6 +354,7 @@ fn validate_page_header(
                         && header.index_page_header.is_none()
                 })
                 .ok_or(CodecError::InvalidPageLayout)?;
+            validate_data_encoding(page.encoding, allow_dictionary)?;
             let values = checked_nonnegative(i64::from(page.num_values))?;
             let nulls = checked_nonnegative(i64::from(page.num_nulls))?;
             let rows = checked_nonnegative(i64::from(page.num_rows))?;
@@ -349,6 +380,11 @@ fn validate_page_header(
                         && header.index_page_header.is_none()
                 })
                 .ok_or(CodecError::InvalidPageLayout)?;
+            if page.encoding != Encoding::PLAIN && page.encoding != Encoding::PLAIN_DICTIONARY {
+                return Err(CodecError::UnsupportedPageEncoding {
+                    encoding: page.encoding.0,
+                });
+            }
             let values = checked_nonnegative(i64::from(page.num_values))?;
             if *saw_dictionary || values > page_value_limit() {
                 return Err(CodecError::InvalidPageLayout);
@@ -847,6 +883,57 @@ mod tests {
             err,
             CodecError::Section { source, .. }
                 if matches!(*source, CodecError::InvalidPageLayout)
+        ));
+    }
+
+    fn plain_binary_body(encoding: parquet::basic::Encoding) -> Vec<u8> {
+        use std::sync::Arc;
+
+        let column: arrow_array::ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![
+            b"alpha".as_slice(),
+            b"beta".as_slice(),
+        ]));
+        let batch =
+            arrow_array::RecordBatch::try_from_iter([("bytes", column)]).expect("build batch");
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_encoding(encoding)
+            .build();
+        let mut body = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut body, batch.schema(), Some(properties))
+                .expect("create writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+        body
+    }
+
+    #[test]
+    fn delta_byte_array_data_pages_are_rejected() {
+        let body = plain_binary_body(parquet::basic::Encoding::PLAIN);
+        super::validate_plain_parquet_decode_work(&body, MAX_DECODED_SECTION_BYTES)
+            .expect("PLAIN data pages pass the profile");
+
+        let body = plain_binary_body(parquet::basic::Encoding::DELTA_BYTE_ARRAY);
+        assert!(matches!(
+            super::validate_plain_parquet_decode_work(&body, MAX_DECODED_SECTION_BYTES),
+            Err(CodecError::UnsupportedPageEncoding { .. })
+        ));
+    }
+
+    #[test]
+    fn non_rle_level_encodings_are_rejected() {
+        let body = plain_binary_body(parquet::basic::Encoding::PLAIN);
+        let body = rewrite_first_page_header(body, |header| {
+            let data = header
+                .data_page_header
+                .as_mut()
+                .expect("dictionary is disabled, first page is data");
+            data.definition_level_encoding = super::Encoding::DELTA_BINARY_PACKED;
+        });
+        assert!(matches!(
+            super::validate_plain_parquet_decode_work(&body, MAX_DECODED_SECTION_BYTES),
+            Err(CodecError::UnsupportedPageEncoding { .. })
         ));
     }
 

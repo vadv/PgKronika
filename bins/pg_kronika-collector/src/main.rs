@@ -48,7 +48,7 @@ use buffering::{
 };
 use config::Config;
 use coverage::{CoverageInputs, collect_coverage_records, push_coverage, snapshot_coverage};
-use kronika_layout::{DataRoot, LayoutLimits, TemporaryKind, WriterOwner};
+use kronika_layout::{DataRoot, LayoutLimits, QuarantineStatus, TemporaryKind, WriterOwner};
 use kronika_source_log::LogCollector;
 use kronika_source_os::{OsScope, ProcFs, detect_container};
 use kronika_source_pg::pool::{ConnectionPool, DEFAULT_MAX_DATABASES};
@@ -117,7 +117,9 @@ fn cleanup_writer_temporaries(owner: &WriterOwner, limits: LayoutLimits) -> Resu
                     field("status", format!("{:?}", outcome.status)),
                 ],
             );
-            quarantined += 1;
+            if matches!(outcome.status, QuarantineStatus::Quarantined { .. }) {
+                quarantined += 1;
+            }
         }
     }
     Ok(quarantined)
@@ -143,6 +145,8 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
     config.validate_runtime_paths()?;
+    kronika_writer::dict::validate_dict_limits_for_seal(activity_dict_limits())
+        .context("dictionary limits admit a value above the sealed page budget")?;
     let data_root = DataRoot::open(&config.out_dir).context("open the data root")?;
     let writer_owner = acquire_collector_writer(&data_root, LayoutLimits::default())?;
 
