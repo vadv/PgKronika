@@ -1623,8 +1623,8 @@ mod tests {
 
         assert!(matches!(
             seal(&journal, &owner, address()),
-            Err(SealError::Part(
-                kronika_format::PartError::SectionCrc { .. }
+            Err(SealError::Codec(
+                kronika_registry::CodecError::SectionCrcMismatch { .. }
             ))
         ));
         assert_eq!(journal.parts().len(), 1, "journal remains recoverable");

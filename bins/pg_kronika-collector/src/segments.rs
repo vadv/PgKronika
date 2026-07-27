@@ -4,15 +4,19 @@ use crate::logging::{
 };
 use anyhow::{Context, Result};
 use kronika_format::{
-    Catalog, EntrySnapshot, FORMAT_VERSION, MAGIC, Placement, StrId, TAIL_INDEX_LEN, TailIndex,
+    Catalog, Crc32c, EntrySnapshot, FORMAT_VERSION, MAGIC, Placement, StrId, TAIL_INDEX_LEN,
+    TailIndex, validate_catalog_layout,
 };
-use kronika_layout::{DataRoot, FileKind, LayoutLimits, SegmentAddress, SegmentId, WriterOwner};
+use kronika_layout::{
+    FileKind, JournalRotationOutcome, LayoutError, LayoutLimits, PendingRootKind, QuarantineReason,
+    SegmentAddress, SegmentId, WriterOwner,
+};
 use kronika_registry::{
     CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_ROWS, sealed_data_body_bound,
 };
 use kronika_writer::{
-    FlushSummary, FlushedPart, Interner, Journal, JournalConfig, JournalError, SectionBuffers,
-    dict, seal,
+    FlushSummary, FlushedPart, Interner, Journal, JournalConfig, JournalError, JournalRecovery,
+    SectionBuffers, dict, seal,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -23,6 +27,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+const PGM_CRC_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AdmissionDictionaryValue {
@@ -538,23 +543,42 @@ where
     Ok(dest)
 }
 
-/// Structurally validates every canonical PGM before startup may open or mutate
-/// `active.parts`.
+/// Fully validates canonical PGM files and quarantines only damaged segments.
 ///
-/// Section bodies remain lazy: readers verify their CRCs when a query selects
-/// them. Startup reads only the magic, tail, and bounded catalog.
-pub(crate) fn validate_existing_segments(root: &DataRoot, limits: LayoutLimits) -> Result<usize> {
-    let snapshot = root
+/// Traversal and global resource failures remain fatal. A stable invalid PGM
+/// is excluded without blocking valid segments or future collection.
+pub(crate) fn quarantine_invalid_segments(
+    owner: &WriterOwner,
+    limits: LayoutLimits,
+) -> Result<usize> {
+    let snapshot = owner
+        .root()
         .scan(limits)
         .context("scan existing segments before journal recovery")?;
+    let mut valid = 0_usize;
     for segment in &snapshot.segments {
-        let file = root
+        let file = owner
+            .root()
             .open_pgm(segment.address)
             .with_context(|| format!("open existing segment {}", segment.address.id))?;
-        validate_existing_segment(&file)
-            .with_context(|| format!("validate existing segment {}", segment.address.id))?;
+        match validate_existing_segment(&file) {
+            Ok(()) => valid += 1,
+            Err(error) => {
+                let outcome = owner.quarantine_invalid_pgm(*segment);
+                log_event(
+                    LogLevel::Error,
+                    "segment_quarantine",
+                    &[
+                        field("segment_id", segment.address.id.get()),
+                        field("reason", "invalid_pgm"),
+                        field("status", format!("{:?}", outcome.status)),
+                        field("error", format!("{error:#}")),
+                    ],
+                );
+            }
+        }
     }
-    Ok(snapshot.segments.len())
+    Ok(valid)
 }
 
 fn validate_existing_segment(file: &File) -> Result<()> {
@@ -594,15 +618,34 @@ fn validate_existing_segment(file: &File) -> Result<()> {
         "unsupported PGM format version {}",
         catalog.format_version
     );
+    let catalog = Catalog {
+        entries: catalog.entries().collect(),
+        min_ts: catalog.min_ts,
+        max_ts: catalog.max_ts,
+        source_id: catalog.source_id,
+        format_version: catalog.format_version,
+    };
+    validate_catalog_layout(&catalog, catalog_at).context("validate PGM section layout")?;
 
-    for entry in catalog.entries() {
-        let end = entry
-            .offset
-            .checked_add(entry.len)
-            .context("PGM section range overflow")?;
+    let mut buffer = [0_u8; PGM_CRC_CHUNK_BYTES];
+    for entry in &catalog.entries {
+        let mut checksum = Crc32c::new();
+        let mut offset = entry.offset;
+        let mut remaining = entry.len;
+        while remaining != 0 {
+            let chunk_len = usize::try_from(remaining.min(PGM_CRC_CHUNK_BYTES as u64))
+                .context("PGM checksum chunk length does not fit memory")?;
+            file.read_exact_at(&mut buffer[..chunk_len], offset)
+                .with_context(|| format!("read PGM section {}", entry.type_id))?;
+            checksum.update(&buffer[..chunk_len]);
+            offset = offset
+                .checked_add(chunk_len as u64)
+                .context("PGM checksum offset overflow")?;
+            remaining -= chunk_len as u64;
+        }
         anyhow::ensure!(
-            entry.offset >= MAGIC.len() as u64 && end <= catalog_at,
-            "PGM section {} points outside the body",
+            checksum.finalize() == entry.crc32c,
+            "PGM section {} crc32c mismatch",
             entry.type_id
         );
     }
@@ -615,36 +658,286 @@ pub(crate) fn open_collector_journal(
     owner: &WriterOwner,
     journal_max_bytes: u64,
 ) -> Result<(Journal, Option<PathBuf>)> {
-    let journal_config = JournalConfig {
+    let config = JournalConfig {
         max_journal_len: usize::try_from(journal_max_bytes)
             .context("KRONIKA_JOURNAL_MAX_BYTES exceeds usize")?,
         ..JournalConfig::default()
     };
-    let mut journal = Journal::open(owner, journal_config).context("open the journal")?;
-    if journal.parts().is_empty() {
-        return Ok((journal, None));
+    let (mut journal, mut recovered) = match Journal::open(owner, config) {
+        Ok(journal) if journal.parts().is_empty() => (journal, None),
+        Ok(mut journal) => match seal_recovered_journal(&mut journal, owner) {
+            Ok(dest) => (journal, dest),
+            Err(error) => {
+                drop(journal);
+                log_event(
+                    LogLevel::Error,
+                    "journal_recovery_seal_failure",
+                    &[field("error", format!("{error:#}"))],
+                );
+                recover_active_journal(owner, config)
+                    .context("preserve a journal whose recovery seal failed")?
+            }
+        },
+        Err(error) if localized_journal_error(&error) => {
+            log_event(
+                LogLevel::Error,
+                "journal_recovery_open_failure",
+                &[
+                    field("reason", "localized_damage"),
+                    field("error", format!("{error}")),
+                ],
+            );
+            recover_active_journal(owner, config).context("recover the damaged active journal")?
+        }
+        Err(error) => return Err(error).context("open the journal"),
+    };
+
+    let pending_recovered = recover_pending_journals(owner, config, &mut journal)?;
+    if pending_recovered.is_some() {
+        recovered = pending_recovered;
     }
-    match seal_recovered_journal(&mut journal, owner) {
-        Ok(dest) => Ok((journal, dest)),
-        Err(err) => {
+    Ok((journal, recovered))
+}
+
+fn localized_journal_error(error: &JournalError) -> bool {
+    matches!(
+        error,
+        JournalError::JournalTooLarge { .. }
+            | JournalError::TooManyParts { .. }
+            | JournalError::UnsupportedJournalFormat
+            | JournalError::TornHeader { .. }
+            | JournalError::InvalidHeader(_)
+            | JournalError::BodyLengthMismatch { .. }
+            | JournalError::EmptyWithFrames { .. }
+            | JournalError::ActiveWithoutFirstFrame
+            | JournalError::DamagedBody { .. }
+            | JournalError::InvalidSegmentId(_)
+            | JournalError::InvalidPart(_)
+            | JournalError::Layout(
+                LayoutError::SymlinkNotAllowed { .. }
+                    | LayoutError::UnexpectedRootEntryType { .. }
+                    | LayoutError::UnexpectedRootEntry { .. }
+                    | LayoutError::ActiveJournalMissing
+            )
+    )
+}
+
+fn recover_active_journal(
+    owner: &WriterOwner,
+    config: JournalConfig,
+) -> Result<(Journal, Option<PathBuf>)> {
+    match owner.begin_journal_rotation() {
+        Ok(mut rotation) => {
+            Journal::prepare_rotation(&mut rotation).context("initialize fresh journal")?;
+            recover_rotation(owner, config, rotation.activate())
+        }
+        Err(rotation_error) => {
+            let source = owner
+                .root()
+                .open_active_journal()
+                .context("open retained active journal evidence")?;
+            let mut journal = create_alternate_journal(owner, config)?;
+            let recovered = match source.as_ref() {
+                Some(source) => {
+                    match recover_evidence(source, &mut journal, owner, config, "retained") {
+                        Ok(recovered) => recovered,
+                        Err(error) => {
+                            log_event(
+                                LogLevel::Error,
+                                "journal_recovery_failure",
+                                &[field("error", format!("{error:#}"))],
+                            );
+                            if !journal.parts().is_empty() {
+                                journal
+                                    .reset()
+                                    .context("reset partial retained journal recovery")?;
+                            }
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            log_event(
+                LogLevel::Error,
+                "journal_rotation_degraded",
+                &[
+                    field("status", "retained"),
+                    field("error", format!("{rotation_error}")),
+                ],
+            );
+            Ok((journal, recovered))
+        }
+    }
+}
+
+fn recover_rotation(
+    owner: &WriterOwner,
+    config: JournalConfig,
+    mut rotation: JournalRotationOutcome,
+) -> Result<(Journal, Option<PathBuf>)> {
+    let mut journal = Journal::open_slot(rotation.fresh, config)
+        .context("open activated fresh journal generation")?;
+    let recovered = recover_evidence(
+        rotation.evidence.file(),
+        &mut journal,
+        owner,
+        config,
+        "rotated",
+    )
+    .unwrap_or_else(|error| {
+        log_event(
+            LogLevel::Error,
+            "journal_recovery_failure",
+            &[field("error", format!("{error:#}"))],
+        );
+        None
+    });
+    if !journal.parts().is_empty() {
+        journal
+            .reset()
+            .context("reset partial journal recovery before collection")?;
+    }
+    let quarantine = owner.quarantine_evidence(
+        &mut rotation.evidence,
+        QuarantineReason::CorruptActiveJournal,
+    );
+    log_event(
+        LogLevel::Warn,
+        "journal_quarantine",
+        &[
+            field("activation", format!("{:?}", rotation.activation)),
+            field("status", format!("{:?}", quarantine.status)),
+            field("diagnostics", rotation.diagnostics.len()),
+        ],
+    );
+    Ok((journal, recovered))
+}
+
+fn create_alternate_journal(owner: &WriterOwner, config: JournalConfig) -> Result<Journal> {
+    let mut generation = owner
+        .create_journal_generation()
+        .context("create alternate journal generation")?;
+    Journal::prepare_slot(&mut generation.slot).context("initialize alternate journal")?;
+    if let Some(diagnostic) = generation.diagnostic {
+        log_event(
+            LogLevel::Warn,
+            "journal_generation_degraded",
+            &[field("diagnostic", format!("{diagnostic:?}"))],
+        );
+    }
+    Journal::open_slot(generation.slot, config).context("open alternate journal generation")
+}
+
+fn recover_evidence(
+    source: &File,
+    journal: &mut Journal,
+    owner: &WriterOwner,
+    config: JournalConfig,
+    source_kind: &'static str,
+) -> Result<Option<PathBuf>> {
+    let recovery =
+        JournalRecovery::inspect(source, config).context("inspect journal recovery evidence")?;
+    let summary = recovery.summary();
+    log_event(
+        LogLevel::Warn,
+        "journal_recovery_scan",
+        &[
+            field("source_kind", source_kind),
+            field("reason", format!("{:?}", summary.reason)),
+            field("evidence_bytes", summary.evidence_bytes),
+            field("verified_frames", summary.verified_frames),
+            field("verified_rows", summary.verified_rows),
+            field("verified_part_bytes", summary.verified_part_bytes),
+            field("discarded_bytes", summary.discarded_bytes),
+        ],
+    );
+    if summary.verified_frames == 0 {
+        return Ok(None);
+    }
+    let replay = recovery
+        .replay_into(journal)
+        .context("replay verified journal frames")?;
+    match seal_recovered_journal(journal, owner) {
+        Ok(dest) => {
+            log_event(
+                LogLevel::Info,
+                "journal_recovery_finish",
+                &[
+                    field("recovered_frames", replay.recovered_frames),
+                    field("recovered_rows", replay.recovered_rows),
+                    field("recovered_part_bytes", replay.recovered_part_bytes),
+                ],
+            );
+            Ok(dest)
+        }
+        Err(error) => {
             log_event(
                 LogLevel::Error,
                 "journal_recovery_seal_failure",
                 &[
-                    field("journal_bytes", journal.bytes()),
-                    field("journal_parts", journal.parts().len()),
-                    field("error", format!("{err:#}")),
+                    field("recovered_frames", replay.recovered_frames),
+                    field("error", format!("{error:#}")),
                 ],
             );
-            if journal.parts().is_empty() {
-                Err(err.context(
-                    "recovered journal is logically empty but its reset durability failed",
-                ))
-            } else {
-                Err(err.context("recovered journal remains intact because it could not be sealed"))
-            }
+            journal
+                .reset()
+                .context("reset an unsealable recovered journal")?;
+            Ok(None)
         }
     }
+}
+
+fn recover_pending_journals(
+    owner: &WriterOwner,
+    config: JournalConfig,
+    journal: &mut Journal,
+) -> Result<Option<PathBuf>> {
+    let snapshot = owner
+        .root()
+        .scan(LayoutLimits::default())
+        .context("scan pending journal recovery entries")?;
+    let mut recovered = None;
+    for pending in &snapshot.pending_root_entries {
+        let source = match owner.root().open_pending_root(pending) {
+            Ok(source) => source,
+            Err(error) => {
+                log_event(
+                    LogLevel::Warn,
+                    "journal_pending_open_failure",
+                    &[field("error", format!("{error}"))],
+                );
+                continue;
+            }
+        };
+        let source_kind = match pending.kind() {
+            PendingRootKind::Evidence => "pending_evidence",
+            PendingRootKind::JournalGeneration => "pending_generation",
+        };
+        match recover_evidence(&source, journal, owner, config, source_kind) {
+            Ok(Some(path)) => recovered = Some(path),
+            Ok(None) => {}
+            Err(error) => {
+                log_event(
+                    LogLevel::Error,
+                    "journal_pending_recovery_failure",
+                    &[field("error", format!("{error:#}"))],
+                );
+                if !journal.parts().is_empty() {
+                    journal
+                        .reset()
+                        .context("reset partial pending journal recovery")?;
+                }
+            }
+        }
+        let outcome = owner.quarantine_pending_root(pending, QuarantineReason::PendingEvidence);
+        log_event(
+            LogLevel::Warn,
+            "journal_pending_quarantine",
+            &[field("status", format!("{:?}", outcome.status))],
+        );
+    }
+    Ok(recovered)
 }
 
 /// Seal recovered windows under the exact identity persisted in journal v1.

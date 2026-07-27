@@ -9,6 +9,9 @@
 //! [`Journal`] appends self-contained PGM parts as synchronized `PGMP` frames
 //! after a checksummed version-1 header in `active.parts`. Opening validates
 //! the complete header and body without repairing or truncating damage.
+//! After layout atomically retains exact damaged evidence, [`JournalRecovery`]
+//! can inspect it with bounded streaming resynchronization and replay only
+//! complete verified frames through the normal [`Journal::append`] contract.
 //! [`JournalConfig::max_journal_len`] is the hard growth bound, reported as
 //! [`JournalError::Full`] so the collector can seal early.
 //!
@@ -23,12 +26,17 @@ mod buffer;
 pub mod dict;
 mod interner;
 mod journal;
+mod recovery;
 mod segment;
 
 pub use buffer::{FlushSummary, FlushedPart, SectionBuffers, SectionFlushSummary};
 pub use interner::{FlushedEntry, Interner, SealedSegment};
 pub use journal::{Journal, JournalConfig, JournalError, JournalPartRef};
 pub use kronika_format::{MAX_JOURNAL_LEN, MAX_JOURNAL_PARTS, MAX_PART_LEN};
+pub use recovery::{
+    JournalRecovery, JournalRecoveryError, JournalRecoveryReason, JournalRecoverySummary,
+    JournalReplaySummary,
+};
 pub use segment::{SealError, SealSummary, seal};
 
 #[cfg(test)]

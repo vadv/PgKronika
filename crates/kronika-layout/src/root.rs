@@ -1,5 +1,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::ffi::{CStr, CString};
+use std::fmt;
 use std::fs::File;
 use std::io;
 #[cfg(target_os = "linux")]
@@ -10,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags};
+use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 
 use crate::{LayoutError, LimitKind, OwnerKind, SegmentAddress, SegmentId, UtcDay};
 
@@ -20,6 +22,8 @@ pub const ACTIVE_JOURNAL_NAME: &str = "active.parts";
 pub const WRITER_OWNER_LOCK_NAME: &str = ".pgkronika-writer.owner.lock";
 /// Permanent process-ownership lock for overview publication and GC.
 pub const OVERVIEW_OWNER_LOCK_NAME: &str = ".pgkronika-overview.owner.lock";
+/// Opaque, non-traversed directory holding exact quarantined objects.
+pub const QUARANTINE_DIRECTORY_NAME: &str = ".pgkronika-quarantine-v1";
 
 const HARD_MAX_VISITED_ENTRIES: usize = 4_000_000;
 const HARD_MAX_ENTRIES_PER_DAY: usize = 1_000_000;
@@ -28,6 +32,14 @@ const HARD_MAX_METADATA_BYTES: usize = 128 * 1024 * 1024;
 const ENTRY_METADATA_BYTES: usize = 128;
 const SCAN_RACE_ATTEMPTS: usize = 4;
 const WRITER_LOCK_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
+const ROOT_GENERATION_PREFIX: &str = ".pgkronika-generation-v1.";
+const ROOT_GENERATION_SUFFIX: &str = ".parts";
+const ROOT_EVIDENCE_PREFIX: &str = ".pgkronika-evidence-v1.";
+const ROOT_EVIDENCE_SUFFIX: &str = ".pending";
+const ROOT_SLOT_HEX_LEN: usize = 2;
+const ROOT_NONCE_HEX_LEN: usize = 16;
+const MAX_ROOT_COLLISION_SLOTS: u8 = 64;
+const MAX_QUARANTINE_COLLISION_SLOTS: u8 = 64;
 const DIRECTORY_MODE: Mode = Mode::RUSR
     .union(Mode::WUSR)
     .union(Mode::XUSR)
@@ -35,6 +47,9 @@ const DIRECTORY_MODE: Mode = Mode::RUSR
     .union(Mode::XGRP);
 const DATA_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::RGRP);
 const LOCK_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
+const QUARANTINE_DIRECTORY_MODE: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::XUSR);
+
+static NEXT_ROOT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +62,23 @@ enum PgmPublishFaultPoint {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuarantineFaultPoint {
+    DirectorySync,
+    Rename,
+    SourceDirectorySync,
+    QuarantineDirectorySync,
+    Exchange,
+}
+
+#[cfg(test)]
 std::thread_local! {
     static PGM_PUBLISH_FAULT: Cell<Option<(PgmPublishFaultPoint, i32)>> =
         const { Cell::new(None) };
     static ENSURE_DIRECTORY_SYNC_FAULT: Cell<Option<i32>> = const { Cell::new(None) };
     static OWNER_LOCK_SYNC_FAULT: Cell<Option<i32>> = const { Cell::new(None) };
+    static QUARANTINE_FAULT: Cell<Option<(QuarantineFaultPoint, i32)>> =
+        const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -62,6 +89,9 @@ struct EnsureDirectorySyncFaultGuard;
 
 #[cfg(test)]
 struct OwnerLockSyncFaultGuard;
+
+#[cfg(test)]
+struct QuarantineFaultGuard;
 
 #[cfg(test)]
 impl Drop for PgmPublishFaultGuard {
@@ -111,6 +141,23 @@ impl Drop for OwnerLockSyncFaultGuard {
 }
 
 #[cfg(test)]
+impl QuarantineFaultGuard {
+    fn assert_consumed(self) {
+        QUARANTINE_FAULT.with(|fault| {
+            assert!(fault.get().is_none(), "quarantine fault was not exercised");
+        });
+        drop(self);
+    }
+}
+
+#[cfg(test)]
+impl Drop for QuarantineFaultGuard {
+    fn drop(&mut self) {
+        QUARANTINE_FAULT.with(|fault| fault.set(None));
+    }
+}
+
+#[cfg(test)]
 fn arm_pgm_publish_fault(point: PgmPublishFaultPoint, raw_os_error: i32) -> PgmPublishFaultGuard {
     PGM_PUBLISH_FAULT.with(|fault| {
         assert!(fault.replace(Some((point, raw_os_error))).is_none());
@@ -132,6 +179,14 @@ fn arm_owner_lock_sync_fault(raw_os_error: i32) -> OwnerLockSyncFaultGuard {
         assert!(fault.replace(Some(raw_os_error)).is_none());
     });
     OwnerLockSyncFaultGuard
+}
+
+#[cfg(test)]
+fn arm_quarantine_fault(point: QuarantineFaultPoint, raw_os_error: i32) -> QuarantineFaultGuard {
+    QUARANTINE_FAULT.with(|fault| {
+        assert!(fault.replace(Some((point, raw_os_error))).is_none());
+    });
+    QuarantineFaultGuard
 }
 
 #[cfg(test)]
@@ -163,6 +218,17 @@ fn inject_owner_lock_sync_fault() -> io::Result<()> {
     })
 }
 
+#[cfg(test)]
+fn inject_quarantine_fault(point: QuarantineFaultPoint) -> io::Result<()> {
+    QUARANTINE_FAULT.with(|fault| match fault.get() {
+        Some((armed, raw_os_error)) if armed == point => {
+            fault.set(None);
+            Err(io::Error::from_raw_os_error(raw_os_error))
+        }
+        _ => Ok(()),
+    })
+}
+
 macro_rules! pgm_publish_failpoint {
     ($point:ident) => {
         #[cfg(test)]
@@ -182,6 +248,21 @@ macro_rules! owner_lock_sync_failpoint {
         #[cfg(test)]
         inject_owner_lock_sync_fault()?;
     };
+}
+
+macro_rules! quarantine_failpoint {
+    ($point:ident) => {
+        #[cfg(test)]
+        inject_quarantine_fault(QuarantineFaultPoint::$point)?;
+    };
+}
+
+fn quarantine_failure(stage: QuarantineFailureStage, error: &io::Error) -> QuarantineFailure {
+    QuarantineFailure {
+        stage,
+        error_kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
+    }
 }
 
 /// Non-zero hard-capped resource limits for one strict tree traversal.
@@ -266,6 +347,8 @@ pub struct TemporaryObject {
     pub address: SegmentAddress,
     /// Publisher that owns cleanup of this object.
     pub kind: TemporaryKind,
+    /// No-follow identity observed by discovery.
+    pub identity: FileIdentity,
     file_name: String,
 }
 
@@ -275,6 +358,311 @@ impl TemporaryObject {
     pub fn file_name(&self) -> &str {
         &self.file_name
     }
+}
+
+/// The verified parent scope of an entry that was not interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryScope {
+    /// Direct child of the data root.
+    Root,
+    /// Direct child of a valid UTC year directory.
+    Year {
+        /// Four-digit UTC year.
+        year: u16,
+    },
+    /// Direct child of a valid UTC month directory.
+    Month {
+        /// Four-digit UTC year.
+        year: u16,
+        /// UTC month, `1..=12`.
+        month: u8,
+    },
+    /// Direct child of a valid UTC day directory.
+    Day(UtcDay),
+    /// Opaque child of the quarantine directory.
+    Quarantine,
+}
+
+/// Filesystem type observed without following a symbolic link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryFileType {
+    /// Regular file.
+    RegularFile,
+    /// Directory.
+    Directory,
+    /// Symbolic link. Its target was not inspected.
+    Symlink,
+    /// FIFO, socket, device, or another unsupported object.
+    Other,
+}
+
+/// Bounded, payload-free identity for one named tree entry.
+///
+/// The raw name is deliberately not exposed. `name_hash` is a stable,
+/// non-cryptographic correlation token, not a content digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathIdentity {
+    /// Verified parent scope.
+    pub scope: EntryScope,
+    /// Stable hash of the raw leaf-name bytes.
+    pub name_hash: u64,
+    /// Raw leaf-name length in bytes.
+    pub name_len: u16,
+    /// No-follow filesystem type.
+    pub file_type: EntryFileType,
+    /// No-follow filesystem identity and metadata.
+    pub file: FileIdentity,
+}
+
+/// Why a tree entry was excluded from the supported readable grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ForeignEntryReason {
+    /// The name is outside the grammar for its verified parent.
+    UnsupportedName,
+    /// The name is reserved, but its filesystem type is unsupported.
+    UnsupportedType,
+    /// A symbolic link was encountered and not followed.
+    SymbolicLink,
+    /// A root-level PGM or OVF belongs to the unsupported flat layout.
+    UnsupportedFlatArtifact,
+    /// Raw name bytes are not ASCII and were not interpreted.
+    NonAsciiName,
+    /// A segment-like leaf points to a different UTC bucket.
+    MisbucketedSegment,
+}
+
+/// Typed diagnostic for one locally excluded tree entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryDiagnostic {
+    /// Bounded path/object identity.
+    pub path: PathIdentity,
+    /// Reason the entry was not interpreted.
+    pub reason: ForeignEntryReason,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct EntryPath {
+    parent: EntryParent,
+    name: CString,
+}
+
+impl fmt::Debug for EntryPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EntryPath")
+            .field("scope", &self.parent.scope())
+            .field("name_hash", &hash_name(self.name.as_bytes()))
+            .field("name_len", &self.name.as_bytes().len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryParent {
+    Root,
+    Year(u16),
+    Month { year: u16, month: u8 },
+    Day(UtcDay),
+}
+
+impl EntryParent {
+    const fn scope(self) -> EntryScope {
+        match self {
+            Self::Root => EntryScope::Root,
+            Self::Year(year) => EntryScope::Year { year },
+            Self::Month { year, month } => EntryScope::Month { year, month },
+            Self::Day(day) => EntryScope::Day(day),
+        }
+    }
+}
+
+/// Opaque capability for one unsupported entry found by a tolerant scan.
+///
+/// Its raw name remains private so only [`WriterOwner`] can mutate it through
+/// descriptor-relative, identity-checked operations.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ForeignEntry {
+    diagnostic: EntryDiagnostic,
+    path: EntryPath,
+}
+
+impl ForeignEntry {
+    /// Returns the bounded diagnostic without exposing the raw leaf name.
+    #[must_use]
+    pub const fn diagnostic(&self) -> EntryDiagnostic {
+        self.diagnostic
+    }
+}
+
+impl fmt::Debug for ForeignEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ForeignEntry")
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
+}
+
+/// Recognized, bounded root-level recovery object kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PendingRootKind {
+    /// Exact evidence retained across an interrupted recovery invocation.
+    Evidence,
+    /// A fresh alternate journal generation.
+    JournalGeneration,
+}
+
+/// Opaque capability for a recognized root-level recovery object.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingRootEntry {
+    kind: PendingRootKind,
+    identity: PathIdentity,
+    name: CString,
+}
+
+impl PendingRootEntry {
+    /// Returns the grammar role encoded by the bounded root name.
+    #[must_use]
+    pub const fn kind(&self) -> PendingRootKind {
+        self.kind
+    }
+
+    /// Returns the bounded path identity.
+    #[must_use]
+    pub const fn identity(&self) -> PathIdentity {
+        self.identity
+    }
+}
+
+impl fmt::Debug for PendingRootEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingRootEntry")
+            .field("kind", &self.kind)
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+/// State of the opaque root quarantine directory during a scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineDirectoryState {
+    /// No quarantine directory is currently present.
+    Absent,
+    /// A real, non-followed directory was found and deliberately not traversed.
+    Present(PathIdentity),
+    /// The reserved name exists with an unsupported type.
+    Unavailable(PathIdentity),
+}
+
+/// Reason code embedded in a quarantine operation and file name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum QuarantineReason {
+    /// An entry outside the supported owned-store grammar.
+    ForeignEntry = 1,
+    /// A PGM failed startup catalog or format validation.
+    InvalidPgm = 2,
+    /// The canonical active journal was corrupt.
+    CorruptActiveJournal = 3,
+    /// A recognized root evidence object was processed.
+    PendingEvidence = 4,
+    /// A stale publication temporary was preserved.
+    StaleTemporary = 5,
+    /// A recovery output failed final canonical validation.
+    InvalidRecoveryOutput = 6,
+}
+
+/// Filesystem stage at which a local quarantine/rotation operation degraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineFailureStage {
+    /// The quarantine directory could not be created or safely opened.
+    QuarantineDirectory,
+    /// The created/existing quarantine root entry could not be synchronized.
+    QuarantineDirectoryEntrySync,
+    /// The source object disappeared before the operation.
+    SourceMissing,
+    /// The source identity changed before the operation.
+    SourceChanged,
+    /// All bounded collision slots already existed.
+    CollisionSlotsExhausted,
+    /// An atomic rename failed.
+    Rename,
+    /// The source parent could not be synchronized after a rename.
+    SourceDirectorySync,
+    /// The quarantine directory could not be synchronized after a rename.
+    QuarantineDirectorySync,
+    /// The fresh journal file could not be synchronized before activation.
+    FreshJournalSync,
+    /// The atomic exchange activation failed.
+    JournalExchange,
+    /// The root directory could not be synchronized after activation.
+    RootDirectorySync,
+    /// A fallback could not promote the fresh generation to `active.parts`.
+    JournalPromotion,
+    /// Post-rename identity verification failed.
+    IdentityVerification,
+}
+
+/// Bounded typed filesystem failure without path names or payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineFailure {
+    /// Operation stage.
+    pub stage: QuarantineFailureStage,
+    /// Portable I/O category.
+    pub error_kind: io::ErrorKind,
+    /// Platform error number, when available.
+    pub raw_os_error: Option<i32>,
+}
+
+impl QuarantineFailure {
+    const fn local(stage: QuarantineFailureStage, error_kind: io::ErrorKind) -> Self {
+        Self {
+            stage,
+            error_kind,
+            raw_os_error: None,
+        }
+    }
+}
+
+/// Result of a local quarantine attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineStatus {
+    /// The exact named object was atomically moved into the opaque directory.
+    Quarantined {
+        /// Bounded identity of the destination name and retained object.
+        destination: PathIdentity,
+    },
+    /// The move completed, but a durability or verification step failed.
+    QuarantinedDegraded {
+        /// Bounded identity of the destination name and retained object.
+        destination: PathIdentity,
+        /// Local degraded operation.
+        failure: QuarantineFailure,
+    },
+    /// The scanned object disappeared before mutation.
+    Missing,
+    /// The scanned name no longer identifies the same object.
+    Changed {
+        /// Newly observed object, when one was present.
+        observed: Option<PathIdentity>,
+    },
+    /// Evidence remained at its source name after a local failure.
+    Retained {
+        /// Local degraded operation.
+        failure: QuarantineFailure,
+    },
+}
+
+/// Typed, payload-free report for one quarantine attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineOutcome {
+    /// Why the entry was quarantined.
+    pub reason: QuarantineReason,
+    /// Identity observed by discovery or rotation.
+    pub source: PathIdentity,
+    /// Final local disposition.
+    pub status: QuarantineStatus,
 }
 
 /// Discovered final artifacts for one source segment.
@@ -301,6 +689,12 @@ pub struct LayoutSnapshot {
     pub orphan_overviews: Vec<SegmentAddress>,
     /// Recognized temporary files.
     pub temporaries: Vec<TemporaryObject>,
+    /// Unsupported entries excluded locally without aborting valid discovery.
+    pub foreign_entries: Vec<ForeignEntry>,
+    /// Recognized bounded root recovery objects, never interpreted by scanning.
+    pub pending_root_entries: Vec<PendingRootEntry>,
+    /// Opaque quarantine-directory state; its contents are never traversed.
+    pub quarantine_directory: QuarantineDirectoryState,
     /// Number of filesystem entries visited.
     pub visited_entries: usize,
     /// Accounted metadata bytes.
@@ -372,15 +766,17 @@ impl DataRoot {
             .join(name)
     }
 
-    /// Performs a closed-grammar, three-level, bounded traversal.
+    /// Performs a tolerant, closed-grammar, three-level, bounded traversal.
     ///
-    /// No partial snapshot is returned when a structural or resource error is
-    /// encountered.
+    /// Entries outside the owned-store grammar are classified in
+    /// [`LayoutSnapshot::foreign_entries`] and never followed or traversed.
+    /// Valid entries remain in the returned inventory. Resource exhaustion and
+    /// failures while reading the verified tree still fail the whole scan.
     ///
     /// # Errors
     ///
-    /// Returns [`LayoutError`] for malformed entries, symbolic links,
-    /// incompatible flat files, exhausted limits, or filesystem failures.
+    /// Returns [`LayoutError`] for exhausted limits or filesystem failures
+    /// that prevent bounded traversal of the verified tree.
     pub fn scan(&self, limits: LayoutLimits) -> Result<LayoutSnapshot, LayoutError> {
         let limits = limits.validate()?;
         for attempt in 0..SCAN_RACE_ATTEMPTS {
@@ -409,54 +805,97 @@ impl DataRoot {
         let mut root_entries = Dir::read_from(&*self.directory).map_err(errno_to_layout)?;
         for entry in &mut root_entries {
             let entry = entry.map_err(errno_to_layout)?;
-            let name = entry_name(&entry);
-            if is_dot(name) {
+            let name = entry.file_name();
+            let name_bytes = name.to_bytes();
+            if is_dot(name_bytes) {
                 continue;
             }
-            state.account(name.len())?;
-            let name_string = ascii_name(name)?;
-            let stat = stat_no_follow(&self.directory, name_string)?;
+            state.account(name_bytes.len())?;
+            let stat = stat_no_follow_name(&self.directory, name)?;
             let file_type = FileType::from_raw_mode(stat.st_mode);
-            if file_type == FileType::Symlink {
-                return Err(LayoutError::SymlinkNotAllowed {
-                    name: name_string.to_owned(),
-                });
+            let Some(name_string) = ascii_name(name_bytes) else {
+                state.record_foreign(
+                    EntryParent::Root,
+                    name,
+                    &stat,
+                    ForeignEntryReason::NonAsciiName,
+                )?;
+                continue;
+            };
+            if name_string == QUARANTINE_DIRECTORY_NAME {
+                let identity = path_identity(EntryParent::Root, name, &stat);
+                if file_type == FileType::Directory {
+                    state.quarantine_directory = QuarantineDirectoryState::Present(identity);
+                } else {
+                    state.quarantine_directory = QuarantineDirectoryState::Unavailable(identity);
+                    state.record_foreign(
+                        EntryParent::Root,
+                        name,
+                        &stat,
+                        foreign_type_reason(file_type),
+                    )?;
+                }
+                continue;
+            }
+            if let Some(kind) = parse_pending_root_name(name_string) {
+                if file_type == FileType::RegularFile {
+                    state.record_pending_root(kind, name, &stat)?;
+                } else {
+                    state.record_foreign(
+                        EntryParent::Root,
+                        name,
+                        &stat,
+                        foreign_type_reason(file_type),
+                    )?;
+                }
+                continue;
             }
             if is_control_name(name_string) {
                 if file_type != FileType::RegularFile {
-                    return Err(LayoutError::UnexpectedRootEntryType {
-                        name: name_string.to_owned(),
-                    });
+                    state.record_foreign(
+                        EntryParent::Root,
+                        name,
+                        &stat,
+                        foreign_type_reason(file_type),
+                    )?;
                 }
                 continue;
             }
             let root_extension = Path::new(name_string).extension();
             if root_extension.is_some_and(|extension| extension == "pgm" || extension == "ovf") {
-                return if file_type == FileType::RegularFile {
-                    Err(LayoutError::UnsupportedFlatLayout {
-                        name: name_string.to_owned(),
-                    })
-                } else {
-                    Err(LayoutError::UnexpectedRootEntryType {
-                        name: name_string.to_owned(),
-                    })
-                };
+                state.record_foreign(
+                    EntryParent::Root,
+                    name,
+                    &stat,
+                    if file_type == FileType::RegularFile {
+                        ForeignEntryReason::UnsupportedFlatArtifact
+                    } else {
+                        foreign_type_reason(file_type)
+                    },
+                )?;
+                continue;
             }
             let Some(year) = parse_year(name_string) else {
-                return if file_type == FileType::Directory {
-                    Err(LayoutError::MalformedYearDirectory {
-                        name: name_string.to_owned(),
-                    })
-                } else {
-                    Err(LayoutError::UnexpectedRootEntry {
-                        name: name_string.to_owned(),
-                    })
-                };
+                state.record_foreign(
+                    EntryParent::Root,
+                    name,
+                    &stat,
+                    if file_type == FileType::Symlink {
+                        ForeignEntryReason::SymbolicLink
+                    } else {
+                        ForeignEntryReason::UnsupportedName
+                    },
+                )?;
+                continue;
             };
             if file_type != FileType::Directory {
-                return Err(LayoutError::UnexpectedCalendarEntryType {
-                    name: name_string.to_owned(),
-                });
+                state.record_foreign(
+                    EntryParent::Root,
+                    name,
+                    &stat,
+                    foreign_type_reason(file_type),
+                )?;
+                continue;
             }
             let year_directory = open_directory_at(&self.directory, name_string)?;
             Self::scan_year(&year_directory, year, &mut state)?;
@@ -472,23 +911,35 @@ impl DataRoot {
         let mut entries = Dir::read_from(year_directory).map_err(errno_to_layout)?;
         for entry in &mut entries {
             let entry = entry.map_err(errno_to_layout)?;
-            let name = entry_name(&entry);
-            if is_dot(name) {
+            let name = entry.file_name();
+            let name_bytes = name.to_bytes();
+            if is_dot(name_bytes) {
                 continue;
             }
-            state.account(name.len())?;
-            let name_string = ascii_name(name)?;
-            let stat = stat_no_follow(year_directory, name_string)?;
+            state.account(name_bytes.len())?;
+            let stat = stat_no_follow_name(year_directory, name)?;
             let file_type = FileType::from_raw_mode(stat.st_mode);
-            let relative = format!("{year:04}/{name_string}");
-            if file_type == FileType::Symlink {
-                return Err(LayoutError::SymlinkNotAllowed { name: relative });
-            }
+            let parent = EntryParent::Year(year);
+            let Some(name_string) = ascii_name(name_bytes) else {
+                state.record_foreign(parent, name, &stat, ForeignEntryReason::NonAsciiName)?;
+                continue;
+            };
             let Some(month) = parse_month(name_string) else {
-                return Err(LayoutError::MalformedMonthDirectory { name: relative });
+                state.record_foreign(
+                    parent,
+                    name,
+                    &stat,
+                    if file_type == FileType::Symlink {
+                        ForeignEntryReason::SymbolicLink
+                    } else {
+                        ForeignEntryReason::UnsupportedName
+                    },
+                )?;
+                continue;
             };
             if file_type != FileType::Directory {
-                return Err(LayoutError::UnexpectedCalendarEntryType { name: relative });
+                state.record_foreign(parent, name, &stat, foreign_type_reason(file_type))?;
+                continue;
             }
             let month_directory = open_directory_at(year_directory, name_string)?;
             Self::scan_month(&month_directory, year, month, state)?;
@@ -505,25 +956,35 @@ impl DataRoot {
         let mut entries = Dir::read_from(month_directory).map_err(errno_to_layout)?;
         for entry in &mut entries {
             let entry = entry.map_err(errno_to_layout)?;
-            let name = entry_name(&entry);
-            if is_dot(name) {
+            let name = entry.file_name();
+            let name_bytes = name.to_bytes();
+            if is_dot(name_bytes) {
                 continue;
             }
-            state.account(name.len())?;
-            let name_string = ascii_name(name)?;
-            let stat = stat_no_follow(month_directory, name_string)?;
+            state.account(name_bytes.len())?;
+            let stat = stat_no_follow_name(month_directory, name)?;
             let file_type = FileType::from_raw_mode(stat.st_mode);
-            let relative = format!("{year:04}/{month:02}/{name_string}");
-            if file_type == FileType::Symlink {
-                return Err(LayoutError::SymlinkNotAllowed { name: relative });
-            }
-            let day_number = parse_day(year, month, name_string).ok_or_else(|| {
-                LayoutError::MalformedDayDirectory {
-                    name: relative.clone(),
-                }
-            })?;
+            let parent = EntryParent::Month { year, month };
+            let Some(name_string) = ascii_name(name_bytes) else {
+                state.record_foreign(parent, name, &stat, ForeignEntryReason::NonAsciiName)?;
+                continue;
+            };
+            let Some(day_number) = parse_day(year, month, name_string) else {
+                state.record_foreign(
+                    parent,
+                    name,
+                    &stat,
+                    if file_type == FileType::Symlink {
+                        ForeignEntryReason::SymbolicLink
+                    } else {
+                        ForeignEntryReason::UnsupportedName
+                    },
+                )?;
+                continue;
+            };
             if file_type != FileType::Directory {
-                return Err(LayoutError::UnexpectedCalendarEntryType { name: relative });
+                state.record_foreign(parent, name, &stat, foreign_type_reason(file_type))?;
+                continue;
             }
             let day_directory = open_directory_at(month_directory, name_string)?;
             let day = UtcDay::new(year, month, day_number)?;
@@ -544,8 +1005,9 @@ impl DataRoot {
         let mut finals: BTreeMap<SegmentId, DayArtifacts> = BTreeMap::new();
         for entry in &mut entries {
             let entry = entry.map_err(errno_to_layout)?;
-            let name = entry_name(&entry);
-            if is_dot(name) {
+            let name = entry.file_name();
+            let name_bytes = name.to_bytes();
+            if is_dot(name_bytes) {
                 continue;
             }
             day_entries =
@@ -561,23 +1023,34 @@ impl DataRoot {
                     limit: state.limits.max_entries_per_day,
                 });
             }
-            state.account(name.len())?;
-            let name_string = ascii_name(name)?;
-            let stat = stat_no_follow(day_directory, name_string)?;
+            state.account(name_bytes.len())?;
+            let stat = stat_no_follow_name(day_directory, name)?;
             let file_type = FileType::from_raw_mode(stat.st_mode);
-            let relative = format!("{day}/{name_string}");
-            if file_type == FileType::Symlink {
-                return Err(LayoutError::SymlinkNotAllowed { name: relative });
-            }
+            let parent = EntryParent::Day(day);
+            let Some(name_string) = ascii_name(name_bytes) else {
+                state.record_foreign(parent, name, &stat, ForeignEntryReason::NonAsciiName)?;
+                continue;
+            };
             if file_type != FileType::RegularFile {
-                return Err(LayoutError::UnexpectedLeafEntryType { name: relative });
+                state.record_foreign(parent, name, &stat, foreign_type_reason(file_type))?;
+                continue;
             }
-            let parsed = parse_leaf(name_string, day).map_err(|error| match error {
-                LayoutError::UnexpectedLeafEntry { .. } => {
-                    LayoutError::UnexpectedLeafEntry { name: relative }
+            let parsed = match parse_leaf(name_string, day) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    state.record_foreign(
+                        parent,
+                        name,
+                        &stat,
+                        if matches!(error, LayoutError::MisbucketedSegment { .. }) {
+                            ForeignEntryReason::MisbucketedSegment
+                        } else {
+                            ForeignEntryReason::UnsupportedName
+                        },
+                    )?;
+                    continue;
                 }
-                other => other,
-            })?;
+            };
             let identity = FileIdentity::from_stat(&stat);
             let bytes = identity.len;
             match parsed {
@@ -592,6 +1065,7 @@ impl DataRoot {
                     state.temporaries.push(TemporaryObject {
                         address,
                         kind,
+                        identity,
                         file_name: name_string.to_owned(),
                     });
                 }
@@ -669,6 +1143,24 @@ impl DataRoot {
         }
     }
 
+    /// Opens and revalidates a recognized pending root recovery object.
+    ///
+    /// The raw name remains encapsulated by [`PendingRootEntry`]. The object
+    /// must still be the same regular file observed by [`scan`](Self::scan).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry disappeared, changed, or is unsafe.
+    pub fn open_pending_root(&self, pending: &PendingRootEntry) -> Result<File, LayoutError> {
+        let file = open_regular_name_at(&self.directory, &pending.name, OFlags::RDONLY)?;
+        if FileIdentity::from_file(&file)? != pending.identity.file {
+            return Err(LayoutError::TemporaryChanged {
+                name: format!("opaque-root:{:016x}", pending.identity.name_hash),
+            });
+        }
+        Ok(file)
+    }
+
     /// Establishes lifetime-exclusive writer ownership after two strict scans.
     ///
     /// # Errors
@@ -676,13 +1168,38 @@ impl DataRoot {
     /// Returns a structural error, I/O error, or
     /// [`LayoutError::OwnerContended`].
     pub fn acquire_writer(&self, limits: LayoutLimits) -> Result<WriterOwner, LayoutError> {
-        self.scan(limits)?;
-        let lock = self.acquire_writer_lock()?;
-        self.scan(limits)?;
-        Ok(WriterOwner {
+        let first = self.scan(limits)?;
+        let root_lock = self.acquire_writer_root_lock()?;
+        let mut startup_quarantine_outcomes = Vec::new();
+        for foreign in &first.foreign_entries {
+            if is_writer_bootstrap_control(foreign) {
+                startup_quarantine_outcomes.push(quarantine_entry(
+                    self,
+                    &foreign.path,
+                    foreign.diagnostic.path,
+                    QuarantineReason::ForeignEntry,
+                ));
+            }
+        }
+        let lock = match self.acquire_writer_lock() {
+            Ok(lock) => lock,
+            Err(_error) if writer_lock_is_poisoned(self) => root_lock.try_clone()?,
+            Err(error) => return Err(error),
+        };
+        let second = self.scan(limits)?;
+        let mut owner = WriterOwner {
             root: self.clone(),
             owner_lock: lock,
-        })
+            _root_lock: root_lock,
+            startup_quarantine_outcomes,
+        };
+        for foreign in &second.foreign_entries {
+            if !is_writer_lock_name(foreign) {
+                let outcome = owner.quarantine_foreign(foreign);
+                owner.startup_quarantine_outcomes.push(outcome);
+            }
+        }
+        Ok(owner)
     }
 
     /// Establishes lifetime-exclusive overview ownership after two strict scans.
@@ -735,6 +1252,36 @@ impl DataRoot {
         }
     }
 
+    fn acquire_writer_root_lock(&self) -> Result<File, LayoutError> {
+        let lock = rustix::fs::openat(
+            &*self.directory,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(errno_to_io)
+        .map_err(LayoutError::Io)?;
+        let started = Instant::now();
+        loop {
+            match rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(lock),
+                Err(error)
+                    if error == rustix::io::Errno::WOULDBLOCK
+                        && started.elapsed() < WRITER_LOCK_HANDOFF_TIMEOUT =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                    return Err(LayoutError::OwnerContended {
+                        owner: OwnerKind::Writer,
+                    });
+                }
+                Err(error) => return Err(LayoutError::Io(errno_to_io(error))),
+            }
+        }
+    }
+
     fn open_final(&self, address: SegmentAddress, kind: FileKind) -> Result<File, LayoutError> {
         let day = self.open_day(address.day)?;
         let name = match kind {
@@ -762,6 +1309,8 @@ impl DataRoot {
 pub struct WriterOwner {
     root: DataRoot,
     owner_lock: File,
+    _root_lock: File,
+    startup_quarantine_outcomes: Vec<QuarantineOutcome>,
 }
 
 /// Opaque clone of the writer lock held by a long-lived mutation handle.
@@ -773,11 +1322,345 @@ pub struct WriterLease {
     _lock: File,
 }
 
+/// Filesystem role of an already-open fresh journal descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalSlotKind {
+    /// Canonical root `active.parts`.
+    Canonical,
+    /// Recognized bounded alternate generation retained at the root.
+    Alternate(PathIdentity),
+}
+
+/// Writer-owned, already-open fresh journal slot.
+///
+/// The raw root name is private. Consuming the slot transfers both the file
+/// descriptor and the writer-lock lease to `kronika-writer`.
+pub struct JournalSlot {
+    lease: WriterLease,
+    file: File,
+    kind: JournalSlotKind,
+}
+
+impl JournalSlot {
+    /// Returns the slot's root grammar role.
+    #[must_use]
+    pub const fn kind(&self) -> JournalSlotKind {
+        self.kind
+    }
+
+    /// Returns the fresh writable descriptor.
+    pub const fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    /// Consumes the slot into the exact writer lease and descriptor.
+    #[must_use]
+    pub fn into_file_and_lease(self) -> (File, WriterLease) {
+        (self.file, self.lease)
+    }
+}
+
+impl fmt::Debug for JournalSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JournalSlot")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Fresh alternate generation created when no safe canonical journal can be
+/// opened. The slot remains usable even when root-directory durability
+/// degraded.
+#[derive(Debug)]
+pub struct FreshJournalGeneration {
+    /// Already-open writable generation.
+    pub slot: JournalSlot,
+    /// Local root-directory synchronization failure, when any.
+    pub diagnostic: Option<QuarantineFailure>,
+}
+
+/// Current owned-store location of a pinned exact journal evidence descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceLocation {
+    /// The damaged object still occupies canonical `active.parts`.
+    Canonical,
+    /// The object is retained by a recognized bounded root recovery name.
+    Pending(PendingRootKind),
+    /// The object was moved into opaque quarantine.
+    Quarantined(PathIdentity),
+}
+
+/// Pinned exact journal evidence retained across activation and quarantine.
+pub struct EvidenceFile {
+    file: File,
+    identity: PathIdentity,
+    location: EvidenceLocation,
+    name: CString,
+}
+
+impl EvidenceFile {
+    /// Returns the already-open exact evidence descriptor.
+    #[must_use]
+    pub const fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Returns the original canonical object identity.
+    #[must_use]
+    pub const fn identity(&self) -> PathIdentity {
+        self.identity
+    }
+
+    /// Returns the current typed location without exposing its raw name.
+    #[must_use]
+    pub const fn location(&self) -> EvidenceLocation {
+        self.location
+    }
+}
+
+impl fmt::Debug for EvidenceFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EvidenceFile")
+            .field("identity", &self.identity)
+            .field("location", &self.location)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How a fresh journal generation became usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalActivation {
+    /// Atomic `RENAME_EXCHANGE` installed it at `active.parts`.
+    Exchanged,
+    /// Two no-replace renames installed it after retaining evidence.
+    Fallback,
+    /// It remains a recognized alternate generation after a local failure.
+    Alternate,
+}
+
+/// Completed journal rotation. Collection can continue through `fresh` for
+/// every activation variant.
+#[derive(Debug)]
+pub struct JournalRotationOutcome {
+    /// Already-open fresh canonical or alternate journal.
+    pub fresh: JournalSlot,
+    /// Already-open exact original evidence.
+    pub evidence: EvidenceFile,
+    /// Activation path used.
+    pub activation: JournalActivation,
+    /// Bounded payload-free local degradation details.
+    pub diagnostics: Vec<QuarantineFailure>,
+}
+
+/// Prepared exact-evidence rotation with a caller-initialized fresh file.
+pub struct JournalRotation {
+    root: DataRoot,
+    lease: WriterLease,
+    fresh: File,
+    fresh_name: CString,
+    evidence: EvidenceFile,
+    diagnostics: Vec<QuarantineFailure>,
+    nonce: u64,
+}
+
+impl JournalRotation {
+    /// Returns the fresh descriptor for canonical journal initialization.
+    ///
+    /// The caller must write a complete valid header before [`activate`](Self::activate).
+    pub const fn fresh_file_mut(&mut self) -> &mut File {
+        &mut self.fresh
+    }
+
+    /// Installs the initialized fresh journal without overwriting evidence.
+    ///
+    /// Atomic exchange is preferred. A bounded two-rename no-replace fallback
+    /// preserves the original under a recognized evidence name. Any local
+    /// failure returns a usable alternate generation and typed diagnostics.
+    #[must_use]
+    pub fn activate(mut self) -> JournalRotationOutcome {
+        if let Err(error) = self.fresh.sync_all() {
+            self.diagnostics.push(quarantine_failure(
+                QuarantineFailureStage::FreshJournalSync,
+                &error,
+            ));
+            return self.finish_alternate();
+        }
+        if let Err(failure) = verify_active_evidence(&self.root, &self.evidence) {
+            self.diagnostics.push(failure);
+            return self.finish_alternate();
+        }
+
+        match exchange_root_names(&self.root.directory, ACTIVE_JOURNAL_NAME, &self.fresh_name) {
+            Ok(()) => {
+                if let Err(error) = self.root.directory.sync_all() {
+                    self.diagnostics.push(quarantine_failure(
+                        QuarantineFailureStage::RootDirectorySync,
+                        &error,
+                    ));
+                }
+                self.evidence.name = self.fresh_name.clone();
+                self.evidence.location =
+                    EvidenceLocation::Pending(PendingRootKind::JournalGeneration);
+                self.move_evidence_to_pending_name();
+                return self.finish(JournalSlotKind::Canonical, JournalActivation::Exchanged);
+            }
+            Err(error) => self.diagnostics.push(quarantine_failure(
+                QuarantineFailureStage::JournalExchange,
+                &error,
+            )),
+        }
+
+        if !self.move_canonical_to_pending_name() {
+            return self.finish_alternate();
+        }
+        match rename_generation_to_active(&self.root.directory, &self.fresh_name) {
+            Ok(()) => {
+                if let Err(error) = self.root.directory.sync_all() {
+                    self.diagnostics.push(quarantine_failure(
+                        QuarantineFailureStage::RootDirectorySync,
+                        &error,
+                    ));
+                }
+                self.finish(JournalSlotKind::Canonical, JournalActivation::Fallback)
+            }
+            Err(error) => {
+                self.diagnostics.push(quarantine_failure(
+                    QuarantineFailureStage::JournalPromotion,
+                    &error,
+                ));
+                self.finish_alternate()
+            }
+        }
+    }
+
+    fn move_evidence_to_pending_name(&mut self) {
+        let Some(destination) =
+            available_evidence_name(&self.root.directory, self.nonce, &self.evidence.name)
+        else {
+            self.diagnostics.push(QuarantineFailure::local(
+                QuarantineFailureStage::CollisionSlotsExhausted,
+                io::ErrorKind::AlreadyExists,
+            ));
+            return;
+        };
+        match rename_noreplace(
+            &self.root.directory,
+            &self.evidence.name,
+            &self.root.directory,
+            &destination,
+        ) {
+            Ok(()) => {
+                self.evidence.name = destination;
+                self.evidence.location = EvidenceLocation::Pending(PendingRootKind::Evidence);
+                if let Err(error) = self.root.directory.sync_all() {
+                    self.diagnostics.push(quarantine_failure(
+                        QuarantineFailureStage::RootDirectorySync,
+                        &error,
+                    ));
+                }
+            }
+            Err(error) => self
+                .diagnostics
+                .push(quarantine_failure(QuarantineFailureStage::Rename, &error)),
+        }
+    }
+
+    fn move_canonical_to_pending_name(&mut self) -> bool {
+        let Some(destination) = available_evidence_name(
+            &self.root.directory,
+            self.nonce,
+            CStr::from_bytes_with_nul(b"active.parts\0")
+                .expect("canonical journal name is a C string"),
+        ) else {
+            self.diagnostics.push(QuarantineFailure::local(
+                QuarantineFailureStage::CollisionSlotsExhausted,
+                io::ErrorKind::AlreadyExists,
+            ));
+            return false;
+        };
+        let active = CStr::from_bytes_with_nul(b"active.parts\0")
+            .expect("canonical journal name is a C string");
+        match rename_noreplace(
+            &self.root.directory,
+            active,
+            &self.root.directory,
+            &destination,
+        ) {
+            Ok(()) => {
+                self.evidence.name = destination;
+                self.evidence.location = EvidenceLocation::Pending(PendingRootKind::Evidence);
+                if let Err(error) = self.root.directory.sync_all() {
+                    self.diagnostics.push(quarantine_failure(
+                        QuarantineFailureStage::RootDirectorySync,
+                        &error,
+                    ));
+                }
+                true
+            }
+            Err(error) => {
+                self.diagnostics
+                    .push(quarantine_failure(QuarantineFailureStage::Rename, &error));
+                false
+            }
+        }
+    }
+
+    fn finish_alternate(self) -> JournalRotationOutcome {
+        let file = FileIdentity::from_file(&self.fresh).unwrap_or(self.evidence.identity.file);
+        let identity = path_identity_from_file(
+            EntryScope::Root,
+            &self.fresh_name,
+            EntryFileType::RegularFile,
+            file,
+        );
+        self.finish(
+            JournalSlotKind::Alternate(identity),
+            JournalActivation::Alternate,
+        )
+    }
+
+    fn finish(
+        self,
+        kind: JournalSlotKind,
+        activation: JournalActivation,
+    ) -> JournalRotationOutcome {
+        JournalRotationOutcome {
+            fresh: JournalSlot {
+                lease: self.lease,
+                file: self.fresh,
+                kind,
+            },
+            evidence: self.evidence,
+            activation,
+            diagnostics: self.diagnostics,
+        }
+    }
+}
+
+impl fmt::Debug for JournalRotation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JournalRotation")
+            .field("fresh_name_hash", &hash_name(self.fresh_name.as_bytes()))
+            .field("evidence", &self.evidence)
+            .field("diagnostics", &self.diagnostics)
+            .finish_non_exhaustive()
+    }
+}
+
 impl WriterOwner {
     /// Returns read-only access to the same verified root.
     #[must_use]
     pub const fn root(&self) -> &DataRoot {
         &self.root
+    }
+
+    /// Returns bounded local outcomes from automatic startup quarantine.
+    #[must_use]
+    pub fn startup_quarantine_outcomes(&self) -> &[QuarantineOutcome] {
+        &self.startup_quarantine_outcomes
     }
 
     /// Clones the operating-system writer-lock lease.
@@ -792,6 +1675,183 @@ impl WriterOwner {
         Ok(WriterLease {
             _lock: self.owner_lock.try_clone()?,
         })
+    }
+
+    /// Prepares an exact-evidence rotation of the canonical active journal.
+    ///
+    /// The existing regular file is opened without following links and pinned
+    /// by identity. A fresh, process-unique, bounded root generation is created
+    /// exclusively and returned for caller initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed layout/I/O error if the canonical file is absent or
+    /// unsafe, no generation slot is available, or a descriptor cannot be
+    /// opened.
+    pub fn begin_journal_rotation(&self) -> Result<JournalRotation, LayoutError> {
+        let evidence_file = self
+            .root
+            .open_active_journal()?
+            .ok_or(LayoutError::ActiveJournalMissing)?;
+        let evidence_identity = FileIdentity::from_file(&evidence_file)?;
+        let active_name = CStr::from_bytes_with_nul(b"active.parts\0")
+            .expect("canonical journal name is a C string");
+        let evidence = EvidenceFile {
+            file: evidence_file,
+            identity: path_identity_from_file(
+                EntryScope::Root,
+                active_name,
+                EntryFileType::RegularFile,
+                evidence_identity,
+            ),
+            location: EvidenceLocation::Canonical,
+            name: active_name.to_owned(),
+        };
+        let nonce = root_generation_nonce(evidence_identity);
+        let mut fresh = None;
+        for slot in 0..MAX_ROOT_COLLISION_SLOTS {
+            let name = generation_name(nonce, slot);
+            let name = CString::new(name).expect("bounded generation names never contain NUL");
+            match create_regular_name_at(&self.root.directory, &name, OFlags::RDWR, DATA_FILE_MODE)
+            {
+                Ok(file) => {
+                    fresh = Some((file, name));
+                    break;
+                }
+                Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let (fresh, fresh_name) = fresh.ok_or(LayoutError::RecoverySlotsExhausted {
+            limit: usize::from(MAX_ROOT_COLLISION_SLOTS),
+        })?;
+        let mut diagnostics = Vec::new();
+        if let Err(error) = self.root.directory.sync_all() {
+            diagnostics.push(quarantine_failure(
+                QuarantineFailureStage::RootDirectorySync,
+                &error,
+            ));
+        }
+        Ok(JournalRotation {
+            root: self.root.clone(),
+            lease: self.try_clone_lease()?,
+            fresh,
+            fresh_name,
+            evidence,
+            diagnostics,
+            nonce,
+        })
+    }
+
+    /// Creates a fresh alternate root journal generation without interpreting
+    /// an unsafe canonical control entry.
+    ///
+    /// This is the local-degradation path for a missing, symlinked, or
+    /// wrong-type `active.parts`. The caller initializes the returned file
+    /// through the normal journal contract and collection can continue without
+    /// replacing or deleting the affected entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when no exclusive generation name can be created
+    /// or the writer lease/file operation itself fails.
+    pub fn create_journal_generation(&self) -> Result<FreshJournalGeneration, LayoutError> {
+        let root_identity = FileIdentity::from_file(&self.root.directory)?;
+        let nonce = root_generation_nonce(root_identity);
+        for slot in 0..MAX_ROOT_COLLISION_SLOTS {
+            let name = CString::new(generation_name(nonce, slot))
+                .expect("bounded generation names never contain NUL");
+            match create_regular_name_at(&self.root.directory, &name, OFlags::RDWR, DATA_FILE_MODE)
+            {
+                Ok(file) => {
+                    let identity = path_identity_from_file(
+                        EntryScope::Root,
+                        &name,
+                        EntryFileType::RegularFile,
+                        FileIdentity::from_file(&file)?,
+                    );
+                    let diagnostic = self.root.directory.sync_all().err().map(|error| {
+                        quarantine_failure(QuarantineFailureStage::RootDirectorySync, &error)
+                    });
+                    return Ok(FreshJournalGeneration {
+                        slot: JournalSlot {
+                            lease: self.try_clone_lease()?,
+                            file,
+                            kind: JournalSlotKind::Alternate(identity),
+                        },
+                        diagnostic,
+                    });
+                }
+                Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(LayoutError::RecoverySlotsExhausted {
+            limit: usize::from(MAX_ROOT_COLLISION_SLOTS),
+        })
+    }
+
+    /// Reopens a recognized alternate generation as a writer-owned slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an evidence entry, identity change, unsafe type, or
+    /// descriptor failure.
+    pub fn open_journal_generation(
+        &self,
+        pending: &PendingRootEntry,
+    ) -> Result<JournalSlot, LayoutError> {
+        if pending.kind != PendingRootKind::JournalGeneration {
+            return Err(LayoutError::TemporaryChanged {
+                name: format!("opaque-root:{:016x}", pending.identity.name_hash),
+            });
+        }
+        let file = open_regular_name_at(&self.root.directory, &pending.name, OFlags::RDWR)?;
+        if FileIdentity::from_file(&file)? != pending.identity.file {
+            return Err(LayoutError::TemporaryChanged {
+                name: format!("opaque-root:{:016x}", pending.identity.name_hash),
+            });
+        }
+        Ok(JournalSlot {
+            lease: self.try_clone_lease()?,
+            file,
+            kind: JournalSlotKind::Alternate(pending.identity),
+        })
+    }
+
+    /// Moves pinned active-journal evidence into opaque quarantine.
+    ///
+    /// The already-open evidence descriptor remains readable after a
+    /// successful rename. Local failures retain the source and return a typed
+    /// degraded outcome.
+    #[must_use]
+    pub fn quarantine_evidence(
+        &self,
+        evidence: &mut EvidenceFile,
+        reason: QuarantineReason,
+    ) -> QuarantineOutcome {
+        let current = FileIdentity::from_file(&evidence.file).unwrap_or(evidence.identity.file);
+        let source = path_identity_from_file(
+            EntryScope::Root,
+            &evidence.name,
+            EntryFileType::RegularFile,
+            current,
+        );
+        let path = EntryPath {
+            parent: EntryParent::Root,
+            name: evidence.name.clone(),
+        };
+        let outcome = self.quarantine_entry(&path, source, reason);
+        match outcome.status {
+            QuarantineStatus::Quarantined { destination }
+            | QuarantineStatus::QuarantinedDegraded { destination, .. } => {
+                evidence.location = EvidenceLocation::Quarantined(destination);
+            }
+            QuarantineStatus::Missing
+            | QuarantineStatus::Changed { .. }
+            | QuarantineStatus::Retained { .. } => {}
+        }
+        outcome
     }
 
     /// Opens or creates the root-level journal without following links.
@@ -820,6 +1880,83 @@ impl WriterOwner {
     /// Returns an I/O error if the directory sync fails.
     pub fn sync_root(&self) -> Result<(), LayoutError> {
         self.root.directory.sync_all().map_err(LayoutError::Io)
+    }
+
+    /// Atomically moves a discovered unsupported entry into opaque quarantine.
+    ///
+    /// The raw path remains private, the source identity is revalidated without
+    /// following links, destination names are bounded and collision-safe, and
+    /// no existing object is overwritten. Every local failure is returned as a
+    /// degraded outcome so callers can continue processing other entries.
+    #[must_use]
+    pub fn quarantine_foreign(&self, foreign: &ForeignEntry) -> QuarantineOutcome {
+        self.quarantine_entry(
+            &foreign.path,
+            foreign.diagnostic.path,
+            QuarantineReason::ForeignEntry,
+        )
+    }
+
+    /// Atomically preserves a PGM that failed startup validation.
+    ///
+    /// The immutable segment identity from discovery pins the exact source
+    /// object. No existing quarantine object is overwritten.
+    #[must_use]
+    pub fn quarantine_invalid_pgm(&self, segment: SegmentArtifacts) -> QuarantineOutcome {
+        let name = CString::new(segment.address.pgm_name())
+            .expect("canonical segment names never contain NUL");
+        let path = EntryPath {
+            parent: EntryParent::Day(segment.address.day),
+            name,
+        };
+        let source = path_identity_from_file(
+            path.parent.scope(),
+            &path.name,
+            EntryFileType::RegularFile,
+            segment.pgm_identity,
+        );
+        self.quarantine_entry(&path, source, QuarantineReason::InvalidPgm)
+    }
+
+    /// Atomically preserves a stale writer temporary after identity recheck.
+    #[must_use]
+    pub fn quarantine_temporary(&self, temporary: &TemporaryObject) -> QuarantineOutcome {
+        let name = CString::new(temporary.file_name.as_bytes())
+            .expect("discovered ASCII temporary names never contain NUL");
+        let path = EntryPath {
+            parent: EntryParent::Day(temporary.address.day),
+            name,
+        };
+        let source = path_identity_from_file(
+            path.parent.scope(),
+            &path.name,
+            EntryFileType::RegularFile,
+            temporary.identity,
+        );
+        self.quarantine_entry(&path, source, QuarantineReason::StaleTemporary)
+    }
+
+    /// Atomically preserves a recognized root recovery object.
+    #[must_use]
+    pub fn quarantine_pending_root(
+        &self,
+        pending: &PendingRootEntry,
+        reason: QuarantineReason,
+    ) -> QuarantineOutcome {
+        let path = EntryPath {
+            parent: EntryParent::Root,
+            name: pending.name.clone(),
+        };
+        self.quarantine_entry(&path, pending.identity, reason)
+    }
+
+    fn quarantine_entry(
+        &self,
+        path: &EntryPath,
+        source: PathIdentity,
+        reason: QuarantineReason,
+    ) -> QuarantineOutcome {
+        quarantine_entry(&self.root, path, source, reason)
     }
 
     /// Creates a new process-unique PGM temporary in the segment's UTC day.
@@ -1324,6 +2461,9 @@ struct ScanState<'scan> {
     segments: Vec<SegmentArtifacts>,
     orphan_overviews: Vec<SegmentAddress>,
     temporaries: Vec<TemporaryObject>,
+    foreign_entries: Vec<ForeignEntry>,
+    pending_root_entries: Vec<PendingRootEntry>,
+    quarantine_directory: QuarantineDirectoryState,
 }
 
 impl<'scan> ScanState<'scan> {
@@ -1336,7 +2476,45 @@ impl<'scan> ScanState<'scan> {
             segments: Vec::new(),
             orphan_overviews: Vec::new(),
             temporaries: Vec::new(),
+            foreign_entries: Vec::new(),
+            pending_root_entries: Vec::new(),
+            quarantine_directory: QuarantineDirectoryState::Absent,
         }
+    }
+
+    fn record_foreign(
+        &mut self,
+        parent: EntryParent,
+        name: &CStr,
+        stat: &rustix::fs::Stat,
+        reason: ForeignEntryReason,
+    ) -> Result<(), LayoutError> {
+        self.account_metadata(size_of::<ForeignEntry>())?;
+        let path = EntryPath {
+            parent,
+            name: name.to_owned(),
+        };
+        let diagnostic = EntryDiagnostic {
+            path: path_identity(parent, name, stat),
+            reason,
+        };
+        self.foreign_entries.push(ForeignEntry { diagnostic, path });
+        Ok(())
+    }
+
+    fn record_pending_root(
+        &mut self,
+        kind: PendingRootKind,
+        name: &CStr,
+        stat: &rustix::fs::Stat,
+    ) -> Result<(), LayoutError> {
+        self.account_metadata(size_of::<PendingRootEntry>())?;
+        self.pending_root_entries.push(PendingRootEntry {
+            kind,
+            identity: path_identity(EntryParent::Root, name, stat),
+            name: name.to_owned(),
+        });
+        Ok(())
     }
 
     fn account(&mut self, name_bytes: usize) -> Result<(), LayoutError> {
@@ -1387,11 +2565,18 @@ impl<'scan> ScanState<'scan> {
         self.orphan_overviews.sort_by_key(|address| address.id);
         self.temporaries
             .sort_by_key(|temporary| (temporary.address.id, temporary.kind as u8));
+        self.foreign_entries
+            .sort_by_key(|entry| entry.diagnostic.path);
+        self.pending_root_entries
+            .sort_by_key(|entry| (entry.kind, entry.identity));
         LayoutSnapshot {
             days: self.days,
             segments: self.segments,
             orphan_overviews: self.orphan_overviews,
             temporaries: self.temporaries,
+            foreign_entries: self.foreign_entries,
+            pending_root_entries: self.pending_root_entries,
+            quarantine_directory: self.quarantine_directory,
             visited_entries: *self.visited_entries,
             metadata_bytes: self.metadata_bytes,
         }
@@ -1490,24 +2675,117 @@ fn is_control_name(name: &str) -> bool {
     )
 }
 
-fn entry_name(entry: &rustix::fs::DirEntry) -> &[u8] {
-    entry.file_name().to_bytes()
+fn is_writer_bootstrap_control(foreign: &ForeignEntry) -> bool {
+    foreign.diagnostic.path.scope == EntryScope::Root
+        && matches!(
+            foreign.path.name.as_bytes(),
+            b"active.parts" | b".pgkronika-writer.owner.lock"
+        )
+}
+
+fn is_writer_lock_name(foreign: &ForeignEntry) -> bool {
+    foreign.diagnostic.path.scope == EntryScope::Root
+        && foreign.path.name.as_bytes() == WRITER_OWNER_LOCK_NAME.as_bytes()
+}
+
+fn writer_lock_is_poisoned(root: &DataRoot) -> bool {
+    stat_no_follow(&root.directory, WRITER_OWNER_LOCK_NAME)
+        .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile)
 }
 
 fn is_dot(name: &[u8]) -> bool {
     name == b"." || name == b".."
 }
 
-fn ascii_name(name: &[u8]) -> Result<&str, LayoutError> {
-    if name.is_ascii() {
-        std::str::from_utf8(name).map_err(|_error| LayoutError::UnexpectedRootEntry {
-            name: String::from_utf8_lossy(name).into_owned(),
-        })
-    } else {
-        Err(LayoutError::UnexpectedRootEntry {
-            name: String::from_utf8_lossy(name).into_owned(),
-        })
+fn ascii_name(name: &[u8]) -> Option<&str> {
+    name.is_ascii()
+        .then(|| std::str::from_utf8(name).ok())
+        .flatten()
+}
+
+fn entry_file_type(file_type: FileType) -> EntryFileType {
+    match file_type {
+        FileType::RegularFile => EntryFileType::RegularFile,
+        FileType::Directory => EntryFileType::Directory,
+        FileType::Symlink => EntryFileType::Symlink,
+        _ => EntryFileType::Other,
     }
+}
+
+fn foreign_type_reason(file_type: FileType) -> ForeignEntryReason {
+    if file_type == FileType::Symlink {
+        ForeignEntryReason::SymbolicLink
+    } else {
+        ForeignEntryReason::UnsupportedType
+    }
+}
+
+fn path_identity(parent: EntryParent, name: &CStr, stat: &rustix::fs::Stat) -> PathIdentity {
+    PathIdentity {
+        scope: parent.scope(),
+        name_hash: hash_name(name.to_bytes()),
+        name_len: u16::try_from(name.to_bytes().len()).unwrap_or(u16::MAX),
+        file_type: entry_file_type(FileType::from_raw_mode(stat.st_mode)),
+        file: FileIdentity::from_stat(stat),
+    }
+}
+
+fn path_identity_from_file(
+    scope: EntryScope,
+    name: &CStr,
+    file_type: EntryFileType,
+    file: FileIdentity,
+) -> PathIdentity {
+    PathIdentity {
+        scope,
+        name_hash: hash_name(name.to_bytes()),
+        name_len: if name.to_bytes().len() > u16::MAX as usize {
+            u16::MAX
+        } else {
+            name.to_bytes().len() as u16
+        },
+        file_type,
+        file,
+    }
+}
+
+const fn hash_name(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+    hash
+}
+
+fn parse_pending_root_name(name: &str) -> Option<PendingRootKind> {
+    if is_bounded_root_name(name, ROOT_EVIDENCE_PREFIX, ROOT_EVIDENCE_SUFFIX) {
+        Some(PendingRootKind::Evidence)
+    } else if is_bounded_root_name(name, ROOT_GENERATION_PREFIX, ROOT_GENERATION_SUFFIX) {
+        Some(PendingRootKind::JournalGeneration)
+    } else {
+        None
+    }
+}
+
+fn is_bounded_root_name(name: &str, prefix: &str, suffix: &str) -> bool {
+    let Some(middle) = name
+        .strip_prefix(prefix)
+        .and_then(|remainder| remainder.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    let expected_len = ROOT_NONCE_HEX_LEN + 1 + ROOT_SLOT_HEX_LEN;
+    middle.len() == expected_len
+        && middle.as_bytes()[ROOT_NONCE_HEX_LEN] == b'.'
+        && middle[..ROOT_NONCE_HEX_LEN]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && middle[ROOT_NONCE_HEX_LEN + 1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn parse_year(name: &str) -> Option<u16> {
@@ -1590,6 +2868,16 @@ fn parse_canonical_u64(value: &str) -> Option<u64> {
 }
 
 fn stat_no_follow(directory: &File, name: &str) -> Result<rustix::fs::Stat, LayoutError> {
+    let name = CString::new(name).map_err(|_error| {
+        LayoutError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "layout leaf contains a NUL byte",
+        ))
+    })?;
+    stat_no_follow_name(directory, &name)
+}
+
+fn stat_no_follow_name(directory: &File, name: &CStr) -> Result<rustix::fs::Stat, LayoutError> {
     rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(errno_to_io)
         .map_err(LayoutError::Io)
@@ -1629,6 +2917,20 @@ fn ensure_directory_at(directory: &File, name: &str) -> Result<File, LayoutError
 }
 
 fn open_regular_at(directory: &File, name: &str, access: OFlags) -> Result<File, LayoutError> {
+    let name = CString::new(name).map_err(|_error| {
+        LayoutError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "layout leaf contains a NUL byte",
+        ))
+    })?;
+    open_regular_name_at(directory, &name, access)
+}
+
+fn open_regular_name_at(
+    directory: &File,
+    name: &CStr,
+    access: OFlags,
+) -> Result<File, LayoutError> {
     let file = rustix::fs::openat(
         directory,
         name,
@@ -1639,7 +2941,7 @@ fn open_regular_at(directory: &File, name: &str, access: OFlags) -> Result<File,
     .map_err(|error| {
         if error == rustix::io::Errno::LOOP {
             LayoutError::SymlinkNotAllowed {
-                name: name.to_owned(),
+                name: format!("opaque:{:016x}", hash_name(name.to_bytes())),
             }
         } else {
             LayoutError::Io(errno_to_io(error))
@@ -1647,10 +2949,36 @@ fn open_regular_at(directory: &File, name: &str, access: OFlags) -> Result<File,
     })?;
     if !file.metadata()?.is_file() {
         return Err(LayoutError::UnexpectedLeafEntryType {
-            name: name.to_owned(),
+            name: format!("opaque:{:016x}", hash_name(name.to_bytes())),
         });
     }
     Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_entry_name(directory: &File, name: &CStr) -> Result<File, LayoutError> {
+    rustix::fs::openat(
+        directory,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(errno_to_io)
+    .map_err(LayoutError::Io)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_entry_name(directory: &File, name: &CStr) -> Result<File, LayoutError> {
+    rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(errno_to_io)
+    .map_err(LayoutError::Io)
 }
 
 #[cfg(target_os = "linux")]
@@ -1698,6 +3026,21 @@ fn create_regular_at(
     access: OFlags,
     mode: Mode,
 ) -> Result<File, LayoutError> {
+    let name = CString::new(name).map_err(|_error| {
+        LayoutError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "layout leaf contains a NUL byte",
+        ))
+    })?;
+    create_regular_name_at(directory, &name, access, mode)
+}
+
+fn create_regular_name_at(
+    directory: &File,
+    name: &CStr,
+    access: OFlags,
+    mode: Mode,
+) -> Result<File, LayoutError> {
     rustix::fs::openat(
         directory,
         name,
@@ -1728,6 +3071,375 @@ fn open_or_create_regular(
         }
         Err(error) => Err(error),
     }
+}
+
+fn quarantine_entry(
+    root: &DataRoot,
+    path: &EntryPath,
+    source: PathIdentity,
+    reason: QuarantineReason,
+) -> QuarantineOutcome {
+    let retained = |failure| QuarantineOutcome {
+        reason,
+        source,
+        status: QuarantineStatus::Retained { failure },
+    };
+    let source_parent = match open_entry_parent(root, path.parent) {
+        Ok(parent) => parent,
+        Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return QuarantineOutcome {
+                reason,
+                source,
+                status: QuarantineStatus::Missing,
+            };
+        }
+        Err(error) => {
+            return retained(layout_failure(
+                QuarantineFailureStage::SourceChanged,
+                &error,
+            ));
+        }
+    };
+    let observed_stat = match stat_no_follow_name(&source_parent, &path.name) {
+        Ok(stat) => stat,
+        Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return QuarantineOutcome {
+                reason,
+                source,
+                status: QuarantineStatus::Missing,
+            };
+        }
+        Err(error) => {
+            return retained(layout_failure(
+                QuarantineFailureStage::SourceChanged,
+                &error,
+            ));
+        }
+    };
+    let observed = path_identity(path.parent, &path.name, &observed_stat);
+    if observed != source {
+        return QuarantineOutcome {
+            reason,
+            source,
+            status: QuarantineStatus::Changed {
+                observed: Some(observed),
+            },
+        };
+    }
+    let pinned = match pin_entry_name(&source_parent, &path.name) {
+        Ok(file) => file,
+        Err(error) => {
+            return retained(layout_failure(
+                QuarantineFailureStage::SourceChanged,
+                &error,
+            ));
+        }
+    };
+    let pinned_identity = match FileIdentity::from_file(&pinned) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return retained(quarantine_failure(
+                QuarantineFailureStage::SourceChanged,
+                &error,
+            ));
+        }
+    };
+    if pinned_identity != source.file {
+        return QuarantineOutcome {
+            reason,
+            source,
+            status: QuarantineStatus::Changed {
+                observed: Some(path_identity_from_file(
+                    path.parent.scope(),
+                    &path.name,
+                    source.file_type,
+                    pinned_identity,
+                )),
+            },
+        };
+    }
+    let quarantine = match ensure_quarantine_directory(root) {
+        Ok(directory) => directory,
+        Err(failure) => return retained(failure),
+    };
+
+    for slot in 0..MAX_QUARANTINE_COLLISION_SLOTS {
+        let destination_name = quarantine_name(reason, source, slot);
+        let destination =
+            CString::new(destination_name).expect("bounded quarantine names never contain NUL");
+        match rename_noreplace(&source_parent, &path.name, &quarantine, &destination) {
+            Ok(()) => {
+                let source_sync = sync_source_directory(&source_parent);
+                let quarantine_sync = sync_quarantine_directory(&quarantine);
+                let destination_stat = stat_no_follow_name(&quarantine, &destination);
+                let destination_identity = destination_stat.as_ref().map_or_else(
+                    |_error| {
+                        path_identity_from_file(
+                            EntryScope::Quarantine,
+                            &destination,
+                            source.file_type,
+                            source.file,
+                        )
+                    },
+                    |stat| PathIdentity {
+                        scope: EntryScope::Quarantine,
+                        ..path_identity(EntryParent::Root, &destination, stat)
+                    },
+                );
+                let verification_failure = match destination_stat {
+                    Ok(stat) => {
+                        let observed_type = entry_file_type(FileType::from_raw_mode(stat.st_mode));
+                        let pinned_after = FileIdentity::from_file(&pinned);
+                        let named_after = FileIdentity::from_stat(&stat);
+                        match pinned_after {
+                            Ok(pinned_after)
+                                if same_object_after_rename(source.file, named_after)
+                                    && same_object_after_rename(source.file, pinned_after)
+                                    && observed_type == source.file_type =>
+                            {
+                                None
+                            }
+                            Ok(_) => Some(QuarantineFailure::local(
+                                QuarantineFailureStage::IdentityVerification,
+                                io::ErrorKind::InvalidData,
+                            )),
+                            Err(error) => Some(quarantine_failure(
+                                QuarantineFailureStage::IdentityVerification,
+                                &error,
+                            )),
+                        }
+                    }
+                    Err(error) => Some(layout_failure(
+                        QuarantineFailureStage::IdentityVerification,
+                        &error,
+                    )),
+                };
+                let failure = source_sync
+                    .err()
+                    .map(|error| {
+                        quarantine_failure(QuarantineFailureStage::SourceDirectorySync, &error)
+                    })
+                    .or_else(|| {
+                        quarantine_sync.err().map(|error| {
+                            quarantine_failure(
+                                QuarantineFailureStage::QuarantineDirectorySync,
+                                &error,
+                            )
+                        })
+                    })
+                    .or(verification_failure);
+                return QuarantineOutcome {
+                    reason,
+                    source,
+                    status: failure.map_or(
+                        QuarantineStatus::Quarantined {
+                            destination: destination_identity,
+                        },
+                        |failure| QuarantineStatus::QuarantinedDegraded {
+                            destination: destination_identity,
+                            failure,
+                        },
+                    ),
+                };
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return retained(quarantine_failure(QuarantineFailureStage::Rename, &error));
+            }
+        }
+    }
+    retained(QuarantineFailure::local(
+        QuarantineFailureStage::CollisionSlotsExhausted,
+        io::ErrorKind::AlreadyExists,
+    ))
+}
+
+fn root_generation_nonce(identity: FileIdentity) -> u64 {
+    let sequence = NEXT_ROOT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let mut nonce = identity.device.rotate_left(7)
+        ^ identity.inode.rotate_left(23)
+        ^ identity.len.rotate_left(41)
+        ^ u64::from(std::process::id())
+        ^ sequence;
+    nonce ^= u64::from_ne_bytes(identity.ctime_seconds.to_ne_bytes()).rotate_left(13);
+    nonce ^= u64::from_ne_bytes(identity.ctime_nanoseconds.to_ne_bytes()).rotate_left(37);
+    nonce
+}
+
+fn generation_name(nonce: u64, slot: u8) -> String {
+    format!("{ROOT_GENERATION_PREFIX}{nonce:016x}.{slot:02x}{ROOT_GENERATION_SUFFIX}")
+}
+
+fn evidence_name(nonce: u64, slot: u8) -> String {
+    format!("{ROOT_EVIDENCE_PREFIX}{nonce:016x}.{slot:02x}{ROOT_EVIDENCE_SUFFIX}")
+}
+
+fn available_evidence_name(root: &File, nonce: u64, _current_name: &CStr) -> Option<CString> {
+    (0..MAX_ROOT_COLLISION_SLOTS).find_map(|slot| {
+        let candidate = CString::new(evidence_name(nonce, slot))
+            .expect("bounded evidence names contain no NUL");
+        match stat_no_follow_name(root, &candidate) {
+            Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Some(candidate)
+            }
+            Ok(_) | Err(_) => None,
+        }
+    })
+}
+
+fn verify_active_evidence(
+    root: &DataRoot,
+    evidence: &EvidenceFile,
+) -> Result<(), QuarantineFailure> {
+    let pinned = FileIdentity::from_file(&evidence.file)
+        .map_err(|error| quarantine_failure(QuarantineFailureStage::SourceChanged, &error))?;
+    if pinned != evidence.identity.file {
+        return Err(QuarantineFailure::local(
+            QuarantineFailureStage::SourceChanged,
+            io::ErrorKind::InvalidData,
+        ));
+    }
+    let stat = stat_no_follow(&root.directory, ACTIVE_JOURNAL_NAME)
+        .map_err(|error| layout_failure(QuarantineFailureStage::SourceChanged, &error))?;
+    let named = FileIdentity::from_stat(&stat);
+    if entry_file_type(FileType::from_raw_mode(stat.st_mode)) != EntryFileType::RegularFile
+        || named != evidence.identity.file
+    {
+        return Err(QuarantineFailure::local(
+            QuarantineFailureStage::SourceChanged,
+            io::ErrorKind::InvalidData,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_root_names(root: &File, first: &str, second: &CStr) -> io::Result<()> {
+    quarantine_failpoint!(Exchange);
+    rustix::fs::renameat_with(root, first, root, second, RenameFlags::EXCHANGE).map_err(errno_to_io)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exchange_root_names(_root: &File, _first: &str, _second: &CStr) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic exchange rename is unsupported on this platform",
+    ))
+}
+
+fn rename_generation_to_active(root: &File, generation: &CStr) -> io::Result<()> {
+    let active =
+        CStr::from_bytes_with_nul(b"active.parts\0").expect("canonical journal name is a C string");
+    rename_noreplace(root, generation, root, active)
+}
+
+fn open_entry_parent(root: &DataRoot, parent: EntryParent) -> Result<File, LayoutError> {
+    match parent {
+        EntryParent::Root => root.directory.try_clone().map_err(LayoutError::Io),
+        EntryParent::Year(year) => open_directory_at(&root.directory, &format!("{year:04}")),
+        EntryParent::Month { year, month } => {
+            let year = open_directory_at(&root.directory, &format!("{year:04}"))?;
+            open_directory_at(&year, &format!("{month:02}"))
+        }
+        EntryParent::Day(day) => root.open_day(day),
+    }
+}
+
+fn ensure_quarantine_directory(root: &DataRoot) -> Result<File, QuarantineFailure> {
+    match rustix::fs::mkdirat(
+        &*root.directory,
+        QUARANTINE_DIRECTORY_NAME,
+        QUARANTINE_DIRECTORY_MODE,
+    ) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => {
+            let error = errno_to_io(error);
+            return Err(quarantine_failure(
+                QuarantineFailureStage::QuarantineDirectory,
+                &error,
+            ));
+        }
+    }
+    let directory = open_directory_at(&root.directory, QUARANTINE_DIRECTORY_NAME)
+        .map_err(|error| layout_failure(QuarantineFailureStage::QuarantineDirectory, &error))?;
+    rustix::fs::fchmod(&directory, QUARANTINE_DIRECTORY_MODE)
+        .map_err(errno_to_io)
+        .map_err(|error| quarantine_failure(QuarantineFailureStage::QuarantineDirectory, &error))?;
+    directory
+        .sync_all()
+        .map_err(|error| quarantine_failure(QuarantineFailureStage::QuarantineDirectory, &error))?;
+    sync_quarantine_entry(&root.directory).map_err(|error| {
+        quarantine_failure(QuarantineFailureStage::QuarantineDirectoryEntrySync, &error)
+    })?;
+    Ok(directory)
+}
+
+fn layout_failure(stage: QuarantineFailureStage, error: &LayoutError) -> QuarantineFailure {
+    match error {
+        LayoutError::Io(error) => quarantine_failure(stage, error),
+        _ => QuarantineFailure::local(stage, io::ErrorKind::InvalidData),
+    }
+}
+
+fn quarantine_name(reason: QuarantineReason, source: PathIdentity, slot: u8) -> String {
+    format!(
+        "qv1-{:02x}-{:016x}-{:016x}-{:016x}-{slot:02x}",
+        reason as u8, source.name_hash, source.file.device, source.file.inode
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(
+    source_directory: &File,
+    source_name: &CStr,
+    destination_directory: &File,
+    destination_name: &CStr,
+) -> io::Result<()> {
+    quarantine_failpoint!(Rename);
+    rustix::fs::renameat_with(
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(errno_to_io)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(
+    _source_directory: &File,
+    _source_name: &CStr,
+    _destination_directory: &File,
+    _destination_name: &CStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unsupported on this platform",
+    ))
+}
+
+fn sync_quarantine_entry(root: &File) -> io::Result<()> {
+    quarantine_failpoint!(DirectorySync);
+    root.sync_all()
+}
+
+fn sync_source_directory(directory: &File) -> io::Result<()> {
+    quarantine_failpoint!(SourceDirectorySync);
+    directory.sync_all()
+}
+
+fn sync_quarantine_directory(directory: &File) -> io::Result<()> {
+    quarantine_failpoint!(QuarantineDirectorySync);
+    directory.sync_all()
+}
+
+const fn same_object_after_rename(expected: FileIdentity, observed: FileIdentity) -> bool {
+    expected.device == observed.device
+        && expected.inode == observed.inode
+        && expected.len == observed.len
+        && expected.mtime_seconds == observed.mtime_seconds
+        && expected.mtime_nanoseconds == observed.mtime_nanoseconds
 }
 
 fn remove_verified_regular(
@@ -1956,32 +3668,38 @@ mod tests {
     }
 
     #[test]
-    fn flat_segment_is_rejected_without_reading_it() {
+    fn flat_segment_is_excluded_without_reading_it() {
         for name in ["1000.pgm", "1000.ovf"] {
             let directory = tempfile::tempdir().unwrap();
             std::fs::write(directory.path().join(name), b"not a container").unwrap();
             let root = DataRoot::open(directory.path()).unwrap();
-            assert!(matches!(
-                root.scan(LayoutLimits::default()),
-                Err(LayoutError::UnsupportedFlatLayout { .. })
-            ));
+            let snapshot = root.scan(LayoutLimits::default()).unwrap();
+            assert!(snapshot.segments.is_empty());
+            assert_eq!(snapshot.foreign_entries.len(), 1);
+            assert_eq!(
+                snapshot.foreign_entries[0].diagnostic().reason,
+                ForeignEntryReason::UnsupportedFlatArtifact
+            );
         }
     }
 
     #[test]
-    fn symlinked_calendar_component_is_rejected() {
+    fn symlinked_calendar_component_is_excluded_without_following() {
         let directory = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
         symlink(target.path(), directory.path().join("2024")).unwrap();
         let root = DataRoot::open(directory.path()).unwrap();
-        assert!(matches!(
-            root.scan(LayoutLimits::default()),
-            Err(LayoutError::SymlinkNotAllowed { .. })
-        ));
+        let snapshot = root.scan(LayoutLimits::default()).unwrap();
+        assert!(snapshot.days.is_empty());
+        assert_eq!(snapshot.foreign_entries.len(), 1);
+        assert_eq!(
+            snapshot.foreign_entries[0].diagnostic().reason,
+            ForeignEntryReason::SymbolicLink
+        );
     }
 
     #[test]
-    fn symlinks_are_rejected_at_month_day_and_leaf_levels() {
+    fn symlinks_are_excluded_at_month_day_and_leaf_levels() {
         for level in ["month", "day", "leaf"] {
             let directory = tempfile::tempdir().unwrap();
             let target = tempfile::tempdir().unwrap();
@@ -2004,29 +3722,33 @@ mod tests {
                 _ => unreachable!(),
             }
             let root = DataRoot::open(directory.path()).unwrap();
+            let snapshot = root.scan(LayoutLimits::default()).unwrap();
             assert!(
-                matches!(
-                    root.scan(LayoutLimits::default()),
-                    Err(LayoutError::SymlinkNotAllowed { .. })
-                ),
-                "{level} symlink must fail the complete scan"
+                snapshot.segments.is_empty(),
+                "{level} symlink must not become a segment"
+            );
+            assert_eq!(snapshot.foreign_entries.len(), 1);
+            assert_eq!(
+                snapshot.foreign_entries[0].diagnostic().reason,
+                ForeignEntryReason::SymbolicLink
             );
         }
     }
 
     #[test]
-    fn noncanonical_segment_names_are_rejected() {
+    fn noncanonical_segment_names_are_excluded() {
         for name in ["+1.pgm", "01.pgm", "-0.pgm"] {
             let directory = tempfile::tempdir().unwrap();
             let day = directory.path().join("1970/01/01");
             std::fs::create_dir_all(&day).unwrap();
             std::fs::write(day.join(name), b"PGM").unwrap();
             let root = DataRoot::open(directory.path()).unwrap();
-            assert!(
-                matches!(
-                    root.scan(LayoutLimits::default()),
-                    Err(LayoutError::UnexpectedLeafEntry { .. })
-                ),
+            let snapshot = root.scan(LayoutLimits::default()).unwrap();
+            assert!(snapshot.segments.is_empty());
+            assert_eq!(snapshot.foreign_entries.len(), 1);
+            assert_eq!(
+                snapshot.foreign_entries[0].diagnostic().reason,
+                ForeignEntryReason::UnsupportedName,
                 "{name} must not alias a canonical SegmentId"
             );
         }
@@ -2051,16 +3773,19 @@ mod tests {
     }
 
     #[test]
-    fn misbucketed_segment_is_rejected() {
+    fn misbucketed_segment_is_excluded() {
         let directory = tempfile::tempdir().unwrap();
         let day = directory.path().join("2024/02/28");
         std::fs::create_dir_all(&day).unwrap();
         std::fs::write(day.join("1709164800000000.pgm"), b"PGM").unwrap();
         let root = DataRoot::open(directory.path()).unwrap();
-        assert!(matches!(
-            root.scan(LayoutLimits::default()),
-            Err(LayoutError::MisbucketedSegment { .. })
-        ));
+        let snapshot = root.scan(LayoutLimits::default()).unwrap();
+        assert!(snapshot.segments.is_empty());
+        assert_eq!(snapshot.foreign_entries.len(), 1);
+        assert_eq!(
+            snapshot.foreign_entries[0].diagnostic().reason,
+            ForeignEntryReason::MisbucketedSegment
+        );
     }
 
     #[test]

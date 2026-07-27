@@ -1665,8 +1665,12 @@ fn an_incomplete_active_baseline_forces_full_descriptor_recovery() {
     let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
     Arc::make_mut(&mut snap.scan.active).clear();
     snap.scan.warnings.push(StoreWarning {
-        path: journal_path,
-        reason: "simulated scan race omitted the validated prefix".to_owned(),
+        affected: StoreObject::ActiveJournal,
+        reason: kronika_store::StoreWarningReason::ActiveJournal(
+            kronika_store::ActiveJournalWarningReason::Io,
+        ),
+        identity: None,
+        failure: None,
     });
     snap.journal_descriptors_complete = false;
     snap.delta_initialized = true;
@@ -1687,7 +1691,7 @@ fn an_incomplete_active_baseline_forces_full_descriptor_recovery() {
 }
 
 #[test]
-fn damaged_sealed_file_fails_closed_and_recovery_replaces_its_identity() {
+fn damaged_sealed_file_is_excluded_until_a_valid_identity_returns() {
     let dir = tempfile::tempdir().unwrap();
     let valid_segment = make_part(1000, 2000, 1);
     let sealed_path = write_segment(dir.path(), 1_000, &valid_segment);
@@ -1697,41 +1701,49 @@ fn damaged_sealed_file_fails_closed_and_recovery_replaces_its_identity() {
     let generation = snap.view_generation();
 
     fs::write(&sealed_path, b"not a pgm segment").unwrap();
-    let unavailable = snap
+    let excluded = snap
         .refresh_incremental_delta()
-        .expect_err("a damaged sealed segment is fatal");
-    assert_eq!(unavailable.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(snap.view_generation(), generation);
-    assert_eq!(snap.units().len(), 1);
+        .expect("damage is localized to the invalid segment");
+    assert!(excluded.view_changed);
+    assert_eq!(excluded.sealed_added.len(), 0);
+    assert_eq!(excluded.sealed_removed.len(), 1);
+    assert!(snap.view_generation() > generation);
+    assert!(snap.units().is_empty());
+    assert!(matches!(
+        snap.warnings(),
+        [StoreWarning {
+            affected: StoreObject::Segment(_),
+            reason: kronika_store::StoreWarningReason::InvalidPgm(_),
+            ..
+        }]
+    ));
 
     fs::write(&sealed_path, &valid_segment).unwrap();
     let recovered = snap.refresh_incremental_delta().expect("readable recovery");
     assert!(recovered.view_changed);
     assert_eq!(recovered.sealed_added.len(), 1);
-    assert_eq!(recovered.sealed_removed.len(), 1);
-    assert_eq!(
-        recovered.sealed_added[0].catalog_digest,
-        recovered.sealed_removed[0].catalog_digest
-    );
-    assert_ne!(
-        recovered.sealed_added[0].file_identity,
-        recovered.sealed_removed[0].file_identity
-    );
+    assert!(recovered.sealed_removed.is_empty());
+    assert!(snap.warnings().is_empty());
 
     fs::write(&sealed_path, b"not a pgm segment").unwrap();
-    let unavailable_again = snap
+    let excluded_again = snap
         .refresh_incremental_delta()
-        .expect_err("second damage remains fatal");
-    assert_eq!(unavailable_again.kind(), io::ErrorKind::InvalidData);
+        .expect("second damage is localized again");
+    assert!(excluded_again.view_changed);
+    assert_eq!(excluded_again.sealed_removed.len(), 1);
+    assert!(excluded_again.sealed_added.is_empty());
 
     fs::remove_file(&sealed_path).unwrap();
     let absent = snap
         .refresh_incremental_delta()
         .expect("authoritative absence");
-    assert_eq!(
-        absent.sealed_removed.len(),
-        1,
-        "the preserved descriptor is removed exactly once"
+    assert!(
+        absent.sealed_removed.is_empty(),
+        "the invalid descriptor was already removed exactly once"
+    );
+    assert!(
+        snap.warnings().is_empty(),
+        "absence clears the invalid-file warning"
     );
     let repeated = snap.refresh_incremental_delta().expect("repeated absence");
     assert!(repeated.sealed_removed.is_empty());
@@ -1761,7 +1773,6 @@ fn same_name_sealed_replacement_reports_remove_and_add() {
 
 #[test]
 fn sealed_delta_compares_compact_scans_without_a_full_descriptor_baseline() {
-    let dir = tempfile::tempdir().unwrap();
     let catalog = PgmUnit::open(make_part(1000, 2000, 1).as_slice())
         .expect("unit")
         .catalog()
@@ -1835,12 +1846,16 @@ fn sealed_delta_compares_compact_scans_without_a_full_descriptor_baseline() {
 
     let journal_warning = LocalScan {
         warnings: vec![StoreWarning {
-            path: dir.path().join("active.parts"),
-            reason: "journal unavailable".to_owned(),
+            affected: StoreObject::ActiveJournal,
+            reason: kronika_store::StoreWarningReason::ActiveJournal(
+                kronika_store::ActiveJournalWarningReason::Io,
+            ),
+            identity: None,
+            failure: None,
         }],
         ..empty_scan
     };
-    assert!(!journal_descriptors_complete(&journal_warning, dir.path()));
+    assert!(!journal_descriptors_complete(&journal_warning));
 }
 
 #[test]

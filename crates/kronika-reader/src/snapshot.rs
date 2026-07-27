@@ -22,7 +22,7 @@ use kronika_registry::{
 };
 use kronika_store::{
     ActivePart, CatalogSummary, JournalScan, LocalDir, LocalScan, SealedUnit, StoreError,
-    StoreWarning, is_active_journal_scan_error,
+    StoreObject, StoreWarning, is_active_journal_scan_error,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -327,7 +327,7 @@ impl LocalDirSnapshot {
         let dir = LocalDir::open(root)?;
         let (scan, journal_identity, journal_prefix_digest) = full_scan_consistent(&dir, &[])?;
         let last_valid_len = scan.valid_len;
-        let journal_descriptors_complete = journal_descriptors_complete(&scan, root);
+        let journal_descriptors_complete = journal_descriptors_complete(&scan);
         let tail_pending = tail_pending(journal_identity, last_valid_len);
         let sealed_active_generation_match = prove_sealed_generation_matches_active(
             &dir,
@@ -453,7 +453,7 @@ impl LocalDirSnapshot {
         }
 
         let sealed = sealed_delta(&scan, previous_sealed.as_slice());
-        let current_parts_complete = journal_descriptors_complete(&scan, &self.root);
+        let current_parts_complete = journal_descriptors_complete(&scan);
         let current_sealed_active_generation_match = prove_sealed_generation_matches_active(
             &self.dir,
             &scan,
@@ -548,7 +548,7 @@ impl LocalDirSnapshot {
             same_committed_reset,
         );
         let scan = self.dir.complete_scan_cached(journal, &self.scan.sealed)?;
-        let transition = if journal_descriptors_complete(&scan, &self.root) {
+        let transition = if journal_descriptors_complete(&scan) {
             transition
         } else {
             PartTransition::Uncertain
@@ -596,7 +596,7 @@ impl LocalDirSnapshot {
             same_committed_reset,
         );
         let scan = self.dir.complete_scan_cached(journal, &self.scan.sealed)?;
-        let transition = if journal_descriptors_complete(&scan, &self.root) {
+        let transition = if journal_descriptors_complete(&scan) {
             transition
         } else {
             PartTransition::Uncertain
@@ -652,7 +652,7 @@ impl LocalDirSnapshot {
             JournalGenerationId(bump(self.journal_generation.0)?)
         };
         let sealed = sealed_delta(&scan, self.scan.sealed.as_slice());
-        let current_parts_complete = journal_descriptors_complete(&scan, &self.root);
+        let current_parts_complete = journal_descriptors_complete(&scan);
         let current_tail_pending = tail_pending(identity, scan.valid_len);
         let current_sealed_active_generation_match =
             prove_sealed_generation_matches_active(&self.dir, &scan, identity, prefix_digest)?;
@@ -1517,12 +1517,11 @@ fn sealed_delta(scan: &LocalScan, previous: &[SealedUnit]) -> SealedDeltaState {
     SealedDeltaState { added, removed }
 }
 
-fn journal_descriptors_complete(scan: &LocalScan, root: &Path) -> bool {
-    let journal_path = root.join("active.parts");
+fn journal_descriptors_complete(scan: &LocalScan) -> bool {
     !scan
         .warnings
         .iter()
-        .any(|warning| warning.path == journal_path)
+        .any(|warning| matches!(warning.affected, StoreObject::ActiveJournal))
 }
 
 fn part_descriptors(
@@ -1803,11 +1802,7 @@ fn same_sealed_units(previous: &LocalScan, current: &LocalScan) -> bool {
 }
 
 fn same_warnings(previous: &[StoreWarning], current: &[StoreWarning]) -> bool {
-    previous.len() == current.len()
-        && previous
-            .iter()
-            .zip(current)
-            .all(|(left, right)| left.path == right.path && left.reason == right.reason)
+    previous == current
 }
 
 #[cfg(test)]

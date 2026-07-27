@@ -66,7 +66,7 @@ use pool_sources::{PoolReads, read_pool_sources};
 use scheduler::{DueSet, Scheduler, SourceKind};
 use segments::{
     SegmentState, append_window_and_maybe_seal, encode_window, open_collector_journal,
-    seal_open_segment, validate_existing_segments,
+    quarantine_invalid_segments, seal_open_segment,
 };
 use service_sections::{collect_due_instance, collect_service_sections};
 use source_contracts::activity_dict_limits;
@@ -105,16 +105,22 @@ fn cleanup_writer_temporaries(owner: &WriterOwner, limits: LayoutLimits) -> Resu
         .root()
         .scan(limits)
         .context("scan for stale writer temporaries")?;
-    let mut removed = 0_usize;
+    let mut quarantined = 0_usize;
     for temporary in &snapshot.temporaries {
         if temporary.kind == TemporaryKind::Pgm {
-            owner
-                .remove_temporary(temporary)
-                .context("remove a stale writer temporary")?;
-            removed += 1;
+            let outcome = owner.quarantine_temporary(temporary);
+            log_event(
+                LogLevel::Warn,
+                "writer_temporary_quarantine",
+                &[
+                    field("reason", "stale_pgm_temporary"),
+                    field("status", format!("{:?}", outcome.status)),
+                ],
+            );
+            quarantined += 1;
         }
     }
-    Ok(removed)
+    Ok(quarantined)
 }
 
 fn prepare_collector_storage(
@@ -122,16 +128,12 @@ fn prepare_collector_storage(
     limits: LayoutLimits,
     journal_max_bytes: u64,
 ) -> Result<(Journal, Option<PathBuf>)> {
-    validate_existing_segments(owner.root(), limits)?;
+    quarantine_invalid_segments(owner, limits)?;
     cleanup_writer_temporaries(owner, limits)?;
     open_collector_journal(owner, journal_max_bytes)
 }
 
 fn acquire_collector_writer(root: &DataRoot, limits: LayoutLimits) -> Result<WriterOwner> {
-    // Refuse corrupt immutable input before creating the persistent lock name.
-    // Validate again under the acquired lock in `prepare_collector_storage` so
-    // a preceding writer cannot publish unchecked input during handoff.
-    validate_existing_segments(root, limits)?;
     root.acquire_writer(limits)
         .context("acquire exclusive writer ownership")
 }

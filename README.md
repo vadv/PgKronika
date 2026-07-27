@@ -146,6 +146,7 @@ allow lists with `cargo run -p xtask -- check-deps`.
 
   ```text
   /data/active.parts
+  /data/.pgkronika-quarantine-v1/
   /data/.pgkronika-writer.owner.lock
   /data/.pgkronika-overview.owner.lock
   /data/YYYY/MM/DD/N.pgm
@@ -158,16 +159,23 @@ allow lists with `cargo run -p xtask -- check-deps`.
   use the PGM catalog's `min_ts` and `max_ts`, not the path. Each owner-lock
   acquisition synchronizes the lock inode and data root; a retry after a
   failed initial root `fsync` does not treat `EEXIST` as proof of durability.
-  Only one collector may write to a data root. Root-level PGM/OVF files,
-  symbolic links, and unknown entries are rejected. This is the first
-  supported layout in the unreleased project.
+  Only one collector may write to a data root. Unknown files, directories, and
+  symbolic links are never followed or interpreted. The writer tries to move
+  each opaque entry into the bounded quarantine namespace without overwrite;
+  a local rename failure is reported but does not hide valid segments or stop
+  collection. This is the first supported layout in the unreleased project.
 - **Durability.** `active.parts` journal version 1 uses magic `PGKJNL1\0` and a
   checksummed header that stores the active `SegmentId`. The first frame and
-  id are synchronized together before append returns. An incompatible, torn,
-  or damaged journal is rejected unchanged. Sealing writes and synchronizes a
-  same-day temporary file, then publishes without overwriting an existing
-  segment. At startup the writer lock holder removes only recognized stale PGM
-  temporaries; OVF temporaries remain overview-owned. For sealed segments, the
+  id are synchronized together before append returns. On localized damage the
+  exact journal inode is quarantined; bounded recovery accepts only complete
+  frames whose frame, PGM, catalog, and section CRCs verify, then uses the
+  normal append/seal path. Discarded bytes are accounted, a fresh generation
+  starts, and collection continues even when evidence movement degrades
+  locally. Invalid PGM files are quarantined whole and excluded while valid
+  segments remain readable. Sealing writes and synchronizes a same-day
+  temporary file, then publishes without overwriting an existing segment. At
+  startup the writer lock holder quarantines recognized stale PGM temporaries;
+  OVF temporaries remain overview-owned. For sealed segments, the
   timeline index checks admitted sibling
   fact files with matching lineage
   before the bounded process-local fallback. Only a recoverable publication

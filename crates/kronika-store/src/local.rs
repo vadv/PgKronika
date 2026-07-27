@@ -10,21 +10,25 @@ use std::sync::Arc;
 #[cfg(test)]
 use kronika_format::FRAME_HEADER_LEN;
 use kronika_format::{
-    Catalog, ENTRY_LEN, FORMAT_VERSION, JOURNAL_HEADER_LEN, JournalHeader, JournalHeaderError,
-    JournalLimits, JournalScanError, JournalState, MAGIC, MAX_JOURNAL_LEN, MAX_JOURNAL_PARTS,
-    MAX_PART_LEN, META_LEN, PartRef, RESET_MARKER_LEN, ReadAt, ResetMarker, ScanReport,
-    TAIL_INDEX_LEN, TailIndex, scan_journal_streaming_strict_from, validate_catalog_layout,
-    validate_part_catalog,
+    Catalog, Crc32c, ENTRY_LEN, Entry, FORMAT_VERSION, JOURNAL_HEADER_LEN, JournalHeader,
+    JournalHeaderError, JournalLimits, JournalScanError, JournalState, MAGIC, MAX_JOURNAL_LEN,
+    MAX_JOURNAL_PARTS, MAX_PART_LEN, META_LEN, PartRef, RESET_MARKER_LEN, ReadAt, ResetMarker,
+    ScanReport, TAIL_INDEX_LEN, TailIndex, scan_journal_streaming_strict_from,
+    validate_catalog_layout, validate_part_catalog,
 };
-use kronika_layout::{
-    DataRoot, FileIdentity, LayoutError, LayoutLimits, LimitKind, SegmentArtifacts, SegmentId,
-};
+#[cfg(test)]
+use kronika_layout::SegmentArtifacts;
+use kronika_layout::{DataRoot, FileIdentity, LayoutError, LayoutLimits, LimitKind, SegmentId};
 
-use crate::catalog_summary::{CatalogDigest, CatalogSummary, CatalogSummaryError};
-use crate::source::{ActivePart, JournalScan, LocalScan, SealedUnit, StoreError};
+use crate::catalog_summary::{CatalogDigest, CatalogSummary};
+use crate::source::{
+    ActiveJournalWarningReason, ActivePart, InvalidPgmReason, JournalScan, LocalScan, SealedUnit,
+    StoreError, StoreIoFailure, StoreIoOperation, StoreObject, StoreWarning, StoreWarningReason,
+};
 
 /// Upper bound on the catalog block size; guards against corrupt tail indices.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+const PGM_CRC_CHUNK_BYTES: usize = 64 * 1024;
 const ARC_ALLOCATION_OVERHEAD: usize = 2 * size_of::<usize>();
 const ACTIVE_ARC_ALLOCATION_BYTES: usize = size_of::<Vec<ActivePart>>() + ARC_ALLOCATION_OVERHEAD;
 
@@ -61,17 +65,25 @@ impl LocalDir {
 
     /// Scan the directory for sealed segments and active journal parts.
     ///
-    /// Every discovered `.pgm` catalog and the complete version-1
-    /// `active.parts` journal must be valid. The journal is scanned streaming,
-    /// keeping peak memory bounded to one part body.
+    /// Every admitted `.pgm` is completely validated. Invalid sealed files and
+    /// an unavailable or corrupt `active.parts` journal are excluded with
+    /// typed warnings so valid sealed data remains queryable. The strict
+    /// journal API remains available through [`scan_journal`](Self::scan_journal).
     ///
     /// # Errors
     ///
-    /// Returns an I/O error for an invalid tree, malformed PGM, malformed
-    /// journal, or an inaccessible object. No partial segment set is returned.
+    /// Returns an I/O error only when bounded root traversal or a global
+    /// resource limit prevents a safe result.
     pub fn scan(&self) -> io::Result<LocalScan> {
-        let journal = self.scan_journal()?;
-        self.complete_scan(journal)
+        match self.scan_journal() {
+            Ok(journal) => self.complete_scan(journal),
+            Err(error) if degradable_active_journal_error(&error) => {
+                let warning = self.active_journal_warning(&error);
+                let journal = empty_journal_scan(self.limits.max_metadata_bytes)?;
+                self.complete_scan_cached_with_warnings(journal, &[], &[warning])
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Scan only `active.parts`.
@@ -118,19 +130,28 @@ impl LocalDir {
     /// - size `< last_valid_len` or the file is gone: a reset;
     ///   `prev_active` is dropped and the journal is scanned from its v1 header.
     ///
-    /// Sealed `.pgm` files are always re-listed. A concurrent journal reset is
-    /// reported as a retryable I/O error; structural damage remains fatal.
+    /// Sealed `.pgm` files are always re-listed. A journal that cannot provide
+    /// an exact incremental view degrades to an empty live generation plus a
+    /// typed warning; callers needing retry/fail semantics can invoke
+    /// [`scan_journal_from`](Self::scan_journal_from) directly.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the tree, a PGM, or the journal cannot be read
-    /// and validated completely.
+    /// Returns an I/O error only when bounded root traversal or a global
+    /// resource limit prevents a safe result.
     pub fn scan_from<A>(&self, last_valid_len: u64, prev_active: A) -> io::Result<LocalScan>
     where
         A: Into<Arc<Vec<ActivePart>>>,
     {
-        let journal = self.scan_journal_from(last_valid_len, prev_active)?;
-        self.complete_scan(journal)
+        match self.scan_journal_from(last_valid_len, prev_active) {
+            Ok(journal) => self.complete_scan(journal),
+            Err(error) if degradable_active_journal_error(&error) => {
+                let warning = self.active_journal_warning(&error);
+                let journal = empty_journal_scan(self.limits.max_metadata_bytes)?;
+                self.complete_scan_cached_with_warnings(journal, &[], &[warning])
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Incrementally scan only `active.parts`.
@@ -200,15 +221,23 @@ impl LocalDir {
         journal: JournalScan,
         previous_sealed: &[SealedUnit],
     ) -> io::Result<LocalScan> {
+        self.complete_scan_cached_with_warnings(journal, previous_sealed, &[])
+    }
+
+    fn complete_scan_cached_with_warnings(
+        &self,
+        journal: JournalScan,
+        previous_sealed: &[SealedUnit],
+        initial_warnings: &[StoreWarning],
+    ) -> io::Result<LocalScan> {
         let layout = self.root.scan(self.limits).map_err(layout_io)?;
         let segment_count = layout.segments.len();
-        let new_summaries = count_new_summaries(&layout.segments, previous_sealed);
         ensure_scan_metadata_budget(
             layout.metadata_bytes,
             journal.metadata_bytes,
             previous_sealed.len(),
             segment_count,
-            new_summaries,
+            0,
             self.limits.max_metadata_bytes,
         )?;
         let mut retained_during_build = accounted_scan_metadata_bytes(
@@ -221,6 +250,29 @@ impl LocalDir {
         .ok_or_else(|| metadata_limit_io(self.limits.max_metadata_bytes))?;
 
         let mut sealed = Vec::with_capacity(segment_count);
+        let mut warnings = Vec::new();
+        for warning in initial_warnings {
+            push_warning_bounded(
+                &mut warnings,
+                *warning,
+                retained_during_build,
+                self.limits.max_metadata_bytes,
+            )?;
+        }
+        for foreign in &layout.foreign_entries {
+            let diagnostic = foreign.diagnostic();
+            push_warning_bounded(
+                &mut warnings,
+                StoreWarning {
+                    affected: StoreObject::Foreign(diagnostic.path),
+                    reason: StoreWarningReason::ForeignEntry(diagnostic.reason),
+                    identity: Some(diagnostic.path.file),
+                    failure: None,
+                },
+                retained_during_build,
+                self.limits.max_metadata_bytes,
+            )?;
+        }
         let mut previous_at = 0_usize;
         for artifact in layout.segments {
             advance_previous(previous_sealed, &mut previous_at, artifact.address);
@@ -231,34 +283,94 @@ impl LocalDir {
                 continue;
             }
 
-            let file = self.open_pinned_pgm(artifact.address, artifact.pgm_identity)?;
-            let summary =
-                read_catalog_summary(&file, retained_during_build, self.limits.max_metadata_bytes)
-                    .map_err(store_io)?;
-            require_file_identity(
+            let file = match self.open_pinned_pgm(artifact.address, artifact.pgm_identity)? {
+                PgmOpen::Open(file) => file,
+                PgmOpen::Invalid(failure) => {
+                    push_warning_bounded(
+                        &mut warnings,
+                        invalid_pgm_warning(
+                            artifact.address,
+                            artifact.pgm_identity,
+                            InvalidPgmReason::Io,
+                            Some(failure),
+                        ),
+                        retained_during_build,
+                        self.limits.max_metadata_bytes,
+                    )?;
+                    continue;
+                }
+            };
+            let validation_retained =
+                retained_metadata_with_warnings(retained_during_build, warnings.capacity())
+                    .ok_or_else(|| metadata_limit_io(self.limits.max_metadata_bytes))?;
+            let validation = read_validated_pgm_summary(
+                &file,
+                validation_retained,
+                self.limits.max_metadata_bytes,
+            );
+            match classify_pgm_validation(
                 &file,
                 artifact.pgm_identity,
                 artifact.address,
-                "after reading its catalog",
-            )?;
-            retained_during_build = retained_during_build
-                .checked_add(summary_allocation_bytes())
-                .ok_or_else(|| metadata_limit_io(self.limits.max_metadata_bytes))?;
-            sealed.push(SealedUnit {
-                address: artifact.address,
-                identity: artifact.pgm_identity,
-                summary: Arc::new(summary),
-            });
+                validation,
+            )? {
+                Ok(summary) => {
+                    ensure_retained_metadata(
+                        retained_during_build,
+                        summary_allocation_bytes(),
+                        warnings.capacity(),
+                        self.limits.max_metadata_bytes,
+                    )?;
+                    retained_during_build = retained_during_build
+                        .checked_add(summary_allocation_bytes())
+                        .ok_or_else(|| metadata_limit_io(self.limits.max_metadata_bytes))?;
+                    sealed.push(SealedUnit {
+                        address: artifact.address,
+                        identity: artifact.pgm_identity,
+                        summary: Arc::new(summary),
+                    });
+                }
+                Err(PgmInvalid { reason, failure }) => push_warning_bounded(
+                    &mut warnings,
+                    invalid_pgm_warning(artifact.address, artifact.pgm_identity, reason, failure),
+                    retained_during_build,
+                    self.limits.max_metadata_bytes,
+                )?,
+            }
         }
 
         Ok(LocalScan {
             sealed: Arc::new(sealed),
             active: journal.active,
             damages: journal.damages,
-            warnings: Vec::new(),
+            warnings,
             valid_len: journal.valid_len,
             committed_reset: journal.committed_reset,
         })
+    }
+
+    fn active_journal_warning(&self, error: &io::Error) -> StoreWarning {
+        let source = active_journal_source(error);
+        let reason = if matches!(
+            source.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+        ) {
+            ActiveJournalWarningReason::Corrupt
+        } else {
+            ActiveJournalWarningReason::Io
+        };
+        let identity = self
+            .root
+            .open_active_journal()
+            .ok()
+            .flatten()
+            .and_then(|file| FileIdentity::from_file(&file).ok());
+        StoreWarning {
+            affected: StoreObject::ActiveJournal,
+            reason: StoreWarningReason::ActiveJournal(reason),
+            identity,
+            failure: Some(StoreIoFailure::from_error(StoreIoOperation::Read, source)),
+        }
     }
 
     /// Open a sealed segment file for raw byte access.
@@ -552,10 +664,71 @@ impl LocalDir {
         &self,
         address: kronika_layout::SegmentAddress,
         expected: FileIdentity,
-    ) -> io::Result<File> {
-        let file = self.root.open_pgm(address).map_err(layout_io)?;
-        require_file_identity(&file, expected, address, "after opening it")?;
-        Ok(file)
+    ) -> io::Result<PgmOpen> {
+        let file = match self.root.open_pgm(address) {
+            Ok(file) => file,
+            Err(LayoutError::Io(source))
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Err(stale_sealed_pgm(address, "before it could be opened"));
+            }
+            Err(LayoutError::Io(source)) if source.kind() == io::ErrorKind::OutOfMemory => {
+                return Err(source);
+            }
+            Err(LayoutError::Io(source)) => {
+                return Ok(PgmOpen::Invalid(StoreIoFailure::from_error(
+                    StoreIoOperation::Open,
+                    &source,
+                )));
+            }
+            Err(
+                LayoutError::SymlinkNotAllowed { .. }
+                | LayoutError::UnexpectedCalendarEntryType { .. }
+                | LayoutError::UnexpectedLeafEntryType { .. },
+            ) => {
+                return Err(stale_sealed_pgm(address, "before it could be opened"));
+            }
+            Err(other) => return Err(layout_io(other)),
+        };
+        match FileIdentity::from_file(&file) {
+            Ok(actual) if actual == expected => Ok(PgmOpen::Open(file)),
+            Ok(_changed) => Err(stale_sealed_pgm(address, "after opening it")),
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                Err(stale_sealed_pgm(address, "after opening it"))
+            }
+            Err(source) if source.kind() == io::ErrorKind::OutOfMemory => Err(source),
+            Err(source) => Ok(PgmOpen::Invalid(StoreIoFailure::from_error(
+                StoreIoOperation::Metadata,
+                &source,
+            ))),
+        }
+    }
+}
+
+enum PgmOpen {
+    Open(File),
+    Invalid(StoreIoFailure),
+}
+
+fn invalid_pgm_warning(
+    address: kronika_layout::SegmentAddress,
+    identity: FileIdentity,
+    reason: InvalidPgmReason,
+    failure: Option<StoreIoFailure>,
+) -> StoreWarning {
+    StoreWarning {
+        affected: StoreObject::Segment(address),
+        reason: StoreWarningReason::InvalidPgm(reason),
+        identity: Some(identity),
+        failure,
     }
 }
 
@@ -572,17 +745,57 @@ fn advance_previous(
     }
 }
 
-fn count_new_summaries(current: &[SegmentArtifacts], previous: &[SealedUnit]) -> usize {
-    let mut previous_at = 0_usize;
-    current
-        .iter()
-        .filter(|artifact| {
-            advance_previous(previous, &mut previous_at, artifact.address);
-            !previous.get(previous_at).is_some_and(|sealed| {
-                (sealed.address, sealed.identity) == (artifact.address, artifact.pgm_identity)
-            })
+fn ensure_retained_metadata(
+    retained_without_warnings: usize,
+    additional: usize,
+    warning_capacity: usize,
+    limit: usize,
+) -> io::Result<()> {
+    let admitted = retained_without_warnings
+        .checked_add(additional)
+        .and_then(|bytes| {
+            warning_capacity
+                .checked_mul(size_of::<StoreWarning>())
+                .and_then(|warning_bytes| bytes.checked_add(warning_bytes))
         })
-        .count()
+        .is_some_and(|bytes| bytes <= limit);
+    if admitted {
+        Ok(())
+    } else {
+        Err(metadata_limit_io(limit))
+    }
+}
+
+fn retained_metadata_with_warnings(
+    retained_without_warnings: usize,
+    warning_capacity: usize,
+) -> Option<usize> {
+    warning_capacity
+        .checked_mul(size_of::<StoreWarning>())
+        .and_then(|warning_bytes| retained_without_warnings.checked_add(warning_bytes))
+}
+
+fn push_warning_bounded(
+    warnings: &mut Vec<StoreWarning>,
+    warning: StoreWarning,
+    retained_without_warnings: usize,
+    limit: usize,
+) -> io::Result<()> {
+    if warnings.len() == warnings.capacity() {
+        let required_capacity = warnings
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| metadata_limit_io(limit))?;
+        ensure_retained_metadata(retained_without_warnings, 0, required_capacity, limit)?;
+        warnings
+            .try_reserve_exact(1)
+            .map_err(|_error| metadata_limit_io(limit))?;
+        // An allocator may satisfy an exact reservation with a larger block.
+        // Check the real retained capacity before making it authoritative.
+        ensure_retained_metadata(retained_without_warnings, 0, warnings.capacity(), limit)?;
+    }
+    warnings.push(warning);
+    Ok(())
 }
 
 fn ensure_scan_metadata_budget(
@@ -644,13 +857,17 @@ fn require_file_identity(
     if actual == expected {
         return Ok(());
     }
-    Err(io::Error::new(
+    Err(stale_sealed_pgm(address, phase))
+}
+
+fn stale_sealed_pgm(address: kronika_layout::SegmentAddress, phase: &str) -> io::Error {
+    io::Error::new(
         io::ErrorKind::Interrupted,
         format!(
             "sealed PGM {} changed {phase}; retry the scan",
             address.pgm_name()
         ),
-    ))
+    )
 }
 
 fn empty_journal_scan(metadata_limit: usize) -> io::Result<JournalScan> {
@@ -723,7 +940,7 @@ fn active_part_catalog_metadata_bytes<R: ReadAt>(reader: &R, part: PartRef) -> i
     }
     let entry_count = entries_bytes / ENTRY_LEN;
     entry_count
-        .checked_mul(size_of::<kronika_format::Entry>())
+        .checked_mul(size_of::<Entry>())
         .ok_or_else(metadata_size_overflow)
 }
 
@@ -769,7 +986,7 @@ fn active_metadata_bytes(active: &[ActivePart], active_capacity: usize) -> io::R
             .catalog
             .entries
             .capacity()
-            .checked_mul(size_of::<kronika_format::Entry>())
+            .checked_mul(size_of::<Entry>())
             .ok_or_else(metadata_size_overflow)?;
         total
             .checked_add(entries)
@@ -913,6 +1130,33 @@ pub fn is_active_journal_scan_error(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(<dyn std::error::Error + Send + Sync + 'static>::is::<ActiveJournalScanError>)
+}
+
+fn active_journal_source(error: &io::Error) -> &io::Error {
+    error
+        .get_ref()
+        .and_then(
+            <dyn std::error::Error + Send + Sync + 'static>::downcast_ref::<ActiveJournalScanError>,
+        )
+        .map_or(error, |wrapped| &wrapped.0)
+}
+
+fn degradable_active_journal_error(error: &io::Error) -> bool {
+    if !is_active_journal_scan_error(error) {
+        return false;
+    }
+    let source = active_journal_source(error);
+    if source.kind() == io::ErrorKind::OutOfMemory {
+        return false;
+    }
+    !source.get_ref().is_some_and(|inner| {
+        inner.downcast_ref::<LayoutError>().is_some_and(|layout| {
+            matches!(
+                layout,
+                LayoutError::InvalidLimits { .. } | LayoutError::TraversalLimitExceeded { .. }
+            )
+        })
+    })
 }
 
 /// Whether an I/O error means the live journal shrank or vanished under us
@@ -1146,7 +1390,7 @@ fn read_encoded_catalog<R: ReadAt>(
 
     let mut tail_bytes = [0_u8; TAIL_INDEX_LEN];
     reader.read_exact_at(&mut tail_bytes, tail_at)?;
-    let tail = TailIndex::decode(tail_bytes).map_err(|_decode_err| StoreError::TooSmall)?;
+    let tail = TailIndex::decode(tail_bytes).map_err(StoreError::TailIndex)?;
 
     let catalog_len = u64::from(tail.catalog_len);
     if catalog_len > MAX_CATALOG_BYTES {
@@ -1177,7 +1421,7 @@ fn read_encoded_catalog<R: ReadAt>(
     })
 }
 
-fn read_catalog_summary<R: ReadAt>(
+fn read_validated_pgm_summary<R: ReadAt>(
     reader: &R,
     retained_metadata: usize,
     metadata_limit: usize,
@@ -1186,21 +1430,150 @@ fn read_catalog_summary<R: ReadAt>(
     CATALOG_SUMMARY_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
 
     let encoded = read_encoded_catalog(reader, Some((retained_metadata, metadata_limit)))?;
-    let summary = CatalogSummary::from_encoded(&encoded.bytes, encoded.body_end)
-        .map_err(summary_store_error)?;
     verify_pgm_magic(reader)?;
-    Ok(summary)
+    let view = Catalog::view(&encoded.bytes).map_err(StoreError::Catalog)?;
+    let entry_allocation = view
+        .entries()
+        .len()
+        .checked_mul(size_of::<Entry>())
+        .ok_or(StoreError::BadCatalogLen)?;
+    let transient = retained_metadata
+        .checked_add(encoded.bytes.len())
+        .and_then(|bytes| bytes.checked_add(entry_allocation))
+        .ok_or_else(|| metadata_limit_store(metadata_limit))?;
+    if transient > metadata_limit {
+        return Err(metadata_limit_store(metadata_limit));
+    }
+    let catalog = Catalog {
+        entries: view.entries().collect(),
+        min_ts: view.min_ts,
+        max_ts: view.max_ts,
+        source_id: view.source_id,
+        format_version: view.format_version,
+    };
+    if catalog.format_version != FORMAT_VERSION {
+        return Err(StoreError::UnsupportedFormat {
+            version: catalog.format_version,
+        });
+    }
+    validate_catalog_layout(&catalog, encoded.body_end).map_err(StoreError::SectionLayout)?;
+    validate_section_checksums(reader, &catalog)?;
+    let catalog_len =
+        u32::try_from(encoded.bytes.len()).map_err(|_overflow| StoreError::BadCatalogLen)?;
+    Ok(CatalogSummary::from_catalog(&catalog, catalog_len))
 }
 
-const fn summary_store_error(error: CatalogSummaryError) -> StoreError {
-    match error {
-        CatalogSummaryError::Decode(error) => StoreError::Catalog(error),
-        CatalogSummaryError::UnsupportedFormat { version } => {
-            StoreError::UnsupportedFormat { version }
+fn validate_section_checksums<R: ReadAt>(reader: &R, catalog: &Catalog) -> Result<(), StoreError> {
+    let mut buffer = [0_u8; PGM_CRC_CHUNK_BYTES];
+    for entry in &catalog.entries {
+        let mut checksum = Crc32c::new();
+        let mut offset = entry.offset;
+        let mut remaining = entry.len;
+        while remaining != 0 {
+            let chunk_len = usize::try_from(remaining.min(PGM_CRC_CHUNK_BYTES as u64)).map_err(
+                |_overflow| {
+                    StoreError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PGM checksum chunk length overflow",
+                    ))
+                },
+            )?;
+            reader.read_exact_at(&mut buffer[..chunk_len], offset)?;
+            checksum.update(&buffer[..chunk_len]);
+            offset = offset.checked_add(chunk_len as u64).ok_or_else(|| {
+                StoreError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PGM checksum offset overflow",
+                ))
+            })?;
+            remaining -= chunk_len as u64;
         }
-        CatalogSummaryError::LengthOverflow => StoreError::BadCatalogLen,
-        CatalogSummaryError::EntryOutOfBounds { .. } => StoreError::OutOfBounds,
+        if checksum.finalize() != entry.crc32c {
+            return Err(StoreError::SectionChecksum {
+                type_id: entry.type_id,
+            });
+        }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PgmInvalid {
+    reason: InvalidPgmReason,
+    failure: Option<StoreIoFailure>,
+}
+
+fn classify_pgm_validation(
+    file: &File,
+    expected: FileIdentity,
+    address: kronika_layout::SegmentAddress,
+    validation: Result<CatalogSummary, StoreError>,
+) -> io::Result<Result<CatalogSummary, PgmInvalid>> {
+    // Identity instability always wins over a stable-invalid verdict. A
+    // replacement or in-place rewrite must be retried from discovery instead
+    // of excluding whichever generation happened to be read.
+    match FileIdentity::from_file(file) {
+        Ok(actual) if actual == expected => {}
+        Ok(_changed) => {
+            return Err(stale_sealed_pgm(address, "during complete validation"));
+        }
+        Err(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            return Err(stale_sealed_pgm(address, "during complete validation"));
+        }
+        Err(source) if source.kind() == io::ErrorKind::OutOfMemory => return Err(source),
+        Err(source) => {
+            return Ok(Err(PgmInvalid {
+                reason: InvalidPgmReason::Io,
+                failure: Some(StoreIoFailure::from_error(
+                    StoreIoOperation::Metadata,
+                    &source,
+                )),
+            }));
+        }
+    }
+    match validation {
+        Ok(summary) => Ok(Ok(summary)),
+        Err(StoreError::Io(source)) if source.kind() == io::ErrorKind::UnexpectedEof => {
+            Ok(Err(PgmInvalid {
+                reason: InvalidPgmReason::Truncated,
+                failure: Some(StoreIoFailure::from_error(StoreIoOperation::Read, &source)),
+            }))
+        }
+        Err(StoreError::Io(source)) if source.kind() == io::ErrorKind::OutOfMemory => Err(source),
+        Err(StoreError::Io(source)) => Ok(Err(PgmInvalid {
+            reason: InvalidPgmReason::Io,
+            failure: Some(StoreIoFailure::from_error(StoreIoOperation::Read, &source)),
+        })),
+        Err(StoreError::TooSmall) => Ok(invalid_pgm(InvalidPgmReason::TooSmall)),
+        Err(StoreError::BadMagic) => Ok(invalid_pgm(InvalidPgmReason::BadMagic)),
+        Err(StoreError::TailIndex(_)) => Ok(invalid_pgm(InvalidPgmReason::TailIndex)),
+        Err(StoreError::UnsupportedFormat { .. }) => {
+            Ok(invalid_pgm(InvalidPgmReason::UnsupportedFormat))
+        }
+        Err(StoreError::BadCatalogLen) => Ok(invalid_pgm(InvalidPgmReason::BadCatalogLength)),
+        Err(StoreError::Catalog(_)) => Ok(invalid_pgm(InvalidPgmReason::Catalog)),
+        Err(StoreError::SectionLayout(_) | StoreError::OutOfBounds) => {
+            Ok(invalid_pgm(InvalidPgmReason::CanonicalLayout))
+        }
+        Err(StoreError::SectionChecksum { .. }) => {
+            Ok(invalid_pgm(InvalidPgmReason::SectionChecksum))
+        }
+        Err(error @ (StoreError::Layout(_) | StoreError::ActivePartTooLarge { .. })) => {
+            Err(store_io(error))
+        }
+    }
+}
+
+const fn invalid_pgm(reason: InvalidPgmReason) -> Result<CatalogSummary, PgmInvalid> {
+    Err(PgmInvalid {
+        reason,
+        failure: None,
+    })
 }
 
 fn verify_pgm_magic<R: ReadAt>(reader: &R) -> Result<(), StoreError> {
@@ -1279,6 +1652,17 @@ mod tests {
 
     fn write_segment(root: &Path, raw_id: i64, bytes: impl AsRef<[u8]>) {
         fs::write(segment_path(root, raw_id), bytes).expect("write test segment");
+    }
+
+    fn invalid_warning(scan: &LocalScan, raw_id: i64) -> StoreWarning {
+        let address =
+            SegmentAddress::new(SegmentId::new(raw_id).expect("representable segment id"))
+                .expect("segment address");
+        *scan
+            .warnings
+            .iter()
+            .find(|warning| warning.affected == StoreObject::Segment(address))
+            .expect("invalid segment warning")
     }
 
     fn frame(part_bytes: &[u8]) -> Vec<u8> {
@@ -1452,13 +1836,13 @@ mod tests {
     }
 
     #[test]
-    fn read_catalog_too_small_bad_tail_magic() {
-        // Exactly TAIL_INDEX_LEN bytes with wrong magic: TailIndex::decode fails
-        // → mapped to TooSmall.
+    fn read_catalog_reports_bad_tail_index_magic() {
+        // Exactly TAIL_INDEX_LEN bytes with wrong magic retains a precise
+        // typed tail-index failure.
         let buf = [0_u8; TAIL_INDEX_LEN];
         assert!(
-            matches!(read_catalog(&buf.as_slice()), Err(StoreError::TooSmall)),
-            "tail with wrong magic must return TooSmall"
+            matches!(read_catalog(&buf.as_slice()), Err(StoreError::TailIndex(_))),
+            "tail with wrong magic must return TailIndex"
         );
     }
 
@@ -1626,7 +2010,7 @@ mod tests {
     #[test]
     fn catalog_summary_transient_bytes_are_admitted_before_allocation() {
         let buf = part(1000, 42);
-        let error = read_catalog_summary(&buf.as_slice(), 1, 1).unwrap_err();
+        let error = read_validated_pgm_summary(&buf.as_slice(), 1, 1).unwrap_err();
         assert!(matches!(
             error,
             StoreError::Layout(LayoutError::TraversalLimitExceeded {
@@ -1884,11 +2268,15 @@ mod tests {
         corrupt[corrupt_at] ^= 0xff;
         fs::write(path, corrupt).unwrap();
         reset_catalog_summary_reads();
-        let error = local
+        let scan = local
             .complete_scan_cached(local.scan_journal().unwrap(), first.sealed.as_slice())
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(scan.sealed.is_empty());
+        assert_eq!(
+            invalid_warning(&scan, 1_000).reason,
+            StoreWarningReason::InvalidPgm(InvalidPgmReason::Catalog)
+        );
         assert_eq!(catalog_summary_reads(), 1);
     }
 
@@ -1930,7 +2318,10 @@ mod tests {
         let file = File::create(&journal_path).unwrap();
         file.set_len(MAX_JOURNAL_LEN as u64 + 1).unwrap();
 
-        let error = LocalDir::open(dir.path()).unwrap().scan().unwrap_err();
+        let error = LocalDir::open(dir.path())
+            .unwrap()
+            .scan_journal()
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("version-1 limit"));
         assert_eq!(
@@ -1991,14 +2382,145 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_sealed_aborts_the_complete_scan() {
+    fn corrupt_sealed_is_excluded_while_valid_segments_continue() {
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 1_000, part(1000, 7));
         write_segment(dir.path(), 2_000, b"not a pgm");
-        assert!(
-            LocalDir::open(dir.path()).unwrap().scan().is_err(),
-            "a partial sealed set must never be returned"
+        let local = LocalDir::open(dir.path()).unwrap();
+        let scan = local.scan().unwrap();
+
+        assert_eq!(scan.sealed.len(), 1);
+        assert_eq!(scan.sealed[0].address.id.get(), 1_000);
+        assert_eq!(
+            invalid_warning(&scan, 2_000).reason,
+            StoreWarningReason::InvalidPgm(InvalidPgmReason::TailIndex)
         );
+        let opened = local.open_sealed(&scan.sealed[0]).unwrap();
+        assert_eq!(read_catalog(&opened).unwrap().min_ts, 1_000);
+    }
+
+    #[test]
+    fn full_pgm_validation_classifies_catalog_geometry_and_section_crc() {
+        let cases = [
+            (
+                2_000,
+                {
+                    let mut bytes = part(2_000, 7);
+                    let corrupt_at = catalog_offset(&bytes);
+                    bytes[corrupt_at] ^= 0xff;
+                    bytes
+                },
+                InvalidPgmReason::Catalog,
+            ),
+            (
+                3_000,
+                {
+                    let mut bytes = part(3_000, 7);
+                    let entry_offset_at = catalog_offset(&bytes) + 8;
+                    bytes[entry_offset_at..entry_offset_at + 8]
+                        .copy_from_slice(&5_u64.to_le_bytes());
+                    repatch_catalog_crc(&mut bytes);
+                    bytes
+                },
+                InvalidPgmReason::CanonicalLayout,
+            ),
+            (
+                4_000,
+                {
+                    let mut bytes = part_with_body(4_000, 7, b"section-secret");
+                    bytes[MAGIC.len()] ^= 0xff;
+                    bytes
+                },
+                InvalidPgmReason::SectionChecksum,
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 1_000, part(1_000, 7));
+        for (raw_id, bytes, _reason) in &cases {
+            write_segment(dir.path(), *raw_id, bytes);
+        }
+
+        let first = LocalDir::open(dir.path()).unwrap().scan().unwrap();
+        let restarted = LocalDir::open(dir.path()).unwrap().scan().unwrap();
+        assert_eq!(first.sealed.len(), 1);
+        assert_eq!(first.sealed[0].address.id.get(), 1_000);
+        assert_eq!(first.warnings, restarted.warnings);
+        for (raw_id, _bytes, reason) in cases {
+            let warning = invalid_warning(&first, raw_id);
+            assert_eq!(warning.reason, StoreWarningReason::InvalidPgm(reason));
+            assert!(warning.identity.is_some());
+            assert!(warning.failure.is_none());
+            let diagnostic = format!("{warning:?}");
+            assert!(!diagnostic.contains("section-secret"));
+            assert!(!diagnostic.contains(&dir.path().display().to_string()));
+        }
+    }
+
+    #[test]
+    fn identity_change_during_invalid_validation_is_interrupted_not_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = segment_path(dir.path(), 2_000);
+        fs::write(&path, b"not a pgm").unwrap();
+        let address = SegmentAddress::new(SegmentId::new(2_000).unwrap()).unwrap();
+        let file = File::open(&path).unwrap();
+        let expected = FileIdentity::from_file(&file).unwrap();
+        let validation =
+            read_validated_pgm_summary(&file, 0, LayoutLimits::default().max_metadata_bytes);
+        assert!(validation.is_err());
+
+        fs::write(&path, part(2_000, 7)).unwrap();
+        let error = classify_pgm_validation(&file, expected, address, validation).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn unreadable_pgm_degrades_locally_with_typed_io_details() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 1_000, part(1_000, 7));
+        let unreadable = segment_path(dir.path(), 2_000);
+        fs::write(&unreadable, part(2_000, 7)).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+
+        let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
+        assert_eq!(scan.sealed.len(), 1);
+        let warning = invalid_warning(&scan, 2_000);
+        assert_eq!(
+            warning.reason,
+            StoreWarningReason::InvalidPgm(InvalidPgmReason::Io)
+        );
+        let failure = warning.failure.expect("typed I/O failure");
+        assert_eq!(failure.operation, StoreIoOperation::Open);
+        assert_eq!(failure.error_kind, io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn foreign_file_and_directory_do_not_hide_valid_segments_or_leak_names() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 1_000, part(1_000, 7));
+        fs::create_dir(dir.path().join("lost+found")).unwrap();
+        fs::write(dir.path().join(".nfs-private-name"), b"foreign-secret").unwrap();
+
+        let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
+        assert_eq!(scan.sealed.len(), 1);
+        let foreign = scan
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning.affected, StoreObject::Foreign(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(foreign.len(), 2);
+        assert!(foreign.iter().all(|warning| {
+            matches!(warning.reason, StoreWarningReason::ForeignEntry(_))
+                && warning.identity.is_some()
+                && warning.failure.is_none()
+        }));
+        let diagnostic = format!("{foreign:?}");
+        assert!(!diagnostic.contains("lost+found"));
+        assert!(!diagnostic.contains(".nfs-private-name"));
+        assert!(!diagnostic.contains("foreign-secret"));
     }
 
     #[test]
@@ -2013,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    fn torn_active_journal_aborts_the_complete_scan() {
+    fn torn_active_journal_degrades_to_sealed_only_scan() {
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 1_000, part(1000, 7));
         let unfinished_part = part(2000, 7);
@@ -2029,10 +2551,18 @@ mod tests {
         .to_vec();
         bytes.extend_from_slice(&body);
         fs::write(dir.path().join("active.parts"), bytes).unwrap();
-        assert!(
-            LocalDir::open(dir.path()).unwrap().scan().is_err(),
-            "stable journal damage is fatal"
-        );
+        let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
+        assert_eq!(scan.sealed.len(), 1);
+        assert!(scan.active.is_empty());
+        assert!(scan.warnings.iter().any(|warning| {
+            warning.affected == StoreObject::ActiveJournal
+                && matches!(
+                    warning.reason,
+                    StoreWarningReason::ActiveJournal(
+                        ActiveJournalWarningReason::Corrupt | ActiveJournalWarningReason::Io
+                    )
+                )
+        }));
     }
 
     #[test]
@@ -2065,7 +2595,10 @@ mod tests {
         bytes[JOURNAL_HEADER_LEN + FRAME_HEADER_LEN] ^= 0xff;
         fs::write(dir.path().join("active.parts"), bytes).unwrap();
 
-        let error = LocalDir::open(dir.path()).unwrap().scan().unwrap_err();
+        let error = LocalDir::open(dir.path())
+            .unwrap()
+            .scan_journal()
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(is_active_journal_scan_error(&error));
     }
@@ -2080,17 +2613,18 @@ mod tests {
         .unwrap();
         let active_error = LocalDir::open(active_dir.path())
             .unwrap()
-            .scan()
+            .scan_journal()
             .unwrap_err();
         assert!(is_active_journal_scan_error(&active_error));
 
         let sealed_dir = tempfile::tempdir().unwrap();
         write_segment(sealed_dir.path(), 2_000, b"stable malformed PGM");
-        let sealed_error = LocalDir::open(sealed_dir.path())
-            .unwrap()
-            .scan()
-            .unwrap_err();
-        assert!(!is_active_journal_scan_error(&sealed_error));
+        let scan = LocalDir::open(sealed_dir.path()).unwrap().scan().unwrap();
+        assert!(scan.sealed.is_empty());
+        assert_eq!(
+            invalid_warning(&scan, 2_000).reason,
+            StoreWarningReason::InvalidPgm(InvalidPgmReason::TailIndex)
+        );
     }
 
     #[test]

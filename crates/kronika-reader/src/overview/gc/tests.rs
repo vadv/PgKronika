@@ -191,7 +191,7 @@ fn bounded_scan_fails_closed_without_advancing_grace() {
 }
 
 #[test]
-fn a_sidecar_symlink_makes_gc_fail_closed_without_removing_sources() {
+fn a_foreign_sidecar_symlink_is_skipped_without_blocking_gc() {
     let directory = TempDir::new().expect("data directory");
     let store = store(directory.path(), immediate_config(256));
     let (_facts, context, path) = published(&store, &directory, 5, "segment");
@@ -210,11 +210,15 @@ fn a_sidecar_symlink_makes_gc_fail_closed_without_removing_sources() {
     symlink(&source, &linked).expect("create sidecar-shaped symlink");
     let active_before = std::fs::read(&active).expect("read active journal");
 
-    let outcome = store.collect_garbage(&GcMark::authoritative(2, []));
+    let first = store.collect_garbage(&GcMark::authoritative(2, []));
 
-    assert_eq!(outcome.skip_reason, Some(GcSkipReason::ScanError));
-    assert_eq!(outcome.deleted, 0);
-    assert!(path.is_file());
+    assert_eq!(first.skip_reason, None);
+    assert_eq!(first.deleted, 0);
+    assert_eq!(first.pending, 1);
+    let second = store.collect_garbage(&GcMark::authoritative(3, []));
+    assert_eq!(second.skip_reason, None);
+    assert_eq!(second.deleted, 1);
+    assert!(!path.exists());
     assert_eq!(
         std::fs::read(&source).expect("source survives"),
         lifecycle_pgm(5)

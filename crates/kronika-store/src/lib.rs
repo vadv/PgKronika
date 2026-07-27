@@ -34,4 +34,7 @@ pub use catalog_summary::{
     CatalogDigest, CatalogLayoutDigest, CatalogSummary, CatalogSummaryError, catalog_digests,
 };
 pub use local::{LocalDir, is_active_journal_scan_error, read_catalog};
-pub use source::{ActivePart, JournalScan, LocalScan, SealedUnit, StoreError, StoreWarning};
+pub use source::{
+    ActiveJournalWarningReason, ActivePart, InvalidPgmReason, JournalScan, LocalScan, SealedUnit,
+    StoreError, StoreIoFailure, StoreIoOperation, StoreObject, StoreWarning, StoreWarningReason,
+};

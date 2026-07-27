@@ -150,6 +150,13 @@ pub enum LayoutError {
         /// Changed PGM.
         id: SegmentId,
     },
+    /// No canonical active journal exists for exact-evidence rotation.
+    ActiveJournalMissing,
+    /// Every bounded root recovery-name collision slot already exists.
+    RecoverySlotsExhausted {
+        /// Number of attempted collision slots.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for LayoutError {
@@ -225,6 +232,13 @@ impl fmt::Display for LayoutError {
             Self::SourceChanged { id } => {
                 write!(f, "segment {id} changed while its overview was being built")
             }
+            Self::ActiveJournalMissing => f.write_str("the canonical active journal is missing"),
+            Self::RecoverySlotsExhausted { limit } => {
+                write!(
+                    f,
+                    "all {limit} bounded root recovery-name collision slots exist"
+                )
+            }
         }
     }
 }
@@ -250,7 +264,9 @@ impl Error for LayoutError {
             | Self::SegmentAlreadyExists { .. }
             | Self::TemporaryChanged { .. }
             | Self::OwnerContended { .. }
-            | Self::SourceChanged { .. } => None,
+            | Self::SourceChanged { .. }
+            | Self::ActiveJournalMissing
+            | Self::RecoverySlotsExhausted { .. } => None,
         }
     }
 }
