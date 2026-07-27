@@ -210,7 +210,7 @@ windows are coalesced inside the one body for their type.
 | 24 | `entry_count` | `u32` | Number of 32-byte entries before this block. |
 | 28 | `format_version` | `u32` | Container layout version; current writers store `1`. |
 | 32 | `crc32c` | `u32` | CRC32C of entries and metadata with this field zeroed. |
-| 36 | `reserved` | `u32` | Reserved; current writers store zero. |
+| 36 | `window_count` | `u32` | Collection windows coalesced into this container. `build_part` stores `1`; `seal` stores the exact number of journal parts; zero means unknown. |
 
 The low-level `Catalog` and `PartMeta` APIs historically document `source_id`
 as the `StrId` of `{cluster_id}/{pg_system_identifier}`. The current collector

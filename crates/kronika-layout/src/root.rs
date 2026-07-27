@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::RenameFlags;
+use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags};
 
 use crate::{LayoutError, LimitKind, OwnerKind, SegmentAddress, SegmentId, UtcDay};
 
@@ -22,7 +24,10 @@ pub const ACTIVE_JOURNAL_NAME: &str = "active.parts";
 pub const WRITER_OWNER_LOCK_NAME: &str = ".pgkronika-writer.owner.lock";
 /// Permanent process-ownership lock for overview publication and GC.
 pub const OVERVIEW_OWNER_LOCK_NAME: &str = ".pgkronika-overview.owner.lock";
-/// Opaque, non-traversed directory holding exact quarantined objects.
+/// Opaque directory holding exact quarantined objects.
+///
+/// Normal tree scans never traverse it. Forensic tools may use the explicit,
+/// bounded [`DataRoot::scan_quarantine`] API.
 pub const QUARANTINE_DIRECTORY_NAME: &str = ".pgkronika-quarantine-v1";
 
 const HARD_MAX_VISITED_ENTRIES: usize = 4_000_000;
@@ -68,6 +73,7 @@ enum QuarantineFaultPoint {
     Rename,
     SourceDirectorySync,
     QuarantineDirectorySync,
+    #[cfg(target_os = "linux")]
     Exchange,
 }
 
@@ -568,6 +574,71 @@ pub enum QuarantineReason {
     StaleTemporary = 5,
     /// A recovery output failed final canonical validation.
     InvalidRecoveryOutput = 6,
+}
+
+impl QuarantineReason {
+    /// Stable machine-readable reason code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ForeignEntry => "foreign_entry",
+            Self::InvalidPgm => "invalid_pgm",
+            Self::CorruptActiveJournal => "corrupt_active_journal",
+            Self::PendingEvidence => "pending_evidence",
+            Self::StaleTemporary => "stale_temporary",
+            Self::InvalidRecoveryOutput => "invalid_recovery_output",
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::ForeignEntry),
+            2 => Some(Self::InvalidPgm),
+            3 => Some(Self::CorruptActiveJournal),
+            4 => Some(Self::PendingEvidence),
+            5 => Some(Self::StaleTemporary),
+            6 => Some(Self::InvalidRecoveryOutput),
+            _ => None,
+        }
+    }
+}
+
+/// One canonical object found by a bounded forensic quarantine scan.
+#[derive(Clone, PartialEq, Eq)]
+pub struct QuarantineEntry {
+    name: CString,
+    canonical_name: String,
+    reason: QuarantineReason,
+    identity: PathIdentity,
+}
+
+impl QuarantineEntry {
+    /// Opaque canonical leaf name that can be passed back to layout.
+    #[must_use]
+    pub fn file_name(&self) -> &str {
+        &self.canonical_name
+    }
+
+    /// Reason encoded when the object entered quarantine.
+    #[must_use]
+    pub const fn reason(&self) -> QuarantineReason {
+        self.reason
+    }
+
+    /// No-follow filesystem identity observed by the scan.
+    #[must_use]
+    pub const fn identity(&self) -> PathIdentity {
+        self.identity
+    }
+}
+
+impl fmt::Debug for QuarantineEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuarantineEntry")
+            .field("reason", &self.reason)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Filesystem stage at which a local quarantine/rotation operation degraded.
@@ -1138,6 +1209,133 @@ impl DataRoot {
             Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Lists canonical quarantine objects without following any entry.
+    ///
+    /// The regular owned-tree scan deliberately treats quarantine as opaque.
+    /// This separate forensic pass recognizes only layout-generated `qv1`
+    /// names, validates their embedded filesystem identity, and applies the
+    /// caller's traversal and metadata limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the quarantine directory is unsafe or unreadable,
+    /// or when a traversal or retained-metadata limit is exhausted.
+    pub fn scan_quarantine(
+        &self,
+        limits: LayoutLimits,
+    ) -> Result<Vec<QuarantineEntry>, LayoutError> {
+        let limits = limits.validate()?;
+        let directory = match open_directory_at(&self.directory, QUARANTINE_DIRECTORY_NAME) {
+            Ok(directory) => directory,
+            Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut entries = Dir::read_from(&directory).map_err(errno_to_layout)?;
+        let mut visited = 0_usize;
+        let mut metadata_bytes = 0_usize;
+        let mut result = Vec::new();
+
+        for entry in &mut entries {
+            let entry = entry.map_err(errno_to_layout)?;
+            let name = entry.file_name();
+            let name_bytes = name.to_bytes();
+            if is_dot(name_bytes) {
+                continue;
+            }
+            visited = visited
+                .checked_add(1)
+                .ok_or(LayoutError::TraversalLimitExceeded {
+                    kind: LimitKind::VisitedEntries,
+                    limit: limits.max_visited_entries,
+                })?;
+            if visited > limits.max_visited_entries {
+                return Err(LayoutError::TraversalLimitExceeded {
+                    kind: LimitKind::VisitedEntries,
+                    limit: limits.max_visited_entries,
+                });
+            }
+            metadata_bytes = metadata_bytes
+                .checked_add(name_bytes.len())
+                .and_then(|bytes| bytes.checked_add(ENTRY_METADATA_BYTES))
+                .ok_or(LayoutError::TraversalLimitExceeded {
+                    kind: LimitKind::MetadataBytes,
+                    limit: limits.max_metadata_bytes,
+                })?;
+            if metadata_bytes > limits.max_metadata_bytes {
+                return Err(LayoutError::TraversalLimitExceeded {
+                    kind: LimitKind::MetadataBytes,
+                    limit: limits.max_metadata_bytes,
+                });
+            }
+
+            let Some(name_string) = ascii_name(name_bytes) else {
+                continue;
+            };
+            let Some(parsed) = parse_quarantine_name(name_string) else {
+                continue;
+            };
+            let stat = stat_no_follow_name(&directory, name)?;
+            let file = FileIdentity::from_stat(&stat);
+            if file.device != parsed.device || file.inode != parsed.inode {
+                continue;
+            }
+            metadata_bytes = metadata_bytes
+                .checked_add(size_of::<QuarantineEntry>())
+                .and_then(|bytes| bytes.checked_add(name_bytes.len()))
+                .ok_or(LayoutError::TraversalLimitExceeded {
+                    kind: LimitKind::MetadataBytes,
+                    limit: limits.max_metadata_bytes,
+                })?;
+            if metadata_bytes > limits.max_metadata_bytes {
+                return Err(LayoutError::TraversalLimitExceeded {
+                    kind: LimitKind::MetadataBytes,
+                    limit: limits.max_metadata_bytes,
+                });
+            }
+            result
+                .try_reserve(1)
+                .map_err(|error| LayoutError::Io(io::Error::other(error)))?;
+            result.push(QuarantineEntry {
+                name: name.to_owned(),
+                canonical_name: name_string.to_owned(),
+                reason: parsed.reason,
+                identity: path_identity_from_file(
+                    EntryScope::Quarantine,
+                    name,
+                    entry_file_type(FileType::from_raw_mode(stat.st_mode)),
+                    file,
+                ),
+            });
+        }
+        result.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        Ok(result)
+    }
+
+    /// Opens and identity-checks a regular object returned by
+    /// [`Self::scan_quarantine`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the object is not a regular file, disappeared, or
+    /// changed since the scan.
+    pub fn open_quarantine(&self, entry: &QuarantineEntry) -> Result<File, LayoutError> {
+        if entry.identity.file_type != EntryFileType::RegularFile {
+            return Err(LayoutError::UnexpectedLeafEntryType {
+                name: "opaque quarantine object".to_owned(),
+            });
+        }
+        let directory = open_directory_at(&self.directory, QUARANTINE_DIRECTORY_NAME)?;
+        let file = open_regular_name_at(&directory, &entry.name, OFlags::RDONLY)?;
+        if FileIdentity::from_file(&file)? != entry.identity.file {
+            return Err(LayoutError::TemporaryChanged {
+                name: "opaque quarantine object".to_owned(),
+            });
+        }
+        Ok(file)
     }
 
     /// Opens and revalidates a recognized pending root recovery object.
@@ -3436,6 +3634,44 @@ fn quarantine_name(reason: QuarantineReason, source: PathIdentity, slot: u8) -> 
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedQuarantineName {
+    reason: QuarantineReason,
+    device: u64,
+    inode: u64,
+}
+
+fn parse_quarantine_name(name: &str) -> Option<ParsedQuarantineName> {
+    let mut fields = name.split('-');
+    if fields.next()? != "qv1" {
+        return None;
+    }
+    let reason = parse_lower_hex(fields.next()?, 2)?;
+    let _name_hash = parse_lower_hex(fields.next()?, 16)?;
+    let device = parse_lower_hex(fields.next()?, 16)?;
+    let inode = parse_lower_hex(fields.next()?, 16)?;
+    let slot = parse_lower_hex(fields.next()?, 2)?;
+    if fields.next().is_some() || slot >= u64::from(MAX_QUARANTINE_COLLISION_SLOTS) {
+        return None;
+    }
+    Some(ParsedQuarantineName {
+        reason: QuarantineReason::from_code(u8::try_from(reason).ok()?)?,
+        device,
+        inode,
+    })
+}
+
+fn parse_lower_hex(field: &str, expected_len: usize) -> Option<u64> {
+    if field.len() != expected_len
+        || !field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    u64::from_str_radix(field, 16).ok()
+}
+
 #[cfg(target_os = "linux")]
 fn rename_noreplace(
     source_directory: &File,
@@ -3461,6 +3697,7 @@ fn rename_noreplace(
     _destination_directory: &File,
     _destination_name: &CStr,
 ) -> io::Result<()> {
+    quarantine_failpoint!(Rename);
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-replace rename is unsupported on this platform",
@@ -3654,6 +3891,25 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn canonical_quarantine_name_roundtrips_forensic_fields() {
+        let file = tempfile::tempfile().unwrap();
+        let identity = FileIdentity::from_file(&file).unwrap();
+        let source = path_identity_from_file(
+            EntryScope::Root,
+            c"active.parts",
+            EntryFileType::RegularFile,
+            identity,
+        );
+        let name = quarantine_name(QuarantineReason::CorruptActiveJournal, source, 7);
+        let parsed = parse_quarantine_name(&name).expect("canonical quarantine name");
+
+        assert_eq!(parsed.reason, QuarantineReason::CorruptActiveJournal);
+        assert_eq!(parsed.device, identity.device);
+        assert_eq!(parsed.inode, identity.inode);
+        assert_eq!(parse_quarantine_name(&name.to_uppercase()), None);
     }
 
     #[test]
@@ -4266,6 +4522,43 @@ mod tests {
             std::fs::read(root.diagnostic_file_path(address, FileKind::Pgm)).unwrap(),
             b"damaged PGM"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn forensic_quarantine_scan_lists_and_reopens_canonical_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(directory.path()).unwrap();
+        let owner = root.acquire_writer(LayoutLimits::default()).unwrap();
+        let address = address(1_709_164_801_000_000);
+        let mut temporary = owner.create_pgm_temp(address).unwrap();
+        temporary.file_mut().write_all(b"damaged PGM").unwrap();
+        temporary.publish().unwrap();
+        let segment = root
+            .scan(LayoutLimits::default())
+            .unwrap()
+            .segments
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let outcome = owner.quarantine_invalid_pgm(segment);
+        assert!(matches!(
+            outcome.status,
+            QuarantineStatus::Quarantined { .. } | QuarantineStatus::QuarantinedDegraded { .. }
+        ));
+
+        let entries = root.scan_quarantine(LayoutLimits::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let evidence = &entries[0];
+        assert_eq!(evidence.reason(), QuarantineReason::InvalidPgm);
+        assert!(evidence.file_name().starts_with("qv1-02-"));
+        assert_eq!(evidence.identity().file.len, 11);
+
+        let file = root.open_quarantine(evidence).unwrap();
+        let mut bytes = [0_u8; 11];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"damaged PGM");
     }
 
     #[test]

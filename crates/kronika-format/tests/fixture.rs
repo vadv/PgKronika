@@ -56,6 +56,7 @@ fn fixture_decodes_to_expected_catalog() {
             max_ts: 2_000_000,
             source_id: 0,
             format_version: 1,
+            window_count: 0,
         }
     );
 }

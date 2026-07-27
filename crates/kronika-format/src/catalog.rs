@@ -16,7 +16,7 @@
 //!   len            u64        entry_count     u32
 //!   rows           u32        format_version  u32
 //!   crc32c         u32        crc32c          u32
-//!                             reserved        u32
+//!                             window_count    u32
 //! ```
 
 use std::error::Error;
@@ -72,6 +72,8 @@ pub struct Catalog {
     pub source_id: u64,
     /// Container format version, [`crate::FORMAT_VERSION`] for new files.
     pub format_version: u32,
+    /// Collection windows coalesced into this container; 0 = unknown.
+    pub window_count: u32,
 }
 
 /// Validated borrowed view of an encoded end catalog.
@@ -92,6 +94,8 @@ pub struct CatalogView<'a> {
     pub entry_count: u32,
     /// Container format version.
     pub format_version: u32,
+    /// Collection windows coalesced into this container; 0 = unknown.
+    pub window_count: u32,
 }
 
 impl CatalogView<'_> {
@@ -396,7 +400,8 @@ impl Catalog {
         })?;
         meta[24..28].copy_from_slice(&entry_count.to_le_bytes());
         meta[28..32].copy_from_slice(&self.format_version.to_le_bytes());
-        // The CRC field and reserved field are already zeroed.
+        meta[36..40].copy_from_slice(&self.window_count.to_le_bytes());
+        // The CRC field is already zeroed.
         checksum.update(&meta);
         meta[META_CRC_OFFSET..META_CRC_OFFSET + 4]
             .copy_from_slice(&checksum.finalize().to_le_bytes());
@@ -422,6 +427,7 @@ impl Catalog {
             max_ts: view.max_ts,
             source_id: view.source_id,
             format_version: view.format_version,
+            window_count: view.window_count,
         })
     }
 
@@ -478,6 +484,7 @@ impl Catalog {
             source_id: u64_at(meta, 16),
             entry_count: stored_count,
             format_version: u32_at(meta, 28),
+            window_count: u32_at(meta, 36),
         })
     }
 }
@@ -523,6 +530,7 @@ mod tests {
             max_ts: 2_000_000,
             source_id: 0,
             format_version: 1,
+            window_count: 7,
         }
     }
 
@@ -573,6 +581,7 @@ mod tests {
         assert_eq!(view.source_id, catalog.source_id);
         assert_eq!(view.entry_count, 1);
         assert_eq!(view.format_version, catalog.format_version);
+        assert_eq!(view.window_count, catalog.window_count);
         assert_eq!(view.entries().collect::<Vec<_>>(), catalog.entries);
     }
 
@@ -584,6 +593,7 @@ mod tests {
             max_ts: 0,
             source_id: 0,
             format_version: 1,
+            window_count: 0,
         };
         let encoded = catalog.encode();
         let body = &encoded[..encoded.len() - TAIL_INDEX_LEN];
@@ -636,6 +646,7 @@ mod tests {
             max_ts: 0,
             source_id: 0,
             format_version: crate::FORMAT_VERSION,
+            window_count: 1,
         }
     }
 

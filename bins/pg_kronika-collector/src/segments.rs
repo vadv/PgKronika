@@ -624,6 +624,7 @@ fn validate_existing_segment(file: &File) -> Result<()> {
         max_ts: catalog.max_ts,
         source_id: catalog.source_id,
         format_version: catalog.format_version,
+        window_count: catalog.window_count,
     };
     validate_catalog_layout(&catalog, catalog_at).context("validate PGM section layout")?;
 

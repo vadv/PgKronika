@@ -2034,6 +2034,17 @@ dependencies = [
 [[package]]
 name = "pg_kronika-dump"
 version = "0.0.0"
+dependencies = [
+ "kronika-format",
+ "kronika-layout",
+ "kronika-reader",
+ "kronika-registry",
+ "kronika-writer",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "pg_kronika-web"

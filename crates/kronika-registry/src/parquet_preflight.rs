@@ -16,6 +16,15 @@ const MAGIC: &[u8; 4] = b"PAR1";
 const MAX_THRIFT_NESTING: usize = 16;
 const MAX_THRIFT_ITEMS: usize = MAX_SECTION_ROWS;
 
+/// Exact bounded work declared by a validated Parquet section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParquetDecodeProfile {
+    /// Rows declared consistently by the file and its row groups.
+    pub rows: usize,
+    /// Page-header plus uncompressed page-payload bytes.
+    pub decoded_bytes: usize,
+}
+
 /// Validate all allocation-driving Parquet metadata before Arrow sees it.
 ///
 /// The footer and every page header are parsed directly from the bounded body.
@@ -29,6 +38,22 @@ pub fn validate_parquet_decode_work(
     body: &[u8],
     max_decoded_bytes: usize,
 ) -> Result<(), CodecError> {
+    parquet_decode_profile(body, max_decoded_bytes).map(|_profile| ())
+}
+
+/// Validate a section and return its exact uncompressed Parquet work.
+///
+/// This performs the same bounded footer and page-header pass as
+/// [`validate_parquet_decode_work`] without materializing Arrow arrays.
+///
+/// # Errors
+///
+/// Returns the same typed [`CodecError`] values as
+/// [`validate_parquet_decode_work`].
+pub fn parquet_decode_profile(
+    body: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<ParquetDecodeProfile, CodecError> {
     validate_parquet_decode_profile(body, max_decoded_bytes, true)
 }
 
@@ -47,6 +72,19 @@ pub fn validate_plain_parquet_decode_work(
     body: &[u8],
     max_decoded_bytes: usize,
 ) -> Result<(), CodecError> {
+    plain_parquet_decode_profile(body, max_decoded_bytes).map(|_profile| ())
+}
+
+/// Validate a dictionary-free section and return exact uncompressed work.
+///
+/// # Errors
+///
+/// Returns the same typed [`CodecError`] values as
+/// [`validate_plain_parquet_decode_work`].
+pub fn plain_parquet_decode_profile(
+    body: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<ParquetDecodeProfile, CodecError> {
     validate_parquet_decode_profile(body, max_decoded_bytes, false)
 }
 
@@ -54,7 +92,7 @@ fn validate_parquet_decode_profile(
     body: &[u8],
     max_decoded_bytes: usize,
     allow_dictionary: bool,
-) -> Result<(), CodecError> {
+) -> Result<ParquetDecodeProfile, CodecError> {
     if body.len() > MAX_SECTION_BYTES {
         return Err(CodecError::SectionTooLarge {
             len: body.len(),
@@ -111,7 +149,7 @@ fn validate_file_metadata(
     metadata_start: usize,
     max_decoded_bytes: usize,
     allow_dictionary: bool,
-) -> Result<(), CodecError> {
+) -> Result<ParquetDecodeProfile, CodecError> {
     let rows = checked_rows(metadata.num_rows)?;
     if rows > MAX_SECTION_ROWS {
         return Err(CodecError::TooManyRows {
@@ -293,7 +331,10 @@ fn validate_file_metadata(
     if page_work != footer_work {
         return Err(CodecError::InvalidPageLayout);
     }
-    Ok(())
+    Ok(ParquetDecodeProfile {
+        rows,
+        decoded_bytes: page_work,
+    })
 }
 
 fn validate_data_encoding(encoding: Encoding, allow_dictionary: bool) -> Result<(), CodecError> {
@@ -763,7 +804,8 @@ mod tests {
     use crate::{CodecError, Section, Ts, VerifiedSection, decode_any};
 
     use super::{
-        BoundedCompactInput, MAGIC, MAX_THRIFT_NESTING, PageHeader, validate_parquet_decode_work,
+        BoundedCompactInput, MAGIC, MAX_THRIFT_NESTING, PageHeader, parquet_decode_profile,
+        validate_parquet_decode_work,
     };
     use crate::MAX_DECODED_SECTION_BYTES;
 
@@ -835,6 +877,13 @@ mod tests {
             .map(|column| usize::try_from(column.uncompressed_size()).expect("positive size"))
             .sum::<usize>();
         validate_parquet_decode_work(&body, work).expect("exact work is admitted");
+        assert_eq!(
+            parquet_decode_profile(&body, work).expect("profile"),
+            super::ParquetDecodeProfile {
+                rows: 1,
+                decoded_bytes: work,
+            }
+        );
         assert!(matches!(
             validate_parquet_decode_work(&body, work - 1),
             Err(CodecError::DecodedSectionTooLarge { .. })

@@ -41,14 +41,16 @@ fn catalog_strategy() -> impl Strategy<Value = Catalog> {
         any::<i64>(),
         any::<u64>(),
         any::<u32>(),
+        any::<u32>(),
     )
         .prop_map(
-            |(entries, min_ts, max_ts, source_id, format_version)| Catalog {
+            |(entries, min_ts, max_ts, source_id, format_version, window_count)| Catalog {
                 entries,
                 min_ts,
                 max_ts,
                 source_id,
                 format_version,
+                window_count,
             },
         )
 }
