@@ -32,6 +32,7 @@ mod pg_log_source;
 mod plans_source;
 mod pool_sources;
 mod reset_source;
+mod rotation;
 mod scheduler;
 mod segments;
 mod service_sections;
@@ -63,6 +64,7 @@ use pg_log_source::{
 };
 use plans_source::{PlansSourceCache, collect_store_plans_cached};
 use pool_sources::{PoolReads, read_pool_sources};
+use rotation::Rotation;
 use scheduler::{DueSet, Scheduler, SourceKind};
 use segments::{
     SegmentState, append_window_and_maybe_seal, encode_window, open_collector_journal,
@@ -83,21 +85,29 @@ fn timer_sleep_delay(
     sched: &Scheduler,
     plans_cache: &PlansSourceCache,
     segment: &SegmentState,
+    rotation: Option<&Rotation>,
 ) -> Option<Duration> {
-    if tick_secs == 0 {
-        return None;
+    let mut delay = (tick_secs != 0).then(|| Duration::from_secs(tick_secs));
+    if let Some(delay) = delay.as_mut() {
+        if let Some(next_due) = sched.next_elapsed_due_in(now) {
+            *delay = (*delay).min(next_due);
+        }
+        if let Some(next_plans) = plans_cache.next_due_in(now) {
+            *delay = (*delay).min(next_plans);
+        }
+        if let Some(next_age) =
+            segment.time_until_age(now, Duration::from_secs(segment_max_age_secs))
+        {
+            *delay = (*delay).min(next_age);
+        }
     }
-    let mut delay = Duration::from_secs(tick_secs);
-    if let Some(next_due) = sched.next_elapsed_due_in(now) {
-        delay = delay.min(next_due);
+    // Rotation runs its own timer, so an otherwise signal-only loop still wakes
+    // for the 60-second size re-check.
+    if let Some(rotation) = rotation {
+        let next_rotation = rotation.time_until_tick(now);
+        delay = Some(delay.map_or(next_rotation, |delay| delay.min(next_rotation)));
     }
-    if let Some(next_plans) = plans_cache.next_due_in(now) {
-        delay = delay.min(next_plans);
-    }
-    if let Some(next_age) = segment.time_until_age(now, Duration::from_secs(segment_max_age_secs)) {
-        delay = delay.min(next_age);
-    }
-    Some(delay)
+    delay
 }
 
 fn cleanup_writer_temporaries(owner: &WriterOwner, limits: LayoutLimits) -> Result<usize> {
@@ -141,6 +151,10 @@ fn acquire_collector_writer(root: &DataRoot, limits: LayoutLimits) -> Result<Wri
 }
 
 #[tokio::main]
+#[allow(
+    clippy::too_many_lines,
+    reason = "main wires storage ownership, the pool, signals, and the event loop in one place"
+)]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
@@ -180,6 +194,12 @@ async fn main() -> Result<()> {
     let mut sched = Scheduler::new(config.intervals);
     let mut segment = SegmentState::default();
     let mut pool_budget = PoolBudget::new(Duration::from_millis(config.cycle_db_budget_ms));
+    let mut rotation = Rotation::new(
+        config.retention,
+        &writer_owner,
+        LayoutLimits::default(),
+        Instant::now(),
+    )?;
     // With the timer disabled collection is signal-driven only.
     let mut first_timer_tick = config.tick_secs > 0;
 
@@ -197,6 +217,7 @@ async fn main() -> Result<()> {
                 &sched,
                 &plans_cache,
                 &segment,
+                rotation.as_ref(),
             )
         };
         let forced = tokio::select! {
@@ -206,11 +227,20 @@ async fn main() -> Result<()> {
                     Some(delay) => tokio::time::sleep(delay).await,
                     None => std::future::pending::<()>().await,
                 }
-            } => false,
+            } => {
+                // With the collection timer disabled the only timed wake is
+                // rotation's; collection stays strictly signal-driven.
+                if config.tick_secs == 0 {
+                    run_rotation(&mut rotation, &writer_owner, &journal, &[]);
+                    continue;
+                }
+                false
+            }
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
         };
         let due = sched.plan(Instant::now(), forced);
+        let mut sealed_this_tick: Vec<PathBuf> = Vec::new();
         // The age valve runs on every tick, before collection: a tick whose
         // sources fail or return no rows must still close an expired segment.
         let age = Duration::from_secs(config.segment_max_age_secs);
@@ -219,6 +249,7 @@ async fn main() -> Result<()> {
                 Ok(dest) => {
                     sched.mark_segment_opened();
                     announce(&format!("sealed {} reason=age", dest.display()));
+                    sealed_this_tick.push(dest);
                 }
                 Err(err) => log_event(
                     LogLevel::Error,
@@ -231,25 +262,66 @@ async fn main() -> Result<()> {
         // The plans pace lives outside the scheduler; a tick with only the
         // plans read due still runs.
         if due.is_empty() && !plans_cache.is_due(Instant::now()) {
+            run_rotation(&mut rotation, &writer_owner, &journal, &sealed_this_tick);
             continue;
         }
-        run_collection_cycle(
-            &mut pool,
-            &mut journal,
-            &writer_owner,
-            &config,
-            &mut statements_cache,
-            &mut plans_cache,
-            &mut log_collector,
-            &due,
-            &mut segment,
-            &mut sched,
-            &mut pool_budget,
-        )
-        .await;
+        sealed_this_tick.extend(
+            run_collection_cycle(
+                &mut pool,
+                &mut journal,
+                &writer_owner,
+                &config,
+                &mut statements_cache,
+                &mut plans_cache,
+                &mut log_collector,
+                &due,
+                &mut segment,
+                &mut sched,
+                &mut pool_budget,
+            )
+            .await,
+        );
         stop_if_persistence_unhealthy(&journal, &segment)?;
+        run_rotation(&mut rotation, &writer_owner, &journal, &sealed_this_tick);
     }
     Ok(())
+}
+
+/// Feeds the tick's publications to rotation and lets it enforce the target.
+///
+/// A no-op when rotation is disabled. Publications grow the incremental size
+/// counter; the enforcement itself is scan-free unless the tree is over target.
+fn run_rotation(
+    rotation: &mut Option<Rotation>,
+    writer_owner: &WriterOwner,
+    journal: &Journal,
+    sealed: &[PathBuf],
+) {
+    let Some(rotation) = rotation.as_mut() else {
+        return;
+    };
+    for dest in sealed {
+        match std::fs::metadata(dest) {
+            Ok(metadata) => rotation.record_publication(metadata.len()),
+            // An uncounted publication under-counts the tree until the next
+            // enforcement scan re-seeds the counter.
+            Err(err) => log_event(
+                LogLevel::Warn,
+                "rotation_publication_stat_failure",
+                &[
+                    field("path", dest.display().to_string()),
+                    field("error", format!("{err:#}")),
+                ],
+            ),
+        }
+    }
+    let journal_bytes = u64::try_from(journal.bytes()).unwrap_or(u64::MAX);
+    rotation.maybe_enforce(
+        writer_owner,
+        journal_bytes,
+        !sealed.is_empty(),
+        Instant::now(),
+    );
 }
 
 fn stop_if_persistence_unhealthy(journal: &Journal, segment: &SegmentState) -> Result<()> {
@@ -285,7 +357,8 @@ async fn run_collection_cycle(
     segment: &mut SegmentState,
     sched: &mut Scheduler,
     pool_budget: &mut PoolBudget,
-) {
+) -> Vec<PathBuf> {
+    let mut sealed_dests = Vec::new();
     if let Err(err) = pool.ensure_main().await {
         log_event(
             LogLevel::Error,
@@ -300,6 +373,7 @@ async fn run_collection_cycle(
                     for (dest, reason) in sealed {
                         sched.mark_segment_opened();
                         announce(&format!("sealed {} reason={reason}", dest.display()));
+                        sealed_dests.push(dest);
                     }
                 }
                 Err(err) => log_event(
@@ -309,7 +383,7 @@ async fn run_collection_cycle(
                 ),
             }
         }
-        return;
+        return sealed_dests;
     }
     if let Err(err) = pool
         .refresh(
@@ -370,6 +444,7 @@ async fn run_collection_cycle(
                 // (instance, reset, settings) come due on its first window.
                 sched.mark_segment_opened();
                 announce(&format!("sealed {} reason={reason}", dest.display()));
+                sealed_dests.push(dest);
             }
         }
         Err(err) => log_event(
@@ -378,6 +453,7 @@ async fn run_collection_cycle(
             &[field("error", format!("{err:#}"))],
         ),
     }
+    sealed_dests
 }
 
 /// Apply one source's trigger verdict to its pace, logging only transitions.

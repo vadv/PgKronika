@@ -72,6 +72,9 @@ pub(crate) struct Config {
     pub(crate) repl_lag_trigger_s: i64,
     /// Slot-retained WAL that trips the replication trigger, bytes.
     pub(crate) slot_retained_trigger_bytes: i64,
+    /// Storage-rotation target for the whole output tree; `None` disables
+    /// rotation and keeps the pre-rotation unbounded-growth behavior.
+    pub(crate) retention: Option<RetentionConfig>,
 }
 
 pub(crate) fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -110,6 +113,80 @@ pub(crate) fn resolve_log_status_interval(raw: Option<&str>) -> Result<Duration>
         "KRONIKA_PG_LOG_STATUS_INTERVAL_S must be greater than 0"
     );
     Ok(Duration::from_secs(seconds))
+}
+
+/// Used-fraction target of the `auto` mode when no percentage is given.
+const DEFAULT_AUTO_PERCENT: u8 = 80;
+
+/// Rotation target for the whole `KRONIKA_OUT_DIR` tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    variant_size_differences,
+    reason = "a 16-byte Copy enum; the byte-budget and percentage arms cannot share a width"
+)]
+pub(crate) enum RetentionConfig {
+    /// Keep the tree at or below this many bytes.
+    Fixed(u64),
+    /// Keep the backing partition's used fraction at or below this percentage.
+    Auto(u8),
+}
+
+/// Parses `KRONIKA_RETENTION` into a rotation target.
+///
+/// Accepts a raw byte budget (`<u64>`), `auto` (equivalent to `auto:80`), or
+/// `auto:<P>` with `P` in `1..=99`. The name omits a `_BYTES` suffix because a
+/// future time criterion will arrive under its own env as an OR condition.
+///
+/// # Errors
+///
+/// Returns an error for an empty value, a non-numeric budget, an out-of-range
+/// percentage, or an unrecognized `auto` suffix.
+pub(crate) fn parse_retention(raw: &str) -> Result<RetentionConfig> {
+    let value = raw.trim();
+    anyhow::ensure!(!value.is_empty(), "KRONIKA_RETENTION must not be empty");
+    if let Some(suffix) = value.strip_prefix("auto") {
+        let percent = if suffix.is_empty() {
+            DEFAULT_AUTO_PERCENT
+        } else {
+            let digits = suffix.strip_prefix(':').with_context(|| {
+                format!("KRONIKA_RETENTION must be 'auto' or 'auto:P', got {value:?}")
+            })?;
+            digits
+                .parse::<u8>()
+                .with_context(|| format!("KRONIKA_RETENTION percentage is not a u8: {digits:?}"))?
+        };
+        anyhow::ensure!(
+            (1..=99).contains(&percent),
+            "KRONIKA_RETENTION auto percentage must be in 1..=99, got {percent}"
+        );
+        return Ok(RetentionConfig::Auto(percent));
+    }
+    let budget = value.parse::<u64>().with_context(|| {
+        format!("KRONIKA_RETENTION must be a byte budget or 'auto[:P]', got {value:?}")
+    })?;
+    Ok(RetentionConfig::Fixed(budget))
+}
+
+/// Rejects a fixed budget that cannot hold the non-deletable minimum plus room
+/// to rotate.
+///
+/// The floor is `2 × KRONIKA_SEGMENT_MAX_BYTES`: the active journal and the
+/// newest sealed segment are never deleted, so a smaller budget could never
+/// converge. `auto` targets a live partition fraction and has no such bound.
+///
+/// # Errors
+///
+/// Returns an error naming the budget and the required floor.
+pub(crate) fn validate_retention(retention: RetentionConfig, segment_max_bytes: u64) -> Result<()> {
+    if let RetentionConfig::Fixed(budget) = retention {
+        let floor = segment_max_bytes.saturating_mul(2);
+        anyhow::ensure!(
+            budget >= floor,
+            "KRONIKA_RETENTION fixed budget {budget} is below 2 × KRONIKA_SEGMENT_MAX_BYTES \
+             ({floor}); a budget that cannot hold two segments cannot converge"
+        );
+    }
+    Ok(())
 }
 
 impl Config {
@@ -191,6 +268,14 @@ impl Config {
             1024 * 1024 * 1024,
         )?)
         .context("KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES exceeds i64")?;
+        let retention = std::env::var("KRONIKA_RETENTION")
+            .ok()
+            .map(|raw| parse_retention(&raw))
+            .transpose()?;
+        if let Some(retention) = retention {
+            validate_retention(retention, segment_max_bytes)?;
+            log_retention_config(retention);
+        }
         let intervals = intervals_from_env()?;
         let log = log_config_from_env(&out_dir)?;
         validate_cardinality(max_tables, max_indexes)?;
@@ -227,6 +312,7 @@ impl Config {
             replication_fast_interval_s,
             repl_lag_trigger_s,
             slot_retained_trigger_bytes,
+            retention,
         })
     }
 
@@ -235,6 +321,24 @@ impl Config {
             return Ok(());
         }
         validate_state_target(&self.out_dir, &self.log.state_path)
+    }
+}
+
+fn log_retention_config(retention: RetentionConfig) {
+    match retention {
+        RetentionConfig::Fixed(budget) => log_event(
+            LogLevel::Info,
+            "config_retention",
+            &[field("mode", "fixed"), field("budget_bytes", budget)],
+        ),
+        RetentionConfig::Auto(percent) => log_event(
+            LogLevel::Info,
+            "config_retention",
+            &[
+                field("mode", "auto"),
+                field("used_percent", u64::from(percent)),
+            ],
+        ),
     }
 }
 

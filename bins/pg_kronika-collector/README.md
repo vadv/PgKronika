@@ -115,6 +115,7 @@ uncovered or skipped work instead of reporting it as complete data. See
 | `KRONIKA_SEGMENT_MAX_BYTES` | `67108864` | Seal after this many raw journal bytes; `0` seals each window. |
 | `KRONIKA_SEGMENT_MAX_AGE_S` | `900` | Maximum age of an open segment. |
 | `KRONIKA_JOURNAL_MAX_BYTES` | `1073741824` | Physical journal cap, including the reset marker; accepted range is 36 bytes–1 GiB, and reaching it triggers an early seal. |
+| `KRONIKA_RETENTION` | unset | Storage rotation target for the whole data root: a byte budget (at least `2 × KRONIKA_SEGMENT_MAX_BYTES`), `auto` (= `auto:80`), or `auto:<P>` with `P` in `1..=99` as the partition used fraction. Unset disables rotation. |
 
 Invalid startup limits fail before collection when they would exceed a section
 or dictionary contract. OS cap parse errors degrade to the documented default
@@ -123,7 +124,9 @@ and emit a warning.
 ## Scheduling
 
 `KRONIKA_INTERVAL_S` is the timer tick (`5` seconds). Set it to `0` for
-signal-driven collection only. Each source has its own base interval:
+signal-driven collection only; with rotation enabled the process still wakes
+every 60 seconds, but that wake runs rotation only and never starts
+collection. Each source has its own base interval:
 
 | Source | Variable | Default seconds |
 | --- | --- | ---: |

@@ -1,8 +1,8 @@
 use crate::config::{
-    resolve_log_enabled, resolve_log_status_interval, validate_cardinality, validate_heavy_cap,
-    validate_journal_max_bytes, validate_max_lock_rows, validate_max_plans,
-    validate_plan_text_limits, validate_replication_detail_bounds, validate_settings_row_count,
-    validate_state_target,
+    RetentionConfig, parse_retention, resolve_log_enabled, resolve_log_status_interval,
+    validate_cardinality, validate_heavy_cap, validate_journal_max_bytes, validate_max_lock_rows,
+    validate_max_plans, validate_plan_text_limits, validate_replication_detail_bounds,
+    validate_retention, validate_settings_row_count, validate_state_target,
 };
 use crate::plans_source::{plans_reread_delay, truncate_to_boundary};
 use kronika_format::{JOURNAL_HEADER_LEN, MAX_JOURNAL_LEN};
@@ -226,4 +226,106 @@ fn replication_detail_bounds_reject_dictionary_overflow() {
     let err = validate_replication_detail_bounds(bounds)
         .expect_err("combined replication labels must fit the dictionary cap");
     assert!(err.to_string().contains("dictionary bytes"));
+}
+
+#[test]
+fn retention_parses_a_fixed_byte_budget() {
+    assert_eq!(
+        parse_retention("1073741824").expect("a plain number is a byte budget"),
+        RetentionConfig::Fixed(1_073_741_824)
+    );
+}
+
+#[test]
+fn retention_auto_defaults_to_eighty_percent() {
+    assert_eq!(
+        parse_retention("auto").expect("bare auto is auto:80"),
+        RetentionConfig::Auto(80)
+    );
+}
+
+#[test]
+fn retention_auto_takes_an_explicit_percentage() {
+    assert_eq!(
+        parse_retention("auto:65").expect("auto with a percentage"),
+        RetentionConfig::Auto(65)
+    );
+    assert_eq!(
+        parse_retention("  auto:1 ").expect("surrounding whitespace is trimmed"),
+        RetentionConfig::Auto(1)
+    );
+}
+
+#[test]
+fn retention_rejects_an_empty_value() {
+    assert!(
+        parse_retention("   ").is_err(),
+        "an empty value is not a target"
+    );
+}
+
+#[test]
+fn retention_rejects_an_out_of_range_percentage() {
+    assert!(parse_retention("auto:0").is_err(), "0% cannot be a target");
+    assert!(
+        parse_retention("auto:100").is_err(),
+        "100% cannot be a target"
+    );
+    assert!(
+        parse_retention("auto:256").is_err(),
+        "a percentage above a u8 is rejected"
+    );
+}
+
+#[test]
+fn retention_rejects_a_malformed_auto_suffix() {
+    assert!(
+        parse_retention("automatic").is_err(),
+        "an unrecognized auto suffix is rejected"
+    );
+    assert!(
+        parse_retention("auto:").is_err(),
+        "auto with an empty percentage is rejected"
+    );
+    assert!(
+        parse_retention("12x").is_err(),
+        "a non-numeric budget is rejected"
+    );
+}
+
+#[test]
+fn retention_fixed_budget_must_hold_two_segments() {
+    let segment_max_bytes = 64 * 1024 * 1024;
+    let floor = 2 * segment_max_bytes;
+    assert!(
+        validate_retention(RetentionConfig::Fixed(floor), segment_max_bytes).is_ok(),
+        "exactly two segments is the minimum viable budget"
+    );
+    let err = validate_retention(RetentionConfig::Fixed(floor - 1), segment_max_bytes)
+        .expect_err("a budget below two segments cannot converge");
+    assert!(err.to_string().contains("cannot converge"));
+}
+
+#[test]
+fn retention_auto_has_no_fixed_floor() {
+    assert!(
+        validate_retention(RetentionConfig::Auto(80), 64 * 1024 * 1024).is_ok(),
+        "auto targets a partition fraction, not a byte floor"
+    );
+}
+
+#[test]
+fn retention_rejects_a_negative_budget() {
+    assert!(
+        parse_retention("-1").is_err(),
+        "a byte budget cannot be negative"
+    );
+}
+
+#[test]
+fn retention_floor_saturates_when_the_segment_cap_is_huge() {
+    // 2 × segment_max overflows u64; the floor saturates instead of wrapping
+    // to a small number that would accept a tiny budget.
+    assert!(validate_retention(RetentionConfig::Fixed(u64::MAX), u64::MAX).is_ok());
+    assert!(validate_retention(RetentionConfig::Fixed(u64::MAX - 1), u64::MAX).is_err());
 }
