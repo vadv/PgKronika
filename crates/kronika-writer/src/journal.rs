@@ -2,8 +2,9 @@
 //!
 //! The checksummed root header persists the exact [`SegmentId`] independently
 //! of the PGM catalogs carried by its frames. A fresh journal always contains a
-//! valid empty header; zero-length and headerless frame-only files are rejected
-//! without modification.
+//! valid empty header. A zero-length file provably never held data and is
+//! re-initialized in place; headerless frame-only files are rejected without
+//! modification.
 
 use std::error::Error;
 use std::fmt;
@@ -173,7 +174,7 @@ pub enum JournalError {
         /// Configured cap.
         max: usize,
     },
-    /// A zero-length, headerless, or differently versioned journal was found.
+    /// A foreign or differently versioned journal header was found.
     UnsupportedJournalFormat,
     /// The file ends before the complete version-1 header.
     TornHeader {
@@ -430,8 +431,8 @@ impl Journal {
     /// Opens or initializes the root journal through a writer-owner capability.
     ///
     /// Existing files are validated without truncation or repair. A newly
-    /// created file receives and synchronizes the canonical empty header before
-    /// its root directory entry is synchronized.
+    /// created or zero-length file receives and synchronizes the canonical
+    /// empty header before its root directory entry is synchronized.
     ///
     /// # Errors
     ///
@@ -458,7 +459,12 @@ impl Journal {
             file_len = JOURNAL_HEADER_LEN as u64;
         }
         if file_len == 0 {
-            return Err(JournalError::UnsupportedJournalFormat);
+            // A crash between creation and the first header write leaves an
+            // empty file; no journal state ever truncates below the header.
+            write_header(&mut file, JournalHeader::EMPTY)?;
+            file.set_len(JOURNAL_HEADER_LEN as u64)?;
+            file.sync_data()?;
+            file_len = JOURNAL_HEADER_LEN as u64;
         }
         if file_len < JOURNAL_HEADER_LEN as u64 {
             return Err(JournalError::TornHeader { len: file_len });
@@ -1757,20 +1763,32 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_and_headerless_journals_are_rejected_without_mutation() {
-        for bytes in [Vec::new(), b"PGMPheaderless".to_vec()] {
-            let directory = tempfile::tempdir().unwrap();
-            std::fs::write(directory.path().join("active.parts"), &bytes).unwrap();
-            let owner = owner(&directory);
-            assert!(matches!(
-                Journal::open(&owner, JournalConfig::default()),
-                Err(JournalError::UnsupportedJournalFormat | JournalError::TornHeader { .. })
-            ));
-            assert_eq!(
-                std::fs::read(directory.path().join("active.parts")).unwrap(),
-                bytes
-            );
-        }
+    fn zero_length_journal_is_reinitialized_to_the_empty_header() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("active.parts"), []).unwrap();
+        let owner = owner(&directory);
+        let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        assert!(journal.segment_id().is_none());
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            JournalHeader::EMPTY.encode()
+        );
+    }
+
+    #[test]
+    fn headerless_journal_is_rejected_without_mutation() {
+        let bytes = b"PGMPheaderless".to_vec();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("active.parts"), &bytes).unwrap();
+        let owner = owner(&directory);
+        assert!(matches!(
+            Journal::open(&owner, JournalConfig::default()),
+            Err(JournalError::TornHeader { .. })
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("active.parts")).unwrap(),
+            bytes
+        );
     }
 
     #[test]

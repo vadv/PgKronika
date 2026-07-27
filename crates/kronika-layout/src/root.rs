@@ -383,8 +383,10 @@ impl DataRoot {
     /// incompatible flat files, exhausted limits, or filesystem failures.
     pub fn scan(&self, limits: LayoutLimits) -> Result<LayoutSnapshot, LayoutError> {
         let limits = limits.validate()?;
-        let mut visited_entries = 0_usize;
         for attempt in 0..SCAN_RACE_ATTEMPTS {
+            // Fresh per attempt: a retried scan revisits the same entries, and
+            // carrying the count over would fail valid trees near the limit.
+            let mut visited_entries = 0_usize;
             match self.scan_once(limits, &mut visited_entries) {
                 Err(LayoutError::Io(error))
                     if error.kind() == io::ErrorKind::NotFound

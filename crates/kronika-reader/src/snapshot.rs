@@ -675,11 +675,11 @@ impl LocalDirSnapshot {
         &self.scan.warnings
     }
 
-    /// Damaged byte ranges found while scanning `active.parts`.
+    /// Damaged byte ranges recorded for this snapshot.
     ///
-    /// These ranges describe journal bytes the frame scanner could not validate.
-    /// Valid parts before or after a damaged region remain visible through
-    /// [`units`](Self::units).
+    /// The strict version-1 journal scan fails closed: damage aborts snapshot
+    /// construction instead of masking bytes, so snapshots opened from disk
+    /// report an empty list.
     #[must_use]
     pub fn damages(&self) -> &[DamageRegion] {
         &self.scan.damages

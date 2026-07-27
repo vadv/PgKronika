@@ -1004,10 +1004,14 @@ fn read_journal_plan<R: ReadAt>(reader: &R) -> io::Result<JournalReadPlan> {
     let file_len = reader.byte_len()?;
     validate_journal_len(file_len)?;
     if file_len == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "active.parts is zero-length and has no journal header",
-        ));
+        // A crash before the writer's first header write; the file provably
+        // holds no frames, so it reads as an empty journal.
+        return Ok(JournalReadPlan {
+            segment_id: None,
+            scan_len: 0,
+            valid_len: 0,
+            committed_reset: false,
+        });
     }
     if file_len < JOURNAL_HEADER_LEN as u64 {
         return Err(io::Error::new(
@@ -1972,6 +1976,17 @@ mod tests {
             LocalDir::open(dir.path()).unwrap().scan().is_err(),
             "a partial sealed set must never be returned"
         );
+    }
+
+    #[test]
+    fn zero_length_active_journal_reads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 1_000, part(1000, 7));
+        fs::write(dir.path().join("active.parts"), []).unwrap();
+        let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
+        assert_eq!(scan.sealed.len(), 1);
+        assert!(scan.active.is_empty());
+        assert!(scan.damages.is_empty());
     }
 
     #[test]

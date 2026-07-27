@@ -487,9 +487,10 @@ The resynchronizing in-memory scanner is a diagnostic API, not a recovery
 policy.
 
 `Journal::open` is fail-closed for version 1. It validates the complete header,
-the recorded body length, and every frame. A zero-length or headerless file,
-another version, a torn header, a length mismatch, or any torn or damaged
-frame returns an error and leaves the file unchanged. The low-level scanner's
+the recorded body length, and every frame. A headerless file, another version,
+a torn header, a length mismatch, or any torn or damaged frame returns an error
+and leaves the file unchanged. A zero-length file provably holds no data and is
+re-initialized to the canonical empty header. The low-level scanner's
 damage classifications are diagnostic data, not a repair policy for this
 journal. Version 1 is the first and only supported journal format. PgKronika
 has not had a public release, and there is no alternate journal format or

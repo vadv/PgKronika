@@ -46,8 +46,9 @@ and first frame durable at the same synchronization boundary. Later appends
 must use the same id.
 
 Open validates the complete header and frame body without loading the whole
-file. A zero-length, headerless, differently versioned, torn, or damaged
-journal is rejected and left unchanged. Version 1 is the first and only
+file. A headerless, differently versioned, torn, or damaged journal is rejected
+and left unchanged; a zero-length file provably holds no data and is
+re-initialized as the empty header. Version 1 is the first and only
 supported journal format. PgKronika has not had a public release, and there is
 no alternate journal format or migration path.
 
