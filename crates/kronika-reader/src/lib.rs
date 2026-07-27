@@ -10,9 +10,9 @@
 //!
 //! Section queries join registered layout versions under one logical name,
 //! filter by source and time, order rows by the registry contract, and return
-//! coverage gaps plus an opaque cursor. [`QueryLimits`] bounds returned rows
-//! and materialized cells; format, catalog, section, row-group, and row-count
-//! ceilings are checked before or during decode.
+//! coverage gaps plus an opaque cursor. [`QueryLimits`] bounds returned rows,
+//! materialization, and request-wide read work; format, catalog, section,
+//! row-group, and row-count ceilings are checked before or during decode.
 //!
 //! Counter folds preserve reset, gap, first-point, invalid-interval, and
 //! collection-disabled states as distinct [`Reason`] values. A zero rate is
@@ -24,6 +24,8 @@ mod overview;
 mod query;
 mod refresh;
 mod snapshot;
+#[cfg(test)]
+mod test_layout;
 mod unit;
 
 // criterion and mimalloc are used only by the `serving` bench; anchored for the
@@ -51,16 +53,17 @@ pub use overview::{
     LiveView, LossCoverageBlock, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS,
     ManifestEntryDescriptor, PersistError, PersistFailureClass, PersistMode, PersistModeSnapshot,
     PersistenceProbeOutcome, ResetMarker, ResetMarkersBlock, ResolvedPattern, SealOutcome,
-    SegmentContext, SegmentContextError, SegmentFacts, SourceDescriptor, SourceError,
-    SourceManifestBlock, StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats,
-    dictionary_context_id, lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
+    SegmentContext, SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock,
+    StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id,
+    lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
-    OutRow, QueryError, QueryLimits, SectionPage, SeriesDiff, SeriesValues, SourceSummary,
-    SourceSummaryError, SourceSummaryLimits, SourceSummaryResource, Value, apply_collection_gating,
-    apply_gating, diff_section, gate_readings, gauge_section, latest_section_row, logical_section,
-    section, section_with_limits, sections, sections_with_limits, select_gate, source_summaries,
+    OutRow, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SectionPage, SeriesDiff,
+    SeriesValues, SourceSummary, SourceSummaryError, SourceSummaryLimits, SourceSummaryResource,
+    Value, apply_collection_gating, apply_gating, diff_section, gate_readings, gauge_section,
+    latest_section_row, logical_section, section, section_with_limits, sections,
+    sections_with_limits, select_gate, source_summaries,
 };
 pub use refresh::{
     ByteRange, CatalogDigest, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor,
@@ -101,7 +104,7 @@ use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{Catalog, DecodeError, Entry};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS,
-    MAX_SECTION_ROWS, validate_parquet_decode_work,
+    MAX_SECTION_ROWS,
 };
 use kronika_store::StoreError;
 
@@ -342,13 +345,14 @@ pub enum Resolved<'a> {
 }
 
 /// One stored dictionary value, with a blob's truncation metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Stored {
     String(Vec<u8>),
     Blob {
         bytes: Vec<u8>,
         full_len: u64,
         truncated: bool,
+        full_sha256: Option<[u8; 32]>,
     },
 }
 
@@ -360,6 +364,7 @@ impl Stored {
                 bytes,
                 full_len,
                 truncated,
+                ..
             } => Resolved::Blob {
                 bytes,
                 full_len: *full_len,
@@ -426,7 +431,7 @@ pub(crate) fn decode_dictionary_selected(
     };
     let decoded_cap = usize::try_from(bounds.decoded_block_len)
         .map_err(|_error| CodecError::InvalidPageLayout)?;
-    validate_parquet_decode_work(body.as_ref(), decoded_cap)?;
+    kronika_registry::validate_plain_parquet_decode_work(body.as_ref(), decoded_cap)?;
     let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(body, options)?;
     let groups = builder.metadata().num_row_groups();
@@ -447,6 +452,13 @@ pub(crate) fn decode_dictionary_selected(
         }
         Err(_) => return Err(CodecError::InvalidRowCount { raw: claimed }),
     };
+    let requested_max = usize::try_from(bounds.items_per_block).unwrap_or(usize::MAX);
+    if claimed_rows > requested_max {
+        return Err(CodecError::TooManyRows {
+            rows: claimed_rows,
+            max: requested_max,
+        });
+    }
     if !dictionary_schema_matches(builder.schema(), is_blob) {
         return Err(CodecError::SchemaMismatch);
     }
@@ -511,6 +523,12 @@ pub(crate) fn decode_dictionary_selected(
                         bytes: bytes.to_vec(),
                         full_len,
                         truncated,
+                        full_sha256: (!full_sha256.is_null(row)).then(|| {
+                            full_sha256
+                                .value(row)
+                                .try_into()
+                                .expect("validated fixed-size binary width is 32")
+                        }),
                     },
                 ));
             }
@@ -642,7 +660,7 @@ mod tests {
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::{Section, Ts};
 
-    use super::{ReadError, Resolved, Segment};
+    use super::{ReadError, Resolved, Segment, decode_dictionary_selected};
 
     fn bgwriter_row(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
@@ -779,5 +797,70 @@ mod tests {
             None,
             "an absent id resolves to None"
         );
+    }
+
+    #[test]
+    fn dictionary_index_expansion_is_rejected_by_preflight() {
+        use std::sync::Arc;
+
+        use arrow_array::types::Int32Type;
+        use arrow_array::{
+            ArrayRef, BinaryArray, DictionaryArray, Int32Array, RecordBatch, UInt64Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+        use kronika_registry::{
+            Bytes, CodecError, DICT_STRINGS_TYPE_ID, MAX_DECODED_SECTION_BYTES,
+        };
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use parquet::file::properties::WriterProperties;
+
+        const ROWS: usize = 4_096;
+        const VALUE_BYTES: usize = 64 * 1_024;
+        let keys = Int32Array::from(vec![0_i32; ROWS]);
+        let value = vec![b'x'; VALUE_BYTES];
+        let values: ArrayRef = Arc::new(BinaryArray::from_iter_values([value.as_slice()]));
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, values)
+                .expect("one-value dictionary array"),
+        );
+        let ids: ArrayRef = Arc::new(UInt64Array::from(vec![7_u64; ROWS]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("str_id", DataType::UInt64, false),
+            Field::new(
+                "bytes",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary)),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![ids, dictionary])
+            .expect("dictionary batch");
+        let options = ArrowWriterOptions::new()
+            .with_properties(
+                WriterProperties::builder()
+                    .set_dictionary_enabled(true)
+                    .set_created_by(String::new())
+                    .build(),
+            )
+            .with_skip_arrow_metadata(true);
+        let mut body = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut body, schema, options).expect("writer");
+        writer.write(&batch).expect("write dictionary batch");
+        writer.close().expect("close dictionary writer");
+
+        kronika_registry::validate_parquet_decode_work(&body, MAX_DECODED_SECTION_BYTES)
+            .expect("encoded-page work alone fits");
+        const {
+            assert!(ROWS * VALUE_BYTES > MAX_DECODED_SECTION_BYTES);
+        }
+        let err = decode_dictionary_selected(
+            Bytes::from(body),
+            DICT_STRINGS_TYPE_ID,
+            None,
+            &crate::LIMIT,
+        )
+        .expect_err("dictionary pages are rejected before Arrow builder construction");
+        assert!(matches!(err, CodecError::DictionaryEncodingUnsupported));
     }
 }

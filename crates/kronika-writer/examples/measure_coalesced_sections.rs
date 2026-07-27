@@ -25,6 +25,9 @@ use kronika_format::{
     Catalog, DictLimits, PartMeta, SectionInput, SegmentDicts, TAIL_INDEX_LEN, TailIndex,
     build_part, crc32c,
 };
+use kronika_layout::{
+    ACTIVE_JOURNAL_NAME, DataRoot, FileKind, LayoutLimits, SegmentAddress, SegmentId,
+};
 use kronika_reader::{LocalDirSnapshot, Segment, section};
 use kronika_registry::{
     Bytes, Cell, Column, ColumnType, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_BYTES,
@@ -293,12 +296,13 @@ fn main() -> Result<()> {
 fn prepare(output_dir: &Path) -> Result<()> {
     fs::create_dir(output_dir)?;
     let journal_path = output_dir.join("active.parts");
-    let (mut journal, report) = Journal::open(&journal_path, JournalConfig::default())?;
-    if !report.is_clean() || !journal.parts().is_empty() {
-        return Err(invalid(
-            "new measurement journal did not open empty and clean",
-        ));
+    let root = DataRoot::open(output_dir)?;
+    let owner = root.acquire_writer(LayoutLimits::default())?;
+    let mut journal = Journal::open(&owner, JournalConfig::default())?;
+    if !journal.parts().is_empty() {
+        return Err(invalid("new measurement journal did not open empty"));
     }
+    let segment_id = measurement_segment_id()?;
 
     let started = Instant::now();
     let mut expected = LogicalData::default();
@@ -311,7 +315,7 @@ fn prepare(output_dir: &Path) -> Result<()> {
         {
             return Err(invalid("measurement source id changed between windows"));
         }
-        journal.append(&part)?;
+        journal.append(segment_id, &part)?;
     }
     if journal.parts().len() != WINDOWS {
         return Err(invalid(
@@ -349,18 +353,24 @@ fn prepare(output_dir: &Path) -> Result<()> {
 
 fn seal_measurement(journal_path: &Path, output_dir: &Path, mode: Mode) -> Result<()> {
     fs::create_dir(output_dir)?;
-    let pgm_path = output_dir.join("segment.pgm");
-    let (journal, report) = Journal::open(journal_path, JournalConfig::default())?;
-    if !report.is_clean() || journal.parts().len() != WINDOWS {
+    let journal_root = journal_root(journal_path)?;
+    let source_root = DataRoot::open(journal_root)?;
+    let source_owner = source_root.acquire_writer(LayoutLimits::default())?;
+    let journal = Journal::open(&source_owner, JournalConfig::default())?;
+    if journal.parts().len() != WINDOWS {
         return Err(invalid(
-            "measurement journal is not clean with exactly four completed parts",
+            "measurement journal does not contain exactly four completed parts",
         ));
     }
+    let output_root = DataRoot::open(output_dir)?;
+    let output_owner = output_root.acquire_writer(LayoutLimits::default())?;
+    let address = SegmentAddress::new(measurement_segment_id()?)?;
+    let pgm_path = output_root.diagnostic_file_path(address, FileKind::Pgm);
     let journal_bytes = fs::metadata(journal_path)?.len();
     let journal_sha256 = sha256_file(journal_path)?;
 
     let started = Instant::now();
-    let summary = seal(&journal, &pgm_path)?;
+    let summary = seal(&journal, &output_owner, address)?;
     let seal_wall_ns = started.elapsed().as_nanos();
     if summary.sections != mode.expected_sections() {
         return Err(invalid(format!(
@@ -549,9 +559,7 @@ struct ProductionQuery {
 }
 
 fn inspect_production_query(path: &Path, source_id: u64) -> Result<ProductionQuery> {
-    let store_dir = path
-        .parent()
-        .ok_or_else(|| invalid("measurement PGM has no parent directory"))?;
+    let store_dir = segment_root(path)?;
     let restart_started = Instant::now();
     let mut snapshot = LocalDirSnapshot::open(store_dir)?;
     let restart_wall_ns = restart_started.elapsed().as_nanos();
@@ -582,6 +590,34 @@ fn inspect_production_query(path: &Path, source_id: u64) -> Result<ProductionQue
         query_gaps: page.gaps.len(),
         query_has_next_cursor: page.next_cursor.is_some(),
     })
+}
+
+fn measurement_segment_id() -> Result<SegmentId> {
+    Ok(SegmentId::new(FIRST_TS_US)?)
+}
+
+fn journal_root(path: &Path) -> Result<&Path> {
+    if path.file_name().and_then(|name| name.to_str()) != Some(ACTIVE_JOURNAL_NAME) {
+        return Err(invalid(format!(
+            "measurement journal must be named {ACTIVE_JOURNAL_NAME}"
+        )));
+    }
+    path.parent()
+        .ok_or_else(|| invalid("measurement journal has no data root"))
+}
+
+fn segment_root(path: &Path) -> Result<&Path> {
+    let day = path
+        .parent()
+        .ok_or_else(|| invalid("measurement PGM has no UTC day directory"))?;
+    let month = day
+        .parent()
+        .ok_or_else(|| invalid("measurement PGM has no UTC month directory"))?;
+    let year = month
+        .parent()
+        .ok_or_else(|| invalid("measurement PGM has no UTC year directory"))?;
+    year.parent()
+        .ok_or_else(|| invalid("measurement PGM has no data root"))
 }
 
 fn validate_production_query(query: &ProductionQuery) -> Result<()> {

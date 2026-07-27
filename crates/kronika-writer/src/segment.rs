@@ -6,27 +6,83 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::os::unix::fs::FileExt as _;
 
 use arrow_array::{
     Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, RecordBatch, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{
-    Catalog, Entry, EntrySnapshot, FORMAT_VERSION, HotMark, MAGIC, PartError, PartRef, Placement,
-    StrId, crc32c, validate_part_catalog,
+    Catalog, ENTRY_LEN, Entry, EntrySnapshot, FORMAT_VERSION, HotMark, MAGIC, META_LEN, PartError,
+    Placement, StrId, TAIL_INDEX_LEN, TailIndex, crc32c, validate_part_catalog,
 };
+use kronika_layout::{FileIdentity, LayoutError, PgmTemp, SegmentAddress, SegmentId, WriterOwner};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_DECODED_SECTION_BYTES,
     MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS, VerifiedSection, decode_any,
-    encode_sealed_batches, sealed_data_body_bound, validate_parquet_decode_work,
+    encode_sealed_batches, sealed_data_body_bound, validate_plain_parquet_decode_work,
 };
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 
-use crate::{Journal, JournalError};
+use crate::{Journal, JournalError, JournalPartRef};
+
+const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
+const COMPARE_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_CATALOG_ENTRIES: usize = (MAX_CATALOG_BYTES - META_LEN) / ENTRY_LEN;
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_FIRST_COMPARISON_CHUNK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+struct ComparisonHookGuard;
+
+#[cfg(test)]
+impl ComparisonHookGuard {
+    fn assert_consumed(self) {
+        AFTER_FIRST_COMPARISON_CHUNK.with(|hook| {
+            assert!(hook.borrow().is_none(), "comparison hook was not exercised");
+        });
+        drop(self);
+    }
+}
+
+#[cfg(test)]
+impl Drop for ComparisonHookGuard {
+    fn drop(&mut self) {
+        AFTER_FIRST_COMPARISON_CHUNK.with(|hook| {
+            hook.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn arm_after_first_comparison_chunk(hook: impl FnOnce() + 'static) -> ComparisonHookGuard {
+    AFTER_FIRST_COMPARISON_CHUNK.with(|armed| {
+        assert!(armed.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+    ComparisonHookGuard
+}
+
+#[cfg(test)]
+fn run_after_first_comparison_chunk() {
+    let hook = AFTER_FIRST_COMPARISON_CHUNK.with(|armed| armed.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+macro_rules! seal_test_hook {
+    (AfterFirstComparisonChunk) => {
+        #[cfg(test)]
+        run_after_first_comparison_chunk();
+    };
+}
 
 /// What a completed segment contains, for the caller's metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +102,8 @@ pub struct SealSummary {
 pub enum SealError {
     /// A filesystem operation failed.
     Io(io::Error),
+    /// The typed data layout rejected publication.
+    Layout(LayoutError),
     /// Reading a part back from the journal failed.
     Journal(JournalError),
     /// A journal part did not validate as a PGM container.
@@ -54,8 +112,28 @@ pub enum SealError {
     Codec(CodecError),
     /// The journal holds no parts, so there is nothing to seal.
     Empty,
-    /// A segment already exists at `dest`; it is never overwritten.
-    AlreadyExists,
+    /// The journal and requested destination carry different identities.
+    SegmentIdMismatch {
+        /// Identity stored in the journal.
+        journal: SegmentId,
+        /// Requested final address.
+        destination: SegmentId,
+    },
+    /// The writer produced a PGM that failed its own structural checks.
+    GeneratedSegmentInvalid,
+    /// An existing final PGM at the recovered identity is structurally invalid.
+    ExistingSegmentInvalid,
+    /// An existing valid PGM differs from the journal's deterministic result.
+    ExistingSegmentMismatch,
+    /// The combined section catalog exceeds the writer's fixed admission limit.
+    CatalogTooLarge {
+        /// Number of entries the next journal part would produce.
+        attempted_entries: usize,
+        /// Maximum supported entries in one segment.
+        max_entries: usize,
+    },
+    /// Reserving bounded memory for the combined section catalog failed.
+    CatalogAllocation(std::collections::TryReserveError),
     /// Two parts carry different non-zero `source_id`s.
     SourceIdMismatch {
         /// The first non-zero source id seen.
@@ -100,11 +178,37 @@ impl fmt::Display for SealError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "segment io: {err}"),
+            Self::Layout(err) => write!(f, "segment layout: {err}"),
             Self::Journal(err) => write!(f, "reading a journal part: {err}"),
             Self::Part(err) => write!(f, "invalid journal part: {err}"),
             Self::Codec(err) => write!(f, "invalid section: {err}"),
             Self::Empty => write!(f, "the journal holds no parts to seal"),
-            Self::AlreadyExists => write!(f, "a segment already exists at the destination"),
+            Self::SegmentIdMismatch {
+                journal,
+                destination,
+            } => write!(
+                f,
+                "journal segment id {journal} does not match destination {destination}"
+            ),
+            Self::GeneratedSegmentInvalid => {
+                f.write_str("the generated segment failed structural validation")
+            }
+            Self::ExistingSegmentInvalid => {
+                f.write_str("the existing segment failed structural validation")
+            }
+            Self::ExistingSegmentMismatch => {
+                f.write_str("the existing segment differs from the recovered journal")
+            }
+            Self::CatalogTooLarge {
+                attempted_entries,
+                max_entries,
+            } => write!(
+                f,
+                "segment catalog would contain {attempted_entries} entries, limit is {max_entries}"
+            ),
+            Self::CatalogAllocation(error) => {
+                write!(f, "reserving the bounded segment catalog failed: {error}")
+            }
             Self::SourceIdMismatch { expected, got } => {
                 write!(f, "journal mixes source_id {expected} and {got}")
             }
@@ -137,11 +241,17 @@ impl Error for SealError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
+            Self::Layout(err) => Some(err),
             Self::Journal(err) => Some(err),
             Self::Part(err) => Some(err),
             Self::Codec(err) => Some(err),
+            Self::CatalogAllocation(error) => Some(error),
             Self::Empty
-            | Self::AlreadyExists
+            | Self::SegmentIdMismatch { .. }
+            | Self::GeneratedSegmentInvalid
+            | Self::ExistingSegmentInvalid
+            | Self::ExistingSegmentMismatch
+            | Self::CatalogTooLarge { .. }
             | Self::SourceIdMismatch { .. }
             | Self::UnsupportedFormat { .. }
             | Self::RowCountMismatch { .. }
@@ -182,104 +292,181 @@ impl From<arrow_schema::ArrowError> for SealError {
     }
 }
 
-/// Seal journal parts into an immutable segment at `dest`.
+impl From<LayoutError> for SealError {
+    fn from(err: LayoutError) -> Self {
+        Self::Layout(err)
+    }
+}
+
+/// Seal journal parts into the immutable segment at `address`.
 ///
-/// `dest` is never overwritten. An existing byte-identical destination is
-/// accepted as an idempotent retry; a different one is rejected. This function
-/// never changes the journal, so call [`Journal::reset`] only after `Ok`.
+/// The final PGM is never overwritten. Call `Journal::reset` only after `Ok`.
 ///
 /// # Errors
 ///
 /// Returns [`SealError`] when the journal is empty, a part is invalid, I/O
-/// fails, or `dest` exists with different bytes.
-pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
+/// fails, or an existing final segment cannot be proven byte-identical.
+pub fn seal(
+    journal: &Journal,
+    owner: &WriterOwner,
+    address: SegmentAddress,
+) -> Result<SealSummary, SealError> {
     if journal.parts().is_empty() {
         return Err(SealError::Empty);
     }
-
-    let (tmp, file) = create_tmp(dest)?;
-    let summary = match write_tmp(journal, file) {
-        Ok(summary) => summary,
-        Err(err) => {
-            fs::remove_file(&tmp).ok();
-            return Err(err);
-        }
-    };
-    // Hard-link publish fails if `dest` exists. The data file is already synced.
-    if let Err(err) = fs::hard_link(&tmp, dest) {
-        if err.kind() != io::ErrorKind::AlreadyExists {
-            fs::remove_file(&tmp).ok();
-            return Err(SealError::Io(err));
-        }
-        let identical = match files_equal(&tmp, dest) {
-            Ok(identical) => identical,
-            Err(err) => {
-                fs::remove_file(&tmp).ok();
-                return Err(err);
+    if let Some(segment_id) = journal.segment_id()
+        && segment_id != address.id
+    {
+        return Err(SealError::SegmentIdMismatch {
+            journal: segment_id,
+            destination: address.id,
+        });
+    }
+    let mut temporary = owner.create_pgm_temp(address)?;
+    let summary = write_tmp(journal, &mut temporary)?;
+    let generated = temporary.try_clone_file()?;
+    if !validate_segment(&generated, summary)? {
+        return Err(SealError::GeneratedSegmentInvalid);
+    }
+    match temporary.publish() {
+        Ok(()) => Ok(summary),
+        Err(LayoutError::SegmentAlreadyExists { .. }) => {
+            let existing = owner.root().open_pgm(address)?;
+            let existing_identity = FileIdentity::from_file(&existing)?;
+            if !validate_segment(&existing, summary)? {
+                return Err(SealError::ExistingSegmentInvalid);
             }
-        };
-        if !identical {
-            fs::remove_file(&tmp).ok();
-            return Err(SealError::AlreadyExists);
+            if !files_equal(&generated, &existing)? {
+                return Err(SealError::ExistingSegmentMismatch);
+            }
+            if FileIdentity::from_file(&existing)? != existing_identity {
+                return Err(SealError::ExistingSegmentMismatch);
+            }
+            let named_existing = owner.root().open_pgm(address)?;
+            if FileIdentity::from_file(&named_existing)? != existing_identity {
+                return Err(SealError::ExistingSegmentMismatch);
+            }
+            temporary.discard()?;
+            Ok(summary)
         }
-        let sync = sync_parent_dir(dest);
-        fs::remove_file(&tmp).ok();
-        sync?;
-        return Ok(summary);
+        Err(error) => Err(SealError::Layout(error)),
     }
-    // Make the new link durable before the temporary name is removed.
-    let sync = sync_parent_dir(dest);
-    fs::remove_file(&tmp).ok();
-    sync?;
-    Ok(summary)
 }
 
-/// Create one invocation-owned temporary beside `dest` without removing stale files.
-fn create_tmp(dest: &Path) -> Result<(PathBuf, File), SealError> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    for _attempt in 0..64 {
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut name = dest.as_os_str().to_owned();
-        name.push(format!(".{}.{seq}.tmp", std::process::id()));
-        let path = PathBuf::from(name);
-        match File::options().create_new(true).write(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(SealError::Io(err)),
-        }
-    }
-    Err(SealError::Io(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not reserve a segment temporary path",
-    )))
-}
-
-fn files_equal(left: &Path, right: &Path) -> Result<bool, SealError> {
-    let mut left = File::open(left)?;
-    let mut right = File::open(right)?;
-    if left.metadata()?.len() != right.metadata()?.len() {
+fn validate_segment(file: &File, expected: SealSummary) -> Result<bool, io::Error> {
+    let length = file.metadata()?.len();
+    if length != expected.bytes {
         return Ok(false);
     }
-    let mut left_buf = vec![0_u8; 64 * 1024];
-    let mut right_buf = vec![0_u8; 64 * 1024];
-    loop {
-        let left_len = left.read(&mut left_buf)?;
-        let right_len = right.read(&mut right_buf)?;
-        if left_len != right_len {
-            return Ok(false);
-        }
-        if left_buf[..left_len] != right_buf[..left_len] {
-            return Ok(false);
-        }
-        if left_len == 0 {
-            return Ok(true);
-        }
+    let minimum = MAGIC
+        .len()
+        .checked_add(META_LEN)
+        .and_then(|value| value.checked_add(TAIL_INDEX_LEN))
+        .expect("fixed PGM lengths fit usize");
+    if length < minimum as u64 {
+        return Ok(false);
     }
+
+    let mut magic = [0_u8; MAGIC.len()];
+    file.read_exact_at(&mut magic, 0)?;
+    if magic != MAGIC {
+        return Ok(false);
+    }
+
+    let tail_at = length - TAIL_INDEX_LEN as u64;
+    let mut tail_bytes = [0_u8; TAIL_INDEX_LEN];
+    file.read_exact_at(&mut tail_bytes, tail_at)?;
+    let Ok(tail) = TailIndex::decode(tail_bytes) else {
+        return Ok(false);
+    };
+    let expected_catalog_len = expected
+        .sections
+        .checked_mul(ENTRY_LEN)
+        .and_then(|value| value.checked_add(META_LEN));
+    let Some(expected_catalog_len) = expected_catalog_len else {
+        return Ok(false);
+    };
+    if expected_catalog_len > MAX_CATALOG_BYTES
+        || usize::try_from(tail.catalog_len).ok() != Some(expected_catalog_len)
+    {
+        return Ok(false);
+    }
+    let catalog_at = match tail_at.checked_sub(u64::from(tail.catalog_len)) {
+        Some(offset) if offset >= MAGIC.len() as u64 => offset,
+        _ => return Ok(false),
+    };
+    let mut catalog_bytes = vec![0_u8; expected_catalog_len];
+    file.read_exact_at(&mut catalog_bytes, catalog_at)?;
+    let Ok(catalog) = Catalog::view(&catalog_bytes) else {
+        return Ok(false);
+    };
+    if catalog.format_version != FORMAT_VERSION
+        || usize::try_from(catalog.entry_count).ok() != Some(expected.sections)
+        || catalog.min_ts != expected.min_ts
+        || catalog.max_ts != expected.max_ts
+    {
+        return Ok(false);
+    }
+    Ok(catalog.entries().all(|entry| {
+        entry.offset >= MAGIC.len() as u64
+            && entry
+                .offset
+                .checked_add(entry.len)
+                .is_some_and(|end| end <= catalog_at)
+    }))
+}
+
+fn files_equal(left: &File, right: &File) -> Result<bool, io::Error> {
+    let left_identity = FileIdentity::from_file(left)?;
+    let right_identity = FileIdentity::from_file(right)?;
+    let length = left_identity.len;
+    if right_identity.len != length {
+        return Ok(false);
+    }
+    let mut left_buffer = vec![0_u8; COMPARE_BUFFER_BYTES].into_boxed_slice();
+    let mut right_buffer = vec![0_u8; COMPARE_BUFFER_BYTES].into_boxed_slice();
+    let mut offset = 0_u64;
+    while offset < length {
+        let remaining = usize::try_from((length - offset).min(COMPARE_BUFFER_BYTES as u64))
+            .map_err(|_overflow| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "comparison chunk does not fit the address space",
+                )
+            })?;
+        left.read_exact_at(&mut left_buffer[..remaining], offset)?;
+        right.read_exact_at(&mut right_buffer[..remaining], offset)?;
+        if left_buffer[..remaining] != right_buffer[..remaining] {
+            return Ok(false);
+        }
+        seal_test_hook!(AfterFirstComparisonChunk);
+        offset = offset
+            .checked_add(remaining as u64)
+            .expect("comparison offset is bounded by file length");
+    }
+    Ok(FileIdentity::from_file(left)? == left_identity
+        && FileIdentity::from_file(right)? == right_identity)
+}
+
+fn checked_catalog_entries(current: usize, additional: usize) -> Result<usize, SealError> {
+    let attempted_entries = current
+        .checked_add(additional)
+        .ok_or(SealError::CatalogTooLarge {
+            attempted_entries: usize::MAX,
+            max_entries: MAX_CATALOG_ENTRIES,
+        })?;
+    if attempted_entries > MAX_CATALOG_ENTRIES {
+        return Err(SealError::CatalogTooLarge {
+            attempted_entries,
+            max_entries: MAX_CATALOG_ENTRIES,
+        });
+    }
+    Ok(attempted_entries)
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SectionDescriptor {
-    part: PartRef,
+    part: JournalPartRef,
     entry: Entry,
 }
 
@@ -291,8 +478,10 @@ struct SegmentPlan {
     source_id: u64,
 }
 
-/// Write the coalesced segment to `tmp` and fsync it. The caller publishes it.
-fn write_tmp(journal: &Journal, file: File) -> Result<SealSummary, SealError> {
+/// Write the merged segment to `tmp` and flush the encoder.
+///
+/// Publication synchronizes the file and its parent directories.
+fn write_tmp(journal: &Journal, temporary: &mut PgmTemp<'_>) -> Result<SealSummary, SealError> {
     let mut plan = plan_segment(journal)?;
     let strings = plan
         .by_type
@@ -301,7 +490,7 @@ fn write_tmp(journal: &Journal, file: File) -> Result<SealSummary, SealError> {
     let blobs = plan.by_type.remove(&DICT_BLOBS_TYPE_ID).unwrap_or_default();
     let dictionary = normalize_dictionary(journal, &strings, &blobs)?;
 
-    let mut out = BufWriter::new(file);
+    let mut out = BufWriter::new(temporary.file_mut());
 
     out.write_all(&MAGIC)?;
     let mut offset = MAGIC.len() as u64;
@@ -396,6 +585,8 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
     let mut source_id = 0_u64;
     for &part_ref in journal.parts() {
         let part = journal.read_part(part_ref)?;
+        // Recheck bodies immediately before publication. The journal may have
+        // changed on disk after append even though its frame remained valid.
         let catalog = validate_part_catalog(&part).map_err(SealError::Part)?;
         if catalog.format_version != FORMAT_VERSION {
             return Err(SealError::UnsupportedFormat {
@@ -428,9 +619,7 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
             let descriptors = by_type.entry(entry.type_id).or_default();
             descriptors
                 .try_reserve(1)
-                .map_err(|_error| SealError::ArithmeticOverflow {
-                    what: "section descriptor allocation",
-                })?;
+                .map_err(SealError::CatalogAllocation)?;
             descriptors.push(SectionDescriptor {
                 part: part_ref,
                 entry,
@@ -488,7 +677,7 @@ fn read_verified_body(
 }
 
 fn write_section(
-    out: &mut BufWriter<File>,
+    out: &mut impl Write,
     entries: &mut Vec<Entry>,
     offset: &mut u64,
     type_id: u32,
@@ -498,6 +687,10 @@ fn write_section(
     if entries.last().is_some_and(|entry| entry.type_id >= type_id) {
         return Err(CodecError::SchemaMismatch.into());
     }
+    checked_catalog_entries(entries.len(), 1)?;
+    entries
+        .try_reserve(1)
+        .map_err(SealError::CatalogAllocation)?;
     let len = u64::try_from(body.len()).map_err(|_error| SealError::ArithmeticOverflow {
         what: "section length",
     })?;
@@ -652,7 +845,7 @@ fn decode_dictionary_body(
         _ => return Err(CodecError::UnknownType { type_id }.into()),
     };
     let body = read_verified_body(journal, descriptor)?.into_bytes();
-    validate_parquet_decode_work(body.as_ref(), MAX_DECODED_SECTION_BYTES)?;
+    validate_plain_parquet_decode_work(body.as_ref(), MAX_DECODED_SECTION_BYTES)?;
     let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(body, options)?;
     let groups = builder.metadata().num_row_groups();
@@ -844,25 +1037,40 @@ fn reject_nulls(array: &dyn Array, name: &'static str) -> Result<(), CodecError>
     }
 }
 
-/// fsync the directory holding `dest` so the new link survives a crash.
-fn sync_parent_dir(dest: &Path) -> io::Result<()> {
-    if let Some(dir) = dest.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        File::open(dir)?.sync_all()?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use kronika_format::{DictLimits, Entry, validate_part};
+    use std::fs::FileTimes;
+    use std::os::unix::fs::FileExt as _;
+
+    use kronika_format::{DictLimits, Entry, MAGIC, validate_part};
+    use kronika_layout::{
+        ACTIVE_JOURNAL_NAME, DataRoot, FileIdentity, LayoutLimits, SegmentAddress, SegmentId,
+        WriterOwner,
+    };
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::{
         Bytes, DICT_STRINGS_TYPE_ID, PgLocksV2, Section, StrId, Ts, VerifiedSection, decode_any,
     };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    use super::{SealError, required_binary, required_u64, seal};
+    use super::{
+        MAX_CATALOG_ENTRIES, SealError, arm_after_first_comparison_chunk, checked_catalog_entries,
+        required_binary, required_u64, seal,
+    };
     use crate::{Interner, Journal, JournalConfig, SectionBuffers, dict};
+
+    const SEGMENT_ID: i64 = 1_709_164_800_000_000;
+
+    fn writer(directory: &tempfile::TempDir) -> WriterOwner {
+        DataRoot::open(directory.path())
+            .unwrap()
+            .acquire_writer(LayoutLimits::default())
+            .unwrap()
+    }
+
+    fn address() -> SegmentAddress {
+        SegmentAddress::new(SegmentId::new(SEGMENT_ID).unwrap()).unwrap()
+    }
 
     fn bgwriter(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
@@ -890,7 +1098,9 @@ mod tests {
         let mut buffers = SectionBuffers::new();
         buffers.push(bgwriter(ts)).expect("buffer not full");
         let part = buffers.flush(&[], 0).expect("encode").expect("a part");
-        journal.append(&part).expect("append");
+        journal
+            .append(address().id, &part)
+            .expect("append under the segment identity");
     }
 
     fn pg_locks(ts: i64, pid: i32) -> PgLocksV2 {
@@ -943,7 +1153,9 @@ mod tests {
                 .expect("lock row fits");
         }
         let part = buffers.flush(&[], 0).expect("encode").expect("a part");
-        journal.append(&part).expect("append lock window");
+        journal
+            .append(address().id, &part)
+            .expect("append lock window");
     }
 
     #[derive(Clone, Copy)]
@@ -1053,7 +1265,9 @@ mod tests {
             .flush(&dictionary, 7)
             .expect("encode fixture part")
             .expect("fixture part has rows");
-        journal.append(&part).expect("append fixture part");
+        journal
+            .append(address().id, &part)
+            .expect("append fixture part");
     }
 
     fn verified_section(segment: &[u8], entry: &Entry) -> VerifiedSection {
@@ -1087,15 +1301,16 @@ mod tests {
     #[test]
     fn seals_journal_parts_into_a_readable_segment() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal_path = dir.path().join("active.parts");
-        let segment_path = dir.path().join("143000.pgm");
+        let owner = writer(&dir);
+        let segment_path = owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
 
-        let (mut journal, _) =
-            Journal::open(&journal_path, JournalConfig::default()).expect("open journal");
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
         append_window(&mut journal, 1_000);
         append_window(&mut journal, 2_000);
 
-        let summary = seal(&journal, &segment_path).expect("seal");
+        let summary = seal(&journal, &owner, address()).expect("seal");
         assert_eq!(summary.sections, 1, "one bgwriter section per segment");
         assert_eq!((summary.min_ts, summary.max_ts), (1_000, 2_000));
 
@@ -1121,10 +1336,11 @@ mod tests {
     #[test]
     fn a_sealed_segment_carries_the_window_dictionary() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let segment_path = dir.path().join("d.pgm");
-        let (mut journal, _) =
-            Journal::open(&dir.path().join("active.parts"), JournalConfig::default())
-                .expect("open journal");
+        let owner = writer(&dir);
+        let segment_path = owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
 
         // Intern two short strings and encode the window dictionary.
         let mut interner = Interner::new(DictLimits::new(4096, 1 << 20).expect("limits"));
@@ -1139,9 +1355,9 @@ mod tests {
             .flush(&dict_sections, 0)
             .expect("flush")
             .expect("a part");
-        journal.append(&part).expect("append");
+        journal.append(address().id, &part).expect("append");
 
-        let summary = seal(&journal, &segment_path).expect("seal");
+        let summary = seal(&journal, &owner, address()).expect("seal");
         assert_eq!(summary.sections, 2, "bgwriter + dict.strings");
 
         let segment = std::fs::read(&segment_path).expect("read segment");
@@ -1169,13 +1385,14 @@ mod tests {
         const NEGATIVE_ZERO: u64 = (-0.0_f64).to_bits();
         const POSITIVE_ZERO: u64 = 0.0_f64.to_bits();
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let first_journal_path = dir.path().join("first.parts");
-        let second_journal_path = dir.path().join("second.parts");
-        let (mut first, _) = Journal::open(&first_journal_path, JournalConfig::default())
-            .expect("open first journal");
-        let (mut second, _) = Journal::open(&second_journal_path, JournalConfig::default())
-            .expect("open second journal");
+        let first_dir = tempfile::tempdir().expect("first tempdir");
+        let second_dir = tempfile::tempdir().expect("second tempdir");
+        let first_owner = writer(&first_dir);
+        let second_owner = writer(&second_dir);
+        let mut first =
+            Journal::open(&first_owner, JournalConfig::default()).expect("open first journal");
+        let mut second =
+            Journal::open(&second_owner, JournalConfig::default()).expect("open second journal");
         let (_interner, ids) = fixture_dictionary();
 
         let nan_1 = lossless_bgwriter(NAN_1, false);
@@ -1208,15 +1425,20 @@ mod tests {
             std::slice::from_ref(&blocked),
         );
         assert_ne!(
-            std::fs::read(&first_journal_path).expect("read first journal"),
-            std::fs::read(&second_journal_path).expect("read second journal"),
+            std::fs::read(first_dir.path().join(ACTIVE_JOURNAL_NAME)).expect("read first journal"),
+            std::fs::read(second_dir.path().join(ACTIVE_JOURNAL_NAME))
+                .expect("read second journal"),
             "the equivalent input uses different order and part boundaries"
         );
 
-        let first_path = dir.path().join("first.pgm");
-        let second_path = dir.path().join("second.pgm");
-        let first_summary = seal(&first, &first_path).expect("seal first journal");
-        let second_summary = seal(&second, &second_path).expect("seal second journal");
+        let first_path = first_owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
+        let second_path = second_owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
+        let first_summary = seal(&first, &first_owner, address()).expect("seal first journal");
+        let second_summary = seal(&second, &second_owner, address()).expect("seal second journal");
         let segment = std::fs::read(&first_path).expect("read first segment");
         assert_eq!(first_summary, second_summary);
         assert_eq!(
@@ -1292,15 +1514,17 @@ mod tests {
     #[test]
     fn aggregate_list_bound_is_checked_before_retaining_the_next_part() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal_path = dir.path().join("active.parts");
-        let segment_path = dir.path().join("locks.pgm");
-        let (mut journal, _) =
-            Journal::open(&journal_path, JournalConfig::default()).expect("open journal");
+        let owner = writer(&dir);
+        let journal_path = dir.path().join(ACTIVE_JOURNAL_NAME);
+        let segment_path = owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
         append_lock_window(&mut journal, 1_000, 1);
         append_lock_window(&mut journal, 2_000, 100);
         let journal_before = std::fs::read(&journal_path).expect("snapshot journal");
 
-        let err = seal(&journal, &segment_path).expect_err("aggregate list stream is rejected");
+        let err = seal(&journal, &owner, address()).expect_err("aggregate list stream is rejected");
 
         assert!(matches!(
             err,
@@ -1320,11 +1544,10 @@ mod tests {
     #[test]
     fn sealing_an_empty_journal_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (journal, _) =
-            Journal::open(&dir.path().join("active.parts"), JournalConfig::default())
-                .expect("open journal");
+        let owner = writer(&dir);
+        let journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
         assert!(matches!(
-            seal(&journal, &dir.path().join("s.pgm")),
+            seal(&journal, &owner, address()),
             Err(SealError::Empty)
         ));
     }
@@ -1332,48 +1555,191 @@ mod tests {
     #[test]
     fn resealing_the_same_journal_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let journal_path = dir.path().join("active.parts");
-        let segment_path = dir.path().join("s.pgm");
-        let (mut journal, _) =
-            Journal::open(&journal_path, JournalConfig::default()).expect("open journal");
+        let owner = writer(&dir);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
         append_window(&mut journal, 1);
 
-        let first = seal(&journal, &segment_path).expect("first seal");
-        let bytes = std::fs::read(&segment_path).expect("read first segment");
-        let second = seal(&journal, &segment_path).expect("idempotent retry");
+        let first = seal(&journal, &owner, address()).expect("first seal");
+        let path = owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
+        let bytes = std::fs::read(&path).expect("read first segment");
+        let second = seal(&journal, &owner, address()).expect("idempotent recovery");
 
         assert_eq!(second, first);
-        assert_eq!(std::fs::read(&segment_path).expect("read retry"), bytes);
+        assert_eq!(std::fs::read(path).expect("read retry"), bytes);
         assert_eq!(journal.parts().len(), 1, "seal never resets the journal");
     }
 
     #[test]
-    fn a_different_existing_segment_is_never_overwritten() {
+    fn different_existing_segment_preserves_the_recovery_conflict() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let segment_path = dir.path().join("s.pgm");
-        let (mut first, _) =
-            Journal::open(&dir.path().join("first.parts"), JournalConfig::default())
-                .expect("open first journal");
-        append_window(&mut first, 1);
-        seal(&first, &segment_path).expect("first seal");
-        let segment_before = std::fs::read(&segment_path).expect("read destination");
+        let owner = writer(&dir);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
+        append_window(&mut journal, 1);
+        seal(&journal, &owner, address()).expect("first seal");
 
-        let second_path = dir.path().join("second.parts");
-        let (mut second, _) =
-            Journal::open(&second_path, JournalConfig::default()).expect("open second journal");
-        append_window(&mut second, 2);
-        let journal_before = std::fs::read(&second_path).expect("read second journal");
-        let err = seal(&second, &segment_path).expect_err("must not overwrite");
+        let path = owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open published segment");
+        file.write_all_at(&[0xFF], MAGIC.len() as u64)
+            .expect("change one body byte without changing the catalog");
+        file.sync_all().expect("persist conflicting bytes");
 
-        assert!(matches!(err, SealError::AlreadyExists));
-        assert_eq!(
-            std::fs::read(&segment_path).expect("read destination after collision"),
-            segment_before
+        assert!(matches!(
+            seal(&journal, &owner, address()),
+            Err(SealError::ExistingSegmentMismatch)
+        ));
+    }
+
+    #[test]
+    fn body_corruption_after_append_prevents_publication() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = writer(&dir);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
+        append_window(&mut journal, 1);
+
+        let part_ref = journal.parts()[0];
+        let part = journal.read_part(part_ref).expect("read valid part");
+        let catalog = validate_part(&part).expect("valid appended part");
+        let body_at = u64::try_from(part_ref.offset()).unwrap() + catalog.entries[0].offset;
+        let journal_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(ACTIVE_JOURNAL_NAME))
+            .expect("open journal for corruption");
+        let mut original = [0_u8; 1];
+        journal_file
+            .read_exact_at(&mut original, body_at)
+            .expect("read body byte");
+        journal_file
+            .write_all_at(&[original[0] ^ 0xFF], body_at)
+            .expect("corrupt section body");
+        journal_file.sync_all().expect("persist corruption");
+
+        assert!(matches!(
+            seal(&journal, &owner, address()),
+            Err(SealError::Part(
+                kronika_format::PartError::SectionCrc { .. }
+            ))
+        ));
+        assert_eq!(journal.parts().len(), 1, "journal remains recoverable");
+        assert!(
+            !owner
+                .root()
+                .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm)
+                .exists(),
+            "a corrupt journal body must not be published"
         );
+    }
+
+    #[test]
+    fn same_inode_rewrite_during_recovery_comparison_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = writer(&dir);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
+        append_window(&mut journal, 1);
+        seal(&journal, &owner, address()).expect("first seal");
+
+        let path = owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
+        let before_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open final");
+        let before = FileIdentity::from_file(&before_file).expect("initial identity");
+        let path_for_hook = path;
+        let hook = arm_after_first_comparison_chunk(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path_for_hook)
+                .expect("open final for rewrite");
+            let original_modified = file.metadata().unwrap().modified().unwrap();
+            let mut byte = [0_u8; 1];
+            file.read_exact_at(&mut byte, MAGIC.len() as u64)
+                .expect("read compared byte");
+            file.write_all_at(&[byte[0] ^ 0xFF], MAGIC.len() as u64)
+                .expect("rewrite compared byte");
+            file.write_all_at(&byte, MAGIC.len() as u64)
+                .expect("restore compared byte");
+            file.set_times(FileTimes::new().set_modified(original_modified))
+                .expect("restore mtime");
+            file.sync_all().expect("persist restored content");
+            assert_ne!(
+                FileIdentity::from_file(&file).expect("changed identity"),
+                before,
+                "ctime must expose a rewrite even after restoring bytes and mtime"
+            );
+        });
+
+        assert!(matches!(
+            seal(&journal, &owner, address()),
+            Err(SealError::ExistingSegmentMismatch)
+        ));
+        hook.assert_consumed();
+        assert_eq!(journal.parts().len(), 1, "journal must not be reset");
+    }
+
+    #[test]
+    fn final_name_replacement_during_recovery_comparison_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = writer(&dir);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open journal");
+        append_window(&mut journal, 1);
+        seal(&journal, &owner, address()).expect("first seal");
+
+        let path = owner
+            .root()
+            .diagnostic_file_path(address(), kronika_layout::FileKind::Pgm);
+        let replacement_bytes = std::fs::read(&path).expect("read final");
+        let displaced = path.with_extension("pgm.displaced");
+        let path_for_hook = path;
+        let hook = arm_after_first_comparison_chunk(move || {
+            std::fs::rename(&path_for_hook, &displaced).expect("displace final name");
+            std::fs::write(&path_for_hook, &replacement_bytes)
+                .expect("replace with byte-identical inode");
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(&path_for_hook)
+                .unwrap()
+                .sync_all()
+                .expect("persist replacement");
+        });
+
+        assert!(matches!(
+            seal(&journal, &owner, address()),
+            Err(SealError::ExistingSegmentMismatch)
+        ));
+        hook.assert_consumed();
+        assert_eq!(journal.parts().len(), 1, "journal must not be reset");
+    }
+
+    #[test]
+    fn catalog_entry_limit_is_checked_without_allocating_the_limit() {
         assert_eq!(
-            std::fs::read(&second_path).expect("read journal after collision"),
-            journal_before
+            checked_catalog_entries(MAX_CATALOG_ENTRIES - 1, 1).unwrap(),
+            MAX_CATALOG_ENTRIES
         );
-        assert_eq!(second.parts().len(), 1);
+        assert!(matches!(
+            checked_catalog_entries(MAX_CATALOG_ENTRIES, 1),
+            Err(SealError::CatalogTooLarge {
+                attempted_entries,
+                max_entries
+            }) if attempted_entries == MAX_CATALOG_ENTRIES + 1
+                && max_entries == MAX_CATALOG_ENTRIES
+        ));
+        assert!(matches!(
+            checked_catalog_entries(usize::MAX, 1),
+            Err(SealError::CatalogTooLarge {
+                attempted_entries: usize::MAX,
+                ..
+            })
+        ));
     }
 }

@@ -29,6 +29,31 @@ pub fn validate_parquet_decode_work(
     body: &[u8],
     max_decoded_bytes: usize,
 ) -> Result<(), CodecError> {
+    validate_parquet_decode_profile(body, max_decoded_bytes, true)
+}
+
+/// Validate Parquet decode work and reject dictionary pages before Arrow.
+///
+/// Variable-width dictionary sections use this profile because encoded page
+/// sizes do not bound the bytes materialized when dictionary indices expand.
+///
+/// # Errors
+///
+/// Returns [`CodecError::DictionaryEncodingUnsupported`] when the footer
+/// declares a dictionary page, or the same bounded-layout errors as
+/// [`validate_parquet_decode_work`].
+pub fn validate_plain_parquet_decode_work(
+    body: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<(), CodecError> {
+    validate_parquet_decode_profile(body, max_decoded_bytes, false)
+}
+
+fn validate_parquet_decode_profile(
+    body: &[u8],
+    max_decoded_bytes: usize,
+    allow_dictionary: bool,
+) -> Result<(), CodecError> {
     if body.len() > MAX_SECTION_BYTES {
         return Err(CodecError::SectionTooLarge {
             len: body.len(),
@@ -42,7 +67,13 @@ pub fn validate_parquet_decode_work(
         });
     }
     let (metadata, metadata_start) = parse_footer(body)?;
-    validate_file_metadata(body, &metadata, metadata_start, max_decoded_bytes)
+    validate_file_metadata(
+        body,
+        &metadata,
+        metadata_start,
+        max_decoded_bytes,
+        allow_dictionary,
+    )
 }
 
 fn parse_footer(body: &[u8]) -> Result<(FileMetaData, usize), CodecError> {
@@ -78,6 +109,7 @@ fn validate_file_metadata(
     metadata: &FileMetaData,
     metadata_start: usize,
     max_decoded_bytes: usize,
+    allow_dictionary: bool,
 ) -> Result<(), CodecError> {
     let rows = checked_rows(metadata.num_rows)?;
     if rows > MAX_SECTION_ROWS {
@@ -136,6 +168,9 @@ fn validate_file_metadata(
             let compressed = checked_nonnegative(column.total_compressed_size)?;
             let data_start = checked_nonnegative(column.data_page_offset)?;
             let has_dictionary = column.dictionary_page_offset.is_some();
+            if has_dictionary && !allow_dictionary {
+                return Err(CodecError::DictionaryEncodingUnsupported);
+            }
             let start = match column.dictionary_page_offset {
                 Some(raw) => {
                     let dictionary_start = checked_nonnegative(raw)?;

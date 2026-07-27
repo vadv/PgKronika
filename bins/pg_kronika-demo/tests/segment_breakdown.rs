@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 
+use kronika_layout::{DataRoot, LayoutLimits};
+
 #[test]
 #[ignore = "manual forensic tool, needs KRONIKA_BREAKDOWN_DIR"]
 fn print_segment_breakdown() {
@@ -21,13 +23,13 @@ fn print_segment_breakdown() {
     let mut total_len = 0_u64;
     let mut file_len = 0_u64;
 
-    for entry in std::fs::read_dir(&dir).expect("read dir") {
-        let path = entry.expect("entry").path();
-        if path.extension().is_none_or(|e| e != "pgm") {
-            continue;
-        }
-        file_len += std::fs::metadata(&path).expect("stat").len();
-        let file = std::fs::File::open(&path).expect("open pgm");
+    let root = DataRoot::open(std::path::Path::new(&dir)).expect("open data root");
+    let snapshot = root
+        .scan(LayoutLimits::default())
+        .expect("scan strict segment tree");
+    for segment in snapshot.segments {
+        file_len += segment.pgm_bytes;
+        let file = root.open_pgm(segment.address).expect("open pgm");
         let unit = kronika_reader::PgmUnit::open(file).expect("parse pgm");
         let catalog = unit.catalog();
         for entry in &catalog.entries {

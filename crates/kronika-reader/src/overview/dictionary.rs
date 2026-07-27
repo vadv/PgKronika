@@ -83,6 +83,7 @@ impl ResolvedPattern {
                 bytes,
                 full_len,
                 truncated,
+                ..
             } => Self::Blob {
                 bytes,
                 full_len,
@@ -143,8 +144,9 @@ pub fn resolve_targeted(
         if !scanned_types.insert(type_id) {
             return Err(CodecError::SchemaMismatch);
         }
+        let section_bounds = remaining_row_bounds(bounds, rows_scanned)?;
         let (entries, section_ids, section_rows, section_bytes) =
-            decode_dictionary_selected(body, type_id, Some(wanted), bounds)?;
+            decode_dictionary_selected(body, type_id, Some(wanted), &section_bounds)?;
         rows_scanned = rows_scanned
             .checked_add(section_rows)
             .ok_or(CodecError::TooManyRows {
@@ -216,6 +218,18 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             ) {
                 continue;
             }
+            let section_bounds =
+                remaining_row_bounds(bounds, stats.rows_scanned).map_err(ReadError::Codec)?;
+            let projected_rows = stats
+                .rows_scanned
+                .checked_add(u64::from(entry.rows))
+                .ok_or(ReadError::CounterOverflow)?;
+            if projected_rows > bounds.items_per_block {
+                return Err(ReadError::Codec(CodecError::TooManyRows {
+                    rows: usize::try_from(projected_rows).unwrap_or(usize::MAX),
+                    max: usize::try_from(bounds.items_per_block).unwrap_or(usize::MAX),
+                }));
+            }
             let body = self.verified_body(entry)?.into_bytes();
             stats.sections_read = stats
                 .sections_read
@@ -226,7 +240,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
                 .checked_add(entry.len)
                 .ok_or(ReadError::CounterOverflow)?;
             let (selected, section_ids, rows_scanned, decoded_bytes) =
-                decode_dictionary_selected(body, entry.type_id, Some(wanted), bounds)
+                decode_dictionary_selected(body, entry.type_id, Some(wanted), &section_bounds)
                     .map_err(ReadError::Codec)?;
             Self::validate_catalog_row_count(entry, rows_scanned)?;
             for str_id in section_ids {
@@ -314,6 +328,24 @@ fn insert_bounded(
     Ok(())
 }
 
+fn remaining_row_bounds(
+    bounds: &crate::Bounds,
+    rows_scanned: u64,
+) -> Result<crate::Bounds, CodecError> {
+    let remaining =
+        bounds
+            .items_per_block
+            .checked_sub(rows_scanned)
+            .ok_or(CodecError::TooManyRows {
+                rows: usize::try_from(rows_scanned).unwrap_or(usize::MAX),
+                max: usize::try_from(bounds.items_per_block).unwrap_or(usize::MAX),
+            })?;
+    Ok(crate::Bounds {
+        items_per_block: remaining,
+        ..*bounds
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
@@ -388,6 +420,26 @@ mod tests {
         )
         .expect("resolve");
         assert_eq!(resolved.len(), 1, "only the requested id is retained");
+    }
+
+    #[test]
+    fn targeted_resolution_enforces_the_aggregate_scan_budget() {
+        let (sections, short_id, _long_id) = dictionary_sections();
+        let tight = crate::Bounds {
+            items_per_block: 1,
+            ..crate::LIMIT
+        };
+        let result = resolve_targeted(
+            sections
+                .into_iter()
+                .map(|(type_id, _rows, body)| (type_id, body)),
+            &BTreeSet::from([short_id]),
+            &tight,
+        );
+        assert!(matches!(
+            result,
+            Err(kronika_registry::CodecError::TooManyRows { rows: 1, max: 0 })
+        ));
     }
 
     #[test]
@@ -600,5 +652,52 @@ mod tests {
         assert_eq!(result.stats, super::TargetedDictionaryStats::default());
         assert_eq!(reads.borrow().len(), reads_before);
         assert_eq!(byte_len_calls.get(), 1);
+    }
+
+    #[test]
+    fn pgm_dictionary_budget_rejects_the_next_catalog_entry_before_reading_it() {
+        let (dictionary, short_id, _long_id) = dictionary_sections();
+        let sections: Vec<_> = dictionary
+            .iter()
+            .map(|(type_id, rows, body)| SectionInput {
+                type_id: *type_id,
+                rows: *rows,
+                body: body.as_ref(),
+            })
+            .collect();
+        let bytes = build_part(
+            &sections,
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 7,
+            },
+        );
+        let reads = Rc::new(RefCell::new(Vec::new()));
+        let byte_len_calls = Rc::new(Cell::new(0));
+        let unit = PgmUnit::open(CountingReader {
+            bytes,
+            reads: Rc::clone(&reads),
+            byte_len_calls,
+        })
+        .expect("open");
+        let reads_before = reads.borrow().len();
+        let tight = crate::Bounds {
+            items_per_block: 1,
+            ..crate::LIMIT
+        };
+
+        let result = unit.resolve_overview_dictionary(&BTreeSet::from([short_id]), &tight);
+        assert!(matches!(
+            result,
+            Err(crate::ReadError::Codec(
+                kronika_registry::CodecError::TooManyRows { rows: 2, max: 1 }
+            ))
+        ));
+        assert_eq!(
+            reads.borrow().len() - reads_before,
+            1,
+            "the second dictionary body must be rejected from its catalog row claim"
+        );
     }
 }

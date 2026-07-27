@@ -15,6 +15,7 @@ qualification = []
 
 [dependencies]
 kronika-format = { path = "../kronika-format" }
+kronika-layout = { path = "../kronika-layout" }
 kronika-registry = { path = "../kronika-registry" }
 kronika-analytics = { path = "../kronika-analytics" }
 kronika-store = { path = "../kronika-store" }

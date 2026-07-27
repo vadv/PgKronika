@@ -29,9 +29,7 @@ async fn web_section_single_row(world: &mut BddWorld, section: String, step: &St
     let name = section_name(section.type_id)
         .with_context(|| format!("section {} has no logical name", section.label))?;
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     let source = web::only_source(dir).await?;
     let page = web::section_page(dir, name, source).await?;
     web::assert_one_row(&page, &expected)
@@ -62,9 +60,7 @@ async fn web_section_row_by_key(
     let name = section_name(section.type_id)
         .with_context(|| format!("section {} has no logical name", section.label))?;
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     let source = web::only_source(dir).await?;
     let page = web::section_page(dir, name, source).await?;
     web::assert_row_where(&page, &keys, &expected)
@@ -74,9 +70,7 @@ async fn web_section_row_by_key(
 #[then("an invalid web API request returns locale-neutral Problem Details")]
 async fn web_locale_neutral_problem(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     web::assert_locale_neutral_problem(dir).await
 }
 
@@ -84,9 +78,7 @@ async fn web_locale_neutral_problem(world: &mut BddWorld) -> Result<()> {
 #[then("the web API reports PostgreSQL log state collecting for the only source")]
 async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     let status = web::only_pg_log_status(dir).await?;
     anyhow::ensure!(
         status["state"] == "collecting",
@@ -115,9 +107,7 @@ async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {
 #[then("the incident API publishes exact active observability")]
 async fn incident_active_observability(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     web::assert_incident_observability(dir).await
 }
 
@@ -125,8 +115,6 @@ async fn incident_active_observability(world: &mut BddWorld) -> Result<()> {
 #[then("the incident API keeps no-data observability honest")]
 async fn incident_no_data_observability(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     web::assert_incident_no_data_observability(dir).await
 }

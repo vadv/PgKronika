@@ -4,8 +4,8 @@
 
 `kronika-writer` turns one or more bounded collection windows into a durable
 PGM segment. It owns in-memory section buffers, per-segment string interning,
-the `active.parts` file, recovery, and sealing. Source queries and format byte
-definitions remain in other crates.
+the version-1 `active.parts` journal, recovery, and sealing. Source queries,
+format bytes, and the data-directory grammar remain in other crates.
 
 ## Collection window
 
@@ -33,22 +33,46 @@ failure: prior state remains valid. The caller seals or flushes when it receives
 
 ## Journal
 
-`Journal::open(path, config)` scans `active.parts` without loading the whole
-file. Peak scan memory is one capped part body, decoded catalog state, a bounded
-resynchronization buffer, and one compact reference per valid part.
+`Journal::open(&WriterOwner, config)` opens the root-level `active.parts`
+through a capability from `kronika-layout`. A new journal is initialized as a
+durable 36-byte version-1 empty header; it is never represented by a zero-length
+file.
 
-An incomplete final frame is truncated to the last valid boundary. Middle or
-non-torn terminal damage remains on disk and appears in `OpenReport`. `append`
-validates a PGM part, writes its `PGMP` frame, synchronizes the file, then
-returns its reference. `JournalConfig::max_journal_len` is a hard file-size
-cap; the next frame returns `JournalError::Full` before unbounded growth.
+Journal version 1 uses the magic `PGKJNL1\0`. Its checksummed header records
+whether the journal is empty or active, the active [`SegmentId`][layout], and
+the exact number of following frame bytes. `append(segment_id, part)` validates
+the PGM part and writes its `PGMP` frame. The first append makes the segment id
+and first frame durable at the same synchronization boundary. Later appends
+must use the same id.
 
-`reset` truncates the journal. The caller must invoke it only after a segment
-was successfully published.
+Open validates the complete header and frame body without loading the whole
+file. A headerless, differently versioned, torn, or damaged journal is rejected
+and left unchanged; a zero-length file provably holds no data and is
+re-initialized as the empty header. Version 1 is the first and only
+supported journal format. PgKronika has not had a public release, and there is
+no alternate journal format or migration path.
+
+`JournalConfig::max_journal_len` caps the physical file, including the
+temporary 32-byte reset marker. Every append, including the first one, reserves
+space for that marker. A frame that would exceed the cap returns
+`JournalError::Full`, allowing the collector to seal first. Version 1 admits at
+most 1 GiB per journal, 1,000,000 frames per journal, and 64 MiB per PGM part.
+Configuration may only lower those absolute limits.
+
+`reset` is valid only after successful segment publication. It first appends
+and synchronizes a marker containing the pre-reset length, `SegmentId`, and
+header checksum. It then writes `JournalHeader::EMPTY` and calls `sync_data`
+while the marker and frame body are still present. Only after that
+synchronization does it truncate the file to 36 bytes and call `sync_data` a
+second time. If the process exits after committing the marker, the next
+`Journal::open` validates that marker and completes the reset. A failed rollback
+or a failure after marker commit poisons the open journal, so collection cannot
+continue through an indeterminate persistence state.
 
 ## Sealing
 
-`seal(journal, destination)` validates every recorded part and reads each body
+`seal(journal, owner, SegmentAddress)` validates every recorded part and reads
+each body
 through its checked catalog range. For each registered data `type_id`, it
 decodes all journal bodies, combines their rows, applies the registry sort key
 plus every remaining column as a deterministic total order, and emits one
@@ -64,15 +88,25 @@ stored bytes, a one-page PLAIN value budget per physical column, and the 8 MiB
 encoded-body cap before append. Seal checks the same limits again while
 decoding and encoding.
 
-Publication uses an invocation-owned sibling temporary file, synchronization,
-and a no-replace hard link. If `destination` already has exactly the bytes that
-the journal produces, the retry succeeds without changing it. A different
-existing file returns `SealError::AlreadyExists`; the destination and journal
-remain untouched. The caller resets the journal only after `Ok`. The writer
-does not select a filename or implement retention; those lifecycle decisions
-belong to the collector.
+Seal writes the coalesced bodies and end catalog to a temporary file in the
+segment's UTC day. PGM publication synchronizes the file, adds the canonical
+`YYYY/MM/DD/N.pgm` name with a hard link, synchronizes the day, removes the
+temporary name, and synchronizes the day again. An existing destination is
+never overwritten; recovery succeeds only when it can prove that the existing
+PGM is structurally valid and byte-identical.
+
+After acquiring the writer owner lock, collector startup removes only
+recognized stale PGM publication temporaries. It leaves OVF and overview-probe
+temporaries to the overview owner.
+
+Seal never resets the journal, chooses the `SegmentId`, or implements
+retention; those lifecycle decisions belong to the collector.
+`SegmentAddress` derives the only valid path from the id, and the writer
+accepts only that strict calendar-tree address.
 
 Failures distinguish journal I/O/framing/full conditions from seal validation,
-destination, and synchronization errors. See [`src/lib.rs`](src/lib.rs) for
-the canonical API and [`../kronika-format/`](../kronika-format/) for on-disk
-framing.
+destination, and synchronization errors. See [`src/lib.rs`](src/lib.rs) for the
+canonical API, [`../kronika-format/`](../kronika-format/) for on-disk framing,
+and [`../kronika-layout/`](../kronika-layout/) for paths and ownership.
+
+[layout]: ../kronika-layout/src/time.rs

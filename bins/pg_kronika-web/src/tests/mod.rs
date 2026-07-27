@@ -106,7 +106,7 @@ async fn fixture_request_captured(
         },
     );
     let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(dir.path().join("143000.pgm"), &bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir.path(), "143000.pgm", &bytes);
 
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
     let state = AppState::new(snapshot).expect("state");
@@ -281,7 +281,7 @@ fn write_bgwriter_segment(
             source_id: source,
         },
     );
-    std::fs::write(dir.join(file), &bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir, file, &bytes);
 }
 
 /// One `pg_stat_archiver` row with every optional column left NULL.
@@ -323,7 +323,7 @@ fn write_archiver_spike_segment(dir: &std::path::Path) -> i64 {
             source_id: 7,
         },
     );
-    std::fs::write(dir.join("0.pgm"), &bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
     to
 }
 

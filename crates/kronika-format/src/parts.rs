@@ -15,16 +15,304 @@ use crate::{
 /// Magic bytes opening every journal frame.
 pub const FRAME_MAGIC: [u8; 4] = *b"PGMP";
 
+/// File signature for the only supported active-journal header format.
+pub const JOURNAL_MAGIC: [u8; 8] = *b"PGKJNL1\0";
+
+/// Current active-journal format version.
+pub const JOURNAL_VERSION: u32 = 1;
+
+/// Size of the version-1 active-journal header.
+pub const JOURNAL_HEADER_LEN: usize = 36;
+
+/// Magic bytes opening a committed journal-reset marker.
+pub const RESET_MARKER_MAGIC: [u8; 8] = *b"PGKRST1\0";
+
+/// Size of a committed journal-reset marker.
+pub const RESET_MARKER_LEN: usize = 32;
+
 /// Size of a frame header on disk, bytes.
 pub const FRAME_HEADER_LEN: usize = 16;
 
-/// Default upper bound for one part, bytes.
-///
-/// This is a starting value, not a fixed format constant.
-pub const DEFAULT_MAX_PART_LEN: u64 = 64 * 1024 * 1024;
+/// Hard version-1 admission limit for the complete active journal, bytes.
+pub const MAX_JOURNAL_LEN: usize = 1024 * 1024 * 1024;
 
-/// Default resync window size for streaming journal recovery, bytes.
-pub const DEFAULT_RESYNC_CHUNK: usize = 1 << 20;
+/// Hard version-1 admission limit for one part body, bytes.
+pub const MAX_PART_LEN: u64 = 64 * 1024 * 1024;
+
+/// Hard version-1 admission limit for valid frames in one active journal.
+pub const MAX_JOURNAL_PARTS: usize = 1_000_000;
+
+/// Whether a version-1 journal is empty or belongs to one active segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalState {
+    /// No frames and no segment identity.
+    Empty,
+    /// One or more frames belonging to the stored segment identity.
+    Active {
+        /// Unix microseconds of the first successfully appended window.
+        segment_id: i64,
+    },
+}
+
+/// Versioned root header of `active.parts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalHeader {
+    /// Empty or active segment state.
+    pub state: JournalState,
+    /// Exact number of frame bytes following this header.
+    pub body_len: u64,
+}
+
+impl JournalHeader {
+    /// Canonical empty journal header.
+    pub const EMPTY: Self = Self {
+        state: JournalState::Empty,
+        body_len: 0,
+    };
+
+    /// Encodes the complete checksummed 36-byte header.
+    #[must_use]
+    pub fn encode(self) -> [u8; JOURNAL_HEADER_LEN] {
+        let mut bytes = [0_u8; JOURNAL_HEADER_LEN];
+        bytes[..8].copy_from_slice(&JOURNAL_MAGIC);
+        bytes[8..12].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
+        match self.state {
+            JournalState::Empty => {}
+            JournalState::Active { segment_id } => {
+                bytes[12] = 1;
+                bytes[13] = 1;
+                bytes[16..24].copy_from_slice(&segment_id.to_le_bytes());
+            }
+        }
+        bytes[24..32].copy_from_slice(&self.body_len.to_le_bytes());
+        let checksum = crc32c(&bytes[..32]);
+        bytes[32..36].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    /// Decodes and validates a complete version-1 journal header.
+    ///
+    /// # Errors
+    ///
+    /// Returns a specific [`JournalHeaderError`] for incompatible magic or
+    /// version, checksum damage, invalid state, or missing identity.
+    pub fn decode(bytes: [u8; JOURNAL_HEADER_LEN]) -> Result<Self, JournalHeaderError> {
+        if bytes[..8] != JOURNAL_MAGIC {
+            let mut actual = [0_u8; 8];
+            actual.copy_from_slice(&bytes[..8]);
+            return Err(JournalHeaderError::UnsupportedMagic { actual });
+        }
+        let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        if version != JOURNAL_VERSION {
+            return Err(JournalHeaderError::UnsupportedVersion { version });
+        }
+        let stored = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+        let computed = crc32c(&bytes[..32]);
+        if stored != computed {
+            return Err(JournalHeaderError::BadChecksum { stored, computed });
+        }
+        if bytes[14] != 0 || bytes[15] != 0 {
+            return Err(JournalHeaderError::NonZeroReserved);
+        }
+        let id_present = bytes[13];
+        let segment_id = i64::from_le_bytes([
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+        ]);
+        let body_len = u64::from_le_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+        ]);
+        let state = match (bytes[12], id_present) {
+            (0, 0) => {
+                if segment_id != 0 {
+                    return Err(JournalHeaderError::UnexpectedIdentity);
+                }
+                JournalState::Empty
+            }
+            (1, 1) => JournalState::Active { segment_id },
+            (1, 0) => return Err(JournalHeaderError::MissingIdentity),
+            (0, 1) => return Err(JournalHeaderError::UnexpectedIdentity),
+            (state, _) => return Err(JournalHeaderError::InvalidState { state }),
+        };
+        Ok(Self { state, body_len })
+    }
+}
+
+/// Why a complete active-journal header is not a valid version-1 header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalHeaderError {
+    /// Magic identifies an unrelated or malformed file.
+    UnsupportedMagic {
+        /// Bytes found at the start of the file.
+        actual: [u8; 8],
+    },
+    /// The file declares another journal version.
+    UnsupportedVersion {
+        /// Version found in the file.
+        version: u32,
+    },
+    /// Header checksum does not match.
+    BadChecksum {
+        /// Stored checksum.
+        stored: u32,
+        /// Computed checksum.
+        computed: u32,
+    },
+    /// State byte is not defined.
+    InvalidState {
+        /// State byte found in the file.
+        state: u8,
+    },
+    /// Active state does not mark its segment identity as present.
+    MissingIdentity,
+    /// Empty state unexpectedly carries a segment identity.
+    UnexpectedIdentity,
+    /// Reserved bytes are non-zero.
+    NonZeroReserved,
+}
+
+impl fmt::Display for JournalHeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedMagic { actual } => {
+                write!(f, "unsupported active-journal magic {actual:02x?}")
+            }
+            Self::UnsupportedVersion { version } => {
+                write!(f, "unsupported active-journal version {version}")
+            }
+            Self::BadChecksum { stored, computed } => write!(
+                f,
+                "active-journal header crc32c mismatch: stored {stored:#010x}, computed {computed:#010x}"
+            ),
+            Self::InvalidState { state } => {
+                write!(f, "invalid active-journal state {state}")
+            }
+            Self::MissingIdentity => {
+                f.write_str("active journal state is missing its segment identity")
+            }
+            Self::UnexpectedIdentity => {
+                f.write_str("empty journal state unexpectedly carries a segment identity")
+            }
+            Self::NonZeroReserved => f.write_str("active-journal reserved bytes are non-zero"),
+        }
+    }
+}
+
+impl Error for JournalHeaderError {}
+
+/// Durable intent to replace one active journal generation with the canonical
+/// empty header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the shared on-disk fields explicitly describe the previous journal generation"
+)]
+pub struct ResetMarker {
+    /// Complete journal length before the marker was appended.
+    pub previous_len: u64,
+    /// Segment identity stored by the previous active header.
+    pub previous_segment_id: i64,
+    /// CRC32C of the complete encoded previous active header.
+    pub previous_header_crc: u32,
+}
+
+impl ResetMarker {
+    /// Builds a marker for one non-empty active journal generation.
+    #[must_use]
+    pub fn new(previous_len: u64, previous_segment_id: i64) -> Option<Self> {
+        if previous_len <= JOURNAL_HEADER_LEN as u64 {
+            return None;
+        }
+        let header = JournalHeader {
+            state: JournalState::Active {
+                segment_id: previous_segment_id,
+            },
+            body_len: previous_len - JOURNAL_HEADER_LEN as u64,
+        };
+        Some(Self {
+            previous_len,
+            previous_segment_id,
+            previous_header_crc: crc32c(&header.encode()),
+        })
+    }
+
+    /// Encodes the checksummed marker.
+    #[must_use]
+    pub fn encode(self) -> [u8; RESET_MARKER_LEN] {
+        let mut bytes = [0_u8; RESET_MARKER_LEN];
+        bytes[..8].copy_from_slice(&RESET_MARKER_MAGIC);
+        bytes[8..16].copy_from_slice(&self.previous_len.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.previous_segment_id.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.previous_header_crc.to_le_bytes());
+        let checksum = crc32c(&bytes[..28]);
+        bytes[28..32].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    /// Decodes a marker after checking its magic and checksum.
+    #[must_use]
+    pub fn decode(bytes: [u8; RESET_MARKER_LEN]) -> Option<Self> {
+        if bytes[..8] != RESET_MARKER_MAGIC {
+            return None;
+        }
+        let stored = u32::from_le_bytes(bytes[28..32].try_into().ok()?);
+        if stored != crc32c(&bytes[..28]) {
+            return None;
+        }
+        Some(Self {
+            previous_len: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            previous_segment_id: i64::from_le_bytes(bytes[16..24].try_into().ok()?),
+            previous_header_crc: u32::from_le_bytes(bytes[24..28].try_into().ok()?),
+        })
+    }
+
+    /// Reconstructs and verifies the active header named by this marker.
+    #[must_use]
+    pub fn expected_previous_header(self) -> Option<JournalHeader> {
+        let marker = Self::new(self.previous_len, self.previous_segment_id)?;
+        (marker.previous_header_crc == self.previous_header_crc).then_some(JournalHeader {
+            state: JournalState::Active {
+                segment_id: self.previous_segment_id,
+            },
+            body_len: self.previous_len - JOURNAL_HEADER_LEN as u64,
+        })
+    }
+
+    /// Classifies an observed root header during a committed reset.
+    ///
+    /// Besides either complete header, only a prefix rewrite from the previous
+    /// active bytes to the empty bytes is accepted. Unrelated corruption and
+    /// non-v1 headers are not reset transitions.
+    #[must_use]
+    pub fn classify_header_transition(
+        self,
+        observed: [u8; JOURNAL_HEADER_LEN],
+    ) -> Option<ResetHeaderTransition> {
+        let previous = self.expected_previous_header()?.encode();
+        let empty = JournalHeader::EMPTY.encode();
+        if observed == previous {
+            return Some(ResetHeaderTransition::Previous);
+        }
+        if observed == empty {
+            return Some(ResetHeaderTransition::Empty);
+        }
+        (1..JOURNAL_HEADER_LEN)
+            .any(|split| {
+                observed[..split] == empty[..split] && observed[split..] == previous[split..]
+            })
+            .then_some(ResetHeaderTransition::Torn)
+    }
+}
+
+/// Valid root-header states observed after a reset marker was committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetHeaderTransition {
+    /// The previous active header is still complete.
+    Previous,
+    /// The canonical empty header is already complete.
+    Empty,
+    /// A prefix of the empty header replaced the corresponding active bytes.
+    Torn,
+}
 
 /// Header of one journal frame.
 ///
@@ -345,7 +633,7 @@ pub struct JournalLimits {
 impl Default for JournalLimits {
     fn default() -> Self {
         Self {
-            max_part_len: DEFAULT_MAX_PART_LEN,
+            max_part_len: MAX_PART_LEN,
         }
     }
 }
@@ -371,9 +659,10 @@ pub struct DamageRegion {
 /// Classification of a damaged journal region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DamageKind {
-    /// An incomplete final frame. Normal after a crash; the journal is
-    /// truncated to `from` and writing continues. Loss is bounded by one
-    /// unfinished part.
+    /// An incomplete final frame.
+    ///
+    /// This is diagnostic classification only. The production journal opens
+    /// fail closed and does not truncate or repair damaged bytes.
     TornTail,
     /// A damaged frame with a valid frame after it.
     Middle {
@@ -382,7 +671,8 @@ pub enum DamageKind {
     },
     /// Damage at the end of the journal with no later valid frame.
     ///
-    /// These bytes stay on disk for diagnostics.
+    /// This is diagnostic classification only; the production journal leaves
+    /// these bytes unchanged and rejects the file.
     QuarantinedTail,
 }
 
@@ -403,6 +693,44 @@ impl ScanReport {
     #[must_use]
     pub const fn is_clean(&self) -> bool {
         self.damages.is_empty()
+    }
+}
+
+/// Failure while scanning a journal with an explicit part-count bound.
+#[derive(Debug)]
+pub enum JournalScanError {
+    /// The byte source could not be read.
+    Io(io::Error),
+    /// Another valid frame would exceed the caller's part-count bound.
+    PartLimitExceeded {
+        /// Maximum number of returned parts.
+        limit: usize,
+    },
+}
+
+impl fmt::Display for JournalScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "journal scan I/O: {error}"),
+            Self::PartLimitExceeded { limit } => {
+                write!(f, "journal contains more than {limit} parts")
+            }
+        }
+    }
+}
+
+impl Error for JournalScanError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::PartLimitExceeded { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for JournalScanError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -454,65 +782,29 @@ pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
     report
 }
 
-/// Scan a journal source frame by frame, keeping peak memory to one part body.
+/// Scans a journal source sequentially from `start_at`.
 ///
-/// Produces a [`ScanReport`] identical to `scan_journal` over the same bytes.
-/// Equivalent to [`scan_journal_streaming_from`] with a start offset of `0`.
+/// `start_at` must be a frame boundary. Returned part and damage offsets, and
+/// [`ScanReport::valid_len`], remain absolute from the start of the source. If
+/// no bytes follow `start_at`, the report is empty and `valid_len` equals
+/// `start_at`.
 ///
-/// `resync_chunk` is the caller-owned read-window size used when searching past
-/// damage. The window allocation is proportional to `resync_chunk`; a value of
-/// `1 << 20` (1 MiB) is a reasonable default. Must be greater than zero.
-///
-/// # Errors
-///
-/// Returns [`io::ErrorKind::InvalidInput`] when `resync_chunk` is zero.
-/// Returns an I/O error if `reader` fails on any read or on `byte_len`.
-pub fn scan_journal_streaming<R: ReadAt>(
-    reader: &R,
-    limits: JournalLimits,
-    resync_chunk: usize,
-) -> io::Result<ScanReport> {
-    scan_journal_streaming_from(reader, 0, limits, resync_chunk)
-}
-
-/// Scan a journal source starting at byte offset `start_at`.
-///
-/// Like [`scan_journal_streaming`] but resumes at `start_at` instead of `0`,
-/// so an incremental follower re-validates only `[start_at, byte_len)`. All
-/// offsets in the returned [`ScanReport`] (`parts`, `damages`, `valid_len`) are
-/// absolute from the start of the source.
-///
-/// `start_at` must be a frame boundary. The `valid_len` of a previous scan
-/// satisfies this by construction: it always ends at the last valid frame.
-/// When the source has no bytes past `start_at`, the report is empty and its
-/// `valid_len` equals `start_at`.
-///
-/// `resync_chunk` is the caller-owned read-window size used when searching past
-/// damage; see [`scan_journal_streaming`].
+/// Scanning stops at the first damaged frame and never searches the damaged
+/// bytes for candidate frame magic. Peak memory is one part body and at most
+/// `max_parts` references. The part limit is checked before adding each
+/// [`PartRef`] to the report.
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] when `resync_chunk` is zero.
-/// Returns an I/O error if `reader` fails on any read or on `byte_len`.
-pub fn scan_journal_streaming_from<R: ReadAt>(
+/// Returns [`JournalScanError::PartLimitExceeded`] before returning more than
+/// `max_parts` valid frames. A `start_at` beyond the source and failures from
+/// the source are returned as [`JournalScanError::Io`].
+pub fn scan_journal_streaming_strict_from<R: ReadAt>(
     reader: &R,
     start_at: u64,
     limits: JournalLimits,
-    resync_chunk: usize,
-) -> io::Result<ScanReport> {
-    if resync_chunk == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "resync_chunk must be greater than zero",
-        ));
-    }
-    let overlap = FRAME_MAGIC.len() - 1;
-    resync_chunk.checked_add(overlap).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "resync_chunk + overlap overflows usize",
-        )
-    })?;
+    max_parts: usize,
+) -> Result<ScanReport, JournalScanError> {
     let total_len = usize::try_from(reader.byte_len()?).map_err(|_overflow| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -525,6 +817,13 @@ pub fn scan_journal_streaming_from<R: ReadAt>(
             "start_at does not fit the address space",
         )
     })?;
+    if pos > total_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "start_at is beyond the journal source",
+        )
+        .into());
+    }
 
     let mut report = ScanReport {
         valid_len: pos,
@@ -535,6 +834,9 @@ pub fn scan_journal_streaming_from<R: ReadAt>(
     while pos < total_len {
         match streaming_frame_at(reader, total_len, pos, limits, &mut part_buf)? {
             StreamingFrame::Valid { body_len } => {
+                if report.parts.len() >= max_parts {
+                    return Err(JournalScanError::PartLimitExceeded { limit: max_parts });
+                }
                 report.parts.push(PartRef {
                     offset: pos + FRAME_HEADER_LEN,
                     len: body_len,
@@ -550,22 +852,6 @@ pub fn scan_journal_streaming_from<R: ReadAt>(
                 return Ok(report);
             }
             StreamingFrame::Damaged { implied_end } => {
-                if let Some(next) = streaming_resync(
-                    reader,
-                    total_len,
-                    pos,
-                    implied_end,
-                    limits,
-                    &mut part_buf,
-                    resync_chunk,
-                )? {
-                    report.damages.push(DamageRegion {
-                        from: pos,
-                        kind: DamageKind::Middle { resumed_at: next },
-                    });
-                    pos = next;
-                    continue;
-                }
                 let kind = if implied_end == Some(total_len) {
                     DamageKind::TornTail
                 } else {
@@ -620,52 +906,6 @@ fn streaming_frame_at<R: ReadAt>(
         });
     }
     Ok(StreamingFrame::Valid { body_len })
-}
-
-fn streaming_resync<R: ReadAt>(
-    reader: &R,
-    total_len: usize,
-    damaged_at: usize,
-    implied_end: Option<usize>,
-    limits: JournalLimits,
-    part_buf: &mut Vec<u8>,
-    chunk_len: usize,
-) -> io::Result<Option<usize>> {
-    if let Some(boundary) = implied_end
-        && boundary < total_len
-        && matches!(
-            streaming_frame_at(reader, total_len, boundary, limits, part_buf)?,
-            StreamingFrame::Valid { .. }
-        )
-    {
-        return Ok(Some(boundary));
-    }
-
-    let overlap = FRAME_MAGIC.len() - 1;
-    let mut window = vec![0_u8; chunk_len + overlap];
-    let mut base = damaged_at + 1;
-    while base + FRAME_HEADER_LEN <= total_len {
-        let take = (total_len - base).min(window.len());
-        reader.read_exact_at(&mut window[..take], base as u64)?;
-
-        let mut from = 0;
-        while let Some(found) = find_magic(&window[from..take]) {
-            let at = base + from + found;
-            if matches!(
-                streaming_frame_at(reader, total_len, at, limits, part_buf)?,
-                StreamingFrame::Valid { .. }
-            ) {
-                return Ok(Some(at));
-            }
-            from = from + found + 1;
-        }
-
-        if base + take >= total_len {
-            break;
-        }
-        base += chunk_len;
-    }
-    Ok(None)
 }
 
 /// Outcome of checking one frame position.
@@ -749,6 +989,59 @@ fn find_magic(haystack: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+
+    const TEST_MAX_PARTS: usize = 16;
+
+    fn scan_streaming(bytes: &[u8], start_at: u64) -> Result<ScanReport, JournalScanError> {
+        scan_journal_streaming_strict_from(
+            &bytes,
+            start_at,
+            JournalLimits::default(),
+            TEST_MAX_PARTS,
+        )
+    }
+
+    #[test]
+    fn journal_v1_header_has_the_initial_magic_and_version() {
+        let bytes = JournalHeader::EMPTY.encode();
+        assert_eq!(&bytes[..8], b"PGKJNL1\0");
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(JournalHeader::decode(bytes), Ok(JournalHeader::EMPTY));
+    }
+
+    #[test]
+    fn reset_marker_accepts_only_the_two_headers_and_their_prefix_transition() {
+        let segment_id = 0x0102_0304_0506_0708;
+        let marker = ResetMarker::new(4096, segment_id).unwrap();
+        assert_eq!(ResetMarker::decode(marker.encode()), Some(marker));
+        let previous = marker.expected_previous_header().unwrap().encode();
+        let empty = JournalHeader::EMPTY.encode();
+        assert_eq!(
+            marker.classify_header_transition(previous),
+            Some(ResetHeaderTransition::Previous)
+        );
+        assert_eq!(
+            marker.classify_header_transition(empty),
+            Some(ResetHeaderTransition::Empty)
+        );
+        for split in 1..JOURNAL_HEADER_LEN {
+            let mut torn = previous;
+            torn[..split].copy_from_slice(&empty[..split]);
+            assert!(
+                marker.classify_header_transition(torn).is_some(),
+                "prefix split {split} must be an admissible reset transition"
+            );
+        }
+
+        let mut non_prefix = previous;
+        non_prefix[20] = empty[20];
+        assert_eq!(marker.classify_header_transition(non_prefix), None);
+        assert_eq!(
+            marker.classify_header_transition([0xA5; JOURNAL_HEADER_LEN]),
+            None
+        );
+    }
+
     fn framed(parts: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
         for p in parts {
@@ -777,9 +1070,18 @@ mod streaming_tests {
         let p = sample_part();
         let buf = framed(&[&p, &p]);
         let want = scan_journal(&buf, JournalLimits::default());
-        let got =
-            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
+        let got = scan_streaming(&buf, 0).unwrap();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn bounded_streaming_scan_stops_before_exceeding_the_part_limit() {
+        let part = sample_part();
+        let bytes = framed(&[&part, &part]);
+        assert!(matches!(
+            scan_journal_streaming_strict_from(&bytes.as_slice(), 0, JournalLimits::default(), 1,),
+            Err(JournalScanError::PartLimitExceeded { limit: 1 })
+        ));
     }
     #[test]
     fn streaming_matches_buffer_on_torn_tail() {
@@ -787,68 +1089,27 @@ mod streaming_tests {
         let mut buf = framed(&[&p]);
         buf.extend_from_slice(&FrameHeader { part_len: 999 }.encode()); // header for absent body
         let want = scan_journal(&buf, JournalLimits::default());
-        let got =
-            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
+        let got = scan_streaming(&buf, 0).unwrap();
         assert_eq!(got, want);
     }
+
     #[test]
-    fn streaming_matches_buffer_on_middle_corruption() {
+    fn strict_streaming_stops_at_middle_corruption_without_resyncing() {
         let p = sample_part();
         let mut buf = framed(&[&p]);
+        let first_frame_len = buf.len();
         buf.extend_from_slice(&[0xFF; 8]); // garbage between valid frames
         buf.extend_from_slice(&framed(&[&p]));
-        let want = scan_journal(&buf, JournalLimits::default());
-        let got =
-            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn resync_chunk_zero_returns_invalid_input() {
-        let p = sample_part();
-        let buf = framed(&[&p]);
-        let err = scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 0)
-            .expect_err("resync_chunk=0 must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn streaming_from_zero_matches_full_scan_on_clean_journal() {
-        let p = sample_part();
-        let buf = framed(&[&p, &p]);
-        let want =
-            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
-        let got =
-            scan_journal_streaming_from(&buf.as_slice(), 0, JournalLimits::default(), 1 << 20)
-                .unwrap();
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn streaming_from_zero_matches_full_scan_on_torn_tail() {
-        let p = sample_part();
-        let mut buf = framed(&[&p]);
-        buf.extend_from_slice(&FrameHeader { part_len: 999 }.encode()); // header for absent body
-        let want =
-            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
-        let got =
-            scan_journal_streaming_from(&buf.as_slice(), 0, JournalLimits::default(), 1 << 20)
-                .unwrap();
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn streaming_from_zero_matches_full_scan_on_middle_corruption() {
-        let p = sample_part();
-        let mut buf = framed(&[&p]);
-        buf.extend_from_slice(&[0xFF; 8]); // garbage between valid frames
-        buf.extend_from_slice(&framed(&[&p]));
-        let want =
-            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
-        let got =
-            scan_journal_streaming_from(&buf.as_slice(), 0, JournalLimits::default(), 1 << 20)
-                .unwrap();
-        assert_eq!(got, want);
+        let report = scan_streaming(&buf, 0).unwrap();
+        assert_eq!(report.parts.len(), 1);
+        assert_eq!(report.valid_len, first_frame_len);
+        assert_eq!(
+            report.damages,
+            vec![DamageRegion {
+                from: first_frame_len,
+                kind: DamageKind::QuarantinedTail,
+            }]
+        );
     }
 
     #[test]
@@ -860,13 +1121,7 @@ mod streaming_tests {
         let buf = framed(&[&p, &p]);
         let first_len = FRAME_HEADER_LEN + p.len();
 
-        let report = scan_journal_streaming_from(
-            &buf.as_slice(),
-            first_len as u64,
-            JournalLimits::default(),
-            1 << 20,
-        )
-        .unwrap();
+        let report = scan_streaming(&buf, first_len as u64).unwrap();
         assert_eq!(report.parts.len(), 1, "only the tail part is scanned");
         assert_eq!(
             report.parts[0].offset,
@@ -888,13 +1143,7 @@ mod streaming_tests {
         // pinned to the start offset (nothing new to read).
         let p = sample_part();
         let buf = framed(&[&p, &p]);
-        let report = scan_journal_streaming_from(
-            &buf.as_slice(),
-            buf.len() as u64,
-            JournalLimits::default(),
-            1 << 20,
-        )
-        .unwrap();
+        let report = scan_streaming(&buf, buf.len() as u64).unwrap();
         assert!(report.parts.is_empty(), "no parts past the end");
         assert!(report.damages.is_empty(), "no damage past the end");
         assert_eq!(
@@ -905,11 +1154,14 @@ mod streaming_tests {
     }
 
     #[test]
-    fn resync_chunk_overflow_returns_invalid_input() {
+    fn streaming_rejects_a_start_offset_beyond_the_source() {
         let p = sample_part();
         let buf = framed(&[&p]);
-        let err = scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), usize::MAX)
-            .expect_err("resync_chunk=usize::MAX must be rejected due to overflow");
+        let JournalScanError::Io(err) = scan_streaming(&buf, buf.len() as u64 + 1)
+            .expect_err("start_at beyond the source must be rejected")
+        else {
+            panic!("invalid start offset must be reported as an I/O validation error");
+        };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

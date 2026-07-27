@@ -2021,12 +2021,15 @@ fn scorable_columns(logical: &LogicalSection) -> (Vec<&'static str>, Vec<&'stati
 
 #[cfg(test)]
 mod tests {
+    use kronika_layout::FileKind;
     use kronika_reader::{ColumnDiff, ColumnValues, DiffAt, Scalar};
 
     use super::*;
     use crate::incident::{ClockRelation, IncidentConfig, analyze};
 
     const MINUTE: i64 = 60 * 1_000_000;
+    const FIRST_ARCHIVER_SEGMENT_ID: i64 = 0;
+    const SECOND_ARCHIVER_SEGMENT_ID: i64 = 20 * MINUTE;
 
     fn quality() -> InputQuality {
         InputQuality::default()
@@ -2552,7 +2555,8 @@ mod tests {
     }
 
     fn write_archiver_segment(
-        path: &std::path::Path,
+        root: &std::path::Path,
+        segment_id: i64,
         rows: &[kronika_registry::pg_stat_archiver::PgStatArchiver],
         min_ts: i64,
         max_ts: i64,
@@ -2612,6 +2616,11 @@ mod tests {
                 source_id: 7,
             },
         );
+        let path = crate::test_layout::file_path(
+            root,
+            crate::test_layout::address(segment_id),
+            FileKind::Pgm,
+        );
         std::fs::write(path, bytes).expect("write segment");
     }
 
@@ -2640,8 +2649,14 @@ mod tests {
             rows.push(row(minute * MINUTE, count));
         }
 
-        write_archiver_segment(&dir.join("0.pgm"), &rows[..21], 0, 20 * MINUTE);
-        write_archiver_segment(&dir.join("2000.pgm"), &rows[20..], 20 * MINUTE, 39 * MINUTE);
+        write_archiver_segment(dir, FIRST_ARCHIVER_SEGMENT_ID, &rows[..21], 0, 20 * MINUTE);
+        write_archiver_segment(
+            dir,
+            SECOND_ARCHIVER_SEGMENT_ID,
+            &rows[20..],
+            20 * MINUTE,
+            39 * MINUTE,
+        );
         39 * MINUTE
     }
 
@@ -2759,9 +2774,16 @@ mod tests {
             stats_reset: None,
         };
         let rows: Vec<PgStatArchiver> = (0..40_i64).map(|m| row(m * MINUTE, m + 1)).collect();
-        write_archiver_segment(&dir.path().join("0.pgm"), &rows[..21], 0, 20 * MINUTE);
         write_archiver_segment(
-            &dir.path().join("2000.pgm"),
+            dir.path(),
+            FIRST_ARCHIVER_SEGMENT_ID,
+            &rows[..21],
+            0,
+            20 * MINUTE,
+        );
+        write_archiver_segment(
+            dir.path(),
+            SECOND_ARCHIVER_SEGMENT_ID,
             &rows[20..],
             20 * MINUTE,
             39 * MINUTE,
@@ -2827,7 +2849,7 @@ mod tests {
                 stats_reset: None,
             },
         ];
-        write_archiver_segment(&dir.path().join("0.pgm"), &rows, 0, MINUTE);
+        write_archiver_segment(dir.path(), FIRST_ARCHIVER_SEGMENT_ID, &rows, 0, MINUTE);
         let mut snap = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let mut limits = InputLimits::for_test();
         limits.materialized_cells = logical_section("instance_metadata")
@@ -2883,7 +2905,7 @@ mod tests {
             last_failed_time: None,
             stats_reset: None,
         }];
-        write_archiver_segment(&dir.path().join("0.pgm"), &rows, 0, MINUTE);
+        write_archiver_segment(dir.path(), FIRST_ARCHIVER_SEGMENT_ID, &rows, 0, MINUTE);
         let scan = ScanParams {
             from: 0,
             to: MINUTE,
@@ -2944,7 +2966,7 @@ mod tests {
             last_failed_time: None,
             stats_reset: None,
         }];
-        write_archiver_segment(&dir.path().join("0.pgm"), &rows, 0, MINUTE);
+        write_archiver_segment(dir.path(), FIRST_ARCHIVER_SEGMENT_ID, &rows, 0, MINUTE);
         let mut snap = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let mut limits = InputLimits::for_test();
         limits.units = 0;

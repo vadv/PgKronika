@@ -55,7 +55,7 @@ pub use codec::{
     sealed_data_body_bound, sealed_plain_body_bound, write_bool, write_bool_nullable,
     write_list_i32, write_nullable, write_required,
 };
-pub use parquet_preflight::validate_parquet_decode_work;
+pub use parquet_preflight::{validate_parquet_decode_work, validate_plain_parquet_decode_work};
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{
     bgwriter_checkpointer, collection_coverage, incident_gauges, instance_metadata, os_cgroup_cpu,

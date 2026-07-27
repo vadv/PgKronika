@@ -22,7 +22,7 @@ fn reservation_id(reservation: Reservation) -> u64 {
 }
 
 fn context() -> SegmentContext {
-    SegmentContext::new("persist-mode-tests.pgm").expect("valid context")
+    SegmentContext::new(crate::test_layout::named_address("persist-mode-tests"))
 }
 
 fn lifecycle_pgm() -> Vec<u8> {
@@ -69,8 +69,7 @@ fn facts(bytes: &[u8]) -> SegmentFacts {
 }
 
 fn write_source(directory: &TempDir, bytes: &[u8]) {
-    std::fs::write(directory.path().join(context().pgm_file_name()), bytes)
-        .expect("write sibling PGM");
+    crate::test_layout::write_pgm(directory.path(), context().address(), bytes);
 }
 
 fn seed_authoritative_mark(store: &FactStore) {
@@ -355,8 +354,7 @@ fn incomplete_recovery_scan_forbids_the_capacity_retry() {
 
     let bytes = lifecycle_pgm();
     write_source(&directory, &bytes);
-    std::fs::write(directory.path().join("active.parts"), b"active view")
-        .expect("write active view");
+    crate::test_layout::write_empty_journal(directory.path());
     assert_eq!(
         store.publish(&facts(&bytes), &context(), &LIMIT),
         Err(PersistError::NoSpace)
@@ -395,6 +393,7 @@ fn due_probe_resets_backoff_and_removes_its_sentinel() {
     let store = FactStore::new(directory.path());
     let bytes = lifecycle_pgm();
     let facts = facts(&bytes);
+    write_source(&directory, &bytes);
     store.inject_publish_faults([PersistError::TransientIo]);
     assert_eq!(
         store.publish(&facts, &context(), &LIMIT),
@@ -407,15 +406,20 @@ fn due_probe_resets_backoff_and_removes_its_sentinel() {
         PersistenceProbeOutcome::Succeeded
     );
     assert_eq!(store.persist_mode().mode, PersistMode::ReadWrite);
-    let probes = std::fs::read_dir(directory.path())
-        .expect("data directory")
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".pgkronika-overview.probe-")
-        })
-        .count();
+    let prefix = format!("{}.ovf.probe.", context().address().id);
+    let probes = std::fs::read_dir(crate::test_layout::day_path(
+        directory.path(),
+        context().address(),
+    ))
+    .expect("UTC day")
+    .filter_map(Result::ok)
+    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+    .filter(|name| {
+        name.starts_with(&prefix)
+            && std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension == "tmp")
+    })
+    .count();
     assert_eq!(probes, 0);
 }

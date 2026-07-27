@@ -41,6 +41,7 @@ use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
 use crate::cluster::{Cluster, shared_matrix};
+use crate::collector::SealedSegment;
 use session::Session;
 
 const SETTINGS_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -122,12 +123,12 @@ pub(crate) struct HarnessState {
     /// Named sessions opened by `session "X" runs ...` steps.
     sessions: BTreeMap<String, Session>,
     /// Sealed segment from the most recent `snapshots the segment` step.
-    segment: Option<PathBuf>,
+    segment: Option<SealedSegment>,
     /// Canonical real-process timeline and sibling bytes established by the
     /// first lifecycle assertion in a scenario.
     web_lifecycle_baseline: Option<web_lifecycle::TimelineBaseline>,
     /// Segments sealed by the internal-timer step, in seal order.
-    timer_segments: Vec<PathBuf>,
+    timer_segments: Vec<SealedSegment>,
     /// The collector's stderr from the most recent snapshot, for failure dumps.
     collector_log: Option<String>,
     /// Prepared transactions that must be rolled back before the database is
@@ -273,12 +274,12 @@ impl HarnessState {
     }
 
     /// Record the segments a timer-driven collector run sealed.
-    pub(crate) fn set_timer_segments(&mut self, segments: Vec<PathBuf>) {
+    pub(crate) fn set_timer_segments(&mut self, segments: Vec<SealedSegment>) {
         self.timer_segments = segments;
     }
 
     /// The `index`-th (1-based) segment of the timer-driven run.
-    pub(crate) fn timer_segment(&self, index: usize) -> Result<&PathBuf> {
+    pub(crate) fn timer_segment(&self, index: usize) -> Result<&SealedSegment> {
         self.timer_segments
             .get(
                 index
@@ -316,12 +317,12 @@ impl HarnessState {
     }
 
     /// Record the sealed segment produced by a snapshot step.
-    pub(crate) fn set_segment(&mut self, path: PathBuf) {
-        self.segment = Some(path);
+    pub(crate) fn set_segment(&mut self, segment: SealedSegment) {
+        self.segment = Some(segment);
     }
 
-    /// The most recent sealed-segment path, or an error if none was taken.
-    pub(crate) fn segment(&self) -> Result<&PathBuf> {
+    /// The most recent sealed segment, with its data root and verified address.
+    pub(crate) fn segment(&self) -> Result<&SealedSegment> {
         self.segment
             .as_ref()
             .context("no snapshot taken; run `When the collector snapshots the segment` first")

@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
+use kronika_layout::{DataRoot, LayoutLimits};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
@@ -91,13 +92,13 @@ fn dedup_by_str_id(batches: &[RecordBatch]) -> Option<(Vec<RecordBatch>, usize, 
 #[ignore = "manual repack experiment, needs KRONIKA_REPACK_DIR"]
 fn repack_estimate() {
     let dir = std::env::var("KRONIKA_REPACK_DIR").expect("KRONIKA_REPACK_DIR");
-    for entry in std::fs::read_dir(&dir).expect("read dir") {
-        let path = entry.expect("entry").path();
-        if path.extension().is_none_or(|e| e != "pgm") {
-            continue;
-        }
-        let file_len = std::fs::metadata(&path).expect("stat").len();
-        let file = std::fs::File::open(&path).expect("open pgm");
+    let root = DataRoot::open(std::path::Path::new(&dir)).expect("open data root");
+    let snapshot = root
+        .scan(LayoutLimits::default())
+        .expect("scan strict segment tree");
+    for segment in snapshot.segments {
+        let file_len = segment.pgm_bytes;
+        let file = root.open_pgm(segment.address).expect("open pgm");
         let unit = kronika_reader::PgmUnit::open(file).expect("parse pgm");
 
         // type_id -> raw section bodies, in catalog order.
@@ -149,7 +150,7 @@ fn repack_estimate() {
         }
 
         report.sort_by_key(|(_, old_len, _, _)| std::cmp::Reverse(*old_len));
-        println!("== {} ==", path.file_name().unwrap().to_string_lossy());
+        println!("== {} ==", segment.address.pgm_name());
         println!(
             "{:>10} {:>12} {:>12} {:>7} {:>6}  type_id",
             "old", "new", "saved", "parts", "x"

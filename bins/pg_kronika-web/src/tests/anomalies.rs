@@ -31,7 +31,7 @@ fn write_status_segment(
             source_id: source,
         },
     );
-    std::fs::write(dir.join(file), part).expect("write status segment");
+    crate::test_layout::write_named_pgm(dir, file, &part);
 }
 
 #[tokio::test]
@@ -170,7 +170,7 @@ async fn segments_report_rows_for_canonical_sections() {
             source_id: 7,
         },
     );
-    std::fs::write(dir.path().join("1000.pgm"), &bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir.path(), "1000.pgm", &bytes);
 
     let (status, body) = serve(dir.path(), "/v1/segments?source=7&from=0&to=3000").await;
     assert_eq!(status, StatusCode::OK, "segments responds 200");
@@ -333,7 +333,7 @@ fn write_two_section_spike_segment(dir: &std::path::Path) -> i64 {
             source_id: 7,
         },
     );
-    std::fs::write(dir.join("0.pgm"), &bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
     to
 }
 
@@ -638,7 +638,7 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
             source_id: 7,
         },
     );
-    std::fs::write(dir.join("0.pgm"), bytes).expect("write plan fixture segment");
+    crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
     to
 }
 
@@ -809,7 +809,7 @@ fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
             source_id: 7,
         },
     );
-    std::fs::write(dir.join("0.pgm"), bytes).expect("write vadv plan fixture segment");
+    crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
     to
 }
 
@@ -1096,7 +1096,7 @@ fn write_gated_db_segment(dir: &std::path::Path) -> i64 {
             source_id: 7,
         },
     );
-    std::fs::write(dir.join("0.pgm"), &bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
     to
 }
 

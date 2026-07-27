@@ -33,8 +33,8 @@ use proptest as _;
 use tempfile as _;
 
 pub use catalog::{
-    Catalog, CatalogLayoutError, DecodeError, ENTRY_LEN, Entry, META_LEN, TAIL_INDEX_LEN,
-    TailIndex, validate_catalog_layout,
+    Catalog, CatalogLayoutError, CatalogView, DecodeError, ENTRY_LEN, Entry, META_LEN,
+    TAIL_INDEX_LEN, TailIndex, validate_catalog_layout,
 };
 pub use crc::{Crc32c, crc32c};
 pub use dictionary::{
@@ -43,10 +43,12 @@ pub use dictionary::{
 };
 pub use dictionary::{EntrySnapshot, HotMark, Placement};
 pub use parts::{
-    DEFAULT_MAX_PART_LEN, DEFAULT_RESYNC_CHUNK, DamageKind, DamageRegion, FRAME_HEADER_LEN,
-    FRAME_MAGIC, FrameError, FrameHeader, JournalLimits, PartError, PartMeta, PartRef, ScanReport,
-    SectionInput, build_part, scan_journal, scan_journal_streaming, scan_journal_streaming_from,
-    validate_part, validate_part_catalog,
+    DamageKind, DamageRegion, FRAME_HEADER_LEN, FRAME_MAGIC, FrameError, FrameHeader,
+    JOURNAL_HEADER_LEN, JOURNAL_MAGIC, JOURNAL_VERSION, JournalHeader, JournalHeaderError,
+    JournalLimits, JournalScanError, JournalState, MAX_JOURNAL_LEN, MAX_JOURNAL_PARTS,
+    MAX_PART_LEN, PartError, PartMeta, PartRef, RESET_MARKER_LEN, RESET_MARKER_MAGIC,
+    ResetHeaderTransition, ResetMarker, ScanReport, SectionInput, build_part, scan_journal,
+    scan_journal_streaming_strict_from, validate_part, validate_part_catalog,
 };
 pub use read_at::ReadAt;
 pub use str_id::StrId;

@@ -18,10 +18,12 @@
     reason = "criterion_group!/criterion_main! expand to undocumented public items; a bench binary has no public API"
 )]
 
+use std::io::Write as _;
 use std::path::Path;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
+use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId, WriterOwner};
 use kronika_reader::{LocalDirSnapshot, section};
 use kronika_registry::pg_stat_statements::{
     PgStatStatementsV1, PgStatStatementsV4, PgStatStatementsV6,
@@ -46,6 +48,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const SECTION: &str = "pg_stat_statements";
 const SOURCE: u64 = 7;
+const FIRST_WINDOW_US: i64 = 1_000;
 /// Query text interned per row so the `str_id` resolve path returns a real
 /// string; the row's `queryid` seeds it so distinct queries get distinct text.
 fn query_text(queryid: i64) -> Vec<u8> {
@@ -238,17 +241,19 @@ const fn split_counts(n: usize) -> (usize, usize, usize) {
     (v6, v4, v1)
 }
 
-/// Build a one-part segment of `n` statements rows in `dir/1000.pgm`.
+/// Build a one-part segment of `n` statements rows at its canonical address.
 ///
 /// The part carries a real dictionary (interned query text) so the `str_id`
 /// resolve path returns strings rather than nulls. `ts` values follow `shape`.
 fn build_fixture(dir: &Path, n: usize, shape: SortKeyShape) {
+    let segment_id = SegmentId::new(FIRST_WINDOW_US).expect("fixture segment id");
+    let address = SegmentAddress::new(segment_id).expect("fixture segment address");
     let mut interner = Interner::new(DictLimits::new(1 << 16, 1 << 24).expect("dict limits"));
 
     // A `ts` per row: monotonic for Unique, constant for Tied. The tie-break
     // needs a shared full sort key `(dbid, userid, ts)`, so Tied also fixes dbid
     // and userid; only the interned `query` column then separates rows.
-    let base_ts = 1_000_i64;
+    let base_ts = FIRST_WINDOW_US;
     let row_ts = |i: i64| -> i64 {
         match shape {
             SortKeyShape::Unique => base_ts + i,
@@ -323,7 +328,11 @@ fn build_fixture(dir: &Path, n: usize, shape: SortKeyShape) {
             source_id: SOURCE,
         },
     );
-    std::fs::write(dir.join("1000.pgm"), &part).expect("write part");
+    let root = DataRoot::open(dir).expect("open fixture root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire fixture writer");
+    publish_pgm(&owner, address, &part);
 }
 
 /// The `(dbid, userid)` for row `i` under `shape`. A free function so it can be
@@ -408,19 +417,26 @@ fn bench_refresh_incremental(c: &mut Criterion) {
     group.finish();
 }
 
-/// Build `m` single-row sealed segments (`1000.pgm`, `1001.pgm`, …).
+/// Build `m` single-row sealed segments at consecutive canonical addresses.
 ///
 /// Opening the dir yields `m` sealed units, so `LocalDirSnapshot::clone` copies
 /// `m` catalogs — the per-request cost the data handlers pay on the happy path
 /// today.
 fn build_many_segments(dir: &Path, m: usize) {
+    let root = DataRoot::open(dir).expect("open fixture root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire fixture writer");
     for i in 0..m {
         let mut interner = Interner::new(DictLimits::new(1 << 16, 1 << 24).expect("dict limits"));
         let idx = i64::try_from(i).expect("segment index fits i64");
+        let first_window_us = FIRST_WINDOW_US + idx;
+        let segment_id = SegmentId::new(first_window_us).expect("fixture segment id");
+        let address = SegmentAddress::new(segment_id).expect("fixture segment address");
         let str_id = interner
             .intern(&query_text(idx))
             .expect("intern query text");
-        let row = statements_v6_row(1000 + idx, 1, 1, idx, StrId(str_id.get()));
+        let row = statements_v6_row(first_window_us, 1, 1, idx, StrId(str_id.get()));
         let body = PgStatStatementsV6::encode(&[row]).expect("encode v6");
         let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
         let mut inputs = vec![SectionInput {
@@ -436,13 +452,22 @@ fn build_many_segments(dir: &Path, m: usize) {
         let part = build_part(
             &inputs,
             PartMeta {
-                min_ts: 1000 + idx,
-                max_ts: 1000 + idx,
+                min_ts: first_window_us,
+                max_ts: first_window_us,
                 source_id: SOURCE,
             },
         );
-        std::fs::write(dir.join(format!("{}.pgm", 1000 + i)), &part).expect("write part");
+        publish_pgm(&owner, address, &part);
     }
+}
+
+fn publish_pgm(owner: &WriterOwner, address: SegmentAddress, bytes: &[u8]) {
+    let mut temporary = owner.create_pgm_temp(address).expect("create fixture PGM");
+    temporary
+        .file_mut()
+        .write_all(bytes)
+        .expect("write fixture PGM");
+    temporary.publish().expect("publish fixture PGM");
 }
 
 /// Per-request snapshot clone as the sealed-segment count grows. Data handlers

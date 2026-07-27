@@ -21,8 +21,9 @@
 
 use std::error::Error;
 use std::fmt;
+use std::io::{self, Write};
 
-use crate::{MAGIC, crc32c};
+use crate::{MAGIC, crc::Crc32c};
 
 /// Size of one catalog entry on disk, bytes.
 pub const ENTRY_LEN: usize = 32;
@@ -71,6 +72,33 @@ pub struct Catalog {
     pub source_id: u64,
     /// Container format version, [`crate::FORMAT_VERSION`] for new files.
     pub format_version: u32,
+}
+
+/// Validated borrowed view of an encoded end catalog.
+///
+/// Unlike [`Catalog`], this type does not allocate or retain decoded entries.
+/// It is intended for bounded discovery paths that need to validate and
+/// summarize a catalog before deciding whether to open the complete segment.
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogView<'a> {
+    entries: &'a [u8],
+    /// Minimal timestamp of the segment, unix microseconds.
+    pub min_ts: i64,
+    /// Maximal timestamp of the segment, unix microseconds.
+    pub max_ts: i64,
+    /// `str_id` of `{cluster_id}/{pg_system_identifier}`; 0 = not set.
+    pub source_id: u64,
+    /// Number of catalog entries.
+    pub entry_count: u32,
+    /// Container format version.
+    pub format_version: u32,
+}
+
+impl CatalogView<'_> {
+    /// Iterates over decoded entries without allocating a `Vec<Entry>`.
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = Entry> + Clone + '_ {
+        self.entries.chunks_exact(ENTRY_LEN).map(decode_entry)
+    }
 }
 
 /// Pointer to the end catalog.
@@ -323,35 +351,57 @@ impl Catalog {
     /// writer bug: a valid segment cannot address a larger catalog block.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let catalog_len = u32::try_from(self.encoded_len())
-            .expect("catalog length must fit u32, the writer produced an absurd section count");
-
         let mut out = Vec::with_capacity(self.encoded_len() + TAIL_INDEX_LEN);
-        for e in &self.entries {
-            out.extend_from_slice(&e.type_id.to_le_bytes());
-            out.extend_from_slice(&e.flags.to_le_bytes());
-            out.extend_from_slice(&e.offset.to_le_bytes());
-            out.extend_from_slice(&e.len.to_le_bytes());
-            out.extend_from_slice(&e.rows.to_le_bytes());
-            out.extend_from_slice(&e.crc32c.to_le_bytes());
-        }
-        out.extend_from_slice(&self.min_ts.to_le_bytes());
-        out.extend_from_slice(&self.max_ts.to_le_bytes());
-        out.extend_from_slice(&self.source_id.to_le_bytes());
-        let entry_count =
-            u32::try_from(self.entries.len()).expect("entry count fits u32, checked above");
-        out.extend_from_slice(&entry_count.to_le_bytes());
-        out.extend_from_slice(&self.format_version.to_le_bytes());
-        // CRC is computed over the whole catalog with this field zeroed,
-        // then patched in.
-        let crc_at = out.len();
-        out.extend_from_slice(&0_u32.to_le_bytes());
-        out.extend_from_slice(&0_u32.to_le_bytes()); // reserved
-        let crc = crc32c(&out);
-        out[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
-
-        out.extend_from_slice(&TailIndex { catalog_len }.encode());
+        self.write_encoded(&mut out)
+            .expect("catalog length must fit u32 and writing to Vec cannot fail");
         out
+    }
+
+    /// Write catalog entries, metadata, and the tail index without allocating
+    /// a second catalog-sized buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the catalog block does not
+    /// fit in `u32`, or forwards an error from `writer`.
+    pub fn write_encoded(&self, mut writer: impl Write) -> io::Result<()> {
+        let catalog_len = u32::try_from(self.encoded_len()).map_err(|_overflow| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "catalog length does not fit the PGM tail index",
+            )
+        })?;
+        let mut checksum = Crc32c::new();
+        for e in &self.entries {
+            let mut bytes = [0_u8; ENTRY_LEN];
+            bytes[0..4].copy_from_slice(&e.type_id.to_le_bytes());
+            bytes[4..8].copy_from_slice(&e.flags.to_le_bytes());
+            bytes[8..16].copy_from_slice(&e.offset.to_le_bytes());
+            bytes[16..24].copy_from_slice(&e.len.to_le_bytes());
+            bytes[24..28].copy_from_slice(&e.rows.to_le_bytes());
+            bytes[28..32].copy_from_slice(&e.crc32c.to_le_bytes());
+            checksum.update(&bytes);
+            writer.write_all(&bytes)?;
+        }
+
+        let mut meta = [0_u8; META_LEN];
+        meta[0..8].copy_from_slice(&self.min_ts.to_le_bytes());
+        meta[8..16].copy_from_slice(&self.max_ts.to_le_bytes());
+        meta[16..24].copy_from_slice(&self.source_id.to_le_bytes());
+        let entry_count = u32::try_from(self.entries.len()).map_err(|_overflow| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "catalog entry count does not fit the PGM metadata",
+            )
+        })?;
+        meta[24..28].copy_from_slice(&entry_count.to_le_bytes());
+        meta[28..32].copy_from_slice(&self.format_version.to_le_bytes());
+        // The CRC field and reserved field are already zeroed.
+        checksum.update(&meta);
+        meta[META_CRC_OFFSET..META_CRC_OFFSET + 4]
+            .copy_from_slice(&checksum.finalize().to_le_bytes());
+        writer.write_all(&meta)?;
+        writer.write_all(&TailIndex { catalog_len }.encode())
     }
 
     /// Decode a catalog block.
@@ -365,6 +415,26 @@ impl Catalog {
     /// stored entry count does not match the block length, or the catalog CRC
     /// does not match.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let view = Self::view(bytes)?;
+        Ok(Self {
+            entries: view.entries().collect(),
+            min_ts: view.min_ts,
+            max_ts: view.max_ts,
+            source_id: view.source_id,
+            format_version: view.format_version,
+        })
+    }
+
+    /// Validate an encoded catalog and borrow its fixed-size entries.
+    ///
+    /// `bytes` must contain catalog entries followed by the 40-byte metadata
+    /// block. The returned view decodes entries on iteration and allocates
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DecodeError`] under the same conditions as [`Self::decode`].
+    pub fn view(bytes: &[u8]) -> Result<CatalogView<'_>, DecodeError> {
         if bytes.len() < META_LEN || !(bytes.len() - META_LEN).is_multiple_of(ENTRY_LEN) {
             return Err(DecodeError::BadCatalogLen {
                 actual: bytes.len(),
@@ -401,25 +471,25 @@ impl Catalog {
             });
         }
 
-        let entries = bytes[..bytes.len() - META_LEN]
-            .chunks_exact(ENTRY_LEN)
-            .map(|c| Entry {
-                type_id: u32_at(c, 0),
-                flags: u32_at(c, 4),
-                offset: u64_at(c, 8),
-                len: u64_at(c, 16),
-                rows: u32_at(c, 24),
-                crc32c: u32_at(c, 28),
-            })
-            .collect();
-
-        Ok(Self {
-            entries,
+        Ok(CatalogView {
+            entries: &bytes[..bytes.len() - META_LEN],
             min_ts: i64_at(meta, 0),
             max_ts: i64_at(meta, 8),
             source_id: u64_at(meta, 16),
+            entry_count: stored_count,
             format_version: u32_at(meta, 28),
         })
+    }
+}
+
+fn decode_entry(bytes: &[u8]) -> Entry {
+    Entry {
+        type_id: u32_at(bytes, 0),
+        flags: u32_at(bytes, 4),
+        offset: u64_at(bytes, 8),
+        len: u64_at(bytes, 16),
+        rows: u32_at(bytes, 24),
+        crc32c: u32_at(bytes, 28),
     }
 }
 
@@ -478,6 +548,32 @@ mod tests {
         let encoded = catalog.encode();
         let body = &encoded[..encoded.len() - TAIL_INDEX_LEN];
         assert_eq!(Catalog::decode(body), Ok(catalog));
+    }
+
+    #[test]
+    fn streaming_encoder_matches_the_in_memory_encoding() {
+        let catalog = sample();
+        let expected = catalog.encode();
+        let mut streamed = Vec::new();
+        catalog
+            .write_encoded(&mut streamed)
+            .expect("write catalog to memory");
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn borrowed_view_matches_owned_decode_without_allocating_entries() {
+        let catalog = sample();
+        let encoded = catalog.encode();
+        let body = &encoded[..encoded.len() - TAIL_INDEX_LEN];
+        let view = Catalog::view(body).expect("valid borrowed view");
+
+        assert_eq!(view.min_ts, catalog.min_ts);
+        assert_eq!(view.max_ts, catalog.max_ts);
+        assert_eq!(view.source_id, catalog.source_id);
+        assert_eq!(view.entry_count, 1);
+        assert_eq!(view.format_version, catalog.format_version);
+        assert_eq!(view.entries().collect::<Vec<_>>(), catalog.entries);
     }
 
     #[test]

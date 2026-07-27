@@ -3,7 +3,10 @@ use crate::logging::{
     LogLevel, duration_ms, field, log_event, log_flush_summary, log_journal_append, summary_rows,
 };
 use anyhow::{Context, Result};
-use kronika_format::{EntrySnapshot, Placement, StrId};
+use kronika_format::{
+    Catalog, EntrySnapshot, FORMAT_VERSION, MAGIC, Placement, StrId, TAIL_INDEX_LEN, TailIndex,
+};
+use kronika_layout::{DataRoot, FileKind, LayoutLimits, SegmentAddress, SegmentId, WriterOwner};
 use kronika_registry::{
     CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_ROWS, sealed_data_body_bound,
 };
@@ -14,8 +17,12 @@ use kronika_writer::{
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::os::unix::fs::FileExt as _;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AdmissionDictionaryValue {
@@ -382,16 +389,17 @@ impl SegmentAdmission {
 /// window's timestamp, its age from the moment that window was appended.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct SegmentState {
-    first_ts: Option<i64>,
+    first_id: Option<SegmentId>,
     opened_at: Option<Instant>,
     admission: SegmentAdmission,
+    published_pending_reset: bool,
 }
 
 impl SegmentState {
     /// Register the appended window; the first one opens the segment.
-    pub(crate) const fn on_window_appended(&mut self, ts: i64, now: Instant) {
-        if self.first_ts.is_none() {
-            self.first_ts = Some(ts);
+    pub(crate) const fn on_window_appended(&mut self, id: SegmentId, now: Instant) {
+        if self.first_id.is_none() {
+            self.first_id = Some(id);
             self.opened_at = Some(now);
         }
     }
@@ -406,9 +414,24 @@ impl SegmentState {
         Some(max_age.saturating_sub(now.saturating_duration_since(self.opened_at?)))
     }
 
+    pub(crate) fn ensure_append_allowed(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.published_pending_reset,
+            "a PGM was published but active.parts was not reset; restart recovery is required"
+        );
+        Ok(())
+    }
+
+    pub(crate) const fn requires_restart(&self) -> bool {
+        self.published_pending_reset
+    }
+
     #[cfg(test)]
     pub(crate) const fn first_ts(&self) -> Option<i64> {
-        self.first_ts
+        match self.first_id {
+            Some(id) => Some(id.get()),
+            None => None,
+        }
     }
 }
 
@@ -452,33 +475,52 @@ pub(crate) fn encode_window(
     Ok(flushed)
 }
 
-/// Seal the open segment into `<first_ts>.pgm` and reset the journal.
+/// Seal the open segment into its first window's canonical UTC path and reset
+/// the journal.
 pub(crate) fn seal_open_segment(
     journal: &mut Journal,
+    owner: &WriterOwner,
     config: &Config,
     segment: &mut SegmentState,
     reason: &'static str,
 ) -> Result<PathBuf> {
-    let first_ts = segment
-        .first_ts
+    seal_open_segment_with_reset(
+        journal,
+        owner,
+        config.source_id,
+        segment,
+        reason,
+        Journal::reset,
+    )
+}
+
+pub(crate) fn seal_open_segment_with_reset<F>(
+    journal: &mut Journal,
+    owner: &WriterOwner,
+    source_id: u64,
+    segment: &mut SegmentState,
+    reason: &'static str,
+    reset: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce(&mut Journal) -> Result<(), JournalError>,
+{
+    let segment_id = segment
+        .first_id
         .context("sealing an open segment requires an appended window")?;
-    let dest = config.out_dir.join(format!("{first_ts}.pgm"));
+    let address = SegmentAddress::new(segment_id).context("derive the segment UTC address")?;
+    let dest = owner.root().diagnostic_file_path(address, FileKind::Pgm);
     let journal_bytes = journal.bytes();
     let journal_parts = journal.parts().len();
     let started = Instant::now();
-    let summary = seal(journal, &dest).context("seal the segment")?;
-    let reset = journal.reset();
-    if matches!(&reset, Ok(()) | Err(JournalError::ResetSync(_))) {
-        *segment = SegmentState::default();
-    }
-    reset.context("reset the journal after seal")?;
+    let summary = seal(journal, owner, address).context("seal the segment")?;
     log_event(
         LogLevel::Info,
         "segment_seal_finish",
         &[
             field("segment_path", dest.display()),
-            field("segment_id", first_ts),
-            field("source_id", config.source_id),
+            field("segment_id", segment_id.get()),
+            field("source_id", source_id),
             field("reason", reason),
             field("sections", summary.sections),
             field("segment_bytes", summary.bytes),
@@ -489,13 +531,88 @@ pub(crate) fn seal_open_segment(
             field("elapsed_ms", duration_ms(started.elapsed())),
         ],
     );
+    // Leave active.parts intact if seal() fails.
+    segment.published_pending_reset = true;
+    reset(journal).context("reset the journal after seal")?;
+    *segment = SegmentState::default();
     Ok(dest)
+}
+
+/// Structurally validates every canonical PGM before startup may open or mutate
+/// `active.parts`.
+///
+/// Section bodies remain lazy: readers verify their CRCs when a query selects
+/// them. Startup reads only the magic, tail, and bounded catalog.
+pub(crate) fn validate_existing_segments(root: &DataRoot, limits: LayoutLimits) -> Result<usize> {
+    let snapshot = root
+        .scan(limits)
+        .context("scan existing segments before journal recovery")?;
+    for segment in &snapshot.segments {
+        let file = root
+            .open_pgm(segment.address)
+            .with_context(|| format!("open existing segment {}", segment.address.id))?;
+        validate_existing_segment(&file)
+            .with_context(|| format!("validate existing segment {}", segment.address.id))?;
+    }
+    Ok(snapshot.segments.len())
+}
+
+fn validate_existing_segment(file: &File) -> Result<()> {
+    let file_len = file.metadata().context("stat PGM")?.len();
+    let tail_at = file_len
+        .checked_sub(TAIL_INDEX_LEN as u64)
+        .context("PGM is shorter than its tail index")?;
+    let mut tail_bytes = [0_u8; TAIL_INDEX_LEN];
+    file.read_exact_at(&mut tail_bytes, tail_at)
+        .context("read PGM tail index")?;
+    let tail = TailIndex::decode(tail_bytes).context("decode PGM tail index")?;
+    let catalog_len = u64::from(tail.catalog_len);
+    anyhow::ensure!(
+        catalog_len <= MAX_CATALOG_BYTES,
+        "PGM catalog exceeds the {MAX_CATALOG_BYTES}-byte validation limit"
+    );
+    let catalog_at = tail_at
+        .checked_sub(catalog_len)
+        .context("PGM catalog length exceeds the file body")?;
+    anyhow::ensure!(
+        catalog_at >= MAGIC.len() as u64,
+        "PGM catalog overlaps the file magic"
+    );
+
+    let mut magic = [0_u8; MAGIC.len()];
+    file.read_exact_at(&mut magic, 0)
+        .context("read PGM magic")?;
+    anyhow::ensure!(magic == MAGIC, "invalid PGM magic");
+
+    let catalog_size = usize::try_from(catalog_len).context("PGM catalog does not fit memory")?;
+    let mut catalog_bytes = vec![0_u8; catalog_size];
+    file.read_exact_at(&mut catalog_bytes, catalog_at)
+        .context("read PGM catalog")?;
+    let catalog = Catalog::view(&catalog_bytes).context("decode PGM catalog")?;
+    anyhow::ensure!(
+        catalog.format_version == FORMAT_VERSION,
+        "unsupported PGM format version {}",
+        catalog.format_version
+    );
+
+    for entry in catalog.entries() {
+        let end = entry
+            .offset
+            .checked_add(entry.len)
+            .context("PGM section range overflow")?;
+        anyhow::ensure!(
+            entry.offset >= MAGIC.len() as u64 && end <= catalog_at,
+            "PGM section {} points outside the body",
+            entry.type_id
+        );
+    }
+    Ok(())
 }
 
 /// Open the journal under the output directory and seal windows a previous
 /// process left behind, so a restart loses no collected data.
 pub(crate) fn open_collector_journal(
-    out_dir: &Path,
+    owner: &WriterOwner,
     journal_max_bytes: u64,
 ) -> Result<(Journal, Option<PathBuf>)> {
     let journal_config = JournalConfig {
@@ -503,22 +620,11 @@ pub(crate) fn open_collector_journal(
             .context("KRONIKA_JOURNAL_MAX_BYTES exceeds usize")?,
         ..JournalConfig::default()
     };
-    let (mut journal, report) =
-        Journal::open(&out_dir.join("active.parts"), journal_config).context("open the journal")?;
-    if report.has_media_damage() {
-        log_event(
-            LogLevel::Warn,
-            "journal_recovery_damaged",
-            &[
-                field("damaged_regions", report.damages.len()),
-                field("truncated_torn_tail", report.truncated_torn_tail),
-            ],
-        );
-    }
+    let mut journal = Journal::open(owner, journal_config).context("open the journal")?;
     if journal.parts().is_empty() {
         return Ok((journal, None));
     }
-    match seal_recovered_journal(&mut journal, out_dir) {
+    match seal_recovered_journal(&mut journal, owner) {
         Ok(dest) => Ok((journal, dest)),
         Err(err) => {
             log_event(
@@ -541,13 +647,16 @@ pub(crate) fn open_collector_journal(
     }
 }
 
-/// Seal recovered windows under the earliest data timestamp they carry.
+/// Seal recovered windows under the exact identity persisted in journal v1.
 ///
 /// Parts without a data timestamp hold no rows (a dictionary needs a data
 /// section to be referenced from), so a journal made only of those is reset
 /// without producing a segment.
-fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Option<PathBuf>> {
-    let mut first_ts: Option<i64> = None;
+fn seal_recovered_journal(journal: &mut Journal, owner: &WriterOwner) -> Result<Option<PathBuf>> {
+    let segment_id = journal
+        .segment_id()
+        .context("an active journal must carry SegmentId")?;
+    let mut has_data = false;
     for part in journal.parts().to_vec() {
         let body = journal.read_part(part).context("read a recovered part")?;
         let catalog = kronika_format::validate_part(&body).context("validate a recovered part")?;
@@ -559,9 +668,9 @@ fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Optio
                 "recovered part has populated sections but no data timestamp; active.parts is preserved"
             );
         }
-        first_ts = Some(first_ts.map_or(catalog.min_ts, |ts| ts.min(catalog.min_ts)));
+        has_data = true;
     }
-    let Some(first_ts) = first_ts else {
+    if !has_data {
         journal
             .reset()
             .context("reset a recovered journal with no data windows")?;
@@ -575,21 +684,19 @@ fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Optio
             ],
         );
         return Ok(None);
-    };
-    let dest = out_dir.join(format!("{first_ts}.pgm"));
+    }
+    let address = SegmentAddress::new(segment_id).context("derive the recovered UTC address")?;
+    let dest = owner.root().diagnostic_file_path(address, FileKind::Pgm);
     let journal_bytes = journal.bytes();
     let journal_parts = journal.parts().len();
     let started = Instant::now();
-    let summary = seal(journal, &dest).context("seal the recovered segment")?;
-    journal
-        .reset()
-        .context("reset the journal after the recovery seal")?;
+    let summary = seal(journal, owner, address).context("seal the recovered segment")?;
     log_event(
         LogLevel::Info,
         "segment_seal_finish",
         &[
             field("segment_path", dest.display()),
-            field("segment_id", first_ts),
+            field("segment_id", segment_id.get()),
             field("reason", "recovered"),
             field("sections", summary.sections),
             field("segment_bytes", summary.bytes),
@@ -600,11 +707,15 @@ fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Optio
             field("elapsed_ms", duration_ms(started.elapsed())),
         ],
     );
+    journal
+        .reset()
+        .context("reset the journal after the recovery seal")?;
     Ok(Some(dest))
 }
 
 fn prepare_window_admission(
     journal: &mut Journal,
+    owner: &WriterOwner,
     config: &Config,
     segment: &mut SegmentState,
     flushed: &FlushedPart,
@@ -613,7 +724,7 @@ fn prepare_window_admission(
 ) -> Result<AdmissionDelta> {
     match segment.admission.assess(&flushed.summary, interner) {
         Ok(delta) => Ok(delta),
-        Err(err) if err.is_capacity() && segment.first_ts.is_some() => {
+        Err(err) if err.is_capacity() && segment.first_id.is_some() => {
             // Prove that the incoming window fits by itself before publishing
             // and resetting the accumulated journal. An intrinsically
             // inadmissible window must leave active.parts untouched.
@@ -630,7 +741,7 @@ fn prepare_window_admission(
                 ],
             );
             sealed.push((
-                seal_open_segment(journal, config, segment, "format-limit")?,
+                seal_open_segment(journal, owner, config, segment, "format-limit")?,
                 "format-limit",
             ));
             Ok(fresh)
@@ -639,8 +750,14 @@ fn prepare_window_admission(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one transaction keeps admission, journal append, early seal, and SegmentId state synchronized"
+)]
 pub(crate) fn append_window_and_maybe_seal(
     journal: &mut Journal,
+    owner: &WriterOwner,
     config: &Config,
     segment: &mut SegmentState,
     ts: i64,
@@ -648,22 +765,34 @@ pub(crate) fn append_window_and_maybe_seal(
     flushed: &FlushedPart,
     interner: &Interner,
 ) -> Result<Vec<(PathBuf, &'static str)>> {
+    segment.ensure_append_allowed()?;
     let mut sealed = Vec::new();
-    let mut admission =
-        prepare_window_admission(journal, config, segment, flushed, interner, &mut sealed)?;
+    let mut admission = prepare_window_admission(
+        journal,
+        owner,
+        config,
+        segment,
+        flushed,
+        interner,
+        &mut sealed,
+    )?;
+    let segment_id = match segment.first_id {
+        Some(segment_id) => segment_id,
+        None => SegmentId::new(ts).context("collection timestamp is outside the layout range")?,
+    };
     let append_started = Instant::now();
     let journal_bytes_before = journal.bytes();
-    match journal.append(&flushed.body) {
+    match journal.append(segment_id, &flushed.body) {
         Ok(part_ref) => log_journal_append(
             &flushed.summary,
-            part_ref.offset,
-            part_ref.len,
+            part_ref.offset(),
+            part_ref.len(),
             journal_bytes_before,
             journal.bytes(),
             append_started.elapsed(),
             false,
         ),
-        Err(JournalError::Full { len, max }) if segment.first_ts.is_some() => {
+        Err(JournalError::Full { len, max }) if segment.first_id.is_some() => {
             let fresh = SegmentAdmission::default()
                 .assess(&flushed.summary, interner)
                 .context("one collection window exceeds sealed PGM limits")?;
@@ -679,19 +808,23 @@ pub(crate) fn append_window_and_maybe_seal(
                 ],
             );
             sealed.push((
-                seal_open_segment(journal, config, segment, "journal-full")?,
+                seal_open_segment(journal, owner, config, segment, "journal-full")?,
                 "journal-full",
             ));
             admission = fresh;
             let retry_started = Instant::now();
             let journal_bytes_before = journal.bytes();
             let part_ref = journal
-                .append(&flushed.body)
+                .append(
+                    SegmentId::new(ts)
+                        .context("collection timestamp is outside the layout range")?,
+                    &flushed.body,
+                )
                 .context("append the window after an early seal")?;
             log_journal_append(
                 &flushed.summary,
-                part_ref.offset,
-                part_ref.len,
+                part_ref.offset(),
+                part_ref.len(),
                 journal_bytes_before,
                 journal.bytes(),
                 retry_started.elapsed(),
@@ -716,7 +849,10 @@ pub(crate) fn append_window_and_maybe_seal(
     }
     segment.admission.commit(admission);
     let now = Instant::now();
-    segment.on_window_appended(ts, now);
+    let active_id = journal
+        .segment_id()
+        .context("a successful journal append must persist SegmentId")?;
+    segment.on_window_appended(active_id, now);
     let age = Duration::from_secs(config.segment_max_age_secs);
     if let Some(reason) = seal_reason(
         forced,
@@ -724,7 +860,10 @@ pub(crate) fn append_window_and_maybe_seal(
         config.segment_max_bytes,
         segment.age_expired(now, age),
     ) {
-        sealed.push((seal_open_segment(journal, config, segment, reason)?, reason));
+        sealed.push((
+            seal_open_segment(journal, owner, config, segment, reason)?,
+            reason,
+        ));
     }
     Ok(sealed)
 }
@@ -736,7 +875,13 @@ mod admission_tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use kronika_format::{DictLimits, PartMeta, SectionInput, build_part, validate_part};
+    use kronika_format::{
+        DictLimits, FRAME_HEADER_LEN, JOURNAL_HEADER_LEN, PartMeta, RESET_MARKER_LEN, SectionInput,
+        build_part, validate_part,
+    };
+    use kronika_layout::{
+        DataRoot, FileKind, LayoutLimits, SegmentAddress, SegmentId, WriterOwner,
+    };
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::{
         CodecError, MAX_SECTION_ROWS, PgLocksV2, SEALED_DATA_PAGE_BYTES, Section, Ts,
@@ -847,17 +992,30 @@ mod admission_tests {
         }
     }
 
-    fn open_journal(path: &Path, max_journal_len: usize) -> Journal {
-        let (journal, report) = Journal::open(
-            path,
+    fn open_journal(root_path: &Path, max_journal_len: usize) -> (WriterOwner, Journal) {
+        let root = DataRoot::open(root_path).expect("open test data root");
+        let owner = root
+            .acquire_writer(LayoutLimits::default())
+            .expect("acquire test writer");
+        let journal = Journal::open(
+            &owner,
             JournalConfig {
                 max_journal_len,
                 ..JournalConfig::default()
             },
         )
         .expect("open test journal");
-        assert!(report.is_clean());
-        journal
+        (owner, journal)
+    }
+
+    fn one_part_journal_cap(part_len: usize) -> usize {
+        JOURNAL_HEADER_LEN + FRAME_HEADER_LEN + part_len + RESET_MARKER_LEN
+    }
+
+    fn segment_path(owner: &WriterOwner, ts: i64) -> std::path::PathBuf {
+        let id = SegmentId::new(ts).expect("test timestamp is a valid segment id");
+        let address = SegmentAddress::new(id).expect("test segment has a UTC address");
+        owner.root().diagnostic_file_path(address, FileKind::Pgm)
     }
 
     fn max_admitted_rows(type_id: u32) -> usize {
@@ -982,8 +1140,8 @@ mod admission_tests {
     #[test]
     fn format_capacity_crossing_seals_accumulated_segment_before_append() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("active.parts");
-        let mut journal = open_journal(&path, usize::MAX);
+        let (owner, mut journal) =
+            open_journal(dir.path(), JournalConfig::default().max_journal_len);
         let config = test_config(dir.path());
         let interner = empty_interner();
         let mut segment = SegmentState::default();
@@ -993,6 +1151,7 @@ mod admission_tests {
         assert!(
             append_window_and_maybe_seal(
                 &mut journal,
+                &owner,
                 &config,
                 &mut segment,
                 100,
@@ -1013,6 +1172,7 @@ mod admission_tests {
 
         let sealed = append_window_and_maybe_seal(
             &mut journal,
+            &owner,
             &config,
             &mut segment,
             200,
@@ -1035,7 +1195,7 @@ mod admission_tests {
             .expect("read current part");
         let current_catalog = validate_part(&current).expect("current part is valid");
         assert_eq!(current_catalog.min_ts, 200);
-        assert_eq!(segment.first_ts, Some(200));
+        assert_eq!(segment.first_ts(), Some(200));
         assert_eq!(
             segment.admission.data_by_type.get(&type_id),
             Some(&DataAdmission {
@@ -1049,13 +1209,15 @@ mod admission_tests {
     fn intrinsically_oversized_window_preserves_active_journal_and_admission() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("active.parts");
-        let mut journal = open_journal(&path, usize::MAX);
+        let (owner, mut journal) =
+            open_journal(dir.path(), JournalConfig::default().max_journal_len);
         let config = test_config(dir.path());
         let interner = empty_interner();
         let mut segment = SegmentState::default();
         let first = flushed_window(100);
         append_window_and_maybe_seal(
             &mut journal,
+            &owner,
             &config,
             &mut segment,
             100,
@@ -1072,6 +1234,7 @@ mod admission_tests {
 
         let err = append_window_and_maybe_seal(
             &mut journal,
+            &owner,
             &config,
             &mut segment,
             200,
@@ -1084,21 +1247,21 @@ mod admission_tests {
         assert_eq!(fs::read(&path).expect("read active.parts"), bytes_before);
         assert_eq!(segment, state_before);
         assert_eq!(journal.parts().len(), 1);
-        assert!(!dir.path().join("100.pgm").exists());
+        assert!(!segment_path(&owner, 100).exists());
     }
 
     #[test]
     fn journal_full_retry_keeps_only_the_incoming_admission() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("active.parts");
-        let mut journal = open_journal(&path, 1);
         let config = test_config(dir.path());
         let interner = empty_interner();
         let mut segment = SegmentState::default();
         let first = flushed_window(100);
         let incoming = flushed_window(200);
+        let (owner, mut journal) = open_journal(dir.path(), one_part_journal_cap(first.body.len()));
         append_window_and_maybe_seal(
             &mut journal,
+            &owner,
             &config,
             &mut segment,
             100,
@@ -1110,6 +1273,7 @@ mod admission_tests {
 
         let sealed = append_window_and_maybe_seal(
             &mut journal,
+            &owner,
             &config,
             &mut segment,
             200,
@@ -1122,7 +1286,7 @@ mod admission_tests {
         assert_eq!(sealed.len(), 1);
         assert_eq!(sealed[0].1, "journal-full");
         assert_eq!(journal.parts().len(), 1);
-        assert_eq!(segment.first_ts, Some(200));
+        assert_eq!(segment.first_ts(), Some(200));
         assert_eq!(segment.admission.descriptors, 1);
         assert_eq!(
             segment
@@ -1139,13 +1303,14 @@ mod admission_tests {
     fn invalid_part_at_journal_cap_is_transactional() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("active.parts");
-        let mut journal = open_journal(&path, 1);
         let config = test_config(dir.path());
         let interner = empty_interner();
         let mut segment = SegmentState::default();
         let first = flushed_window(100);
+        let (owner, mut journal) = open_journal(dir.path(), one_part_journal_cap(first.body.len()));
         append_window_and_maybe_seal(
             &mut journal,
+            &owner,
             &config,
             &mut segment,
             100,
@@ -1163,6 +1328,7 @@ mod admission_tests {
 
         append_window_and_maybe_seal(
             &mut journal,
+            &owner,
             &config,
             &mut segment,
             200,
@@ -1175,14 +1341,15 @@ mod admission_tests {
         assert_eq!(fs::read(&path).expect("read active.parts"), bytes_before);
         assert_eq!(segment, state_before);
         assert_eq!(journal.parts().len(), 1);
-        assert!(!dir.path().join("100.pgm").exists());
+        assert!(!segment_path(&owner, 100).exists());
     }
 
     #[test]
     fn recovery_preserves_a_populated_part_without_a_timestamp() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("active.parts");
-        let mut journal = open_journal(&path, usize::MAX);
+        let (owner, mut journal) =
+            open_journal(dir.path(), JournalConfig::default().max_journal_len);
         let body = BgwriterCheckpointer::encode(&[bgwriter(100)]).expect("encode section");
         let part = build_part(
             &[SectionInput {
@@ -1197,11 +1364,11 @@ mod admission_tests {
             },
         );
         journal
-            .append(&part)
+            .append(SegmentId::new(100).expect("valid recovery identity"), &part)
             .expect("append structurally valid part");
         let bytes_before = fs::read(&path).expect("snapshot active.parts");
 
-        let err = seal_recovered_journal(&mut journal, dir.path())
+        let err = seal_recovered_journal(&mut journal, &owner)
             .expect_err("populated sentinel-timestamp part is not empty");
 
         assert!(format!("{err:#}").contains("active.parts is preserved"));

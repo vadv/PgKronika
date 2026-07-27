@@ -8,8 +8,8 @@ use std::collections::hash_map::Entry as MapEntry;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kronika_format::{
-    Catalog, Crc32c, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c,
-    validate_catalog_layout,
+    Catalog, Crc32c, DecodeError, ENTRY_LEN, Entry, FORMAT_VERSION, MAGIC, META_LEN,
+    TAIL_INDEX_LEN, TailIndex, crc32c, validate_catalog_layout,
 };
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
@@ -20,7 +20,15 @@ use crate::{Dictionary, ReadError, Stored, decode_dictionary};
 
 /// Upper bound on the catalog block, checked before allocation.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+const CATALOG_READ_CHUNK_BYTES: usize = 64 * 1024;
 const SCRUB_BUFFER_BYTES: usize = 64 * 1024;
+const META_ENTRY_COUNT_AT: usize = 24;
+const META_FORMAT_VERSION_AT: usize = 28;
+const META_CRC_AT: usize = 32;
+const _: () = assert!(
+    CATALOG_READ_CHUNK_BYTES.is_multiple_of(ENTRY_LEN),
+    "catalog read chunks must contain complete fixed-size entries"
+);
 
 /// Completed PGM section-body I/O performed by one open unit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -82,8 +90,7 @@ pub struct PgmUnit<R: kronika_format::ReadAt> {
     reader: R,
     catalog: Catalog,
     source_file_len: u64,
-    tail_index_bytes: [u8; TAIL_INDEX_LEN],
-    raw_catalog_bytes: Vec<u8>,
+    source_descriptor: crate::SourceDescriptor,
     body_read_calls: AtomicU64,
     body_bytes_read: AtomicU64,
 }
@@ -101,8 +108,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             reader,
             catalog: opened.catalog,
             source_file_len: len,
-            tail_index_bytes: opened.tail_index_bytes,
-            raw_catalog_bytes: opened.raw_catalog_bytes,
+            source_descriptor: opened.source_descriptor,
             body_read_calls: AtomicU64::new(0),
             body_bytes_read: AtomicU64::new(0),
         })
@@ -116,12 +122,8 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
 
     /// Descriptor of the exact file length, tail index, and catalog bytes.
     #[must_use]
-    pub fn source_descriptor(&self) -> crate::SourceDescriptor {
-        crate::SourceDescriptor::derive(
-            self.source_file_len,
-            &self.tail_index_bytes,
-            &self.raw_catalog_bytes,
-        )
+    pub const fn source_descriptor(&self) -> crate::SourceDescriptor {
+        self.source_descriptor
     }
 
     /// Exact PGM file length used by [`Self::source_descriptor`].
@@ -391,8 +393,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
 
 struct OpenedCatalog {
     catalog: Catalog,
-    tail_index_bytes: [u8; TAIL_INDEX_LEN],
-    raw_catalog_bytes: Vec<u8>,
+    source_descriptor: crate::SourceDescriptor,
 }
 
 fn read_catalog_bytes<R: kronika_format::ReadAt>(
@@ -418,36 +419,211 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
         return Err(bad_len());
     }
 
-    let mut buf = vec![0_u8; tail.catalog_len as usize];
-    reader.read_exact_at(&mut buf, catalog_at)?;
-    let catalog = Catalog::decode(&buf).map_err(ReadError::Catalog)?;
+    let catalog_len = usize::try_from(catalog_len).map_err(|_overflow| bad_len())?;
+    let entries_bytes = admitted_entries_bytes(catalog_len).map_err(ReadError::Catalog)?;
+    let meta_at = catalog_at
+        .checked_add(u64::try_from(entries_bytes).map_err(|_overflow| bad_len())?)
+        .ok_or_else(bad_len)?;
+    let mut meta = [0_u8; META_LEN];
+    reader.read_exact_at(&mut meta, meta_at)?;
+
+    let entry_count = entries_bytes / ENTRY_LEN;
+    let stored_count = u32_at(&meta, META_ENTRY_COUNT_AT);
+    let derived_count = u32::try_from(entry_count).map_err(|_overflow| {
+        ReadError::Catalog(DecodeError::BadCatalogLen {
+            actual: catalog_len,
+        })
+    })?;
+    if stored_count != derived_count {
+        return Err(ReadError::Catalog(DecodeError::EntryCountMismatch {
+            stored: stored_count,
+            derived: derived_count,
+        }));
+    }
+
+    let max_decoded_bytes = usize::try_from(MAX_CATALOG_BYTES).map_err(|_overflow| bad_len())?;
+    entry_count
+        .checked_mul(size_of::<Entry>())
+        .filter(|&bytes| bytes <= max_decoded_bytes)
+        .ok_or_else(bad_len)?;
+    let mut entries = Vec::new();
+    if entries.try_reserve_exact(entry_count).is_err() {
+        return Err(bad_len());
+    }
+
+    let mut catalog_crc = Crc32c::new();
+    let mut source_descriptor = crate::SourceDescriptor::builder(len, &tail_bytes);
+    let mut scratch = vec![0_u8; entries_bytes.min(CATALOG_READ_CHUNK_BYTES)].into_boxed_slice();
+    let mut consumed = 0_usize;
+    while consumed < entries_bytes {
+        let chunk_len = (entries_bytes - consumed).min(scratch.len());
+        let offset = catalog_at
+            .checked_add(u64::try_from(consumed).map_err(|_overflow| bad_len())?)
+            .ok_or_else(bad_len)?;
+        let chunk = &mut scratch[..chunk_len];
+        reader.read_exact_at(chunk, offset)?;
+        catalog_crc.update(chunk);
+        crate::SourceDescriptor::update_catalog(&mut source_descriptor, chunk);
+        entries.extend(chunk.chunks_exact(ENTRY_LEN).map(decode_catalog_entry));
+        consumed = consumed.checked_add(chunk_len).ok_or_else(bad_len)?;
+    }
+
+    crate::SourceDescriptor::update_catalog(&mut source_descriptor, &meta);
+    catalog_crc.update(&meta[..META_CRC_AT]);
+    catalog_crc.update(&[0_u8; 4]);
+    catalog_crc.update(&meta[META_CRC_AT + 4..]);
+    let stored_crc = u32_at(&meta, META_CRC_AT);
+    let computed_crc = catalog_crc.finalize();
+    if stored_crc != computed_crc {
+        return Err(ReadError::Catalog(DecodeError::BadCrc {
+            stored: stored_crc,
+            computed: computed_crc,
+        }));
+    }
 
     let mut magic = [0_u8; MAGIC.len()];
     reader.read_exact_at(&mut magic, 0)?;
     if magic != MAGIC {
         return Err(ReadError::BadMagic { actual: magic });
     }
-    if catalog.format_version != FORMAT_VERSION {
+    let format_version = u32_at(&meta, META_FORMAT_VERSION_AT);
+    if format_version != FORMAT_VERSION {
         return Err(ReadError::UnsupportedFormat {
-            version: catalog.format_version,
+            version: format_version,
         });
     }
+    let catalog = Catalog {
+        entries,
+        min_ts: i64_at(&meta, 0),
+        max_ts: i64_at(&meta, 8),
+        source_id: u64_at(&meta, 16),
+        format_version,
+    };
     validate_catalog_layout(&catalog, catalog_at).map_err(ReadError::Layout)?;
     Ok(OpenedCatalog {
         catalog,
-        tail_index_bytes: tail_bytes,
-        raw_catalog_bytes: buf,
+        source_descriptor: crate::SourceDescriptor::finish(source_descriptor),
     })
+}
+
+const fn admitted_entries_bytes(catalog_len: usize) -> Result<usize, DecodeError> {
+    let Some(entries_bytes) = catalog_len.checked_sub(META_LEN) else {
+        return Err(DecodeError::BadCatalogLen {
+            actual: catalog_len,
+        });
+    };
+    if !entries_bytes.is_multiple_of(ENTRY_LEN) {
+        return Err(DecodeError::BadCatalogLen {
+            actual: catalog_len,
+        });
+    }
+    Ok(entries_bytes)
+}
+
+fn decode_catalog_entry(bytes: &[u8]) -> Entry {
+    Entry {
+        type_id: u32_at(bytes, 0),
+        flags: u32_at(bytes, 4),
+        offset: u64_at(bytes, 8),
+        len: u64_at(bytes, 16),
+        rows: u32_at(bytes, 24),
+        crc32c: u32_at(bytes, 28),
+    }
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("fixed catalog field"))
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("fixed catalog field"))
+}
+
+fn i64_at(bytes: &[u8], at: usize) -> i64 {
+    i64::from_le_bytes(bytes[at..at + 8].try_into().expect("fixed catalog field"))
 }
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use kronika_format::{DictLimits, PartMeta, ReadAt, SectionInput, build_part};
     use kronika_registry::os_loadavg::OsLoadavg;
     use kronika_registry::{Section, Ts};
     use kronika_writer::{Interner, dict};
 
     use super::*;
+
+    const OVERSIZED_CATALOG_LEN: u32 = 64 * 1024 * 1024 + 1;
+
+    #[derive(Default)]
+    struct ReadObservation {
+        calls: Cell<usize>,
+        max_len: Cell<usize>,
+    }
+
+    struct CountingReader<'a> {
+        bytes: &'a [u8],
+        observation: Rc<ReadObservation>,
+    }
+
+    impl ReadAt for CountingReader<'_> {
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            self.observation
+                .calls
+                .set(self.observation.calls.get().saturating_add(1));
+            self.observation
+                .max_len
+                .set(self.observation.max_len.get().max(buf.len()));
+            self.bytes.read_exact_at(buf, offset)
+        }
+
+        fn byte_len(&self) -> std::io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    struct OversizedCatalogReader {
+        len: u64,
+        observation: Rc<ReadObservation>,
+    }
+
+    impl ReadAt for OversizedCatalogReader {
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            self.observation
+                .calls
+                .set(self.observation.calls.get().saturating_add(1));
+            self.observation
+                .max_len
+                .set(self.observation.max_len.get().max(buf.len()));
+            assert_eq!(offset, self.len - TAIL_INDEX_LEN as u64);
+            assert_eq!(buf.len(), TAIL_INDEX_LEN);
+            buf.copy_from_slice(
+                &TailIndex {
+                    catalog_len: OVERSIZED_CATALOG_LEN,
+                }
+                .encode(),
+            );
+            Ok(())
+        }
+
+        fn byte_len(&self) -> std::io::Result<u64> {
+            Ok(self.len)
+        }
+    }
+
+    struct ZeroSizedReader;
+
+    impl ReadAt for ZeroSizedReader {
+        fn read_exact_at(&self, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
+            unreachable!("structural size test never reads")
+        }
+
+        fn byte_len(&self) -> std::io::Result<u64> {
+            unreachable!("structural size test never reads")
+        }
+    }
 
     fn data_body() -> Vec<u8> {
         OsLoadavg::encode(&[OsLoadavg {
@@ -471,6 +647,24 @@ mod tests {
                 rows: 1,
                 body: &body,
             }],
+            PartMeta {
+                min_ts: 5,
+                max_ts: 6,
+                source_id: 1,
+            },
+        )
+    }
+
+    fn large_catalog_part(entry_count: usize) -> Vec<u8> {
+        let sections = (0..entry_count)
+            .map(|index| SectionInput {
+                type_id: 2_000_000 + u32::try_from(index).expect("test entry count fits u32"),
+                rows: 1,
+                body: b"x",
+            })
+            .collect::<Vec<_>>();
+        build_part(
+            &sections,
             PartMeta {
                 min_ts: 5,
                 max_ts: 6,
@@ -603,6 +797,59 @@ mod tests {
     }
 
     #[test]
+    fn streaming_catalog_matches_monolithic_decode_across_chunk_boundary() {
+        let bytes = large_catalog_part(CATALOG_READ_CHUNK_BYTES / ENTRY_LEN + 1);
+        let tail_at = bytes.len() - TAIL_INDEX_LEN;
+        let tail_bytes: [u8; TAIL_INDEX_LEN] = bytes[tail_at..].try_into().expect("tail bytes");
+        let tail = TailIndex::decode(tail_bytes).expect("tail");
+        let catalog_at =
+            tail_at - usize::try_from(tail.catalog_len).expect("catalog length fits usize");
+        let expected_catalog =
+            Catalog::decode(&bytes[catalog_at..tail_at]).expect("monolithic catalog decode");
+        let expected_descriptor = crate::SourceDescriptor::derive(
+            bytes.len() as u64,
+            &tail_bytes,
+            &bytes[catalog_at..tail_at],
+        );
+        let observation = Rc::new(ReadObservation::default());
+
+        let unit = PgmUnit::open(CountingReader {
+            bytes: &bytes,
+            observation: Rc::clone(&observation),
+        })
+        .expect("streaming open");
+
+        assert_eq!(unit.catalog(), &expected_catalog);
+        assert_eq!(unit.source_descriptor(), expected_descriptor);
+        assert!(
+            observation.max_len.get() <= CATALOG_READ_CHUNK_BYTES,
+            "largest positional read was {} bytes",
+            observation.max_len.get()
+        );
+        assert_eq!(
+            observation.calls.get(),
+            5,
+            "tail, meta, two entry chunks, and leading magic"
+        );
+    }
+
+    #[test]
+    fn corrupt_catalog_crc_is_rejected_after_streaming_read() {
+        let mut bytes = large_catalog_part(CATALOG_READ_CHUNK_BYTES / ENTRY_LEN + 1);
+        let tail_at = bytes.len() - TAIL_INDEX_LEN;
+        let tail_bytes: [u8; TAIL_INDEX_LEN] = bytes[tail_at..].try_into().expect("tail bytes");
+        let tail = TailIndex::decode(tail_bytes).expect("tail");
+        let catalog_at =
+            tail_at - usize::try_from(tail.catalog_len).expect("catalog length fits usize");
+        bytes[catalog_at] ^= 0xFF;
+
+        assert!(matches!(
+            PgmUnit::open(bytes.as_slice()),
+            Err(ReadError::Catalog(DecodeError::BadCrc { .. }))
+        ));
+    }
+
+    #[test]
     fn dictionary_rejects_cross_placement_overlap() {
         let limits = DictLimits::new(4_096, 1 << 20).expect("dictionary limits");
         let mut strings = Interner::new(limits);
@@ -700,5 +947,44 @@ mod tests {
                 decoded: 1,
             }) if type_id == section.type_id
         ));
+    }
+
+    #[test]
+    fn catalog_admission_rejects_over_64_mib_before_large_read_or_allocation() {
+        let observation = Rc::new(ReadObservation::default());
+        let reader = OversizedCatalogReader {
+            len: MAX_CATALOG_BYTES + 1 + TAIL_INDEX_LEN as u64 + MAGIC.len() as u64,
+            observation: Rc::clone(&observation),
+        };
+
+        assert!(matches!(
+            PgmUnit::open(reader),
+            Err(ReadError::BadCatalogLen { catalog_len })
+                if catalog_len == OVERSIZED_CATALOG_LEN
+        ));
+        assert_eq!(observation.calls.get(), 1, "only the tail is read");
+        assert_eq!(observation.max_len.get(), TAIL_INDEX_LEN);
+    }
+
+    #[test]
+    fn open_state_retains_descriptor_instead_of_raw_catalog() {
+        let fixed_state = size_of::<Catalog>()
+            + size_of::<u64>()
+            + size_of::<crate::SourceDescriptor>()
+            + 2 * size_of::<AtomicU64>();
+        assert_eq!(size_of::<PgmUnit<ZeroSizedReader>>(), fixed_state);
+        assert_eq!(size_of::<Entry>(), ENTRY_LEN);
+        assert_eq!(CATALOG_READ_CHUNK_BYTES, 64 * 1024);
+
+        let max_catalog_bytes =
+            usize::try_from(MAX_CATALOG_BYTES).expect("64 MiB fits every supported target");
+        let max_valid_len = (max_catalog_bytes - META_LEN) / ENTRY_LEN * ENTRY_LEN + META_LEN;
+        let max_entries =
+            admitted_entries_bytes(max_valid_len).expect("largest aligned catalog") / ENTRY_LEN;
+        assert!(
+            max_entries
+                .checked_mul(size_of::<Entry>())
+                .is_some_and(|bytes| bytes <= max_catalog_bytes)
+        );
     }
 }

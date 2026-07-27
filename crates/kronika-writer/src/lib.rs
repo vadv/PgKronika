@@ -7,18 +7,17 @@
 //! placement metadata for deduplication.
 //!
 //! [`Journal`] appends self-contained PGM parts as synchronized `PGMP` frames
-//! in `active.parts`. Opening a journal truncates only a torn final frame;
-//! middle or terminal media damage remains in [`OpenReport`].
+//! after a checksummed version-1 header in `active.parts`. Opening validates
+//! the complete header and body without repairing or truncating damage.
 //! [`JournalConfig::max_journal_len`] is the hard growth bound, reported as
 //! [`JournalError::Full`] so the collector can seal early.
 //!
 //! [`seal`] validates and decodes journal bodies, coalesces each registered
 //! type, normalizes dictionaries, and emits canonical Parquet 1.0 bodies with
-//! PLAIN values and Zstandard level 6. It synchronizes an invocation-owned
-//! sibling temporary file and publishes without replacing the destination.
-//! An exact existing destination is a successful idempotent retry; a different
-//! one returns [`SealError::AlreadyExists`]. Seal never resets the journal, so
-//! the caller does so only after `Ok`.
+//! PLAIN values and Zstandard level 6. It writes a temporary file in the
+//! segment's UTC day and publishes without overwriting another identity.
+//! Recovery accepts an existing final file only after exact comparison. Seal
+//! never resets the journal, so the caller does so only after `Ok`.
 
 mod buffer;
 pub mod dict;
@@ -28,7 +27,8 @@ mod segment;
 
 pub use buffer::{FlushSummary, FlushedPart, SectionBuffers, SectionFlushSummary};
 pub use interner::{FlushedEntry, Interner, SealedSegment};
-pub use journal::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalConfig, JournalError, OpenReport};
+pub use journal::{Journal, JournalConfig, JournalError, JournalPartRef};
+pub use kronika_format::{MAX_JOURNAL_LEN, MAX_JOURNAL_PARTS, MAX_PART_LEN};
 pub use segment::{SealError, SealSummary, seal};
 
 #[cfg(test)]
@@ -40,13 +40,18 @@ mod composition_tests {
     //! file-backed journal unchanged.
 
     use kronika_format::{PartMeta, SectionInput, build_part, validate_part};
+    use kronika_layout::{DataRoot, LayoutLimits, SegmentId};
 
     use crate::{Journal, JournalConfig};
 
     #[test]
     fn a_built_part_survives_the_file_journal() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("active.parts");
+        let root = DataRoot::open(dir.path()).expect("open root");
+        let owner = root
+            .acquire_writer(LayoutLimits::default())
+            .expect("acquire writer");
+        let segment_id = SegmentId::new(1_709_164_800_000_000).expect("segment id");
 
         let part = build_part(
             &[
@@ -68,9 +73,10 @@ mod composition_tests {
             },
         );
 
-        let (mut journal, report) = Journal::open(&path, JournalConfig::default()).expect("open");
-        assert!(report.is_clean(), "a fresh journal opens clean");
-        let part_ref = journal.append(&part).expect("append a valid part");
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open");
+        let part_ref = journal
+            .append(segment_id, &part)
+            .expect("append a valid part");
 
         let read_back = journal.read_part(part_ref).expect("read the part back");
         assert_eq!(read_back, part, "the journal returns the bytes appended");

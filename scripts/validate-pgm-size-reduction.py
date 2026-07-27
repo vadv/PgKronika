@@ -132,7 +132,11 @@ def check_owner_contract_text() -> None:
 def check_format_contract(summary: dict[str, Any]) -> None:
     contract = summary["updated_pgm_contract"]
     require(
-        contract["container"] == "PGM, replaced in place; sealed path remains N.pgm",
+        contract["container"]
+        == (
+            "PGM, replaced in place; basename remains N.pgm; "
+            "canonical path is YYYY/MM/DD/N.pgm"
+        ),
         "candidate must remain the single PGM container",
     )
     require(

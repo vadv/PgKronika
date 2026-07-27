@@ -3,14 +3,15 @@
 //! Configuration is environment-only; required variables are
 //! `KRONIKA_PG_DSN` and `KRONIKA_OUT_DIR`. The process opens one `PostgreSQL`
 //! instance, schedules each source independently, appends synchronized windows
-//! to `<out>/active.parts`, and rotates immutable `<timestamp>.pgm` segments by
-//! size, age, journal pressure, or `SIGUSR2`.
+//! to `<out>/active.parts`, and publishes immutable
+//! `<out>/YYYY/MM/DD/<segment-id>.pgm` segments by size, age, journal pressure,
+//! or `SIGUSR2`.
 //!
 //! `SIGTERM` and `SIGINT` stop the loop without discarding the journal. Startup
 //! recovery seals valid frames left by the preceding process before opening a
 //! database connection. Individual cycle failures are logged and retried; bad
-//! startup configuration, the initial connection, and journal-open failures
-//! terminate the process.
+//! startup configuration, the initial connection, journal-open failures, and
+//! any persistence failure that poisons the journal terminate the process.
 //!
 //! Source discovery, paced reads, resource budgets, segment I/O, logfmt
 //! diagnostics, and config parsing live in separate modules. See the package
@@ -47,6 +48,7 @@ use buffering::{
 };
 use config::Config;
 use coverage::{CoverageInputs, collect_coverage_records, push_coverage, snapshot_coverage};
+use kronika_layout::{DataRoot, LayoutLimits, TemporaryKind, WriterOwner};
 use kronika_source_log::LogCollector;
 use kronika_source_os::{OsScope, ProcFs, detect_container};
 use kronika_source_pg::pool::{ConnectionPool, DEFAULT_MAX_DATABASES};
@@ -64,7 +66,7 @@ use pool_sources::{PoolReads, read_pool_sources};
 use scheduler::{DueSet, Scheduler, SourceKind};
 use segments::{
     SegmentState, append_window_and_maybe_seal, encode_window, open_collector_journal,
-    seal_open_segment,
+    seal_open_segment, validate_existing_segments,
 };
 use service_sections::{collect_due_instance, collect_service_sections};
 use source_contracts::activity_dict_limits;
@@ -98,15 +100,57 @@ fn timer_sleep_delay(
     Some(delay)
 }
 
+fn cleanup_writer_temporaries(owner: &WriterOwner, limits: LayoutLimits) -> Result<usize> {
+    let snapshot = owner
+        .root()
+        .scan(limits)
+        .context("scan for stale writer temporaries")?;
+    let mut removed = 0_usize;
+    for temporary in &snapshot.temporaries {
+        if temporary.kind == TemporaryKind::Pgm {
+            owner
+                .remove_temporary(temporary)
+                .context("remove a stale writer temporary")?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn prepare_collector_storage(
+    owner: &WriterOwner,
+    limits: LayoutLimits,
+    journal_max_bytes: u64,
+) -> Result<(Journal, Option<PathBuf>)> {
+    validate_existing_segments(owner.root(), limits)?;
+    cleanup_writer_temporaries(owner, limits)?;
+    open_collector_journal(owner, journal_max_bytes)
+}
+
+fn acquire_collector_writer(root: &DataRoot, limits: LayoutLimits) -> Result<WriterOwner> {
+    // Refuse corrupt immutable input before creating the persistent lock name.
+    // Validate again under the acquired lock in `prepare_collector_storage` so
+    // a preceding writer cannot publish unchecked input during handoff.
+    validate_existing_segments(root, limits)?;
+    root.acquire_writer(limits)
+        .context("acquire exclusive writer ownership")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
+    config.validate_runtime_paths()?;
+    let data_root = DataRoot::open(&config.out_dir).context("open the data root")?;
+    let writer_owner = acquire_collector_writer(&data_root, LayoutLimits::default())?;
 
     // The journal lives next to sealed segments so windows survive restarts.
     // Recovered windows are sealed before connecting to PostgreSQL.
-    let (mut journal, recovered) =
-        open_collector_journal(&config.out_dir, config.journal_max_bytes)?;
+    let (mut journal, recovered) = prepare_collector_storage(
+        &writer_owner,
+        LayoutLimits::default(),
+        config.journal_max_bytes,
+    )?;
     if let Some(dest) = recovered {
         announce(&format!("sealed {} reason=recovered", dest.display()));
     }
@@ -165,7 +209,7 @@ async fn main() -> Result<()> {
         // sources fail or return no rows must still close an expired segment.
         let age = Duration::from_secs(config.segment_max_age_secs);
         if segment.age_expired(Instant::now(), age) {
-            match seal_open_segment(&mut journal, &config, &mut segment, "age") {
+            match seal_open_segment(&mut journal, &writer_owner, &config, &mut segment, "age") {
                 Ok(dest) => {
                     sched.mark_segment_opened();
                     announce(&format!("sealed {} reason=age", dest.display()));
@@ -176,6 +220,7 @@ async fn main() -> Result<()> {
                     &[field("reason", "age"), field("error", format!("{err:#}"))],
                 ),
             }
+            stop_if_persistence_unhealthy(&journal, &segment)?;
         }
         // The plans pace lives outside the scheduler; a tick with only the
         // plans read due still runs.
@@ -185,6 +230,7 @@ async fn main() -> Result<()> {
         run_collection_cycle(
             &mut pool,
             &mut journal,
+            &writer_owner,
             &config,
             &mut statements_cache,
             &mut plans_cache,
@@ -195,6 +241,21 @@ async fn main() -> Result<()> {
             &mut pool_budget,
         )
         .await;
+        stop_if_persistence_unhealthy(&journal, &segment)?;
+    }
+    Ok(())
+}
+
+fn stop_if_persistence_unhealthy(journal: &Journal, segment: &SegmentState) -> Result<()> {
+    if segment.requires_restart() {
+        anyhow::bail!(
+            "a PGM was published but active.parts was not reset; stop before appending and recover on restart"
+        );
+    }
+    if journal.is_poisoned() {
+        anyhow::bail!(
+            "active.parts entered an indeterminate persistence state; stop and recover it on restart"
+        );
     }
     Ok(())
 }
@@ -209,6 +270,7 @@ async fn main() -> Result<()> {
 async fn run_collection_cycle(
     pool: &mut ConnectionPool,
     journal: &mut Journal,
+    writer_owner: &WriterOwner,
     config: &Config,
     statements_cache: &mut StatementsSourceCache,
     plans_cache: &mut PlansSourceCache,
@@ -225,7 +287,9 @@ async fn run_collection_cycle(
             &[field("source", "main"), field("error", format!("{err:#}"))],
         );
         if due.has(SourceKind::PgLog) {
-            match run_log_only_cycle(log_collector, journal, config, due, segment).await {
+            match run_log_only_cycle(log_collector, journal, writer_owner, config, due, segment)
+                .await
+            {
                 Ok(sealed) => {
                     for (dest, reason) in sealed {
                         sched.mark_segment_opened();
@@ -266,6 +330,7 @@ async fn run_collection_cycle(
         pool,
         major,
         journal,
+        writer_owner,
         config,
         statements_cache,
         plans_cache,
@@ -349,6 +414,7 @@ async fn snapshot_and_seal(
     pool: &ConnectionPool,
     major: u32,
     journal: &mut Journal,
+    writer_owner: &WriterOwner,
     config: &Config,
     statements_cache: &mut StatementsSourceCache,
     plans_cache: &mut PlansSourceCache,
@@ -510,7 +576,7 @@ async fn snapshot_and_seal(
     if buffers.is_empty() {
         // Empty due sources append nothing; the main loop still closes an
         // expired segment before the next collection attempt.
-        commit_log_collection(log_collector, log_collection.as_ref());
+        commit_log_collection(log_collector, log_collection.as_ref(), config);
         return Ok(CycleOutcome {
             sealed: Vec::new(),
             deferred,
@@ -521,6 +587,7 @@ async fn snapshot_and_seal(
     let flushed = encode_window(buffers, &interner, config)?;
     let sealed = append_window_and_maybe_seal(
         journal,
+        writer_owner,
         config,
         segment,
         main_src.ts.0,
@@ -529,7 +596,7 @@ async fn snapshot_and_seal(
         &interner,
     )
     .context("append the collection window")?;
-    commit_log_collection(log_collector, log_collection.as_ref());
+    commit_log_collection(log_collector, log_collection.as_ref(), config);
     Ok(CycleOutcome {
         sealed,
         deferred,

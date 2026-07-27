@@ -115,11 +115,55 @@ fn timer_segment_spans(
     type_id: String,
     min: usize,
 ) -> Result<()> {
-    use kronika_registry::Cell;
-
     let type_id = parse_type_id(&type_id)?;
     let path = world.harness.timer_segment(index)?;
     let rows = decode_all_sections_of(path, type_id)?;
+    assert_min_snapshots(world, index, type_id, &rows, min)
+}
+
+/// A multi-window type occupies one canonical physical section.
+#[then(
+    regex = r"^timer segment (\d+) section ([\w.+-]+) is one physical section spanning at least (\d+) snapshots$"
+)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+fn timer_segment_is_coalesced(
+    world: &mut BddWorld,
+    index: usize,
+    type_id: String,
+    min: usize,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let path = world.harness.timer_segment(index)?;
+    let segment = Segment::open(path).context("open sealed segment")?;
+    let section_count = segment
+        .catalog()
+        .entries
+        .iter()
+        .filter(|entry| entry.type_id == type_id)
+        .count();
+    anyhow::ensure!(
+        section_count == 1,
+        "timer segment {index}: section {type_id} has {section_count} physical catalog entries, \
+         expected exactly one\ncollector stderr:\n{}",
+        world.harness.failure_log().unwrap_or_default(),
+    );
+
+    let rows = decode_all_sections_of(path, type_id)?;
+    assert_min_snapshots(world, index, type_id, &rows, min)
+}
+
+fn assert_min_snapshots(
+    world: &BddWorld,
+    index: usize,
+    type_id: u32,
+    rows: &[kronika_registry::Row],
+    min: usize,
+) -> Result<()> {
+    use kronika_registry::Cell;
+
     let mut stamps: Vec<i64> = rows
         .iter()
         .filter_map(|row| match row.get("ts") {
@@ -140,8 +184,6 @@ fn timer_segment_spans(
 }
 
 /// Decode rows from every catalog entry of `type_id`.
-///
-/// A multi-window segment contains one entry per collection window.
 fn decode_all_sections_of(
     path: &std::path::Path,
     type_id: u32,

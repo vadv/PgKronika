@@ -5,8 +5,8 @@
 `pg_kronika-collector` is the only process that connects to PostgreSQL and
 writes PGM data. It reads due PostgreSQL, Linux, cgroup, and PostgreSQL
 stderr-log sources, appends one bounded collection window to `active.parts`,
-and seals the journal into `<first_timestamp>.pgm` when a rotation condition
-fires.
+and seals the journal into `YYYY/MM/DD/<segment_id>.pgm` when a rotation
+condition fires.
 
 The daemon prints `ready` and `sealed ...` state changes to stdout. Structured
 logfmt diagnostics go to stderr. A failed collection cycle is logged and
@@ -18,13 +18,54 @@ startup.
 | Variable | Default | Meaning |
 | --- | ---: | --- |
 | `KRONIKA_PG_DSN` | required | `tokio-postgres` URI or `key=value` connection string. |
-| `KRONIKA_OUT_DIR` | required | Directory containing `active.parts` and sealed `.pgm` files. |
-| `KRONIKA_SOURCE_ID` | `0` | `u64` source id stored in segment catalogs. Use a distinct non-zero value when multiple collectors share a directory. |
+| `KRONIKA_OUT_DIR` | required | PgKronika-owned data root containing `active.parts`, owner locks, and the `YYYY/MM/DD` segment tree. |
+| `KRONIKA_SOURCE_ID` | `0` | `u64` source id stored in segment catalogs. Use a stable, distinct non-zero value for each collector/data root whose data may be compared. |
 | `KRONIKA_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, or `trace`; an invalid value falls back to `info`. |
 
 The output directory is created if absent. File modes follow the process umask.
 Segments may contain SQL, plans, process arguments, and log text; restrict this
 directory accordingly.
+
+## Data root and segment identity
+
+The supported local layout is fixed:
+
+```text
+KRONIKA_OUT_DIR/
+├── active.parts
+├── .pgkronika-writer.owner.lock
+├── .pgkronika-overview.owner.lock
+└── YYYY/
+    └── MM/
+        └── DD/
+            ├── N.pgm
+            └── N.ovf
+```
+
+`N` is the `SegmentId`: the Unix timestamp in microseconds of the first
+collection window successfully appended to the segment. `YYYY/MM/DD` is the
+UTC day derived from that id. A segment open across midnight stays in its
+starting day's directory; readers use the PGM catalog's `min_ts` and `max_ts`
+for time-range queries.
+
+The collector writes `active.parts`, the writer lock, and PGM files. The web
+process may add the overview lock and derived `N.ovf` siblings. One collector
+holds `.pgkronika-writer.owner.lock` for the lifetime of the process, so two
+collectors cannot write the same data root. Use a separate `KRONIKA_OUT_DIR`
+for each collector. After acquiring that lock, startup removes only recognized
+stale PGM publication temporaries. OVF and overview-probe temporaries remain
+under the overview owner's control.
+
+`active.parts` uses journal version 1 with magic `PGKJNL1\0`. Its checksummed
+header stores the active `SegmentId`; the first id and frame are synchronized
+together. A zero-length, headerless, differently versioned, torn, or damaged
+journal stops startup and is left unchanged. After successful PGM publication,
+the file becomes a synchronized valid empty version-1 journal.
+
+The root has a closed grammar. Root-level `.pgm` or `.ovf` files, symbolic
+links, unknown entries, malformed dates, and misplaced segment ids stop
+startup. This is the first supported layout in the unreleased project.
+Recreate development and test data that does not satisfy this contract.
 
 ## Connection and query guards
 
@@ -63,7 +104,7 @@ uncovered or skipped work instead of reporting it as complete data. See
 | `KRONIKA_OS_CGROUP_MAX_DEPTH` | `8` | Cgroup traversal depth. |
 | `KRONIKA_SEGMENT_MAX_BYTES` | `67108864` | Seal after this many raw journal bytes; `0` seals each window. |
 | `KRONIKA_SEGMENT_MAX_AGE_S` | `900` | Maximum age of an open segment. |
-| `KRONIKA_JOURNAL_MAX_BYTES` | `1073741824` | Hard on-disk journal cap; reaching it triggers an early seal. |
+| `KRONIKA_JOURNAL_MAX_BYTES` | `1073741824` | Physical journal cap, including the reset marker; accepted range is 36 bytes–1 GiB, and reaching it triggers an early seal. |
 
 Invalid startup limits fail before collection when they would exceed a section
 or dictionary contract. OS cap parse errors degrade to the documented default
@@ -157,12 +198,18 @@ keeps fresh-event delay to one bounded old-file read.
 | `KRONIKA_LOG_PATH` | unset | Override the discovered path; does not override explicit disable. |
 | `KRONIKA_LOG_ROOT` | unset | Root used for PostgreSQL log discovery. |
 | `KRONIKA_LOG_FORMAT` | `stderr` | `stderr` is parsed; `csvlog` is accepted but reported as unsupported. |
-| `KRONIKA_LOG_STATE_PATH` | `<out>/pg_log_tail.state` | Durable tail position. |
+| `KRONIKA_LOG_STATE_PATH` | required when enabled | Durable tail position. Must be outside `KRONIKA_OUT_DIR`. |
 | `KRONIKA_LOG_START_AT_BEGINNING` | `false` | Start a newly discovered file at offset zero. |
 
 The tailer applies fixed line, byte, time, backlog, and output caps. Rotation,
 truncation, binary input, backlog skips, and exhausted budgets become typed gap
 rows; the collector does not present a partial read as complete.
+
+Because PostgreSQL log collection is enabled by default,
+`KRONIKA_LOG_STATE_PATH` is normally required. It is not required when
+`KRONIKA_PG_LOG_ENABLED=0`. The state file is deliberately outside the strict
+data root; include it separately in a consistent backup when preserving the
+exact committed log-tail position matters.
 
 ## Linux fixture overrides
 
@@ -174,6 +221,7 @@ BDD and parser fixtures. Production deployments normally leave them unset.
 ```sh
 KRONIKA_PG_DSN='host=127.0.0.1 dbname=postgres user=kronika password=change-me' \
 KRONIKA_OUT_DIR=/var/lib/pg_kronika \
+KRONIKA_LOG_STATE_PATH=/var/lib/pg_kronika-log.state \
 KRONIKA_SOURCE_ID=1 \
 pg_kronika-collector
 ```

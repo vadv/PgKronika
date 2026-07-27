@@ -16,7 +16,7 @@ use crate::{AppState, OverviewConfig, app};
 
 use super::{capture_json, test_metrics_handle, write_bgwriter_segment};
 
-fn write_overview_event_segment(dir: &std::path::Path) {
+fn write_overview_event_segment(dir: &std::path::Path) -> std::path::PathBuf {
     let body = PgLogErrorV1::encode(&[PgLogErrorV1 {
         ts: Ts(1),
         severity: 2,
@@ -46,7 +46,7 @@ fn write_overview_event_segment(dir: &std::path::Path) {
             source_id: 7,
         },
     );
-    std::fs::write(dir.join("one.pgm"), bytes).expect("write overview event segment");
+    crate::test_layout::write_named_pgm(dir, "one.pgm", &bytes)
 }
 
 fn corrupt_first_section_body(path: &std::path::Path) {
@@ -101,8 +101,7 @@ async fn a_metadata_only_fallback_keeps_the_snapshot_that_authorized_its_descrip
 #[tokio::test]
 async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_body() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let segment_path = dir.path().join("one.pgm");
-    write_overview_event_segment(dir.path());
+    let segment_path = write_overview_event_segment(dir.path());
 
     let first_snapshot =
         kronika_reader::LocalDirSnapshot::open(dir.path()).expect("first snapshot");
@@ -154,8 +153,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
 #[tokio::test]
 async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let segment_path = dir.path().join("one.pgm");
-    write_overview_event_segment(dir.path());
+    let segment_path = write_overview_event_segment(dir.path());
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
     let state = AppState::with_overview_config(
         snapshot,
@@ -200,8 +198,7 @@ async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
 #[tokio::test]
 async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let segment_path = dir.path().join("one.pgm");
-    write_overview_event_segment(dir.path());
+    let segment_path = write_overview_event_segment(dir.path());
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
     let mut config = OverviewConfig::new();
     config.source_scrub_interval = Duration::from_millis(10);

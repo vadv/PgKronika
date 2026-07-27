@@ -83,6 +83,63 @@ BDD_SCENARIOS = (
     ),
 )
 
+MICROS_PER_DAY = 86_400_000_000
+I64_MIN = -(1 << 63)
+I64_MAX = (1 << 63) - 1
+SEGMENT_RELATIVE_PATH = re.compile(
+    r"^(?P<year>[0-9]{4})/"
+    r"(?P<month>[0-9]{2})/"
+    r"(?P<day>[0-9]{2})/"
+    r"(?P<segment_id>(?:0|[1-9][0-9]*|-[1-9][0-9]*))"
+    r"\.(?P<extension>pgm|ovf)$"
+)
+
+
+def canonical_segment_path(
+    value: object, expected_extension: str
+) -> tuple[int, str] | None:
+    if not isinstance(value, str):
+        return None
+    match = SEGMENT_RELATIVE_PATH.fullmatch(value)
+    if match is None or match.group("extension") != expected_extension:
+        return None
+
+    segment_id = int(match.group("segment_id"))
+    if not I64_MIN <= segment_id <= I64_MAX:
+        return None
+
+    days_since_epoch = segment_id // MICROS_PER_DAY
+    shifted = days_since_epoch + 719_468
+    era = shifted // 146_097
+    day_of_era = shifted - era * 146_097
+    year_of_era = (
+        day_of_era
+        - day_of_era // 1_460
+        + day_of_era // 36_524
+        - day_of_era // 146_096
+    ) // 365
+    year = year_of_era + era * 400
+    day_of_year = day_of_era - (
+        365 * year_of_era + year_of_era // 4 - year_of_era // 100
+    )
+    month_prime = (5 * day_of_year + 2) // 153
+    day = day_of_year - (153 * month_prime + 2) // 5 + 1
+    month = month_prime + (3 if month_prime < 10 else -9)
+    if month <= 2:
+        year += 1
+    if not 0 <= year <= 9_999:
+        return None
+
+    actual_day = (
+        int(match.group("year")),
+        int(match.group("month")),
+        int(match.group("day")),
+    )
+    if actual_day != (year, month, day):
+        return None
+    return segment_id, f"{segment_id}.{expected_extension}"
+
+
 def rust_evidence(binary: str, path: str, name: str) -> tuple[str, str, str, str]:
     return ("rust_test", binary, path, name)
 
@@ -429,7 +486,7 @@ EXPECTED_EVIDENCE = (
         rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/gc/tests.rs",
-            "source_entries_and_symlinks_are_never_followed_or_removed",
+            "a_sidecar_symlink_makes_gc_fail_closed_without_removing_sources",
         ),
         rust_evidence(
             "kronika-reader",
@@ -482,8 +539,8 @@ WORK_FIELDS = (
     "fallback_resident_bytes",
     "completed_active_parts",
     "visibility_lag_us",
-    "tail_pending_from_offset_bytes",
-    "tail_pending_to_offset_bytes",
+    "damaged_journal_rejections",
+    "damaged_journal_preserved",
     "successful_responses",
     "serialized_response_bytes",
 )
@@ -587,6 +644,8 @@ def validate_storage(storage: dict[str, object], failures: list[str]) -> None:
             "active_journal_name",
             "pgm_file_name",
             "sidecar_file_name",
+            "pgm_relative_path",
+            "sidecar_relative_path",
             "same_stem",
         },
         "storage profile",
@@ -594,6 +653,10 @@ def validate_storage(storage: dict[str, object], failures: list[str]) -> None:
     )
     pgm_name = storage.get("pgm_file_name")
     sidecar_name = storage.get("sidecar_file_name")
+    pgm_path = canonical_segment_path(storage.get("pgm_relative_path"), "pgm")
+    sidecar_path = canonical_segment_path(
+        storage.get("sidecar_relative_path"), "ovf"
+    )
     check(
         storage.get("model") == "owned-data-directory-sibling-sidecars-v1",
         "wrong overview storage model",
@@ -605,13 +668,16 @@ def validate_storage(storage: dict[str, object], failures: list[str]) -> None:
         failures,
     )
     check(
-        isinstance(pgm_name, str)
-        and isinstance(sidecar_name, str)
-        and pgm_name.endswith(".pgm")
-        and sidecar_name.endswith(".ovf")
-        and pgm_name.removesuffix(".pgm") == sidecar_name.removesuffix(".ovf")
+        pgm_path is not None
+        and sidecar_path is not None
+        and pgm_path[0] == sidecar_path[0]
+        and pgm_name == pgm_path[1]
+        and sidecar_name == sidecar_path[1]
         and storage.get("same_stem") is True,
-        "qualification files are not same-stem PGM/OVF siblings",
+        (
+            "qualification files are not canonical UTC YYYY/MM/DD/N.pgm "
+            "and matching N.ovf siblings"
+        ),
         failures,
     )
 
@@ -1087,11 +1153,9 @@ def validate_mode_work(
             failures,
         )
         check(
-            work["tail_pending_from_offset_bytes"] > 0
-            and work["tail_pending_to_offset_bytes"]
-            - work["tail_pending_from_offset_bytes"]
-            == 4,
-            "live did not retain the exact four-byte incomplete tail",
+            work["damaged_journal_rejections"] == 1
+            and work["damaged_journal_preserved"] == 1,
+            "live did not reject and preserve exactly one damaged version-1 journal",
             failures,
         )
     elif mode == "concurrent-identical":

@@ -105,12 +105,28 @@ impl SourceDescriptor {
     /// Derives a descriptor from the exact bytes read while opening a PGM.
     #[must_use]
     pub fn derive(source_file_len: u64, tail_index_bytes: &[u8], raw_catalog_bytes: &[u8]) -> Self {
-        Self(hash_parts(&[
-            CATALOG_DESCRIPTOR_TAG,
-            &source_file_len.to_le_bytes(),
-            tail_index_bytes,
-            raw_catalog_bytes,
-        ]))
+        let mut builder = Self::builder(source_file_len, tail_index_bytes);
+        Self::update_catalog(&mut builder, raw_catalog_bytes);
+        Self::finish(builder)
+    }
+
+    /// Starts an incremental descriptor over one PGM catalog.
+    pub(crate) fn builder(source_file_len: u64, tail_index_bytes: &[u8]) -> Sha256 {
+        let mut hasher = Sha256::new();
+        hasher.update(CATALOG_DESCRIPTOR_TAG);
+        hasher.update(source_file_len.to_le_bytes());
+        hasher.update(tail_index_bytes);
+        hasher
+    }
+
+    /// Adds the next contiguous raw catalog block.
+    pub(crate) fn update_catalog(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update(bytes);
+    }
+
+    /// Completes the descriptor after the final catalog block.
+    pub(crate) fn finish(hasher: Sha256) -> Self {
+        Self(hasher.finalize().into())
     }
 }
 
@@ -247,6 +263,24 @@ mod tests {
         assert_ne!(base, SourceDescriptor::derive(1_001, b"tail", b"catalog"));
         assert_ne!(base, SourceDescriptor::derive(1_000, b"TAIL", b"catalog"));
         assert_ne!(base, SourceDescriptor::derive(1_000, b"tail", b"CATALOG"));
+    }
+
+    #[test]
+    fn incremental_source_descriptor_matches_derive_across_chunk_boundaries() {
+        let catalog: Vec<u8> = (0_u8..=255).cycle().take(128 * 1024 + 17).collect();
+        let expected = SourceDescriptor::derive(1_000, b"tail", &catalog);
+
+        for chunk_len in [1, 31, 32, 64 * 1024, 64 * 1024 + 1] {
+            let mut builder = SourceDescriptor::builder(1_000, b"tail");
+            for chunk in catalog.chunks(chunk_len) {
+                SourceDescriptor::update_catalog(&mut builder, chunk);
+            }
+            assert_eq!(
+                SourceDescriptor::finish(builder),
+                expected,
+                "chunk length {chunk_len}"
+            );
+        }
     }
 
     #[test]

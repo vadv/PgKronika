@@ -7,7 +7,6 @@
 //! steps use.
 
 use std::collections::BTreeSet;
-use std::fs::File;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -23,6 +22,7 @@ use pg_kronika_web::{AppState, app};
 use serde_json::Value;
 use tower::ServiceExt as _;
 
+use crate::collector::SealedSegment;
 use crate::harness::assert_row::KeyMatch;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue};
 
@@ -405,16 +405,15 @@ pub(crate) async fn section_page(dir: &Path, name: &str, source: u64) -> Result<
 /// all read the same immutable fact set and cursor registry. This is the
 /// end-to-end collector → PGM → reader → HTTP assertion used by the `PostgreSQL`
 /// 15–18 feature matrix.
-pub(crate) async fn assert_timeline_pg_log_contract(segment: &Path) -> Result<()> {
-    anyhow::ensure!(
-        segment
-            .extension()
-            .is_some_and(|extension| extension == "pgm"),
-        "timeline fixture is not a sealed PGM: {}",
-        segment.display()
-    );
-    let unit = PgmUnit::open(File::open(segment).context("open timeline fixture PGM")?)
-        .context("read timeline fixture catalog")?;
+pub(crate) async fn assert_timeline_pg_log_contract(segment: &SealedSegment) -> Result<()> {
+    let data_root =
+        kronika_layout::DataRoot::open(segment.data_root()).context("open timeline data root")?;
+    let unit = PgmUnit::open(
+        data_root
+            .open_pgm(segment.address())
+            .context("open timeline fixture PGM")?,
+    )
+    .context("read timeline fixture catalog")?;
     let from_us = unit.catalog().min_ts;
     let to_us = unit
         .catalog()
@@ -422,9 +421,7 @@ pub(crate) async fn assert_timeline_pg_log_contract(segment: &Path) -> Result<()
         .checked_add(1)
         .context("timeline fixture range cannot form a half-open interval")?;
     anyhow::ensure!(from_us < to_us, "timeline fixture range is empty");
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
     let state = AppState::new(snapshot).context("build the timeline web state")?;
     let router = app(state, None, bdd_metrics_handle());
@@ -484,10 +481,13 @@ pub(crate) async fn assert_timeline_pg_log_contract(segment: &Path) -> Result<()
     assert_shared_event_facts(&overview, &events, source)?;
     assert_metric_factor_coverage(&overview, &events, &health)?;
     assert_parsed_panic_and_child_termination_do_not_set_health_floor(&health)?;
-    let sidecar = segment.with_extension("ovf");
+    let sidecar = data_root.diagnostic_file_path(segment.address(), kronika_layout::FileKind::Ovf);
     anyhow::ensure!(
-        sidecar.is_file() && sidecar.parent() == Some(dir),
-        "timeline did not publish the same-stem sibling sidecar: {}",
+        data_root
+            .open_ovf(segment.address())
+            .context("open timeline sibling sidecar")?
+            .is_some(),
+        "timeline did not publish the canonical sibling sidecar: {}",
         sidecar.display()
     );
     Ok(())

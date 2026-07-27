@@ -25,6 +25,7 @@ static DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
         ))
         .set_max_row_group_size(MAX_SECTION_ROWS)
+        .set_dictionary_enabled(false)
         .set_created_by(String::new())
         .build()
 });
@@ -301,7 +302,9 @@ fn section(
 #[cfg(test)]
 mod tests {
     use kronika_format::DictLimits;
-    use kronika_registry::{DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID};
+    use kronika_registry::{Bytes, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID};
+    use parquet::basic::Encoding;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
 
     use super::encode;
     use crate::Interner;
@@ -336,5 +339,44 @@ mod tests {
             .expect("blobs section");
         assert_eq!(blobs.rows, 1);
         assert_eq!(&blobs.body[..4], b"PAR1", "a Parquet body");
+    }
+
+    #[test]
+    fn journal_dictionary_columns_have_no_dictionary_pages() {
+        let mut interner = Interner::new(DictLimits::new(8, 4096).expect("limits"));
+        for value in [
+            b"short-a".as_slice(),
+            b"short-b".as_slice(),
+            b"a value longer than eight bytes".as_slice(),
+            b"another value longer than eight bytes".as_slice(),
+        ] {
+            interner.intern(value).expect("dictionary value");
+        }
+
+        let sections = encode(interner.window()).expect("encode journal dictionary");
+        assert_eq!(sections.len(), 2, "strings and blobs are both exercised");
+        for section in sections {
+            let reader = SerializedFileReader::new(Bytes::from(section.body))
+                .expect("open journal dictionary metadata");
+            for row_group in reader.metadata().row_groups() {
+                for column in row_group.columns() {
+                    assert!(
+                        column.dictionary_page_offset().is_none(),
+                        "journal dictionary type {} column {} has a dictionary page",
+                        section.type_id,
+                        column.column_path().string()
+                    );
+                    assert!(
+                        column.encodings().iter().all(|encoding| !matches!(
+                            encoding,
+                            Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                        )),
+                        "journal dictionary type {} column {} advertises dictionary encoding",
+                        section.type_id,
+                        column.column_path().string()
+                    );
+                }
+            }
+        }
     }
 }

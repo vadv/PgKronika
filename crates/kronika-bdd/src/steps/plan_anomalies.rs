@@ -5,9 +5,12 @@
 //! counters, while the fork-specific features continue to prove that the real
 //! collectors produce those row contracts from `PostgreSQL` 15-18.
 
+use std::io::Write as _;
+
 use anyhow::{Context, Result, ensure};
 use cucumber::{given, then};
 use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
+use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId};
 use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::pg_store_plans::PgStorePlansOsscV1;
 use kronika_registry::reset_metadata::ResetMetadata;
@@ -15,6 +18,7 @@ use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
 use kronika_registry::{Section, StrId, Ts};
 
 use crate::BddWorld;
+use crate::collector::SealedSegment;
 use crate::harness::web_process::WebCase;
 
 const MINUTE_US: i64 = 60 * 1_000_000;
@@ -24,9 +28,29 @@ const SOURCE_ID: u64 = 7;
 #[given("a deterministic OSSC plan-evidence segment")]
 fn deterministic_plan_segment(world: &mut BddWorld) -> Result<()> {
     let directory = tempfile::tempdir().context("create plan-evidence fixture directory")?;
-    let segment = directory.path().join("plan-evidence.pgm");
-    std::fs::write(&segment, plan_evidence_pgm()?)
-        .with_context(|| format!("write {}", segment.display()))?;
+    let address = SegmentAddress::new(
+        SegmentId::new(0).context("construct plan-evidence fixture SegmentId")?,
+    )
+    .context("construct plan-evidence fixture address")?;
+    let root = DataRoot::open(directory.path()).context("open plan-evidence data root")?;
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .context("acquire plan-evidence fixture writer")?;
+    let mut temporary = owner
+        .create_pgm_temp(address)
+        .context("create plan-evidence PGM temporary")?;
+    temporary
+        .file_mut()
+        .write_all(&plan_evidence_pgm()?)
+        .context("write plan-evidence PGM")?;
+    temporary
+        .file_mut()
+        .sync_all()
+        .context("sync plan-evidence PGM")?;
+    temporary.publish().context("publish plan-evidence PGM")?;
+    drop(temporary);
+    drop(owner);
+    let segment = SealedSegment::from_address(directory.path(), address)?;
     world.harness.set_segment(segment);
     world.harness.retain_collector_output_dir(directory);
     Ok(())

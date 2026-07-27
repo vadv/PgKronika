@@ -377,8 +377,19 @@ mod tests {
             },
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("dict.pgm");
-        std::fs::write(&path, &bytes).expect("write segment");
+        let root = kronika_layout::DataRoot::open(dir.path()).expect("open fixture data root");
+        let owner = root
+            .acquire_writer(kronika_layout::LayoutLimits::default())
+            .expect("acquire fixture writer");
+        let address = kronika_layout::SegmentAddress::new(
+            kronika_layout::SegmentId::new(0).expect("fixture SegmentId"),
+        )
+        .expect("fixture address");
+        let mut temporary = owner.create_pgm_temp(address).expect("create PGM fixture");
+        std::io::Write::write_all(temporary.file_mut(), &bytes).expect("write segment");
+        temporary.file_mut().sync_all().expect("sync segment");
+        temporary.publish().expect("publish segment");
+        let path = root.diagnostic_file_path(address, kronika_layout::FileKind::Pgm);
         let dict = Segment::open(&path)
             .expect("open segment")
             .dictionary()

@@ -1340,6 +1340,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kronika-format",
+ "kronika-layout",
  "kronika-reader",
  "kronika-registry",
  "kronika-writer",
@@ -1377,6 +1378,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kronika-layout"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+]
+
+[[package]]
 name = "kronika-reader"
 version = "0.0.0"
 dependencies = [
@@ -1385,6 +1394,7 @@ dependencies = [
  "criterion",
  "kronika-analytics",
  "kronika-format",
+ "kronika-layout",
  "kronika-registry",
  "kronika-store",
  "kronika-writer",
@@ -1449,6 +1459,8 @@ name = "kronika-store"
 version = "0.0.0"
 dependencies = [
  "kronika-format",
+ "kronika-layout",
+ "sha2 0.10.9",
  "tempfile",
 ]
 
@@ -1459,6 +1471,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "kronika-format",
+ "kronika-layout",
  "kronika-reader",
  "kronika-registry",
  "parquet",
@@ -1989,6 +2002,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "kronika-format",
+ "kronika-layout",
  "kronika-registry",
  "kronika-source-log",
  "kronika-source-os",
@@ -2008,6 +2022,7 @@ dependencies = [
  "arrow-select",
  "bytes",
  "kronika-analytics",
+ "kronika-layout",
  "kronika-reader",
  "nix",
  "parquet",
@@ -2033,8 +2048,10 @@ dependencies = [
  "http-body-util",
  "kronika-analytics",
  "kronika-format",
+ "kronika-layout",
  "kronika-reader",
  "kronika-registry",
+ "kronika-store",
  "kronika-writer",
  "metrics",
  "metrics-exporter-prometheus",

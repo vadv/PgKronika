@@ -58,12 +58,7 @@ fn latest_once(
     let mut candidates: Vec<(usize, UnitHandle, UnitMeta)> = snapshot
         .unit_descriptors()
         .filter(|unit| {
-            unit.meta.source_id == source
-                && unit
-                    .catalog
-                    .entries
-                    .iter()
-                    .any(|entry| entry.rows != 0 && logical.type_ids.contains(&entry.type_id))
+            unit.meta.source_id == source && unit.may_contain_any_nonempty_type(&logical.type_ids)
         })
         .map(|unit| (unit.index, unit.handle, unit.meta))
         .collect();
@@ -92,11 +87,21 @@ fn latest_once(
             }
             Err(error) => return Err(LatestError::Read(error)),
         };
+        let has_matching_entry = unit
+            .catalog()
+            .entries
+            .iter()
+            .any(|entry| entry.rows != 0 && logical.type_ids.contains(&entry.type_id));
+        if !has_matching_entry {
+            continue;
+        }
         let dictionary = unit.dictionary().map_err(LatestError::Read)?;
-        for entry in &unit.catalog().entries {
-            if entry.rows == 0 || !logical.type_ids.contains(&entry.type_id) {
-                continue;
-            }
+        for entry in unit
+            .catalog()
+            .entries
+            .iter()
+            .filter(|entry| entry.rows != 0 && logical.type_ids.contains(&entry.type_id))
+        {
             let rows = unit.decode_rows(entry).map_err(LatestError::Read)?;
             let Some(first) = rows.first() else {
                 continue;
@@ -163,11 +168,21 @@ impl SourceSummaryLimits {
             read_bytes: max_read_bytes,
         }
     }
+
+    /// Maximum snapshot units one source-summary query may inspect.
+    #[must_use]
+    pub const fn max_units(self) -> usize {
+        self.units
+    }
 }
 
 impl Default for SourceSummaryLimits {
     fn default() -> Self {
-        Self::new(65_536, 1_048_576, 64 * 1_048_576)
+        Self::new(
+            kronika_layout::LayoutLimits::default().max_segments,
+            1_048_576,
+            64 * 1_048_576,
+        )
     }
 }
 
@@ -224,7 +239,8 @@ pub struct SourceSummary {
 ///
 /// A stale unit restarts the whole operation after refreshing the request-local
 /// snapshot. The final stale attempt is an explicit error; an older status is
-/// never returned as current.
+/// never returned as current. Work admitted by stale attempts still counts
+/// toward the request-wide ceilings.
 ///
 /// # Errors
 ///
@@ -242,8 +258,9 @@ pub fn source_summaries(
     let logical =
         logical_section(PG_LOG_SOURCE_STATUS).expect("pg_log_source_status is a registry contract");
     let mut refreshes = 0_u32;
+    let mut budget = SummaryBudget::new(limits);
     loop {
-        match source_summaries_once(snapshot, &logical, limits) {
+        match source_summaries_once(snapshot, &logical, &mut budget) {
             Ok(summaries) => return Ok(summaries),
             Err(SummaryAttemptError::Stale(_unit_idx)) if refreshes < MAX_REFRESH => {
                 snapshot
@@ -267,9 +284,6 @@ struct SourceCandidate {
     index: usize,
     handle: UnitHandle,
     meta: UnitMeta,
-    status_ordinals: Vec<usize>,
-    status_rows: u64,
-    status_bytes: u64,
     eager_open_bytes: u64,
 }
 
@@ -313,20 +327,11 @@ impl From<SourceSummaryError> for SummaryAttemptError {
 fn source_summaries_once(
     snapshot: &LocalDirSnapshot,
     logical: &LogicalSection,
-    limits: SourceSummaryLimits,
+    budget: &mut SummaryBudget,
 ) -> Result<Vec<SourceSummary>, SummaryAttemptError> {
     let mut by_source = BTreeMap::<u64, SourceAccumulator>::new();
-    let mut units = 0_usize;
     for descriptor in snapshot.unit_descriptors() {
-        units = units.saturating_add(1);
-        if units > limits.units {
-            return Err(limit_error(
-                SourceSummaryResource::Units,
-                u64::try_from(limits.units).unwrap_or(u64::MAX),
-                u64::try_from(units).unwrap_or(u64::MAX),
-            )
-            .into());
-        }
+        budget.charge_unit()?;
         let accumulator = by_source
             .entry(descriptor.meta.source_id)
             .or_insert_with(|| SourceAccumulator::new(descriptor.meta));
@@ -334,35 +339,16 @@ fn source_summaries_once(
         accumulator.max_ts = accumulator.max_ts.max(descriptor.meta.max_ts);
         accumulator.segments = accumulator.segments.saturating_add(1);
 
-        let status_ordinals: Vec<usize> = descriptor
-            .catalog
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(ordinal, entry)| {
-                (entry.rows != 0 && logical.type_ids.contains(&entry.type_id)).then_some(ordinal)
-            })
-            .collect();
-        if !status_ordinals.is_empty() {
-            let status_rows = status_ordinals.iter().fold(0_u64, |rows, &ordinal| {
-                rows.saturating_add(u64::from(descriptor.catalog.entries[ordinal].rows))
-            });
-            let status_bytes = status_ordinals.iter().fold(0_u64, |bytes, &ordinal| {
-                bytes.saturating_add(descriptor.catalog.entries[ordinal].len)
-            });
+        if descriptor.may_contain_any_nonempty_type(&logical.type_ids) {
             accumulator.candidates.push(SourceCandidate {
                 index: descriptor.index,
                 handle: descriptor.handle,
                 meta: descriptor.meta,
-                status_ordinals,
-                status_rows,
-                status_bytes,
                 eager_open_bytes: descriptor.eager_open_bytes,
             });
         }
     }
 
-    let mut budget = SummaryBudget::new(limits);
     let mut summaries = Vec::with_capacity(by_source.len());
     for (source_id, mut accumulator) in by_source {
         accumulator.candidates.sort_by(|left, right| {
@@ -374,7 +360,7 @@ fn source_summaries_once(
                 .then_with(|| right.index.cmp(&left.index))
         });
         let latest_status =
-            latest_status_for_source(snapshot, logical, &accumulator.candidates, &mut budget)?;
+            latest_status_for_source(snapshot, logical, &accumulator.candidates, budget)?;
         summaries.push(SourceSummary {
             source_id,
             min_ts: accumulator.min_ts,
@@ -400,24 +386,35 @@ fn latest_status_for_source(
         {
             break;
         }
-        budget.charge_rows(candidate.status_rows)?;
-        budget.charge_bytes(if candidate.meta.live {
-            candidate.eager_open_bytes
-        } else {
-            candidate.status_bytes
-        })?;
+        budget.charge_bytes(candidate.eager_open_bytes)?;
         let unit = snapshot
             .open_unit_handle(candidate.index, candidate.handle)
             .map_err(attempt_read_error)?;
+        let (status_rows, status_bytes) = unit
+            .catalog()
+            .entries
+            .iter()
+            .filter(|entry| entry.rows != 0 && logical.type_ids.contains(&entry.type_id))
+            .fold((0_u64, 0_u64), |(rows, bytes), entry| {
+                (
+                    rows.saturating_add(u64::from(entry.rows)),
+                    bytes.saturating_add(entry.len),
+                )
+            });
+        if status_rows == 0 {
+            continue;
+        }
+        budget.charge_rows(status_rows)?;
+        if !candidate.meta.live {
+            budget.charge_bytes(status_bytes)?;
+        }
         let mut unit_best = None::<(i64, kronika_registry::Row)>;
-        for &ordinal in &candidate.status_ordinals {
-            let entry = unit.catalog().entries.get(ordinal).ok_or_else(|| {
-                SummaryAttemptError::Failed(SourceSummaryError::Read(
-                    ReadError::CatalogOrdinalOutOfRange {
-                        ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
-                    },
-                ))
-            })?;
+        for entry in unit
+            .catalog()
+            .entries
+            .iter()
+            .filter(|entry| entry.rows != 0 && logical.type_ids.contains(&entry.type_id))
+        {
             let rows = unit.decode_rows(entry).map_err(attempt_read_error)?;
             for row in rows {
                 let Some(Cell::Ts(ts)) = row.get("ts") else {
@@ -489,6 +486,7 @@ fn materialize_row(
 
 struct SummaryBudget {
     limits: SourceSummaryLimits,
+    units: usize,
     rows: u64,
     read_bytes: u64,
 }
@@ -497,9 +495,23 @@ impl SummaryBudget {
     const fn new(limits: SourceSummaryLimits) -> Self {
         Self {
             limits,
+            units: 0,
             rows: 0,
             read_bytes: 0,
         }
+    }
+
+    fn charge_unit(&mut self) -> Result<(), SummaryAttemptError> {
+        self.units = self.units.saturating_add(1);
+        if self.units > self.limits.units {
+            return Err(limit_error(
+                SourceSummaryResource::Units,
+                u64::try_from(self.limits.units).unwrap_or(u64::MAX),
+                u64::try_from(self.units).unwrap_or(u64::MAX),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn charge_rows(&mut self, rows: u64) -> Result<(), SummaryAttemptError> {
@@ -555,16 +567,30 @@ mod tests {
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
 
     use super::{
-        SourceSummaryError, SourceSummaryLimits, SourceSummaryResource, latest_section_row,
-        source_summaries,
+        PG_LOG_SOURCE_STATUS, SourceSummaryError, SourceSummaryLimits, SourceSummaryResource,
+        latest_section_row, logical_section, source_summaries,
     };
     use crate::LocalDirSnapshot;
     use crate::query::Value;
-    use crate::snapshot::{FORCED_STALE_OPEN_UNIT_CALLS, OPEN_UNIT_CALLS};
+    use crate::snapshot::{DECODE_ROWS_CALLS, FORCED_STALE_OPEN_UNIT_CALLS, OPEN_UNIT_CALLS};
+
+    #[test]
+    fn default_source_summary_unit_limit_covers_the_supported_five_year_store() {
+        const FIVE_YEARS_OF_FIFTEEN_MINUTE_SEGMENTS: usize = 5 * 365 * 24 * 4;
+
+        let limits = SourceSummaryLimits::default();
+
+        assert_eq!(
+            limits.max_units(),
+            kronika_layout::LayoutLimits::default().max_segments,
+            "reader and layout must admit the same supported unit cardinality"
+        );
+        assert!(limits.max_units() >= FIVE_YEARS_OF_FIFTEEN_MINUTE_SEGMENTS);
+    }
 
     fn write_status(
         dir: &std::path::Path,
-        file: &str,
+        segment_id: i64,
         source: u64,
         min_ts: i64,
         max_ts: i64,
@@ -592,7 +618,7 @@ mod tests {
                 source_id: source,
             },
         );
-        std::fs::write(dir.join(file), part).expect("write PGM");
+        crate::test_layout::write_pgm(dir, crate::test_layout::address(segment_id), &part);
     }
 
     fn write_status_with_path(dir: &std::path::Path, path: &str) {
@@ -630,7 +656,7 @@ mod tests {
                 source_id: 7,
             },
         );
-        std::fs::write(dir.join("status-with-path.pgm"), part).expect("write PGM");
+        crate::test_layout::write_pgm(dir, crate::test_layout::address(100), &part);
     }
 
     fn field<'a>(row: &'a crate::OutRow, name: &str) -> &'a Value {
@@ -664,14 +690,33 @@ mod tests {
                 source_id: source,
             },
         );
-        std::fs::write(dir.join("old.pgm"), part).expect("write old-store PGM");
+        crate::test_layout::write_pgm(dir, crate::test_layout::address(5), &part);
+    }
+
+    fn write_bloom_false_positive_without_status(dir: &std::path::Path) {
+        let sections = (0..1_024_u32)
+            .map(|index| SectionInput {
+                type_id: 2_000_000 + index,
+                rows: 1,
+                body: b"x",
+            })
+            .collect::<Vec<_>>();
+        let part = build_part(
+            &sections,
+            PartMeta {
+                min_ts: 0,
+                max_ts: 10,
+                source_id: 7,
+            },
+        );
+        crate::test_layout::write_pgm(dir, crate::test_layout::address(5), &part);
     }
 
     #[test]
     fn latest_row_uses_row_timestamp_across_overlapping_units() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_status(dir.path(), "wide.pgm", 7, 0, 1_000, 100, 2);
-        write_status(dir.path(), "older-max.pgm", 7, 0, 900, 800, 0);
+        write_status(dir.path(), 100, 7, 0, 1_000, 100, 2);
+        write_status(dir.path(), 200, 7, 0, 900, 800, 0);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
 
         let row = latest_section_row(&mut snapshot, "pg_log_source_status", 7)
@@ -684,8 +729,8 @@ mod tests {
     #[test]
     fn latest_row_stops_before_provably_older_units() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_status(dir.path(), "new.pgm", 7, 200, 300, 250, 0);
-        write_status(dir.path(), "old.pgm", 7, 100, 200, 190, 2);
+        write_status(dir.path(), 200, 7, 200, 300, 250, 0);
+        write_status(dir.path(), 100, 7, 100, 200, 190, 2);
         OPEN_UNIT_CALLS.with(|calls| calls.set(0));
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
 
@@ -709,6 +754,30 @@ mod tests {
     }
 
     #[test]
+    fn source_summary_confirms_a_bloom_positive_against_the_real_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bloom_false_positive_without_status(dir.path());
+        let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
+        let logical = logical_section(PG_LOG_SOURCE_STATUS).expect("registered status");
+        assert!(
+            snapshot
+                .unit_descriptors()
+                .next()
+                .expect("unit")
+                .may_contain_any_nonempty_type(&logical.type_ids),
+            "fixture must exercise a Bloom false positive"
+        );
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+
+        let summaries = source_summaries(&mut snapshot, SourceSummaryLimits::default())
+            .expect("false positive is not an error");
+
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].latest_status.is_none());
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
     fn latest_row_rejects_an_unregistered_section() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
@@ -722,9 +791,9 @@ mod tests {
     #[test]
     fn source_summaries_scan_all_sources_in_one_bounded_operation() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_status(dir.path(), "source-7-old.pgm", 7, 0, 1_000, 900, 2);
-        write_status(dir.path(), "source-7-new.pgm", 7, 0, 2_000, 1_900, 0);
-        write_status(dir.path(), "source-42.pgm", 42, 0, 1_500, 1_400, 1);
+        write_status(dir.path(), 100, 7, 0, 1_000, 900, 2);
+        write_status(dir.path(), 200, 7, 0, 2_000, 1_900, 0);
+        write_status(dir.path(), 300, 42, 0, 1_500, 1_400, 1);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
         OPEN_UNIT_CALLS.with(|calls| calls.set(0));
 
@@ -765,8 +834,8 @@ mod tests {
     #[test]
     fn source_summary_unit_limit_precedes_body_reads() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_status(dir.path(), "one.pgm", 7, 0, 1, 1, 0);
-        write_status(dir.path(), "two.pgm", 42, 0, 1, 1, 0);
+        write_status(dir.path(), 1, 7, 0, 1, 1, 0);
+        write_status(dir.path(), 2, 42, 0, 1, 1, 0);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
         OPEN_UNIT_CALLS.with(|calls| calls.set(0));
 
@@ -790,7 +859,7 @@ mod tests {
     #[test]
     fn source_summary_row_and_byte_limits_precede_body_reads() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_status(dir.path(), "status.pgm", 7, 0, 1, 1, 0);
+        write_status(dir.path(), 1, 7, 0, 1, 1, 0);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
 
         for (limits, expected_resource) in [
@@ -804,6 +873,7 @@ mod tests {
             ),
         ] {
             OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+            DECODE_ROWS_CALLS.with(|calls| calls.set(0));
             let error =
                 source_summaries(&mut snapshot, limits).expect_err("work ceiling must reject");
             let SourceSummaryError::LimitExceeded {
@@ -817,7 +887,13 @@ mod tests {
             assert_eq!(resource, expected_resource);
             assert_eq!(limit, 0);
             assert!(observed > 0);
-            assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 0);
+            let expected_catalog_opens =
+                usize::from(expected_resource == SourceSummaryResource::Rows);
+            assert_eq!(
+                OPEN_UNIT_CALLS.with(std::cell::Cell::get),
+                expected_catalog_opens
+            );
+            assert_eq!(DECODE_ROWS_CALLS.with(std::cell::Cell::get), 0);
         }
     }
 
@@ -838,9 +914,44 @@ mod tests {
     }
 
     #[test]
+    fn source_summary_byte_limit_is_cumulative_across_stale_retries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_status(dir.path(), 1, 7, 0, 1, 1, 0);
+        let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
+        let catalog_bytes = snapshot
+            .unit_descriptors()
+            .next()
+            .expect("status unit")
+            .eager_open_bytes;
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+        FORCED_STALE_OPEN_UNIT_CALLS.with(|calls| calls.set(1));
+
+        let error = source_summaries(
+            &mut snapshot,
+            SourceSummaryLimits::new(usize::MAX, u64::MAX, catalog_bytes),
+        )
+        .expect_err("the retried catalog read must exceed the request-wide byte ceiling");
+
+        FORCED_STALE_OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            error,
+            SourceSummaryError::LimitExceeded {
+                resource: SourceSummaryResource::Bytes,
+                limit,
+                observed,
+            } if limit == catalog_bytes && observed == catalog_bytes * 2
+        ));
+        assert_eq!(
+            OPEN_UNIT_CALLS.with(std::cell::Cell::get),
+            1,
+            "the second attempt must be rejected before reopening the unit"
+        );
+    }
+
+    #[test]
     fn repeated_staleness_is_explicit_instead_of_returning_an_old_status() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_status(dir.path(), "status.pgm", 7, 0, 1, 1, 0);
+        write_status(dir.path(), 1, 7, 0, 1, 1, 0);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("snapshot");
         FORCED_STALE_OPEN_UNIT_CALLS.with(|calls| calls.set(3));
 

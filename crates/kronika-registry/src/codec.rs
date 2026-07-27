@@ -144,6 +144,9 @@ pub enum CodecError {
     },
     /// Parquet footer, column ranges, or page headers are inconsistent.
     InvalidPageLayout,
+    /// A variable-width dictionary section uses Parquet dictionary encoding,
+    /// whose index expansion is not bounded by encoded page sizes.
+    DictionaryEncodingUnsupported,
     /// A column required by the contract is absent from the decoded file.
     MissingColumn {
         /// The missing column name.
@@ -238,6 +241,9 @@ impl fmt::Display for CodecError {
             Self::InvalidPageLayout => {
                 f.write_str("Parquet page layout violates the bounded footer contract")
             }
+            Self::DictionaryEncodingUnsupported => {
+                f.write_str("Parquet dictionary encoding is not admitted for dictionary sections")
+            }
             Self::MissingColumn { name } => write!(f, "decoded section lacks column {name:?}"),
             Self::ColumnType { name } => write!(f, "decoded column {name:?} has the wrong type"),
             Self::NullInRequiredColumn { name } => {
@@ -283,6 +289,7 @@ impl Error for CodecError {
             | Self::DecodedSectionTooLarge { .. }
             | Self::TooManyRowGroups { .. }
             | Self::InvalidPageLayout
+            | Self::DictionaryEncodingUnsupported
             | Self::MissingColumn { .. }
             | Self::ColumnType { .. }
             | Self::NullInRequiredColumn { .. }

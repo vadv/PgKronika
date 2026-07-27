@@ -21,6 +21,10 @@ pub(super) const MAX_REFRESH: u32 = 2;
 const MAX_MATERIALIZED_CELLS: usize = 10_000_000;
 /// Maximum owned variable-width payload retained by one query.
 const MAX_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum catalog/open bytes admitted by one section query.
+const MAX_CATALOG_READ_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum dictionary body bytes admitted by one section query.
+const MAX_DICTIONARY_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One logical section's answer for a source and time window.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,30 +42,89 @@ pub struct SectionPage {
     pub next_cursor: Option<Cursor>,
 }
 
-/// Row and materialized-cell ceilings for a section query.
+/// Request-wide I/O work ceilings for a section query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryWorkLimits {
+    units: usize,
+    catalog_read_bytes: u64,
+    dictionary_read_bytes: u64,
+}
+
+impl QueryWorkLimits {
+    /// Set unit, catalog/open-byte, and dictionary-body-byte ceilings.
+    #[must_use]
+    pub const fn new(
+        max_units: usize,
+        max_catalog_read_bytes: u64,
+        max_dictionary_read_bytes: u64,
+    ) -> Self {
+        Self {
+            units: max_units,
+            catalog_read_bytes: max_catalog_read_bytes,
+            dictionary_read_bytes: max_dictionary_read_bytes,
+        }
+    }
+}
+
+impl Default for QueryWorkLimits {
+    fn default() -> Self {
+        Self::new(
+            kronika_layout::LayoutLimits::default().max_segments,
+            MAX_CATALOG_READ_BYTES,
+            MAX_DICTIONARY_READ_BYTES,
+        )
+    }
+}
+
+/// Row, materialization, and request-wide work ceilings for a section query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryLimits {
     rows: usize,
     cells: usize,
     bytes: usize,
+    work: QueryWorkLimits,
 }
 
 impl QueryLimits {
     /// Set the row and cell ceilings.
     #[must_use]
-    pub const fn new(rows: usize, cells: usize) -> Self {
+    pub fn new(rows: usize, cells: usize) -> Self {
         Self {
             rows,
             cells,
             bytes: MAX_MATERIALIZED_BYTES,
+            work: QueryWorkLimits::default(),
         }
     }
 
     /// Set row, cell, and owned variable-width byte ceilings.
     #[must_use]
-    pub const fn with_bytes(rows: usize, cells: usize, bytes: usize) -> Self {
-        Self { rows, cells, bytes }
+    pub fn with_bytes(rows: usize, cells: usize, bytes: usize) -> Self {
+        Self {
+            rows,
+            cells,
+            bytes,
+            work: QueryWorkLimits::default(),
+        }
     }
+
+    /// Replace the request-wide I/O work ceilings.
+    #[must_use]
+    pub const fn with_work_limits(mut self, work: QueryWorkLimits) -> Self {
+        self.work = work;
+        self
+    }
+}
+
+/// Resource whose section-query work ceiling was exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryWorkResource {
+    /// Snapshot units inspected after source and time filtering.
+    Units,
+    /// Stored bytes admitted to open candidate catalogs.
+    CatalogBytes,
+    /// Stored dictionary body bytes admitted after catalog confirmation.
+    DictionaryBytes,
 }
 
 /// Why a batch section read failed.
@@ -83,6 +146,15 @@ pub enum QueryError {
         /// Maximum owned variable-width bytes a query may retain.
         max_bytes: usize,
     },
+    /// Request-wide unit or read-byte work exceeded its ceiling.
+    WorkLimitExceeded {
+        /// Work dimension that reached its ceiling.
+        resource: QueryWorkResource,
+        /// Configured ceiling.
+        limit: u64,
+        /// Work required after admitting the next operation.
+        observed: u64,
+    },
 }
 
 impl From<ReadError> for QueryError {
@@ -103,7 +175,8 @@ impl From<ReadError> for QueryError {
 /// Returns [`QueryError::UnknownSection`] when `name` is not registered,
 /// [`QueryError::BadCursor`] when `cursor` targets another source, or
 /// [`QueryError::Read`] when a unit cannot be opened or decoded. Returns
-/// [`QueryError::ResultTooLarge`] before retaining more than the query budget.
+/// [`QueryError::ResultTooLarge`] before retaining more than the materialization
+/// budget, or [`QueryError::WorkLimitExceeded`] before exceeding read work.
 pub fn section(
     snap: &mut LocalDirSnapshot,
     name: &str,
@@ -163,7 +236,8 @@ pub fn section_with_limits(
 /// Returns [`QueryError::UnknownSection`] for the first unregistered name,
 /// [`QueryError::BadCursor`] when a cursor targets another source, or
 /// [`QueryError::Read`] when a unit cannot be opened or decoded. Returns
-/// [`QueryError::ResultTooLarge`] before retaining more than the query budget.
+/// [`QueryError::ResultTooLarge`] before retaining more than the materialization
+/// budget, or [`QueryError::WorkLimitExceeded`] before exceeding read work.
 pub fn sections(
     snap: &mut LocalDirSnapshot,
     source: u64,
@@ -200,7 +274,12 @@ pub fn sections_with_limits(
 ) -> Result<BTreeMap<String, SectionPage>, QueryError> {
     let max_cells = limits.cells.min(MAX_MATERIALIZED_CELLS);
     let max_bytes = limits.bytes.min(MAX_MATERIALIZED_BYTES);
-    let effective_limits = QueryLimits::with_bytes(limits.rows, max_cells, max_bytes);
+    let effective_limits = QueryLimits {
+        rows: limits.rows,
+        cells: max_cells,
+        bytes: max_bytes,
+        work: limits.work,
+    };
     // Resolve every requested name up front; an unknown name fails the whole call.
     let mut requested: Vec<(String, LogicalSection)> = Vec::with_capacity(names.len());
     for &name in names {
@@ -208,23 +287,31 @@ pub fn sections_with_limits(
             logical_section(name).ok_or_else(|| QueryError::UnknownSection(name.to_owned()))?;
         requested.push((name.to_owned(), logical));
     }
+    let mut requested_type_ids = requested
+        .iter()
+        .flat_map(|(_, logical)| logical.type_ids.iter().copied())
+        .collect::<Vec<_>>();
+    requested_type_ids.sort_unstable();
+    requested_type_ids.dedup();
 
     // Gather rows and the time ranges actually read. A unit that goes stale mid
     // read (concurrent seal/reset) triggers a snapshot refresh and a full retry,
     // up to MAX_REFRESH times; after that the still-stale unit is skipped and its
     // time drops out of coverage, surfacing as a gap.
     let mut refreshed: u32 = 0;
+    let mut work_budget = QueryWorkBudget::new(effective_limits.work);
     let (buffers, covered) = loop {
         let skip_stale = refreshed >= MAX_REFRESH;
-        match gather(
-            snap,
+        let query = GatherQuery {
             source,
             from,
             to,
-            &requested,
+            requested: &requested,
+            requested_type_ids: &requested_type_ids,
             skip_stale,
-            effective_limits,
-        ) {
+            limits: effective_limits,
+        };
+        match gather(snap, &query, &mut work_budget) {
             Ok(gathered) => break gathered,
             Err(GatherError::Stale) => {
                 snap.refresh()
@@ -237,6 +324,17 @@ pub fn sections_with_limits(
             }
             Err(GatherError::MaterializedBytesTooLarge) => {
                 return Err(QueryError::MaterializedBytesTooLarge { max_bytes });
+            }
+            Err(GatherError::WorkLimitExceeded {
+                resource,
+                limit,
+                observed,
+            }) => {
+                return Err(QueryError::WorkLimitExceeded {
+                    resource,
+                    limit,
+                    observed,
+                });
             }
         }
     };
@@ -305,116 +403,226 @@ enum GatherError {
     ResultTooLarge,
     /// Retaining another row would exceed the variable-width byte budget.
     MaterializedBytesTooLarge,
+    /// Admitting another unit or read would exceed a request-wide work budget.
+    WorkLimitExceeded {
+        resource: QueryWorkResource,
+        limit: u64,
+        observed: u64,
+    },
 }
 
 /// Per-section row buffers plus the `[min, max]` ranges actually read.
 type Gathered = (Vec<Vec<OutRow>>, Vec<(i64, i64)>);
 
-/// Decode every requested section from the source's in-window units in one pass.
-///
-/// Opens each unit once, reads its dictionary once, and returns per-section row
-/// buffers alongside the units' `[min, max]` ranges. With `skip_stale` a unit
-/// that opens stale is skipped; otherwise the first stale unit returns
-/// [`GatherError::Stale`] so the caller can refresh and retry.
-fn gather(
-    snap: &LocalDirSnapshot,
+struct QueryWorkBudget {
+    limits: QueryWorkLimits,
+    units: u64,
+    catalog_read_bytes: u64,
+    dictionary_read_bytes: u64,
+}
+
+impl QueryWorkBudget {
+    const fn new(limits: QueryWorkLimits) -> Self {
+        Self {
+            limits,
+            units: 0,
+            catalog_read_bytes: 0,
+            dictionary_read_bytes: 0,
+        }
+    }
+
+    fn charge_unit(&mut self) -> Result<(), GatherError> {
+        let limit = u64::try_from(self.limits.units).unwrap_or(u64::MAX);
+        charge_work(&mut self.units, 1, limit, QueryWorkResource::Units)
+    }
+
+    fn charge_catalog_read(&mut self, bytes: u64) -> Result<(), GatherError> {
+        charge_work(
+            &mut self.catalog_read_bytes,
+            bytes,
+            self.limits.catalog_read_bytes,
+            QueryWorkResource::CatalogBytes,
+        )
+    }
+
+    fn charge_dictionary_read(&mut self, bytes: u64) -> Result<(), GatherError> {
+        charge_work(
+            &mut self.dictionary_read_bytes,
+            bytes,
+            self.limits.dictionary_read_bytes,
+            QueryWorkResource::DictionaryBytes,
+        )
+    }
+}
+
+fn charge_work(
+    current: &mut u64,
+    amount: u64,
+    limit: u64,
+    resource: QueryWorkResource,
+) -> Result<(), GatherError> {
+    let observed = current.checked_add(amount).unwrap_or(u64::MAX);
+    if observed > limit {
+        return Err(GatherError::WorkLimitExceeded {
+            resource,
+            limit,
+            observed,
+        });
+    }
+    *current = observed;
+    Ok(())
+}
+
+struct GatherQuery<'a> {
     source: u64,
     from: i64,
     to: i64,
-    requested: &[(String, LogicalSection)],
+    requested: &'a [(String, LogicalSection)],
+    requested_type_ids: &'a [u32],
     skip_stale: bool,
     limits: QueryLimits,
+}
+
+#[derive(Default)]
+struct MaterializationUsage {
+    cells: usize,
+    bytes: usize,
+}
+
+/// Decode every requested section from the source's in-window units in one pass.
+///
+/// Catalog summaries reject definite type misses before open. A Bloom positive
+/// is confirmed against the opened catalog before its dictionary is read. With
+/// `skip_stale` a unit that opens stale is skipped; otherwise the first stale
+/// unit returns [`GatherError::Stale`] so the caller can refresh and retry.
+fn gather(
+    snap: &LocalDirSnapshot,
+    query: &GatherQuery<'_>,
+    work_budget: &mut QueryWorkBudget,
 ) -> Result<Gathered, GatherError> {
-    let metas = snap.units();
-    let in_window: Vec<usize> = metas
-        .iter()
-        .enumerate()
-        .filter(|(_, meta)| meta.source_id == source && meta.max_ts >= from && meta.min_ts <= to)
-        .map(|(idx, _)| idx)
-        .collect();
-
-    let mut buffers: Vec<Vec<OutRow>> = vec![Vec::new(); requested.len()];
+    let mut buffers: Vec<Vec<OutRow>> = vec![Vec::new(); query.requested.len()];
     let mut covered: Vec<(i64, i64)> = Vec::new();
-    let mut materialized_cells = 0_usize;
-    let mut materialized_bytes = 0_usize;
+    let mut materialization = MaterializationUsage::default();
 
-    for &idx in &in_window {
-        let unit = match snap.open_unit(idx) {
+    for descriptor in snap.unit_descriptors().filter(|descriptor| {
+        descriptor.meta.source_id == query.source
+            && descriptor.meta.max_ts >= query.from
+            && descriptor.meta.min_ts <= query.to
+    }) {
+        work_budget.charge_unit()?;
+        let range = (descriptor.meta.min_ts, descriptor.meta.max_ts);
+        if !descriptor.may_contain_any_nonempty_type(query.requested_type_ids) {
+            covered.push(range);
+            continue;
+        }
+
+        work_budget.charge_catalog_read(descriptor.eager_open_bytes)?;
+        let unit = match snap.open_unit_handle(descriptor.index, descriptor.handle) {
             Ok(unit) => unit,
-            Err(ReadError::StaleSnapshot { .. }) if skip_stale => continue,
+            Err(ReadError::StaleSnapshot { .. }) if query.skip_stale => continue,
             Err(ReadError::StaleSnapshot { .. }) => return Err(GatherError::Stale),
             Err(err) => return Err(GatherError::Read(err)),
         };
-        let dict = unit.dictionary().map_err(GatherError::Read)?;
         let catalog = unit.catalog();
-        covered.push((metas[idx].min_ts, metas[idx].max_ts));
-        for (buffer, (_, logical)) in buffers.iter_mut().zip(requested) {
-            for entry in &catalog.entries {
-                if !logical.type_ids.contains(&entry.type_id) {
-                    continue;
-                }
-                let rows = unit.decode_rows(entry).map_err(GatherError::Read)?;
-                let Some(first) = rows.first() else {
+        covered.push(range);
+        if !catalog
+            .entries
+            .iter()
+            .any(|entry| entry.rows != 0 && query.requested_type_ids.contains(&entry.type_id))
+        {
+            continue;
+        }
+
+        let dictionary_read_bytes = catalog
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.type_id,
+                    kronika_registry::DICT_STRINGS_TYPE_ID | kronika_registry::DICT_BLOBS_TYPE_ID
+                )
+            })
+            .fold(0_u64, |bytes, entry| bytes.saturating_add(entry.len));
+        work_budget.charge_dictionary_read(dictionary_read_bytes)?;
+        let dict = unit.dictionary().map_err(GatherError::Read)?;
+        decode_requested_rows(&unit, &dict, query, &mut buffers, &mut materialization)?;
+    }
+    Ok((buffers, covered))
+}
+
+fn decode_requested_rows(
+    unit: &crate::OpenUnit,
+    dict: &crate::Dictionary,
+    query: &GatherQuery<'_>,
+    buffers: &mut [Vec<OutRow>],
+    materialization: &mut MaterializationUsage,
+) -> Result<(), GatherError> {
+    for (buffer, (_, logical)) in buffers.iter_mut().zip(query.requested) {
+        for entry in &unit.catalog().entries {
+            if entry.rows == 0 || !logical.type_ids.contains(&entry.type_id) {
+                continue;
+            }
+            let rows = unit.decode_rows(entry).map_err(GatherError::Read)?;
+            let Some(first) = rows.first() else {
+                continue;
+            };
+            // Cell positions are fixed per contract, so resolve each union
+            // column (and `ts`) once per entry, not per row.
+            let columns = first.contract().columns;
+            let ts_at = columns.iter().position(|column| column.name == "ts");
+            let cell_at: Vec<Option<usize>> = logical
+                .columns
+                .iter()
+                .map(|col| columns.iter().position(|column| column.name == col.name))
+                .collect();
+            for row in rows {
+                let cells = row.cells();
+                let Some(&Cell::Ts(t)) = ts_at.and_then(|at| cells.get(at)) else {
                     continue;
                 };
-                // Cell positions are fixed per contract, so resolve each union
-                // column (and `ts`) to its index once per entry, not per row.
-                // A section without `ts` has no rows in a time-window query.
-                let columns = first.contract().columns;
-                let ts_at = columns.iter().position(|column| column.name == "ts");
-                let cell_at: Vec<Option<usize>> = logical
+                if t < query.from || t > query.to {
+                    continue;
+                }
+                charge_materialization(
+                    &mut materialization.cells,
+                    logical.columns.len(),
+                    query.limits.cells,
+                )?;
+                let row_bytes = logical.columns.iter().zip(&cell_at).try_fold(
+                    0_usize,
+                    |total, (column, at)| {
+                        let value_bytes = at
+                            .and_then(|at| cells.get(at))
+                            .map_or(0, |cell| materialized_value_bytes(cell, dict));
+                        total
+                            .checked_add(column.name.len())
+                            .and_then(|sum| sum.checked_add(value_bytes))
+                    },
+                );
+                let Some(row_bytes) = row_bytes else {
+                    return Err(GatherError::MaterializedBytesTooLarge);
+                };
+                materialization.bytes = materialization
+                    .bytes
+                    .checked_add(row_bytes)
+                    .filter(|total| *total <= query.limits.bytes)
+                    .ok_or(GatherError::MaterializedBytesTooLarge)?;
+                let out = logical
                     .columns
                     .iter()
-                    .map(|col| columns.iter().position(|column| column.name == col.name))
+                    .zip(&cell_at)
+                    .map(|(col, at)| {
+                        let value = at
+                            .and_then(|at| cells.get(at))
+                            .map_or(Value::Null, |cell| cell_to_value(cell, dict).0);
+                        (col.name.to_owned(), value)
+                    })
                     .collect();
-                for row in rows {
-                    let cells = row.cells();
-                    let Some(&Cell::Ts(t)) = ts_at.and_then(|at| cells.get(at)) else {
-                        continue;
-                    };
-                    if t < from || t > to {
-                        continue;
-                    }
-                    charge_materialization(
-                        &mut materialized_cells,
-                        logical.columns.len(),
-                        limits.cells,
-                    )?;
-                    let row_bytes = logical.columns.iter().zip(&cell_at).try_fold(
-                        0_usize,
-                        |total, (column, at)| {
-                            let value_bytes = at
-                                .and_then(|at| cells.get(at))
-                                .map_or(0, |cell| materialized_value_bytes(cell, &dict));
-                            total
-                                .checked_add(column.name.len())
-                                .and_then(|sum| sum.checked_add(value_bytes))
-                        },
-                    );
-                    let Some(row_bytes) = row_bytes else {
-                        return Err(GatherError::MaterializedBytesTooLarge);
-                    };
-                    materialized_bytes = materialized_bytes
-                        .checked_add(row_bytes)
-                        .filter(|total| *total <= limits.bytes)
-                        .ok_or(GatherError::MaterializedBytesTooLarge)?;
-                    let out: OutRow = logical
-                        .columns
-                        .iter()
-                        .zip(&cell_at)
-                        .map(|(col, at)| {
-                            let value = at
-                                .and_then(|at| cells.get(at))
-                                .map_or(Value::Null, |cell| cell_to_value(cell, &dict).0);
-                            (col.name.to_owned(), value)
-                        })
-                        .collect();
-                    buffer.push(out);
-                }
+                buffer.push(out);
             }
         }
     }
-    Ok((buffers, covered))
+    Ok(())
 }
 
 fn materialized_value_bytes(cell: &Cell, dict: &crate::Dictionary) -> usize {
@@ -598,18 +806,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
-    use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
+    use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_registry::Section;
     use kronika_registry::pg_stat_activity::{PgStatActivityV1, PgStatActivityV3};
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use kronika_registry::{StrId, Ts};
 
     use super::{
-        Cursor, QueryError, QueryLimits, Value, charge_materialization, section,
-        section_with_limits, sections,
+        Cursor, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, Value,
+        charge_materialization, section, section_with_limits, sections,
     };
     use crate::LocalDirSnapshot;
-    use crate::snapshot::OPEN_UNIT_CALLS;
+    use crate::query::logical::logical_section;
+    use crate::snapshot::{FORCED_STALE_OPEN_UNIT_CALLS, OPEN_UNIT_CALLS};
 
     /// No cursors; the common resume-nothing case for the batch entry point.
     fn no_cursors() -> BTreeMap<String, Cursor> {
@@ -704,17 +913,24 @@ mod tests {
         )
     }
 
-    /// Wrap part bytes in a journal frame.
-    fn framed(part: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(
-            &FrameHeader {
-                part_len: part.len() as u64,
-            }
-            .encode(),
-        );
-        buf.extend_from_slice(part);
-        buf
+    fn write_pgm(root: &std::path::Path, segment_id: i64, part: &[u8]) {
+        crate::test_layout::write_pgm(root, crate::test_layout::address(segment_id), part);
+    }
+
+    fn write_journal(root: &std::path::Path, segment_id: i64, part: &[u8]) -> std::path::PathBuf {
+        crate::test_layout::write_journal(root, crate::test_layout::address(segment_id).id, &[part])
+    }
+
+    fn write_bloom_false_positive_with_broken_dictionary(root: &std::path::Path) {
+        let mut sections = (0..1_024_u32)
+            .map(|index| (2_000_000 + index, 1, vec![0]))
+            .collect::<Vec<_>>();
+        sections.push((
+            kronika_registry::DICT_STRINGS_TYPE_ID,
+            1,
+            b"not a parquet dictionary".to_vec(),
+        ));
+        write_pgm(root, 5, &part_from(&sections, 0, 10, 7));
     }
 
     /// Extract a named value out of one output row.
@@ -734,7 +950,7 @@ mod tests {
         ])
         .expect("encode");
         let part = part_from(&[(1_008_001, 3, body)], 1000, 3000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page =
@@ -766,7 +982,7 @@ mod tests {
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
             .expect("encode");
         let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page =
@@ -781,12 +997,12 @@ mod tests {
         let body_a = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(3000, 3)])
             .expect("encode");
         let part_a = part_from(&[(1_008_001, 2, body_a)], 1000, 3000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part_a).unwrap();
+        write_pgm(dir.path(), 1000, &part_a);
 
         let body_b = PgStatArchiver::encode(&[archiver_row(2000, 2), archiver_row(4000, 4)])
             .expect("encode");
         let part_b = part_from(&[(1_008_001, 2, body_b)], 2000, 4000, 7);
-        fs::write(dir.path().join("2000.pgm"), &part_b).unwrap();
+        write_pgm(dir.path(), 2000, &part_b);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         assert_eq!(snap.units().len(), 2);
@@ -811,11 +1027,11 @@ mod tests {
         // V3 unit carries leader_pid; V1 unit does not.
         let body_v3 = PgStatActivityV3::encode(&[activity_v3(1000, 10, Some(9))]).expect("encode");
         let part_v3 = part_from(&[(1_001_003, 1, body_v3)], 1000, 1000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part_v3).unwrap();
+        write_pgm(dir.path(), 1000, &part_v3);
 
         let body_v1 = PgStatActivityV1::encode(&[activity_v1(2000, 20)]).expect("encode");
         let part_v1 = part_from(&[(1_001_001, 1, body_v1)], 2000, 2000, 7);
-        fs::write(dir.path().join("2000.pgm"), &part_v1).unwrap();
+        write_pgm(dir.path(), 2000, &part_v1);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page =
@@ -850,24 +1066,24 @@ mod tests {
         // Rows decoded from different layout versions must still present the
         // same column list: the full union, in logical-section order.
         let body_v3 = PgStatActivityV3::encode(&[activity_v3(1000, 10, Some(9))]).expect("encode");
-        fs::write(
-            dir.path().join("1000.pgm"),
-            part_from(&[(1_001_003, 1, body_v3)], 1000, 1000, 7),
-        )
-        .unwrap();
+        write_pgm(
+            dir.path(),
+            1000,
+            &part_from(&[(1_001_003, 1, body_v3)], 1000, 1000, 7),
+        );
         let body_v1 = PgStatActivityV1::encode(&[activity_v1(2000, 20)]).expect("encode");
-        fs::write(
-            dir.path().join("2000.pgm"),
-            part_from(&[(1_001_001, 1, body_v1)], 2000, 2000, 7),
-        )
-        .unwrap();
+        write_pgm(
+            dir.path(),
+            2000,
+            &part_from(&[(1_001_001, 1, body_v1)], 2000, 2000, 7),
+        );
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page =
             section(&mut snap, "pg_stat_activity", 7, 0, 10_000, 100, None).expect("section");
         assert_eq!(page.rows.len(), 2, "one row per layout version");
 
-        let union: Vec<&str> = crate::query::logical::logical_section("pg_stat_activity")
+        let union: Vec<&str> = logical_section("pg_stat_activity")
             .expect("registered section")
             .columns
             .iter()
@@ -890,7 +1106,7 @@ mod tests {
         ])
         .expect("encode");
         let part = part_from(&[(1_008_001, 4, body)], 1000, 4000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // Window [2000, 3000]: boundaries included, 1000 and 4000 excluded.
@@ -910,7 +1126,7 @@ mod tests {
         ])
         .expect("encode");
         let part = part_from(&[(1_008_001, 3, body)], 1000, 3000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 2, None).expect("section");
@@ -941,7 +1157,8 @@ mod tests {
             other @ (QueryError::Read(_)
             | QueryError::BadCursor(_)
             | QueryError::ResultTooLarge { .. }
-            | QueryError::MaterializedBytesTooLarge { .. }) => {
+            | QueryError::MaterializedBytesTooLarge { .. }
+            | QueryError::WorkLimitExceeded { .. }) => {
                 panic!("expected UnknownSection, got {other:?}")
             }
         }
@@ -967,7 +1184,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1_000, 1)]).expect("encode");
         let part = part_from(&[(1_008_001, 1, body)], 1_000, 1_000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let error = section_with_limits(
             &mut snap,
@@ -986,6 +1203,228 @@ mod tests {
     }
 
     #[test]
+    fn default_work_unit_limit_matches_the_layout_ceiling() {
+        assert_eq!(
+            QueryWorkLimits::default().units,
+            kronika_layout::LayoutLimits::default().max_segments
+        );
+    }
+
+    #[test]
+    fn catalog_summary_rejects_a_definite_type_miss_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
+        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10, 7));
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let activity = logical_section("pg_stat_activity").expect("registered section");
+        assert!(
+            !snap
+                .unit_descriptors()
+                .next()
+                .expect("unit")
+                .may_contain_any_nonempty_type(&activity.type_ids),
+            "fixture must exercise the definite-negative Bloom path"
+        );
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+
+        let page = section(&mut snap, "pg_stat_activity", 7, 0, 10, 100, None).expect("section");
+
+        assert!(page.rows.is_empty());
+        assert!(page.gaps.is_empty());
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn bloom_false_positive_is_confirmed_before_dictionary_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bloom_false_positive_with_broken_dictionary(dir.path());
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let archiver = logical_section("pg_stat_archiver").expect("registered section");
+        assert!(
+            snap.unit_descriptors()
+                .next()
+                .expect("unit")
+                .may_contain_any_nonempty_type(&archiver.type_ids),
+            "fixture must exercise a Bloom false positive"
+        );
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 0, 10, 100, None).expect("false positive");
+
+        assert!(page.rows.is_empty());
+        assert!(page.gaps.is_empty());
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn unit_work_limit_precedes_catalog_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
+        let part = part_from(&[(1_008_001, 1, body)], 0, 10, 7);
+        write_pgm(dir.path(), 1, &part);
+        write_pgm(dir.path(), 2, &part);
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+
+        let error = section_with_limits(
+            &mut snap,
+            "pg_stat_activity",
+            7,
+            0,
+            10,
+            None,
+            QueryLimits::new(100, 10_000).with_work_limits(QueryWorkLimits::new(
+                1,
+                u64::MAX,
+                u64::MAX,
+            )),
+        )
+        .expect_err("the second in-window unit exceeds the work ceiling");
+
+        assert!(matches!(
+            error,
+            QueryError::WorkLimitExceeded {
+                resource: QueryWorkResource::Units,
+                limit: 1,
+                observed: 2,
+            }
+        ));
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn catalog_byte_limit_precedes_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
+        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10, 7));
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let catalog_bytes = snap
+            .unit_descriptors()
+            .next()
+            .expect("unit")
+            .eager_open_bytes;
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+
+        let error = section_with_limits(
+            &mut snap,
+            "pg_stat_archiver",
+            7,
+            0,
+            10,
+            None,
+            QueryLimits::new(100, 10_000).with_work_limits(QueryWorkLimits::new(
+                1,
+                catalog_bytes - 1,
+                u64::MAX,
+            )),
+        )
+        .expect_err("catalog open exceeds the byte ceiling");
+
+        assert!(matches!(
+            error,
+            QueryError::WorkLimitExceeded {
+                resource: QueryWorkResource::CatalogBytes,
+                limit,
+                observed,
+            } if limit == catalog_bytes - 1 && observed == catalog_bytes
+        ));
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn dictionary_byte_limit_precedes_dictionary_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
+        let broken_dictionary = b"not a parquet dictionary".to_vec();
+        write_pgm(
+            dir.path(),
+            5,
+            &part_from(
+                &[
+                    (1_008_001, 1, body),
+                    (
+                        kronika_registry::DICT_STRINGS_TYPE_ID,
+                        1,
+                        broken_dictionary.clone(),
+                    ),
+                ],
+                0,
+                10,
+                7,
+            ),
+        );
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+
+        let error = section_with_limits(
+            &mut snap,
+            "pg_stat_archiver",
+            7,
+            0,
+            10,
+            None,
+            QueryLimits::new(100, 10_000).with_work_limits(QueryWorkLimits::new(1, u64::MAX, 0)),
+        )
+        .expect_err("dictionary body exceeds the byte ceiling");
+
+        assert!(matches!(
+            error,
+            QueryError::WorkLimitExceeded {
+                resource: QueryWorkResource::DictionaryBytes,
+                limit: 0,
+                observed,
+            } if observed == broken_dictionary.len() as u64
+        ));
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn catalog_byte_budget_is_cumulative_across_stale_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
+        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10, 7));
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let catalog_bytes = snap
+            .unit_descriptors()
+            .next()
+            .expect("unit")
+            .eager_open_bytes;
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+        FORCED_STALE_OPEN_UNIT_CALLS.with(|calls| calls.set(1));
+
+        let error = section_with_limits(
+            &mut snap,
+            "pg_stat_archiver",
+            7,
+            0,
+            10,
+            None,
+            QueryLimits::new(100, 10_000).with_work_limits(QueryWorkLimits::new(
+                usize::MAX,
+                catalog_bytes,
+                u64::MAX,
+            )),
+        )
+        .expect_err("the retried catalog open must consume the same request budget");
+
+        FORCED_STALE_OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            error,
+            QueryError::WorkLimitExceeded {
+                resource: QueryWorkResource::CatalogBytes,
+                limit,
+                observed,
+            } if limit == catalog_bytes && observed == catalog_bytes * 2
+        ));
+        assert_eq!(
+            OPEN_UNIT_CALLS.with(std::cell::Cell::get),
+            1,
+            "the retry is rejected before the second open"
+        );
+    }
+
+    #[test]
     fn batch_opens_each_unit_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         // Two sealed units, each carrying both sections.
@@ -997,7 +1436,7 @@ mod tests {
             1000,
             7,
         );
-        fs::write(dir.path().join("1000.pgm"), &part_a).unwrap();
+        write_pgm(dir.path(), 1000, &part_a);
 
         let arch_b = PgStatArchiver::encode(&[archiver_row(2000, 2)]).expect("encode");
         let act_b = PgStatActivityV3::encode(&[activity_v3(2000, 6, None)]).expect("encode");
@@ -1007,7 +1446,7 @@ mod tests {
             2000,
             7,
         );
-        fs::write(dir.path().join("2000.pgm"), &part_b).unwrap();
+        write_pgm(dir.path(), 2000, &part_b);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         assert_eq!(snap.units().len(), 2);
@@ -1048,7 +1487,7 @@ mod tests {
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
             .expect("encode");
         let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let one = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
@@ -1070,7 +1509,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
         let part = part_from(&[(1_008_001, 1, body)], 1000, 1000, 42);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // Query source 7 — the only unit belongs to source 42.
@@ -1085,8 +1524,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
         let part = part_from(&[(1_008_001, 1, body)], 1000, 1000, 7);
-        let journal_path = dir.path().join("active.parts");
-        fs::write(&journal_path, framed(&part)).unwrap();
+        let journal_path = write_journal(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         assert!(snap.units()[0].live);
@@ -1263,7 +1701,7 @@ mod tests {
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
             .expect("encode");
         let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 0, None).expect("section");
@@ -1331,7 +1769,7 @@ mod tests {
         ])
         .expect("encode");
         let part = part_from(&[(1_008_001, 5, body)], 1000, 5000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let pages = page_archived_counts(&mut snap, 7, 2);
@@ -1347,12 +1785,12 @@ mod tests {
         let body_a = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(3000, 3)])
             .expect("encode");
         let part_a = part_from(&[(1_008_001, 2, body_a)], 1000, 3000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part_a).unwrap();
+        write_pgm(dir.path(), 1000, &part_a);
 
         let body_b = PgStatArchiver::encode(&[archiver_row(2000, 2), archiver_row(4000, 4)])
             .expect("encode");
         let part_b = part_from(&[(1_008_001, 2, body_b)], 2000, 4000, 7);
-        fs::write(dir.path().join("2000.pgm"), &part_b).unwrap();
+        write_pgm(dir.path(), 2000, &part_b);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         assert_eq!(snap.units().len(), 2);
@@ -1369,7 +1807,7 @@ mod tests {
         let body = PgStatArchiver::encode(&[archiver_row(5000, 1), archiver_row(5000, 2)])
             .expect("encode");
         let part = part_from(&[(1_008_001, 2, body)], 5000, 5000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // limit 1 cuts between the two equal-ts rows.
@@ -1398,7 +1836,7 @@ mod tests {
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
             .expect("encode");
         let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // limit equals the row count: the first page already drains the stream.
@@ -1421,7 +1859,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
         let part = part_from(&[(1_008_001, 1, body)], 1000, 1000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // A cursor minted for source 42, replayed against source 7.
@@ -1508,7 +1946,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(5000, 1)]).expect("encode");
         let part = part_from(&[(1_008_001, 1, body)], 5000, 5000, 7);
-        fs::write(dir.path().join("5000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 5000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page = section(&mut snap, "pg_stat_archiver", 7, 0, 1000, 100, None).expect("section");
@@ -1522,7 +1960,7 @@ mod tests {
         let body = PgStatArchiver::encode(&[archiver_row(2000, 1), archiver_row(3000, 2)])
             .expect("encode");
         let part = part_from(&[(1_008_001, 2, body)], 2000, 3000, 7);
-        fs::write(dir.path().join("2000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 2000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page =
@@ -1547,17 +1985,17 @@ mod tests {
     fn hole_between_two_units_becomes_a_gap() {
         let dir = tempfile::tempdir().unwrap();
         let a = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
-        fs::write(
-            dir.path().join("1000.pgm"),
-            part_from(&[(1_008_001, 1, a)], 1000, 1000, 7),
-        )
-        .unwrap();
+        write_pgm(
+            dir.path(),
+            1000,
+            &part_from(&[(1_008_001, 1, a)], 1000, 1000, 7),
+        );
         let b = PgStatArchiver::encode(&[archiver_row(5000, 2)]).expect("encode");
-        fs::write(
-            dir.path().join("5000.pgm"),
-            part_from(&[(1_008_001, 1, b)], 5000, 5000, 7),
-        )
-        .unwrap();
+        write_pgm(
+            dir.path(),
+            5000,
+            &part_from(&[(1_008_001, 1, b)], 5000, 5000, 7),
+        );
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page =
@@ -1578,7 +2016,7 @@ mod tests {
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(4000, 2)])
             .expect("encode");
         let part = part_from(&[(1_008_001, 2, body)], 1000, 4000, 7);
-        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page =
@@ -1589,7 +2027,6 @@ mod tests {
     #[test]
     fn stale_active_unit_refreshes_and_reads_the_new_part() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = dir.path().join("active.parts");
         let a = part_from(
             &[(
                 1_008_001,
@@ -1600,7 +2037,7 @@ mod tests {
             1000,
             7,
         );
-        fs::write(&journal, framed(&a)).unwrap();
+        let journal = write_journal(dir.path(), 1000, &a);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         assert!(snap.units()[0].live);
@@ -1618,7 +2055,9 @@ mod tests {
             2000,
             7,
         );
-        fs::write(&journal, framed(&b)).unwrap();
+        let replacement =
+            crate::test_layout::journal_bytes(crate::test_layout::address(2000).id, &[&b]);
+        fs::write(&journal, replacement).unwrap();
 
         let page =
             section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");

@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
+use kronika_format::{JOURNAL_HEADER_LEN, MAX_JOURNAL_LEN};
 use kronika_registry::MAX_SECTION_ROWS;
 use kronika_source_log::{LogConfig, ParserKind as LogParserKind};
 use kronika_source_pg::pool::{DEFAULT_MAX_DATABASES, SessionConfig};
 use kronika_source_pg::replication_details::ReplicationDetailBounds;
 use kronika_source_pg::user_indexes::INDEX_TOPN_AXES;
 use kronika_source_pg::user_tables::TABLE_TOPN_AXES;
-use kronika_writer::DEFAULT_MAX_JOURNAL_LEN;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -166,8 +166,8 @@ impl Config {
         let tick_secs = env_u64("KRONIKA_INTERVAL_S", 5)?;
         let segment_max_bytes = env_u64("KRONIKA_SEGMENT_MAX_BYTES", 64 * 1024 * 1024)?;
         let segment_max_age_secs = env_u64("KRONIKA_SEGMENT_MAX_AGE_S", 900)?;
-        let journal_max_bytes =
-            env_u64("KRONIKA_JOURNAL_MAX_BYTES", DEFAULT_MAX_JOURNAL_LEN as u64)?;
+        let journal_max_bytes = env_u64("KRONIKA_JOURNAL_MAX_BYTES", MAX_JOURNAL_LEN as u64)?;
+        validate_journal_max_bytes(journal_max_bytes)?;
         if segment_max_bytes > journal_max_bytes {
             log_event(
                 LogLevel::Warn,
@@ -229,6 +229,21 @@ impl Config {
             slot_retained_trigger_bytes,
         })
     }
+
+    pub(crate) fn validate_runtime_paths(&self) -> Result<()> {
+        if !self.log.enabled {
+            return Ok(());
+        }
+        validate_state_target(&self.out_dir, &self.log.state_path)
+    }
+}
+
+pub(crate) fn validate_journal_max_bytes(value: u64) -> Result<()> {
+    anyhow::ensure!(
+        (JOURNAL_HEADER_LEN as u64..=MAX_JOURNAL_LEN as u64).contains(&value),
+        "KRONIKA_JOURNAL_MAX_BYTES must be in {JOURNAL_HEADER_LEN}..={MAX_JOURNAL_LEN}, got {value}"
+    );
+    Ok(())
 }
 
 /// Read the per-source intervals, falling back to the built-in defaults.
@@ -294,8 +309,29 @@ fn log_config_from_env(out_dir: &Path) -> Result<LogConfig> {
         "unknown" => LogParserKind::Unknown,
         other => anyhow::bail!("KRONIKA_LOG_FORMAT must be stderr or csvlog, got {other:?}"),
     };
-    let state_path = std::env::var("KRONIKA_LOG_STATE_PATH")
-        .map_or_else(|_| out_dir.join("pg_log_tail.state"), PathBuf::from);
+    let state_path = match std::env::var("KRONIKA_LOG_STATE_PATH") {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
+        Ok(_) | Err(std::env::VarError::NotPresent) if enabled => {
+            anyhow::bail!(
+                "KRONIKA_LOG_STATE_PATH must be set when PostgreSQL log collection is enabled"
+            );
+        }
+        Err(std::env::VarError::NotUnicode(_)) if enabled => {
+            anyhow::bail!("KRONIKA_LOG_STATE_PATH is not valid Unicode");
+        }
+        _ => out_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".pgkronika-disabled-log.state"),
+    };
+    if enabled {
+        let data_root = lexical_absolute(out_dir)?;
+        let state = lexical_absolute(&state_path)?;
+        anyhow::ensure!(
+            !state.starts_with(&data_root),
+            "KRONIKA_LOG_STATE_PATH must be outside KRONIKA_OUT_DIR"
+        );
+    }
     Ok(LogConfig {
         enabled,
         path_override,
@@ -307,6 +343,75 @@ fn log_config_from_env(out_dir: &Path) -> Result<LogConfig> {
         status_interval,
         tail_caps: kronika_source_log::TailCaps::default(),
     })
+}
+
+fn lexical_absolute(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .context("resolve the current directory")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn validate_state_target(data_root: &Path, state_path: &Path) -> Result<()> {
+    let data_root = std::fs::canonicalize(data_root)
+        .with_context(|| format!("canonicalize KRONIKA_OUT_DIR {}", data_root.display()))?;
+    let state = canonicalize_with_missing_tail(state_path)?;
+    anyhow::ensure!(
+        !state.starts_with(&data_root),
+        "KRONIKA_LOG_STATE_PATH resolves inside KRONIKA_OUT_DIR"
+    );
+    Ok(())
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf> {
+    let absolute = lexical_absolute(path)?;
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing
+                    .file_name()
+                    .with_context(|| format!("no existing ancestor for {}", absolute.display()))?;
+                missing.push(name.to_os_string());
+                existing = existing
+                    .parent()
+                    .with_context(|| format!("no existing ancestor for {}", absolute.display()))?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "resolve existing state-path ancestor {}",
+                        existing.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 /// Reject per-axis top-N counts that could overflow a single section.

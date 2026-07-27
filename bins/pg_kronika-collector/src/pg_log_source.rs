@@ -1,5 +1,5 @@
 use crate::buffering::buffer_row;
-use crate::config::Config;
+use crate::config::{Config, validate_state_target};
 use crate::logging::{
     LogLevel, duration_ms, field, log_collection_finish, log_collection_start, log_count_degraded,
     log_event,
@@ -8,6 +8,7 @@ use crate::scheduler::DueSet;
 use crate::segments::{SegmentState, append_window_and_maybe_seal, encode_window};
 use crate::source_contracts::activity_dict_limits;
 use anyhow::{Context, Result};
+use kronika_layout::WriterOwner;
 use kronika_registry::pg_log::{
     PgLogAutovacuumV1, PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1,
     PgLogLockWaitV1, PgLogSlowQueryV1, PgLogSourceStatusV1, PgLogTempFileV1,
@@ -29,6 +30,7 @@ use tokio_postgres::Client;
 pub(crate) async fn run_log_only_cycle(
     log_collector: &mut LogCollector,
     journal: &mut Journal,
+    writer_owner: &WriterOwner,
     config: &Config,
     due: &DueSet,
     segment: &mut SegmentState,
@@ -45,12 +47,13 @@ pub(crate) async fn run_log_only_cycle(
         ts,
     )?;
     if buffers.is_empty() {
-        commit_log_collection(log_collector, Some(&collection));
+        commit_log_collection(log_collector, Some(&collection), config);
         return Ok(Vec::new());
     }
     let flushed = encode_window(buffers, &interner, config)?;
     let sealed = append_window_and_maybe_seal(
         journal,
+        writer_owner,
         config,
         segment,
         ts,
@@ -59,7 +62,7 @@ pub(crate) async fn run_log_only_cycle(
         &interner,
     )
     .context("append the log-only collection window")?;
-    commit_log_collection(log_collector, Some(&collection));
+    commit_log_collection(log_collector, Some(&collection), config);
     Ok(sealed)
 }
 
@@ -193,10 +196,19 @@ pub(crate) const fn source_status_log_level(collection: &LogCollection) -> Optio
 pub(crate) fn commit_log_collection(
     log_collector: &mut LogCollector,
     collection: Option<&LogCollection>,
+    config: &Config,
 ) {
     let Some(collection) = collection else {
         return;
     };
+    if let Err(err) = validate_state_target(&config.out_dir, &config.log.state_path) {
+        log_event(
+            LogLevel::Error,
+            "pg_log_state_path_rejected",
+            &[field("error", format!("{err:#}"))],
+        );
+        return;
+    }
     if let Err(err) = log_collector.commit(collection) {
         log_event(
             LogLevel::Error,

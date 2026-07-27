@@ -3,6 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::parser::ParserKind;
 
@@ -48,21 +49,22 @@ impl TailState {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)?;
+        let tmp = unique_temp_path(path);
+        let result = (|| {
+            let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
             file.write_all(self.render().as_bytes())?;
             file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp, path)?;
+            if let Some(parent) = path.parent() {
+                sync_dir(parent)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            fs::remove_file(&tmp).ok();
         }
-        fs::rename(&tmp, path)?;
-        if let Some(parent) = path.parent() {
-            sync_dir(parent)?;
-        }
-        Ok(())
+        result
     }
 
     fn render(&self) -> String {
@@ -76,6 +78,12 @@ impl TailState {
             self.skip_until_newline
         )
     }
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{sequence}", std::process::id()))
 }
 
 fn sync_dir(path: &Path) -> io::Result<()> {
@@ -155,6 +163,30 @@ mod tests {
         second.save(&path).expect("second save");
         assert_eq!(TailState::load(&path).expect("load"), Some(second));
         assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn save_ignores_an_existing_fixed_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.txt");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, path.with_extension("tmp")).unwrap();
+        let state = TailState {
+            path: dir.path().join("postgresql.log"),
+            dev: 10,
+            inode: 20,
+            offset: 30,
+            parser_kind: ParserKind::Stderr,
+            skip_until_newline: false,
+        };
+
+        state.save(&path).expect("save through a unique temp");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert_eq!(TailState::load(&path).unwrap(), Some(state));
     }
 
     #[test]

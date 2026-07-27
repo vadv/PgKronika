@@ -64,6 +64,22 @@ Feature: The scheduler paces sources by their own intervals
     Then timer segment 1 section pg_stat_activity.pg14_18 contains at least 2 snapshots
     And timer segment 1 has section pg_settings
 
+  @pgm_coalesced_sections @pg15 @pg16 @pg17 @pg18 @serial
+  Scenario Outline: multi-window data is coalesced on PostgreSQL <major>
+    Given a fresh database on PostgreSQL <major>
+    And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
+    And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "0"
+    And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "3"
+    When the collector runs on its own timer until 1 segment is sealed
+    Then timer segment 1 section pg_stat_activity.pg14_18 is one physical section spanning at least 2 snapshots
+
+    Examples:
+      | major |
+      | 15    |
+      | 16    |
+      | 17    |
+      | 18    |
+
   @pg15 @serial
   Scenario: max age seals even when every due source stays empty
     Given a fresh database on PostgreSQL 15
@@ -79,7 +95,12 @@ Feature: The scheduler paces sources by their own intervals
     Given a fresh database on PostgreSQL 16
     And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
     And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "0"
-    And the collector runs with env "KRONIKA_JOURNAL_MAX_BYTES" = "1"
+    And the collector runs with env "KRONIKA_PG_SETTINGS_INTERVAL_S" = "0"
+    # 256 KiB admits the first complete baseline window, then fills with
+    # paced windows and exercises the journal-full rotation path. The normal
+    # size and age rotation thresholds are disabled for this scenario.
+    And the collector runs with env "KRONIKA_JOURNAL_MAX_BYTES" = "262144"
+    And the collector runs with env "KRONIKA_SEGMENT_MAX_BYTES" = "18446744073709551615"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "3600"
     When the collector runs on its own timer until 2 segments are sealed
     Then timer segment 1 has section pg_stat_activity.pg14_18

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::Json;
 use axum::extract::{RawQuery, State};
 use axum::response::{IntoResponse, Response};
-use kronika_reader::{LocalDirSnapshot, QueryError, logical_section};
+use kronika_reader::{LocalDirSnapshot, QueryError, QueryWorkResource, logical_section};
 use serde_json::Value;
 
 use crate::AppState;
@@ -357,6 +357,19 @@ fn read_error_response(error: QueryError) -> ApiProblem {
         }
         QueryError::MaterializedBytesTooLarge { max_bytes } => {
             ApiProblem::query_limit_exceeded(LimitResource::Bytes, count_u64(max_bytes), None)
+        }
+        QueryError::WorkLimitExceeded {
+            resource,
+            limit,
+            observed,
+        } => {
+            let resource = match resource {
+                QueryWorkResource::Units => LimitResource::Units,
+                QueryWorkResource::CatalogBytes | QueryWorkResource::DictionaryBytes => {
+                    LimitResource::Bytes
+                }
+            };
+            ApiProblem::query_limit_exceeded(resource, limit, Some(observed))
         }
         QueryError::BadCursor(message) => {
             logged_internal_problem("api_reader_cursor_invariant", &message)
