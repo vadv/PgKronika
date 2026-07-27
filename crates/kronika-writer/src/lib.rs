@@ -32,6 +32,9 @@ pub use journal::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalConfig, JournalError,
 pub use segment::{SealError, SealSummary, seal};
 
 #[cfg(test)]
+use kronika_reader as _;
+
+#[cfg(test)]
 mod composition_tests {
     //! Cross-crate check: a part built by `kronika-format` survives the
     //! file-backed journal unchanged.

@@ -17,6 +17,7 @@ parquet = { version = "55", default-features = false, features = ["arrow", "zstd
 sha2 = "0.10"
 
 [dev-dependencies]
+kronika-reader = { path = "../kronika-reader" }
 tempfile = "3"
 
 [lints]

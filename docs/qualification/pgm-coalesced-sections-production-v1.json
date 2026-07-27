@@ -1,0 +1,214 @@
+{
+  "schema": "pgkronika.pgm-coalesced-sections.production-measurement/v1",
+  "measured_at_utc": "2026-07-27T06:29:39Z",
+  "repository": {
+    "url": "https://github.com/vadv/PgKronika",
+    "branch": "feat/pgm-coalesced-sections",
+    "base_commit": "d50d9795fbd6a29965224b8c510139d285fe1b02",
+    "base_tree": "b3eaaa772f61c48802ef8370ac01b32e14f1e860",
+    "production_candidate_commit": "18948c58593120f5d1c79d76e23c05461d93ba11",
+    "production_candidate_tree": "c7098dff75d0e2cad6fc5a14eaea0b0011f08598"
+  },
+  "runner": {
+    "source": "crates/kronika-writer/examples/measure_coalesced_sections.rs",
+    "source_sha256": "841207be277f74e35cc1829afe77de5ca58c84e49d9ec9618bcc29610df33788",
+    "base_binary_sha256": "a53a687c73d7882274552379e98d8d73a2b6763da01dfdd1bbbca9181fe3284c",
+    "candidate_binary_sha256": "e45ed17b4fee2e90904fa969d35e423b7d0175919b85defe11b5d159f01d6e13",
+    "target": "x86_64-unknown-linux-musl",
+    "linkage": "static-pie",
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)"
+  },
+  "host": {
+    "os": "Fedora Linux 41",
+    "kernel": "6.17.10-100.fc41.x86_64",
+    "filesystem": "ext4",
+    "filesystem_block_bytes": 4096,
+    "cpu": "AMD Ryzen 9 8945HS",
+    "physical_cores": 8,
+    "logical_cpus": 16,
+    "memory_kib": 63541348,
+    "page_cache": "not dropped",
+    "isolation": "shared host; no CPU, memory, or block-device isolation"
+  },
+  "method": {
+    "input": "one deterministic active.parts generated through Journal::append",
+    "base_candidate_input": "base and candidate prepare phases produced byte-identical journals; both seal phases consumed the same retained file",
+    "logical_identity": "sorted row multiset with length-delimited physical cell encodings, raw f32/f64 bits, and normalized dictionary entries",
+    "timing": "one warm-cache observation per prebuilt release phase; internal wall clocks use Instant",
+    "rss_and_process_io": "GNU time 1.9; filesystem input/output counters are retained raw and are not converted to bytes",
+    "query_io": "strace 6.17 pread64 return bytes; traced wall time is not used",
+    "restart": "fresh LocalDirSnapshot over a directory containing only segment.pgm",
+    "pgm_scope": "PGM bytes only; no OVF or combined total"
+  },
+  "fixture": {
+    "windows": 4,
+    "rows_per_type_per_window": 8,
+    "registered_types": 76,
+    "registry_type_id_sha256": "9ab1972d04bc6dd6728357a91ab16faf5f956002dd1a3f4583d4f103374a424c",
+    "input_physical_sections": 312,
+    "source_id": 18377929088695774795,
+    "active_parts": {
+      "bytes": 1728441,
+      "sha256": "fbf0e41167e4fccbb579b55bd2ba88f76989f143af4e46d63c93963e26edb9f7",
+      "parts": 4,
+      "base_prepare_sha256": "fbf0e41167e4fccbb579b55bd2ba88f76989f143af4e46d63c93963e26edb9f7",
+      "candidate_prepare_sha256": "fbf0e41167e4fccbb579b55bd2ba88f76989f143af4e46d63c93963e26edb9f7",
+      "byte_identical": true,
+      "base_prepare": {
+        "internal_wall_ns": 3390886176,
+        "process_wall_seconds": 3.39,
+        "user_seconds": 0.41,
+        "system_seconds": 2.93,
+        "max_rss_kib": 9636,
+        "filesystem_inputs": 0,
+        "filesystem_outputs": 3400
+      },
+      "candidate_prepare": {
+        "internal_wall_ns": 3404422427,
+        "process_wall_seconds": 3.4,
+        "user_seconds": 0.45,
+        "system_seconds": 2.9,
+        "max_rss_kib": 9672,
+        "filesystem_inputs": 0,
+        "filesystem_outputs": 3400
+      }
+    },
+    "logical": {
+      "data_rows": 2432,
+      "dictionary_entries": 33,
+      "canonical_stream_bytes": 369513,
+      "sha256": "94cf781e2731600cd695267afbd2ce2b8eecc118d9bd718fbc313c9488381833"
+    }
+  },
+  "baseline": {
+    "pgm": {
+      "bytes": 1728221,
+      "sha256": "37b3d06a969d99bb695b2e5f4c1dd6b22c9609f3f1d6145a204b5161683ef7b5"
+    },
+    "catalog": {
+      "sections": 312,
+      "rows": 2468,
+      "data_rows": 2432,
+      "dictionary_rows": 36
+    },
+    "logical": {
+      "data_rows": 2432,
+      "dictionary_entries": 33,
+      "canonical_stream_bytes": 369513,
+      "sha256": "94cf781e2731600cd695267afbd2ce2b8eecc118d9bd718fbc313c9488381833"
+    },
+    "seal": {
+      "internal_wall_ns": 3565995,
+      "process_wall_seconds": 0.01,
+      "user_seconds": 0.0,
+      "system_seconds": 0.0,
+      "max_rss_kib": 2816,
+      "filesystem_inputs": 0,
+      "filesystem_outputs": 3376
+    },
+    "read": {
+      "logical_wall_ns": 365283121,
+      "production_open_wall_ns": 49602,
+      "production_decode_wall_ns": 353280412,
+      "production_data_rows": 2432,
+      "process_wall_seconds": 0.73,
+      "user_seconds": 0.14,
+      "system_seconds": 0.57,
+      "max_rss_kib": 5880,
+      "filesystem_inputs": 0,
+      "filesystem_outputs": 0
+    },
+    "query": {
+      "section": "pg_stat_activity",
+      "snapshot_restart_wall_ns": 84438,
+      "snapshot_units": 1,
+      "snapshot_warnings": 0,
+      "snapshot_damages": 0,
+      "wall_ns": 16459636,
+      "rows": 96,
+      "gaps": 2,
+      "has_next_cursor": false,
+      "max_rss_kib": 5804,
+      "filesystem_inputs": 0,
+      "filesystem_outputs": 0,
+      "pread64": {
+        "calls": 26,
+        "bytes": 94177
+      },
+      "strace_sha256": "c364c089b52e820dfad9faf7c318d3ff71d1d4be55ec9f7e04431dea8e7deaab"
+    }
+  },
+  "candidate": {
+    "pgm": {
+      "bytes": 284298,
+      "sha256": "583d00d84274c71c9bf1591a0ac8faedaebd0abcd66310db4203c48944cea969"
+    },
+    "catalog": {
+      "sections": 78,
+      "rows": 2465,
+      "data_rows": 2432,
+      "dictionary_rows": 33
+    },
+    "logical": {
+      "data_rows": 2432,
+      "dictionary_entries": 33,
+      "canonical_stream_bytes": 369513,
+      "sha256": "94cf781e2731600cd695267afbd2ce2b8eecc118d9bd718fbc313c9488381833"
+    },
+    "seal": {
+      "internal_wall_ns": 1517596657,
+      "process_wall_seconds": 1.52,
+      "user_seconds": 0.19,
+      "system_seconds": 1.3,
+      "max_rss_kib": 11172,
+      "filesystem_inputs": 0,
+      "filesystem_outputs": 560
+    },
+    "read": {
+      "logical_wall_ns": 58310988,
+      "production_open_wall_ns": 25788,
+      "production_decode_wall_ns": 53605116,
+      "production_data_rows": 2432,
+      "process_wall_seconds": 0.11,
+      "user_seconds": 0.02,
+      "system_seconds": 0.08,
+      "max_rss_kib": 6188,
+      "filesystem_inputs": 0,
+      "filesystem_outputs": 0
+    },
+    "query": {
+      "section": "pg_stat_activity",
+      "snapshot_restart_wall_ns": 61565,
+      "snapshot_units": 1,
+      "snapshot_warnings": 0,
+      "snapshot_damages": 0,
+      "wall_ns": 3310688,
+      "rows": 96,
+      "gaps": 2,
+      "has_next_cursor": false,
+      "max_rss_kib": 5832,
+      "filesystem_inputs": 0,
+      "filesystem_outputs": 0,
+      "pread64": {
+        "calls": 11,
+        "bytes": 19317
+      },
+      "strace_sha256": "b8c72d53cfd09f60cfa1d0b35122cc5b871bd4e46d78bb77428664a2ae90e02c"
+    }
+  },
+  "comparison": {
+    "bytes_saved": 1443923,
+    "byte_reduction_ratio": "6.078906640215548473784550014",
+    "saving_percent": "83.54967333460246114356902271",
+    "section_reduction": "4",
+    "logical_bit_exact": true
+  },
+  "limitations": [
+    "The fixture is synthetic and covers all 76 contracts registered at the measured revisions; it is not the frozen three-segment PostgreSQL 17.10 corpus.",
+    "Wall, RSS, and I/O values are single warm-cache observations on a shared host, not service objectives or population percentiles.",
+    "canonical_stream_bytes is the number of bytes fed to the length-delimited logical digest, not a separately stored manifest file.",
+    "The result does not qualify the frozen natural-segment, 1 GiB journal, ext4/XFS fault, or real-process PostgreSQL 15-18 thresholds.",
+    "The PR #124 prototype measurements remain unchanged and are not relabeled as production results."
+  ]
+}

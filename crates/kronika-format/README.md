@@ -614,8 +614,8 @@ section access.
 The preliminary estimator is superseded. The current
 [physical PGM reduction research](../../docs/superpowers/specs/2026-07-26-pgm-size-reduction-research.md)
 writes complete reader-valid candidates, verifies exact canonical Arrow and
-dictionary equality, covers every registered contract, and records fault,
-resource, I/O, and separate PGM-plus-OVF evidence.
+dictionary equality, covers all 75 contracts registered at its frozen base,
+and records fault, resource, I/O, and separate PGM-plus-OVF evidence.
 
 Three natural full 15-minute files produced candidates of 549,761, 524,989,
 and 522,016 bytes, for reductions of 35.343x, 37.091x, and 37.029x.
@@ -623,6 +623,13 @@ Candidate size has an empirical nearest-rank p50 of 524,989 bytes and
 p95/worst of 549,761 bytes. A separate 62.52-second tail reduced 6.016x and is
 not part of that distribution. The full-segment sample contains only three
 files; it does not support an hourly retention projection.
+
+Those figures are prototype results, not measurements of this implementation.
+The separate
+[production base/candidate measurement](../../docs/qualification/pgm-coalesced-sections-production.md)
+uses one byte-identical `active.parts`, covers the current 76 contracts, and
+records exact PGM hashes, logical identity, timing, RSS, I/O, and restart
+evidence.
 
 The implemented contract applies that in-place replacement while keeping the
 PGM name and `N.pgm` path. There is one writer, one reader, and one canonical

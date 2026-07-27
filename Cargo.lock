@@ -1459,6 +1459,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "kronika-format",
+ "kronika-reader",
  "kronika-registry",
  "parquet",
  "sha2 0.10.9",
