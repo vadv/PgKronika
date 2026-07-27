@@ -1282,6 +1282,7 @@ mod admission_tests {
             replication_fast_interval_s: 10,
             repl_lag_trigger_s: 10,
             slot_retained_trigger_bytes: 1024 * 1024 * 1024,
+            retention: crate::config::RetentionPolicy::Disabled,
         }
     }
 

@@ -115,6 +115,7 @@ uncovered or skipped work instead of reporting it as complete data. See
 | `KRONIKA_SEGMENT_MAX_BYTES` | `67108864` | Seal after this many raw journal bytes; `0` seals each window. |
 | `KRONIKA_SEGMENT_MAX_AGE_S` | `900` | Maximum age of an open segment. |
 | `KRONIKA_JOURNAL_MAX_BYTES` | `1073741824` | Physical journal cap, including the reset marker; accepted range is 36 bytes–1 GiB, and reaching it triggers an early seal. |
+| `KRONIKA_RETENTION` | — | Storage retention policy: fixed bytes budget (e.g., `1073741824`), `auto` (default 80% of filesystem used), or `auto:P` (e.g., `auto:75`). Unset disables retention. |
 
 Invalid startup limits fail before collection when they would exceed a section
 or dictionary contract. OS cap parse errors degrade to the documented default

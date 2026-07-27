@@ -14,6 +14,17 @@ use crate::logging::{LogLevel, field, log_event};
 use crate::scheduler::Intervals;
 use crate::source_contracts::activity_dict_limits;
 
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    variant_size_differences,
+    reason = "Fixed(u64) is larger; size difference acceptable for retention policy enum"
+)]
+pub(crate) enum RetentionPolicy {
+    Disabled,
+    Fixed(u64),
+    Auto(u8),
+}
+
 pub(crate) struct Config {
     pub(crate) dsn: String,
     pub(crate) out_dir: PathBuf,
@@ -72,6 +83,8 @@ pub(crate) struct Config {
     pub(crate) repl_lag_trigger_s: i64,
     /// Slot-retained WAL that trips the replication trigger, bytes.
     pub(crate) slot_retained_trigger_bytes: i64,
+    /// Storage retention policy: bytes budget, auto mode, or disabled.
+    pub(crate) retention: RetentionPolicy,
 }
 
 pub(crate) fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -193,6 +206,7 @@ impl Config {
         .context("KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES exceeds i64")?;
         let intervals = intervals_from_env()?;
         let log = log_config_from_env(&out_dir)?;
+        let retention = parse_retention_policy(segment_max_bytes)?;
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
@@ -227,6 +241,7 @@ impl Config {
             replication_fast_interval_s,
             repl_lag_trigger_s,
             slot_retained_trigger_bytes,
+            retention,
         })
     }
 
@@ -594,4 +609,36 @@ fn check_replication_detail_section_bound(guc: &str, value: i64, cap: i64) -> Re
         "{guc} ({value}) exceeds the {cap}-row section cap; lower {guc}"
     );
     Ok(())
+}
+
+fn parse_retention_policy(segment_max_bytes: u64) -> Result<RetentionPolicy> {
+    let raw = std::env::var("KRONIKA_RETENTION").ok();
+    match raw {
+        None => Ok(RetentionPolicy::Disabled),
+        Some(val) => {
+            let val = val.trim();
+            if val.eq_ignore_ascii_case("auto") {
+                Ok(RetentionPolicy::Auto(80))
+            } else if let Some(percent_str) = val.strip_prefix("auto:") {
+                let percent = percent_str
+                    .parse::<u8>()
+                    .context("KRONIKA_RETENTION auto:P percent is not u8")?;
+                anyhow::ensure!(
+                    (1..=99).contains(&percent),
+                    "KRONIKA_RETENTION auto:P must be in 1..99, got {percent}"
+                );
+                Ok(RetentionPolicy::Auto(percent))
+            } else {
+                let bytes = val
+                    .parse::<u64>()
+                    .context("KRONIKA_RETENTION is not a valid u64")?;
+                let min_budget = 2 * segment_max_bytes;
+                anyhow::ensure!(
+                    bytes >= min_budget,
+                    "KRONIKA_RETENTION budget {bytes} is less than 2 * KRONIKA_SEGMENT_MAX_BYTES ({min_budget})"
+                );
+                Ok(RetentionPolicy::Fixed(bytes))
+            }
+        }
+    }
 }

@@ -32,6 +32,7 @@ mod pg_log_source;
 mod plans_source;
 mod pool_sources;
 mod reset_source;
+mod rotation;
 mod scheduler;
 mod segments;
 mod service_sections;
@@ -63,6 +64,7 @@ use pg_log_source::{
 };
 use plans_source::{PlansSourceCache, collect_store_plans_cached};
 use pool_sources::{PoolReads, read_pool_sources};
+use rotation::RotationState;
 use scheduler::{DueSet, Scheduler, SourceKind};
 use segments::{
     SegmentState, append_window_and_maybe_seal, encode_window, open_collector_journal,
@@ -141,6 +143,10 @@ fn acquire_collector_writer(root: &DataRoot, limits: LayoutLimits) -> Result<Wri
 }
 
 #[tokio::main]
+#[allow(
+    clippy::too_many_lines,
+    reason = "main event loop and initialization in one function is necessary for state coordination"
+)]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
@@ -160,6 +166,10 @@ async fn main() -> Result<()> {
     if let Some(dest) = recovered {
         announce(&format!("sealed {} reason=recovered", dest.display()));
     }
+
+    let initial_tree_size = rotation::scan_and_count_tree(&data_root, &config.out_dir).unwrap_or(0);
+    let mut rotation_state =
+        RotationState::new(config.retention, config.out_dir.clone(), initial_tree_size);
 
     let mut pool = ConnectionPool::connect(
         &config.dsn,
@@ -227,6 +237,9 @@ async fn main() -> Result<()> {
                 ),
             }
             stop_if_persistence_unhealthy(&journal, &segment)?;
+        }
+        if rotation_state.should_rotate() && rotation_state.can_emit_degradation(Instant::now()) {
+            rotation::log_degradation(rotation_state.get_current_size(), 0);
         }
         // The plans pace lives outside the scheduler; a tick with only the
         // plans read due still runs.
