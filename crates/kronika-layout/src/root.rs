@@ -746,6 +746,26 @@ pub struct SegmentArtifacts {
     pub ovf_bytes: Option<u64>,
 }
 
+/// Bytes reclaimed by removing one sealed segment during rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SegmentRemoval {
+    /// Bytes freed by unlinking the immutable PGM; zero if it was already gone.
+    pub pgm_bytes: u64,
+    /// Bytes freed by unlinking the sibling OVF, when one was present.
+    pub ovf_bytes: Option<u64>,
+}
+
+impl SegmentRemoval {
+    /// Total bytes reclaimed across the PGM and its sibling OVF.
+    #[must_use]
+    pub const fn total_bytes(self) -> u64 {
+        match self.ovf_bytes {
+            Some(ovf) => self.pgm_bytes.saturating_add(ovf),
+            None => self.pgm_bytes,
+        }
+    }
+}
+
 /// Complete result of one successful strict, bounded traversal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutSnapshot {
@@ -767,6 +787,20 @@ pub struct LayoutSnapshot {
     pub visited_entries: usize,
     /// Accounted metadata bytes.
     pub metadata_bytes: usize,
+}
+
+/// Byte occupancy of the filesystem that backs one data root.
+///
+/// Both figures come from a single `statvfs` of the root descriptor and count
+/// every user of the partition, not only `PgKronika` data. `used_bytes` is the
+/// classic "how full is the filesystem" figure (`total − free`), the basis for
+/// the `auto:P` retention target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilesystemUsage {
+    /// Total addressable bytes of the partition.
+    pub total_bytes: u64,
+    /// Bytes occupied by all data on the partition.
+    pub used_bytes: u64,
 }
 
 /// Open, stable descriptor for one `PgKronika` data root.
@@ -1354,6 +1388,26 @@ impl DataRoot {
             });
         }
         Ok(file)
+    }
+
+    /// Reads the byte occupancy of the partition backing this root.
+    ///
+    /// The measurement is a single `statvfs` of the already-open root
+    /// descriptor, so no path is re-resolved and foreign data on a shared
+    /// partition is included in [`FilesystemUsage::used_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the descriptor cannot be queried.
+    pub fn filesystem_usage(&self) -> Result<FilesystemUsage, LayoutError> {
+        let stat = rustix::fs::fstatvfs(&*self.directory).map_err(errno_to_layout)?;
+        let block_bytes = stat.f_frsize;
+        let total_bytes = stat.f_blocks.saturating_mul(block_bytes);
+        let free_bytes = stat.f_bfree.saturating_mul(block_bytes);
+        Ok(FilesystemUsage {
+            total_bytes,
+            used_bytes: total_bytes.saturating_sub(free_bytes),
+        })
     }
 
     /// Establishes lifetime-exclusive writer ownership after two strict scans.
@@ -2200,6 +2254,89 @@ impl WriterOwner {
         }
         remove_verified_regular(&self.root, temporary.address, temporary.file_name())
     }
+
+    /// Removes a sealed segment (its PGM and sibling OVF) and prunes the day.
+    ///
+    /// Direct unlink is safe: live readers keep their own descriptors, the
+    /// overview owner revalidates source identity before publishing an OVF, and
+    /// its GC rechecks device/inode, so no delayed two-step deletion is needed.
+    /// A part of the pair that already vanished frees zero bytes instead of
+    /// failing. The writer owns the root, so empty calendar ancestors are
+    /// pruned in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a present entry is an unsafe type or a filesystem
+    /// operation other than a missing-file race fails.
+    pub fn remove_sealed_segment(
+        &self,
+        address: SegmentAddress,
+    ) -> Result<SegmentRemoval, LayoutError> {
+        let day = match self.root.open_day(address.day) {
+            Ok(day) => day,
+            Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(SegmentRemoval::default());
+            }
+            Err(error) => return Err(error),
+        };
+        let pgm_bytes = unlink_regular_capturing_size(&day, &address.pgm_name())?;
+        let ovf_bytes = unlink_regular_capturing_size(&day, &address.ovf_name())?;
+        day.sync_all()?;
+        prune_empty_calendar(&self.root, address.day)?;
+        Ok(SegmentRemoval {
+            pgm_bytes: pgm_bytes.unwrap_or(0),
+            ovf_bytes,
+        })
+    }
+
+    /// Removes an overview sidecar that has no sibling PGM and prunes the day.
+    ///
+    /// Returns the bytes reclaimed, or zero if the sidecar was already gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry is an unsafe type or the unlink fails for
+    /// a reason other than the file already being absent.
+    pub fn remove_orphan_overview(&self, address: SegmentAddress) -> Result<u64, LayoutError> {
+        let day = match self.root.open_day(address.day) {
+            Ok(day) => day,
+            Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        };
+        let freed = unlink_regular_capturing_size(&day, &address.ovf_name())?;
+        day.sync_all()?;
+        prune_empty_calendar(&self.root, address.day)?;
+        Ok(freed.unwrap_or(0))
+    }
+
+    /// Removes one object found by [`DataRoot::scan_quarantine`] after an
+    /// identity recheck and reports the bytes it freed; a vanished or replaced
+    /// object frees zero. Non-regular entries are never removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry is an unsafe type or a filesystem
+    /// operation other than a missing-file race fails.
+    pub fn remove_quarantine_entry(&self, entry: &QuarantineEntry) -> Result<u64, LayoutError> {
+        if entry.identity.file_type != EntryFileType::RegularFile {
+            return Ok(0);
+        }
+        let directory = match open_directory_at(&self.root.directory, QUARANTINE_DIRECTORY_NAME) {
+            Ok(directory) => directory,
+            Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        };
+        if unlink_named_if_identity(&directory, entry.file_name(), entry.identity.file)? {
+            directory.sync_all()?;
+            Ok(entry.identity.file.len)
+        } else {
+            Ok(0)
+        }
+    }
 }
 
 /// Exclusive, crash-safe PGM publication in one verified day directory.
@@ -2472,39 +2609,48 @@ impl OverviewOwner {
             }) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let year_name = day.year_component();
-        let month_name = day.month_component();
-        let day_name = day.day_component();
-        let year = match open_directory_at(&self.root.directory, &year_name) {
-            Ok(directory) => directory,
-            Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let month = match open_directory_at(&year, &month_name) {
-            Ok(directory) => directory,
-            Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        match open_directory_at(&month, &day_name) {
-            Ok(_directory) => {}
-            Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        }
-        if !remove_empty_directory_at(&month, &day_name)? {
-            return Ok(());
-        }
-        if !remove_empty_directory_at(&year, &month_name)? {
-            return Ok(());
-        }
-        remove_empty_directory_at(&self.root.directory, &year_name)?;
-        Ok(())
+        prune_empty_calendar(&self.root, day)
     }
+}
+
+/// Removes an empty UTC day directory and its now-empty month/year ancestors.
+///
+/// The caller must already hold writer quiescence: [`OverviewOwner`] takes the
+/// writer lock first, while [`WriterOwner`] owns it for its whole lifetime. A
+/// non-empty or concurrently removed directory ends the walk as a no-op.
+fn prune_empty_calendar(root: &DataRoot, day: UtcDay) -> Result<(), LayoutError> {
+    let year_name = day.year_component();
+    let month_name = day.month_component();
+    let day_name = day.day_component();
+    let year = match open_directory_at(&root.directory, &year_name) {
+        Ok(directory) => directory,
+        Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let month = match open_directory_at(&year, &month_name) {
+        Ok(directory) => directory,
+        Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    match open_directory_at(&month, &day_name) {
+        Ok(_directory) => {}
+        Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
+    if !remove_empty_directory_at(&month, &day_name)? {
+        return Ok(());
+    }
+    if !remove_empty_directory_at(&year, &month_name)? {
+        return Ok(());
+    }
+    remove_empty_directory_at(&root.directory, &year_name)?;
+    Ok(())
 }
 
 /// Exclusive OVF or probe temporary tied to one stable source PGM.
@@ -3752,6 +3898,36 @@ fn remove_verified_regular(
     Ok(())
 }
 
+/// Unlinks a regular leaf and reports the bytes it held.
+///
+/// A missing name returns `Ok(None)`; the day directory is not synchronized
+/// here so a caller removing several siblings can batch one `sync_all`.
+fn unlink_regular_capturing_size(directory: &File, name: &str) -> Result<Option<u64>, LayoutError> {
+    let stat = match stat_no_follow(directory, name) {
+        Ok(stat) => stat,
+        Err(LayoutError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let kind = FileType::from_raw_mode(stat.st_mode);
+    if kind == FileType::Symlink {
+        return Err(LayoutError::SymlinkNotAllowed {
+            name: name.to_owned(),
+        });
+    }
+    if kind != FileType::RegularFile {
+        return Err(LayoutError::UnexpectedLeafEntryType {
+            name: name.to_owned(),
+        });
+    }
+    let bytes = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+    rustix::fs::unlinkat(directory, name, AtFlags::empty())
+        .map_err(errno_to_io)
+        .map_err(LayoutError::Io)?;
+    Ok(Some(bytes))
+}
+
 fn verify_named_identity(
     directory: &File,
     file_name: &str,
@@ -3933,6 +4109,103 @@ mod tests {
                 .map(|segment| segment.address.id)
                 .collect::<Vec<_>>(),
             vec![earlier.id, later.id]
+        );
+    }
+
+    #[test]
+    fn remove_sealed_segment_unlinks_the_pgm_and_reports_freed_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(directory.path()).unwrap();
+        let older = address(1_709_164_801_000_000);
+        let newer = address(1_709_164_802_000_000);
+        let writer = root.acquire_writer(LayoutLimits::default()).unwrap();
+        for item in [older, newer] {
+            let mut temp = writer.create_pgm_temp(item).unwrap();
+            temp.file_mut().write_all(b"PGMBODY").unwrap();
+            temp.publish().unwrap();
+        }
+
+        let removal = writer.remove_sealed_segment(older).unwrap();
+        assert_eq!(removal.pgm_bytes, b"PGMBODY".len() as u64);
+        assert_eq!(removal.ovf_bytes, None, "no sibling overview was present");
+
+        let snapshot = root.scan(LayoutLimits::default()).unwrap();
+        assert_eq!(
+            snapshot
+                .segments
+                .iter()
+                .map(|segment| segment.address.id)
+                .collect::<Vec<_>>(),
+            vec![newer.id],
+            "only the newer segment survives"
+        );
+    }
+
+    #[test]
+    fn remove_sealed_segment_frees_nothing_when_it_is_already_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(directory.path()).unwrap();
+        let older = address(1_709_164_801_000_000);
+        let keeper = address(1_709_164_802_000_000);
+        let writer = root.acquire_writer(LayoutLimits::default()).unwrap();
+        for item in [older, keeper] {
+            let mut temp = writer.create_pgm_temp(item).unwrap();
+            temp.file_mut().write_all(b"PGM").unwrap();
+            temp.publish().unwrap();
+        }
+        writer.remove_sealed_segment(older).unwrap();
+
+        let second = writer.remove_sealed_segment(older).unwrap();
+        assert_eq!(second.total_bytes(), 0, "a repeated removal frees nothing");
+    }
+
+    #[test]
+    fn remove_quarantine_entry_frees_bytes_once_and_rechecks_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(directory.path()).unwrap();
+        let writer = root.acquire_writer(LayoutLimits::default()).unwrap();
+        std::fs::write(directory.path().join("junk.bin"), b"JUNK").unwrap();
+        let snapshot = root.scan(LayoutLimits::default()).unwrap();
+        assert_eq!(snapshot.foreign_entries.len(), 1);
+        for foreign in &snapshot.foreign_entries {
+            let outcome = writer.quarantine_foreign(foreign);
+            assert!(
+                matches!(outcome.status, QuarantineStatus::Quarantined { .. }),
+                "the fixture entry must reach quarantine, got {:?}",
+                outcome.status
+            );
+        }
+
+        let entries = root.scan_quarantine(LayoutLimits::default()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let freed = writer.remove_quarantine_entry(&entries[0]).unwrap();
+        assert_eq!(freed, b"JUNK".len() as u64);
+        let repeat = writer.remove_quarantine_entry(&entries[0]).unwrap();
+        assert_eq!(repeat, 0, "a repeated removal frees nothing");
+        assert!(
+            root.scan_quarantine(LayoutLimits::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn segment_removal_total_sums_the_pgm_and_overview() {
+        assert_eq!(
+            SegmentRemoval {
+                pgm_bytes: 100,
+                ovf_bytes: Some(30),
+            }
+            .total_bytes(),
+            130
+        );
+        assert_eq!(
+            SegmentRemoval {
+                pgm_bytes: 100,
+                ovf_bytes: None,
+            }
+            .total_bytes(),
+            100
         );
     }
 

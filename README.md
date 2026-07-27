@@ -10,10 +10,9 @@ counter diffs, source-scoped timeline digests, health lines, notable events,
 anomaly episodes, and incident clusters through a local UI and JSON API.
 
 The project is under active development. The collector, local segment store,
-reader, offline dump command, and web API are implemented. PostgreSQL-facing
-flows are covered by PostgreSQL 15–18 BDD tests. Packaging, retention
-management, remote archival, MCP, alerting, and root-cause diagnosis are not
-implemented.
+reader, offline dump command, storage rotation, and web API are implemented.
+PostgreSQL-facing flows are covered by PostgreSQL 15–18 BDD tests. Packaging,
+remote archival, MCP, alerting, and root-cause diagnosis are not implemented.
 
 ## Data path
 
@@ -191,6 +190,33 @@ allow lists with `cargo run -p xtask -- check-deps`.
   capped scan, and never deletes PGM source files or follows symlinks. Optional
   logical-byte and file-count ceilings apply only to recognized derived
   files. Write backoff never suppresses reads of valid sidecars.
+- **Storage rotation.** `KRONIKA_RETENTION` bounds the whole `KRONIKA_OUT_DIR`
+  tree; unset keeps the pre-rotation unbounded growth. A `<bytes>` value is a
+  fixed budget and must be at least `2 × KRONIKA_SEGMENT_MAX_BYTES`. `auto`
+  (equivalently `auto:80`) or `auto:<P>` targets a used fraction of the backing
+  partition, `P` in `1..=99`. The collector owns rotation: after each
+  publication and on a 60-second tick it deletes the oldest replaceable data —
+  writer temporaries, then orphan overviews, then quarantined evidence oldest
+  first, then sealed segments oldest first, each segment taking its sibling
+  `N.ovf` in the same pass — and prunes emptied day directories. Quarantined
+  evidence counts toward the budget. One pass deletes against a deficit
+  computed at its start and stops at the first removal error; in `auto` mode
+  bytes freed by unlink count as reclaimed even while readers hold the files
+  open, so held descriptors never cause deleting extra history. With
+  `KRONIKA_INTERVAL_S=0` the rotation timer wakes the process for rotation
+  only; collection stays signal-driven. Direct unlink is safe because readers keep open descriptors
+  and the overview owner revalidates identity. The active journal and the newest
+  sealed segment are never deleted; when the tree is pinned to that minimum the
+  collector logs a degradation event at most once per tick and keeps collecting.
+  `auto` cooperates with other data on a shared partition — foreign growth
+  speeds cleanup of our history down to the minimum — but reserves no free
+  space. Fixed size may exceed the budget by the active journal's growth
+  between ticks and by overview sidecars published since the last enforcement
+  scan; every scan re-seeds the size counter, and an hourly authoritative
+  recount bounds that drift even when the incremental counter alone never
+  crosses the budget. Each deletion is logged with the path, `SegmentId`, freed
+  bytes, the `budget` or `auto` reason, and the current size against the
+  threshold.
 - **Resource bounds.** Registry sections are capped at 65,536 rows, 8 MiB of
   encoded bytes, and 16 Parquet row groups. The collector applies source,
   dictionary, cycle-time, journal, and cardinality caps. Reader queries have

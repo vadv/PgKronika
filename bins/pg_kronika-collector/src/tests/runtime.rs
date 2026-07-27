@@ -109,7 +109,8 @@ fn timer_sleep_uses_source_deadline_before_regular_tick() {
             900,
             &sched,
             &PlansSourceCache::default(),
-            &SegmentState::default()
+            &SegmentState::default(),
+            None,
         ),
         Some(Duration::from_secs(1)),
         "a 1s source interval is not capped by a 5s regular wake"
@@ -132,7 +133,8 @@ fn timer_sleep_uses_accelerated_deadline_before_regular_tick() {
             900,
             &sched,
             &PlansSourceCache::default(),
-            &SegmentState::default()
+            &SegmentState::default(),
+            None,
         ),
         Some(Duration::from_secs(1)),
         "default activity fast pace can wake before the 5s regular timer"
@@ -158,7 +160,8 @@ fn timer_sleep_keeps_zero_interval_on_regular_wakes() {
             900,
             &sched,
             &PlansSourceCache::default(),
-            &SegmentState::default()
+            &SegmentState::default(),
+            None,
         ),
         Some(Duration::from_secs(5)),
         "zero means every timer wake, not an immediate busy loop"

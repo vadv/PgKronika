@@ -13,13 +13,13 @@ mod time;
 pub use error::{LayoutError, LimitKind, OwnerKind};
 pub use root::{
     ACTIVE_JOURNAL_NAME, DataRoot, EntryDiagnostic, EntryFileType, EntryScope, EvidenceFile,
-    EvidenceLocation, FileIdentity, FileKind, ForeignEntry, ForeignEntryReason,
+    EvidenceLocation, FileIdentity, FileKind, FilesystemUsage, ForeignEntry, ForeignEntryReason,
     FreshJournalGeneration, JournalActivation, JournalRotation, JournalRotationOutcome,
     JournalSlot, JournalSlotKind, LayoutLimits, LayoutSnapshot, OVERVIEW_OWNER_LOCK_NAME,
     OverviewOwner, OvfTemp, PathIdentity, PendingRootEntry, PendingRootKind, PgmTemp,
     QUARANTINE_DIRECTORY_NAME, QuarantineDirectoryState, QuarantineEntry, QuarantineFailure,
     QuarantineFailureStage, QuarantineOutcome, QuarantineReason, QuarantineStatus,
-    SegmentArtifacts, TemporaryKind, TemporaryObject, WRITER_OWNER_LOCK_NAME, WriterLease,
-    WriterOwner,
+    SegmentArtifacts, SegmentRemoval, TemporaryKind, TemporaryObject, WRITER_OWNER_LOCK_NAME,
+    WriterLease, WriterOwner,
 };
 pub use time::{SegmentAddress, SegmentId, UtcDay};
