@@ -89,11 +89,11 @@ pub struct JournalRecovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct JournalReplaySummary {
     /// Complete frames appended to the fresh journal.
-    pub recovered_frames: usize,
+    pub frames: usize,
     /// Catalog row declarations in replayed parts.
-    pub recovered_rows: u64,
+    pub rows: u64,
     /// Replayed PGM part-body bytes.
-    pub recovered_part_bytes: u64,
+    pub part_bytes: u64,
 }
 
 /// Failure to inspect stable evidence or replay verified parts.
@@ -199,6 +199,10 @@ impl JournalRecovery {
     /// # Errors
     ///
     /// Returns a typed configuration, I/O, scan, or source-instability error.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one bounded inspection classifies the root header and physical frame scan atomically"
+    )]
     pub fn inspect(source: &File, config: JournalConfig) -> Result<Self, JournalRecoveryError> {
         validate_config(config).map_err(JournalRecoveryError::Config)?;
         let source = source.try_clone()?;
@@ -369,21 +373,21 @@ impl JournalRecovery {
                 .ok_or(JournalRecoveryError::AccountingOverflow { quantity: "row" })?;
             destination.append(segment_id, &bytes).map_err(|source| {
                 JournalRecoveryError::Append {
-                    recovered_frames: recovered.recovered_frames,
+                    recovered_frames: recovered.frames,
                     source,
                 }
             })?;
-            recovered.recovered_frames = recovered.recovered_frames.checked_add(1).ok_or(
+            recovered.frames = recovered.frames.checked_add(1).ok_or(
                 JournalRecoveryError::AccountingOverflow {
                     quantity: "frame count",
                 },
             )?;
-            recovered.recovered_rows = recovered
-                .recovered_rows
+            recovered.rows = recovered
+                .rows
                 .checked_add(rows)
                 .ok_or(JournalRecoveryError::AccountingOverflow { quantity: "row" })?;
-            recovered.recovered_part_bytes = recovered
-                .recovered_part_bytes
+            recovered.part_bytes = recovered
+                .part_bytes
                 .checked_add(u64::try_from(bytes.len()).map_err(|_overflow| {
                     JournalRecoveryError::AccountingOverflow {
                         quantity: "part byte",
@@ -592,8 +596,7 @@ mod tests {
     #[test]
     fn torn_frame_recovers_only_the_complete_verified_prefix() {
         let part = part(999);
-        let complete = frame(&part);
-        let mut physical = complete.clone();
+        let mut physical = frame(&part);
         let torn = frame(&part);
         physical.extend_from_slice(&torn[..torn.len() - 3]);
         let evidence = evidence(&active_bytes(1_000, physical.len() as u64, &physical));
@@ -640,8 +643,8 @@ mod tests {
         let mut journal = fresh_journal(&directory);
 
         let replayed = recovery.replay_into(&mut journal).unwrap();
-        assert_eq!(replayed.recovered_frames, 1);
-        assert_eq!(replayed.recovered_rows, 1);
+        assert_eq!(replayed.frames, 1);
+        assert_eq!(replayed.rows, 1);
         assert_eq!(journal.segment_id(), SegmentId::new(1_000).ok());
         let replayed_part = journal.read_part(journal.parts()[0]).unwrap();
         assert_eq!(validate_part(&replayed_part).unwrap().min_ts, 999);

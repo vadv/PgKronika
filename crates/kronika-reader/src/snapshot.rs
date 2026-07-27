@@ -22,7 +22,7 @@ use kronika_registry::{
 };
 use kronika_store::{
     ActivePart, CatalogSummary, JournalScan, LocalDir, LocalScan, SealedUnit, StoreError,
-    StoreObject, StoreWarning, is_active_journal_scan_error,
+    StoreObject, StoreWarning, StoreWarningReason, is_active_journal_scan_error,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -701,6 +701,21 @@ impl LocalDirSnapshot {
     #[must_use]
     pub fn warnings(&self) -> &[StoreWarning] {
         &self.scan.warnings
+    }
+
+    /// Whether the current scan excluded this canonical segment as invalid.
+    ///
+    /// Callers may retain the last verified descriptor as unavailable while
+    /// the warning remains, without treating an authoritative deletion as a
+    /// permanent gap.
+    #[must_use]
+    pub fn has_invalid_segment_warning(&self, locator: SealedLocator) -> bool {
+        self.scan.warnings.iter().any(|warning| {
+            matches!(
+                warning.affected,
+                StoreObject::Segment(address) if address.id == locator.segment_id()
+            ) && matches!(warning.reason, StoreWarningReason::InvalidPgm(_))
+        })
     }
 
     /// Damaged byte ranges recorded for this snapshot.

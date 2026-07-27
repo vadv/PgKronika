@@ -447,9 +447,8 @@ struct EntryPath {
 }
 
 impl fmt::Debug for EntryPath {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("EntryPath")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EntryPath")
             .field("scope", &self.parent.scope())
             .field("name_hash", &hash_name(self.name.as_bytes()))
             .field("name_len", &self.name.as_bytes().len())
@@ -495,11 +494,10 @@ impl ForeignEntry {
 }
 
 impl fmt::Debug for ForeignEntry {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ForeignEntry")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ForeignEntry")
             .field("diagnostic", &self.diagnostic)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -535,12 +533,11 @@ impl PendingRootEntry {
 }
 
 impl fmt::Debug for PendingRootEntry {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PendingRootEntry")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingRootEntry")
             .field("kind", &self.kind)
             .field("identity", &self.identity)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1361,9 +1358,8 @@ impl JournalSlot {
 }
 
 impl fmt::Debug for JournalSlot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("JournalSlot")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JournalSlot")
             .field("kind", &self.kind)
             .finish_non_exhaustive()
     }
@@ -1420,9 +1416,8 @@ impl EvidenceFile {
 }
 
 impl fmt::Debug for EvidenceFile {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("EvidenceFile")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EvidenceFile")
             .field("identity", &self.identity)
             .field("location", &self.location)
             .finish_non_exhaustive()
@@ -1568,20 +1563,16 @@ impl JournalRotation {
     }
 
     fn move_canonical_to_pending_name(&mut self) -> bool {
-        let Some(destination) = available_evidence_name(
-            &self.root.directory,
-            self.nonce,
-            CStr::from_bytes_with_nul(b"active.parts\0")
-                .expect("canonical journal name is a C string"),
-        ) else {
+        let Some(destination) =
+            available_evidence_name(&self.root.directory, self.nonce, c"active.parts")
+        else {
             self.diagnostics.push(QuarantineFailure::local(
                 QuarantineFailureStage::CollisionSlotsExhausted,
                 io::ErrorKind::AlreadyExists,
             ));
             return false;
         };
-        let active = CStr::from_bytes_with_nul(b"active.parts\0")
-            .expect("canonical journal name is a C string");
+        let active = c"active.parts";
         match rename_noreplace(
             &self.root.directory,
             active,
@@ -1640,9 +1631,8 @@ impl JournalRotation {
 }
 
 impl fmt::Debug for JournalRotation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("JournalRotation")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JournalRotation")
             .field("fresh_name_hash", &hash_name(self.fresh_name.as_bytes()))
             .field("evidence", &self.evidence)
             .field("diagnostics", &self.diagnostics)
@@ -1694,8 +1684,7 @@ impl WriterOwner {
             .open_active_journal()?
             .ok_or(LayoutError::ActiveJournalMissing)?;
         let evidence_identity = FileIdentity::from_file(&evidence_file)?;
-        let active_name = CStr::from_bytes_with_nul(b"active.parts\0")
-            .expect("canonical journal name is a C string");
+        let active_name = c"active.parts";
         let evidence = EvidenceFile {
             file: evidence_file,
             identity: path_identity_from_file(
@@ -1711,7 +1700,10 @@ impl WriterOwner {
         let mut fresh = None;
         for slot in 0..MAX_ROOT_COLLISION_SLOTS {
             let name = generation_name(nonce, slot);
-            let name = CString::new(name).expect("bounded generation names never contain NUL");
+            let name =
+                CString::new(name).map_err(|_invalid_name| LayoutError::UnexpectedRootEntry {
+                    name: "generated journal name contains NUL".to_owned(),
+                })?;
             match create_regular_name_at(&self.root.directory, &name, OFlags::RDWR, DATA_FILE_MODE)
             {
                 Ok(file) => {
@@ -1722,7 +1714,7 @@ impl WriterOwner {
                 Err(error) => return Err(error),
             }
         }
-        let (fresh, fresh_name) = fresh.ok_or(LayoutError::RecoverySlotsExhausted {
+        let (fresh, fresh_name) = fresh.ok_or_else(|| LayoutError::RecoverySlotsExhausted {
             limit: usize::from(MAX_ROOT_COLLISION_SLOTS),
         })?;
         let mut diagnostics = Vec::new();
@@ -1759,8 +1751,11 @@ impl WriterOwner {
         let root_identity = FileIdentity::from_file(&self.root.directory)?;
         let nonce = root_generation_nonce(root_identity);
         for slot in 0..MAX_ROOT_COLLISION_SLOTS {
-            let name = CString::new(generation_name(nonce, slot))
-                .expect("bounded generation names never contain NUL");
+            let name = CString::new(generation_name(nonce, slot)).map_err(|_invalid_name| {
+                LayoutError::UnexpectedRootEntry {
+                    name: "generated journal name contains NUL".to_owned(),
+                }
+            })?;
             match create_regular_name_at(&self.root.directory, &name, OFlags::RDWR, DATA_FILE_MODE)
             {
                 Ok(file) => {
@@ -1903,8 +1898,15 @@ impl WriterOwner {
     /// object. No existing quarantine object is overwritten.
     #[must_use]
     pub fn quarantine_invalid_pgm(&self, segment: SegmentArtifacts) -> QuarantineOutcome {
-        let name = CString::new(segment.address.pgm_name())
-            .expect("canonical segment names never contain NUL");
+        let name = segment.address.pgm_name();
+        let Ok(name) = CString::new(name.as_bytes()) else {
+            return invalid_generated_name_outcome(
+                QuarantineReason::InvalidPgm,
+                EntryScope::Day(segment.address.day),
+                name.as_bytes(),
+                segment.pgm_identity,
+            );
+        };
         let path = EntryPath {
             parent: EntryParent::Day(segment.address.day),
             name,
@@ -1921,8 +1923,14 @@ impl WriterOwner {
     /// Atomically preserves a stale writer temporary after identity recheck.
     #[must_use]
     pub fn quarantine_temporary(&self, temporary: &TemporaryObject) -> QuarantineOutcome {
-        let name = CString::new(temporary.file_name.as_bytes())
-            .expect("discovered ASCII temporary names never contain NUL");
+        let Ok(name) = CString::new(temporary.file_name.as_bytes()) else {
+            return invalid_generated_name_outcome(
+                QuarantineReason::StaleTemporary,
+                EntryScope::Day(temporary.address.day),
+                temporary.file_name.as_bytes(),
+                temporary.identity,
+            );
+        };
         let path = EntryPath {
             parent: EntryParent::Day(temporary.address.day),
             name,
@@ -2703,7 +2711,7 @@ fn ascii_name(name: &[u8]) -> Option<&str> {
         .flatten()
 }
 
-fn entry_file_type(file_type: FileType) -> EntryFileType {
+const fn entry_file_type(file_type: FileType) -> EntryFileType {
     match file_type {
         FileType::RegularFile => EntryFileType::RegularFile,
         FileType::Directory => EntryFileType::Directory,
@@ -2730,7 +2738,7 @@ fn path_identity(parent: EntryParent, name: &CStr, stat: &rustix::fs::Stat) -> P
     }
 }
 
-fn path_identity_from_file(
+const fn path_identity_from_file(
     scope: EntryScope,
     name: &CStr,
     file_type: EntryFileType,
@@ -2739,13 +2747,45 @@ fn path_identity_from_file(
     PathIdentity {
         scope,
         name_hash: hash_name(name.to_bytes()),
-        name_len: if name.to_bytes().len() > u16::MAX as usize {
-            u16::MAX
-        } else {
-            name.to_bytes().len() as u16
-        },
+        name_len: bounded_name_len(name.to_bytes().len()),
         file_type,
         file,
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the explicit bound saturates every length above u16::MAX"
+)]
+const fn bounded_name_len(len: usize) -> u16 {
+    if len > u16::MAX as usize {
+        u16::MAX
+    } else {
+        len as u16
+    }
+}
+
+const fn invalid_generated_name_outcome(
+    reason: QuarantineReason,
+    scope: EntryScope,
+    name: &[u8],
+    file: FileIdentity,
+) -> QuarantineOutcome {
+    QuarantineOutcome {
+        reason,
+        source: PathIdentity {
+            scope,
+            name_hash: hash_name(name),
+            name_len: bounded_name_len(name.len()),
+            file_type: EntryFileType::RegularFile,
+            file,
+        },
+        status: QuarantineStatus::Retained {
+            failure: QuarantineFailure::local(
+                QuarantineFailureStage::SourceChanged,
+                io::ErrorKind::InvalidInput,
+            ),
+        },
     }
 }
 
@@ -2778,13 +2818,16 @@ fn is_bounded_root_name(name: &str, prefix: &str, suffix: &str) -> bool {
         return false;
     };
     let expected_len = ROOT_NONCE_HEX_LEN + 1 + ROOT_SLOT_HEX_LEN;
+    let middle = middle.as_bytes();
     middle.len() == expected_len
-        && middle.as_bytes()[ROOT_NONCE_HEX_LEN] == b'.'
+        && middle[ROOT_NONCE_HEX_LEN] == b'.'
         && middle[..ROOT_NONCE_HEX_LEN]
-            .bytes()
+            .iter()
+            .copied()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         && middle[ROOT_NONCE_HEX_LEN + 1..]
-            .bytes()
+            .iter()
+            .copied()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
@@ -3073,6 +3116,10 @@ fn open_or_create_regular(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one descriptor-relative transaction pins, renames, syncs, and verifies exact evidence"
+)]
 fn quarantine_entry(
     root: &DataRoot,
     path: &EntryPath,
@@ -3165,8 +3212,12 @@ fn quarantine_entry(
 
     for slot in 0..MAX_QUARANTINE_COLLISION_SLOTS {
         let destination_name = quarantine_name(reason, source, slot);
-        let destination =
-            CString::new(destination_name).expect("bounded quarantine names never contain NUL");
+        let Ok(destination) = CString::new(destination_name) else {
+            return retained(QuarantineFailure::local(
+                QuarantineFailureStage::QuarantineDirectory,
+                io::ErrorKind::InvalidInput,
+            ));
+        };
         match rename_noreplace(&source_parent, &path.name, &quarantine, &destination) {
             Ok(()) => {
                 let source_sync = sync_source_directory(&source_parent);
@@ -3328,9 +3379,7 @@ fn exchange_root_names(_root: &File, _first: &str, _second: &CStr) -> io::Result
 }
 
 fn rename_generation_to_active(root: &File, generation: &CStr) -> io::Result<()> {
-    let active =
-        CStr::from_bytes_with_nul(b"active.parts\0").expect("canonical journal name is a C string");
-    rename_noreplace(root, generation, root, active)
+    rename_noreplace(root, generation, root, c"active.parts")
 }
 
 fn open_entry_parent(root: &DataRoot, parent: EntryParent) -> Result<File, LayoutError> {
@@ -4180,6 +4229,44 @@ mod tests {
                 assert!(snapshot.segments.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn quarantine_rename_failure_retains_the_exact_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = DataRoot::open(directory.path()).unwrap();
+        let owner = root.acquire_writer(LayoutLimits::default()).unwrap();
+        let address = address(1_709_164_801_000_000);
+        let mut temporary = owner.create_pgm_temp(address).unwrap();
+        temporary.file_mut().write_all(b"damaged PGM").unwrap();
+        temporary.publish().unwrap();
+        let segment = root
+            .scan(LayoutLimits::default())
+            .unwrap()
+            .segments
+            .into_iter()
+            .next()
+            .unwrap();
+        let raw_os_error = rustix::io::Errno::IO.raw_os_error();
+        let fault = arm_quarantine_fault(QuarantineFaultPoint::Rename, raw_os_error);
+
+        let outcome = owner.quarantine_invalid_pgm(segment);
+
+        fault.assert_consumed();
+        assert!(matches!(
+            outcome.status,
+            QuarantineStatus::Retained {
+                failure: QuarantineFailure {
+                    stage: QuarantineFailureStage::Rename,
+                    raw_os_error: Some(error),
+                    ..
+                }
+            } if error == raw_os_error
+        ));
+        assert_eq!(
+            std::fs::read(root.diagnostic_file_path(address, FileKind::Pgm)).unwrap(),
+            b"damaged PGM"
+        );
     }
 
     #[test]

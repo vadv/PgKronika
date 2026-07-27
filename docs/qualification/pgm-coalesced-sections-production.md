@@ -5,8 +5,9 @@ This measurement compares the production `seal` and reader paths at:
 - base `d50d9795fbd6a29965224b8c510139d285fe1b02`;
 - candidate `18948c58593120f5d1c79d76e23c05461d93ba11`.
 
-Both builds use the same Rust source for the measurement example and consume
-the same retained `active.parts`. The machine-readable result is
+Both builds use the same Rust source for the measurement example, frozen at
+`2bd9cae706680f89a604ea39132128a69d51bf6b`, and consume the same retained
+`active.parts`. The machine-readable result is
 [`pgm-coalesced-sections-production-v1.json`](pgm-coalesced-sections-production-v1.json).
 
 ## Input and identity

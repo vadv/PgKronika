@@ -11,6 +11,7 @@
   },
   "runner": {
     "source": "crates/kronika-writer/examples/measure_coalesced_sections.rs",
+    "source_commit": "2bd9cae706680f89a604ea39132128a69d51bf6b",
     "source_sha256": "841207be277f74e35cc1829afe77de5ca58c84e49d9ec9618bcc29610df33788",
     "base_binary_sha256": "a53a687c73d7882274552379e98d8d73a2b6763da01dfdd1bbbca9181fe3284c",
     "candidate_binary_sha256": "e45ed17b4fee2e90904fa969d35e423b7d0175919b85defe11b5d159f01d6e13",

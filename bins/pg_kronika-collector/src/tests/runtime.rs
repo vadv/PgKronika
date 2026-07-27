@@ -369,6 +369,131 @@ fn startup_with_an_empty_journal_recovers_nothing() {
 }
 
 #[test]
+fn startup_quarantines_a_torn_header_and_accepts_future_windows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let evidence = b"PGKJNL1".to_vec();
+    std::fs::write(dir.path().join("active.parts"), &evidence).expect("write torn header");
+
+    let (mut journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("recover torn journal header");
+
+    assert!(recovered.is_none());
+    assert!(journal.parts().is_empty());
+    assert_eq!(quarantine_payloads(dir.path()), vec![evidence]);
+    journal
+        .append(SegmentId::new(2_000).unwrap(), &activity_window())
+        .expect("collection continues in the fresh journal");
+}
+
+#[test]
+fn startup_recovers_complete_frames_despite_a_wrong_recorded_body_length() {
+    use kronika_format::{JOURNAL_HEADER_LEN, JournalHeader, JournalState};
+    use kronika_writer::{Journal, JournalConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let segment_id = SegmentId::new(1_000).unwrap();
+    {
+        let mut journal =
+            Journal::open(&owner, JournalConfig::default()).expect("open the journal");
+        journal
+            .append(segment_id, &activity_window())
+            .expect("append valid frame");
+    }
+    let active = dir.path().join("active.parts");
+    let mut evidence = std::fs::read(&active).expect("read active journal");
+    let physical_body_len = u64::try_from(evidence.len() - JOURNAL_HEADER_LEN).unwrap();
+    evidence[..JOURNAL_HEADER_LEN].copy_from_slice(
+        &JournalHeader {
+            state: JournalState::Active {
+                segment_id: segment_id.get(),
+            },
+            body_len: physical_body_len + 17,
+        }
+        .encode(),
+    );
+    std::fs::write(&active, &evidence).expect("write mismatched header");
+
+    let (journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("recover verified physical frame");
+
+    assert!(journal.parts().is_empty());
+    assert!(recovered.expect("verified frame is sealed").is_file());
+    assert_eq!(quarantine_payloads(dir.path()), vec![evidence]);
+}
+
+#[test]
+fn startup_finishes_recovery_pending_evidence_after_activation() {
+    use kronika_writer::{Journal, JournalConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let segment_id = SegmentId::new(1_000).unwrap();
+    {
+        let mut journal =
+            Journal::open(&owner, JournalConfig::default()).expect("open the journal");
+        journal
+            .append(segment_id, &activity_window())
+            .expect("append valid frame");
+    }
+    let evidence = std::fs::read(dir.path().join("active.parts")).expect("read evidence");
+    let mut rotation = owner
+        .begin_journal_rotation()
+        .expect("begin exact-evidence rotation");
+    Journal::prepare_rotation(&mut rotation).expect("prepare fresh journal");
+    let activated = rotation.activate();
+    drop(activated);
+
+    let (journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("finish pending evidence recovery");
+
+    assert!(journal.parts().is_empty());
+    assert!(recovered.expect("pending evidence is sealed").is_file());
+    assert_eq!(quarantine_payloads(dir.path()), vec![evidence]);
+}
+
+#[test]
+fn startup_recovers_a_pending_alternate_generation() {
+    use kronika_writer::{Journal, JournalConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let canonical =
+        Journal::open(&owner, JournalConfig::default()).expect("create canonical journal");
+    drop(canonical);
+    let mut generation = owner
+        .create_journal_generation()
+        .expect("create alternate generation");
+    Journal::prepare_slot(&mut generation.slot).expect("prepare alternate generation");
+    let mut alternate = Journal::open_slot(generation.slot, JournalConfig::default())
+        .expect("open alternate generation");
+    alternate
+        .append(SegmentId::new(1_000).unwrap(), &activity_window())
+        .expect("append alternate frame");
+    drop(alternate);
+
+    let (journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("recover pending generation");
+
+    assert!(journal.parts().is_empty());
+    assert!(recovered.expect("pending generation is sealed").is_file());
+    assert_eq!(quarantine_payloads(dir.path()).len(), 1);
+}
+
+#[test]
 fn failed_recovery_seal_preserves_evidence_and_continues_empty() {
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_writer::{Journal, JournalConfig};

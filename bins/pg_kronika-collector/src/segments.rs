@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
-const PGM_CRC_CHUNK_BYTES: usize = 64 * 1024;
+const PGM_CRC_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AdmissionDictionaryValue {
@@ -699,7 +699,7 @@ pub(crate) fn open_collector_journal(
     Ok((journal, recovered))
 }
 
-fn localized_journal_error(error: &JournalError) -> bool {
+const fn localized_journal_error(error: &JournalError) -> bool {
     matches!(
         error,
         JournalError::JournalTooLarge { .. }
@@ -864,9 +864,9 @@ fn recover_evidence(
                 LogLevel::Info,
                 "journal_recovery_finish",
                 &[
-                    field("recovered_frames", replay.recovered_frames),
-                    field("recovered_rows", replay.recovered_rows),
-                    field("recovered_part_bytes", replay.recovered_part_bytes),
+                    field("recovered_frames", replay.frames),
+                    field("recovered_rows", replay.rows),
+                    field("recovered_part_bytes", replay.part_bytes),
                 ],
             );
             Ok(dest)
@@ -876,7 +876,7 @@ fn recover_evidence(
                 LogLevel::Error,
                 "journal_recovery_seal_failure",
                 &[
-                    field("recovered_frames", replay.recovered_frames),
+                    field("recovered_frames", replay.frames),
                     field("error", format!("{error:#}")),
                 ],
             );

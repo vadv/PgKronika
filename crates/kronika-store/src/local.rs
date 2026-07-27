@@ -28,7 +28,7 @@ use crate::source::{
 
 /// Upper bound on the catalog block size; guards against corrupt tail indices.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
-const PGM_CRC_CHUNK_BYTES: usize = 64 * 1024;
+const PGM_CRC_CHUNK_BYTES: usize = 16 * 1024;
 const ARC_ALLOCATION_OVERHEAD: usize = 2 * size_of::<usize>();
 const ACTIVE_ARC_ALLOCATION_BYTES: usize = size_of::<Vec<ActivePart>>() + ARC_ALLOCATION_OVERHEAD;
 
@@ -224,6 +224,10 @@ impl LocalDir {
         self.complete_scan_cached_with_warnings(journal, previous_sealed, &[])
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one bounded merge accounts retained metadata while classifying each stable segment"
+    )]
     fn complete_scan_cached_with_warnings(
         &self,
         journal: JournalScan,
@@ -718,7 +722,7 @@ enum PgmOpen {
     Invalid(StoreIoFailure),
 }
 
-fn invalid_pgm_warning(
+const fn invalid_pgm_warning(
     address: kronika_layout::SegmentAddress,
     identity: FileIdentity,
     reason: InvalidPgmReason,
@@ -2482,7 +2486,7 @@ mod tests {
         write_segment(dir.path(), 1_000, part(1_000, 7));
         let unreadable = segment_path(dir.path(), 2_000);
         fs::write(&unreadable, part(2_000, 7)).unwrap();
-        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o0)).unwrap();
 
         let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
         assert_eq!(scan.sealed.len(), 1);
@@ -2739,7 +2743,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_from_torn_tail_fails_without_returning_partial_state() {
+    fn scan_from_torn_tail_returns_a_typed_empty_live_generation() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
         let journal = journal(1_000, &[part(1000, 7)]);
@@ -2763,13 +2767,17 @@ mod tests {
         );
         fs::write(&journal_path, &buf).unwrap();
 
-        assert_eq!(
-            local
-                .scan_from(first_valid, first.active)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
+        let scan = local.scan_from(first_valid, first.active).unwrap();
+        assert!(scan.active.is_empty());
+        assert_eq!(scan.valid_len, 0);
+        assert!(matches!(
+            scan.warnings.as_slice(),
+            [StoreWarning {
+                affected: StoreObject::ActiveJournal,
+                reason: StoreWarningReason::ActiveJournal(ActiveJournalWarningReason::Corrupt),
+                ..
+            }]
+        ));
     }
 
     #[test]

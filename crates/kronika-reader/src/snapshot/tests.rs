@@ -1666,9 +1666,7 @@ fn an_incomplete_active_baseline_forces_full_descriptor_recovery() {
     Arc::make_mut(&mut snap.scan.active).clear();
     snap.scan.warnings.push(StoreWarning {
         affected: StoreObject::ActiveJournal,
-        reason: kronika_store::StoreWarningReason::ActiveJournal(
-            kronika_store::ActiveJournalWarningReason::Io,
-        ),
+        reason: StoreWarningReason::ActiveJournal(kronika_store::ActiveJournalWarningReason::Io),
         identity: None,
         failure: None,
     });
@@ -1713,7 +1711,7 @@ fn damaged_sealed_file_is_excluded_until_a_valid_identity_returns() {
         snap.warnings(),
         [StoreWarning {
             affected: StoreObject::Segment(_),
-            reason: kronika_store::StoreWarningReason::InvalidPgm(_),
+            reason: StoreWarningReason::InvalidPgm(_),
             ..
         }]
     ));
@@ -1847,7 +1845,7 @@ fn sealed_delta_compares_compact_scans_without_a_full_descriptor_baseline() {
     let journal_warning = LocalScan {
         warnings: vec![StoreWarning {
             affected: StoreObject::ActiveJournal,
-            reason: kronika_store::StoreWarningReason::ActiveJournal(
+            reason: StoreWarningReason::ActiveJournal(
                 kronika_store::ActiveJournalWarningReason::Io,
             ),
             identity: None,

@@ -2614,7 +2614,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/gc/tests.rs",
-                    "a_sidecar_symlink_makes_gc_fail_closed_without_removing_sources",
+                    "a_foreign_sidecar_symlink_is_skipped_without_blocking_gc",
                 ),
                 (
                     "rust_test",

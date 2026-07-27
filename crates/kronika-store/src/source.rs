@@ -337,8 +337,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Io(err) => Some(err),
             Self::SectionLayout(err) => Some(err),
-            Self::Catalog(err) => Some(err),
-            Self::TailIndex(err) => Some(err),
+            Self::Catalog(err) | Self::TailIndex(err) => Some(err),
             Self::Layout(err) => Some(err),
             Self::ActivePartTooLarge { .. }
             | Self::TooSmall

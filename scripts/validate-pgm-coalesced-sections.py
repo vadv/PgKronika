@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -35,6 +36,16 @@ def require_sha256(value: Any, name: str) -> str:
     return value
 
 
+def require_git_oid(value: Any, name: str) -> str:
+    require(
+        isinstance(value, str)
+        and len(value) in (40, 64)
+        and set(value).issubset(HEX_DIGITS),
+        f"{name} is not a full Git object id",
+    )
+    return value
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -52,9 +63,18 @@ def main() -> None:
 
     runner = data["runner"]
     runner_sha = require_sha256(runner["source_sha256"], "runner.source_sha256")
+    runner_commit = require_git_oid(runner["source_commit"], "runner.source_commit")
     repo_root = Path(__file__).resolve().parent.parent
-    runner_path = repo_root / runner["source"]
-    require(sha256_file(runner_path) == runner_sha, "runner source hash mismatch")
+    runner_source = subprocess.run(
+        ["git", "show", f"{runner_commit}:{runner['source']}"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+    ).stdout
+    require(
+        hashlib.sha256(runner_source).hexdigest() == runner_sha,
+        "runner source hash mismatch",
+    )
     require_sha256(runner["base_binary_sha256"], "runner.base_binary_sha256")
     require_sha256(runner["candidate_binary_sha256"], "runner.candidate_binary_sha256")
 
