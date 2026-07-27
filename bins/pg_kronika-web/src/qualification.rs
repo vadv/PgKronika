@@ -7,8 +7,8 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::MetadataExt as _;
-use std::path::Path;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,7 +19,13 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use kronika_analytics::overview::{CountLimits, CoverageSpan, OracleLimits, RawOracle};
-use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
+use kronika_format::{
+    FRAME_HEADER_LEN, FrameHeader, JOURNAL_HEADER_LEN, JournalHeader, JournalState, PartMeta,
+    SectionInput, build_part,
+};
+use kronika_layout::{
+    DataRoot, FileKind as LayoutFileKind, LayoutLimits, SegmentAddress, SegmentId, WriterOwner,
+};
 use kronika_reader::{
     BlockKind, FactFile, FactOrigin, FactStore, FallbackConfig, LIMIT, LocalDirSnapshot,
     PersistError, PersistenceProbeOutcome, PgmUnit, SegmentContext, SegmentFacts,
@@ -44,6 +50,9 @@ const CADENCE_US: i64 = 5_000_000;
 const ITERATIONS: usize = 20;
 const CONCURRENT_WORKERS: usize = 16;
 const SOURCE_ID: u64 = 7;
+const DENSE_FIRST_WINDOW_US: i64 = 1_000_000;
+const DENSE_END_US: i64 = 3_601_000_000;
+const LIVE_FIRST_WINDOW_US: i64 = DENSE_END_US + 10;
 
 /// Prefix emitted by a qualification-enabled real server after its listener
 /// has bound successfully.
@@ -159,8 +168,10 @@ struct HostProfile {
 struct StorageProfile {
     model: &'static str,
     active_journal_name: &'static str,
-    pgm_file_name: &'static str,
-    sidecar_file_name: &'static str,
+    pgm_file_name: String,
+    sidecar_file_name: String,
+    pgm_relative_path: String,
+    sidecar_relative_path: String,
     same_stem: bool,
 }
 
@@ -239,8 +250,8 @@ struct Work {
     fallback_resident_bytes: u64,
     completed_active_parts: u64,
     visibility_lag_us: u64,
-    tail_pending_from_offset_bytes: u64,
-    tail_pending_to_offset_bytes: u64,
+    damaged_journal_rejections: u64,
+    damaged_journal_preserved: u64,
     successful_responses: u64,
     serialized_response_bytes: u64,
 }
@@ -375,7 +386,8 @@ fn run_coordinator(output: &Path) {
         modes.push(mode_result(mode, samples, syscalls));
     }
 
-    let dense = dense_hour_pgm(SOURCE_ID, 1_000_000, SAMPLES);
+    let dense_address = dense_address();
+    let dense = dense_hour_pgm(SOURCE_ID, DENSE_FIRST_WINDOW_US, SAMPLES);
     let unit = PgmUnit::open(dense.as_slice()).expect("open dense fixture");
     let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract dense fixture");
     let encoded = facts.encode(&LIMIT).expect("encode dense facts");
@@ -383,16 +395,17 @@ fn run_coordinator(output: &Path) {
         .expect("admit dense facts");
     let profile_root = runtime_root.join("accounting-profile");
     fs::create_dir(&profile_root).expect("create accounting profile directory");
-    fs::write(profile_root.join("dense-hour.pgm"), &dense).expect("write profile PGM");
+    publish_fixture_pgm(&profile_root, dense_address, &dense);
+    let profile_context = SegmentContext::new(dense_address);
     FactStore::new(&profile_root)
-        .publish(
-            &facts,
-            &SegmentContext::new("dense-hour.pgm").expect("profile context"),
-            &LIMIT,
-        )
+        .publish(&facts, &profile_context, &LIMIT)
         .expect("publish profile OVF");
-    let sidecar_meta =
-        fs::metadata(profile_root.join("dense-hour.ovf")).expect("stat profile sidecar");
+    let sidecar_meta = fs::metadata(layout_file_path(
+        &profile_root,
+        dense_address,
+        LayoutFileKind::Ovf,
+    ))
+    .expect("stat profile sidecar");
 
     let accounting = accounting(&facts, &file, encoded.len(), &sidecar_meta);
     let compact_performance = compact_performance(&runtime_root, &dense, &facts);
@@ -409,8 +422,22 @@ fn run_coordinator(output: &Path) {
         storage: StorageProfile {
             model: "owned-data-directory-sibling-sidecars-v1",
             active_journal_name: "active.parts",
-            pgm_file_name: "dense-hour.pgm",
-            sidecar_file_name: "dense-hour.ovf",
+            pgm_file_name: dense_address.pgm_name(),
+            sidecar_file_name: dense_address.ovf_name(),
+            pgm_relative_path: format!(
+                "{}/{}/{}/{}",
+                dense_address.day.year_component(),
+                dense_address.day.month_component(),
+                dense_address.day.day_component(),
+                dense_address.pgm_name()
+            ),
+            sidecar_relative_path: format!(
+                "{}/{}/{}/{}",
+                dense_address.day.year_component(),
+                dense_address.day.month_component(),
+                dense_address.day.day_component(),
+                dense_address.ovf_name()
+            ),
             same_stem: true,
         },
         fixture: fixture_profile(&unit, &facts, dense.len()),
@@ -436,27 +463,31 @@ fn prepare_mode(mode: &str, root: &Path) {
     fs::create_dir(root).expect("create mode data directory");
     match mode {
         "concurrent-disjoint" => {
+            let owner = fixture_writer(root);
             for worker in 0..CONCURRENT_WORKERS {
                 let source = 100 + u64::try_from(worker).expect("worker source");
-                let start =
-                    1_000_000 + i64::try_from(worker).expect("worker range") * 1_000_000_000;
+                let start = DENSE_FIRST_WINDOW_US
+                    + i64::try_from(worker).expect("worker range") * 1_000_000_000;
+                let address = segment_address(start);
                 let bytes = dense_hour_pgm(source, start, 32);
-                fs::write(root.join(format!("segment-{worker:02}.pgm")), bytes)
-                    .expect("write disjoint PGM");
+                publish_pgm(&owner, address, &bytes);
             }
         }
         "live" => {
-            fs::write(
-                root.join("dense-hour.pgm"),
-                dense_hour_pgm(SOURCE_ID, 1_000_000, SAMPLES),
-            )
-            .expect("write live sealed PGM");
-            let first = lifecycle_part(dense_end() + 10, 41);
-            fs::write(root.join("active.parts"), framed(&first)).expect("write first active frame");
+            let owner = fixture_writer(root);
+            publish_pgm(
+                &owner,
+                dense_address(),
+                &dense_hour_pgm(SOURCE_ID, DENSE_FIRST_WINDOW_US, SAMPLES),
+            );
+            let first = lifecycle_part(LIVE_FIRST_WINDOW_US, 41);
+            initialize_fixture_journal(&owner);
+            append_fixture_journal(&owner, live_segment_id(), &first);
         }
         _ => {
-            let bytes = dense_hour_pgm(SOURCE_ID, 1_000_000, SAMPLES);
-            fs::write(root.join("dense-hour.pgm"), &bytes).expect("write dense PGM");
+            let address = dense_address();
+            let bytes = dense_hour_pgm(SOURCE_ID, DENSE_FIRST_WINDOW_US, SAMPLES);
+            publish_fixture_pgm(root, address, &bytes);
             if matches!(mode, "restart-warm" | "oracle-profile") {
                 let facts = SegmentFacts::extract(
                     &PgmUnit::open(bytes.as_slice()).expect("open seed PGM"),
@@ -464,15 +495,138 @@ fn prepare_mode(mode: &str, root: &Path) {
                 )
                 .expect("extract seed facts");
                 FactStore::new(root)
-                    .publish(
-                        &facts,
-                        &SegmentContext::new("dense-hour.pgm").expect("seed context"),
-                        &LIMIT,
-                    )
+                    .publish(&facts, &SegmentContext::new(address), &LIMIT)
                     .expect("seed durable facts");
             }
         }
     }
+}
+
+fn segment_address(first_window_us: i64) -> SegmentAddress {
+    let segment_id = SegmentId::new(first_window_us).expect("fixture segment id");
+    SegmentAddress::new(segment_id).expect("fixture segment address")
+}
+
+fn dense_address() -> SegmentAddress {
+    segment_address(DENSE_FIRST_WINDOW_US)
+}
+
+fn live_segment_id() -> SegmentId {
+    SegmentId::new(LIVE_FIRST_WINDOW_US).expect("live fixture segment id")
+}
+
+fn fixture_writer(root: &Path) -> WriterOwner {
+    DataRoot::open(root)
+        .expect("open fixture data root")
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire fixture writer")
+}
+
+fn publish_pgm(owner: &WriterOwner, address: SegmentAddress, bytes: &[u8]) -> PathBuf {
+    let mut temporary = owner.create_pgm_temp(address).expect("create fixture PGM");
+    temporary
+        .file_mut()
+        .write_all(bytes)
+        .expect("write fixture PGM");
+    temporary.publish().expect("publish fixture PGM");
+    owner
+        .root()
+        .diagnostic_file_path(address, LayoutFileKind::Pgm)
+}
+
+fn publish_fixture_pgm(root: &Path, address: SegmentAddress, bytes: &[u8]) -> PathBuf {
+    publish_pgm(&fixture_writer(root), address, bytes)
+}
+
+fn layout_file_path(root: &Path, address: SegmentAddress, kind: LayoutFileKind) -> PathBuf {
+    DataRoot::open(root)
+        .expect("open fixture data root")
+        .diagnostic_file_path(address, kind)
+}
+
+fn initialize_fixture_journal(owner: &WriterOwner) {
+    let (file, created) = owner
+        .open_or_create_journal()
+        .expect("create fixture journal");
+    assert!(created, "fixture journal must start absent");
+    file.write_all_at(&JournalHeader::EMPTY.encode(), 0)
+        .expect("write empty fixture journal header");
+    file.set_len(JOURNAL_HEADER_LEN as u64)
+        .expect("size empty fixture journal");
+    file.sync_data().expect("sync empty fixture journal");
+    owner.sync_root().expect("sync fixture journal entry");
+}
+
+fn append_fixture_journal(owner: &WriterOwner, segment_id: SegmentId, part: &[u8]) {
+    let (file, created) = owner
+        .open_or_create_journal()
+        .expect("open fixture journal");
+    assert!(!created, "fixture journal header was not initialized");
+    let file_len = file.metadata().expect("stat fixture journal").len();
+    assert!(
+        file_len >= JOURNAL_HEADER_LEN as u64,
+        "fixture journal header is incomplete"
+    );
+
+    let mut header_bytes = [0_u8; JOURNAL_HEADER_LEN];
+    file.read_exact_at(&mut header_bytes, 0)
+        .expect("read fixture journal header");
+    let header = JournalHeader::decode(header_bytes).expect("decode fixture journal header");
+    assert_eq!(
+        header.body_len,
+        file_len - JOURNAL_HEADER_LEN as u64,
+        "fixture journal body length changed"
+    );
+    match header.state {
+        JournalState::Empty => {}
+        JournalState::Active {
+            segment_id: current,
+        } => assert_eq!(
+            current,
+            segment_id.get(),
+            "fixture journal segment identity changed"
+        ),
+    }
+
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + part.len());
+    frame.extend_from_slice(
+        &FrameHeader {
+            part_len: u64::try_from(part.len()).expect("fixture part length"),
+        }
+        .encode(),
+    );
+    frame.extend_from_slice(part);
+    let frame_len = u64::try_from(frame.len()).expect("fixture frame length");
+    let next_body_len = header
+        .body_len
+        .checked_add(frame_len)
+        .expect("fixture journal body length");
+    let next_header = JournalHeader {
+        state: JournalState::Active {
+            segment_id: segment_id.get(),
+        },
+        body_len: next_body_len,
+    }
+    .encode();
+
+    if matches!(header.state, JournalState::Empty) {
+        file.write_all_at(&next_header, 0)
+            .expect("activate fixture journal");
+        file.write_all_at(&frame, file_len)
+            .expect("write first fixture journal frame");
+    } else {
+        file.write_all_at(&frame, file_len)
+            .expect("append fixture journal frame");
+        file.write_all_at(&next_header, 0)
+            .expect("advance fixture journal header");
+    }
+    file.set_len(
+        (JOURNAL_HEADER_LEN as u64)
+            .checked_add(next_body_len)
+            .expect("fixture journal file length"),
+    )
+    .expect("size fixture journal");
+    file.sync_data().expect("sync fixture journal append");
 }
 
 fn spawn_worker(executable: &Path, mode: &str, root: &Path) -> WorkerOutcome {
@@ -602,7 +756,7 @@ async fn http_cold(root: &Path, restart: bool) -> WorkerOutcome {
         "only the derived-cold mode may publish the sidecar"
     );
     assert!(
-        root.join("dense-hour.ovf").is_file(),
+        layout_file_path(root, dense_address(), LayoutFileKind::Ovf).is_file(),
         "cold and restart modes must leave one durable sibling sidecar"
     );
     measurement.finish(work)
@@ -644,7 +798,7 @@ async fn range_cold(root: &Path) -> WorkerOutcome {
         )
         .await,
     );
-    let sidecar = root.join("dense-hour.ovf");
+    let sidecar = layout_file_path(root, dense_address(), LayoutFileKind::Ovf);
     let sidecar_before = fs::read(&sidecar).expect("read policy-neutral sidecar");
     let metadata_before = fs::metadata(&sidecar).expect("stat policy-neutral sidecar");
     let identity_before = (
@@ -705,7 +859,7 @@ async fn concurrent_identical(root: &Path) -> WorkerOutcome {
         .select_overview(
             view,
             &[SOURCE_ID],
-            CoverageSpan::new(1_000_000, dense_end()).expect("identical range"),
+            CoverageSpan::new(DENSE_FIRST_WINDOW_US, dense_end()).expect("identical range"),
         )
         .expect("identical plan");
     let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_WORKERS + 1));
@@ -762,7 +916,8 @@ async fn concurrent_disjoint(root: &Path) -> WorkerOutcome {
     let mut plans = Vec::with_capacity(CONCURRENT_WORKERS);
     for worker in 0..CONCURRENT_WORKERS {
         let source = 100 + u64::try_from(worker).expect("worker source");
-        let start = 1_000_000 + i64::try_from(worker).expect("worker range") * 1_000_000_000;
+        let start =
+            DENSE_FIRST_WINDOW_US + i64::try_from(worker).expect("worker range") * 1_000_000_000;
         plans.push(
             state
                 .select_overview(
@@ -824,37 +979,18 @@ async fn concurrent_disjoint(root: &Path) -> WorkerOutcome {
 }
 
 async fn live_mode(root: &Path) -> WorkerOutcome {
+    let (damaged_journal_rejections, damaged_journal_preserved) =
+        verify_damaged_journal_fail_closed(root);
     let state = state(root, &OverviewConfig::new());
     let service = qualification_service(state.clone());
     let before_loader = state.overview_loader.qualification_snapshot();
     let before_live = live_stats(&state);
-    let second = lifecycle_part(dense_end() + 20, 42);
-    let completed_frame = framed(&second);
-    let next_header = FrameHeader {
-        part_len: u64::try_from(second.len()).expect("active part length"),
-    }
-    .encode();
-    let pending_from = fs::metadata(root.join("active.parts"))
-        .expect("stat active journal")
-        .len()
-        .checked_add(u64::try_from(completed_frame.len()).expect("completed frame length"))
-        .expect("pending tail offset");
-    let pending_to = pending_from
-        .checked_add(4)
-        .expect("pending tail end offset");
+    let second = lifecycle_part(LIVE_FIRST_WINDOW_US + 10, 42);
 
     let measurement = Measurement::start();
-    let mut journal = OpenOptions::new()
-        .append(true)
-        .open(root.join("active.parts"))
-        .expect("open active journal");
-    journal
-        .write_all(&completed_frame)
-        .expect("append completed active frame");
-    journal
-        .write_all(&next_header[..4])
-        .expect("append pending tail");
-    journal.sync_all().expect("sync active journal");
+    let owner = fixture_writer(root);
+    append_fixture_journal(&owner, live_segment_id(), &second);
+    drop(owner);
 
     let mut snapshot = state.snapshot().as_ref().clone();
     let delta = snapshot
@@ -864,6 +1000,10 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
         delta.journal.completed_parts.len(),
         1,
         "incremental refresh did not admit exactly one completed active part"
+    );
+    assert_eq!(
+        delta.journal.tail_pending, None,
+        "a synchronized version-1 append exposed a pending tail"
     );
     state
         .republish_store_view(snapshot, &delta)
@@ -886,13 +1026,9 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
         2,
         "both completed active lifecycle frames must be visible"
     );
-    assert_eq!(
-        value["meta"]["tail_pending"],
-        serde_json::json!({
-            "from_offset_bytes": pending_from,
-            "to_offset_bytes": pending_to,
-        }),
-        "truncated next frame must publish its exact byte range"
+    assert!(
+        value["meta"]["tail_pending"].is_null(),
+        "a valid version-1 journal must not expose a pending tail"
     );
     let after_loader = state.overview_loader.qualification_snapshot();
     let after_live = live_stats(&state);
@@ -912,8 +1048,8 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
     );
     work.visibility_lag_us =
         u64::try_from(measurement.started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    work.tail_pending_from_offset_bytes = pending_from;
-    work.tail_pending_to_offset_bytes = pending_to;
+    work.damaged_journal_rejections = damaged_journal_rejections;
+    work.damaged_journal_preserved = damaged_journal_preserved;
     assert_eq!(
         work.completed_active_parts, 1,
         "live evidence did not account for the completed part"
@@ -925,13 +1061,61 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
     measurement.finish(work)
 }
 
+fn verify_damaged_journal_fail_closed(root: &Path) -> (u64, u64) {
+    let damaged_root = root.with_extension("damaged-journal");
+    assert!(
+        !damaged_root.exists(),
+        "damaged-journal fixture must start absent"
+    );
+    fs::create_dir(&damaged_root).expect("create damaged-journal fixture");
+    {
+        let owner = fixture_writer(&damaged_root);
+        initialize_fixture_journal(&owner);
+        append_fixture_journal(
+            &owner,
+            live_segment_id(),
+            &lifecycle_part(LIVE_FIRST_WINDOW_US, 99),
+        );
+    }
+
+    let journal_path = damaged_root.join(kronika_layout::ACTIVE_JOURNAL_NAME);
+    let mut journal = OpenOptions::new()
+        .append(true)
+        .open(&journal_path)
+        .expect("open negative journal for damage injection");
+    journal
+        .write_all(b"torn")
+        .expect("append incomplete journal bytes");
+    journal.sync_all().expect("sync damaged journal");
+    drop(journal);
+    let before = fs::read(&journal_path).expect("read damaged journal before rejection");
+
+    let error =
+        LocalDirSnapshot::open(&damaged_root).expect_err("damaged version-1 journal was accepted");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::InvalidData,
+        "damaged version-1 journal must fail closed"
+    );
+    let after = fs::read(&journal_path).expect("read damaged journal after rejection");
+    assert_eq!(
+        after, before,
+        "rejecting a damaged version-1 journal mutated its bytes"
+    );
+    fs::remove_dir_all(&damaged_root).expect("remove damaged-journal fixture");
+    (1, 1)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one mode must keep fallback, recovery, restart, and accounting evidence in a single measured process"
 )]
 fn memory_only(root: &Path) -> WorkerOutcome {
     let snapshot = LocalDirSnapshot::open(root).expect("memory snapshot");
-    let descriptor = snapshot.sealed_descriptors()[0];
+    let descriptor = snapshot
+        .sealed_descriptors()
+        .next()
+        .expect("memory descriptor");
     let context = snapshot
         .sealed_context(&descriptor)
         .expect("memory context");
@@ -1063,7 +1247,10 @@ fn memory_only(root: &Path) -> WorkerOutcome {
 
 fn oracle_profile(root: &Path) -> WorkerOutcome {
     let snapshot = LocalDirSnapshot::open(root).expect("oracle snapshot");
-    let descriptor = snapshot.sealed_descriptors()[0];
+    let descriptor = snapshot
+        .sealed_descriptors()
+        .next()
+        .expect("oracle descriptor");
     let context = snapshot
         .sealed_context(&descriptor)
         .expect("oracle context");
@@ -1087,7 +1274,7 @@ fn oracle_profile(root: &Path) -> WorkerOutcome {
         "the oracle profile did not use the prepared sibling sidecar"
     );
     for range in [
-        CoverageSpan::new(1_000_000, dense_end()).expect("full oracle range"),
+        CoverageSpan::new(DENSE_FIRST_WINDOW_US, dense_end()).expect("full oracle range"),
         CoverageSpan::new(61_000_000, 361_000_000).expect("partial oracle range"),
     ] {
         assert_eq!(
@@ -1399,6 +1586,10 @@ fn mode_result(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the four compact modes share one fixture and must remain directly comparable"
+)]
 fn compact_performance(
     runtime_root: &Path,
     dense: &[u8],
@@ -1406,19 +1597,20 @@ fn compact_performance(
 ) -> CompactPerformanceProfile {
     let root = runtime_root.join("compact-performance");
     fs::create_dir(&root).expect("create compact performance root");
-    let context = SegmentContext::new("dense-hour.pgm").expect("compact context");
+    let address = dense_address();
     let restart_root = root.join("restart-warm");
     fs::create_dir(&restart_root).expect("create compact restart root");
-    fs::write(restart_root.join("dense-hour.pgm"), dense).expect("write compact restart PGM");
+    publish_fixture_pgm(&restart_root, address, dense);
     FactStore::new(&restart_root)
-        .publish(expected, &context, &LIMIT)
+        .publish(expected, &SegmentContext::new(address), &LIMIT)
         .expect("seed compact restart facts");
-    let full_range = CoverageSpan::new(1_000_000, dense_end()).expect("compact full range");
+    let full_range =
+        CoverageSpan::new(DENSE_FIRST_WINDOW_US, dense_end()).expect("compact full range");
     let derived_roots = (0..iterations())
         .map(|iteration| {
             let data_dir = root.join(format!("derived-cold-{iteration:02}"));
             fs::create_dir(&data_dir).expect("create compact derived root");
-            fs::write(data_dir.join("dense-hour.pgm"), dense).expect("write compact derived PGM");
+            publish_fixture_pgm(&data_dir, address, dense);
             data_dir
         })
         .collect::<Vec<_>>();
@@ -1426,7 +1618,10 @@ fn compact_performance(
     let derived = measure_compact("derived-cold", |iteration| {
         let data_dir = &derived_roots[iteration];
         let snapshot = LocalDirSnapshot::open(data_dir).expect("open compact derived snapshot");
-        let descriptor = snapshot.sealed_descriptors()[0];
+        let descriptor = snapshot
+            .sealed_descriptors()
+            .next()
+            .expect("compact derived descriptor");
         let context = snapshot
             .sealed_context(&descriptor)
             .expect("compact derived context");
@@ -1452,7 +1647,10 @@ fn compact_performance(
     let restart = measure_compact("restart-warm", |_iteration| {
         let snapshot =
             LocalDirSnapshot::open(&restart_root).expect("open compact restart snapshot");
-        let descriptor = snapshot.sealed_descriptors()[0];
+        let descriptor = snapshot
+            .sealed_descriptors()
+            .next()
+            .expect("compact restart descriptor");
         let context = snapshot
             .sealed_context(&descriptor)
             .expect("compact restart context");
@@ -1489,8 +1687,11 @@ fn compact_performance(
     });
     let range_cold = measure_compact("range-cold/facts-warm", |iteration| {
         let offset = i64::try_from(iteration % 60).expect("compact iteration fits") * CADENCE_US;
-        let range = CoverageSpan::new(1_000_000 + offset, 1_000_000 + offset + 300_000_000)
-            .expect("compact partial range");
+        let range = CoverageSpan::new(
+            DENSE_FIRST_WINDOW_US + offset,
+            DENSE_FIRST_WINDOW_US + offset + 300_000_000,
+        )
+        .expect("compact partial range");
         std::hint::black_box(
             expected
                 .query(range, ORACLE_LIMITS)
@@ -1609,19 +1810,29 @@ fn validate_mode_samples(mode: &str, samples: &[WorkerOutcome]) {
                     "memory-only did not retain the bounded fallback"
                 );
             }
-            "live" => {
-                assert_eq!(
-                    sample.work.completed_active_parts, 1,
-                    "live mode did not fold one completed part"
-                );
-                assert!(
-                    sample.work.visibility_lag_us <= 2_500_000,
-                    "live mode exceeded the 2.5-second visibility contract"
-                );
-            }
+            "live" => validate_live_sample(sample.work),
             _ => {}
         }
     }
+}
+
+fn validate_live_sample(work: Work) {
+    assert_eq!(
+        work.completed_active_parts, 1,
+        "live mode did not fold one completed part"
+    );
+    assert!(
+        work.visibility_lag_us <= 2_500_000,
+        "live mode exceeded the 2.5-second visibility contract"
+    );
+    assert_eq!(
+        work.damaged_journal_rejections, 1,
+        "live mode did not reject one damaged version-1 journal"
+    );
+    assert_eq!(
+        work.damaged_journal_preserved, 1,
+        "live mode mutated the rejected version-1 journal"
+    );
 }
 
 fn percentile(sorted: &[u128], percentile: usize) -> u128 {
@@ -1754,18 +1965,8 @@ fn lifecycle_part(ts_us: i64, pid: i32) -> Vec<u8> {
     )
 }
 
-fn framed(part: &[u8]) -> Vec<u8> {
-    let mut bytes = FrameHeader {
-        part_len: u64::try_from(part.len()).expect("frame length"),
-    }
-    .encode()
-    .to_vec();
-    bytes.extend_from_slice(part);
-    bytes
-}
-
-fn dense_end() -> i64 {
-    1_000_000 + i64::try_from(SAMPLES).expect("sample count") * CADENCE_US
+const fn dense_end() -> i64 {
+    DENSE_END_US
 }
 
 fn fixture_profile(
@@ -2413,7 +2614,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/gc/tests.rs",
-                    "source_entries_and_symlinks_are_never_followed_or_removed",
+                    "a_sidecar_symlink_makes_gc_fail_closed_without_removing_sources",
                 ),
                 (
                     "rust_test",
@@ -2475,5 +2676,63 @@ fn evidence_binary(kind: &str, path: &str) -> &'static str {
         ("rust_test", path) if path.starts_with("bins/pg_kronika-web/") => "pg-kronika-web",
         ("bdd_scenario", path) if path.starts_with("crates/kronika-bdd/features/") => "kronika-bdd",
         _ => "unknown-evidence-binary",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_journal_v1_preserves_identity_and_absolute_frame_offsets() {
+        let directory = tempfile::tempdir().expect("fixture parent");
+        let owner = fixture_writer(directory.path());
+        initialize_fixture_journal(&owner);
+        append_fixture_journal(
+            &owner,
+            live_segment_id(),
+            &lifecycle_part(LIVE_FIRST_WINDOW_US, 41),
+        );
+        append_fixture_journal(
+            &owner,
+            live_segment_id(),
+            &lifecycle_part(LIVE_FIRST_WINDOW_US + 10, 42),
+        );
+        drop(owner);
+
+        let bytes = fs::read(directory.path().join(kronika_layout::ACTIVE_JOURNAL_NAME))
+            .expect("read fixture journal");
+        let header = JournalHeader::decode(
+            bytes[..JOURNAL_HEADER_LEN]
+                .try_into()
+                .expect("complete fixture journal header"),
+        )
+        .expect("decode fixture journal");
+        assert_eq!(
+            header.state,
+            JournalState::Active {
+                segment_id: live_segment_id().get(),
+            }
+        );
+        assert_eq!(
+            usize::try_from(header.body_len).expect("fixture body length"),
+            bytes.len() - JOURNAL_HEADER_LEN
+        );
+
+        let snapshot = LocalDirSnapshot::open(directory.path()).expect("open fixture snapshot");
+        let units = snapshot.units();
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|unit| unit.live));
+        assert_eq!(units[0].min_ts, LIVE_FIRST_WINDOW_US);
+        assert_eq!(units[1].min_ts, LIVE_FIRST_WINDOW_US + 10);
+    }
+
+    #[test]
+    fn damaged_fixture_journal_is_rejected_without_mutation() {
+        let directory = tempfile::tempdir().expect("fixture parent");
+        assert_eq!(
+            verify_damaged_journal_fail_closed(&directory.path().join("live")),
+            (1, 1)
+        );
     }
 }

@@ -1673,12 +1673,14 @@ mod tests {
     use super::*;
     use kronika_analytics::overview::{CountLimits, OracleSourceError};
     use kronika_format::{PartMeta, SectionInput, build_part};
+    use kronika_layout::FileIdentity;
     use kronika_reader::{
         JournalDelta, JournalGenerationId, LIMIT, LiveBuilder, PartTransition, PgmUnit,
         RefreshDelta,
     };
     use kronika_registry::Section;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_store::CatalogSummary;
 
     const LIMITS: OracleLimits = OracleLimits {
         max_observations: 4096,
@@ -1731,8 +1733,24 @@ mod tests {
 
     fn sealed_entry_from_bytes(file: &str, bytes: &[u8]) -> SealedEntry {
         let unit = PgmUnit::open(bytes).expect("open sealed unit");
-        let locator = SealedLocator::from_file_name_bytes(file.as_bytes());
-        let descriptor = SegmentDescriptor::from_catalog(locator, unit.catalog());
+        let locator = SealedLocator::from_segment_id(crate::test_layout::named_address(file).id);
+        let summary = CatalogSummary::from_catalog(
+            unit.catalog(),
+            u32::try_from(unit.catalog().encoded_len()).expect("catalog length"),
+        );
+        let descriptor = SegmentDescriptor::from_summary(
+            locator,
+            FileIdentity {
+                device: 1,
+                inode: locator.segment_id().get().unsigned_abs(),
+                len: unit.source_file_len(),
+                mtime_seconds: 0,
+                mtime_nanoseconds: 0,
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+            },
+            &summary,
+        );
         let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract facts");
         SealedEntry::new(descriptor, Arc::new(facts))
     }
@@ -1750,8 +1768,8 @@ mod tests {
                 generation_id: JournalGenerationId(1),
                 previous_valid_len: 0,
                 new_valid_len: 0,
-                completed_parts: Vec::new(),
-                current_parts: Vec::new(),
+                completed_parts: Arc::from([]),
+                current_parts: Arc::from([]),
                 current_parts_complete: true,
                 transition: PartTransition::Append,
                 tail_pending: None,

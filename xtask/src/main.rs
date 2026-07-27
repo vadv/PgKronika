@@ -20,6 +20,7 @@ const RULES: &[(&str, &[&str])] = &[
         // privileged process. No reader: the collector only writes.
         &[
             "kronika-format",
+            "kronika-layout",
             "kronika-derive",
             "kronika-registry",
             "kronika-writer",
@@ -34,6 +35,7 @@ const RULES: &[(&str, &[&str])] = &[
         // enter the web process.
         &[
             "kronika-format",
+            "kronika-layout",
             "kronika-derive",
             "kronika-registry",
             "kronika-reader",
@@ -45,12 +47,13 @@ const RULES: &[(&str, &[&str])] = &[
         "pg_kronika-archiver",
         // No registry: the archiver checks only the container and must not
         // need a rebuild when data types are added.
-        &["kronika-format", "kronika-store"],
+        &["kronika-format", "kronika-layout", "kronika-store"],
     ),
     (
         "pg_kronika-dump",
         &[
             "kronika-format",
+            "kronika-layout",
             "kronika-derive",
             "kronika-registry",
             "kronika-reader",

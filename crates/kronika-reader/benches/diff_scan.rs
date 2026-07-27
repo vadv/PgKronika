@@ -15,10 +15,12 @@
 )]
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::Path;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use kronika_format::{PartMeta, SectionInput, build_part};
+use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId};
 use kronika_reader::{LocalDirSnapshot, OutRow, Value, diff_section, section, sections};
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
@@ -42,6 +44,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const SOURCE: u64 = 7;
 const SECOND: i64 = 1_000_000;
+const FIRST_WINDOW_US: i64 = 0;
 /// Snapshot cadence of the synthetic fixtures: one row per series each 10 s.
 const STEP: i64 = 10 * SECOND;
 const CUMULATIVE: [&str; 5] = ["c0", "c1", "c2", "c3", "c4"];
@@ -95,6 +98,8 @@ fn bench_diff_section_fold(c: &mut Criterion) {
 
 /// A two-hour, 10-second-cadence archiver + bgwriter segment (720 rows each).
 fn build_two_section_fixture(dir: &Path) {
+    let segment_id = SegmentId::new(FIRST_WINDOW_US).expect("fixture segment id");
+    let address = SegmentAddress::new(segment_id).expect("fixture segment address");
     let snapshots = 720;
     let mut archiver = Vec::with_capacity(snapshots);
     let mut bgwriter = Vec::with_capacity(snapshots);
@@ -149,12 +154,21 @@ fn build_two_section_fixture(dir: &Path) {
             },
         ],
         PartMeta {
-            min_ts: 0,
+            min_ts: FIRST_WINDOW_US,
             max_ts: i64::try_from(snapshots).expect("fits") * STEP,
             source_id: SOURCE,
         },
     );
-    std::fs::write(dir.join("0.pgm"), &part).expect("write part");
+    let root = DataRoot::open(dir).expect("open fixture root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire fixture writer");
+    let mut temporary = owner.create_pgm_temp(address).expect("create fixture PGM");
+    temporary
+        .file_mut()
+        .write_all(&part)
+        .expect("write fixture PGM");
+    temporary.publish().expect("publish fixture PGM");
 }
 
 const TWO_SECTIONS: [&str; 2] = [

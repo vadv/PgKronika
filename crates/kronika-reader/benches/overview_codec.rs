@@ -12,6 +12,7 @@ use kronika_analytics::overview::{
     AlignmentId, CounterSample, GaugeSample, MetricSeriesId, SegmentIdentity,
 };
 use kronika_format::{PartMeta, ReadAt, SectionInput, build_part};
+use kronika_layout as _;
 use kronika_reader::{
     BlockContent, BlockKind, CounterSamplesBlock, FactFile, FactFileReader, GaugeSamplesBlock,
     HeaderIdentity, LIMIT, SegmentFacts, SourceDescriptor, SourceManifestBlock,

@@ -4,8 +4,6 @@
 //! failures, and persistence failures return the computed facts with a typed
 //! diagnostic.
 
-use std::ffi::OsStr;
-use std::fs::File;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::{self, Write as _};
 #[cfg(feature = "qualification")]
@@ -25,9 +23,8 @@ use std::collections::VecDeque;
 
 use kronika_analytics::overview::SegmentIdentity;
 use kronika_format::ReadAt;
-use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
+use kronika_layout::{DataRoot, LayoutError, LayoutLimits, OverviewOwner};
 
-use super::cache_owner::{SidecarOwner, SidecarOwnerError, open_data_dir, open_file_at};
 use super::container::{CacheReadError, FactReadStats, HeaderIdentity};
 use super::descriptors::CatalogEntryDescriptor;
 use super::factkey::{FactBuildKey, FactKey, FileKind};
@@ -37,9 +34,6 @@ use super::gc::{GcAdmissionError, GcConfig, GcMark, GcOutcome, GcSkipReason, GcS
 use super::limits::Bounds;
 use super::persist_mode::{PersistModeSnapshot, PersistState, Reservation};
 use crate::unit::{PgmBodyReadStats, PgmUnit};
-
-const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
-const NAME_RETRIES: usize = 32;
 
 /// Qualification-only Unix socket used to stop a real web process immediately
 /// before the atomic sidecar rename.
@@ -63,7 +57,6 @@ pub const QUALIFICATION_PUBLISH_BARRIER_READY: &str = "before_commit";
 #[doc(hidden)]
 pub const QUALIFICATION_PUBLISH_BARRIER_RELEASE: &str = "continue\n";
 
-static PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static STORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "qualification")]
@@ -307,7 +300,7 @@ pub struct FactStore {
     fallback: Arc<Mutex<FallbackFactLru>>,
     gc_config: GcConfig,
     gc: Arc<Mutex<GcState>>,
-    owner: Arc<Mutex<Option<Arc<SidecarOwner>>>>,
+    owner: Arc<Mutex<Option<Arc<OverviewOwner>>>>,
     publication_gate: Arc<Mutex<()>>,
     /// Write mode and retry backoff for sibling sidecars.
     persist: Arc<Mutex<PersistState>>,
@@ -461,18 +454,16 @@ impl FactStore {
         operation(&mut persist)
     }
 
-    fn acquire_owner(&self) -> Result<Arc<SidecarOwner>, PersistError> {
+    fn acquire_owner(&self) -> Result<Arc<OverviewOwner>, PersistError> {
         let mut owner = lock_unpoisoned(&self.owner);
         if let Some(owner) = owner.as_ref() {
             return Ok(Arc::clone(owner));
         }
-        let acquired = Arc::new(SidecarOwner::acquire(&self.data_dir).map_err(
-            |error| match error {
-                SidecarOwnerError::Contended => PersistError::Busy,
-                SidecarOwnerError::UnsafePath => PersistError::UnsafePath,
-                SidecarOwnerError::Io(error) => PersistError::from_io(error),
-            },
-        )?);
+        let root = DataRoot::open(&self.data_dir).map_err(PersistError::from_layout)?;
+        let acquired = Arc::new(
+            root.acquire_overview(LayoutLimits::default())
+                .map_err(PersistError::from_layout)?,
+        );
         *owner = Some(Arc::clone(&acquired));
         drop(owner);
         Ok(acquired)
@@ -485,14 +476,8 @@ impl FactStore {
     #[must_use]
     pub fn collect_garbage(&self, mark: &GcMark) -> GcOutcome {
         let _publication = lock_unpoisoned(&self.publication_gate);
-        if self.acquire_owner().is_err() {
-            return GcOutcome {
-                skip_reason: Some(GcSkipReason::OwnerUnavailable),
-                ..GcOutcome::default()
-            };
-        }
-        let directory = match open_data_dir(&self.data_dir) {
-            Ok(directory) => directory,
+        let owner = match self.acquire_owner() {
+            Ok(owner) => owner,
             Err(_error) => {
                 return GcOutcome {
                     skip_reason: Some(GcSkipReason::OwnerUnavailable),
@@ -501,7 +486,7 @@ impl FactStore {
             }
         };
         let mut gc = lock_unpoisoned(&self.gc);
-        super::gc::collect(&directory, mark, &mut gc, self.gc_config, SystemTime::now())
+        super::gc::collect(&owner, mark, &mut gc, self.gc_config, SystemTime::now())
     }
 
     /// PgKronika-owned data directory containing PGM and OVF siblings.
@@ -796,17 +781,17 @@ impl FactStore {
             }
         }
         let _publication = lock_unpoisoned(&self.publication_gate);
-        let _owner = self.acquire_owner()?;
+        let owner = self.acquire_owner()?;
         let key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
         let lineage = facts.lineage().id();
         let build_key = FactBuildKey::new(key, lineage);
-        let directory = open_data_dir(&self.data_dir).map_err(PersistError::from_io)?;
-        validate_sibling_source(&directory, context, facts.identity())
+        validate_sibling_source(owner.root(), context, facts.identity())
             .map_err(PersistError::from_io)?;
-        let final_name = context.sidecar_file_name();
-        let final_path = self.data_dir.join(final_name);
+        let final_path = owner
+            .root()
+            .diagnostic_file_path(context.address(), kronika_layout::FileKind::Ovf);
         let expected_catalog = facts.catalog_descriptors();
-        if let Ok(existing) = open_regular_at(&directory, final_name)
+        if let Ok(Some(existing)) = owner.root().open_ovf(context.address())
             && SegmentFacts::from_reader(
                 existing,
                 facts.identity(),
@@ -816,85 +801,79 @@ impl FactStore {
             )
             .is_ok()
         {
-            lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
+            lock_unpoisoned(&self.gc).record_cache_hit(build_key, SystemTime::now());
             return Ok(final_path);
         }
 
         if self.gc_config.max_logical_bytes().is_some() || self.gc_config.max_files().is_some() {
             let incoming =
                 u64::try_from(bytes.len()).map_err(|_error| PersistError::QuotaExceeded)?;
-            match super::gc::admit_publication(&directory, self.gc_config, incoming) {
+            let mut gc = lock_unpoisoned(&self.gc);
+            match super::gc::admit_publication(&owner, &mut gc, self.gc_config, incoming) {
                 Ok(()) => {}
                 Err(GcAdmissionError::Capped) => return Err(PersistError::QuotaExceeded),
                 Err(GcAdmissionError::Incomplete) => return Err(PersistError::TransientIo),
             }
         }
 
-        let (temp_name, temp_file) = create_temp(&directory)?;
-        let write_result = write_synced(temp_file, bytes);
-        if let Err(error) = write_result {
-            unlink_ignoring_missing(&directory, &temp_name);
-            return Err(error);
-        }
-        #[cfg(feature = "qualification")]
-        if let Err(error) = self
-            .qualification_publish_barrier
-            .wait_before_commit(&temp_name)
-        {
-            unlink_ignoring_missing(&directory, &temp_name);
-            return Err(error);
-        }
-
-        let outcome = commit_temp(
-            &directory,
-            &temp_name,
-            final_name,
-            facts,
+        let mut temporary = owner
+            .create_ovf_temp(context.address())
+            .map_err(PersistError::from_layout)?;
+        temporary
+            .file_mut()
+            .write_all(bytes)
+            .map_err(PersistError::from_io)?;
+        let candidate = temporary
+            .try_clone_file()
+            .map_err(PersistError::from_layout)?;
+        let candidate_metadata = candidate.metadata().map_err(PersistError::from_io)?;
+        let published_usage = super::gc::FileUsage {
+            logical_bytes: candidate_metadata.len(),
+            allocated_bytes: std::os::unix::fs::MetadataExt::blocks(&candidate_metadata)
+                .saturating_mul(512),
+        };
+        SegmentFacts::from_reader(
+            candidate,
+            facts.identity(),
+            facts.lineage(),
             &expected_catalog,
             bounds,
+        )
+        .map_err(|_error| PersistError::InvalidSidecarState)?;
+        #[cfg(feature = "qualification")]
+        self.qualification_publish_barrier
+            .wait_before_commit(temporary.temp_name())?;
+
+        temporary.publish().map_err(PersistError::from_layout)?;
+        lock_unpoisoned(&self.gc).record_publication(
+            context.address(),
+            build_key,
+            published_usage,
+            SystemTime::now(),
         );
-        unlink_ignoring_missing(&directory, &temp_name);
-        outcome.map(|()| {
-            lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
-            final_path
-        })
+        Ok(final_path)
     }
 
     fn probe_once(&self) -> Result<(), PersistError> {
         let _publication = lock_unpoisoned(&self.publication_gate);
-        let _owner = self.acquire_owner()?;
-        let directory = open_data_dir(&self.data_dir).map_err(PersistError::from_io)?;
-        for _ in 0..NAME_RETRIES {
-            let sequence = PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = format!(
-                ".pgkronika-overview.probe-{}-{sequence}",
-                std::process::id()
-            );
-            let mut file = match open_file_at(
-                &directory,
-                &name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                FILE_MODE,
-            ) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(PersistError::from_io(error)),
-            };
-            let probe_result = rustix::fs::fchmod(&file, FILE_MODE)
-                .map_err(PersistError::from_errno)
-                .and_then(|()| file.write_all(b"p").map_err(PersistError::from_io))
-                .and_then(|()| file.sync_all().map_err(PersistError::from_io));
-            drop(file);
-            if let Err(error) = probe_result {
-                unlink_ignoring_missing(&directory, &name);
-                return Err(error);
-            }
-            rustix::fs::unlinkat(&directory, &name, AtFlags::empty())
-                .map_err(PersistError::from_errno)?;
-            directory.sync_all().map_err(PersistError::from_io)?;
-            return Ok(());
-        }
-        Err(PersistError::TransientIo)
+        let owner = self.acquire_owner()?;
+        let snapshot = owner
+            .root()
+            .scan(LayoutLimits::default())
+            .map_err(PersistError::from_layout)?;
+        let address = snapshot
+            .segments
+            .last()
+            .map(|segment| segment.address)
+            .ok_or(PersistError::InvalidSidecarState)?;
+        let mut probe = owner
+            .create_probe_temp(address)
+            .map_err(PersistError::from_layout)?;
+        probe
+            .file_mut()
+            .write_all(b"p")
+            .map_err(PersistError::from_io)?;
+        probe.finish_probe().map_err(PersistError::from_layout)
     }
 
     #[cfg(any(test, feature = "qualification"))]
@@ -981,10 +960,17 @@ impl FactStore {
         expected_catalog: &[CatalogEntryDescriptor],
         bounds: &Bounds,
     ) -> Result<(SegmentFacts, FactReadStats), CacheReadError> {
-        let directory = open_data_dir(&self.data_dir).map_err(CacheReadError::Io)?;
-        validate_sibling_source(&directory, context, identity).map_err(CacheReadError::Io)?;
-        let file =
-            open_regular_at(&directory, context.sidecar_file_name()).map_err(CacheReadError::Io)?;
+        let root = DataRoot::open(&self.data_dir).map_err(cache_layout_error)?;
+        validate_sibling_source(&root, context, identity).map_err(CacheReadError::Io)?;
+        let file = root
+            .open_ovf(context.address())
+            .map_err(cache_layout_error)?
+            .ok_or_else(|| {
+                CacheReadError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "overview sidecar is absent",
+                ))
+            })?;
         SegmentFacts::from_reader_with_stats(file, identity, lineage, expected_catalog, bounds)
     }
 
@@ -1005,91 +991,12 @@ impl FactStore {
     }
 }
 
-fn commit_temp(
-    directory: &File,
-    temp_name: &str,
-    final_name: &OsStr,
-    facts: &SegmentFacts,
-    expected_catalog: &[CatalogEntryDescriptor],
-    bounds: &Bounds,
-) -> Result<(), PersistError> {
-    let temp = open_regular_at(directory, temp_name).map_err(PersistError::from_io)?;
-    SegmentFacts::from_reader(
-        temp,
-        facts.identity(),
-        facts.lineage(),
-        expected_catalog,
-        bounds,
-    )
-    .map_err(|_error| PersistError::InvalidSidecarState)?;
-
-    rustix::fs::renameat_with(
-        directory,
-        temp_name,
-        directory,
-        final_name,
-        RenameFlags::empty(),
-    )
-    .map_err(PersistError::from_errno)?;
-    directory.sync_all().map_err(PersistError::from_io)
-}
-
-fn open_regular_at<P: rustix::path::Arg>(directory: &File, name: P) -> Result<File, io::Error> {
-    let file = open_file_at(
-        directory,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache candidate is not a regular file",
-        ));
-    }
-    Ok(file)
-}
-
-fn create_temp(directory: &File) -> Result<(String, File), PersistError> {
-    for _ in 0..NAME_RETRIES {
-        let sequence = PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".pgkronika-overview.tmp-{}-{sequence}", std::process::id());
-        match open_file_at(
-            directory,
-            &name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            FILE_MODE,
-        ) {
-            Ok(file) => {
-                rustix::fs::fchmod(&file, FILE_MODE).map_err(PersistError::from_errno)?;
-                return Ok((name, file));
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(PersistError::from_io(error)),
-        }
-    }
-    Err(PersistError::TransientIo)
-}
-
-fn write_synced(mut file: File, bytes: &[u8]) -> Result<(), PersistError> {
-    file.write_all(bytes).map_err(PersistError::from_io)?;
-    file.sync_all().map_err(PersistError::from_io)
-}
-
-fn unlink_ignoring_missing(directory: &File, name: &str) {
-    match rustix::fs::unlinkat(directory, name, AtFlags::empty()) {
-        Ok(()) => {}
-        Err(error) if error == rustix::io::Errno::NOENT => {}
-        Err(_error) => {}
-    }
-}
-
 fn validate_sibling_source(
-    directory: &File,
+    root: &DataRoot,
     context: &SegmentContext,
     expected: &HeaderIdentity,
 ) -> io::Result<()> {
-    let source = open_regular_at(directory, context.pgm_file_name())?;
+    let source = root.open_pgm(context.address()).map_err(layout_to_io)?;
     let unit = PgmUnit::open(source)
         .map_err(|_error| io::Error::new(io::ErrorKind::InvalidData, "invalid sibling PGM"))?;
     let (actual, _lineage) = SegmentFacts::provenance(&unit)
@@ -1101,6 +1008,14 @@ fn validate_sibling_source(
         ));
     }
     Ok(())
+}
+
+fn layout_to_io(error: LayoutError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn cache_layout_error(error: LayoutError) -> CacheReadError {
+    CacheReadError::Io(layout_to_io(error))
 }
 
 fn cache_rebuild_reason(error: &CacheReadError) -> CacheRebuildReason {
@@ -1144,6 +1059,16 @@ impl PersistError {
 
     const fn is_fallback_eligible(self) -> bool {
         self.is_backoff_eligible() || matches!(self.class(), PersistFailureClass::Contended)
+    }
+
+    fn from_layout(error: LayoutError) -> Self {
+        match error {
+            LayoutError::OwnerContended { .. } => Self::Busy,
+            LayoutError::SymlinkNotAllowed { .. } => Self::UnsafePath,
+            LayoutError::Io(error) => Self::from_io(error),
+            LayoutError::TraversalLimitExceeded { .. } => Self::TransientIo,
+            _ => Self::InvalidSidecarState,
+        }
     }
 
     pub(super) fn from_errno(error: rustix::io::Errno) -> Self {
@@ -1234,12 +1159,50 @@ mod tests {
     }
 
     fn context_for(stem: &str) -> SegmentContext {
-        SegmentContext::new(format!("{stem}.pgm")).expect("valid context")
+        SegmentContext::new(crate::test_layout::named_address(stem))
     }
 
     fn write_pgm(directory: &TempDir, context: &SegmentContext, bytes: &[u8]) {
-        std::fs::write(directory.path().join(context.pgm_file_name()), bytes)
-            .expect("write sibling PGM");
+        crate::test_layout::write_pgm(directory.path(), context.address(), bytes);
+    }
+
+    fn pgm_path(directory: &TempDir, context: &SegmentContext) -> PathBuf {
+        crate::test_layout::file_path(
+            directory.path(),
+            context.address(),
+            kronika_layout::FileKind::Pgm,
+        )
+    }
+
+    fn sidecar_path(directory: &TempDir, context: &SegmentContext) -> PathBuf {
+        crate::test_layout::file_path(
+            directory.path(),
+            context.address(),
+            kronika_layout::FileKind::Ovf,
+        )
+    }
+
+    fn stale_ovf_temp_path(directory: &TempDir, context: &SegmentContext) -> PathBuf {
+        crate::test_layout::day_path(directory.path(), context.address())
+            .join(format!("{}.ovf.12.34.tmp", context.address().id))
+    }
+
+    fn overview_temp_count(directory: &TempDir, context: &SegmentContext) -> usize {
+        let prefix = format!("{}.ovf.", context.address().id);
+        std::fs::read_dir(crate::test_layout::day_path(
+            directory.path(),
+            context.address(),
+        ))
+        .expect("list UTC day")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.starts_with(&prefix)
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension == "tmp")
+        })
+        .count()
     }
 
     fn lifecycle_pgm(source_id: u64) -> Vec<u8> {
@@ -1400,8 +1363,8 @@ mod tests {
         assert_eq!(first.facts().identity(), second.facts().identity());
         assert_eq!(first.facts().lineage(), second.facts().lineage());
 
-        let first_path = directory.path().join("first.ovf");
-        let second_path = directory.path().join("second.ovf");
+        let first_path = sidecar_path(&directory, &first_context);
+        let second_path = sidecar_path(&directory, &second_context);
         assert_ne!(first_path, second_path);
         assert!(first_path.is_file());
         assert!(second_path.is_file());
@@ -1438,17 +1401,7 @@ mod tests {
         store
             .read(&unit(&bytes), &context(), &LIMIT)
             .expect("replacement is valid");
-        let artifacts = std::fs::read_dir(path.parent().expect("parent"))
-            .expect("list data directory")
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".pgkronika-overview.tmp-")
-            })
-            .count();
-        assert_eq!(artifacts, 0);
+        assert_eq!(overview_temp_count(&directory, &context()), 0);
     }
 
     #[test]
@@ -1501,14 +1454,13 @@ mod tests {
             large_encoded.len() > target_encoded.len(),
             "qualification candidate must exceed the target fact file"
         );
-        let sidecar = directory.path().join(context().sidecar_file_name());
+        let sidecar = sidecar_path(&directory, &context());
         std::fs::write(&sidecar, &large_encoded).expect("seed oversized candidate");
 
         let mut tight = LIMIT;
         tight.fact_file_len =
             u64::try_from(target_encoded.len()).expect("target fact length fits u64");
-        let source_before =
-            std::fs::read(directory.path().join(context().pgm_file_name())).expect("read source");
+        let source_before = std::fs::read(pgm_path(&directory, &context())).expect("read source");
         let loaded = store
             .load_or_build(&unit(&target_bytes), &context(), &tight)
             .expect("rebuild target below the configured bound");
@@ -1528,22 +1480,23 @@ mod tests {
             .read(&unit(&target_bytes), &context(), &tight)
             .expect("replacement is restart-admissible");
         assert_eq!(
-            std::fs::read(directory.path().join(context().pgm_file_name())).expect("reread source"),
+            std::fs::read(pgm_path(&directory, &context())).expect("reread source"),
             source_before,
             "rebuild must not alter the source PGM"
         );
     }
 
     #[test]
-    fn symlink_sidecar_is_atomically_replaced_without_touching_target() {
+    fn symlink_sidecar_fails_closed_without_touching_target() {
         let directory = TempDir::new().expect("data directory");
+        let outside = TempDir::new().expect("outside directory");
         let store = FactStore::new(directory.path());
         let bytes = lifecycle_pgm(7);
         write_pgm(&directory, &context(), &bytes);
         let facts = built(&bytes);
         let path = store.publish(&facts, &context(), &LIMIT).expect("publish");
         std::fs::remove_file(&path).expect("remove fact target");
-        let victim = directory.path().join("victim");
+        let victim = outside.path().join("victim");
         std::fs::write(&victim, b"source authority").expect("write victim");
         symlink(&victim, &path).expect("plant symlink candidate");
 
@@ -1551,6 +1504,7 @@ mod tests {
             .load_or_build(&unit(&bytes), &context(), &LIMIT)
             .expect("rebuild around symlink");
         assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
+        assert_eq!(loaded.persist_error(), Some(PersistError::UnsafePath));
         assert_eq!(
             std::fs::read(&victim).expect("read victim"),
             b"source authority"
@@ -1559,7 +1513,7 @@ mod tests {
             std::fs::symlink_metadata(&path)
                 .expect("replacement metadata")
                 .file_type()
-                .is_file()
+                .is_symlink()
         );
     }
 
@@ -1570,7 +1524,8 @@ mod tests {
         let bytes = lifecycle_pgm(7);
         let outside_pgm = outside.path().join("source.pgm");
         std::fs::write(&outside_pgm, &bytes).expect("write outside PGM");
-        symlink(&outside_pgm, directory.path().join("segment.pgm")).expect("plant PGM symlink");
+        let pgm = pgm_path(&directory, &context());
+        symlink(&outside_pgm, pgm).expect("plant PGM symlink");
         let store = FactStore::new(directory.path());
         let loaded = store
             .load_or_build(&unit(&bytes), &context(), &LIMIT)
@@ -1608,19 +1563,13 @@ mod tests {
         store
             .read(&unit(&bytes), &context(), &LIMIT)
             .expect("committed winner");
-        let path = directory.path().join("segment.ovf");
+        let path = sidecar_path(&directory, &context());
         assert!(path.is_file());
-        let temps = std::fs::read_dir(directory.path())
-            .expect("list data directory")
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".pgkronika-overview.tmp-")
-            })
-            .count();
-        assert_eq!(temps, 0, "completed builders clean their temp files");
+        assert_eq!(
+            overview_temp_count(&directory, &context()),
+            0,
+            "completed builders clean their temp files"
+        );
     }
 
     #[test]
@@ -1668,7 +1617,7 @@ mod tests {
         write_pgm(&directory, &context(), &bytes);
         let facts = built(&bytes);
         let path = store.publish(&facts, &context(), &LIMIT).expect("publish");
-        let stale = directory.path().join(".pgkronika-overview.tmp-12-34");
+        let stale = stale_ovf_temp_path(&directory, &context());
         std::fs::write(&stale, b"torn").expect("write stale temp");
         std::fs::remove_file(&path).expect("remove committed target");
 
@@ -1897,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_and_owner_lock_modes_are_owner_only() {
+    fn sidecar_mode_respects_data_policy_and_owner_lock_stays_private() {
         let directory = TempDir::new().expect("data directory");
         let store = FactStore::new(directory.path());
         let bytes = lifecycle_pgm(7);
@@ -1905,9 +1854,13 @@ mod tests {
         let path = store
             .publish(&built(&bytes), &context(), &LIMIT)
             .expect("publish");
+        let sidecar_mode = std::fs::metadata(&path).expect("fact metadata").mode() & 0o777;
+        assert_eq!(sidecar_mode & 0o600, 0o600, "owner can read and write");
+        assert_eq!(sidecar_mode & 0o117, 0, "no execute or world permissions");
         assert_eq!(
-            std::fs::metadata(&path).expect("fact metadata").mode() & 0o777,
-            0o600
+            sidecar_mode & !0o640,
+            0,
+            "umask may remove, but cannot add permissions beyond 0640"
         );
         assert_eq!(
             std::fs::metadata(directory.path().join(".pgkronika-overview.owner.lock"))

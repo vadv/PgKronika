@@ -290,8 +290,7 @@ impl OverviewWriter {
     ) {
         let baseline = snapshot
             .sealed_descriptors()
-            .iter()
-            .map(|descriptor| (descriptor.locator, *descriptor))
+            .map(|descriptor| (descriptor.locator, descriptor))
             .collect::<BTreeMap<_, _>>();
         self.scrub_damaged
             .retain(|locator, descriptor| baseline.get(locator) == Some(descriptor));
@@ -337,19 +336,21 @@ impl OverviewWriter {
         }
         self.next_source_scrub = now.checked_add(self.source_scrub_interval).unwrap_or(now);
 
-        let descriptors = snapshot.sealed_descriptors();
-        if descriptors.is_empty() {
+        if snapshot.sealed_descriptors().len() == 0 {
             self.scrub_cursor = None;
             return;
         }
-        let (position, ordinal) = self.scrub_position(descriptors);
-        let descriptor = descriptors[position];
+        let (position, ordinal) = self.scrub_position(snapshot);
+        let descriptor = snapshot
+            .sealed_descriptors()
+            .nth(position)
+            .expect("scrub position is bounded by the sealed descriptor count");
         let started = Instant::now();
         let unit = match snapshot.open_sealed_by_descriptor(&descriptor) {
             Ok(unit) => unit,
             Err(_error) => {
                 self.mark_scrub_damage(descriptor);
-                self.advance_scrub_cursor(descriptors, position);
+                self.advance_scrub_cursor(snapshot, position);
                 metrics::counter!(
                     "overview_source_failures_total",
                     "reason" => "scrub_open"
@@ -361,7 +362,7 @@ impl OverviewWriter {
         };
         if unit.catalog().entries.is_empty() {
             self.scrub_damaged.remove(&descriptor.locator);
-            self.advance_scrub_cursor(descriptors, position);
+            self.advance_scrub_cursor(snapshot, position);
             record_scrub("empty", 0, started);
             return;
         }
@@ -378,13 +379,13 @@ impl OverviewWriter {
                     self.scrub_cursor = Some((descriptor.locator, ordinal.saturating_add(1)));
                 } else {
                     self.scrub_damaged.remove(&descriptor.locator);
-                    self.advance_scrub_cursor(descriptors, position);
+                    self.advance_scrub_cursor(snapshot, position);
                 }
                 record_scrub("ok", stats.stored_bytes_read, started);
             }
             Err(_error) => {
                 self.mark_scrub_damage(descriptor);
-                self.advance_scrub_cursor(descriptors, position);
+                self.advance_scrub_cursor(snapshot, position);
                 metrics::counter!(
                     "overview_source_failures_total",
                     "reason" => "scrub_damage"
@@ -395,19 +396,25 @@ impl OverviewWriter {
         }
     }
 
-    fn scrub_position(&self, descriptors: &[SegmentDescriptor]) -> (usize, u32) {
+    fn scrub_position(&self, snapshot: &LocalDirSnapshot) -> (usize, u32) {
         let Some((locator, ordinal)) = self.scrub_cursor else {
             return (0, 0);
         };
-        descriptors
-            .iter()
+        snapshot
+            .sealed_descriptors()
             .position(|descriptor| descriptor.locator == locator)
             .map_or((0, 0), |position| (position, ordinal))
     }
 
-    fn advance_scrub_cursor(&mut self, descriptors: &[SegmentDescriptor], position: usize) {
+    fn advance_scrub_cursor(&mut self, snapshot: &LocalDirSnapshot, position: usize) {
         let next = position.saturating_add(1);
-        self.scrub_cursor = Some((descriptors.get(next).unwrap_or(&descriptors[0]).locator, 0));
+        let locator = snapshot
+            .sealed_descriptors()
+            .nth(next)
+            .or_else(|| snapshot.sealed_descriptors().next())
+            .expect("advance is called only for a non-empty sealed snapshot")
+            .locator;
+        self.scrub_cursor = Some((locator, 0));
     }
 
     fn mark_scrub_damage(&mut self, descriptor: SegmentDescriptor) {
@@ -471,7 +478,7 @@ fn fold_refresh(
     builder
         .begin_refresh(delta)
         .map_err(OverviewBuildError::Live)?;
-    for part in &delta.journal.completed_parts {
+    for part in delta.journal.completed_parts.iter() {
         let unit = snapshot
             .open_active_part(part)
             .map_err(OverviewBuildError::ActiveRead)?;
@@ -538,7 +545,7 @@ fn record_live_metrics(view: &DescriptorView) {
 fn full_live_baseline(delta: &RefreshDelta) -> RefreshDelta {
     let mut baseline = delta.clone();
     baseline.journal.bootstrap = true;
-    baseline.journal.completed_parts = baseline.journal.current_parts.clone();
+    baseline.journal.completed_parts = Arc::clone(&baseline.journal.current_parts);
     baseline
 }
 
@@ -549,12 +556,12 @@ pub(crate) type OverviewIndex = OverviewWriter;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     use kronika_analytics::overview::{
         CountLimits, CoverageSpan, OracleLimits, RawOracle, notable_event_id,
     };
-    use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
+    use kronika_format::{PartMeta, SectionInput, build_part};
+    use kronika_layout::FileKind;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::pg_log::PgLogLifecycleV1;
     use kronika_registry::{Section, Ts};
@@ -571,8 +578,14 @@ mod tests {
             max_signal_keys: 32,
         },
     };
+    const FIRST_SEGMENT_ID: i64 = 1_000;
+    const SECOND_SEGMENT_ID: i64 = 3_000;
 
-    fn write_segment(dir: &std::path::Path, file: &str, min_ts: i64, max_ts: i64) {
+    fn fixture_pgm_path(root: &std::path::Path, segment_id: i64) -> PathBuf {
+        crate::test_layout::file_path(root, crate::test_layout::address(segment_id), FileKind::Pgm)
+    }
+
+    fn write_segment(root: &std::path::Path, segment_id: i64, min_ts: i64, max_ts: i64) {
         let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
         let bytes = build_part(
             &[SectionInput {
@@ -586,7 +599,7 @@ mod tests {
                 source_id: 7,
             },
         );
-        std::fs::write(dir.join(file), &bytes).expect("write segment");
+        std::fs::write(fixture_pgm_path(root, segment_id), &bytes).expect("write segment");
     }
 
     fn lifecycle_part(rows: &[PgLogLifecycleV1]) -> Vec<u8> {
@@ -626,16 +639,6 @@ mod tests {
             query_detail: None,
             dict_dropped_fields: 0,
         }
-    }
-
-    fn framed(part: &[u8]) -> Vec<u8> {
-        let mut bytes = FrameHeader {
-            part_len: u64::try_from(part.len()).expect("part length"),
-        }
-        .encode()
-        .to_vec();
-        bytes.extend_from_slice(part);
-        bytes
     }
 
     async fn load_selected(
@@ -682,10 +685,29 @@ mod tests {
         assert_eq!(view.source_status(), SourceStatus::CompleteForContract);
     }
 
+    #[test]
+    fn a_torn_version_one_journal_fails_closed_without_repair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let segment_id = crate::test_layout::address(FIRST_SEGMENT_ID).id;
+        let part = lifecycle_part(&[lifecycle_row(1_500, 41)]);
+        let mut torn = crate::test_layout::journal_bytes(segment_id, &[&part]);
+        torn.pop().expect("fixture journal has a body byte");
+        std::fs::write(dir.path().join("active.parts"), &torn).expect("write torn journal");
+
+        let error = LocalDirSnapshot::open(dir.path())
+            .expect_err("a torn version-1 journal must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(dir.path().join("active.parts")).expect("read rejected journal"),
+            torn,
+            "the fail-closed scan must not rewrite or truncate damaged input"
+        );
+    }
+
     #[tokio::test]
     async fn a_sealed_segment_is_loaded_only_after_its_plan_is_admitted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
+        write_segment(dir.path(), FIRST_SEGMENT_ID, 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let delta = snapshot
             .refresh_incremental_delta()
@@ -735,7 +757,7 @@ mod tests {
     #[tokio::test]
     async fn gc_reclaims_the_fact_file_of_a_dropped_segment() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
+        write_segment(dir.path(), FIRST_SEGMENT_ID, 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let delta = snapshot
             .refresh_incremental_delta()
@@ -775,25 +797,28 @@ mod tests {
             "a live segment's fact file survives GC"
         );
 
-        // The segment disappears from the source; the view drops it but the
-        // fact file lingers until two GC scans carrying different successful
-        // source-view generations have both marked it absent.
-        std::fs::remove_file(dir.path().join("143000.pgm")).expect("drop segment");
+        // Once its source PGM disappears, the strict inventory classifies the
+        // OVF as an orphan publication artifact. This test config gives
+        // artifacts zero wall grace, so the next scheduled authoritative scan
+        // removes it without applying final-sidecar generation grace.
+        std::fs::remove_file(fixture_pgm_path(dir.path(), FIRST_SEGMENT_ID)).expect("drop segment");
         let drop_delta = snapshot.refresh_incremental_delta().expect("drop delta");
         index
             .assemble_with_live(&snapshot, &drop_delta)
             .expect("view without the segment");
 
-        let mut first_absence = None;
+        let mut orphan_cleanup = None;
         for _ in 0..GC_INTERVAL_PASSES {
-            first_absence = index.collect_fact_garbage().or(first_absence);
+            orphan_cleanup = index.collect_fact_garbage().or(orphan_cleanup);
         }
         assert_eq!(
-            first_absence.expect("first absence scan").deleted,
-            0,
-            "one authoritative absence scan cannot delete"
+            orphan_cleanup.expect("orphan cleanup scan").deleted,
+            1,
+            "the orphan sidecar is removed on the next scheduled scan"
         );
-        write_segment(dir.path(), "143001.pgm", 3_000, 4_000);
+        assert_eq!(ovf_files(dir.path()), 0);
+
+        write_segment(dir.path(), SECOND_SEGMENT_ID, 3_000, 4_000);
         let next_delta = snapshot
             .refresh_incremental_delta()
             .expect("advance source view with a distinct retained set");
@@ -809,15 +834,6 @@ mod tests {
                 CoverageSpan::new(0, 10_000).expect("range"),
             )
             .await,
-        );
-        let mut second_absence = None;
-        for _ in 0..GC_INTERVAL_PASSES {
-            second_absence = index.collect_fact_garbage().or(second_absence);
-        }
-        let outcome = second_absence.expect("second absence scan");
-        assert_eq!(
-            outcome.deleted, 1,
-            "the dropped segment's fact file is unlinked"
         );
         assert_eq!(
             ovf_files(dir.path()),
@@ -846,7 +862,7 @@ mod tests {
     #[test]
     fn repeat_assembly_is_deterministic_in_plan_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
+        write_segment(dir.path(), FIRST_SEGMENT_ID, 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let first_delta = snapshot
             .refresh_incremental_delta()
@@ -889,11 +905,11 @@ mod tests {
     )]
     async fn append_then_seal_keeps_one_coherent_event_set() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let segment_address = crate::test_layout::address(FIRST_SEGMENT_ID);
         let first = lifecycle_row(1_500, 41);
         let second = lifecycle_row(2_500, 42);
         let first_part = lifecycle_part(std::slice::from_ref(&first));
-        std::fs::write(dir.path().join("active.parts"), framed(&first_part))
-            .expect("write first frame");
+        crate::test_layout::write_journal(dir.path(), segment_address.id, &[&first_part]);
 
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let bootstrap = snapshot
@@ -915,12 +931,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         let second_part = lifecycle_part(std::slice::from_ref(&second));
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(dir.path().join("active.parts"))
-            .expect("open journal")
-            .write_all(&framed(&second_part))
-            .expect("append second frame");
+        crate::test_layout::write_journal(
+            dir.path(),
+            segment_address.id,
+            &[&first_part, &second_part],
+        );
         let appended = snapshot.refresh_incremental_delta().expect("append delta");
         assert_eq!(appended.journal.completed_parts.len(), 1);
         let second_descriptors = writer
@@ -970,8 +985,12 @@ mod tests {
                 source_id: 7,
             },
         );
-        std::fs::write(dir.path().join("1000.pgm"), sealed).expect("write sealed segment");
-        std::fs::write(dir.path().join("active.parts"), []).expect("reset journal");
+        std::fs::write(
+            crate::test_layout::file_path(dir.path(), segment_address, FileKind::Pgm),
+            sealed,
+        )
+        .expect("write sealed segment");
+        crate::test_layout::write_empty_journal(dir.path());
         let sealed_delta = snapshot.refresh_incremental_delta().expect("seal delta");
         assert_eq!(sealed_delta.sealed_added.len(), 1);
         let sealed_descriptors = writer

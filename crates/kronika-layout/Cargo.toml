@@ -1,0 +1,18 @@
+[package]
+name = "kronika-layout"
+description = "Typed, bounded, descriptor-relative access to the PgKronika data directory"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

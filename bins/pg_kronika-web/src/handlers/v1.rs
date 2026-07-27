@@ -277,7 +277,10 @@ pub(crate) async fn segments(
         if unit.source_id != source || unit.max_ts < from || unit.min_ts > to {
             continue;
         }
-        let Some(catalog) = snapshot.unit_catalog(idx) else {
+        let Some(catalog) = snapshot
+            .unit_catalog(idx)
+            .map_err(|error| query_error_response_without_cursor(&QueryError::Read(error)))?
+        else {
             continue;
         };
         let mut rows_by_name: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -599,11 +602,26 @@ pub(crate) async fn sections_batch_diff(
 mod tests {
     use std::collections::BTreeMap;
 
-    use kronika_reader::{ColumnDiff, DiffAt, DiffPoint, Reason, Scalar, SeriesDiff, Value};
+    use kronika_reader::{
+        ColumnDiff, DiffAt, DiffPoint, Reason, Scalar, SeriesDiff, SourceSummaryLimits, Value,
+    };
 
     use super::Gates;
 
     const SEC: i64 = 1_000_000;
+
+    #[test]
+    fn sources_default_admits_the_layout_segment_ceiling() {
+        const FIVE_YEARS_OF_FIFTEEN_MINUTE_SEGMENTS: usize = 5 * 365 * 24 * 4;
+
+        let limits = SourceSummaryLimits::default();
+
+        assert_eq!(
+            limits.max_units(),
+            kronika_layout::LayoutLimits::default().max_segments
+        );
+        assert!(limits.max_units() >= FIVE_YEARS_OF_FIFTEEN_MINUTE_SEGMENTS);
+    }
 
     fn series(object: &str, column: &str) -> SeriesDiff {
         SeriesDiff {

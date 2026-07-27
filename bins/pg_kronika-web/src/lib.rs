@@ -114,6 +114,8 @@ pub mod qualification;
 mod reason;
 mod serialize;
 pub(crate) mod startup;
+#[cfg(test)]
+mod test_layout;
 
 pub use auth::AuthConfig;
 use auth::require_basic_auth;

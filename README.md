@@ -23,7 +23,7 @@ PostgreSQL 15–18       Linux /proc, /sys, cgroups       stderr log
                               |
                  kronika-registry + kronika-derive
                               |
-                kronika-writer -> active.parts -> *.pgm
+          kronika-writer -> active.parts -> YYYY/MM/DD/*.pgm
                               |
                  kronika-store -> kronika-reader
                               |
@@ -32,9 +32,10 @@ PostgreSQL 15–18       Linux /proc, /sys, cgroups       stderr log
 ```
 
 The collector runs on the database host and opens no network listener. It
-writes an append-only `active.parts` journal and seals its frames into
-self-contained `.pgm` files. The web process reads both sealed files and valid
-live journal parts from the same directory. It never connects to PostgreSQL.
+writes synchronized frames to the root-level `active.parts` journal and seals
+them into self-contained `.pgm` files. The web process reads both sealed files
+and valid live journal parts from the same data root. It never connects to
+PostgreSQL.
 
 PgKronika is useful when an operator needs detailed, high-cardinality evidence
 close to the database: sessions, statements, plans, relation statistics,
@@ -79,6 +80,7 @@ window, which makes the first result available immediately.
 ```sh
 KRONIKA_PG_DSN='host=127.0.0.1 port=5432 dbname=postgres user=kronika password=change-me' \
 KRONIKA_OUT_DIR="$PWD/var/segments" \
+KRONIKA_LOG_STATE_PATH="$PWD/var/pg_log_tail.state" \
 KRONIKA_SEGMENT_MAX_BYTES=0 \
 ./target/x86_64-unknown-linux-gnu/debug/pg_kronika-collector
 ```
@@ -113,6 +115,7 @@ crates.io.
 | Package | Responsibility |
 | --- | --- |
 | [`kronika-format`](crates/kronika-format/) | PGM framing, catalog, CRC32C, dictionaries, and journal frame validation. |
+| [`kronika-layout`](crates/kronika-layout/) | Typed `YYYY/MM/DD` data-root grammar, segment addresses, strict bounded discovery, and mutation ownership. |
 | [`kronika-derive`](crates/kronika-derive/) | Internal `Section` derive that generates registry contracts and Parquet codecs. |
 | [`kronika-registry`](crates/kronika-registry/) | Stable type ids, schemas, column semantics, gates, codecs, and registry linting. |
 | [`kronika-writer`](crates/kronika-writer/) | Bounded section buffers, string interning, `active.parts`, and sealing. |
@@ -138,24 +141,41 @@ allow lists with `cargo run -p xtask -- check-deps`.
   per-section CRC32C, and a CRC-protected end catalog. CRC detects accidental
   corruption; it is not authentication. Unknown or malformed data is reported
   or skipped with typed diagnostics rather than interpreted as valid rows.
-- **Durability.** A journal frame is synchronized before append returns. Sealing
-  writes and synchronizes a temporary file, then publishes without overwriting
-  an existing segment. A torn final journal frame is truncated on recovery;
-  other damage remains visible in scan diagnostics. For sealed segments, the
-  timeline index checks admitted sibling fact files with matching lineage
-  before the bounded process-local fallback. Only a recoverable publication
-  failure can place the same immutable facts in that fallback.
-- **Derived fact sidecars.** `KRONIKA_WEB_DIR` is one PgKronika-owned data
-  directory. Every sealed `N.pgm` has at most one `N.ovf` sibling:
+- **Data-root layout.** `KRONIKA_OUT_DIR` and `KRONIKA_WEB_DIR` name the same
+  PgKronika-owned root:
 
   ```text
   /data/active.parts
-  /data/N.pgm
-  /data/N.ovf
+  /data/.pgkronika-writer.owner.lock
+  /data/.pgkronika-overview.owner.lock
+  /data/YYYY/MM/DD/N.pgm
+  /data/YYYY/MM/DD/N.ovf
   ```
 
-  One independently constructed `FactStore` or process holds the directory
-  mutation lease; clones share it. Garbage collection scans the directory
+  `N` is `SegmentId`: Unix microseconds of the first collection window
+  successfully appended to the segment. Its UTC day determines `YYYY/MM/DD`;
+  a segment crossing midnight stays in that starting-day directory. Queries
+  use the PGM catalog's `min_ts` and `max_ts`, not the path. Each owner-lock
+  acquisition synchronizes the lock inode and data root; a retry after a
+  failed initial root `fsync` does not treat `EEXIST` as proof of durability.
+  Only one collector may write to a data root. Root-level PGM/OVF files,
+  symbolic links, and unknown entries are rejected. This is the first
+  supported layout in the unreleased project.
+- **Durability.** `active.parts` journal version 1 uses magic `PGKJNL1\0` and a
+  checksummed header that stores the active `SegmentId`. The first frame and
+  id are synchronized together before append returns. An incompatible, torn,
+  or damaged journal is rejected unchanged. Sealing writes and synchronizes a
+  same-day temporary file, then publishes without overwriting an existing
+  segment. At startup the writer lock holder removes only recognized stale PGM
+  temporaries; OVF temporaries remain overview-owned. For sealed segments, the
+  timeline index checks admitted sibling
+  fact files with matching lineage
+  before the bounded process-local fallback. Only a recoverable publication
+  failure can place the same immutable facts in that fallback.
+- **Derived fact sidecars.** `KRONIKA_WEB_DIR` is one PgKronika-owned data
+  root. Every sealed `YYYY/MM/DD/N.pgm` has at most one same-day `N.ovf`
+  sibling. One independently constructed `FactStore` or process holds the
+  overview mutation lease; clones share it. Garbage collection scans the tree
   with fixed bounds, refuses to sweep after an unavailable, incomplete, or
   capped scan, and never deletes PGM source files or follows symlinks. Optional
   logical-byte and file-count ceilings apply only to recognized derived
@@ -178,6 +198,10 @@ allow lists with `cargo run -p xtask -- check-deps`.
   collector does not encrypt or redact them. Bind web to loopback or place it
   behind a TLS reverse proxy; Basic Auth alone does not provide transport
   security.
+
+PostgreSQL log collection is enabled by default. Its durable position must be
+set with `KRONIKA_LOG_STATE_PATH` outside `KRONIKA_OUT_DIR`; back it up
+separately at the same consistency point when exact log-tail recovery matters.
 
 Detailed limits and failure variants live in each crate's README and rustdoc.
 

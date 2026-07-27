@@ -74,6 +74,8 @@ pub(crate) struct StandPaths {
     pub(crate) tablespaces: [PathBuf; 2],
     /// Collector output directory with `.pgm` segments.
     pub(crate) segments: PathBuf,
+    /// Durable `PostgreSQL` log-tail position, kept outside the data root.
+    pub(crate) log_state: PathBuf,
     /// Final JSON report path.
     pub(crate) report: PathBuf,
 }
@@ -84,6 +86,7 @@ impl StandPaths {
             pgdata: root.join("pgdata"),
             tablespaces: [root.join("ts_hot"), root.join("ts_cold")],
             segments: root.join("segments"),
+            log_state: root.join("pg-log.state"),
             report: root.join("report.json"),
         }
     }
@@ -132,6 +135,11 @@ mod tests {
             paths.report,
             Path::new("/data/report.json"),
             "report under root"
+        );
+        assert_eq!(
+            paths.log_state,
+            Path::new("/data/pg-log.state"),
+            "log state belongs to the stand but stays outside the segments data root"
         );
     }
 }

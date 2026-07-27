@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use tokio::time::{Instant, sleep};
 use tokio_postgres::NoTls;
 
-use crate::collector::Collector;
+use crate::collector::{Collector, SealedSegment};
 use crate::harness::HarnessState;
 
 const LIVE_STATEMENT_TIMEOUT_SQL: &str =
@@ -32,7 +32,7 @@ const LOG_TAIL_LIMIT_BYTES: u64 = 256 * 1024;
 /// Returns an error if no cluster is selected, or if the collector fails to spawn
 /// or seal a segment. On a spawn/seal failure the collector's stderr is folded
 /// into the error so CI sees the collector-side cause.
-pub(crate) async fn take(state: &mut HarnessState) -> Result<PathBuf> {
+pub(crate) async fn take(state: &mut HarnessState) -> Result<SealedSegment> {
     let cluster = state.cluster()?;
     let extra_env = state.collector_env().to_vec();
     let mut collector = Collector::spawn_with_env(cluster, &extra_env).await?;
@@ -54,7 +54,7 @@ pub(crate) async fn take(state: &mut HarnessState) -> Result<PathBuf> {
 
 /// Run timer-driven log collection across a real `PostgreSQL` stderr rotation,
 /// then seal both source-status transitions into one segment.
-pub(crate) async fn take_across_log_rotation(state: &mut HarnessState) -> Result<PathBuf> {
+pub(crate) async fn take_across_log_rotation(state: &mut HarnessState) -> Result<SealedSegment> {
     let cluster = state.cluster()?;
     let mut extra_env = state.collector_env().to_vec();
     extra_env.extend([
@@ -130,7 +130,9 @@ pub(crate) async fn take_across_log_rotation(state: &mut HarnessState) -> Result
 
 /// Establish the default tail-at-EOF state, make the running `PostgreSQL`
 /// backend emit a statement-timeout error, and seal the newly appended record.
-pub(crate) async fn take_after_live_statement_timeout(state: &mut HarnessState) -> Result<PathBuf> {
+pub(crate) async fn take_after_live_statement_timeout(
+    state: &mut HarnessState,
+) -> Result<SealedSegment> {
     let cluster = state.cluster()?;
     let extra_env = state.collector_env().to_vec();
     let database_dsn = state.database_dsn()?;
@@ -151,7 +153,7 @@ pub(crate) async fn take_after_live_statement_timeout(state: &mut HarnessState) 
 async fn capture_live_statement_timeout(
     collector: &mut Collector,
     database_dsn: &str,
-) -> Result<PathBuf> {
+) -> Result<SealedSegment> {
     // A newly discovered source starts at EOF. The first committed cycle
     // establishes that offset; the second one must observe only the live event.
     collector

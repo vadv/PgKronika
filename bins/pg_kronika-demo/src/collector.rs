@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
+use kronika_layout::{DataRoot, LayoutLimits};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
@@ -67,7 +68,8 @@ impl Collector {
         let mut command = Command::new(&bin);
         command
             .env("KRONIKA_PG_DSN", dsn)
-            .env("KRONIKA_OUT_DIR", &paths.segments);
+            .env("KRONIKA_OUT_DIR", &paths.segments)
+            .env("KRONIKA_LOG_STATE_PATH", &paths.log_state);
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -109,14 +111,19 @@ impl Collector {
 /// so even a run shorter than one segment age has something to measure. An
 /// empty tail recovers into nothing; that is a warning, not a failure.
 pub(crate) async fn seal_tail(dsn: &str, paths: &StandPaths, config: &Config) -> Result<()> {
-    if !paths.segments.join("active.parts").exists() {
+    let root = DataRoot::open(&paths.segments).context("open the segments data root")?;
+    if root
+        .open_active_journal()
+        .context("inspect the active segment journal")?
+        .is_none()
+    {
         return Ok(());
     }
-    let before = sealed_count(&paths.segments)?;
+    let before = sealed_count(&root)?;
     let recovery = Collector::spawn_with(dsn, paths, config, &[("KRONIKA_INTERVAL_S", "0")])?;
     let sealed = timeout(STOP_TIMEOUT, async {
         loop {
-            match sealed_count(&paths.segments) {
+            match sealed_count(&root) {
                 Ok(count) if count > before => break,
                 _ => tokio::time::sleep(Duration::from_millis(200)).await,
             }
@@ -130,14 +137,9 @@ pub(crate) async fn seal_tail(dsn: &str, paths: &StandPaths, config: &Config) ->
     Ok(())
 }
 
-fn sealed_count(segments: &std::path::Path) -> Result<usize> {
-    let entries = std::fs::read_dir(segments).context("list the segments directory")?;
-    let mut count = 0;
-    for entry in entries {
-        let path = entry.context("read a segments directory entry")?.path();
-        if path.extension().is_some_and(|ext| ext == "pgm") {
-            count += 1;
-        }
-    }
-    Ok(count)
+fn sealed_count(root: &DataRoot) -> Result<usize> {
+    let snapshot = root
+        .scan(LayoutLimits::default())
+        .context("scan the segments data root")?;
+    Ok(snapshot.segments.len())
 }

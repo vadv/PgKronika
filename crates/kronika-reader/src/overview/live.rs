@@ -7,7 +7,7 @@ use kronika_analytics::overview::{
     Coverage, CoverageSpan, OracleError, OracleLimits, OracleResult, OracleSourceError, RawOracle,
     query_bounded,
 };
-use kronika_format::{DamageKind, DamageRegion, FRAME_HEADER_LEN, ReadAt};
+use kronika_format::{DamageKind, DamageRegion, FRAME_HEADER_LEN, JOURNAL_HEADER_LEN, ReadAt};
 
 use crate::refresh::{
     ByteRange, JournalGenerationId, PartDescriptor, PartId, RefreshDelta,
@@ -193,7 +193,7 @@ impl LiveUsage {
 struct PendingRefresh {
     new_view_generation: u64,
     new_valid_len: u64,
-    current_parts: Vec<PartDescriptor>,
+    current_parts: Arc<[PartDescriptor]>,
     current_parts_complete: bool,
     tail_pending: Option<ByteRange>,
     damages: Vec<DamageRegion>,
@@ -345,8 +345,8 @@ impl LiveBuilder {
             if delta.journal.current_parts_complete
                 && (delta.journal.previous_valid_len != self.folded_through_offset
                     || !delta.journal.current_parts.starts_with(&self.folded_parts)
-                    || delta.journal.completed_parts
-                        != delta.journal.current_parts[self.folded_parts.len()..])
+                    || delta.journal.completed_parts.as_ref()
+                        != &delta.journal.current_parts[self.folded_parts.len()..])
             {
                 self.state = LiveState::NeedsRebuild;
                 return Err(LiveFoldError::RefreshMismatch);
@@ -369,11 +369,14 @@ impl LiveBuilder {
             self.clear_folded(delta.journal.generation_id);
         }
 
+        if delta.journal.current_parts.is_empty() {
+            self.folded_through_offset = delta.journal.new_valid_len;
+        }
         self.rebaseline_prepared = false;
         self.pending_refresh = Some(PendingRefresh {
             new_view_generation: delta.new_view_generation,
             new_valid_len: delta.journal.new_valid_len,
-            current_parts: delta.journal.current_parts.clone(),
+            current_parts: Arc::clone(&delta.journal.current_parts),
             current_parts_complete: delta.journal.current_parts_complete,
             tail_pending: delta.journal.tail_pending,
             damages: delta.journal.damages.clone(),
@@ -427,8 +430,13 @@ impl LiveBuilder {
             || !delta.sealed_removed.is_empty()
             || !delta.journal.completed_parts.is_empty()
             || !delta.journal.transition.preserves_generation()
-            || delta.journal.current_parts != self.folded_parts
-            || delta.journal.new_valid_len != self.folded_through_offset
+            || delta.journal.current_parts.as_ref() != self.folded_parts
+            || !equivalent_empty_journal_offsets(
+                &delta.journal.current_parts,
+                &self.folded_parts,
+                delta.journal.new_valid_len,
+                self.folded_through_offset,
+            )
             || delta.journal.tail_pending != self.completed_tail_pending
     }
 
@@ -453,7 +461,7 @@ impl LiveBuilder {
         self.view_generation = pending.new_view_generation;
         if self.state != LiveState::Warming
             || !pending.current_parts_complete
-            || self.folded_parts != pending.current_parts
+            || self.folded_parts != pending.current_parts.as_ref()
             || self.folded_through_offset != pending.new_valid_len
             || (pending.current_parts.is_empty()
                 && (pending.tail_pending.is_some() || !pending.damages.is_empty()))
@@ -653,7 +661,7 @@ fn validate_descriptor_sequence(
     valid_len: u64,
 ) -> Result<(), LiveFoldError> {
     if parts.is_empty() {
-        return if valid_len == 0 {
+        return if valid_len == 0 || valid_len == JOURNAL_HEADER_LEN as u64 {
             Ok(())
         } else {
             Err(LiveFoldError::RefreshMismatch)
@@ -662,7 +670,11 @@ fn validate_descriptor_sequence(
 
     let frame_header_len =
         u64::try_from(FRAME_HEADER_LEN).map_err(|_error| LiveFoldError::Overflow)?;
-    let mut expected_body_offset = frame_header_len;
+    let journal_header_len =
+        u64::try_from(JOURNAL_HEADER_LEN).map_err(|_error| LiveFoldError::Overflow)?;
+    let mut expected_body_offset = journal_header_len
+        .checked_add(frame_header_len)
+        .ok_or(LiveFoldError::Overflow)?;
     let mut seen = BTreeSet::new();
     let mut last_end = 0_u64;
     for part in parts {
@@ -685,6 +697,19 @@ fn validate_descriptor_sequence(
         return Err(LiveFoldError::RefreshMismatch);
     }
     Ok(())
+}
+
+const fn equivalent_empty_journal_offsets(
+    current_parts: &[PartDescriptor],
+    folded_parts: &[PartDescriptor],
+    current: u64,
+    folded: u64,
+) -> bool {
+    if !current_parts.is_empty() || !folded_parts.is_empty() {
+        return current == folded;
+    }
+    let header_len = JOURNAL_HEADER_LEN as u64;
+    (current == 0 || current == header_len) && (folded == 0 || folded == header_len)
 }
 
 fn completion_damage_is_valid(
@@ -1126,7 +1151,7 @@ mod tests {
     }
 
     fn sealed_context() -> SegmentContext {
-        SegmentContext::new("sealed.pgm").expect("valid context")
+        SegmentContext::new(crate::test_layout::named_address("sealed"))
     }
 
     fn live_builder() -> LiveBuilder {
@@ -1188,7 +1213,15 @@ mod tests {
         };
         let new_valid_len = current_parts
             .last()
-            .map_or(0, |part| part.part_id.frame_offset + part.part_id.body_len);
+            .map_or(JOURNAL_HEADER_LEN as u64, |part| {
+                part.part_id.frame_offset + part.part_id.body_len
+            });
+        let current_parts: Arc<[PartDescriptor]> = Arc::from(current_parts);
+        let completed_parts = if transition.preserves_generation() {
+            Arc::from(completed_parts)
+        } else {
+            Arc::clone(&current_parts)
+        };
         RefreshDelta {
             previous_view_generation: builder.view_generation(),
             new_view_generation: builder.view_generation() + 1,
@@ -1211,7 +1244,8 @@ mod tests {
     }
 
     fn descriptors_for_bytes(builder: &LiveBuilder, bytes: &[&[u8]]) -> Vec<PartDescriptor> {
-        let mut frame_offset = u64::try_from(FRAME_HEADER_LEN).expect("header length fits");
+        let mut frame_offset = u64::try_from(JOURNAL_HEADER_LEN + FRAME_HEADER_LEN)
+            .expect("journal and frame headers fit");
         bytes
             .iter()
             .map(|part_bytes| {
@@ -1360,6 +1394,14 @@ mod tests {
         delta.journal.bootstrap = true;
         delta.journal.previous_valid_len = delta.journal.new_valid_len;
         builder.begin_refresh(&delta).expect("begin bootstrap");
+        assert!(Arc::ptr_eq(
+            &builder
+                .pending_refresh
+                .as_ref()
+                .expect("pending refresh")
+                .current_parts,
+            &delta.journal.current_parts
+        ));
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
         builder.fold_part(&parts[0], &unit).expect("fold bootstrap");
         builder.complete_refresh().expect("complete bootstrap");
@@ -1380,8 +1422,9 @@ mod tests {
         delta.previous_view_generation = 17;
         delta.new_view_generation = 18;
         delta.journal.generation_id = JournalGenerationId(41);
-        delta.journal.completed_parts.clone_from(&parts);
-        delta.journal.current_parts.clone_from(&parts);
+        let parts: Arc<[PartDescriptor]> = Arc::from(parts);
+        delta.journal.completed_parts = Arc::clone(&parts);
+        delta.journal.current_parts = Arc::clone(&parts);
 
         builder.begin_refresh(&delta).expect("begin bootstrap");
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
@@ -1427,8 +1470,8 @@ mod tests {
                 generation_id: builder.generation(),
                 previous_valid_len: builder.folded_through_offset(),
                 new_valid_len: builder.folded_through_offset(),
-                completed_parts: Vec::new(),
-                current_parts: builder.folded_parts.clone(),
+                completed_parts: Arc::from([]),
+                current_parts: Arc::from(builder.folded_parts.clone()),
                 current_parts_complete: true,
                 transition: PartTransition::Append,
                 tail_pending: builder.completed_tail_pending,
@@ -1457,8 +1500,8 @@ mod tests {
                 generation_id: builder.generation(),
                 previous_valid_len: builder.folded_through_offset(),
                 new_valid_len: builder.folded_through_offset(),
-                completed_parts: Vec::new(),
-                current_parts: builder.folded_parts.clone(),
+                completed_parts: Arc::from([]),
+                current_parts: Arc::from(builder.folded_parts.clone()),
                 current_parts_complete: true,
                 transition: PartTransition::Append,
                 tail_pending: builder.completed_tail_pending,
@@ -1594,7 +1637,8 @@ mod tests {
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
         let descriptor = descriptor(
             builder.generation(),
-            u64::try_from(FRAME_HEADER_LEN).expect("header length fits"),
+            u64::try_from(JOURNAL_HEADER_LEN + FRAME_HEADER_LEN)
+                .expect("journal and frame headers fit"),
             &bytes,
         );
         let delta = complete_delta(&builder, vec![descriptor], PartTransition::Append);
@@ -1619,7 +1663,8 @@ mod tests {
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
         let expected = descriptor(
             builder.generation(),
-            u64::try_from(FRAME_HEADER_LEN).expect("header length fits"),
+            u64::try_from(JOURNAL_HEADER_LEN + FRAME_HEADER_LEN)
+                .expect("journal and frame headers fit"),
             &bytes,
         );
         let delta = complete_delta(&builder, vec![expected], PartTransition::Append);
@@ -1645,7 +1690,8 @@ mod tests {
         let mut builder = live_builder();
         let expected = descriptor(
             builder.generation(),
-            u64::try_from(FRAME_HEADER_LEN).expect("header length fits"),
+            u64::try_from(JOURNAL_HEADER_LEN + FRAME_HEADER_LEN)
+                .expect("journal and frame headers fit"),
             &bytes,
         );
         let delta = complete_delta(&builder, vec![expected], PartTransition::Append);
@@ -1791,7 +1837,7 @@ mod tests {
 
     fn store(sealed_bytes: &[u8]) -> (tempfile::TempDir, FactStore) {
         let directory = tempfile::TempDir::new().expect("data directory");
-        fs::write(directory.path().join("sealed.pgm"), sealed_bytes).expect("write sealed PGM");
+        crate::test_layout::write_pgm(directory.path(), sealed_context().address(), sealed_bytes);
         let store = FactStore::new(directory.path());
         (directory, store)
     }

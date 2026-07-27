@@ -1,9 +1,11 @@
 use crate::config::{
     resolve_log_enabled, resolve_log_status_interval, validate_cardinality, validate_heavy_cap,
-    validate_max_lock_rows, validate_max_plans, validate_plan_text_limits,
-    validate_replication_detail_bounds, validate_settings_row_count,
+    validate_journal_max_bytes, validate_max_lock_rows, validate_max_plans,
+    validate_plan_text_limits, validate_replication_detail_bounds, validate_settings_row_count,
+    validate_state_target,
 };
 use crate::plans_source::{plans_reread_delay, truncate_to_boundary};
+use kronika_format::{JOURNAL_HEADER_LEN, MAX_JOURNAL_LEN};
 use kronika_registry::MAX_SECTION_ROWS;
 use kronika_source_pg::replication_details::ReplicationDetailBounds;
 use std::time::Duration;
@@ -37,6 +39,35 @@ fn pg_log_status_interval_rejects_zero() {
             .to_string()
             .contains("KRONIKA_PG_LOG_STATUS_INTERVAL_S")
     );
+}
+
+#[test]
+fn journal_limit_accepts_the_complete_v1_range() {
+    validate_journal_max_bytes(JOURNAL_HEADER_LEN as u64).expect("canonical empty journal");
+    validate_journal_max_bytes(MAX_JOURNAL_LEN as u64).expect("absolute v1 maximum");
+}
+
+#[test]
+fn journal_limit_rejects_values_outside_the_v1_range() {
+    for value in [JOURNAL_HEADER_LEN as u64 - 1, MAX_JOURNAL_LEN as u64 + 1] {
+        let error = validate_journal_max_bytes(value).expect_err("value outside v1 range");
+        assert!(error.to_string().contains("KRONIKA_JOURNAL_MAX_BYTES"));
+    }
+}
+
+#[test]
+fn log_state_runtime_check_rejects_direct_and_symlinked_paths_inside_data_root() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let data_root = directory.path().join("segments");
+    std::fs::create_dir(&data_root).unwrap();
+    assert!(validate_state_target(&data_root, &data_root.join("state")).is_err());
+
+    let link = directory.path().join("state-parent");
+    symlink(&data_root, &link).unwrap();
+    assert!(validate_state_target(&data_root, &link.join("state")).is_err());
+    assert!(validate_state_target(&data_root, &directory.path().join("state")).is_ok());
 }
 
 #[test]

@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 kronika-analytics = { path = "../../crates/kronika-analytics" }
+kronika-layout = { path = "../../crates/kronika-layout" }
 kronika-reader = { path = "../../crates/kronika-reader" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "sync", "signal"] }
 tokio-postgres = "0.7"

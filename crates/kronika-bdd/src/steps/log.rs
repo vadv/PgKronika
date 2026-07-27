@@ -1,6 +1,6 @@
 //! Steps for `features/pg_log.feature`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cucumber::{gherkin::Step, given, then, when};
 
 use crate::BddWorld;
@@ -33,8 +33,6 @@ async fn collector_captures_statement_timeout(world: &mut BddWorld) -> Result<()
 #[then("pg_log_source_status contains two distinct source_path values")]
 async fn two_log_source_paths(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
+    let dir = segment.data_root();
     web::assert_two_log_source_paths(dir).await
 }

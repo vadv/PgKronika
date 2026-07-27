@@ -5,18 +5,26 @@
 //! `PgmUnit`.
 
 use std::io::{self, Read as _};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use kronika_format::{Catalog, DamageRegion, Entry};
+use kronika_format::{
+    Catalog, DamageRegion, ENTRY_LEN, Entry, JOURNAL_HEADER_LEN, JournalHeader, JournalState,
+    MAGIC, META_LEN, RESET_MARKER_LEN, ResetMarker, TAIL_INDEX_LEN,
+};
+use kronika_layout::SegmentId;
 use kronika_registry::{DecodedSection, Row};
-use kronika_store::{LocalDir, LocalScan, SealedUnit, StoreError, StoreWarning};
+use kronika_store::{
+    ActivePart, CatalogSummary, JournalScan, LocalDir, LocalScan, SealedUnit, StoreError,
+    StoreWarning, catalog_digests, is_active_journal_scan_error,
+};
 use sha2::{Digest as _, Sha256};
 
 use crate::refresh::{
-    ByteRange, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor, PartTransition,
-    RefreshDelta, SealedLocator, SegmentDescriptor, classify_transition, part_id,
+    ByteRange, JournalDelta, JournalGenerationId, JournalIdentity, JournalPhase, PartDescriptor,
+    PartTransition, RefreshDelta, SealedLocator, SegmentDescriptor,
+    apply_committed_reset_transition, classify_transition, part_id_from_digest,
 };
 use crate::{
     Bounds, BuildError, Dictionary, FactLoad, FactStore, PgmUnit, ReadError, SegmentContext,
@@ -24,19 +32,38 @@ use crate::{
 
 const JOURNAL_PREFIX_DOMAIN: &[u8] = b"pgk-overview-journal-prefix-v1\0";
 const JOURNAL_HASH_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_CONSISTENT_SCAN_ATTEMPTS: usize = 2;
 
-fn segment_context(sealed: &SealedUnit) -> Result<SegmentContext, SealedFactError> {
-    let name = sealed
-        .path
-        .file_name()
-        .ok_or_else(|| SealedFactError::DescriptorUnavailable {
-            locator: SealedLocator::from_file_name_bytes(b""),
-        })?;
-    SegmentContext::new(name.to_os_string()).map_err(|_error| {
-        SealedFactError::DescriptorUnavailable {
-            locator: SealedLocator::from_file_name_bytes(name.as_bytes()),
-        }
-    })
+fn segment_context(sealed: &SealedUnit) -> SegmentContext {
+    SegmentContext::new(sealed.address)
+}
+
+fn journal_phase(scan: &LocalScan) -> JournalPhase {
+    if scan.committed_reset {
+        JournalPhase::CommittedReset
+    } else if scan.active.is_empty() {
+        JournalPhase::Empty
+    } else {
+        JournalPhase::Active
+    }
+}
+
+fn journal_scan_phase(scan: &JournalScan) -> JournalPhase {
+    if scan.committed_reset {
+        JournalPhase::CommittedReset
+    } else if scan.active.is_empty() {
+        JournalPhase::Empty
+    } else {
+        JournalPhase::Active
+    }
+}
+
+fn map_sealed_open_error(error: io::Error, unit_idx: usize) -> ReadError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        ReadError::StaleSnapshot { unit_idx }
+    } else {
+        ReadError::Io(error)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +77,8 @@ thread_local! {
     pub(crate) static OPEN_UNIT_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     pub(crate) static FORCED_STALE_OPEN_UNIT_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static DECODE_ROWS_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -77,6 +106,19 @@ impl OpenUnit {
         }
     }
 
+    /// Decode one typed section.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the section is a dictionary, out of bounds,
+    /// fails CRC, or fails typed decode.
+    pub fn decode(&self, entry: &Entry) -> Result<DecodedSection, ReadError> {
+        match self {
+            Self::Sealed(unit) => unit.decode(entry),
+            Self::Active(unit) => unit.decode(entry),
+        }
+    }
+
     /// Decode one section as named-cell rows.
     ///
     /// `entry` must come from this unit's [`catalog`](Self::catalog).
@@ -86,6 +128,8 @@ impl OpenUnit {
     /// Returns [`ReadError`] when the section is a dictionary, out of bounds,
     /// fails CRC, or fails typed decode.
     pub fn decode_rows(&self, entry: &Entry) -> Result<Vec<Row>, ReadError> {
+        #[cfg(test)]
+        DECODE_ROWS_CALLS.with(|calls| calls.set(calls.get() + 1));
         match self {
             Self::Sealed(unit) => unit.decode_rows(entry),
             Self::Active(unit) => unit.decode_rows(entry),
@@ -125,12 +169,29 @@ pub(crate) enum UnitHandle {
     Active(usize),
 }
 
+enum UnitCatalogHint<'a> {
+    Sealed(&'a CatalogSummary),
+    Active(&'a Catalog),
+}
+
 pub(crate) struct UnitDescriptor<'a> {
     pub(crate) index: usize,
     pub(crate) handle: UnitHandle,
     pub(crate) meta: UnitMeta,
-    pub(crate) catalog: &'a Catalog,
     pub(crate) eager_open_bytes: u64,
+    catalog_hint: UnitCatalogHint<'a>,
+}
+
+impl UnitDescriptor<'_> {
+    pub(crate) fn may_contain_any_nonempty_type(&self, type_ids: &[u32]) -> bool {
+        match self.catalog_hint {
+            UnitCatalogHint::Sealed(summary) => summary.may_contain_any_nonempty_type(type_ids),
+            UnitCatalogHint::Active(catalog) => catalog
+                .entries
+                .iter()
+                .any(|entry| entry.rows != 0 && type_ids.contains(&entry.type_id)),
+        }
+    }
 }
 
 /// A read view of a `LocalDir` combining sealed and active units.
@@ -159,9 +220,6 @@ pub struct LocalDirSnapshot {
     journal_identity: Option<JournalIdentity>,
     /// Digest of the exact journal bytes through `last_valid_len`.
     journal_prefix_digest: JournalPrefixDigest,
-    /// Last authoritative sealed-segment baseline, including entries preserved
-    /// across a per-file or whole-listing warning.
-    sealed_baseline: Vec<SegmentDescriptor>,
     /// Whether the active descriptor set in `scan` is authoritative.
     journal_descriptors_complete: bool,
     /// Whether a delta consumer has received the current journal baseline.
@@ -190,12 +248,12 @@ pub enum SealedFactError {
     },
     /// The exact sealed descriptor is not readable in the current scan.
     DescriptorUnavailable {
-        /// Stable direct-child file-name identity requested by the caller.
+        /// Stable `SegmentId` locator requested by the caller.
         locator: SealedLocator,
     },
     /// A sealed locator now resolves to a different catalog descriptor.
     StaleDescriptor {
-        /// Stable direct-child file-name identity requested by the caller.
+        /// Stable `SegmentId` locator requested by the caller.
         locator: SealedLocator,
     },
     /// Source extraction or a hard fact bound failed.
@@ -258,9 +316,8 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be opened or scanned.
     pub fn open(root: &Path) -> io::Result<Self> {
         let dir = LocalDir::open(root)?;
-        let (scan, journal_identity, journal_prefix_digest) = full_scan_consistent(&dir, root)?;
+        let (scan, journal_identity, journal_prefix_digest) = full_scan_consistent(&dir, &[])?;
         let last_valid_len = scan.valid_len;
-        let sealed_baseline = sealed_descriptors(&scan)?;
         let journal_descriptors_complete = journal_descriptors_complete(&scan, root);
         let tail_pending = tail_pending(journal_identity, last_valid_len);
         Ok(Self {
@@ -272,7 +329,6 @@ impl LocalDirSnapshot {
             journal_generation: JournalGenerationId(0),
             journal_identity,
             journal_prefix_digest,
-            sealed_baseline,
             journal_descriptors_complete,
             delta_initialized: false,
             tail_pending,
@@ -295,12 +351,7 @@ impl LocalDirSnapshot {
     ///
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh(&mut self) -> io::Result<()> {
-        let (scan, identity, prefix_digest) = full_scan_consistent(&self.dir, &self.root)?;
-        let transition = if journal_descriptors_complete(&scan, &self.root) {
-            self.verified_transition(identity)?
-        } else {
-            PartTransition::Uncertain
-        };
+        let (scan, identity, transition, prefix_digest) = self.scan_full_consistent()?;
         self.install_baseline(scan, identity, prefix_digest, transition)?;
         Ok(())
     }
@@ -340,7 +391,7 @@ impl LocalDirSnapshot {
     /// generation counter would overflow.
     pub fn refresh_incremental_delta(&mut self) -> io::Result<RefreshDelta> {
         let previous_valid_len = self.last_valid_len;
-        let previous_sealed = &self.sealed_baseline;
+        let previous_sealed = Arc::clone(&self.scan.sealed);
         let previous_view_generation = self.view_generation;
         let bootstrap = !self.delta_initialized;
 
@@ -353,25 +404,39 @@ impl LocalDirSnapshot {
             JournalGenerationId(bump(self.journal_generation.0)?)
         };
 
-        let current_parts = part_descriptors(&scan, generation_id)?;
-        let floor = if !bootstrap && transition == PartTransition::Append {
+        let current_parts: Arc<[PartDescriptor]> =
+            Arc::from(part_descriptors(&scan, generation_id)?);
+        let rebase_after_committed_reset = self.scan.committed_reset
+            && !scan.committed_reset
+            && !scan.active.is_empty()
+            && transition.preserves_generation();
+        let floor = if !bootstrap
+            && transition == PartTransition::Append
+            && !rebase_after_committed_reset
+        {
             previous_valid_len
         } else {
             0
         };
-        let completed_parts = current_parts
-            .iter()
-            .copied()
-            .filter(|descriptor| descriptor.part_id.frame_offset >= floor)
-            .collect::<Vec<_>>();
+        let completed_parts = if floor == 0 {
+            Arc::clone(&current_parts)
+        } else {
+            Arc::from(
+                current_parts
+                    .iter()
+                    .copied()
+                    .filter(|descriptor| descriptor.part_id.frame_offset >= floor)
+                    .collect::<Vec<_>>(),
+            )
+        };
 
         let current_tail_pending = tail_pending(current_identity, new_valid_len);
-        if transition.preserves_generation() {
+        if transition.preserves_generation() && !rebase_after_committed_reset {
             scan.damages =
                 merge_incremental_damages(&self.scan.damages, &scan.damages, previous_valid_len);
         }
 
-        let sealed = sealed_delta(&scan, previous_sealed, &self.root)?;
+        let sealed = sealed_delta(&scan, previous_sealed.as_slice());
         let current_parts_complete = journal_descriptors_complete(&scan, &self.root);
 
         let changed = !completed_parts.is_empty()
@@ -399,7 +464,6 @@ impl LocalDirSnapshot {
         self.journal_generation = generation_id;
         self.journal_identity = current_identity;
         self.journal_prefix_digest = prefix_digest;
-        self.sealed_baseline = sealed.baseline;
         self.journal_descriptors_complete = current_parts_complete;
         self.view_generation = new_view_generation;
         self.delta_initialized = true;
@@ -427,6 +491,48 @@ impl LocalDirSnapshot {
     }
 
     /// Scans from the current watermark when the journal identity permits it.
+    fn scan_full_consistent(
+        &self,
+    ) -> io::Result<(
+        LocalScan,
+        Option<JournalIdentity>,
+        PartTransition,
+        JournalPrefixDigest,
+    )> {
+        let ((journal, base_transition, prefix_digest), identity) = with_stable_journal_identity(
+            || journal_identity(&self.dir),
+            |identity_before| {
+                let transition = self
+                    .verified_transition(identity_before)
+                    .map_err(ScanAttemptError::journal)?;
+                let journal = self.dir.scan_journal().map_err(ScanAttemptError::store)?;
+                let prefix_digest = journal_prefix_digest(&self.dir, journal.valid_len)
+                    .map_err(ScanAttemptError::journal)?;
+                Ok((journal, transition, prefix_digest))
+            },
+        )?;
+        let same_file = same_journal_file(self.journal_identity, identity);
+        let same_committed_reset = same_file
+            && self.scan.committed_reset
+            && journal.committed_reset
+            && self.journal_prefix_digest == prefix_digest;
+        let transition = apply_committed_reset_transition(
+            base_transition,
+            same_file,
+            journal_phase(&self.scan),
+            journal_scan_phase(&journal),
+            same_committed_reset,
+        );
+        let scan = self.dir.complete_scan_cached(journal, &self.scan.sealed)?;
+        let transition = if journal_descriptors_complete(&scan, &self.root) {
+            transition
+        } else {
+            PartTransition::Uncertain
+        };
+        Ok((scan, identity, transition, prefix_digest))
+    }
+
+    /// Scans from the current watermark when the journal identity permits it.
     fn scan_incremental_consistent(
         &self,
     ) -> io::Result<(
@@ -435,45 +541,39 @@ impl LocalDirSnapshot {
         PartTransition,
         JournalPrefixDigest,
     )> {
-        let identity_before = journal_identity(&self.root)?;
-        let transition = self.verified_transition(identity_before)?;
-        let scan = if transition.preserves_generation() {
-            self.dir
-                .scan_from(self.last_valid_len, self.scan.active.clone())?
-        } else {
-            self.dir.scan()?
-        };
-        let prefix_digest = match journal_prefix_digest(&self.root, scan.valid_len) {
-            Ok(digest) => digest,
-            Err(error) if is_journal_race(&error) => {
-                return self.full_scan_after_race();
-            }
-            Err(error) => return Err(error),
-        };
-        let identity_after = journal_identity(&self.root)?;
-        if identity_before == identity_after {
-            let transition = if journal_descriptors_complete(&scan, &self.root) {
-                transition
-            } else {
-                PartTransition::Uncertain
-            };
-            return Ok((scan, identity_after, transition, prefix_digest));
-        }
-
-        self.full_scan_after_race()
-    }
-
-    fn full_scan_after_race(
-        &self,
-    ) -> io::Result<(
-        LocalScan,
-        Option<JournalIdentity>,
-        PartTransition,
-        JournalPrefixDigest,
-    )> {
-        let (scan, identity, prefix_digest) = full_scan_consistent(&self.dir, &self.root)?;
+        let ((journal, base_transition, prefix_digest), identity) = with_stable_journal_identity(
+            || journal_identity(&self.dir),
+            |identity_before| {
+                let transition = self
+                    .verified_transition(identity_before)
+                    .map_err(ScanAttemptError::journal)?;
+                let journal = if transition.preserves_generation() && !self.scan.committed_reset {
+                    self.dir
+                        .scan_journal_from(self.last_valid_len, Arc::clone(&self.scan.active))
+                } else {
+                    self.dir.scan_journal()
+                };
+                let journal = journal.map_err(ScanAttemptError::store)?;
+                let prefix_digest = journal_prefix_digest(&self.dir, journal.valid_len)
+                    .map_err(ScanAttemptError::journal)?;
+                Ok((journal, transition, prefix_digest))
+            },
+        )?;
+        let same_file = same_journal_file(self.journal_identity, identity);
+        let same_committed_reset = same_file
+            && self.scan.committed_reset
+            && journal.committed_reset
+            && self.journal_prefix_digest == prefix_digest;
+        let transition = apply_committed_reset_transition(
+            base_transition,
+            same_file,
+            journal_phase(&self.scan),
+            journal_scan_phase(&journal),
+            same_committed_reset,
+        );
+        let scan = self.dir.complete_scan_cached(journal, &self.scan.sealed)?;
         let transition = if journal_descriptors_complete(&scan, &self.root) {
-            self.verified_transition(identity)?
+            transition
         } else {
             PartTransition::Uncertain
         };
@@ -492,8 +592,13 @@ impl LocalDirSnapshot {
                     && previous.inode == current.inode
                     && current.len > previous.len
         );
-        if transition == PartTransition::Append && same_inode_growth && self.last_valid_len > 0 {
-            let observed = journal_prefix_digest(&self.root, self.last_valid_len)?;
+        if transition == PartTransition::Append
+            && same_inode_growth
+            && self.last_valid_len > 0
+            && !self.scan.committed_reset
+            && !self.scan.active.is_empty()
+        {
+            let observed = journal_prefix_digest(&self.dir, self.last_valid_len)?;
             if observed != self.journal_prefix_digest {
                 return Ok(PartTransition::Uncertain);
             }
@@ -509,7 +614,11 @@ impl LocalDirSnapshot {
         prefix_digest: JournalPrefixDigest,
         transition: PartTransition,
     ) -> io::Result<()> {
-        if transition.preserves_generation() {
+        let rebase_after_committed_reset = self.scan.committed_reset
+            && !scan.committed_reset
+            && !scan.active.is_empty()
+            && transition.preserves_generation();
+        if transition.preserves_generation() && !rebase_after_committed_reset {
             scan.damages =
                 merge_incremental_damages(&self.scan.damages, &scan.damages, self.last_valid_len);
         }
@@ -518,7 +627,7 @@ impl LocalDirSnapshot {
         } else {
             JournalGenerationId(bump(self.journal_generation.0)?)
         };
-        let sealed = sealed_delta(&scan, &self.sealed_baseline, &self.root)?;
+        let sealed = sealed_delta(&scan, self.scan.sealed.as_slice());
         let current_parts_complete = journal_descriptors_complete(&scan, &self.root);
         let current_tail_pending = tail_pending(identity, scan.valid_len);
         let changed = !same_active_parts(&self.scan, &scan)
@@ -541,7 +650,6 @@ impl LocalDirSnapshot {
         self.journal_identity = identity;
         self.journal_prefix_digest = prefix_digest;
         self.journal_generation = generation;
-        self.sealed_baseline = sealed.baseline;
         self.journal_descriptors_complete = current_parts_complete;
         self.view_generation = view_generation;
         self.delta_initialized = false;
@@ -567,11 +675,11 @@ impl LocalDirSnapshot {
         &self.scan.warnings
     }
 
-    /// Damaged byte ranges found while scanning `active.parts`.
+    /// Damaged byte ranges recorded for this snapshot.
     ///
-    /// These ranges describe journal bytes the frame scanner could not validate.
-    /// Valid parts before or after a damaged region remain visible through
-    /// [`units`](Self::units).
+    /// The strict version-1 journal scan fails closed: damage aborts snapshot
+    /// construction instead of masking bytes, so snapshots opened from disk
+    /// report an empty list.
     #[must_use]
     pub fn damages(&self) -> &[DamageRegion] {
         &self.scan.damages
@@ -589,24 +697,32 @@ impl LocalDirSnapshot {
             .collect()
     }
 
-    /// The catalog cached for unit `idx` in the same ordering as `units()`.
+    /// Read the catalog for unit `idx` in the same ordering as `units()`.
     ///
-    /// Returns `None` when `idx` is out of range.
-    #[must_use]
-    pub fn unit_catalog(&self, idx: usize) -> Option<&Catalog> {
-        let handle = self.handles().nth(idx)?;
-        Some(self.catalog_for_handle(handle))
+    /// Sealed catalogs are opened lazily and checked against the compact
+    /// descriptor captured by this snapshot. Returns `Ok(None)` when `idx` is
+    /// out of range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the unit changed or its catalog cannot be
+    /// opened and validated.
+    pub fn unit_catalog(&self, idx: usize) -> Result<Option<Catalog>, ReadError> {
+        let Some(handle) = self.handles().nth(idx) else {
+            return Ok(None);
+        };
+        Ok(Some(self.open_unit_handle(idx, handle)?.catalog().clone()))
     }
 
-    /// Ordered sealed descriptors pinned by this snapshot.
+    /// Iterates over ordered sealed descriptors pinned by this snapshot.
     ///
-    /// A descriptor preserved across a transient per-file scan warning remains
-    /// in this baseline, but an exact load reports
-    /// [`SealedFactError::DescriptorUnavailable`] until the file is readable
-    /// again.
+    /// Descriptors are derived from the compact sealed scan without retaining a
+    /// second collection proportional to the number of segments.
     #[must_use]
-    pub fn sealed_descriptors(&self) -> &[SegmentDescriptor] {
-        &self.sealed_baseline
+    pub fn sealed_descriptors(
+        &self,
+    ) -> impl ExactSizeIterator<Item = SegmentDescriptor> + DoubleEndedIterator + '_ {
+        self.scan.sealed.iter().map(descriptor_for_sealed)
     }
 
     /// Loads persistent overview facts for one sealed unit.
@@ -616,7 +732,7 @@ impl LocalDirSnapshot {
     /// [`SealedFactError::StaleSnapshot`] instead of facts for a different
     /// descriptor. Active journal parts are rejected.
     ///
-    /// `context` must name the exact direct-child PGM selected by the snapshot.
+    /// `context` must name the exact PGM address selected by the snapshot.
     ///
     /// # Errors
     ///
@@ -636,16 +752,13 @@ impl LocalDirSnapshot {
             return Err(SealedFactError::LiveUnit { unit_idx: idx });
         };
         let sealed = &self.scan.sealed[sealed_idx];
-        let context = segment_context(sealed)?;
-        let file = self
-            .dir
-            .open_sealed(sealed)
-            .map_err(ReadError::Io)
-            .map_err(BuildError::from)?;
-        let unit = PgmUnit::open(file).map_err(BuildError::from)?;
-        if unit.catalog() != &sealed.catalog {
-            return Err(SealedFactError::StaleSnapshot { unit_idx: idx });
-        }
+        let context = segment_context(sealed);
+        let unit = self
+            .open_checked_sealed(idx, sealed_idx)
+            .map_err(|error| match error {
+                ReadError::StaleSnapshot { .. } => SealedFactError::StaleSnapshot { unit_idx: idx },
+                other => SealedFactError::Build(BuildError::from(other)),
+            })?;
         store
             .load_or_build(&unit, &context, bounds)
             .map_err(Into::into)
@@ -654,7 +767,7 @@ impl LocalDirSnapshot {
     /// Loads overview facts for one exact reader-authored sealed descriptor.
     ///
     /// This avoids index lookup through the deduplicated query-unit view. The
-    /// direct-child filename and catalog descriptor must both still match.
+    /// verified segment address and catalog descriptor must both still match.
     ///
     /// # Errors
     ///
@@ -687,27 +800,23 @@ impl LocalDirSnapshot {
             .scan
             .sealed
             .iter()
-            .find(|sealed| {
-                sealed
-                    .path
-                    .file_name()
-                    .map(|name| SealedLocator::from_file_name_bytes(name.as_bytes()))
-                    == Some(descriptor.locator)
-            })
+            .find(|sealed| SealedLocator::from_segment_id(sealed.address.id) == descriptor.locator)
             .ok_or(SealedFactError::DescriptorUnavailable {
                 locator: descriptor.locator,
             })?;
-        if SegmentDescriptor::from_catalog(descriptor.locator, &sealed.catalog) != *descriptor {
+        if SegmentDescriptor::from_summary(descriptor.locator, sealed.identity, &sealed.summary)
+            != *descriptor
+        {
             return Err(SealedFactError::StaleDescriptor {
                 locator: descriptor.locator,
             });
         }
-        segment_context(sealed)
+        Ok(segment_context(sealed))
     }
 
     /// Opens one exact reader-authored sealed descriptor.
     ///
-    /// The direct-child locator and catalog descriptor must both still match
+    /// The `SegmentId` locator and catalog descriptor must both still match
     /// the pinned scan. This is the source-authority path used by seal
     /// reconciliation before durable fact publication.
     ///
@@ -719,45 +828,31 @@ impl LocalDirSnapshot {
         &self,
         descriptor: &SegmentDescriptor,
     ) -> Result<PgmUnit<std::fs::File>, SealedFactError> {
-        let sealed = self
+        let (sealed_idx, sealed) = self
             .scan
             .sealed
             .iter()
-            .find(|sealed| {
-                sealed
-                    .path
-                    .file_name()
-                    .map(|name| SealedLocator::from_file_name_bytes(name.as_bytes()))
-                    == Some(descriptor.locator)
+            .enumerate()
+            .find(|(_, sealed)| {
+                SealedLocator::from_segment_id(sealed.address.id) == descriptor.locator
             })
             .ok_or(SealedFactError::DescriptorUnavailable {
                 locator: descriptor.locator,
             })?;
-        if SegmentDescriptor::from_catalog(descriptor.locator, &sealed.catalog) != *descriptor {
+        if SegmentDescriptor::from_summary(descriptor.locator, sealed.identity, &sealed.summary)
+            != *descriptor
+        {
             return Err(SealedFactError::StaleDescriptor {
                 locator: descriptor.locator,
             });
         }
-
-        let file = self.dir.open_sealed(sealed).map_err(|error| {
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
-            ) {
-                SealedFactError::StaleDescriptor {
+        self.open_checked_sealed(sealed_idx, sealed_idx)
+            .map_err(|error| match error {
+                ReadError::StaleSnapshot { .. } => SealedFactError::StaleDescriptor {
                     locator: descriptor.locator,
-                }
-            } else {
-                SealedFactError::Build(BuildError::from(ReadError::Io(error)))
-            }
-        })?;
-        let unit = PgmUnit::open(file).map_err(BuildError::from)?;
-        if unit.catalog() != &sealed.catalog {
-            return Err(SealedFactError::StaleDescriptor {
-                locator: descriptor.locator,
-            });
-        }
-        Ok(unit)
+                },
+                other => SealedFactError::Build(BuildError::from(other)),
+            })
     }
 
     /// Opens one active journal part by its exact refresh descriptor.
@@ -785,11 +880,11 @@ impl LocalDirSnapshot {
                     return false;
                 };
                 PartDescriptor {
-                    part_id: part_id(
+                    part_id: part_id_from_digest(
                         self.journal_generation,
                         frame_offset,
                         body_len,
-                        &active.catalog,
+                        active.catalog_digest,
                     ),
                     source_id: active.catalog.source_id,
                     min_ts: active.catalog.min_ts,
@@ -846,50 +941,14 @@ impl LocalDirSnapshot {
     /// the unit cannot be opened, the section fails CRC or typed decode, or the
     /// active part's catalog has changed since the snapshot was taken.
     pub fn decode_unit(&self, idx: usize, entry_idx: usize) -> Result<DecodedSection, ReadError> {
-        let handle = self.handles().nth(idx).ok_or_else(|| {
+        let unit = self.open_unit(idx)?;
+        let entry = unit.catalog().entries.get(entry_idx).ok_or_else(|| {
             ReadError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unit index {idx} is out of range"),
+                format!("entry index {entry_idx} is out of range for unit {idx}"),
             ))
         })?;
-        match handle {
-            UnitHandle::Sealed(i) => {
-                let su = &self.scan.sealed[i];
-                let entry = su.catalog.entries.get(entry_idx).ok_or_else(|| {
-                    ReadError::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("entry index {entry_idx} is out of range for sealed unit {idx}"),
-                    ))
-                })?;
-                let file = self.dir.open_sealed(su)?;
-                PgmUnit::open(file)?.decode(entry)
-            }
-            UnitHandle::Active(i) => {
-                let ap = &self.scan.active[i];
-                let cached_entry = ap.catalog.entries.get(entry_idx).ok_or_else(|| {
-                    ReadError::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("entry index {entry_idx} is out of range for active unit {idx}"),
-                    ))
-                })?;
-                let bytes = match self.dir.read_active_part(ap) {
-                    Ok(b) => b,
-                    Err(StoreError::Io(err))
-                        if err.kind() == io::ErrorKind::NotFound
-                            || err.kind() == io::ErrorKind::UnexpectedEof =>
-                    {
-                        return Err(ReadError::StaleSnapshot { unit_idx: idx });
-                    }
-                    Err(StoreError::Io(err)) => return Err(ReadError::Io(err)),
-                    Err(err) => return Err(ReadError::Store(err)),
-                };
-                let unit = PgmUnit::open(bytes.as_slice())?;
-                if unit.catalog() != &ap.catalog {
-                    return Err(ReadError::StaleSnapshot { unit_idx: idx });
-                }
-                unit.decode(cached_entry)
-            }
-        }
+        unit.decode(entry)
     }
 
     /// Decode one section as named-cell rows from the unit at position `idx`.
@@ -902,50 +961,14 @@ impl LocalDirSnapshot {
     ///
     /// Returns [`ReadError`] for the same reasons as [`decode_unit`](Self::decode_unit).
     pub fn decode_unit_rows(&self, idx: usize, entry_idx: usize) -> Result<Vec<Row>, ReadError> {
-        let handle = self.handles().nth(idx).ok_or_else(|| {
+        let unit = self.open_unit(idx)?;
+        let entry = unit.catalog().entries.get(entry_idx).ok_or_else(|| {
             ReadError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unit index {idx} is out of range"),
+                format!("entry index {entry_idx} is out of range for unit {idx}"),
             ))
         })?;
-        match handle {
-            UnitHandle::Sealed(i) => {
-                let su = &self.scan.sealed[i];
-                let entry = su.catalog.entries.get(entry_idx).ok_or_else(|| {
-                    ReadError::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("entry index {entry_idx} is out of range for sealed unit {idx}"),
-                    ))
-                })?;
-                let file = self.dir.open_sealed(su)?;
-                PgmUnit::open(file)?.decode_rows(entry)
-            }
-            UnitHandle::Active(i) => {
-                let ap = &self.scan.active[i];
-                let cached_entry = ap.catalog.entries.get(entry_idx).ok_or_else(|| {
-                    ReadError::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("entry index {entry_idx} is out of range for active unit {idx}"),
-                    ))
-                })?;
-                let bytes = match self.dir.read_active_part(ap) {
-                    Ok(b) => b,
-                    Err(StoreError::Io(err))
-                        if err.kind() == io::ErrorKind::NotFound
-                            || err.kind() == io::ErrorKind::UnexpectedEof =>
-                    {
-                        return Err(ReadError::StaleSnapshot { unit_idx: idx });
-                    }
-                    Err(StoreError::Io(err)) => return Err(ReadError::Io(err)),
-                    Err(err) => return Err(ReadError::Store(err)),
-                };
-                let unit = PgmUnit::open(bytes.as_slice())?;
-                if unit.catalog() != &ap.catalog {
-                    return Err(ReadError::StaleSnapshot { unit_idx: idx });
-                }
-                unit.decode_rows(cached_entry)
-            }
-        }
+        unit.decode_rows(entry)
     }
 
     /// Read the dictionary of the unit at position `idx` in `units()`.
@@ -960,38 +983,7 @@ impl LocalDirSnapshot {
     /// cannot be opened, a dictionary section fails CRC or decode, or the
     /// active part's catalog changed since the snapshot was taken.
     pub fn unit_dictionary(&self, idx: usize) -> Result<Dictionary, ReadError> {
-        let handle = self.handles().nth(idx).ok_or_else(|| {
-            ReadError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unit index {idx} is out of range"),
-            ))
-        })?;
-        match handle {
-            UnitHandle::Sealed(i) => {
-                let su = &self.scan.sealed[i];
-                let file = self.dir.open_sealed(su)?;
-                PgmUnit::open(file)?.dictionary()
-            }
-            UnitHandle::Active(i) => {
-                let ap = &self.scan.active[i];
-                let bytes = match self.dir.read_active_part(ap) {
-                    Ok(b) => b,
-                    Err(StoreError::Io(err))
-                        if err.kind() == io::ErrorKind::NotFound
-                            || err.kind() == io::ErrorKind::UnexpectedEof =>
-                    {
-                        return Err(ReadError::StaleSnapshot { unit_idx: idx });
-                    }
-                    Err(StoreError::Io(err)) => return Err(ReadError::Io(err)),
-                    Err(err) => return Err(ReadError::Store(err)),
-                };
-                let unit = PgmUnit::open(bytes.as_slice())?;
-                if unit.catalog() != &ap.catalog {
-                    return Err(ReadError::StaleSnapshot { unit_idx: idx });
-                }
-                unit.dictionary()
-            }
-        }
+        self.open_unit(idx)?.dictionary()
     }
 
     /// Open the unit at position `idx` in `units()` for multi-section decoding.
@@ -1017,6 +1009,31 @@ impl LocalDirSnapshot {
         self.open_unit_handle(idx, handle)
     }
 
+    fn open_checked_sealed(
+        &self,
+        unit_idx: usize,
+        sealed_idx: usize,
+    ) -> Result<PgmUnit<std::fs::File>, ReadError> {
+        let sealed = &self.scan.sealed[sealed_idx];
+        let file = self
+            .dir
+            .open_sealed(sealed)
+            .map_err(|error| map_sealed_open_error(error, unit_idx))?;
+        let identity_check = file.try_clone()?;
+        let opened = PgmUnit::open(file);
+        if let Err(error) = self.dir.validate_sealed_file(&identity_check, sealed) {
+            return Err(map_sealed_open_error(error, unit_idx));
+        }
+        let unit = opened?;
+        let catalog_len = u32::try_from(unit.catalog().encoded_len())
+            .map_err(|_overflow| ReadError::CounterOverflow)?;
+        let observed = CatalogSummary::from_catalog(unit.catalog(), catalog_len);
+        if observed != *sealed.summary {
+            return Err(ReadError::StaleSnapshot { unit_idx });
+        }
+        Ok(unit)
+    }
+
     pub(crate) fn open_unit_handle(
         &self,
         idx: usize,
@@ -1033,15 +1050,7 @@ impl LocalDirSnapshot {
             return Err(ReadError::StaleSnapshot { unit_idx: idx });
         }
         match handle {
-            UnitHandle::Sealed(i) => {
-                let su = &self.scan.sealed[i];
-                let file = self.dir.open_sealed(su)?;
-                let unit = PgmUnit::open(file)?;
-                if unit.catalog() != &su.catalog {
-                    return Err(ReadError::StaleSnapshot { unit_idx: idx });
-                }
-                Ok(OpenUnit::Sealed(unit))
-            }
+            UnitHandle::Sealed(i) => self.open_checked_sealed(idx, i).map(OpenUnit::Sealed),
             UnitHandle::Active(i) => {
                 let ap = &self.scan.active[i];
                 let bytes = match self.dir.read_active_part(ap) {
@@ -1065,129 +1074,232 @@ impl LocalDirSnapshot {
     }
 
     pub(crate) fn unit_descriptors(&self) -> impl Iterator<Item = UnitDescriptor<'_>> {
-        self.handles().enumerate().map(|(index, handle)| {
-            let catalog = self.catalog_for_handle(handle);
-            UnitDescriptor {
+        self.handles()
+            .enumerate()
+            .map(|(index, handle)| UnitDescriptor {
                 index,
                 handle,
                 meta: self.meta_for_handle(handle),
-                catalog,
                 eager_open_bytes: match handle {
-                    UnitHandle::Sealed(_) => 0,
+                    UnitHandle::Sealed(i) => u64::from(self.scan.sealed[i].summary.catalog_len)
+                        .saturating_add(MAGIC.len() as u64)
+                        .saturating_add(TAIL_INDEX_LEN as u64),
                     UnitHandle::Active(i) => {
                         u64::try_from(self.scan.active[i].part.len).unwrap_or(u64::MAX)
                     }
                 },
-            }
-        })
-    }
-
-    fn catalog_for_handle(&self, handle: UnitHandle) -> &Catalog {
-        match handle {
-            UnitHandle::Sealed(i) => &self.scan.sealed[i].catalog,
-            UnitHandle::Active(i) => &self.scan.active[i].catalog,
-        }
+                catalog_hint: match handle {
+                    UnitHandle::Sealed(i) => {
+                        UnitCatalogHint::Sealed(self.scan.sealed[i].summary.as_ref())
+                    }
+                    UnitHandle::Active(i) => UnitCatalogHint::Active(&self.scan.active[i].catalog),
+                },
+            })
     }
 
     fn meta_for_handle(&self, handle: UnitHandle) -> UnitMeta {
-        let catalog = self.catalog_for_handle(handle);
-        UnitMeta {
-            source_id: catalog.source_id,
-            min_ts: catalog.min_ts,
-            max_ts: catalog.max_ts,
-            live: matches!(handle, UnitHandle::Active(_)),
+        match handle {
+            UnitHandle::Sealed(i) => {
+                let summary = self.scan.sealed[i].summary.as_ref();
+                UnitMeta {
+                    source_id: summary.source_id,
+                    min_ts: summary.min_ts,
+                    max_ts: summary.max_ts,
+                    live: false,
+                }
+            }
+            UnitHandle::Active(i) => {
+                let catalog = &self.scan.active[i].catalog;
+                UnitMeta {
+                    source_id: catalog.source_id,
+                    min_ts: catalog.min_ts,
+                    max_ts: catalog.max_ts,
+                    live: true,
+                }
+            }
         }
     }
 
     /// Iterator over handles in the same order as `units()`.
     fn handles(&self) -> impl Iterator<Item = UnitHandle> + '_ {
         let sealed_iter = (0..self.scan.sealed.len()).map(UnitHandle::Sealed);
+        let suppress_active_generation = sealed_generation_matches_active(&self.scan);
 
         let active_iter = self
             .scan
             .active
             .iter()
             .enumerate()
-            .filter(|(_, ap)| !self.scan.sealed.iter().any(|su| su.catalog == ap.catalog))
+            .filter(move |_| !suppress_active_generation)
             .map(|(i, _)| UnitHandle::Active(i));
 
         sealed_iter.chain(active_iter)
     }
 }
 
-/// Snapshots the sealed segment descriptors visible in a scan, in scan order.
-fn sealed_descriptors(scan: &LocalScan) -> io::Result<Vec<SegmentDescriptor>> {
-    scan.sealed
+/// Whether sealing every active part for one segment produces this sealed catalog.
+///
+/// The sealer relocates section bodies into one PGM, so a multi-part active
+/// catalog cannot be compared to the sealed catalog one part at a time.
+fn sealed_generation_matches_active(scan: &LocalScan) -> bool {
+    let Some(segment_id) = scan.active.first().map(|active| active.segment_id) else {
+        return false;
+    };
+    let Some(sealed) = scan
+        .sealed
         .iter()
-        .map(|sealed| {
-            let file_name = sealed.path.file_name().ok_or_else(|| {
-                io::Error::other("sealed segment path has no direct-child file name")
-            })?;
-            Ok(SegmentDescriptor::from_catalog(
-                SealedLocator::from_file_name_bytes(file_name.as_bytes()),
-                &sealed.catalog,
-            ))
-        })
-        .collect()
+        .find(|sealed| sealed.address.id == segment_id)
+    else {
+        return false;
+    };
+    aggregate_catalog_matches(&sealed.summary, &scan.active, segment_id)
+}
+
+/// Mirrors the catalog transformation performed by `kronika_writer::seal`.
+fn aggregate_catalog_matches(
+    sealed: &CatalogSummary,
+    active: &[ActivePart],
+    segment_id: SegmentId,
+) -> bool {
+    if active.is_empty() {
+        return false;
+    }
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    let mut source_id = 0_u64;
+    let format_version = active[0].catalog.format_version;
+    let mut entry_count = 0_usize;
+    let mut body_end = MAGIC.len() as u64;
+
+    for active_part in active {
+        if active_part.segment_id != segment_id {
+            return false;
+        }
+        let catalog = &active_part.catalog;
+        if catalog.format_version != format_version {
+            return false;
+        }
+        min_ts = min_ts.min(catalog.min_ts);
+        max_ts = max_ts.max(catalog.max_ts);
+        if catalog.source_id != 0 {
+            if source_id != 0 && source_id != catalog.source_id {
+                return false;
+            }
+            source_id = catalog.source_id;
+        }
+        entry_count = match entry_count.checked_add(catalog.entries.len()) {
+            Some(count) => count,
+            None => return false,
+        };
+        for entry in &catalog.entries {
+            body_end = match body_end.checked_add(entry.len) {
+                Some(next) => next,
+                None => return false,
+            };
+        }
+    }
+
+    if min_ts > max_ts {
+        min_ts = 0;
+        max_ts = 0;
+    }
+    let Ok(entry_count_u32) = u32::try_from(entry_count) else {
+        return false;
+    };
+    let Some(catalog_len) = entry_count
+        .checked_mul(ENTRY_LEN)
+        .and_then(|entries_len| META_LEN.checked_add(entries_len))
+        .and_then(|len| u32::try_from(len).ok())
+    else {
+        return false;
+    };
+    let mut relocated_offset = MAGIC.len() as u64;
+    let relocated_entries = active
+        .iter()
+        .flat_map(|part| part.catalog.entries.iter().copied())
+        .map(|entry| {
+            let relocated = Entry {
+                offset: relocated_offset,
+                ..entry
+            };
+            relocated_offset = relocated_offset
+                .checked_add(entry.len)
+                .expect("aggregate body length was checked above");
+            relocated
+        });
+    let (logical_digest, layout_digest) = catalog_digests(
+        source_id,
+        min_ts,
+        max_ts,
+        format_version,
+        entry_count_u32,
+        relocated_entries,
+    );
+
+    sealed.min_ts == min_ts
+        && sealed.max_ts == max_ts
+        && sealed.source_id == source_id
+        && sealed.entry_count == entry_count_u32
+        && sealed.format_version == format_version
+        && sealed.catalog_len == catalog_len
+        && sealed.logical_digest == logical_digest
+        && sealed.layout_digest == layout_digest
+        && body_end >= MAGIC.len() as u64
+}
+
+fn descriptor_for_sealed(sealed: &SealedUnit) -> SegmentDescriptor {
+    SegmentDescriptor::from_summary(
+        SealedLocator::from_segment_id(sealed.address.id),
+        sealed.identity,
+        &sealed.summary,
+    )
 }
 
 #[derive(Debug)]
 struct SealedDeltaState {
     added: Vec<SegmentDescriptor>,
     removed: Vec<SegmentDescriptor>,
-    baseline: Vec<SegmentDescriptor>,
 }
 
-fn sealed_delta(
-    scan: &LocalScan,
-    previous: &[SegmentDescriptor],
-    root: &Path,
-) -> io::Result<SealedDeltaState> {
-    let current = sealed_descriptors(scan)?;
-    let listing_authoritative = !scan.warnings.iter().any(|warning| warning.path == root);
-    let unavailable = scan
-        .warnings
-        .iter()
-        .filter_map(|warning| sealed_warning_locator(warning, root))
-        .collect::<std::collections::BTreeSet<_>>();
-    let added = difference(&current, previous);
-    let current_locators = current
-        .iter()
-        .map(|descriptor| descriptor.locator)
-        .collect::<std::collections::BTreeSet<_>>();
+fn sealed_delta(scan: &LocalScan, previous: &[SealedUnit]) -> SealedDeltaState {
+    let current = scan.sealed.as_slice();
+    let mut added = Vec::new();
     let mut removed = Vec::new();
-    let mut baseline = current;
+    let mut current_index = 0;
+    let mut previous_index = 0;
 
-    for descriptor in difference(previous, &baseline) {
-        if current_locators.contains(&descriptor.locator) {
-            removed.push(descriptor);
-        } else if !listing_authoritative || unavailable.contains(&descriptor.locator) {
-            baseline.push(descriptor);
-        } else {
-            removed.push(descriptor);
+    while let (Some(current_unit), Some(previous_unit)) =
+        (current.get(current_index), previous.get(previous_index))
+    {
+        match current_unit.address.id.cmp(&previous_unit.address.id) {
+            std::cmp::Ordering::Less => {
+                added.push(descriptor_for_sealed(current_unit));
+                current_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let current_descriptor = descriptor_for_sealed(current_unit);
+                let previous_descriptor = descriptor_for_sealed(previous_unit);
+                if current_descriptor != previous_descriptor {
+                    removed.push(previous_descriptor);
+                    added.push(current_descriptor);
+                }
+                current_index += 1;
+                previous_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                removed.push(descriptor_for_sealed(previous_unit));
+                previous_index += 1;
+            }
         }
     }
-
-    Ok(SealedDeltaState {
-        added,
-        removed,
-        baseline,
-    })
-}
-
-fn sealed_warning_locator(warning: &StoreWarning, root: &Path) -> Option<SealedLocator> {
-    if warning.path.parent() != Some(root)
-        || warning
-            .path
-            .extension()
-            .is_none_or(|extension| extension.as_bytes() != b"pgm")
-    {
-        return None;
+    for unit in &current[current_index..] {
+        added.push(descriptor_for_sealed(unit));
     }
-    warning
-        .path
-        .file_name()
-        .map(|name| SealedLocator::from_file_name_bytes(name.as_bytes()))
+    for unit in &previous[previous_index..] {
+        removed.push(descriptor_for_sealed(unit));
+    }
+
+    SealedDeltaState { added, removed }
 }
 
 fn journal_descriptors_complete(scan: &LocalScan, root: &Path) -> bool {
@@ -1210,7 +1322,12 @@ fn part_descriptors(
             let body_len = u64::try_from(active.part.len)
                 .map_err(|_error| io::Error::other("journal part length overflow"))?;
             Ok(PartDescriptor {
-                part_id: part_id(generation, frame_offset, body_len, &active.catalog),
+                part_id: part_id_from_digest(
+                    generation,
+                    frame_offset,
+                    body_len,
+                    active.catalog_digest,
+                ),
                 source_id: active.catalog.source_id,
                 min_ts: active.catalog.min_ts,
                 max_ts: active.catalog.max_ts,
@@ -1222,43 +1339,124 @@ fn part_descriptors(
 /// Performs a full scan while the journal identity remains stable.
 fn full_scan_consistent(
     dir: &LocalDir,
-    root: &Path,
+    previous_sealed: &[SealedUnit],
 ) -> io::Result<(LocalScan, Option<JournalIdentity>, JournalPrefixDigest)> {
-    for _attempt in 0..2 {
-        let identity_before = journal_identity(root)?;
-        let scan = dir.scan()?;
-        let prefix_digest = match journal_prefix_digest(root, scan.valid_len) {
-            Ok(digest) => digest,
-            Err(error) if is_journal_race(&error) => continue,
-            Err(error) => return Err(error),
+    let ((journal, prefix_digest), identity) = with_stable_journal_identity(
+        || journal_identity(dir),
+        |_identity_before| {
+            let journal = dir.scan_journal().map_err(ScanAttemptError::store)?;
+            let prefix_digest =
+                journal_prefix_digest(dir, journal.valid_len).map_err(ScanAttemptError::journal)?;
+            Ok((journal, prefix_digest))
+        },
+    )?;
+    let scan = dir.complete_scan_cached(journal, previous_sealed)?;
+    Ok((scan, identity, prefix_digest))
+}
+
+#[derive(Debug)]
+struct ScanAttemptError {
+    source: io::Error,
+    retry_if_identity_changed: bool,
+}
+
+impl ScanAttemptError {
+    fn journal(source: io::Error) -> Self {
+        let retry_if_identity_changed = is_transition_read_error(&source);
+        Self {
+            source,
+            retry_if_identity_changed,
+        }
+    }
+
+    fn store(source: io::Error) -> Self {
+        let retry_if_identity_changed =
+            is_active_journal_scan_error(&source) && is_transition_read_error(&source);
+        Self {
+            source,
+            retry_if_identity_changed,
+        }
+    }
+}
+
+fn is_transition_read_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn with_stable_journal_identity<T>(
+    mut identity: impl FnMut() -> io::Result<Option<JournalIdentity>>,
+    mut operation: impl FnMut(Option<JournalIdentity>) -> Result<T, ScanAttemptError>,
+) -> io::Result<(T, Option<JournalIdentity>)> {
+    for _attempt in 0..MAX_CONSISTENT_SCAN_ATTEMPTS {
+        let identity_before = identity()?;
+        let result = match operation(identity_before) {
+            Err(failure) if !failure.retry_if_identity_changed => return Err(failure.source),
+            result => result,
         };
-        let identity_after = journal_identity(root)?;
-        if identity_before == identity_after {
-            return Ok((scan, identity_after, prefix_digest));
+        let identity_after = match identity() {
+            Ok(identity) => identity,
+            Err(identity_error) => {
+                return match result {
+                    Ok(_) => Err(identity_error),
+                    Err(failure) => Err(failure.source),
+                };
+            }
+        };
+        match result {
+            Ok(value) if identity_before == identity_after => {
+                return Ok((value, identity_after));
+            }
+            Err(failure) if identity_before == identity_after => return Err(failure.source),
+            Ok(_) | Err(_) => {}
         }
     }
     Err(io::Error::new(
         io::ErrorKind::WouldBlock,
-        "active.parts changed during two consecutive scans",
+        format!(
+            "active.parts changed during {MAX_CONSISTENT_SCAN_ATTEMPTS} consecutive scan attempts"
+        ),
     ))
 }
 
-fn is_journal_race(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
-    )
-}
-
-fn journal_prefix_digest(root: &Path, valid_len: u64) -> io::Result<JournalPrefixDigest> {
+fn journal_prefix_digest(dir: &LocalDir, valid_len: u64) -> io::Result<JournalPrefixDigest> {
     let mut hasher = Sha256::new();
     hasher.update(JOURNAL_PREFIX_DOMAIN);
+    hasher.update(valid_len.to_le_bytes());
     if valid_len == 0 {
         return Ok(JournalPrefixDigest(hasher.finalize().into()));
     }
 
-    let mut file = std::fs::File::open(root.join("active.parts"))?;
-    let mut remaining = valid_len;
+    if valid_len < JOURNAL_HEADER_LEN as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal prefix ends inside the version-1 header",
+        ));
+    }
+    let mut file = dir
+        .open_active()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "active.parts is absent"))?;
+    let mut header_bytes = [0_u8; JOURNAL_HEADER_LEN];
+    file.read_exact(&mut header_bytes)?;
+    if is_committed_reset_state(&file, valid_len, header_bytes)? {
+        hasher.update([0]);
+    } else {
+        let header = JournalHeader::decode(header_bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        match header.state {
+            JournalState::Empty => hasher.update([0]),
+            JournalState::Active { segment_id } => {
+                hasher.update([1]);
+                hasher.update(segment_id.to_le_bytes());
+            }
+        }
+    }
+    let mut remaining = valid_len - JOURNAL_HEADER_LEN as u64;
     let mut buffer = vec![0_u8; JOURNAL_HASH_BUFFER_BYTES].into_boxed_slice();
     let buffer_len = u64::try_from(buffer.len())
         .map_err(|_error| io::Error::other("journal hash buffer length overflow"))?;
@@ -1274,13 +1472,35 @@ fn journal_prefix_digest(root: &Path, valid_len: u64) -> io::Result<JournalPrefi
     Ok(JournalPrefixDigest(hasher.finalize().into()))
 }
 
-/// Reads the observable identity of `active.parts`.
-fn journal_identity(root: &Path) -> io::Result<Option<JournalIdentity>> {
-    let metadata = match std::fs::metadata(root.join("active.parts")) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+fn is_committed_reset_state(
+    file: &std::fs::File,
+    valid_len: u64,
+    header_bytes: [u8; JOURNAL_HEADER_LEN],
+) -> io::Result<bool> {
+    let marker_len = RESET_MARKER_LEN as u64;
+    let Some(marker_at) = valid_len.checked_sub(marker_len) else {
+        return Ok(false);
     };
+    if marker_at <= JOURNAL_HEADER_LEN as u64 {
+        return Ok(false);
+    }
+    let mut marker_bytes = [0_u8; RESET_MARKER_LEN];
+    file.read_exact_at(&mut marker_bytes, marker_at)?;
+    let Some(marker) = ResetMarker::decode(marker_bytes) else {
+        return Ok(false);
+    };
+    Ok(marker.previous_len == marker_at
+        && SegmentId::new(marker.previous_segment_id).is_ok()
+        && marker.expected_previous_header().is_some()
+        && marker.classify_header_transition(header_bytes).is_some())
+}
+
+/// Reads the observable identity of `active.parts`.
+fn journal_identity(dir: &LocalDir) -> io::Result<Option<JournalIdentity>> {
+    let Some(file) = dir.open_active()? else {
+        return Ok(None);
+    };
+    let metadata = file.metadata()?;
     let mtime_ns = timestamp_ns(metadata.mtime(), metadata.mtime_nsec())?;
     let ctime_ns = timestamp_ns(metadata.ctime(), metadata.ctime_nsec())?;
     Ok(Some(JournalIdentity {
@@ -1290,6 +1510,17 @@ fn journal_identity(root: &Path) -> io::Result<Option<JournalIdentity>> {
         mtime_ns,
         ctime_ns,
     }))
+}
+
+const fn same_journal_file(
+    previous: Option<JournalIdentity>,
+    current: Option<JournalIdentity>,
+) -> bool {
+    matches!(
+        (previous, current),
+        (Some(previous), Some(current))
+            if previous.device == current.device && previous.inode == current.inode
+    )
 }
 
 fn timestamp_ns(seconds: i64, nanoseconds: i64) -> io::Result<i128> {
@@ -1313,22 +1544,6 @@ fn bump(value: u64) -> io::Result<u64> {
     value
         .checked_add(1)
         .ok_or_else(|| io::Error::other("generation counter overflow"))
-}
-
-/// Descriptors present in `left` but not in `right`, preserving `left` order.
-fn difference(left: &[SegmentDescriptor], right: &[SegmentDescriptor]) -> Vec<SegmentDescriptor> {
-    let mut remaining = std::collections::BTreeMap::<SegmentDescriptor, usize>::new();
-    for descriptor in right {
-        *remaining.entry(*descriptor).or_default() += 1;
-    }
-    let mut difference = Vec::new();
-    for descriptor in left {
-        match remaining.get_mut(descriptor) {
-            Some(count) if *count > 0 => *count -= 1,
-            _ => difference.push(*descriptor),
-        }
-    }
-    difference
 }
 
 fn merge_incremental_damages(
@@ -1355,7 +1570,7 @@ fn same_active_parts(previous: &LocalScan, current: &LocalScan) -> bool {
         && previous
             .active
             .iter()
-            .zip(&current.active)
+            .zip(current.active.iter())
             .all(|(left, right)| left.part == right.part && left.catalog == right.catalog)
 }
 
@@ -1364,8 +1579,12 @@ fn same_sealed_units(previous: &LocalScan, current: &LocalScan) -> bool {
         && previous
             .sealed
             .iter()
-            .zip(&current.sealed)
-            .all(|(left, right)| left.path == right.path && left.catalog == right.catalog)
+            .zip(current.sealed.iter())
+            .all(|(left, right)| {
+                left.address == right.address
+                    && left.identity == right.identity
+                    && left.summary == right.summary
+            })
 }
 
 fn same_warnings(previous: &[StoreWarning], current: &[StoreWarning]) -> bool {

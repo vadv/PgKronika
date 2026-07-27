@@ -142,7 +142,7 @@ fn write_section_with_source_and_node(
             source_id,
         },
     );
-    std::fs::write(dir.join(file), bytes).expect("write segment");
+    crate::test_layout::write_named_pgm(dir, file, &bytes);
 }
 
 fn fixture_str_id(value: &str) -> StrId {
@@ -949,7 +949,8 @@ async fn incident_read_failure_is_sanitized() {
     write_archiver_with_identity(dir.path(), &archiver_rows(true), 0, to);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
     let state = AppState::new(snapshot).expect("state");
-    std::fs::remove_file(dir.path().join("0.pgm")).expect("remove fixture after snapshot");
+    std::fs::remove_file(crate::test_layout::named_pgm_path(dir.path(), "0.pgm"))
+        .expect("remove fixture after snapshot");
     let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
     let response = app(state, None, test_metrics_handle())
         .oneshot(

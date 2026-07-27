@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 kronika-format = { path = "../kronika-format" }
+kronika-layout = { path = "../kronika-layout" }
 kronika-registry = { path = "../kronika-registry" }
 arrow-array = "55"
 arrow-schema = "55"
