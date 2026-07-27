@@ -6,6 +6,7 @@
 //! manifest and, where it belongs to the target factor inventory, is emitted as
 //! explicit unsupported coverage rather than a fabricated zero.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
@@ -198,7 +199,7 @@ fn latest_at<T>(values: &[T], ts_us: i64, timestamp: impl Fn(&T) -> i64) -> Opti
         .map(|index| &values[index])
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CoverageRecord {
     ts_us: i64,
     read_state: u8,
@@ -1326,13 +1327,17 @@ fn insert_coverage(
     source_type: u32,
     record: CoverageRecord,
 ) -> Result<(), BuildError> {
-    if coverage
-        .insert((source_type, record.ts_us), record)
-        .is_some()
-    {
-        return Err(BuildError::Source(SourceError::Corrupt));
+    match coverage.entry((source_type, record.ts_us)) {
+        Entry::Vacant(slot) => {
+            slot.insert(record);
+            Ok(())
+        }
+        // A truncated read is legitimately restated by both the snapshot and
+        // the collection coverage sections; only a conflicting restatement of
+        // the same source and timestamp is corruption.
+        Entry::Occupied(slot) if *slot.get() == record => Ok(()),
+        Entry::Occupied(_) => Err(BuildError::Source(SourceError::Corrupt)),
     }
-    Ok(())
 }
 
 #[allow(
@@ -1819,6 +1824,32 @@ mod tests {
             collected: population,
             total_exact: true,
         }
+    }
+
+    #[test]
+    fn identical_coverage_restatement_is_not_corruption() {
+        let mut canonical = BTreeMap::new();
+        let record = CoverageRecord {
+            ts_us: 100,
+            read_state: 1,
+            visibility: 0,
+            source_total: 888,
+            collected: 707,
+            total_exact: true,
+        };
+        insert_coverage(&mut canonical, 1_002_005, record).expect("first statement");
+        insert_coverage(&mut canonical, 1_002_005, record)
+            .expect("the collection section restates the snapshot record");
+        assert_eq!(canonical.len(), 1);
+
+        let conflicting = CoverageRecord {
+            collected: 706,
+            ..record
+        };
+        assert!(matches!(
+            insert_coverage(&mut canonical, 1_002_005, conflicting),
+            Err(BuildError::Source(SourceError::Corrupt))
+        ));
     }
 
     #[test]
