@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kronika_layout::{
-    DataRoot, EntryFileType, FileIdentity, LayoutLimits, SegmentArtifacts, UtcDay,
+    DataRoot, EntryFileType, FileIdentity, LayoutLimits, LayoutSnapshot, SegmentArtifacts, UtcDay,
 };
 use kronika_reader::PgmUnit;
 
@@ -20,11 +20,10 @@ pub(crate) fn inspect_path(path: &Path, options: Options) -> Result<TreeOutput, 
         !options.rows,
         "tree inspection must reject --rows before traversal"
     );
-    let root = DataRoot::open(path).map_err(|error| DumpError::input("open data root", error))?;
     let limits = LayoutLimits::default();
-    let snapshot = root
-        .scan(limits)
-        .map_err(|error| DumpError::input("scan data root", error))?;
+    let selection = select_tree(path, limits)?;
+    let root = selection.root;
+    let snapshot = selection.snapshot;
     let quarantine = root
         .scan_quarantine(limits)
         .map_err(|error| DumpError::input("scan quarantine", error))?
@@ -36,12 +35,13 @@ pub(crate) fn inspect_path(path: &Path, options: Options) -> Result<TreeOutput, 
             file_type: file_type_name(entry.identity().file_type),
         })
         .collect();
-    let journal = inspect_active_journal(&root, path, options)?;
+    let journal = inspect_active_journal(&root, root.diagnostic_path(), options)?;
 
     let mut by_day: BTreeMap<UtcDay, Vec<TreeSegmentOutput>> = snapshot
         .days
         .iter()
         .copied()
+        .filter(|day| selection.scope.includes(*day))
         .map(|day| (day, Vec::new()))
         .collect();
     let mut segment_count = 0_u64;
@@ -49,7 +49,11 @@ pub(crate) fn inspect_path(path: &Path, options: Options) -> Result<TreeOutput, 
     let mut stored_bytes = 0_u64;
     let mut decoded_bytes = Some(0_u64);
 
-    for segment in snapshot.segments {
+    for segment in snapshot
+        .segments
+        .into_iter()
+        .filter(|segment| selection.scope.includes(segment.address.day))
+    {
         let output = inspect_segment(&root, segment)?;
         segment_count = checked_add(segment_count, 1, "tree segment count")?;
         pgm_bytes = checked_add(pgm_bytes, output.pgm_bytes, "tree PGM bytes")?;
@@ -67,7 +71,8 @@ pub(crate) fn inspect_path(path: &Path, options: Options) -> Result<TreeOutput, 
         .collect();
     Ok(TreeOutput {
         kind: "tree",
-        root: path.display().to_string(),
+        root: root.diagnostic_path().display().to_string(),
+        scope: selection.scope.label(),
         journal,
         quarantine,
         days,
@@ -79,6 +84,120 @@ pub(crate) fn inspect_path(path: &Path, options: Options) -> Result<TreeOutput, 
             ratio: None,
         },
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TreeScope {
+    All,
+    Year(u16),
+    Month { year: u16, month: u8 },
+    Day(UtcDay),
+}
+
+impl TreeScope {
+    fn includes(self, day: UtcDay) -> bool {
+        match self {
+            Self::All => true,
+            Self::Year(year) => day.year == year,
+            Self::Month { year, month } => day.year == year && day.month == month,
+            Self::Day(expected) => day == expected,
+        }
+    }
+
+    fn label(self) -> Option<String> {
+        match self {
+            Self::All => None,
+            Self::Year(year) => Some(format!("{year:04}")),
+            Self::Month { year, month } => Some(format!("{year:04}/{month:02}")),
+            Self::Day(day) => Some(day.to_string()),
+        }
+    }
+}
+
+struct TreeSelection {
+    root: DataRoot,
+    snapshot: LayoutSnapshot,
+    scope: TreeScope,
+}
+
+fn select_tree(path: &Path, limits: LayoutLimits) -> Result<TreeSelection, DumpError> {
+    if let Some((root_path, scope)) = calendar_scope(path) {
+        let root = DataRoot::open(&root_path)
+            .map_err(|error| DumpError::input("open data root", error))?;
+        let snapshot = root
+            .scan(limits)
+            .map_err(|error| DumpError::input("scan data root", error))?;
+        if snapshot.days.iter().copied().any(|day| scope.includes(day)) {
+            return Ok(TreeSelection {
+                root,
+                snapshot,
+                scope,
+            });
+        }
+    }
+
+    let root = DataRoot::open(path).map_err(|error| DumpError::input("open data root", error))?;
+    let snapshot = root
+        .scan(limits)
+        .map_err(|error| DumpError::input("scan data root", error))?;
+    Ok(TreeSelection {
+        root,
+        snapshot,
+        scope: TreeScope::All,
+    })
+}
+
+fn calendar_scope(path: &Path) -> Option<(PathBuf, TreeScope)> {
+    day_scope(path)
+        .or_else(|| month_scope(path))
+        .or_else(|| year_scope(path))
+}
+
+fn day_scope(path: &Path) -> Option<(PathBuf, TreeScope)> {
+    let leaf = path.file_name()?.to_str()?;
+    let day = parse_component(leaf, 2).and_then(|value| u8::try_from(value).ok())?;
+    let month_path = path.parent()?;
+    let month = parse_component(month_path.file_name()?.to_str()?, 2)
+        .and_then(|value| u8::try_from(value).ok())?;
+    let year_path = month_path.parent()?;
+    let year = parse_component(year_path.file_name()?.to_str()?, 4)?;
+    let root = parent_path(year_path)?;
+    let day = UtcDay::new(year, month, day).ok()?;
+    Some((root, TreeScope::Day(day)))
+}
+
+fn month_scope(path: &Path) -> Option<(PathBuf, TreeScope)> {
+    let leaf = path.file_name()?.to_str()?;
+    let month = parse_component(leaf, 2).and_then(|value| u8::try_from(value).ok())?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let year_path = path.parent()?;
+    let year = parse_component(year_path.file_name()?.to_str()?, 4)?;
+    Some((parent_path(year_path)?, TreeScope::Month { year, month }))
+}
+
+fn year_scope(path: &Path) -> Option<(PathBuf, TreeScope)> {
+    let leaf = path.file_name()?.to_str()?;
+    let year = parse_component(leaf, 4)?;
+    Some((parent_path(path)?, TreeScope::Year(year)))
+}
+
+fn parent_path(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        Some(PathBuf::from("."))
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
+fn parse_component(value: &str, width: usize) -> Option<u16> {
+    if value.len() == width && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        value.parse().ok()
+    } else {
+        None
+    }
 }
 
 const fn file_type_name(file_type: EntryFileType) -> &'static str {

@@ -37,7 +37,7 @@ pg_kronika-dump <path> [--rows] [--limit N]
 
 | Argument | Meaning |
 | --- | --- |
-| `<path>` | A PgKronika data root, one PGM, or an `active.parts`/quarantine journal. |
+| `<path>` | A PgKronika data root, a `YYYY[/MM[/DD]]` calendar directory, one PGM, or an `active.parts`/quarantine journal. |
 | `--rows` | Add decoded rows to PGM sections or valid journal frames. It is rejected for a data root. |
 | `--limit N` | Emit at most `N` rows per section. The default is `1000`; the option requires `--rows`. `N=0` emits empty arrays and marks nonempty sections as truncated. |
 
@@ -45,7 +45,7 @@ The input mode is automatic:
 
 | Input | Mode |
 | --- | --- |
-| Directory | Strict bounded data-root traversal. |
+| Data root or its `YYYY`, `YYYY/MM`, `YYYY/MM/DD` directory | Strict bounded tree traversal with an optional calendar filter. |
 | Regular file starting with `PGM1` | One sealed PGM or self-contained PGM part. |
 | Any other regular file | Version-1 journal forensics. |
 
@@ -56,6 +56,7 @@ command reports an error instead of combining two states.
 
 ```sh
 pg_kronika-dump /var/lib/pg_kronika | jq .
+pg_kronika-dump /var/lib/pg_kronika/2026/07/27 | jq .
 ```
 
 This mode uses the same closed `kronika-layout` grammar as collector and web.
@@ -66,10 +67,16 @@ The result contains:
 
 | Field | Meaning |
 | --- | --- |
+| `root` | The actual PgKronika data root. For a calendar-directory input, the command derives it from the parent components. |
+| `scope` | The `YYYY`, `YYYY/MM`, or `YYYY/MM/DD` filter. It is omitted for the data root itself. |
 | `journal` | Root `active.parts` state, verified-frame count, physical bytes, and first damage kind. `state: "absent"` means the file does not exist. |
 | `quarantine` | Canonical `qv1` evidence: opaque `id`, quarantine reason, bytes, and filesystem object type. Unknown names inside quarantine are not interpreted. |
-| `days` | Every valid UTC day directory, including empty days, with sealed PGMs ordered by `SegmentId`. |
-| `totals` | Segment count and byte totals for the tree. |
+| `days` | Valid UTC day directories in the selected scope, including empty days, with sealed PGMs ordered by `SegmentId`. |
+| `totals` | Segment count and byte totals for the selected scope. |
+
+With a `scope`, only `days` and `totals` are filtered. The root `journal` and
+`quarantine` still describe the whole data root because those objects do not
+belong to an individual calendar directory.
 
 Each segment reports its `segment_id`, full `pgm_bytes`, whether a sibling OVF
 exists, data-section count, stored section bytes, collection-window count, and

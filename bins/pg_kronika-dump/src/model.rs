@@ -171,6 +171,8 @@ pub(crate) struct TreeTotalsOutput {
 pub(crate) struct TreeOutput {
     pub(crate) kind: &'static str,
     pub(crate) root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scope: Option<String>,
     pub(crate) journal: TreeJournalOutput,
     pub(crate) quarantine: Vec<QuarantineOutput>,
     pub(crate) days: Vec<TreeDayOutput>,

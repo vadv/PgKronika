@@ -385,6 +385,7 @@ fn tree_reads_only_catalogs_and_lists_days_and_quarantine() {
     assert_eq!(status, ExitCode::SUCCESS);
     assert!(stderr.is_empty());
     assert_eq!(output["kind"], "tree");
+    assert!(output.get("scope").is_none());
     assert_eq!(output["journal"]["state"], "empty");
     assert_eq!(output["journal"]["frames"], 0);
     assert_eq!(output["quarantine"][0]["id"], evidence_name);
@@ -408,6 +409,40 @@ fn tree_reads_only_catalogs_and_lists_days_and_quarantine() {
     );
     assert_eq!(output["totals"]["decoded_bytes"], Value::Null);
     assert_eq!(output["totals"]["ratio"], Value::Null);
+
+    let first_address =
+        SegmentAddress::new(SegmentId::new(FIRST_SEGMENT).expect("segment id")).expect("address");
+    let year = first_address.day.year_component();
+    let month = first_address.day.month_component();
+    let day = first_address.day.day_component();
+
+    let (status, day_output, stderr) = run_json([directory
+        .path()
+        .join(&year)
+        .join(&month)
+        .join(&day)
+        .into_os_string()]);
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert!(stderr.is_empty());
+    assert_eq!(day_output["root"], directory.path().display().to_string());
+    assert_eq!(day_output["scope"], first_address.day.to_string());
+    assert_eq!(day_output["days"].as_array().expect("days").len(), 1);
+    assert_eq!(day_output["totals"]["segments"], 1);
+
+    let (status, month_output, stderr) =
+        run_json([directory.path().join(&year).join(&month).into_os_string()]);
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert!(stderr.is_empty());
+    assert_eq!(month_output["scope"], format!("{year}/{month}"));
+    assert_eq!(month_output["days"].as_array().expect("days").len(), 2);
+    assert_eq!(month_output["totals"]["segments"], 2);
+
+    let (status, year_output, stderr) = run_json([directory.path().join(&year).into_os_string()]);
+    assert_eq!(status, ExitCode::SUCCESS);
+    assert!(stderr.is_empty());
+    assert_eq!(year_output["scope"], year);
+    assert_eq!(year_output["days"].as_array().expect("days").len(), 2);
+    assert_eq!(year_output["totals"]["segments"], 2);
 }
 
 #[test]
