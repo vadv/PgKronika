@@ -627,6 +627,7 @@ pub fn build_part(sections: &[SectionInput<'_>], meta: PartMeta) -> Vec<u8> {
         max_ts: meta.max_ts,
         source_id: meta.source_id,
         format_version: crate::FORMAT_VERSION,
+        window_count: 1,
     };
     out.extend_from_slice(&catalog.encode());
     out
@@ -2282,6 +2283,7 @@ mod tests {
             max_ts: 2,
             source_id: 0,
             format_version: crate::FORMAT_VERSION,
+            window_count: 1,
         };
         part.extend_from_slice(&catalog.encode());
         part
@@ -2620,6 +2622,7 @@ mod tests {
             max_ts: 2,
             source_id: 0,
             format_version: crate::FORMAT_VERSION,
+            window_count: 1,
         };
         tricky.extend_from_slice(&catalog.encode());
 

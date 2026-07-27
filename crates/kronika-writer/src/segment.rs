@@ -476,6 +476,7 @@ struct SegmentPlan {
     min_ts: i64,
     max_ts: i64,
     source_id: u64,
+    window_count: u32,
 }
 
 /// Write the merged segment to `tmp` and flush the encoder.
@@ -563,6 +564,7 @@ fn write_tmp(journal: &Journal, temporary: &mut PgmTemp<'_>) -> Result<SealSumma
         max_ts: plan.max_ts,
         source_id: plan.source_id,
         format_version: FORMAT_VERSION,
+        window_count: plan.window_count,
     };
     out.write_all(&catalog.encode())?;
 
@@ -583,6 +585,10 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     let mut source_id = 0_u64;
+    let window_count =
+        u32::try_from(journal.parts().len()).map_err(|_error| SealError::ArithmeticOverflow {
+            what: "window count",
+        })?;
     for &part_ref in journal.parts() {
         let part = journal.read_part(part_ref)?;
         // Recheck bodies immediately before publication. The journal may have
@@ -635,6 +641,7 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
         min_ts,
         max_ts,
         source_id,
+        window_count,
     })
 }
 
@@ -1318,6 +1325,7 @@ mod tests {
         let segment = std::fs::read(&segment_path).expect("read segment");
         assert_eq!(u64::try_from(segment.len()).unwrap(), summary.bytes);
         let catalog = validate_part(&segment).expect("segment validates");
+        assert_eq!(catalog.window_count, 2, "both collection windows");
         let [entry] = catalog.entries.as_slice() else {
             panic!("the sealed segment must coalesce to one section");
         };
@@ -1418,10 +1426,9 @@ mod tests {
             &[negative_zero, nan_1, positive_zero],
             &[blocked.clone(), root.clone()],
         );
-        append_lossless_part(&mut second, &[nan_2], &[]);
         append_lossless_part(
             &mut second,
-            &[negative_zero],
+            &[nan_2, negative_zero],
             std::slice::from_ref(&blocked),
         );
         assert_ne!(
@@ -1449,6 +1456,7 @@ mod tests {
         assert_eq!((first_summary.min_ts, first_summary.max_ts), (42, 84));
 
         let catalog = validate_part(&segment).expect("sealed PGM validates");
+        assert_eq!(catalog.window_count, 2);
         let bgwriter_entry = catalog
             .entries
             .iter()

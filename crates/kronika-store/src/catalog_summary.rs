@@ -32,6 +32,7 @@ impl CatalogDigest {
             catalog.min_ts,
             catalog.max_ts,
             catalog.format_version,
+            catalog.window_count,
             entry_count,
             catalog.entries.iter().copied(),
         )
@@ -73,6 +74,8 @@ pub struct CatalogSummary {
     pub entry_count: u32,
     /// Container format version.
     pub format_version: u32,
+    /// Collection windows coalesced into this container; 0 = unknown.
+    pub window_count: u32,
     /// Encoded catalog bytes, excluding the tail index.
     pub catalog_len: u32,
     /// Offset-independent identity used across journal finalization.
@@ -111,6 +114,7 @@ impl CatalogSummary {
             view.min_ts,
             view.max_ts,
             view.format_version,
+            view.window_count,
             view.entry_count,
             entries.clone(),
         );
@@ -121,6 +125,7 @@ impl CatalogSummary {
             source_id: view.source_id,
             entry_count: view.entry_count,
             format_version: view.format_version,
+            window_count: view.window_count,
             catalog_len,
             logical_digest,
             layout_digest,
@@ -145,6 +150,7 @@ impl CatalogSummary {
             catalog.min_ts,
             catalog.max_ts,
             catalog.format_version,
+            catalog.window_count,
             entry_count,
             catalog.entries.iter().copied(),
         );
@@ -155,6 +161,7 @@ impl CatalogSummary {
             source_id: catalog.source_id,
             entry_count,
             format_version: catalog.format_version,
+            window_count: catalog.window_count,
             catalog_len,
             logical_digest,
             layout_digest,
@@ -230,6 +237,7 @@ pub fn catalog_digests(
     min_ts: i64,
     max_ts: i64,
     format_version: u32,
+    window_count: u32,
     entry_count: u32,
     entries: impl IntoIterator<Item = Entry>,
 ) -> (CatalogDigest, CatalogLayoutDigest) {
@@ -239,6 +247,7 @@ pub fn catalog_digests(
     logical.update(min_ts.to_le_bytes());
     logical.update(max_ts.to_le_bytes());
     logical.update(format_version.to_le_bytes());
+    logical.update(window_count.to_le_bytes());
     logical.update(u128::from(entry_count).to_le_bytes());
 
     let mut layout = Sha256::new();
@@ -247,6 +256,7 @@ pub fn catalog_digests(
     layout.update(min_ts.to_le_bytes());
     layout.update(max_ts.to_le_bytes());
     layout.update(format_version.to_le_bytes());
+    layout.update(window_count.to_le_bytes());
     layout.update(u128::from(entry_count).to_le_bytes());
 
     for entry in entries {
@@ -355,6 +365,7 @@ mod tests {
             max_ts: 200,
             source_id: 7,
             format_version: FORMAT_VERSION,
+            window_count: 3,
         }
     }
 
@@ -385,6 +396,19 @@ mod tests {
 
         assert_eq!(first.logical_digest, relocated.logical_digest);
         assert_ne!(first.layout_digest, relocated.layout_digest);
+    }
+
+    #[test]
+    fn catalog_digests_include_window_count() {
+        let first = catalog();
+        let mut more_windows = first.clone();
+        more_windows.window_count += 1;
+
+        let first = CatalogSummary::from_catalog(&first, 136);
+        let more_windows = CatalogSummary::from_catalog(&more_windows, 136);
+
+        assert_ne!(first.logical_digest, more_windows.logical_digest);
+        assert_ne!(first.layout_digest, more_windows.layout_digest);
     }
 
     #[test]

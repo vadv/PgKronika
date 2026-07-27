@@ -28,6 +28,8 @@
   переменные окружения и расписание сбора;
 - [`pg_kronika-web`](../bins/pg_kronika-web/README.ru.md) — HTTP API,
   ограничения запросов и эксплуатация веб-процесса.
+- [`pg_kronika-dump`](../bins/pg_kronika-dump/README.ru.md) — офлайн-разбор
+  корня данных, PGM и повреждённого `active.parts`.
 
 ## Источники истины
 

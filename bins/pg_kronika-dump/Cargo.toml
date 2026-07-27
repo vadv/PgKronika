@@ -1,6 +1,6 @@
 [package]
 name = "pg_kronika-dump"
-description = "Placeholder for future command-line PGM diagnostics"
+description = "Read-only JSON inspection for PgKronika data files and directories"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -9,6 +9,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-format = { path = "../../crates/kronika-format" }
+kronika-layout = { path = "../../crates/kronika-layout" }
+kronika-reader = { path = "../../crates/kronika-reader" }
+kronika-registry = { path = "../../crates/kronika-registry" }
+rustix = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+kronika-writer = { path = "../../crates/kronika-writer" }
+tempfile = "3"
 
 [lints]
 workspace = true

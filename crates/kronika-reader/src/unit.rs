@@ -25,6 +25,7 @@ const SCRUB_BUFFER_BYTES: usize = 64 * 1024;
 const META_ENTRY_COUNT_AT: usize = 24;
 const META_FORMAT_VERSION_AT: usize = 28;
 const META_CRC_AT: usize = 32;
+const META_WINDOW_COUNT_AT: usize = 36;
 const _: () = assert!(
     CATALOG_READ_CHUNK_BYTES.is_multiple_of(ENTRY_LEN),
     "catalog read chunks must contain complete fixed-size entries"
@@ -498,6 +499,7 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
         max_ts: i64_at(&meta, 8),
         source_id: u64_at(&meta, 16),
         format_version,
+        window_count: u32_at(&meta, META_WINDOW_COUNT_AT),
     };
     validate_catalog_layout(&catalog, catalog_at).map_err(ReadError::Layout)?;
     Ok(OpenedCatalog {

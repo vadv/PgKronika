@@ -1115,6 +1115,7 @@ mod tests {
             max_ts: 2,
             source_id: 0,
             format_version: FORMAT_VERSION,
+            window_count: 1,
         };
         part.extend_from_slice(&catalog.encode());
         assert!(validate_part(&part).is_ok());

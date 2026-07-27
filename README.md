@@ -4,15 +4,16 @@
 
 PgKronika records diagnostic history for a PostgreSQL instance in local,
 immutable PGM segment files. A collector reads PostgreSQL statistics, Linux
-`/proc` and cgroup data, and optionally PostgreSQL stderr logs. A separate web
-process serves the recorded rows, counter diffs, source-scoped timeline
-digests, health lines, notable events, anomaly episodes, and incident clusters
-through a local UI and JSON API.
+`/proc` and cgroup data, and PostgreSQL stderr logs by default when they are
+discoverable and readable. A separate web process serves the recorded rows,
+counter diffs, source-scoped timeline digests, health lines, notable events,
+anomaly episodes, and incident clusters through a local UI and JSON API.
 
 The project is under active development. The collector, local segment store,
-reader, and web API are implemented and covered by PostgreSQL 15–18 BDD tests.
-Packaging, retention management, remote archival, `pg_kronika-dump`, MCP,
-alerting, and root-cause diagnosis are not implemented.
+reader, offline dump command, and web API are implemented. PostgreSQL-facing
+flows are covered by PostgreSQL 15–18 BDD tests. Packaging, retention
+management, remote archival, MCP, alerting, and root-cause diagnosis are not
+implemented.
 
 ## Data path
 
@@ -29,6 +30,8 @@ PostgreSQL 15–18       Linux /proc, /sys, cgroups       stderr log
                               |
              kronika-analytics -> pg_kronika-web
               diff, anomaly, health     JSON/UI, timeline, incidents
+
+        data root / PGM / active.parts -> pg_kronika-dump -> JSON
 ```
 
 The collector runs on the database host and opens no network listener. It
@@ -64,12 +67,11 @@ the [PostgreSQL collection contract](docs/type-registry/postgresql-collection.md
 The following path produces a segment, opens it with the web process, and
 returns the first useful API result. Run it from the repository root on Linux.
 
-Build the two implemented user-facing binaries:
+Build the three implemented user-facing binaries:
 
 ```sh
 rustup target add x86_64-unknown-linux-gnu --toolchain 1.96.0
-cargo +1.96.0 build --locked --target x86_64-unknown-linux-gnu \
-  -p pg_kronika-collector -p pg_kronika-web
+make build TARGET=x86_64-unknown-linux-gnu
 mkdir -p var/segments
 ```
 
@@ -127,9 +129,10 @@ crates.io.
 | [`kronika-source-log`](crates/kronika-source-log/) | Bounded stderr tailing, normalization, typed events, and gap reporting. |
 | [`pg_kronika-collector`](bins/pg_kronika-collector/) | Collection lifecycle, pacing, budgets, coverage, journaling, and rotation. |
 | [`pg_kronika-web`](bins/pg_kronika-web/) | Local UI, JSON API, auth, readiness, bounded source-scoped timelines, anomalies, incident clustering, and diagnostic findings. |
+| [`pg_kronika-dump`](bins/pg_kronika-dump/) | Read-only JSON inventory of a data root, exact PGM size/row inspection, and bounded damaged-journal forensics. |
 | [`kronika-bdd`](crates/kronika-bdd/) | Docker/Nix integration runner for the PostgreSQL 15–18 matrix. |
 | [`xtask`](xtask/) | Dependency-boundary check used by CI. |
-| `pg_kronika-archiver`, `pg_kronika-dump` | Placeholders that print an error and exit with status 2. |
+| `pg_kronika-archiver` | Placeholder that prints an error and exits with status 2. |
 
 The current dependency boundaries and data flow are described in
 [`docs/architecture.md`](docs/architecture.md). CI enforces binary-to-crate
@@ -219,6 +222,7 @@ Detailed limits and failure variants live in each crate's README and rustdoc.
 - Installation and first run: [Build and run the shortest path](#build-and-run-the-shortest-path)
 - Collector configuration: [`pg_kronika-collector` operator guide](bins/pg_kronika-collector/README.md)
 - JSON API and web configuration: [`pg_kronika-web` operator guide](bins/pg_kronika-web/README.md)
+- Offline data and journal inspection: [`pg_kronika-dump` operator guide](bins/pg_kronika-dump/README.md)
 - PostgreSQL connection and collection behavior: [`docs/connection-and-multidb.md`](docs/connection-and-multidb.md)
 - Type and data-quality contracts: [`docs/type-registry.md`](docs/type-registry.md)
 - Local and CI tests: [`docs/testing.md`](docs/testing.md)

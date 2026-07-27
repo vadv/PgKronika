@@ -1454,6 +1454,7 @@ fn read_validated_pgm_summary<R: ReadAt>(
         max_ts: view.max_ts,
         source_id: view.source_id,
         format_version: view.format_version,
+        window_count: view.window_count,
     };
     if catalog.format_version != FORMAT_VERSION {
         return Err(StoreError::UnsupportedFormat {
@@ -1774,6 +1775,7 @@ mod tests {
             max_ts: 0,
             source_id: 0,
             format_version,
+            window_count: 0,
         };
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);

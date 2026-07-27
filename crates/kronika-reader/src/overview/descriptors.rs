@@ -324,6 +324,7 @@ mod tests {
             max_ts: 2_000,
             source_id: 7,
             format_version: 1,
+            window_count: 2,
         };
         let source_descriptor = SourceDescriptor([3; 32]);
         let derived = lineage_from_catalog(&catalog, source_descriptor).expect("entry");
