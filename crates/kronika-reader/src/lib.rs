@@ -101,12 +101,12 @@ use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{Catalog, DecodeError, Entry};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS,
-    MAX_SECTION_ROWS,
+    MAX_SECTION_ROWS, validate_parquet_decode_work,
 };
 use kronika_store::StoreError;
 
 pub use kronika_registry::{Cell, Row};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 
 pub use unit::{OverviewSectionBody, PgmBodyReadStats, PgmUnit};
 
@@ -147,6 +147,11 @@ pub enum ReadError {
         /// The dictionary section's `type_id`.
         type_id: u32,
     },
+    /// The same dictionary id appears in both physical dictionary sections.
+    DictionaryConflict {
+        /// Conflicting dictionary id.
+        str_id: u64,
+    },
     /// The tail index did not decode.
     Tail(DecodeError),
     /// `catalog_len` does not fit between the magic and the tail index, or
@@ -157,6 +162,8 @@ pub enum ReadError {
     },
     /// The catalog block did not decode (length, count, or CRC).
     Catalog(DecodeError),
+    /// The catalog does not describe the canonical physical section layout.
+    Layout(kronika_format::CatalogLayoutError),
     /// A catalog entry's length is above
     /// [`kronika_registry::MAX_SECTION_BYTES`].
     SectionTooLarge {
@@ -210,11 +217,15 @@ impl fmt::Display for ReadError {
             Self::DictionarySection { type_id } => {
                 write!(f, "section {type_id} is a dictionary; use dictionary()")
             }
+            Self::DictionaryConflict { str_id } => {
+                write!(f, "dictionary id {str_id} appears more than once")
+            }
             Self::Tail(err) => write!(f, "segment tail index: {err}"),
             Self::BadCatalogLen { catalog_len } => {
                 write!(f, "segment catalog_len {catalog_len} does not fit the file")
             }
             Self::Catalog(err) => write!(f, "segment catalog: {err}"),
+            Self::Layout(err) => write!(f, "segment section layout: {err}"),
             Self::SectionTooLarge { len } => write!(f, "section of {len} bytes is above the cap"),
             Self::Codec(err) => write!(f, "section decode: {err}"),
             Self::Store(err) => write!(f, "store read: {err}"),
@@ -245,6 +256,7 @@ impl Error for ReadError {
         match self {
             Self::Io(err) => Some(err),
             Self::Tail(err) | Self::Catalog(err) => Some(err),
+            Self::Layout(err) => Some(err),
             Self::Codec(err) => Some(err),
             Self::Store(err) => Some(err),
             Self::TooSmall { .. }
@@ -252,6 +264,7 @@ impl Error for ReadError {
             | Self::UnsupportedFormat { .. }
             | Self::SectionOutOfBounds { .. }
             | Self::DictionarySection { .. }
+            | Self::DictionaryConflict { .. }
             | Self::BadCatalogLen { .. }
             | Self::SectionTooLarge { .. }
             | Self::StaleSnapshot { .. }
@@ -388,12 +401,12 @@ impl Dictionary {
 pub(crate) fn decode_dictionary(
     body: Bytes,
     type_id: u32,
-) -> Result<Vec<(u64, Stored)>, CodecError> {
+) -> Result<(Vec<(u64, Stored)>, u64), CodecError> {
     decode_dictionary_selected(body, type_id, None, &LIMIT)
-        .map(|(entries, _rows, _decoded_bytes)| entries)
+        .map(|(entries, _ids, rows, _decoded_bytes)| (entries, rows))
 }
 
-type DictionarySelection = (Vec<(u64, Stored)>, u64, u64);
+type DictionarySelection = (Vec<(u64, Stored)>, Vec<u64>, u64, u64);
 
 /// Decodes a dictionary section while copying only selected values.
 #[allow(
@@ -411,7 +424,11 @@ pub(crate) fn decode_dictionary_selected(
         DICT_BLOBS_TYPE_ID => true,
         _ => return Err(CodecError::UnknownType { type_id }),
     };
-    let builder = ParquetRecordBatchReaderBuilder::try_new(body)?;
+    let decoded_cap = usize::try_from(bounds.decoded_block_len)
+        .map_err(|_error| CodecError::InvalidPageLayout)?;
+    validate_parquet_decode_work(body.as_ref(), decoded_cap)?;
+    let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(body, options)?;
     let groups = builder.metadata().num_row_groups();
     if groups > MAX_ROW_GROUPS {
         return Err(CodecError::TooManyRowGroups {
@@ -430,32 +447,13 @@ pub(crate) fn decode_dictionary_selected(
         }
         Err(_) => return Err(CodecError::InvalidRowCount { raw: claimed }),
     };
-    let mut declared_decoded_bytes = 0_u64;
-    for row_group in builder.metadata().row_groups() {
-        for column in row_group.columns() {
-            let bytes = u64::try_from(column.uncompressed_size())
-                .map_err(|_error| CodecError::SchemaMismatch)?;
-            declared_decoded_bytes =
-                declared_decoded_bytes
-                    .checked_add(bytes)
-                    .ok_or(CodecError::SectionTooLarge {
-                        len: usize::MAX,
-                        max: usize::try_from(bounds.decoded_block_len).unwrap_or(usize::MAX),
-                    })?;
-        }
-    }
-    if declared_decoded_bytes > bounds.decoded_block_len {
-        return Err(CodecError::SectionTooLarge {
-            len: usize::try_from(declared_decoded_bytes).unwrap_or(usize::MAX),
-            max: usize::try_from(bounds.decoded_block_len).unwrap_or(usize::MAX),
-        });
-    }
     if !dictionary_schema_matches(builder.schema(), is_blob) {
         return Err(CodecError::SchemaMismatch);
     }
 
     let value_column = if is_blob { "stored_bytes" } else { "bytes" };
     let mut out = Vec::new();
+    let mut scanned_ids = wanted.map(|_| Vec::with_capacity(claimed_rows));
     let mut rows_scanned = 0_u64;
     let mut decoded_bytes = 0_u64;
     let mut previous_id = None;
@@ -480,6 +478,9 @@ pub(crate) fn decode_dictionary_selected(
                     return Err(CodecError::SchemaMismatch);
                 }
                 previous_id = Some(str_id);
+                if let Some(scanned_ids) = &mut scanned_ids {
+                    scanned_ids.push(str_id);
+                }
                 let bytes = values.value(row);
                 decoded_bytes = decoded_bytes.checked_add(bytes.len() as u64).ok_or(
                     CodecError::SectionTooLarge {
@@ -520,6 +521,9 @@ pub(crate) fn decode_dictionary_selected(
                     return Err(CodecError::SchemaMismatch);
                 }
                 previous_id = Some(str_id);
+                if let Some(scanned_ids) = &mut scanned_ids {
+                    scanned_ids.push(str_id);
+                }
                 let bytes = values.value(row);
                 decoded_bytes = decoded_bytes.checked_add(bytes.len() as u64).ok_or(
                     CodecError::SectionTooLarge {
@@ -547,7 +551,12 @@ pub(crate) fn decode_dictionary_selected(
     if rows_scanned != claimed_rows as u64 {
         return Err(CodecError::SchemaMismatch);
     }
-    Ok((out, rows_scanned, decoded_bytes))
+    Ok((
+        out,
+        scanned_ids.unwrap_or_default(),
+        rows_scanned,
+        decoded_bytes,
+    ))
 }
 
 fn dictionary_schema_matches(schema: &Schema, is_blob: bool) -> bool {
@@ -630,10 +639,31 @@ fn reject_nulls(array: &dyn Array, name: &'static str) -> Result<(), CodecError>
 #[cfg(test)]
 mod tests {
     use kronika_format::{PartMeta, SectionInput, build_part};
-    use kronika_registry::Section;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::{Section, Ts};
 
     use super::{ReadError, Resolved, Segment};
+
+    fn bgwriter_row(ts: i64) -> BgwriterCheckpointer {
+        BgwriterCheckpointer {
+            ts: Ts(ts),
+            checkpoints_timed: 0,
+            checkpoints_req: 0,
+            checkpoint_write_time: 0.0,
+            checkpoint_sync_time: 0.0,
+            buffers_checkpoint: 0,
+            restartpoints_timed: None,
+            restartpoints_req: None,
+            restartpoints_done: None,
+            buffers_clean: 0,
+            maxwritten_clean: 0,
+            buffers_backend: Some(0),
+            buffers_backend_fsync: Some(0),
+            buffers_alloc: 0,
+            bgwriter_stats_reset: Ts(ts),
+            checkpointer_stats_reset: None,
+        }
+    }
 
     /// Write a one-section segment to a temp file. A chartless segment is
     /// structurally a PGM part, so `build_part` writes a valid one.
@@ -662,8 +692,8 @@ mod tests {
 
     #[test]
     fn opens_a_segment_and_decodes_a_section() {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode empty section");
-        let (_dir, path) = segment_with(&body, 1_006_001, 0);
+        let body = BgwriterCheckpointer::encode(&[bgwriter_row(1_000)]).expect("encode section");
+        let (_dir, path) = segment_with(&body, 1_006_001, 1);
 
         let segment = Segment::open(&path).expect("open");
         assert_eq!(segment.catalog().source_id, 7);
@@ -672,13 +702,13 @@ mod tests {
         let entry = segment.catalog().entries[0];
         let decoded = segment.decode(&entry).expect("decode");
         assert_eq!(decoded.stats.type_id, 1_006_001);
-        assert_eq!(decoded.stats.rows, 0);
+        assert_eq!(decoded.stats.rows, 1);
     }
 
     #[test]
     fn a_corrupted_section_body_fails_the_crc_check() {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode");
-        let (_dir, path) = segment_with(&body, 1_006_001, 0);
+        let body = BgwriterCheckpointer::encode(&[bgwriter_row(1_000)]).expect("encode");
+        let (_dir, path) = segment_with(&body, 1_006_001, 1);
 
         // Flip a byte inside the section body, just past the segment magic.
         let mut bytes = std::fs::read(&path).expect("read");

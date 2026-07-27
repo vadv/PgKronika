@@ -327,11 +327,29 @@ mod tests {
     }
 
     fn part_catalog(min_ts: i64, max_ts: i64, source_id: u64) -> Catalog {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+        let row = BgwriterCheckpointer {
+            ts: kronika_registry::Ts(min_ts),
+            checkpoints_timed: 0,
+            checkpoints_req: 0,
+            checkpoint_write_time: 0.0,
+            checkpoint_sync_time: 0.0,
+            buffers_checkpoint: 0,
+            restartpoints_timed: None,
+            restartpoints_req: None,
+            restartpoints_done: None,
+            buffers_clean: 0,
+            maxwritten_clean: 0,
+            buffers_backend: Some(0),
+            buffers_backend_fsync: Some(0),
+            buffers_alloc: 0,
+            bgwriter_stats_reset: kronika_registry::Ts(min_ts),
+            checkpointer_stats_reset: None,
+        };
+        let body = BgwriterCheckpointer::encode(&[row]).expect("encode section");
         let bytes = build_part(
             &[SectionInput {
                 type_id: 1_006_001,
-                rows: 0,
+                rows: 1,
                 body: &body,
             }],
             PartMeta {

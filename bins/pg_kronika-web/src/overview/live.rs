@@ -561,6 +561,7 @@ mod tests {
 
     use crate::overview::selection::SelectedSealedPlan;
     use crate::overview::view::{IndexView, SourceStatus};
+    use crate::tests::bgwriter_row;
 
     const QUERY_LIMITS: OracleLimits = OracleLimits {
         max_observations: 32,
@@ -573,11 +574,11 @@ mod tests {
     };
 
     fn write_segment(dir: &std::path::Path, file: &str, min_ts: i64, max_ts: i64) {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+        let body = BgwriterCheckpointer::encode(&[bgwriter_row(min_ts)]).expect("encode section");
         let bytes = build_part(
             &[SectionInput {
                 type_id: 1_006_001,
-                rows: 0,
+                rows: 1,
                 body: &body,
             }],
             PartMeta {
@@ -947,23 +948,13 @@ mod tests {
             "append must preserve the stable public identity of prior live rows"
         );
 
-        let first_body =
-            PgLogLifecycleV1::encode(std::slice::from_ref(&first)).expect("first body");
-        let second_body =
-            PgLogLifecycleV1::encode(std::slice::from_ref(&second)).expect("second body");
+        let sealed_body = PgLogLifecycleV1::encode(&[first, second]).expect("sealed body");
         let sealed = build_part(
-            &[
-                SectionInput {
-                    type_id: 1_028_001,
-                    rows: 1,
-                    body: &first_body,
-                },
-                SectionInput {
-                    type_id: 1_028_001,
-                    rows: 1,
-                    body: &second_body,
-                },
-            ],
+            &[SectionInput {
+                type_id: 1_028_001,
+                rows: 2,
+                body: &sealed_body,
+            }],
             PartMeta {
                 min_ts: first.ts.0,
                 max_ts: second.ts.0,

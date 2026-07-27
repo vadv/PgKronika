@@ -313,15 +313,7 @@ fn build_fixture(dir: &Path) {
         let archiver_body = PgStatArchiver::encode(&archiver).expect("encode archiver");
         let bgwriter_body = BgwriterCheckpointer::encode(&bgwriter).expect("encode bgwriter");
         let min_ts = first_tick * STEP;
-        let mut sections: Vec<SectionInput<'_>> = dictionary
-            .iter()
-            .map(|section| SectionInput {
-                type_id: section.type_id,
-                rows: section.rows,
-                body: &section.body,
-            })
-            .collect();
-        sections.extend([
+        let mut sections = vec![
             SectionInput {
                 type_id: 1_002_006,
                 rows: u32::try_from(statements.len()).expect("row count fits u32"),
@@ -333,9 +325,14 @@ fn build_fixture(dir: &Path) {
                 body: &plans_body,
             },
             SectionInput {
-                type_id: 1_038_001,
-                rows: u32::try_from(plan_coverage.len()).expect("coverage count fits u32"),
-                body: &plan_coverage_body,
+                type_id: 1_006_001,
+                rows: u32::try_from(bgwriter.len()).expect("fits"),
+                body: &bgwriter_body,
+            },
+            SectionInput {
+                type_id: 1_008_001,
+                rows: u32::try_from(archiver.len()).expect("fits"),
+                body: &archiver_body,
             },
             SectionInput {
                 type_id: 1_020_001,
@@ -348,16 +345,16 @@ fn build_fixture(dir: &Path) {
                 body: &metadata_body,
             },
             SectionInput {
-                type_id: 1_008_001,
-                rows: u32::try_from(archiver.len()).expect("fits"),
-                body: &archiver_body,
+                type_id: 1_038_001,
+                rows: u32::try_from(plan_coverage.len()).expect("coverage count fits u32"),
+                body: &plan_coverage_body,
             },
-            SectionInput {
-                type_id: 1_006_001,
-                rows: u32::try_from(bgwriter.len()).expect("fits"),
-                body: &bgwriter_body,
-            },
-        ]);
+        ];
+        sections.extend(dictionary.iter().map(|section| SectionInput {
+            type_id: section.type_id,
+            rows: section.rows,
+            body: &section.body,
+        }));
         let part = build_part(
             &sections,
             PartMeta {

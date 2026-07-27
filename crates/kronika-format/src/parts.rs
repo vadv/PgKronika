@@ -7,7 +7,10 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use crate::{Catalog, DecodeError, Entry, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex, crc32c};
+use crate::{
+    Catalog, CatalogLayoutError, DecodeError, Entry, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex,
+    crc32c, validate_catalog_layout,
+};
 
 /// Magic bytes opening every journal frame.
 pub const FRAME_MAGIC: [u8; 4] = *b"PGMP";
@@ -135,6 +138,8 @@ pub enum PartError {
     },
     /// The catalog failed to decode.
     Catalog(DecodeError),
+    /// The catalog does not describe the canonical physical section layout.
+    Layout(CatalogLayoutError),
     /// A catalog entry points outside the section area of the body.
     SectionOutOfBounds {
         /// `type_id` of the entry that failed validation.
@@ -165,6 +170,7 @@ impl fmt::Display for PartError {
                 write!(f, "part catalog_len {catalog_len} does not fit the body")
             }
             Self::Catalog(err) => write!(f, "part catalog: {err}"),
+            Self::Layout(err) => write!(f, "part section layout: {err}"),
             Self::SectionOutOfBounds { type_id } => {
                 write!(f, "section {type_id} points outside the part body")
             }
@@ -257,18 +263,7 @@ fn decode_and_bound(bytes: &[u8]) -> Result<Catalog, PartError> {
 
     let catalog = Catalog::decode(&bytes[catalog_start..body_end]).map_err(PartError::Catalog)?;
 
-    for entry in &catalog.entries {
-        let in_bounds = entry.offset >= MAGIC.len() as u64
-            && entry
-                .offset
-                .checked_add(entry.len)
-                .is_some_and(|end| end <= catalog_start as u64);
-        if !in_bounds {
-            return Err(PartError::SectionOutOfBounds {
-                type_id: entry.type_id,
-            });
-        }
-    }
+    validate_catalog_layout(&catalog, catalog_start as u64).map_err(PartError::Layout)?;
 
     Ok(catalog)
 }
@@ -769,11 +764,7 @@ mod streaming_tests {
     }
     fn sample_part() -> Vec<u8> {
         build_part(
-            &[SectionInput {
-                type_id: 1_006_001,
-                rows: 0,
-                body: b"",
-            }],
+            &[],
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
@@ -1034,6 +1025,64 @@ mod tests {
             validate_part_catalog(&bad_magic),
             Err(PartError::BadMagic { .. })
         ));
+    }
+
+    #[test]
+    fn part_validation_rejects_duplicate_section_types() {
+        let part = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 1,
+                    body: b"first",
+                },
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 1,
+                    body: b"second",
+                },
+            ],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 0,
+            },
+        );
+
+        assert!(matches!(
+            validate_part_catalog(&part),
+            Err(PartError::Layout(_))
+        ));
+    }
+
+    #[test]
+    fn part_validation_accepts_canonical_dictionary_tail() {
+        let part = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 1,
+                    body: b"data",
+                },
+                SectionInput {
+                    type_id: 3_001_001,
+                    rows: 1,
+                    body: b"strings",
+                },
+                SectionInput {
+                    type_id: 3_002_001,
+                    rows: 1,
+                    body: b"blobs",
+                },
+            ],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 0,
+            },
+        );
+
+        assert!(validate_part(&part).is_ok());
     }
 
     #[test]

@@ -12,10 +12,13 @@
 //! [`JournalConfig::max_journal_len`] is the hard growth bound, reported as
 //! [`JournalError::Full`] so the collector can seal early.
 //!
-//! [`seal`] streams one journal part at a time into a sibling temporary file,
-//! writes and synchronizes the end catalog, and publishes the result without
-//! overwriting an existing destination. It never resets the journal; the
-//! caller does so only after a successful seal.
+//! [`seal`] validates and decodes journal bodies, coalesces each registered
+//! type, normalizes dictionaries, and emits canonical Parquet 1.0 bodies with
+//! PLAIN values and Zstandard level 6. It synchronizes an invocation-owned
+//! sibling temporary file and publishes without replacing the destination.
+//! An exact existing destination is a successful idempotent retry; a different
+//! one returns [`SealError::AlreadyExists`]. Seal never resets the journal, so
+//! the caller does so only after `Ok`.
 
 mod buffer;
 pub mod dict;

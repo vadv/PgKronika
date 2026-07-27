@@ -2058,7 +2058,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_contiguous_partition_reconciles_to_exact_cold_sealed_facts",
                 ),
                 ("mode", "qualification", "oracle-profile"),
             ],
@@ -2071,7 +2071,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_contiguous_partition_reconciles_to_exact_cold_sealed_facts",
                 ),
                 (
                     "rust_test",
@@ -2187,7 +2187,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_contiguous_partition_reconciles_to_exact_cold_sealed_facts",
                 ),
                 (
                     "rust_test",
@@ -2248,7 +2248,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_contiguous_partition_reconciles_to_exact_cold_sealed_facts",
                 ),
             ],
             timeline_bdd: false,

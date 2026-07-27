@@ -16,10 +16,12 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::{concat::concat_batches, take::take};
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 
 use crate::contract::{ColumnType, TypeContract};
 
@@ -76,6 +78,9 @@ pub const MAX_SECTION_ROWS: usize = 65_536;
 /// Checked before Parquet metadata is parsed.
 pub const MAX_SECTION_BYTES: usize = 8 * 1024 * 1024;
 
+/// Maximum aggregate uncompressed Parquet column bytes admitted before decode.
+pub const MAX_DECODED_SECTION_BYTES: usize = 128 * 1024 * 1024;
+
 /// Maximum Parquet row groups accepted in one snapshot section.
 ///
 /// Decode rejects excessive row groups before reading column data.
@@ -114,6 +119,22 @@ pub enum CodecError {
         /// The enforced cap.
         max: usize,
     },
+    /// A final PLAIN column would cross the one-page value budget.
+    PlainPageTooLarge {
+        /// Registry or dictionary column name.
+        name: &'static str,
+        /// Worst-case PLAIN value bytes.
+        len: usize,
+        /// Largest admitted value byte count.
+        max: usize,
+    },
+    /// Parquet metadata declares more decoded column bytes than the work cap.
+    DecodedSectionTooLarge {
+        /// Aggregate uncompressed column bytes.
+        len: usize,
+        /// The enforced cap.
+        max: usize,
+    },
     /// The section has more than [`MAX_ROW_GROUPS`] row groups.
     TooManyRowGroups {
         /// The row-group count that exceeded the cap.
@@ -121,6 +142,8 @@ pub enum CodecError {
         /// The enforced cap.
         max: usize,
     },
+    /// Parquet footer, column ranges, or page headers are inconsistent.
+    InvalidPageLayout,
     /// A column required by the contract is absent from the decoded file.
     MissingColumn {
         /// The missing column name.
@@ -201,8 +224,19 @@ impl fmt::Display for CodecError {
             Self::SectionTooLarge { len, max } => {
                 write!(f, "section is {len} bytes, above the cap of {max}")
             }
+            Self::PlainPageTooLarge { name, len, max } => write!(
+                f,
+                "PLAIN column {name:?} needs {len} value bytes, above the one-page cap of {max}"
+            ),
+            Self::DecodedSectionTooLarge { len, max } => write!(
+                f,
+                "section declares {len} decoded bytes, above the work cap of {max}"
+            ),
             Self::TooManyRowGroups { groups, max } => {
                 write!(f, "section has {groups} row groups, above the cap of {max}")
+            }
+            Self::InvalidPageLayout => {
+                f.write_str("Parquet page layout violates the bounded footer contract")
             }
             Self::MissingColumn { name } => write!(f, "decoded section lacks column {name:?}"),
             Self::ColumnType { name } => write!(f, "decoded column {name:?} has the wrong type"),
@@ -245,7 +279,10 @@ impl Error for CodecError {
             Self::TooManyRows { .. }
             | Self::InvalidRowCount { .. }
             | Self::SectionTooLarge { .. }
+            | Self::PlainPageTooLarge { .. }
+            | Self::DecodedSectionTooLarge { .. }
             | Self::TooManyRowGroups { .. }
+            | Self::InvalidPageLayout
             | Self::MissingColumn { .. }
             | Self::ColumnType { .. }
             | Self::NullInRequiredColumn { .. }
@@ -525,11 +562,209 @@ static WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
 pub const SEALED_ZSTD_LEVEL: i32 = 6;
 
 /// Target data-page size for coalesced sealed sections.
-const SEALED_DATA_PAGE_BYTES: usize = 1024 * 1024;
+pub const SEALED_DATA_PAGE_BYTES: usize = 1024 * 1024;
+
+/// Fixed allowance for one page header and its column-chunk metadata.
+const SEALED_PAGE_FRAMING_BOUND: usize = 4 * 1024;
+
+/// Fixed allowance for the Parquet header, schema, row-group and file footer.
+const SEALED_FILE_FRAMING_BOUND: usize = 64 * 1024;
+
+/// PLAIN value and level bytes for one physical column before Zstandard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedPlainColumnSize {
+    name: &'static str,
+    value_bytes: usize,
+    level_bytes: usize,
+}
+
+impl SealedPlainColumnSize {
+    /// Describe one physical PLAIN column for final-body admission.
+    #[must_use]
+    pub const fn new(name: &'static str, value_bytes: usize, level_bytes: usize) -> Self {
+        Self {
+            name,
+            value_bytes,
+            level_bytes,
+        }
+    }
+}
+
+/// Conservative upper bound for one final PLAIN + Zstd Parquet body.
+///
+/// `value_bytes` is also the quantity Parquet 55 uses to decide whether to
+/// flush a PLAIN data page. Keeping it strictly below the configured page size
+/// guarantees that later NULL/list levels cannot create another page. The
+/// body bound uses Zstandard's documented compression bound plus fixed,
+/// deliberately generous page/metadata allowances for the pinned writer.
+/// The encoded body is checked against the same hard cap again after write.
+///
+/// # Errors
+///
+/// Returns [`CodecError::PlainPageTooLarge`] when one value stream cannot stay
+/// on one page, or [`CodecError::SectionTooLarge`] when the conservative final
+/// body bound crosses [`MAX_SECTION_BYTES`].
+pub fn sealed_plain_body_bound(
+    columns: impl IntoIterator<Item = SealedPlainColumnSize>,
+) -> Result<usize, CodecError> {
+    let mut body = SEALED_FILE_FRAMING_BOUND;
+    for column in columns {
+        if column.value_bytes >= SEALED_DATA_PAGE_BYTES {
+            return Err(CodecError::PlainPageTooLarge {
+                name: column.name,
+                len: column.value_bytes,
+                max: SEALED_DATA_PAGE_BYTES - 1,
+            });
+        }
+        let page = column.value_bytes.checked_add(column.level_bytes).ok_or(
+            CodecError::SectionTooLarge {
+                len: usize::MAX,
+                max: MAX_SECTION_BYTES,
+            },
+        )?;
+        let compressed = zstd_compress_bound(page).ok_or(CodecError::SectionTooLarge {
+            len: usize::MAX,
+            max: MAX_SECTION_BYTES,
+        })?;
+        body = body
+            .checked_add(compressed)
+            .and_then(|bytes| bytes.checked_add(SEALED_PAGE_FRAMING_BOUND))
+            .ok_or(CodecError::SectionTooLarge {
+                len: usize::MAX,
+                max: MAX_SECTION_BYTES,
+            })?;
+    }
+    if body > MAX_SECTION_BYTES {
+        return Err(CodecError::SectionTooLarge {
+            len: body,
+            max: MAX_SECTION_BYTES,
+        });
+    }
+    Ok(body)
+}
+
+/// The `ZSTD_COMPRESSBOUND` formula from the pinned Zstandard 1.5 contract.
+fn zstd_compress_bound(src_size: usize) -> Option<usize> {
+    let small_input_margin = if src_size < 128 * 1024 {
+        ((128 * 1024) - src_size) >> 11
+    } else {
+        0
+    };
+    src_size
+        .checked_add(src_size >> 8)
+        .and_then(|bytes| bytes.checked_add(small_input_margin))
+}
+
+/// Prove the page and final-body bounds for one registered sealed section.
+///
+/// `list_i32_child_values` is the aggregate child count reported by the
+/// generated section codec. Current contracts have at most one list column;
+/// assigning the aggregate to each list is conservative if another is added.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for an unknown type, row/list overflow, a value page
+/// above [`SEALED_DATA_PAGE_BYTES`], or an 8 MiB final-body bound breach.
+pub fn sealed_data_body_bound(
+    type_id: u32,
+    rows: usize,
+    list_i32_child_values: usize,
+) -> Result<usize, CodecError> {
+    check_row_cap(rows)?;
+    let contract = crate::registry()
+        .iter()
+        .find(|contract| contract.type_id.get() == type_id)
+        .ok_or(CodecError::UnknownType { type_id })?;
+    let list_name = contract
+        .columns
+        .iter()
+        .find(|column| column.ty == ColumnType::ListI32)
+        .map_or("ListI32", |column| column.name);
+    if list_i32_child_values > MAX_LIST_I32_VALUES_PER_SECTION {
+        return Err(CodecError::TooManyListValues {
+            name: list_name,
+            values: list_i32_child_values,
+            max: MAX_LIST_I32_VALUES_PER_SECTION,
+        });
+    }
+    if list_i32_child_values != 0
+        && !contract
+            .columns
+            .iter()
+            .any(|column| column.ty == ColumnType::ListI32)
+    {
+        return Err(CodecError::SchemaMismatch);
+    }
+
+    let mut columns = Vec::with_capacity(contract.columns.len());
+    for column in contract.columns {
+        let (value_bytes, level_bytes) = if column.ty == ColumnType::ListI32 {
+            let values =
+                list_i32_child_values
+                    .checked_mul(4)
+                    .ok_or(CodecError::PlainPageTooLarge {
+                        name: column.name,
+                        len: usize::MAX,
+                        max: SEALED_DATA_PAGE_BYTES - 1,
+                    })?;
+            let levels = rows
+                .checked_add(list_i32_child_values)
+                .and_then(|count| count.checked_mul(4))
+                .and_then(|bytes| bytes.checked_add(16))
+                .ok_or(CodecError::SectionTooLarge {
+                    len: usize::MAX,
+                    max: MAX_SECTION_BYTES,
+                })?;
+            (values, levels)
+        } else {
+            let width = match column.ty {
+                ColumnType::I8
+                | ColumnType::I16
+                | ColumnType::I32
+                | ColumnType::U8
+                | ColumnType::U16
+                | ColumnType::U32
+                | ColumnType::F32 => 4,
+                ColumnType::I64
+                | ColumnType::U64
+                | ColumnType::F64
+                | ColumnType::Ts
+                | ColumnType::StrId => 8,
+                ColumnType::Bool => 1,
+                ColumnType::ListI32 => unreachable!("handled above"),
+            };
+            let values = rows
+                .checked_mul(width)
+                .ok_or(CodecError::PlainPageTooLarge {
+                    name: column.name,
+                    len: usize::MAX,
+                    max: SEALED_DATA_PAGE_BYTES - 1,
+                })?;
+            let levels = if column.nullable {
+                rows.checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(8))
+                    .ok_or(CodecError::SectionTooLarge {
+                        len: usize::MAX,
+                        max: MAX_SECTION_BYTES,
+                    })?
+            } else {
+                0
+            };
+            (values, levels)
+        };
+        columns.push(SealedPlainColumnSize::new(
+            column.name,
+            value_bytes,
+            level_bytes,
+        ));
+    }
+    sealed_plain_body_bound(columns)
+}
 
 /// Parquet properties for the single final body of each populated type.
 static SEALED_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
     WriterProperties::builder()
+        .set_writer_version(WriterVersion::PARQUET_1_0)
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(SEALED_ZSTD_LEVEL).expect("zstd level 6 is valid"),
         ))
@@ -611,7 +846,7 @@ fn sort_by_sort_key(
 /// section byte cap.
 pub fn encode_sealed_batches(
     type_id: u32,
-    batches: &[RecordBatch],
+    mut batches: Vec<RecordBatch>,
 ) -> Result<Vec<u8>, CodecError> {
     let contract = crate::registry()
         .iter()
@@ -627,7 +862,7 @@ pub fn encode_sealed_batches(
         .collect::<Vec<_>>();
     let mut list_values = vec![0_usize; list_columns.len()];
 
-    for batch in batches {
+    for batch in &batches {
         if !schema_matches(batch.schema().as_ref(), contract) {
             return Err(CodecError::SchemaMismatch);
         }
@@ -640,13 +875,14 @@ pub fn encode_sealed_batches(
         check_row_cap(rows)?;
         for (index, &name) in list_columns.iter().enumerate() {
             let values = validate_list_i32_batch(batch, name)?;
-            list_values[index] = list_values[index].checked_add(values).ok_or(
-                CodecError::TooManyListValues {
-                    name,
-                    values: usize::MAX,
-                    max: MAX_LIST_I32_VALUES_PER_SECTION,
-                },
-            )?;
+            list_values[index] =
+                list_values[index]
+                    .checked_add(values)
+                    .ok_or(CodecError::TooManyListValues {
+                        name,
+                        values: usize::MAX,
+                        max: MAX_LIST_I32_VALUES_PER_SECTION,
+                    })?;
             if list_values[index] > MAX_LIST_I32_VALUES_PER_SECTION {
                 return Err(CodecError::TooManyListValues {
                     name,
@@ -656,13 +892,27 @@ pub fn encode_sealed_batches(
             }
         }
     }
+    let total_list_values = list_values.iter().try_fold(0_usize, |total, &values| {
+        total
+            .checked_add(values)
+            .ok_or(CodecError::TooManyListValues {
+                name: list_columns.first().copied().unwrap_or("ListI32"),
+                values: usize::MAX,
+                max: MAX_LIST_I32_VALUES_PER_SECTION,
+            })
+    })?;
+    sealed_data_body_bound(type_id, rows, total_list_values)?;
 
     let merged = if batches.is_empty() {
         RecordBatch::new_empty(Arc::clone(&schema))
+    } else if batches.len() == 1 {
+        batches.pop().ok_or(CodecError::SchemaMismatch)?
     } else {
-        concat_batches(&schema, batches)?
+        let merged = concat_batches(&schema, &batches)?;
+        drop(batches);
+        merged
     };
-    let canonical = sort_canonical(&merged, contract)?;
+    let canonical = sort_canonical(merged, contract)?;
     let options = ArrowWriterOptions::new()
         .with_properties(SEALED_WRITER_PROPS.clone())
         .with_skip_arrow_metadata(true);
@@ -680,12 +930,9 @@ pub fn encode_sealed_batches(
 }
 
 /// Apply a deterministic total column order after the registry sort key.
-fn sort_canonical(
-    batch: &RecordBatch,
-    contract: &TypeContract,
-) -> Result<RecordBatch, CodecError> {
+fn sort_canonical(batch: RecordBatch, contract: &TypeContract) -> Result<RecordBatch, CodecError> {
     if contract.columns.is_empty() || batch.num_rows() <= 1 {
-        return Ok(batch.clone());
+        return Ok(batch);
     }
     let mut names = contract.sort_key.to_vec();
     names.extend(
@@ -706,6 +953,14 @@ fn sort_canonical(
         });
     }
     let indices = lexsort_to_indices(&sort_columns, None)?;
+    if indices
+        .values()
+        .iter()
+        .enumerate()
+        .all(|(expected, &actual)| actual as usize == expected)
+    {
+        return Ok(batch);
+    }
     let columns = batch
         .columns()
         .iter()
@@ -788,6 +1043,127 @@ mod verified_section_tests {
 }
 
 #[cfg(test)]
+mod sealed_profile_tests {
+    use bytes::Bytes;
+    use parquet::basic::{Compression, Encoding};
+    use parquet::column::page::Page;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    use super::{SEALED_ZSTD_LEVEL, VerifiedSection, encode_sealed_batches};
+    use crate::bgwriter_checkpointer::BgwriterCheckpointer;
+    use crate::{Section, Ts, decode_any};
+
+    fn row(write_time: f64) -> BgwriterCheckpointer {
+        BgwriterCheckpointer {
+            ts: Ts(42),
+            checkpoints_timed: 10,
+            checkpoints_req: 2,
+            checkpoint_write_time: write_time,
+            checkpoint_sync_time: 2.0,
+            buffers_checkpoint: 4_096,
+            restartpoints_timed: None,
+            restartpoints_req: None,
+            restartpoints_done: None,
+            buffers_clean: 512,
+            maxwritten_clean: 3,
+            buffers_backend: Some(128),
+            buffers_backend_fsync: Some(0),
+            buffers_alloc: 9_000,
+            bgwriter_stats_reset: Ts(1),
+            checkpointer_stats_reset: None,
+        }
+    }
+
+    fn decoded_batches(rows: &[BgwriterCheckpointer]) -> Vec<arrow_array::RecordBatch> {
+        let body = BgwriterCheckpointer::encode(rows).expect("encode input section");
+        decode_any(
+            BgwriterCheckpointer::CONTRACT.type_id.get(),
+            VerifiedSection::for_test(Bytes::from(body)),
+        )
+        .expect("decode input section")
+        .batches
+    }
+
+    #[test]
+    fn sealed_encoding_is_physical_and_boundary_deterministic() {
+        let rows = [
+            row(f64::from_bits(0x7ff8_0000_0000_0002)),
+            row(-0.0),
+            row(0.0),
+            row(f64::from_bits(0x7ff8_0000_0000_0001)),
+            row(-0.0),
+        ];
+        let one_batch = decoded_batches(&rows);
+        let many_reversed = rows
+            .iter()
+            .rev()
+            .flat_map(|row| decoded_batches(std::slice::from_ref(row)))
+            .collect::<Vec<_>>();
+        let type_id = BgwriterCheckpointer::CONTRACT.type_id.get();
+        let one = encode_sealed_batches(type_id, one_batch).expect("seal one batch");
+        let many =
+            encode_sealed_batches(type_id, many_reversed).expect("seal reversed one-row batches");
+        assert_eq!(one, many, "partition and input order must not affect bytes");
+
+        let decoded = decode_any(type_id, VerifiedSection::for_test(Bytes::from(one.clone())))
+            .expect("decode sealed section");
+        assert_eq!(
+            decoded.stats.rows,
+            rows.len(),
+            "duplicate rows are retained"
+        );
+        let typed =
+            BgwriterCheckpointer::decode(VerifiedSection::for_test(Bytes::from(one.clone())))
+                .expect("decode typed sealed rows");
+        assert_eq!(
+            typed
+                .iter()
+                .map(|row| row.checkpoint_write_time.to_bits())
+                .collect::<Vec<_>>(),
+            vec![
+                (-0.0_f64).to_bits(),
+                (-0.0_f64).to_bits(),
+                0.0_f64.to_bits(),
+                0x7ff8_0000_0000_0001,
+                0x7ff8_0000_0000_0002,
+            ],
+            "canonical ordering preserves NaN payloads, signed zero, and duplicates"
+        );
+        assert_eq!(SEALED_ZSTD_LEVEL, 6);
+
+        let reader = SerializedFileReader::new(Bytes::from(one)).expect("open Parquet metadata");
+        let metadata = reader.metadata();
+        assert_eq!(metadata.file_metadata().version(), 1);
+        assert_eq!(metadata.file_metadata().created_by(), Some(""));
+        assert_eq!(metadata.num_row_groups(), 1);
+        let row_group = metadata.row_group(0);
+        for column in row_group.columns() {
+            assert!(matches!(column.compression(), Compression::ZSTD(_)));
+            assert!(column.statistics().is_none());
+            assert!(column.dictionary_page_offset().is_none());
+            assert!(
+                column
+                    .encodings()
+                    .iter()
+                    .all(|encoding| matches!(encoding, Encoding::PLAIN | Encoding::RLE)),
+                "sealed columns use only PLAIN data and RLE levels"
+            );
+        }
+        let group = reader.get_row_group(0).expect("row group");
+        for column in 0..group.metadata().num_columns() {
+            let mut pages = group.get_column_page_reader(column).expect("page reader");
+            let mut data_pages = 0;
+            while let Some(page) = pages.get_next_page().expect("read page") {
+                if matches!(page, Page::DataPage { .. } | Page::DataPageV2 { .. }) {
+                    data_pages += 1;
+                }
+            }
+            assert_eq!(data_pages, 1, "one data page per column chunk");
+        }
+    }
+}
+
+#[cfg(test)]
 mod codec_error_tests {
     use super::CodecError;
 
@@ -845,6 +1221,8 @@ pub struct DecodeStats {
     pub batches: usize,
     /// Rows decoded.
     pub rows: usize,
+    /// Child values decoded across every `ListI32` column.
+    pub list_i32_child_values: usize,
 }
 
 /// A decoded section: its Arrow batches and the [`DecodeStats`] for the call.
@@ -873,7 +1251,9 @@ fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize
             max: MAX_SECTION_BYTES,
         });
     }
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+    crate::validate_parquet_decode_work(bytes.as_ref(), MAX_DECODED_SECTION_BYTES)?;
+    let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, options)?;
 
     let groups = builder.metadata().num_row_groups();
     if groups > MAX_ROW_GROUPS {
@@ -1003,12 +1383,24 @@ pub(crate) fn decode_batches(
         }
         batches.push(batch);
     }
+    let list_i32_child_values = list_child_values
+        .iter()
+        .try_fold(0_usize, |total, &values| {
+            total
+                .checked_add(values)
+                .ok_or(CodecError::TooManyListValues {
+                    name: list_columns.first().copied().unwrap_or("ListI32"),
+                    values: usize::MAX,
+                    max: MAX_LIST_I32_VALUES_PER_SECTION,
+                })
+        })?;
     let stats = DecodeStats {
         type_id: contract.type_id.get(),
         bytes_in,
         row_groups,
         batches: batches.len(),
         rows,
+        list_i32_child_values,
     };
     Ok(DecodedSection { batches, stats })
 }

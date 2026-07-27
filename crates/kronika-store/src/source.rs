@@ -79,6 +79,8 @@ pub enum StoreError {
     BadCatalogLen,
     /// The catalog bytes failed to decode.
     Catalog(kronika_format::DecodeError),
+    /// The catalog does not describe the canonical physical section layout.
+    Layout(kronika_format::CatalogLayoutError),
     /// A catalog entry points outside the section area.
     OutOfBounds,
 }
@@ -100,6 +102,7 @@ impl std::fmt::Display for StoreError {
             }
             Self::BadCatalogLen => write!(f, "catalog_len does not fit in the source"),
             Self::Catalog(err) => write!(f, "catalog decode failed: {err}"),
+            Self::Layout(err) => write!(f, "invalid section layout: {err}"),
             Self::OutOfBounds => write!(f, "a catalog entry points outside the section area"),
         }
     }
@@ -110,6 +113,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Io(err) => Some(err),
             Self::Catalog(err) => Some(err),
+            Self::Layout(err) => Some(err),
             Self::ActivePartTooLarge { .. }
             | Self::TooSmall
             | Self::BadMagic

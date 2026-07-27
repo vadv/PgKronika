@@ -59,6 +59,9 @@ impl Default for JournalConfig {
 pub enum JournalError {
     /// The underlying file operation failed.
     Io(std::io::Error),
+    /// Truncation was applied and in-memory state is empty, but syncing the
+    /// reset file failed.
+    ResetSync(std::io::Error),
     /// The part is larger than the configured frame limit.
     PartTooLarge {
         /// Length of the rejected part, bytes.
@@ -96,6 +99,7 @@ impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "journal io: {err}"),
+            Self::ResetSync(err) => write!(f, "journal reset sync: {err}"),
             Self::PartTooLarge { len, max } => {
                 write!(f, "part of {len} bytes exceeds the frame limit of {max}")
             }
@@ -119,7 +123,7 @@ impl fmt::Display for JournalError {
 impl Error for JournalError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io(err) => Some(err),
+            Self::Io(err) | Self::ResetSync(err) => Some(err),
             Self::InvalidPart(err) => Some(err),
             Self::PartTooLarge { .. } | Self::Full { .. } | Self::StalePartRef { .. } => None,
         }
@@ -253,6 +257,11 @@ impl Journal {
                 max: self.config.limits.max_part_len,
             });
         }
+        // Validate before flow control. A full journal must not cause the
+        // caller to publish/reset valid accumulated data for an invalid
+        // incoming part.
+        validate_part(part).map_err(JournalError::InvalidPart)?;
+
         // The cap decides when the writer must merge; the first frame is
         // always allowed so that a tiny cap cannot wedge an empty journal.
         let frame_len = FRAME_HEADER_LEN + part.len();
@@ -262,11 +271,6 @@ impl Journal {
                 max: self.config.max_journal_len,
             });
         }
-        // An invalid body would be framed and synced, but the next recovery
-        // scan would report the frame as damage and skip it. Treat that as a
-        // writer bug and fail before writing.
-        validate_part(part).map_err(JournalError::InvalidPart)?;
-
         let header = FrameHeader { part_len }.encode();
         if let Err(err) = self.write_frame(&header, part) {
             // Roll the file back so a half-written frame from a transient
@@ -310,32 +314,73 @@ impl Journal {
     /// point inside the current journal (e.g. it was kept across a
     /// [`Journal::reset`]). Returns [`JournalError::Io`] if the read fails.
     pub fn read_part(&self, part: PartRef) -> Result<Vec<u8>, JournalError> {
+        self.check_part_ref(part)?;
+        let mut body = vec![0_u8; part.len];
+        self.file.read_exact_at(&mut body, part.offset as u64)?;
+        Ok(body)
+    }
+
+    /// Read a bounded byte range relative to one part body.
+    ///
+    /// Sealing uses this after catalog validation so each Parquet body is read
+    /// once without allocating the rest of its journal part again.
+    pub(crate) fn read_part_range(
+        &self,
+        part: PartRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, JournalError> {
+        self.check_part_ref(part)?;
+        let Some(relative_end) = offset.checked_add(len) else {
+            return Err(JournalError::StalePartRef { offset, len });
+        };
+        if relative_end > part.len {
+            return Err(JournalError::StalePartRef { offset, len });
+        }
+        let absolute = part
+            .offset
+            .checked_add(offset)
+            .ok_or(JournalError::StalePartRef { offset, len })?;
+        let mut body = vec![0_u8; len];
+        self.file.read_exact_at(&mut body, absolute as u64)?;
+        Ok(body)
+    }
+
+    fn check_part_ref(&self, part: PartRef) -> Result<(), JournalError> {
         let in_bounds = part.offset >= FRAME_HEADER_LEN
             && part
                 .offset
                 .checked_add(part.len)
                 .is_some_and(|end| end <= self.end);
-        if !in_bounds {
-            return Err(JournalError::StalePartRef {
+        if in_bounds {
+            Ok(())
+        } else {
+            Err(JournalError::StalePartRef {
                 offset: part.offset,
                 len: part.len,
-            });
+            })
         }
-        let mut body = vec![0_u8; part.len];
-        self.file.read_exact_at(&mut body, part.offset as u64)?;
-        Ok(body)
     }
 
     /// Empty the journal after a segment has been completed successfully.
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::Io`] if truncation or sync fails.
+    /// Returns [`JournalError::Io`] if truncation fails. Returns
+    /// [`JournalError::ResetSync`] if truncation was applied but its durability
+    /// sync failed; in that case this journal is already logically empty.
     pub fn reset(&mut self) -> Result<(), JournalError> {
+        self.reset_with_sync(File::sync_data)
+    }
+
+    fn reset_with_sync(
+        &mut self,
+        sync: impl FnOnce(&File) -> Result<(), std::io::Error>,
+    ) -> Result<(), JournalError> {
         self.file.set_len(0)?;
-        self.file.sync_data()?;
         self.end = 0;
         self.parts.clear();
+        sync(&self.file).map_err(JournalError::ResetSync)?;
         Ok(())
     }
 
@@ -531,6 +576,16 @@ mod tests {
         let second = journal.append(&part).expect("append");
         assert_eq!(journal.parts(), &[first, second]);
         assert_eq!(journal.read_part(first).expect("read"), part);
+        assert_eq!(
+            journal
+                .read_part_range(first, MAGIC.len(), 4)
+                .expect("read range"),
+            b"data"
+        );
+        assert!(matches!(
+            journal.read_part_range(first, part.len() - 1, 2),
+            Err(JournalError::StalePartRef { .. })
+        ));
 
         // Reopen: the recovery scan finds both parts, clean.
         drop(journal);
@@ -714,5 +769,34 @@ mod tests {
         // A fresh ref works again after new appends.
         let fresh = journal.append(&part).expect("append");
         assert_eq!(journal.read_part(fresh).expect("read"), part);
+    }
+
+    #[test]
+    fn reset_sync_failure_keeps_file_and_memory_logically_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_journal_path(&dir);
+        let part = sample_part();
+        let (mut journal, _) = Journal::open(&path, small_config()).expect("open");
+        let stale = journal.append(&part).expect("append");
+
+        let err = journal
+            .reset_with_sync(|_file| Err(std::io::Error::other("injected sync failure")))
+            .expect_err("sync failure is reported");
+        assert!(matches!(err, JournalError::ResetSync(_)));
+        assert!(journal.is_empty());
+        assert!(journal.parts().is_empty());
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
+        assert!(matches!(
+            journal.read_part(stale),
+            Err(JournalError::StalePartRef { .. })
+        ));
+
+        let fresh = journal.append(&part).expect("append after logical reset");
+        assert_eq!(fresh.offset, FRAME_HEADER_LEN);
+        assert_eq!(journal.read_part(fresh).expect("read fresh"), part);
+        drop(journal);
+        let (reopened, report) = Journal::open(&path, small_config()).expect("reopen");
+        assert!(report.is_clean());
+        assert_eq!(reopened.parts().len(), 1);
     }
 }

@@ -526,6 +526,7 @@ async fn snapshot_and_seal(
         main_src.ts.0,
         due.forced(),
         &flushed,
+        &interner,
     )
     .context("append the collection window")?;
     commit_log_collection(log_collector, log_collection.as_ref());

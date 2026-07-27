@@ -106,6 +106,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let encode = build_encode(&columns);
     let decode = build_decode(struct_name, &columns);
     let ts_range = build_ts_range(&columns);
+    let list_i32_child_value_count = build_list_i32_child_value_count(&columns);
 
     Ok(quote! {
         impl ::kronika_registry::sealed::Sealed for #struct_name {}
@@ -131,6 +132,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
 
             #ts_range
+
+            #list_i32_child_value_count
         }
     })
 }
@@ -573,6 +576,38 @@ fn build_ts_range(columns: &[ColumnDef]) -> TokenStream2 {
                 }
             },
         )
+}
+
+/// Generate conservative accounting for child values in every `ListI32`
+/// column. Saturation makes an unrepresentable total fail closed in admission
+/// code instead of wrapping to an underestimated value.
+fn build_list_i32_child_value_count(columns: &[ColumnDef]) -> TokenStream2 {
+    let fields: Vec<&Ident> = columns
+        .iter()
+        .filter(|column| column.column_type == "ListI32")
+        .map(|column| &column.field)
+        .collect();
+    if fields.is_empty() {
+        return quote! {
+            fn list_i32_child_value_count(_rows: &[Self]) -> usize {
+                0
+            }
+        };
+    }
+
+    let additions = fields.iter().map(|field| {
+        quote! {
+            count = count.saturating_add(row.#field.len());
+        }
+    });
+    quote! {
+        fn list_i32_child_value_count(rows: &[Self]) -> usize {
+            rows.iter().fold(0usize, |mut count, row| {
+                #( #additions )*
+                count
+            })
+        }
+    }
 }
 
 fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {

@@ -692,11 +692,13 @@ mod tests {
                     type_id: 1_006_001,
                     rows: 2,
                     body_bytes: 10,
+                    list_i32_child_value_count: 0,
                 },
                 SectionFlushSummary {
                     type_id: 1_021_001,
                     rows: 5,
                     body_bytes: 20,
+                    list_i32_child_value_count: 0,
                 },
             ],
             part_bytes: 30,

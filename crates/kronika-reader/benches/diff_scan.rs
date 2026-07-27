@@ -138,14 +138,14 @@ fn build_two_section_fixture(dir: &Path) {
     let part = build_part(
         &[
             SectionInput {
-                type_id: 1_008_001,
-                rows,
-                body: &archiver_body,
-            },
-            SectionInput {
                 type_id: 1_006_001,
                 rows,
                 body: &bgwriter_body,
+            },
+            SectionInput {
+                type_id: 1_008_001,
+                rows,
+                body: &archiver_body,
             },
         ],
         PartMeta {

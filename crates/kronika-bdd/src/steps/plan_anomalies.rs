@@ -230,24 +230,11 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
     let reset_body = ResetMetadata::encode(&resets).context("encode plan reset metadata")?;
     let instance_body =
         InstanceMetadata::encode(&[instance]).context("encode plan instance metadata")?;
-    let mut sections: Vec<SectionInput<'_>> = dictionary
-        .iter()
-        .map(|section| SectionInput {
-            type_id: section.type_id,
-            rows: section.rows,
-            body: &section.body,
-        })
-        .collect();
-    sections.extend([
+    let mut sections = vec![
         SectionInput {
             type_id: 1_003_001,
             rows: u32::try_from(plans.len())?,
             body: &plans_body,
-        },
-        SectionInput {
-            type_id: 1_038_001,
-            rows: u32::try_from(coverage.len())?,
-            body: &coverage_body,
         },
         SectionInput {
             type_id: 1_020_001,
@@ -259,7 +246,17 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
             rows: 1,
             body: &instance_body,
         },
-    ]);
+        SectionInput {
+            type_id: 1_038_001,
+            rows: u32::try_from(coverage.len())?,
+            body: &coverage_body,
+        },
+    ];
+    sections.extend(dictionary.iter().map(|section| SectionInput {
+        type_id: section.type_id,
+        rows: section.rows,
+        body: &section.body,
+    }));
     Ok(build_part(
         &sections,
         PartMeta {

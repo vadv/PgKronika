@@ -74,11 +74,11 @@ fn snapshot_arc_swap_round_trips_and_clone_stays_queryable() {
     // it through ArcSwap, then clone the loaded pointer and run a `&mut`
     // query against the clone.
     let dir = tempfile::tempdir().expect("tempdir");
-    let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+    let body = BgwriterCheckpointer::encode(&[bgwriter_row(1_000)]).expect("encode section");
     let bytes = build_part(
         &[SectionInput {
             type_id: 1_006_001,
-            rows: 0,
+            rows: 1,
             body: &body,
         }],
         PartMeta {

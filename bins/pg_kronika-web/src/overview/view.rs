@@ -1671,6 +1671,7 @@ const fn live_state_tag(state: LiveState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::bgwriter_row;
     use kronika_analytics::overview::{CountLimits, OracleSourceError};
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_reader::{
@@ -1699,11 +1700,11 @@ mod tests {
     }
 
     fn sealed_bytes_for_source(min_ts: i64, max_ts: i64, source_id: u64) -> Vec<u8> {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+        let body = BgwriterCheckpointer::encode(&[bgwriter_row(min_ts)]).expect("encode section");
         build_part(
             &[SectionInput {
                 type_id: 1_006_001,
-                rows: 0,
+                rows: 1,
                 body: &body,
             }],
             PartMeta {

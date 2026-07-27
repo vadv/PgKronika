@@ -49,8 +49,16 @@ pub(crate) async fn run_log_only_cycle(
         return Ok(Vec::new());
     }
     let flushed = encode_window(buffers, &interner, config)?;
-    let sealed = append_window_and_maybe_seal(journal, config, segment, ts, due.forced(), &flushed)
-        .context("append the log-only collection window")?;
+    let sealed = append_window_and_maybe_seal(
+        journal,
+        config,
+        segment,
+        ts,
+        due.forced(),
+        &flushed,
+        &interner,
+    )
+    .context("append the log-only collection window")?;
     commit_log_collection(log_collector, Some(&collection));
     Ok(sealed)
 }

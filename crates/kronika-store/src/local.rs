@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use kronika_format::{
     Catalog, DEFAULT_MAX_PART_LEN, DEFAULT_RESYNC_CHUNK, DamageRegion, FORMAT_VERSION,
     FRAME_HEADER_LEN, JournalLimits, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex,
-    scan_journal_streaming_from, validate_part_catalog,
+    scan_journal_streaming_from, validate_catalog_layout, validate_part_catalog,
 };
 
 use crate::source::{ActivePart, LocalScan, SealedUnit, StoreError, StoreWarning};
@@ -382,16 +382,7 @@ pub fn read_catalog<R: ReadAt>(reader: &R) -> Result<Catalog, StoreError> {
         });
     }
 
-    for entry in &catalog.entries {
-        let in_bounds = entry.offset >= MAGIC.len() as u64
-            && entry
-                .offset
-                .checked_add(entry.len)
-                .is_some_and(|end| end <= catalog_at);
-        if !in_bounds {
-            return Err(StoreError::OutOfBounds);
-        }
-    }
+    validate_catalog_layout(&catalog, catalog_at).map_err(StoreError::Layout)?;
 
     Ok(catalog)
 }
@@ -405,11 +396,7 @@ mod tests {
 
     fn part(ts: i64, src: u64) -> Vec<u8> {
         build_part(
-            &[SectionInput {
-                type_id: 1_006_001,
-                rows: 0,
-                body: b"",
-            }],
+            &[],
             PartMeta {
                 min_ts: ts,
                 max_ts: ts + 1,
@@ -620,9 +607,37 @@ mod tests {
         // Recompute catalog CRC so Catalog::decode succeeds.
         repatch_catalog_crc(&mut buf);
         assert!(
-            matches!(read_catalog(&buf.as_slice()), Err(StoreError::OutOfBounds)),
-            "entry pointing into catalog block must return OutOfBounds"
+            matches!(read_catalog(&buf.as_slice()), Err(StoreError::Layout(_))),
+            "entry pointing into catalog block must fail physical layout validation"
         );
+    }
+
+    #[test]
+    fn read_catalog_rejects_noncanonical_section_order() {
+        let buf = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_021_001,
+                    rows: 1,
+                    body: b"first",
+                },
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 1,
+                    body: b"second",
+                },
+            ],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 0,
+            },
+        );
+
+        assert!(matches!(
+            read_catalog(&buf.as_slice()),
+            Err(StoreError::Layout(_))
+        ));
     }
 
     #[test]

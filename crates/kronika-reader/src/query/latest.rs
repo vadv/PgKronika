@@ -419,15 +419,6 @@ fn latest_status_for_source(
                 ))
             })?;
             let rows = unit.decode_rows(entry).map_err(attempt_read_error)?;
-            let decoded = u64::try_from(rows.len())
-                .map_err(|_overflow| attempt_read_error(ReadError::CounterOverflow))?;
-            if decoded != u64::from(entry.rows) {
-                return Err(attempt_read_error(ReadError::CatalogRowCountMismatch {
-                    type_id: entry.type_id,
-                    declared: entry.rows,
-                    decoded,
-                }));
-            }
             for row in rows {
                 let Some(Cell::Ts(ts)) = row.get("ts") else {
                     continue;

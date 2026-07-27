@@ -150,30 +150,20 @@ async fn sections_catalog_describes_archiver_from_the_registry() {
 }
 
 #[tokio::test]
-async fn segments_sum_rows_per_name_and_skip_dictionaries() {
+async fn segments_report_rows_for_canonical_sections() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let archiver_a = PgStatArchiver::encode(&[archiver_row(1_000, 1), archiver_row(1_100, 2)])
-        .expect("encode archiver");
-    let archiver_b = PgStatArchiver::encode(&[archiver_row(1_200, 3)]).expect("encode archiver");
-    let bgwriter = BgwriterCheckpointer::encode(&[]).expect("encode bgwriter");
+    let archiver = PgStatArchiver::encode(&[
+        archiver_row(1_000, 1),
+        archiver_row(1_100, 2),
+        archiver_row(1_200, 3),
+    ])
+    .expect("encode archiver");
     let bytes = build_part(
-        &[
-            SectionInput {
-                type_id: 1_008_001,
-                rows: 2,
-                body: &archiver_a,
-            },
-            SectionInput {
-                type_id: 1_008_001,
-                rows: 1,
-                body: &archiver_b,
-            },
-            SectionInput {
-                type_id: 1_006_001,
-                rows: 0,
-                body: &bgwriter,
-            },
-        ],
+        &[SectionInput {
+            type_id: 1_008_001,
+            rows: 3,
+            body: &archiver,
+        }],
         PartMeta {
             min_ts: 1_000,
             max_ts: 2_000,
@@ -188,12 +178,9 @@ async fn segments_sum_rows_per_name_and_skip_dictionaries() {
         body,
         serde_json::json!({ "segments": [
             { "segment_id": "1000", "source_id": 7, "min_ts": 1_000, "max_ts": 2_000,
-              "sections": [
-                { "name": "pg_stat_archiver", "rows": 3 },
-                { "name": "pg_stat_bgwriter + pg_stat_checkpointer", "rows": 0 }
-              ] }
+              "sections": [{ "name": "pg_stat_archiver", "rows": 3 }] }
         ] }),
-        "repeated type_ids of one name sum their rows; sections order by name"
+        "canonical section rows are reported exactly"
     );
 }
 #[tokio::test]
@@ -330,14 +317,14 @@ fn write_two_section_spike_segment(dir: &std::path::Path) -> i64 {
     let bytes = build_part(
         &[
             SectionInput {
-                type_id: 1_008_001,
-                rows: 40,
-                body: &archiver_body,
-            },
-            SectionInput {
                 type_id: 1_005_001,
                 rows: 40,
                 body: &database_body,
+            },
+            SectionInput {
+                type_id: 1_008_001,
+                rows: 40,
+                body: &archiver_body,
             },
         ],
         PartMeta {
@@ -485,7 +472,6 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
 
     let set_addition = matches!(fixture, OsscPlanFixture::PlanSetAddition);
     let eviction = matches!(fixture, OsscPlanFixture::EvictionAndReentry);
-    let query_id_disabled = matches!(fixture, OsscPlanFixture::ComputeQueryIdDisabled);
     let mut calls = if set_addition {
         [100_i64, 0]
     } else {
@@ -542,7 +528,7 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
                 shared_reads[1] += call_deltas[1];
             }
         }
-        let empty_snapshot = query_id_disabled || (eviction && minute == 40);
+        let empty_snapshot = eviction && minute == 40;
         if !empty_snapshot {
             plan_rows.push(ossc_plan_row(
                 ts,
@@ -616,24 +602,11 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
     let coverage = SnapshotCoverageV1::encode(&coverage_rows).expect("encode plan coverage");
     let resets = ResetMetadata::encode(&reset_rows).expect("encode plan reset metadata");
     let metadata = InstanceMetadata::encode(&[metadata]).expect("encode plan instance metadata");
-    let mut sections: Vec<SectionInput<'_>> = dictionary
-        .iter()
-        .map(|section| SectionInput {
-            type_id: section.type_id,
-            rows: section.rows,
-            body: &section.body,
-        })
-        .collect();
-    sections.extend([
+    let mut sections = vec![
         SectionInput {
             type_id: 1_003_001,
             rows: u32::try_from(plan_rows.len()).expect("plan row count"),
             body: &plans,
-        },
-        SectionInput {
-            type_id: 1_038_001,
-            rows: u32::try_from(coverage_rows.len()).expect("coverage row count"),
-            body: &coverage,
         },
         SectionInput {
             type_id: 1_020_001,
@@ -645,7 +618,17 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
             rows: 1,
             body: &metadata,
         },
-    ]);
+        SectionInput {
+            type_id: 1_038_001,
+            rows: u32::try_from(coverage_rows.len()).expect("coverage row count"),
+            body: &coverage,
+        },
+    ];
+    sections.extend(dictionary.iter().map(|section| SectionInput {
+        type_id: section.type_id,
+        rows: section.rows,
+        body: &section.body,
+    }));
     let to = (SNAPSHOTS - 1) * PLAN_MINUTE_US;
     let bytes = build_part(
         &sections,
@@ -790,24 +773,11 @@ fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
     let coverage = SnapshotCoverageV1::encode(&coverage_rows).expect("encode plan coverage");
     let resets_body = ResetMetadata::encode(&resets).expect("encode plan reset metadata");
     let metadata = InstanceMetadata::encode(&[metadata]).expect("encode plan instance metadata");
-    let mut sections: Vec<SectionInput<'_>> = dictionary
-        .iter()
-        .map(|section| SectionInput {
-            type_id: section.type_id,
-            rows: section.rows,
-            body: &section.body,
-        })
-        .collect();
-    sections.extend([
+    let mut sections = vec![
         SectionInput {
             type_id: 1_004_001,
             rows: u32::try_from(plan_rows.len()).expect("plan row count"),
             body: &plans,
-        },
-        SectionInput {
-            type_id: 1_038_001,
-            rows: u32::try_from(coverage_rows.len()).expect("coverage row count"),
-            body: &coverage,
         },
         SectionInput {
             type_id: 1_020_001,
@@ -819,7 +789,17 @@ fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
             rows: 1,
             body: &metadata,
         },
-    ]);
+        SectionInput {
+            type_id: 1_038_001,
+            rows: u32::try_from(coverage_rows.len()).expect("coverage row count"),
+            body: &coverage,
+        },
+    ];
+    sections.extend(dictionary.iter().map(|section| SectionInput {
+        type_id: section.type_id,
+        rows: section.rows,
+        body: &section.body,
+    }));
     let to = (SNAPSHOTS - 1) * PLAN_MINUTE_US;
     let bytes = build_part(
         &sections,

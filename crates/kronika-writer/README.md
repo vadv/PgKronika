@@ -48,15 +48,29 @@ was successfully published.
 
 ## Sealing
 
-`seal(journal, destination)` streams each part, copies section bodies into a
-sibling temporary file, writes the combined end catalog, synchronizes the file,
-and publishes it with a hard link. An existing destination is never
-overwritten. The temporary file is cleaned up on return.
+`seal(journal, destination)` validates every recorded part and reads each body
+through its checked catalog range. For each registered data `type_id`, it
+decodes all journal bodies, combines their rows, applies the registry sort key
+plus every remaining column as a deterministic total order, and emits one
+canonical Parquet body. Dictionary bodies are decoded and normalized into at
+most one `dict.strings` and one `dict.blobs` body. Exact repeated dictionary
+records are deduplicated; conflicting values, metadata, or placement fail the
+seal.
 
-The writer preserves repeated section entries in catalog order. It does not
-compact or re-encode them into one section. It also does not reset the journal,
-select a filename, or implement retention; those lifecycle decisions belong to
-the collector.
+Final bodies use Parquet 1.0, PLAIN values, RLE levels, and Zstd level 6, with
+dictionary encoding, statistics, and offset indexes disabled. Collector
+admission checks aggregate rows, `List<i32>` child values, dictionary rows and
+stored bytes, a one-page PLAIN value budget per physical column, and the 8 MiB
+encoded-body cap before append. Seal checks the same limits again while
+decoding and encoding.
+
+Publication uses an invocation-owned sibling temporary file, synchronization,
+and a no-replace hard link. If `destination` already has exactly the bytes that
+the journal produces, the retry succeeds without changing it. A different
+existing file returns `SealError::AlreadyExists`; the destination and journal
+remain untouched. The caller resets the journal only after `Ok`. The writer
+does not select a filename or implement retention; those lifecycle decisions
+belong to the collector.
 
 Failures distinguish journal I/O/framing/full conditions from seal validation,
 destination, and synchronization errors. See [`src/lib.rs`](src/lib.rs) for

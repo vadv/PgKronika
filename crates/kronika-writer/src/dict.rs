@@ -11,11 +11,12 @@ use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{EntrySnapshot, Placement, SegmentDicts};
 use kronika_registry::{
     CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
+    SEALED_DATA_PAGE_BYTES, SealedPlainColumnSize, sealed_plain_body_bound,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 
 /// Parquet writer properties shared by dictionary sections.
 static DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
@@ -32,9 +33,9 @@ static DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
 /// append profile; normalization uses this profile exactly once at seal.
 static SEALED_DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
     WriterProperties::builder()
+        .set_writer_version(WriterVersion::PARQUET_1_0)
         .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(kronika_registry::SEALED_ZSTD_LEVEL)
-                .expect("zstd level 6 is valid"),
+            ZstdLevel::try_new(kronika_registry::SEALED_ZSTD_LEVEL).expect("zstd level 6 is valid"),
         ))
         .set_max_row_group_size(MAX_SECTION_ROWS)
         .set_data_page_size_limit(1024 * 1024)
@@ -74,7 +75,102 @@ pub fn encode(window: &SegmentDicts) -> Result<Vec<DictSection>, CodecError> {
 pub(crate) fn encode_sealed_entries<'a>(
     entries: impl IntoIterator<Item = EntrySnapshot<'a>>,
 ) -> Result<Vec<DictSection>, CodecError> {
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    let mut string_rows = 0_usize;
+    let mut string_bytes = 0_usize;
+    let mut blob_rows = 0_usize;
+    let mut blob_bytes = 0_usize;
+    let mut truncated_blobs = 0_usize;
+    for entry in &entries {
+        match entry.placement {
+            Placement::Strings => {
+                string_rows += 1;
+                string_bytes = string_bytes.checked_add(entry.stored_bytes.len()).ok_or(
+                    CodecError::SectionTooLarge {
+                        len: usize::MAX,
+                        max: MAX_SECTION_BYTES,
+                    },
+                )?;
+            }
+            Placement::Blobs => {
+                blob_rows += 1;
+                blob_bytes = blob_bytes.checked_add(entry.stored_bytes.len()).ok_or(
+                    CodecError::SectionTooLarge {
+                        len: usize::MAX,
+                        max: MAX_SECTION_BYTES,
+                    },
+                )?;
+                truncated_blobs += usize::from(entry.truncated);
+            }
+        }
+    }
+    if string_rows != 0 {
+        sealed_dictionary_body_bound(Placement::Strings, string_rows, string_bytes, 0)?;
+    }
+    if blob_rows != 0 {
+        sealed_dictionary_body_bound(Placement::Blobs, blob_rows, blob_bytes, truncated_blobs)?;
+    }
     encode_entries_with_properties(entries, &SEALED_DICT_WRITER_PROPS)
+}
+
+/// Prove one normalized dictionary body's PLAIN page and encoded-size bounds.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when row arithmetic overflows, one physical value
+/// stream cannot remain below the 1 MiB page target, or the conservative body
+/// bound crosses 8 MiB.
+pub fn sealed_dictionary_body_bound(
+    placement: Placement,
+    rows: usize,
+    stored_bytes: usize,
+    truncated_rows: usize,
+) -> Result<usize, CodecError> {
+    check_dict_rows(rows)?;
+    if truncated_rows > rows || (placement == Placement::Strings && truncated_rows != 0) {
+        return Err(CodecError::SchemaMismatch);
+    }
+    let too_large = |name| CodecError::PlainPageTooLarge {
+        name,
+        len: usize::MAX,
+        max: SEALED_DATA_PAGE_BYTES - 1,
+    };
+    let ids = rows.checked_mul(8).ok_or_else(|| too_large("str_id"))?;
+    let binary = rows
+        .checked_mul(4)
+        .and_then(|offsets| offsets.checked_add(stored_bytes))
+        .ok_or_else(|| too_large("stored_bytes"))?;
+    let mut columns = vec![
+        SealedPlainColumnSize::new("str_id", ids, 0),
+        SealedPlainColumnSize::new(
+            if placement == Placement::Strings {
+                "bytes"
+            } else {
+                "stored_bytes"
+            },
+            binary,
+            0,
+        ),
+    ];
+    if placement == Placement::Blobs {
+        let full_len = rows.checked_mul(8).ok_or_else(|| too_large("full_len"))?;
+        let sha = truncated_rows
+            .checked_mul(32)
+            .ok_or_else(|| too_large("full_sha256"))?;
+        let sha_levels = rows
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(8))
+            .ok_or(CodecError::SectionTooLarge {
+                len: usize::MAX,
+                max: MAX_SECTION_BYTES,
+            })?;
+        columns.extend([
+            SealedPlainColumnSize::new("full_len", full_len, 0),
+            SealedPlainColumnSize::new("truncated", rows, 0),
+            SealedPlainColumnSize::new("full_sha256", sha, sha_levels),
+        ]);
+    }
+    sealed_plain_body_bound(columns)
 }
 
 #[allow(

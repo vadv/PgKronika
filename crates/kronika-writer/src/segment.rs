@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,13 +17,14 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{
     Catalog, Entry, EntrySnapshot, FORMAT_VERSION, HotMark, MAGIC, PartError, PartRef, Placement,
-    StrId, crc32c, validate_part,
+    StrId, crc32c, validate_part_catalog,
 };
 use kronika_registry::{
-    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_ROW_GROUPS,
-    MAX_SECTION_BYTES, MAX_SECTION_ROWS, VerifiedSection, decode_any, encode_sealed_batches,
+    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_DECODED_SECTION_BYTES,
+    MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS, VerifiedSection, decode_any,
+    encode_sealed_batches, sealed_data_body_bound, validate_parquet_decode_work,
 };
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 
 use crate::{Journal, JournalError};
 
@@ -86,6 +87,13 @@ pub enum SealError {
         /// Quantity that overflowed.
         what: &'static str,
     },
+    /// The journal contains more section descriptors than sealing will retain.
+    TooManySections {
+        /// Descriptor count encountered.
+        sections: usize,
+        /// Enforced bound.
+        max: usize,
+    },
 }
 
 impl fmt::Display for SealError {
@@ -115,6 +123,12 @@ impl fmt::Display for SealError {
                 write!(f, "dictionary id {str_id} has conflicting representations")
             }
             Self::ArithmeticOverflow { what } => write!(f, "{what} overflow"),
+            Self::TooManySections { sections, max } => {
+                write!(
+                    f,
+                    "journal has {sections} sections, above the limit of {max}"
+                )
+            }
         }
     }
 }
@@ -132,7 +146,8 @@ impl Error for SealError {
             | Self::UnsupportedFormat { .. }
             | Self::RowCountMismatch { .. }
             | Self::DictionaryConflict { .. }
-            | Self::ArithmeticOverflow { .. } => None,
+            | Self::ArithmeticOverflow { .. }
+            | Self::TooManySections { .. } => None,
         }
     }
 }
@@ -169,19 +184,21 @@ impl From<arrow_schema::ArrowError> for SealError {
 
 /// Seal journal parts into an immutable segment at `dest`.
 ///
-/// `dest` is never overwritten. Call `Journal::reset` only after `Ok`.
+/// `dest` is never overwritten. An existing byte-identical destination is
+/// accepted as an idempotent retry; a different one is rejected. This function
+/// never changes the journal, so call [`Journal::reset`] only after `Ok`.
 ///
 /// # Errors
 ///
 /// Returns [`SealError`] when the journal is empty, a part is invalid, I/O
-/// fails, or `dest` already exists.
+/// fails, or `dest` exists with different bytes.
 pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
     if journal.parts().is_empty() {
         return Err(SealError::Empty);
     }
 
-    let tmp = tmp_path(dest);
-    let summary = match write_tmp(journal, &tmp) {
+    let (tmp, file) = create_tmp(dest)?;
+    let summary = match write_tmp(journal, file) {
         Ok(summary) => summary,
         Err(err) => {
             fs::remove_file(&tmp).ok();
@@ -190,29 +207,74 @@ pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
     };
     // Hard-link publish fails if `dest` exists. The data file is already synced.
     if let Err(err) = fs::hard_link(&tmp, dest) {
-        // Drop the temporary best-effort and keep `AlreadyExists` distinguishable.
+        if err.kind() != io::ErrorKind::AlreadyExists {
+            fs::remove_file(&tmp).ok();
+            return Err(SealError::Io(err));
+        }
+        let identical = match files_equal(&tmp, dest) {
+            Ok(identical) => identical,
+            Err(err) => {
+                fs::remove_file(&tmp).ok();
+                return Err(err);
+            }
+        };
+        if !identical {
+            fs::remove_file(&tmp).ok();
+            return Err(SealError::AlreadyExists);
+        }
+        let sync = sync_parent_dir(dest);
         fs::remove_file(&tmp).ok();
-        return Err(if err.kind() == io::ErrorKind::AlreadyExists {
-            SealError::AlreadyExists
-        } else {
-            SealError::Io(err)
-        });
+        sync?;
+        return Ok(summary);
     }
     // Make the new link durable before the temporary name is removed.
-    sync_parent_dir(dest)?;
-    fs::remove_file(&tmp)?;
+    let sync = sync_parent_dir(dest);
+    fs::remove_file(&tmp).ok();
+    sync?;
     Ok(summary)
 }
 
-/// A process-unique temporary path beside `dest`.
-///
-/// Uses pid plus a counter so stale temporary names cannot collide.
-fn tmp_path(dest: &Path) -> PathBuf {
+/// Create one invocation-owned temporary beside `dest` without removing stale files.
+fn create_tmp(dest: &Path) -> Result<(PathBuf, File), SealError> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut name = dest.as_os_str().to_owned();
-    name.push(format!(".{}.{seq}.tmp", std::process::id()));
-    PathBuf::from(name)
+    for _attempt in 0..64 {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut name = dest.as_os_str().to_owned();
+        name.push(format!(".{}.{seq}.tmp", std::process::id()));
+        let path = PathBuf::from(name);
+        match File::options().create_new(true).write(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(SealError::Io(err)),
+        }
+    }
+    Err(SealError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve a segment temporary path",
+    )))
+}
+
+fn files_equal(left: &Path, right: &Path) -> Result<bool, SealError> {
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    if left.metadata()?.len() != right.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut left_buf = vec![0_u8; 64 * 1024];
+    let mut right_buf = vec![0_u8; 64 * 1024];
+    loop {
+        let left_len = left.read(&mut left_buf)?;
+        let right_len = right.read(&mut right_buf)?;
+        if left_len != right_len {
+            return Ok(false);
+        }
+        if left_buf[..left_len] != right_buf[..left_len] {
+            return Ok(false);
+        }
+        if left_len == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -230,14 +292,15 @@ struct SegmentPlan {
 }
 
 /// Write the coalesced segment to `tmp` and fsync it. The caller publishes it.
-fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
+fn write_tmp(journal: &Journal, file: File) -> Result<SealSummary, SealError> {
     let mut plan = plan_segment(journal)?;
-    let strings = plan.by_type.remove(&DICT_STRINGS_TYPE_ID).unwrap_or_default();
+    let strings = plan
+        .by_type
+        .remove(&DICT_STRINGS_TYPE_ID)
+        .unwrap_or_default();
     let blobs = plan.by_type.remove(&DICT_BLOBS_TYPE_ID).unwrap_or_default();
     let dictionary = normalize_dictionary(journal, &strings, &blobs)?;
 
-    // Never truncate an existing temporary.
-    let file = File::options().create_new(true).write(true).open(tmp)?;
     let mut out = BufWriter::new(file);
 
     out.write_all(&MAGIC)?;
@@ -246,11 +309,9 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
 
     for (type_id, descriptors) in plan.by_type {
         let declared_rows = aggregate_rows(type_id, &descriptors)?;
-        if declared_rows == 0 {
-            continue;
-        }
         let mut batches = Vec::<RecordBatch>::new();
         let mut decoded_rows = 0_usize;
+        let mut list_i32_child_values = 0_usize;
         for descriptor in descriptors {
             let decoded = decode_any(type_id, read_verified_body(journal, descriptor)?)?;
             if decoded.stats.rows != descriptor.entry.rows as usize {
@@ -260,11 +321,19 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
                     decoded: decoded.stats.rows,
                 });
             }
-            decoded_rows = decoded_rows.checked_add(decoded.stats.rows).ok_or(
+            let projected_rows = decoded_rows.checked_add(decoded.stats.rows).ok_or(
                 SealError::ArithmeticOverflow {
                     what: "decoded row count",
                 },
             )?;
+            let projected_list_values = list_i32_child_values
+                .checked_add(decoded.stats.list_i32_child_values)
+                .ok_or(SealError::ArithmeticOverflow {
+                    what: "decoded ListI32 child count",
+                })?;
+            sealed_data_body_bound(type_id, projected_rows, projected_list_values)?;
+            decoded_rows = projected_rows;
+            list_i32_child_values = projected_list_values;
             batches.extend(decoded.batches);
         }
         if decoded_rows != declared_rows {
@@ -274,7 +343,7 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
                 decoded: decoded_rows,
             });
         }
-        let body = encode_sealed_batches(type_id, &batches)?;
+        let body = encode_sealed_batches(type_id, batches)?;
         write_section(
             &mut out,
             &mut entries,
@@ -321,12 +390,13 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
 
 fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
     let mut by_type = BTreeMap::<u32, Vec<SectionDescriptor>>::new();
+    let mut section_count = 0_usize;
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     let mut source_id = 0_u64;
     for &part_ref in journal.parts() {
         let part = journal.read_part(part_ref)?;
-        let catalog = validate_part(&part).map_err(SealError::Part)?;
+        let catalog = validate_part_catalog(&part).map_err(SealError::Part)?;
         if catalog.format_version != FORMAT_VERSION {
             return Err(SealError::UnsupportedFormat {
                 version: catalog.format_version,
@@ -344,6 +414,17 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
             source_id = catalog.source_id;
         }
         for entry in catalog.entries {
+            section_count = section_count
+                .checked_add(1)
+                .ok_or(SealError::ArithmeticOverflow {
+                    what: "section descriptor count",
+                })?;
+            if section_count > MAX_SECTION_ROWS {
+                return Err(SealError::TooManySections {
+                    sections: section_count,
+                    max: MAX_SECTION_ROWS,
+                });
+            }
             let descriptors = by_type.entry(entry.type_id).or_default();
             descriptors
                 .try_reserve(1)
@@ -368,10 +449,7 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
     })
 }
 
-fn aggregate_rows(
-    type_id: u32,
-    descriptors: &[SectionDescriptor],
-) -> Result<usize, SealError> {
+fn aggregate_rows(type_id: u32, descriptors: &[SectionDescriptor]) -> Result<usize, SealError> {
     let rows = descriptors.iter().try_fold(0_usize, |rows, descriptor| {
         rows.checked_add(descriptor.entry.rows as usize)
             .ok_or(SealError::ArithmeticOverflow {
@@ -395,33 +473,18 @@ fn read_verified_body(
     journal: &Journal,
     descriptor: SectionDescriptor,
 ) -> Result<VerifiedSection, SealError> {
-    let part = journal.read_part(descriptor.part)?;
     let start = usize::try_from(descriptor.entry.offset).map_err(|_error| {
         SealError::ArithmeticOverflow {
             what: "section offset",
         }
     })?;
-    let len = usize::try_from(descriptor.entry.len).map_err(|_error| {
-        SealError::ArithmeticOverflow {
+    let len =
+        usize::try_from(descriptor.entry.len).map_err(|_error| SealError::ArithmeticOverflow {
             what: "section length",
-        }
-    })?;
-    let end = start
-        .checked_add(len)
-        .ok_or(SealError::ArithmeticOverflow {
-            what: "section end",
         })?;
-    let body = part
-        .get(start..end)
-        .ok_or(SealError::Part(PartError::SectionOutOfBounds {
-            type_id: descriptor.entry.type_id,
-        }))?;
-    VerifiedSection::verify(
-        Bytes::copy_from_slice(body),
-        descriptor.entry.crc32c,
-        crc32c,
-    )
-    .map_err(SealError::Codec)
+    let body = journal.read_part_range(descriptor.part, start, len)?;
+    VerifiedSection::verify(Bytes::from(body), descriptor.entry.crc32c, crc32c)
+        .map_err(SealError::Codec)
 }
 
 fn write_section(
@@ -469,7 +532,10 @@ enum DictionaryValue {
 #[derive(Debug, Default)]
 struct NormalizedDictionary {
     values: BTreeMap<StrId, DictionaryValue>,
-    stored_bytes: usize,
+    string_rows: usize,
+    blob_rows: usize,
+    string_bytes: usize,
+    blob_bytes: usize,
 }
 
 impl NormalizedDictionary {
@@ -483,28 +549,39 @@ impl NormalizedDictionary {
             }
             None => {}
         }
-        let value_bytes = match &value {
-            DictionaryValue::String(bytes) | DictionaryValue::Blob { bytes, .. } => bytes.len(),
-        };
-        self.stored_bytes = self.stored_bytes.checked_add(value_bytes).ok_or(
-            SealError::ArithmeticOverflow {
-                what: "dictionary stored bytes",
-            },
-        )?;
-        if self.stored_bytes > MAX_SECTION_BYTES {
-            return Err(CodecError::SectionTooLarge {
-                len: self.stored_bytes,
-                max: MAX_SECTION_BYTES,
+        let (rows, stored_bytes, value_bytes) = match &value {
+            DictionaryValue::String(bytes) => {
+                (&mut self.string_rows, &mut self.string_bytes, bytes.len())
             }
-            .into());
-        }
-        if self.values.len() >= MAX_SECTION_ROWS {
+            DictionaryValue::Blob { bytes, .. } => {
+                (&mut self.blob_rows, &mut self.blob_bytes, bytes.len())
+            }
+        };
+        let next_rows = rows.checked_add(1).ok_or(SealError::ArithmeticOverflow {
+            what: "dictionary row count",
+        })?;
+        if next_rows > MAX_SECTION_ROWS {
             return Err(CodecError::TooManyRows {
-                rows: self.values.len() + 1,
+                rows: next_rows,
                 max: MAX_SECTION_ROWS,
             }
             .into());
         }
+        let next_bytes =
+            stored_bytes
+                .checked_add(value_bytes)
+                .ok_or(SealError::ArithmeticOverflow {
+                    what: "dictionary stored bytes",
+                })?;
+        if next_bytes > MAX_SECTION_BYTES {
+            return Err(CodecError::SectionTooLarge {
+                len: next_bytes,
+                max: MAX_SECTION_BYTES,
+            }
+            .into());
+        }
+        *rows = next_rows;
+        *stored_bytes = next_bytes;
         self.values.insert(str_id, value);
         Ok(())
     }
@@ -575,7 +652,9 @@ fn decode_dictionary_body(
         _ => return Err(CodecError::UnknownType { type_id }.into()),
     };
     let body = read_verified_body(journal, descriptor)?.into_bytes();
-    let builder = ParquetRecordBatchReaderBuilder::try_new(body)?;
+    validate_parquet_decode_work(body.as_ref(), MAX_DECODED_SECTION_BYTES)?;
+    let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(body, options)?;
     let groups = builder.metadata().num_row_groups();
     if groups > MAX_ROW_GROUPS {
         return Err(CodecError::TooManyRowGroups {
@@ -585,16 +664,17 @@ fn decode_dictionary_body(
         .into());
     }
     let claimed = builder.metadata().file_metadata().num_rows();
-    let claimed_rows = usize::try_from(claimed)
-        .ok()
-        .filter(|&rows| rows <= MAX_SECTION_ROWS)
-        .ok_or_else(|| match usize::try_from(claimed) {
-            Ok(rows) => CodecError::TooManyRows {
+    let claimed_rows = match usize::try_from(claimed) {
+        Ok(rows) if rows <= MAX_SECTION_ROWS => rows,
+        Ok(rows) => {
+            return Err(CodecError::TooManyRows {
                 rows,
                 max: MAX_SECTION_ROWS,
-            },
-            Err(_) => CodecError::InvalidRowCount { raw: claimed },
-        })?;
+            }
+            .into());
+        }
+        Err(_) => return Err(CodecError::InvalidRowCount { raw: claimed }.into()),
+    };
     if claimed_rows != descriptor.entry.rows as usize {
         return Err(SealError::RowCountMismatch {
             type_id,
@@ -610,11 +690,12 @@ fn decode_dictionary_body(
     let mut decoded_rows = 0_usize;
     for batch in builder.with_batch_size(4_096).build()? {
         let batch = batch?;
-        decoded_rows = decoded_rows.checked_add(batch.num_rows()).ok_or(
-            SealError::ArithmeticOverflow {
-                what: "dictionary row count",
-            },
-        )?;
+        decoded_rows =
+            decoded_rows
+                .checked_add(batch.num_rows())
+                .ok_or(SealError::ArithmeticOverflow {
+                    what: "dictionary row count",
+                })?;
         let ids = required_u64(&batch, "str_id")?;
         if is_blob {
             let bytes = required_binary(&batch, "stored_bytes")?;
@@ -773,11 +854,14 @@ fn sync_parent_dir(dest: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::{DictLimits, validate_part};
+    use kronika_format::{DictLimits, Entry, validate_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
-    use kronika_registry::{Bytes, Ts, VerifiedSection, decode_any};
+    use kronika_registry::{
+        Bytes, DICT_STRINGS_TYPE_ID, PgLocksV2, Section, StrId, Ts, VerifiedSection, decode_any,
+    };
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    use super::{SealError, seal};
+    use super::{SealError, required_binary, required_u64, seal};
     use crate::{Interner, Journal, JournalConfig, SectionBuffers, dict};
 
     fn bgwriter(ts: i64) -> BgwriterCheckpointer {
@@ -807,6 +891,197 @@ mod tests {
         buffers.push(bgwriter(ts)).expect("buffer not full");
         let part = buffers.flush(&[], 0).expect("encode").expect("a part");
         journal.append(&part).expect("append");
+    }
+
+    fn pg_locks(ts: i64, pid: i32) -> PgLocksV2 {
+        PgLocksV2 {
+            ts: Ts(ts),
+            pid,
+            blocked_by: vec![pid; 4_096],
+            depth: 0,
+            root_pid: pid,
+            datid: 16_384,
+            datname: StrId(1),
+            usename: Some(StrId(2)),
+            application_name: StrId(3),
+            client_addr: StrId(4),
+            backend_type: StrId(5),
+            state: Some(StrId(6)),
+            wait_event_type: None,
+            wait_event: None,
+            query: StrId(7),
+            backend_xid_age: None,
+            backend_xmin_age: None,
+            backend_start: Some(Ts(ts - 60)),
+            xact_start: Some(Ts(ts - 5)),
+            query_start: Some(Ts(ts - 1)),
+            state_change: Some(Ts(ts - 1)),
+            lock_locktype: None,
+            lock_mode: None,
+            lock_granted: None,
+            lock_database: None,
+            lock_relation: None,
+            lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
+            lock_virtualxid: None,
+            lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
+            lock_fastpath: None,
+            lock_target: None,
+            waitstart: None,
+        }
+    }
+
+    fn append_lock_window(journal: &mut Journal, ts: i64, first_pid: i32) {
+        let mut buffers = SectionBuffers::new();
+        for row in 0..33 {
+            buffers
+                .push(pg_locks(ts + i64::from(row), first_pid + row))
+                .expect("lock row fits");
+        }
+        let part = buffers.flush(&[], 0).expect("encode").expect("a part");
+        journal.append(&part).expect("append lock window");
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixtureTextIds {
+        datname: StrId,
+        usename: StrId,
+        application_name: StrId,
+        client_addr: StrId,
+        backend_type: StrId,
+        state: StrId,
+        query: StrId,
+    }
+
+    fn fixture_dictionary() -> (Interner, FixtureTextIds) {
+        let mut interner =
+            Interner::new(DictLimits::new(4_096, 4_096).expect("small dictionary limits"));
+        let mut intern =
+            |bytes: &[u8]| StrId(interner.intern(bytes).expect("fixture text fits").get());
+        let ids = FixtureTextIds {
+            datname: intern(b"appdb"),
+            usename: intern(b"alice"),
+            application_name: intern(b"psql"),
+            client_addr: intern(b"127.0.0.1"),
+            backend_type: intern(b"client backend"),
+            state: intern(b"active"),
+            query: intern(b"select 1"),
+        };
+        (interner, ids)
+    }
+
+    fn lossless_bgwriter(write_time_bits: u64, pg17: bool) -> BgwriterCheckpointer {
+        BgwriterCheckpointer {
+            ts: Ts(42),
+            checkpoint_write_time: f64::from_bits(write_time_bits),
+            restartpoints_timed: pg17.then_some(7),
+            restartpoints_req: pg17.then_some(1),
+            restartpoints_done: pg17.then_some(6),
+            buffers_backend: (!pg17).then_some(128),
+            buffers_backend_fsync: (!pg17).then_some(0),
+            checkpointer_stats_reset: pg17.then_some(Ts(7)),
+            ..bgwriter(42)
+        }
+    }
+
+    fn lossless_lock(
+        ids: FixtureTextIds,
+        pid: i32,
+        blocked_by: Vec<i32>,
+        nullable_text: bool,
+    ) -> PgLocksV2 {
+        PgLocksV2 {
+            ts: Ts(84),
+            pid,
+            depth: i32::from(!blocked_by.is_empty()),
+            root_pid: 10,
+            blocked_by,
+            datid: 16_384,
+            datname: ids.datname,
+            usename: nullable_text.then_some(ids.usename),
+            application_name: ids.application_name,
+            client_addr: ids.client_addr,
+            backend_type: ids.backend_type,
+            state: (!nullable_text).then_some(ids.state),
+            query: ids.query,
+            backend_xid_age: nullable_text.then_some(11),
+            backend_xmin_age: None,
+            backend_start: Some(Ts(12)),
+            xact_start: nullable_text.then_some(Ts(13)),
+            query_start: Some(Ts(14)),
+            state_change: None,
+            wait_event_type: None,
+            wait_event: None,
+            lock_locktype: None,
+            lock_mode: None,
+            lock_granted: None,
+            lock_database: None,
+            lock_relation: None,
+            lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
+            lock_virtualxid: None,
+            lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
+            lock_fastpath: None,
+            lock_target: None,
+            waitstart: nullable_text.then_some(Ts(15)),
+        }
+    }
+
+    fn append_lossless_part(
+        journal: &mut Journal,
+        bgwriter_rows: &[BgwriterCheckpointer],
+        lock_rows: &[PgLocksV2],
+    ) {
+        let (interner, _ids) = fixture_dictionary();
+        let dictionary = dict::encode(interner.window()).expect("encode fixture dictionary");
+        let mut buffers = SectionBuffers::new();
+        for &row in bgwriter_rows {
+            buffers.push(row).expect("bgwriter row fits");
+        }
+        for row in lock_rows {
+            buffers.push(row.clone()).expect("lock row fits");
+        }
+        let part = buffers
+            .flush(&dictionary, 7)
+            .expect("encode fixture part")
+            .expect("fixture part has rows");
+        journal.append(&part).expect("append fixture part");
+    }
+
+    fn verified_section(segment: &[u8], entry: &Entry) -> VerifiedSection {
+        let start = usize::try_from(entry.offset).expect("fixture offset fits");
+        let len = usize::try_from(entry.len).expect("fixture length fits");
+        VerifiedSection::verify(
+            Bytes::copy_from_slice(&segment[start..start + len]),
+            entry.crc32c,
+            kronika_format::crc32c,
+        )
+        .expect("fixture section CRC matches")
+    }
+
+    fn decode_string_dictionary(section: VerifiedSection) -> Vec<(u64, Vec<u8>)> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(section.into_bytes())
+            .expect("open string dictionary")
+            .build()
+            .expect("build string dictionary reader");
+        let mut entries = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("decode string dictionary batch");
+            let ids = required_u64(&batch, "str_id").expect("dictionary ids");
+            let bytes = required_binary(&batch, "bytes").expect("dictionary bytes");
+            entries.extend(
+                (0..batch.num_rows()).map(|row| (ids.value(row), bytes.value(row).to_vec())),
+            );
+        }
+        entries
     }
 
     #[test]
@@ -874,13 +1149,172 @@ mod tests {
         let dict_entry = catalog
             .entries
             .iter()
-            .find(|entry| entry.type_id == kronika_registry::DICT_STRINGS_TYPE_ID)
+            .find(|entry| entry.type_id == DICT_STRINGS_TYPE_ID)
             .expect("the dictionary section reached the segment");
         assert_eq!(dict_entry.rows, 2, "both interned strings");
         let start = usize::try_from(dict_entry.offset).unwrap();
         let end = start + usize::try_from(dict_entry.len).unwrap();
         assert_eq!(&segment[start..start + 4], b"PAR1", "a Parquet dict body");
         assert_eq!(&segment[end - 4..end], b"PAR1", "intact to its last byte");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end assertion keeps the two equivalent journals and all lossless fields together"
+    )]
+    fn sealing_is_lossless_across_journal_order_and_partitioning() {
+        const NAN_1: u64 = 0x7ff8_0000_0000_0001;
+        const NAN_2: u64 = 0x7ff8_0000_0000_0002;
+        const NEGATIVE_ZERO: u64 = (-0.0_f64).to_bits();
+        const POSITIVE_ZERO: u64 = 0.0_f64.to_bits();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_journal_path = dir.path().join("first.parts");
+        let second_journal_path = dir.path().join("second.parts");
+        let (mut first, _) = Journal::open(&first_journal_path, JournalConfig::default())
+            .expect("open first journal");
+        let (mut second, _) = Journal::open(&second_journal_path, JournalConfig::default())
+            .expect("open second journal");
+        let (_interner, ids) = fixture_dictionary();
+
+        let nan_1 = lossless_bgwriter(NAN_1, false);
+        let nan_2 = lossless_bgwriter(NAN_2, true);
+        let negative_zero = lossless_bgwriter(NEGATIVE_ZERO, false);
+        let positive_zero = lossless_bgwriter(POSITIVE_ZERO, true);
+        let root = lossless_lock(ids, 10, Vec::new(), false);
+        let blocked = lossless_lock(ids, 20, vec![10, 0], true);
+
+        append_lossless_part(
+            &mut first,
+            &[nan_2, negative_zero],
+            std::slice::from_ref(&blocked),
+        );
+        append_lossless_part(
+            &mut first,
+            &[positive_zero, nan_1, negative_zero],
+            &[root.clone(), blocked.clone()],
+        );
+
+        append_lossless_part(
+            &mut second,
+            &[negative_zero, nan_1, positive_zero],
+            &[blocked.clone(), root.clone()],
+        );
+        append_lossless_part(&mut second, &[nan_2], &[]);
+        append_lossless_part(
+            &mut second,
+            &[negative_zero],
+            std::slice::from_ref(&blocked),
+        );
+        assert_ne!(
+            std::fs::read(&first_journal_path).expect("read first journal"),
+            std::fs::read(&second_journal_path).expect("read second journal"),
+            "the equivalent input uses different order and part boundaries"
+        );
+
+        let first_path = dir.path().join("first.pgm");
+        let second_path = dir.path().join("second.pgm");
+        let first_summary = seal(&first, &first_path).expect("seal first journal");
+        let second_summary = seal(&second, &second_path).expect("seal second journal");
+        let segment = std::fs::read(&first_path).expect("read first segment");
+        assert_eq!(first_summary, second_summary);
+        assert_eq!(
+            segment,
+            std::fs::read(&second_path).expect("read second segment"),
+            "equivalent journals must produce exact PGM bytes"
+        );
+        assert_eq!((first_summary.min_ts, first_summary.max_ts), (42, 84));
+
+        let catalog = validate_part(&segment).expect("sealed PGM validates");
+        let bgwriter_entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.type_id == BgwriterCheckpointer::CONTRACT.type_id.get())
+            .expect("bgwriter section");
+        let decoded_bgwriter =
+            BgwriterCheckpointer::decode(verified_section(&segment, bgwriter_entry))
+                .expect("decode bgwriter rows");
+        assert_eq!(
+            decoded_bgwriter
+                .iter()
+                .map(|row| row.checkpoint_write_time.to_bits())
+                .collect::<Vec<_>>(),
+            [NEGATIVE_ZERO, NEGATIVE_ZERO, POSITIVE_ZERO, NAN_1, NAN_2],
+            "raw float bits, canonical order, and duplicate rows survive sealing"
+        );
+        assert_eq!(decoded_bgwriter[0].buffers_backend, Some(128));
+        assert_eq!(decoded_bgwriter[0].restartpoints_timed, None);
+        assert_eq!(decoded_bgwriter[2].buffers_backend, None);
+        assert_eq!(decoded_bgwriter[2].restartpoints_timed, Some(7));
+        assert_eq!(decoded_bgwriter[2].checkpointer_stats_reset, Some(Ts(7)));
+
+        let locks_entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.type_id == PgLocksV2::CONTRACT.type_id.get())
+            .expect("locks section");
+        let decoded_locks =
+            PgLocksV2::decode(verified_section(&segment, locks_entry)).expect("decode lock rows");
+        assert_eq!(
+            decoded_locks,
+            [root, blocked.clone(), blocked.clone()],
+            "canonical rows retain the duplicate lock observation"
+        );
+        assert!(decoded_locks[0].blocked_by.is_empty());
+        assert_eq!(decoded_locks[0].usename, None);
+        assert_eq!(decoded_locks[0].state, Some(ids.state));
+        assert_eq!(decoded_locks[1].blocked_by, [10, 0]);
+        assert_eq!(decoded_locks[1].usename, Some(ids.usename));
+        assert_eq!(decoded_locks[1].state, None);
+        assert_eq!(decoded_locks[1].xact_start, Some(Ts(13)));
+        assert_eq!(decoded_locks[1].state_change, None);
+
+        let dictionary_entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.type_id == DICT_STRINGS_TYPE_ID)
+            .expect("string dictionary section");
+        let dictionary = decode_string_dictionary(verified_section(&segment, dictionary_entry));
+        let mut expected_dictionary = vec![
+            (ids.datname.0, b"appdb".to_vec()),
+            (ids.usename.0, b"alice".to_vec()),
+            (ids.application_name.0, b"psql".to_vec()),
+            (ids.client_addr.0, b"127.0.0.1".to_vec()),
+            (ids.backend_type.0, b"client backend".to_vec()),
+            (ids.state.0, b"active".to_vec()),
+            (ids.query.0, b"select 1".to_vec()),
+        ];
+        expected_dictionary.sort_unstable_by_key(|entry| entry.0);
+        assert_eq!(dictionary, expected_dictionary);
+    }
+
+    #[test]
+    fn aggregate_list_bound_is_checked_before_retaining_the_next_part() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("active.parts");
+        let segment_path = dir.path().join("locks.pgm");
+        let (mut journal, _) =
+            Journal::open(&journal_path, JournalConfig::default()).expect("open journal");
+        append_lock_window(&mut journal, 1_000, 1);
+        append_lock_window(&mut journal, 2_000, 100);
+        let journal_before = std::fs::read(&journal_path).expect("snapshot journal");
+
+        let err = seal(&journal, &segment_path).expect_err("aggregate list stream is rejected");
+
+        assert!(matches!(
+            err,
+            SealError::Codec(kronika_registry::CodecError::TooManyListValues {
+                name: "blocked_by",
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&journal_path).expect("read journal"),
+            journal_before
+        );
+        assert_eq!(journal.parts().len(), 2);
+        assert!(!segment_path.exists());
     }
 
     #[test]
@@ -896,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_segment_is_never_overwritten() {
+    fn resealing_the_same_journal_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal_path = dir.path().join("active.parts");
         let segment_path = dir.path().join("s.pgm");
@@ -904,8 +1338,42 @@ mod tests {
             Journal::open(&journal_path, JournalConfig::default()).expect("open journal");
         append_window(&mut journal, 1);
 
-        seal(&journal, &segment_path).expect("first seal");
-        let err = seal(&journal, &segment_path).expect_err("must not overwrite");
+        let first = seal(&journal, &segment_path).expect("first seal");
+        let bytes = std::fs::read(&segment_path).expect("read first segment");
+        let second = seal(&journal, &segment_path).expect("idempotent retry");
+
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read(&segment_path).expect("read retry"), bytes);
+        assert_eq!(journal.parts().len(), 1, "seal never resets the journal");
+    }
+
+    #[test]
+    fn a_different_existing_segment_is_never_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let segment_path = dir.path().join("s.pgm");
+        let (mut first, _) =
+            Journal::open(&dir.path().join("first.parts"), JournalConfig::default())
+                .expect("open first journal");
+        append_window(&mut first, 1);
+        seal(&first, &segment_path).expect("first seal");
+        let segment_before = std::fs::read(&segment_path).expect("read destination");
+
+        let second_path = dir.path().join("second.parts");
+        let (mut second, _) =
+            Journal::open(&second_path, JournalConfig::default()).expect("open second journal");
+        append_window(&mut second, 2);
+        let journal_before = std::fs::read(&second_path).expect("read second journal");
+        let err = seal(&second, &segment_path).expect_err("must not overwrite");
+
         assert!(matches!(err, SealError::AlreadyExists));
+        assert_eq!(
+            std::fs::read(&segment_path).expect("read destination after collision"),
+            segment_before
+        );
+        assert_eq!(
+            std::fs::read(&second_path).expect("read journal after collision"),
+            journal_before
+        );
+        assert_eq!(second.parts().len(), 1);
     }
 }

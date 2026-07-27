@@ -208,10 +208,85 @@ fn startup_seals_windows_a_dead_process_left_in_the_journal() {
 }
 
 #[test]
+fn startup_finishes_a_segment_published_before_journal_reset() {
+    use kronika_writer::{Journal, JournalConfig, seal};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal_path = dir.path().join("active.parts");
+    let dest = dir.path().join("1000.pgm");
+    {
+        let (mut journal, _report) =
+            Journal::open(&journal_path, JournalConfig::default()).expect("open the journal");
+        journal.append(&activity_window()).expect("append");
+        seal(&journal, &dest).expect("publish before simulated crash");
+        assert!(!journal.parts().is_empty(), "the crash precedes reset");
+    }
+    let published = std::fs::read(&dest).expect("read published segment");
+
+    let (journal, recovered) =
+        open_collector_journal(dir.path(), 1 << 30).expect("finish interrupted publication");
+    assert_eq!(recovered, Some(dest.clone()));
+    assert!(journal.parts().is_empty());
+    assert_eq!(
+        std::fs::read(dest).expect("read recovered segment"),
+        published
+    );
+}
+
+#[test]
 fn startup_with_an_empty_journal_recovers_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (journal, recovered) =
         open_collector_journal(dir.path(), 1 << 30).expect("open the journal");
     assert!(recovered.is_none());
     assert!(journal.parts().is_empty());
+}
+
+#[test]
+fn failed_recovery_seal_preserves_the_journal() {
+    use kronika_format::{PartMeta, SectionInput, build_part};
+    use kronika_writer::{Journal, JournalConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("active.parts");
+    let part = build_part(
+        &[SectionInput {
+            type_id: 9_999_999,
+            rows: 1,
+            body: b"not a registered Parquet section",
+        }],
+        PartMeta {
+            min_ts: 123,
+            max_ts: 123,
+            source_id: 7,
+        },
+    );
+    let expected_bytes;
+    {
+        let (mut journal, _report) =
+            Journal::open(&path, JournalConfig::default()).expect("open the journal");
+        journal
+            .append(&part)
+            .expect("append a structurally valid part");
+        expected_bytes = journal.bytes();
+    }
+
+    let err = open_collector_journal(dir.path(), 1 << 30)
+        .expect_err("an unknown recovered section cannot be sealed");
+    assert!(
+        format!("{err:#}").contains("remains intact"),
+        "the startup error explains the preservation policy: {err:#}"
+    );
+    let (journal, _report) =
+        Journal::open(&path, JournalConfig::default()).expect("reopen preserved journal");
+    assert_eq!(
+        journal.parts().len(),
+        1,
+        "the recovered part remains present"
+    );
+    assert_eq!(
+        journal.bytes(),
+        expected_bytes,
+        "the journal is not truncated"
+    );
 }
