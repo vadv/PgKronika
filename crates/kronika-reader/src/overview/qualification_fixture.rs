@@ -5,7 +5,10 @@
 //! the production extraction, identity, reset, coverage, and loss rules that
 //! the qualification suite is intended to prove.
 
-use kronika_format::{PartMeta, SectionInput, build_part};
+use std::collections::BTreeMap;
+
+use arrow_array::RecordBatch;
+use kronika_format::{PartMeta, SectionInput, build_part, crc32c};
 use kronika_registry::incident_gauges::{
     PgProcessCgroupMemoryV1, PgReplicationPhysicalV1, PgReplicationSlotRetentionV3,
     PgStorageMountV2,
@@ -18,7 +21,9 @@ use kronika_registry::pg_stat_database::PgStatDatabaseV4;
 use kronika_registry::replication_instance::ReplicationInstance;
 use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
-use kronika_registry::{Section, StrId, Ts};
+use kronika_registry::{
+    Bytes, Section, StrId, Ts, VerifiedSection, decode_any, encode_sealed_batches,
+};
 
 /// Schema version for [`all_family_fixture`].
 #[cfg(test)]
@@ -62,9 +67,9 @@ pub(super) struct VersionedFixture {
 impl VersionedFixture {
     /// Every contiguous grouping of the fixture's completed parts.
     ///
-    /// Every cut mask is represented. Section order remains identical to the
-    /// sealed catalog, which is the provenance condition required for a
-    /// lossless promotion.
+    /// Every cut mask is represented. Each group coalesces rows by `type_id`,
+    /// so every emitted PGM is canonical while all variants retain the same
+    /// source rows and temporal partition boundaries.
     #[cfg(test)]
     pub(super) fn contiguous_partitions(&self) -> Vec<Vec<Vec<u8>>> {
         let boundary_count = self.parts.len().saturating_sub(1);
@@ -110,18 +115,7 @@ impl VersionedFixture {
             .iter()
             .flat_map(|part| part.sections().iter().cloned())
             .collect();
-        let min_ts_us = self
-            .parts
-            .iter()
-            .map(|part| part.min_ts_us)
-            .min()
-            .expect("qualification fixture has parts");
-        let max_ts_us = self
-            .parts
-            .iter()
-            .map(|part| part.max_ts_us)
-            .max()
-            .expect("qualification fixture has parts");
+        let (min_ts_us, max_ts_us) = fixture_range(&self.parts);
         build_fixture_part(&sections, min_ts_us, max_ts_us)
     }
 }
@@ -198,8 +192,55 @@ fn fixture_part(ts_us: i64, snapshot: u8) -> FixturePart {
     }
 }
 
+fn canonical_fixture_sections(sections: &[FixtureSection]) -> Vec<FixtureSection> {
+    let mut grouped = BTreeMap::<u32, (u32, Vec<RecordBatch>)>::new();
+    for section in sections {
+        let verified = VerifiedSection::verify(
+            Bytes::copy_from_slice(&section.body),
+            crc32c(&section.body),
+            crc32c,
+        )
+        .expect("qualification section CRC matches");
+        let decoded = decode_any(section.type_id, verified).expect("decode qualification section");
+        assert_eq!(
+            decoded.stats.rows, section.rows as usize,
+            "qualification section row count matches its catalog entry"
+        );
+        let (rows, batches) = grouped.entry(section.type_id).or_default();
+        *rows = rows
+            .checked_add(section.rows)
+            .expect("qualification row count fits u32");
+        batches.extend(decoded.batches);
+    }
+
+    grouped
+        .into_iter()
+        .map(|(type_id, (rows, batches))| FixtureSection {
+            type_id,
+            rows,
+            body: encode_sealed_batches(type_id, batches)
+                .expect("encode sealed qualification section"),
+        })
+        .collect()
+}
+
+fn fixture_range(parts: &[FixturePart]) -> (i64, i64) {
+    let min_ts_us = parts
+        .iter()
+        .map(|part| part.min_ts_us)
+        .min()
+        .expect("qualification fixture has parts");
+    let max_ts_us = parts
+        .iter()
+        .map(|part| part.max_ts_us)
+        .max()
+        .expect("qualification fixture has parts");
+    (min_ts_us, max_ts_us)
+}
+
 fn build_fixture_part(sections: &[FixtureSection], min_ts_us: i64, max_ts_us: i64) -> Vec<u8> {
-    let inputs: Vec<_> = sections
+    let bodies = canonical_fixture_sections(sections);
+    let inputs: Vec<_> = bodies
         .iter()
         .map(|section| SectionInput {
             type_id: section.type_id,

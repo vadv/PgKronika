@@ -234,7 +234,7 @@ impl OverviewWriter {
         self.scrub_one_source_section(snapshot);
         let mut sealed = self.sealed.clone();
         let mut unavailable = self.unavailable.clone();
-        self.refresh_sealed(snapshot, &mut sealed, &mut unavailable);
+        self.refresh_sealed(snapshot, delta, &mut sealed, &mut unavailable);
 
         let mut live = self.live.clone();
         let fold_stats = match fold_refresh(&mut live, snapshot, delta) {
@@ -285,6 +285,7 @@ impl OverviewWriter {
     fn refresh_sealed(
         &mut self,
         snapshot: &LocalDirSnapshot,
+        delta: &RefreshDelta,
         sealed: &mut BTreeMap<SealedLocator, DescriptorEntry>,
         unavailable: &mut BTreeMap<SealedLocator, SegmentDescriptor>,
     ) {
@@ -299,7 +300,15 @@ impl OverviewWriter {
                 .get(locator)
                 .is_some_and(|descriptor| descriptor == entry.descriptor())
         });
-        unavailable.retain(|locator, descriptor| baseline.get(locator) == Some(descriptor));
+        unavailable.retain(|locator, descriptor| {
+            baseline.get(locator) == Some(descriptor)
+                || snapshot.has_invalid_segment_warning(*locator)
+        });
+        for descriptor in &delta.sealed_removed {
+            if snapshot.has_invalid_segment_warning(descriptor.locator) {
+                unavailable.insert(descriptor.locator, *descriptor);
+            }
+        }
         for descriptor in baseline.values() {
             if self.scrub_damaged.get(&descriptor.locator) == Some(descriptor) {
                 sealed.remove(&descriptor.locator);
@@ -568,6 +577,7 @@ mod tests {
 
     use crate::overview::selection::SelectedSealedPlan;
     use crate::overview::view::{IndexView, SourceStatus};
+    use crate::tests::bgwriter_row;
 
     const QUERY_LIMITS: OracleLimits = OracleLimits {
         max_observations: 32,
@@ -586,11 +596,11 @@ mod tests {
     }
 
     fn write_segment(root: &std::path::Path, segment_id: i64, min_ts: i64, max_ts: i64) {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+        let body = BgwriterCheckpointer::encode(&[bgwriter_row(min_ts)]).expect("encode section");
         let bytes = build_part(
             &[SectionInput {
                 type_id: 1_006_001,
-                rows: 0,
+                rows: 1,
                 body: &body,
             }],
             PartMeta {
@@ -962,23 +972,13 @@ mod tests {
             "append must preserve the stable public identity of prior live rows"
         );
 
-        let first_body =
-            PgLogLifecycleV1::encode(std::slice::from_ref(&first)).expect("first body");
-        let second_body =
-            PgLogLifecycleV1::encode(std::slice::from_ref(&second)).expect("second body");
+        let sealed_body = PgLogLifecycleV1::encode(&[first, second]).expect("sealed body");
         let sealed = build_part(
-            &[
-                SectionInput {
-                    type_id: 1_028_001,
-                    rows: 1,
-                    body: &first_body,
-                },
-                SectionInput {
-                    type_id: 1_028_001,
-                    rows: 1,
-                    body: &second_body,
-                },
-            ],
+            &[SectionInput {
+                type_id: 1_028_001,
+                rows: 2,
+                body: &sealed_body,
+            }],
             PartMeta {
                 min_ts: first.ts.0,
                 max_ts: second.ts.0,

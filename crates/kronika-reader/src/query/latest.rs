@@ -416,15 +416,6 @@ fn latest_status_for_source(
             .filter(|entry| entry.rows != 0 && logical.type_ids.contains(&entry.type_id))
         {
             let rows = unit.decode_rows(entry).map_err(attempt_read_error)?;
-            let decoded = u64::try_from(rows.len())
-                .map_err(|_overflow| attempt_read_error(ReadError::CounterOverflow))?;
-            if decoded != u64::from(entry.rows) {
-                return Err(attempt_read_error(ReadError::CatalogRowCountMismatch {
-                    type_id: entry.type_id,
-                    declared: entry.rows,
-                    decoded,
-                }));
-            }
             for row in rows {
                 let Some(Cell::Ts(ts)) = row.get("ts") else {
                     continue;
@@ -707,7 +698,7 @@ mod tests {
             .map(|index| SectionInput {
                 type_id: 2_000_000 + index,
                 rows: 1,
-                body: &[][..],
+                body: b"x",
             })
             .collect::<Vec<_>>();
         let part = build_part(

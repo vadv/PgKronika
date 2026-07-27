@@ -21,6 +21,7 @@ struct EncodedRows {
     body: Vec<u8>,
     rows: u32,
     ts_range: Option<(i64, i64)>,
+    list_i32_child_value_count: usize,
 }
 
 /// Encoded bytes and row count for one section in a flushed journal part.
@@ -32,6 +33,8 @@ pub struct SectionFlushSummary {
     pub rows: u32,
     /// Encoded section body bytes.
     pub body_bytes: usize,
+    /// Child values across all `ListI32` columns in this section.
+    pub list_i32_child_value_count: usize,
 }
 
 /// Accounting for one flushed collection window.
@@ -66,6 +69,7 @@ impl<T: Section + 'static> TypeBuffer for RowBuffer<T> {
     }
 
     fn encode(&self) -> Result<EncodedRows, CodecError> {
+        let list_i32_child_value_count = T::list_i32_child_value_count(&self.rows);
         let body = T::encode(&self.rows)?;
         // `encode` already enforced the row cap; the catalog row field is `u32`.
         let rows = u32::try_from(self.rows.len()).unwrap_or(u32::MAX);
@@ -73,6 +77,7 @@ impl<T: Section + 'static> TypeBuffer for RowBuffer<T> {
             body,
             rows,
             ts_range: T::ts_range(&self.rows),
+            list_i32_child_value_count,
         })
     }
 
@@ -214,11 +219,20 @@ impl SectionBuffers {
             },
         );
         let mut summary_sections = Vec::with_capacity(sections.len());
-        for section in &sections {
+        for (type_id, section) in &encoded {
+            summary_sections.push(SectionFlushSummary {
+                type_id: *type_id,
+                rows: section.rows,
+                body_bytes: section.body.len(),
+                list_i32_child_value_count: section.list_i32_child_value_count,
+            });
+        }
+        for section in dict_sections {
             summary_sections.push(SectionFlushSummary {
                 type_id: section.type_id,
                 rows: section.rows,
                 body_bytes: section.body.len(),
+                list_i32_child_value_count: 0,
             });
         }
         let summary = FlushSummary {
@@ -241,7 +255,9 @@ mod tests {
     use kronika_format::{crc32c, validate_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::instance_metadata::InstanceMetadata;
-    use kronika_registry::{Bytes, MAX_SECTION_ROWS, StrId, Ts, VerifiedSection, decode_any};
+    use kronika_registry::{
+        Bytes, MAX_SECTION_ROWS, PgLocksV2, StrId, Ts, VerifiedSection, decode_any,
+    };
 
     use super::SectionBuffers;
 
@@ -278,6 +294,48 @@ mod tests {
             page_size_bytes: 4096,
             boot_id: StrId(4),
             btime: Ts(ts - 1_000),
+        }
+    }
+
+    fn pg_locks(ts: i64, pid: i32, blocked_by: Vec<i32>) -> PgLocksV2 {
+        PgLocksV2 {
+            ts: Ts(ts),
+            pid,
+            blocked_by,
+            depth: 0,
+            root_pid: pid,
+            datid: 16_384,
+            datname: StrId(1),
+            usename: Some(StrId(2)),
+            application_name: StrId(3),
+            client_addr: StrId(4),
+            backend_type: StrId(5),
+            state: Some(StrId(6)),
+            wait_event_type: None,
+            wait_event: None,
+            query: StrId(7),
+            backend_xid_age: None,
+            backend_xmin_age: None,
+            backend_start: Some(Ts(ts - 60_000_000)),
+            xact_start: Some(Ts(ts - 5_000_000)),
+            query_start: Some(Ts(ts - 1_000_000)),
+            state_change: Some(Ts(ts - 1_000_000)),
+            lock_locktype: None,
+            lock_mode: None,
+            lock_granted: None,
+            lock_database: None,
+            lock_relation: None,
+            lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
+            lock_virtualxid: None,
+            lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
+            lock_fastpath: None,
+            lock_target: None,
+            waitstart: None,
         }
     }
 
@@ -344,6 +402,7 @@ mod tests {
             .expect("bgwriter section summary");
         assert_eq!(bgwriter.rows, 2);
         assert!(bgwriter.body_bytes > 0);
+        assert_eq!(bgwriter.list_i32_child_value_count, 0);
         let instance = flushed
             .summary
             .sections
@@ -352,7 +411,27 @@ mod tests {
             .expect("instance section summary");
         assert_eq!(instance.rows, 1);
         assert!(instance.body_bytes > 0);
+        assert_eq!(instance.list_i32_child_value_count, 0);
         assert!(buffers.is_empty(), "flush clears the window");
+    }
+
+    #[test]
+    fn flush_summary_counts_all_list_i32_child_values() {
+        let mut buffers = SectionBuffers::new();
+        buffers
+            .push(pg_locks(1, 10, vec![1, 2, 3, 4]))
+            .expect("buffer not full");
+        buffers
+            .push(pg_locks(2, 11, vec![5, 6, 7, 8, 9]))
+            .expect("buffer not full");
+
+        let flushed = buffers
+            .flush_with_summary(&[], 7)
+            .expect("flush encodes rows")
+            .expect("rows produce a part");
+        assert_eq!(flushed.summary.sections.len(), 1);
+        assert_eq!(flushed.summary.sections[0].rows, 2);
+        assert_eq!(flushed.summary.sections[0].list_i32_child_value_count, 9);
     }
 
     #[test]
@@ -381,6 +460,7 @@ mod tests {
                 type_id: kronika_registry::DICT_STRINGS_TYPE_ID,
                 rows: 3,
                 body_bytes: 4,
+                list_i32_child_value_count: 0,
             }
         );
         assert_eq!(flushed.summary.part_bytes, flushed.body.len());

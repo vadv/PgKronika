@@ -12,7 +12,6 @@ use kronika_registry::incident_gauges::{
 };
 use kronika_registry::os_meminfo::OsMeminfo;
 use kronika_registry::pg_log::PgLogErrorV1;
-use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
 use kronika_registry::pg_stat_database::PgStatDatabaseV1;
 use kronika_registry::reset_metadata::ResetMetadata;
@@ -92,11 +91,12 @@ async fn fixture_request_captured(
     uri: &str,
     request_headers: &[(&str, &str)],
 ) -> (tempfile::TempDir, CapturedResponse) {
-    let body = BgwriterCheckpointer::encode(&[]).expect("encode empty section");
+    let body =
+        BgwriterCheckpointer::encode(&[bgwriter_row(1_000)]).expect("encode fixture section");
     let bytes = build_part(
         &[SectionInput {
             type_id: 1_006_001,
-            rows: 0,
+            rows: 1,
             body: &body,
         }],
         PartMeta {
@@ -239,7 +239,28 @@ fn assert_problem(
     assert_eq!(request_id, request_id.to_ascii_lowercase());
 }
 
-/// Write an empty `pg_stat_bgwriter + pg_stat_checkpointer` segment.
+pub(crate) fn bgwriter_row(ts: i64) -> BgwriterCheckpointer {
+    BgwriterCheckpointer {
+        ts: Ts(ts),
+        checkpoints_timed: 0,
+        checkpoints_req: 0,
+        checkpoint_write_time: 0.0,
+        checkpoint_sync_time: 0.0,
+        buffers_checkpoint: 0,
+        restartpoints_timed: None,
+        restartpoints_req: None,
+        restartpoints_done: None,
+        buffers_clean: 0,
+        maxwritten_clean: 0,
+        buffers_backend: Some(0),
+        buffers_backend_fsync: Some(0),
+        buffers_alloc: 0,
+        bgwriter_stats_reset: Ts(ts),
+        checkpointer_stats_reset: None,
+    }
+}
+
+/// Write a one-row `pg_stat_bgwriter + pg_stat_checkpointer` segment.
 fn write_bgwriter_segment(
     dir: &std::path::Path,
     file: &str,
@@ -247,11 +268,11 @@ fn write_bgwriter_segment(
     min_ts: i64,
     max_ts: i64,
 ) {
-    let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+    let body = BgwriterCheckpointer::encode(&[bgwriter_row(min_ts)]).expect("encode section");
     let bytes = build_part(
         &[SectionInput {
             type_id: 1_006_001,
-            rows: 0,
+            rows: 1,
             body: &body,
         }],
         PartMeta {

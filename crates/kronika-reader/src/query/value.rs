@@ -250,6 +250,7 @@ mod tests {
                 bytes: b"SELECT * FROM".to_vec(),
                 full_len: 4096,
                 truncated: true,
+                full_sha256: Some([7; 32]),
             },
         )]);
         let (value, signal) = cell_to_value(&Cell::StrId(42), &dictionary);

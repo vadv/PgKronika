@@ -146,7 +146,9 @@ impl From<ReadError> for SourceError {
                 Self::UnsupportedFormat
             }
             ReadError::SectionOutOfBounds { .. }
+            | ReadError::Layout(_)
             | ReadError::DictionarySection { .. }
+            | ReadError::DictionaryConflict { .. }
             | ReadError::SectionTooLarge { .. }
             | ReadError::CatalogOrdinalOutOfRange { .. }
             | ReadError::CatalogRowCountMismatch { .. } => Self::UnsupportedLayout,
@@ -2091,6 +2093,27 @@ mod tests {
         }
     }
 
+    fn bgwriter_row(ts: i64) -> BgwriterCheckpointer {
+        BgwriterCheckpointer {
+            ts: Ts(ts),
+            checkpoints_timed: 0,
+            checkpoints_req: 0,
+            checkpoint_write_time: 0.0,
+            checkpoint_sync_time: 0.0,
+            buffers_checkpoint: 0,
+            restartpoints_timed: None,
+            restartpoints_req: None,
+            restartpoints_done: None,
+            buffers_clean: 0,
+            maxwritten_clean: 0,
+            buffers_backend: Some(0),
+            buffers_backend_fsync: Some(0),
+            buffers_alloc: 0,
+            bgwriter_stats_reset: Ts(ts),
+            checkpointer_stats_reset: None,
+        }
+    }
+
     fn lifecycle_pgm(rows: &[PgLogLifecycleV1], min_ts: i64, max_ts: i64) -> Vec<u8> {
         let body = PgLogLifecycleV1::encode(rows).expect("encode lifecycle section");
         let rows_len = row_count(rows);
@@ -2215,24 +2238,30 @@ mod tests {
             .chain(coverage.iter().map(|row| row.ts.0))
             .max()
             .expect("fixture has a timestamp");
+        let mut sections = Vec::with_capacity(3);
+        if !resets.is_empty() {
+            sections.push(SectionInput {
+                type_id: 1_020_001,
+                rows: row_count(resets),
+                body: &reset_body,
+            });
+        }
+        if !senders.is_empty() {
+            sections.push(SectionInput {
+                type_id: 1_033_001,
+                rows: row_count(senders),
+                body: &sender_body,
+            });
+        }
+        if !coverage.is_empty() {
+            sections.push(SectionInput {
+                type_id: 1_038_001,
+                rows: row_count(coverage),
+                body: &coverage_body,
+            });
+        }
         build_part(
-            &[
-                SectionInput {
-                    type_id: 1_020_001,
-                    rows: row_count(resets),
-                    body: &reset_body,
-                },
-                SectionInput {
-                    type_id: 1_033_001,
-                    rows: row_count(senders),
-                    body: &sender_body,
-                },
-                SectionInput {
-                    type_id: 1_038_001,
-                    rows: row_count(coverage),
-                    body: &coverage_body,
-                },
-            ],
+            &sections,
             PartMeta {
                 min_ts,
                 max_ts,
@@ -2426,6 +2455,12 @@ mod tests {
 
         let mut sections = vec![
             (
+                1_006_001,
+                1,
+                BgwriterCheckpointer::encode(&[bgwriter_row(1_000)])
+                    .expect("encode unrelated section"),
+            ),
+            (
                 1_022_001,
                 1,
                 PgLogErrorV1::encode(&[PgLogErrorV1 {
@@ -2578,11 +2613,6 @@ mod tests {
                     dict_dropped_fields: 0,
                 }])
                 .expect("encode temp file"),
-            ),
-            (
-                1_006_001,
-                0,
-                BgwriterCheckpointer::encode(&[]).expect("encode unrelated section"),
             ),
         ];
         sections.extend(
@@ -3035,18 +3065,21 @@ mod tests {
 
     #[test]
     fn catalog_bound_is_checked_before_any_section_body_read() {
-        let body = PgLogLifecycleV1::encode(&[]).expect("encode empty lifecycle section");
+        let bgwriter_body =
+            BgwriterCheckpointer::encode(&[bgwriter_row(1_000)]).expect("encode bgwriter");
+        let lifecycle_body = PgLogLifecycleV1::encode(&[lifecycle_row(1_000, 0, None, None)])
+            .expect("encode lifecycle");
         let bytes = build_part(
             &[
                 SectionInput {
-                    type_id: 1_028_001,
-                    rows: 0,
-                    body: &body,
+                    type_id: 1_006_001,
+                    rows: 1,
+                    body: &bgwriter_body,
                 },
                 SectionInput {
                     type_id: 1_028_001,
-                    rows: 0,
-                    body: &body,
+                    rows: 1,
+                    body: &lifecycle_body,
                 },
             ],
             PartMeta {

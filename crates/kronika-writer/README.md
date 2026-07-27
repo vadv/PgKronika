@@ -71,9 +71,25 @@ continue through an indeterminate persistence state.
 
 ## Sealing
 
-`seal(journal, owner, SegmentAddress)` streams each part, copies section bodies
-into a temporary file in the segment's UTC day, and writes the combined end
-catalog. PGM publication synchronizes the file, adds the canonical
+`seal(journal, owner, SegmentAddress)` validates every recorded part and reads
+each body
+through its checked catalog range. For each registered data `type_id`, it
+decodes all journal bodies, combines their rows, applies the registry sort key
+plus every remaining column as a deterministic total order, and emits one
+canonical Parquet body. Dictionary bodies are decoded and normalized into at
+most one `dict.strings` and one `dict.blobs` body. Exact repeated dictionary
+records are deduplicated; conflicting values, metadata, or placement fail the
+seal.
+
+Final bodies use Parquet 1.0, PLAIN values, RLE levels, and Zstd level 6, with
+dictionary encoding, statistics, and offset indexes disabled. Collector
+admission checks aggregate rows, `List<i32>` child values, dictionary rows and
+stored bytes, a one-page PLAIN value budget per physical column, and the 8 MiB
+encoded-body cap before append. Seal checks the same limits again while
+decoding and encoding.
+
+Seal writes the coalesced bodies and end catalog to a temporary file in the
+segment's UTC day. PGM publication synchronizes the file, adds the canonical
 `YYYY/MM/DD/N.pgm` name with a hard link, synchronizes the day, removes the
 temporary name, and synchronizes the day again. An existing destination is
 never overwritten; recovery succeeds only when it can prove that the existing
@@ -83,11 +99,10 @@ After acquiring the writer owner lock, collector startup removes only
 recognized stale PGM publication temporaries. It leaves OVF and overview-probe
 temporaries to the overview owner.
 
-The writer preserves repeated section entries in catalog order. It does not
-compact or re-encode them into one section. It also does not reset the journal,
-choose the `SegmentId`, or implement retention; those lifecycle decisions
-belong to the collector. `SegmentAddress` derives the only valid path from the
-id, and the writer accepts only that strict calendar-tree address.
+Seal never resets the journal, chooses the `SegmentId`, or implements
+retention; those lifecycle decisions belong to the collector.
+`SegmentAddress` derives the only valid path from the id, and the writer
+accepts only that strict calendar-tree address.
 
 Failures distinguish journal I/O/framing/full conditions from seal validation,
 destination, and synchronization errors. See [`src/lib.rs`](src/lib.rs) for the

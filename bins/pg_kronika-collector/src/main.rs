@@ -48,7 +48,7 @@ use buffering::{
 };
 use config::Config;
 use coverage::{CoverageInputs, collect_coverage_records, push_coverage, snapshot_coverage};
-use kronika_layout::{DataRoot, LayoutLimits, TemporaryKind, WriterOwner};
+use kronika_layout::{DataRoot, LayoutLimits, QuarantineStatus, TemporaryKind, WriterOwner};
 use kronika_source_log::LogCollector;
 use kronika_source_os::{OsScope, ProcFs, detect_container};
 use kronika_source_pg::pool::{ConnectionPool, DEFAULT_MAX_DATABASES};
@@ -66,7 +66,7 @@ use pool_sources::{PoolReads, read_pool_sources};
 use scheduler::{DueSet, Scheduler, SourceKind};
 use segments::{
     SegmentState, append_window_and_maybe_seal, encode_window, open_collector_journal,
-    seal_open_segment, validate_existing_segments,
+    quarantine_invalid_segments, seal_open_segment,
 };
 use service_sections::{collect_due_instance, collect_service_sections};
 use source_contracts::activity_dict_limits;
@@ -105,16 +105,24 @@ fn cleanup_writer_temporaries(owner: &WriterOwner, limits: LayoutLimits) -> Resu
         .root()
         .scan(limits)
         .context("scan for stale writer temporaries")?;
-    let mut removed = 0_usize;
+    let mut quarantined = 0_usize;
     for temporary in &snapshot.temporaries {
         if temporary.kind == TemporaryKind::Pgm {
-            owner
-                .remove_temporary(temporary)
-                .context("remove a stale writer temporary")?;
-            removed += 1;
+            let outcome = owner.quarantine_temporary(temporary);
+            log_event(
+                LogLevel::Warn,
+                "writer_temporary_quarantine",
+                &[
+                    field("reason", "stale_pgm_temporary"),
+                    field("status", format!("{:?}", outcome.status)),
+                ],
+            );
+            if matches!(outcome.status, QuarantineStatus::Quarantined { .. }) {
+                quarantined += 1;
+            }
         }
     }
-    Ok(removed)
+    Ok(quarantined)
 }
 
 fn prepare_collector_storage(
@@ -122,16 +130,12 @@ fn prepare_collector_storage(
     limits: LayoutLimits,
     journal_max_bytes: u64,
 ) -> Result<(Journal, Option<PathBuf>)> {
-    validate_existing_segments(owner.root(), limits)?;
+    quarantine_invalid_segments(owner, limits)?;
     cleanup_writer_temporaries(owner, limits)?;
     open_collector_journal(owner, journal_max_bytes)
 }
 
 fn acquire_collector_writer(root: &DataRoot, limits: LayoutLimits) -> Result<WriterOwner> {
-    // Refuse corrupt immutable input before creating the persistent lock name.
-    // Validate again under the acquired lock in `prepare_collector_storage` so
-    // a preceding writer cannot publish unchecked input during handoff.
-    validate_existing_segments(root, limits)?;
     root.acquire_writer(limits)
         .context("acquire exclusive writer ownership")
 }
@@ -141,6 +145,8 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
     config.validate_runtime_paths()?;
+    kronika_writer::dict::validate_dict_limits_for_seal(activity_dict_limits())
+        .context("dictionary limits admit a value above the sealed page budget")?;
     let data_root = DataRoot::open(&config.out_dir).context("open the data root")?;
     let writer_owner = acquire_collector_writer(&data_root, LayoutLimits::default())?;
 
@@ -593,6 +599,7 @@ async fn snapshot_and_seal(
         main_src.ts.0,
         due.forced(),
         &flushed,
+        &interner,
     )
     .context("append the collection window")?;
     commit_log_collection(log_collector, log_collection.as_ref(), config);

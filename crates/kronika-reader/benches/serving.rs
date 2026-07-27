@@ -289,30 +289,34 @@ fn build_fixture(dir: &Path, n: usize, shape: SortKeyShape) {
     let body_v4 = PgStatStatementsV4::encode(&v4).expect("encode v4");
     let body_v1 = PgStatStatementsV1::encode(&v1).expect("encode v1");
 
+    let mut inputs = Vec::with_capacity(5);
+    if n_v1 != 0 {
+        inputs.push(SectionInput {
+            type_id: 1_002_001,
+            rows: u32::try_from(n_v1).expect("v1 count fits u32"),
+            body: &body_v1,
+        });
+    }
+    if n_v4 != 0 {
+        inputs.push(SectionInput {
+            type_id: 1_002_004,
+            rows: u32::try_from(n_v4).expect("v4 count fits u32"),
+            body: &body_v4,
+        });
+    }
+    if n_v6 != 0 {
+        inputs.push(SectionInput {
+            type_id: 1_002_006,
+            rows: u32::try_from(n_v6).expect("v6 count fits u32"),
+            body: &body_v6,
+        });
+    }
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
-    let mut inputs: Vec<SectionInput<'_>> = dict_sections
-        .iter()
-        .map(|s| SectionInput {
-            type_id: s.type_id,
-            rows: s.rows,
-            body: &s.body,
-        })
-        .collect();
-    inputs.push(SectionInput {
-        type_id: 1_002_006,
-        rows: u32::try_from(n_v6).expect("v6 count fits u32"),
-        body: &body_v6,
-    });
-    inputs.push(SectionInput {
-        type_id: 1_002_004,
-        rows: u32::try_from(n_v4).expect("v4 count fits u32"),
-        body: &body_v4,
-    });
-    inputs.push(SectionInput {
-        type_id: 1_002_001,
-        rows: u32::try_from(n_v1).expect("v1 count fits u32"),
-        body: &body_v1,
-    });
+    inputs.extend(dict_sections.iter().map(|section| SectionInput {
+        type_id: section.type_id,
+        rows: section.rows,
+        body: &section.body,
+    }));
 
     let min_ts = base_ts;
     let max_ts = base_ts + i64::try_from(n).expect("row count fits i64");
@@ -435,19 +439,16 @@ fn build_many_segments(dir: &Path, m: usize) {
         let row = statements_v6_row(first_window_us, 1, 1, idx, StrId(str_id.get()));
         let body = PgStatStatementsV6::encode(&[row]).expect("encode v6");
         let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
-        let mut inputs: Vec<SectionInput<'_>> = dict_sections
-            .iter()
-            .map(|s| SectionInput {
-                type_id: s.type_id,
-                rows: s.rows,
-                body: &s.body,
-            })
-            .collect();
-        inputs.push(SectionInput {
+        let mut inputs = vec![SectionInput {
             type_id: 1_002_006,
             rows: 1,
             body: &body,
-        });
+        }];
+        inputs.extend(dict_sections.iter().map(|section| SectionInput {
+            type_id: section.type_id,
+            rows: section.rows,
+            body: &section.body,
+        }));
         let part = build_part(
             &inputs,
             PartMeta {

@@ -243,6 +243,25 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
         plan.sealed_gap(),
         "scrub damage becomes an unavailable descriptor"
     );
+    let mut repeated_snapshot = (*state.snapshot()).clone();
+    let repeated_delta = repeated_snapshot
+        .refresh_incremental_delta()
+        .expect("repeated invalid source refresh");
+    assert!(repeated_delta.sealed_removed.is_empty());
+    state
+        .republish_store_view(repeated_snapshot, &repeated_delta)
+        .expect("repeated damaged publication");
+    let repeated_plan = state
+        .select_overview(
+            state.overview_view(),
+            &[7],
+            kronika_analytics::overview::CoverageSpan::new(0, 2).expect("range"),
+        )
+        .expect("persistently damaged source selection");
+    assert!(
+        repeated_plan.sealed_gap(),
+        "the unavailable descriptor remains while the invalid-PGM warning persists"
+    );
 
     let damaged = app(state.clone(), None, test_metrics_handle())
         .oneshot(

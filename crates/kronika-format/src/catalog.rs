@@ -38,9 +38,8 @@ const META_CRC_OFFSET: usize = 32;
 /// One row in the end catalog.
 ///
 /// Each row points to one section body and records the checksum of that body.
-/// A `type_id` may repeat: repeated rows are parts of one logical section in
-/// catalog order, except for chart sections where repeated rows describe
-/// different entities.
+/// Physical readers additionally require the canonical ordering checked by
+/// [`validate_catalog_layout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
     /// Section type from the type registry (`kronika-registry`).
@@ -63,8 +62,7 @@ pub struct Entry {
 /// stored after those entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Catalog {
-    /// Section table, in on-disk order. Order matters for multi-part
-    /// sections, so it is preserved exactly.
+    /// Section table in canonical physical order.
     pub entries: Vec<Entry>,
     /// Minimal timestamp of the segment, unix microseconds.
     pub min_ts: i64,
@@ -110,6 +108,141 @@ impl CatalogView<'_> {
 pub struct TailIndex {
     /// Length of the catalog (entries + meta) preceding the tail index.
     pub catalog_len: u32,
+}
+
+/// Why a decoded catalog is not the canonical physical section layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogLayoutError {
+    type_id: Option<u32>,
+    reason: &'static str,
+}
+
+impl CatalogLayoutError {
+    const fn entry(type_id: u32, reason: &'static str) -> Self {
+        Self {
+            type_id: Some(type_id),
+            reason,
+        }
+    }
+
+    const fn container(reason: &'static str) -> Self {
+        Self {
+            type_id: None,
+            reason,
+        }
+    }
+}
+
+impl fmt::Display for CatalogLayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(type_id) = self.type_id {
+            write!(f, "section {type_id}: {}", self.reason)
+        } else {
+            f.write_str(self.reason)
+        }
+    }
+}
+
+impl Error for CatalogLayoutError {}
+
+const DICT_STRINGS_TYPE_ID: u32 = 3_001_001;
+const DICT_BLOBS_TYPE_ID: u32 = 3_002_001;
+const MAX_PHYSICAL_SECTION_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PHYSICAL_SECTION_ROWS: u32 = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SectionOrder {
+    Data(u32),
+    Strings,
+    Blobs,
+}
+
+/// Validate the canonical physical section inventory and exact body geometry.
+///
+/// Data sections must be unique and ordered by ascending `type_id`, followed
+/// by at most one strings dictionary and at most one blobs dictionary. Bodies
+/// must be contiguous from the opening magic through `catalog_at`, with zero
+/// flags and bounded lengths and row counts.
+///
+/// # Errors
+///
+/// Returns [`CatalogLayoutError`] for any non-canonical entry or body range.
+pub fn validate_catalog_layout(
+    catalog: &Catalog,
+    catalog_at: u64,
+) -> Result<(), CatalogLayoutError> {
+    let mut expected_offset = MAGIC.len() as u64;
+    let mut previous: Option<SectionOrder> = None;
+
+    for entry in &catalog.entries {
+        if entry.flags != 0 {
+            return Err(CatalogLayoutError::entry(
+                entry.type_id,
+                "reserved flags are not zero",
+            ));
+        }
+        if entry.rows == 0 {
+            return Err(CatalogLayoutError::entry(
+                entry.type_id,
+                "populated section has zero rows",
+            ));
+        }
+        if entry.len == 0 {
+            return Err(CatalogLayoutError::entry(
+                entry.type_id,
+                "section body is empty",
+            ));
+        }
+        if entry.len > MAX_PHYSICAL_SECTION_BYTES {
+            return Err(CatalogLayoutError::entry(
+                entry.type_id,
+                "body length is above the physical cap",
+            ));
+        }
+        if entry.rows > MAX_PHYSICAL_SECTION_ROWS {
+            return Err(CatalogLayoutError::entry(
+                entry.type_id,
+                "row count is above the physical cap",
+            ));
+        }
+        if entry.offset != expected_offset {
+            return Err(CatalogLayoutError::entry(
+                entry.type_id,
+                "body is not contiguous with the preceding section",
+            ));
+        }
+
+        let order = match entry.type_id {
+            DICT_STRINGS_TYPE_ID => SectionOrder::Strings,
+            DICT_BLOBS_TYPE_ID => SectionOrder::Blobs,
+            type_id => SectionOrder::Data(type_id),
+        };
+        if let Some(previous_order) = previous {
+            if order == previous_order {
+                return Err(CatalogLayoutError::entry(
+                    entry.type_id,
+                    "section type occurs more than once",
+                ));
+            }
+            if order < previous_order {
+                return Err(CatalogLayoutError::entry(
+                    entry.type_id,
+                    "section is out of canonical order",
+                ));
+            }
+        }
+        previous = Some(order);
+        expected_offset = entry.offset.checked_add(entry.len).ok_or_else(|| {
+            CatalogLayoutError::entry(entry.type_id, "body range overflows the container")
+        })?;
+    }
+
+    if expected_offset != catalog_at {
+        return Err(CatalogLayoutError::container(
+            "section bodies do not end at the catalog start",
+        ));
+    }
+    Ok(())
 }
 
 /// Why catalog or tail index bytes failed to decode.
@@ -494,5 +627,77 @@ mod tests {
             Catalog::decode(&body),
             Err(DecodeError::BadCrc { .. })
         ));
+    }
+
+    fn layout_catalog(entries: Vec<Entry>) -> Catalog {
+        Catalog {
+            entries,
+            min_ts: 0,
+            max_ts: 0,
+            source_id: 0,
+            format_version: crate::FORMAT_VERSION,
+        }
+    }
+
+    const fn layout_entry(type_id: u32, offset: u64, len: u64) -> Entry {
+        Entry {
+            type_id,
+            flags: 0,
+            offset,
+            len,
+            rows: 1,
+            crc32c: 0,
+        }
+    }
+
+    #[test]
+    fn canonical_layout_accepts_data_then_dictionary_tail() {
+        let catalog = layout_catalog(vec![
+            layout_entry(1_006_001, 4, 2),
+            layout_entry(1_021_001, 6, 3),
+            layout_entry(DICT_STRINGS_TYPE_ID, 9, 1),
+            layout_entry(DICT_BLOBS_TYPE_ID, 10, 2),
+        ]);
+
+        assert_eq!(validate_catalog_layout(&catalog, 12), Ok(()));
+    }
+
+    #[test]
+    fn canonical_layout_rejects_duplicate_or_misordered_sections() {
+        let duplicate = layout_catalog(vec![
+            layout_entry(1_006_001, 4, 1),
+            layout_entry(1_006_001, 5, 1),
+        ]);
+        assert!(validate_catalog_layout(&duplicate, 6).is_err());
+
+        let misordered = layout_catalog(vec![
+            layout_entry(DICT_STRINGS_TYPE_ID, 4, 1),
+            layout_entry(1_006_001, 5, 1),
+        ]);
+        assert!(validate_catalog_layout(&misordered, 6).is_err());
+    }
+
+    #[test]
+    fn canonical_layout_rejects_flags_caps_and_noncontiguous_bodies() {
+        let mut flagged = layout_catalog(vec![layout_entry(1_006_001, 4, 1)]);
+        flagged.entries[0].flags = 1;
+        assert!(validate_catalog_layout(&flagged, 5).is_err());
+
+        let mut too_many_rows = layout_catalog(vec![layout_entry(1_006_001, 4, 1)]);
+        too_many_rows.entries[0].rows = MAX_PHYSICAL_SECTION_ROWS + 1;
+        assert!(validate_catalog_layout(&too_many_rows, 5).is_err());
+
+        let oversized = layout_catalog(vec![layout_entry(
+            1_006_001,
+            4,
+            MAX_PHYSICAL_SECTION_BYTES + 1,
+        )]);
+        assert!(validate_catalog_layout(&oversized, 4 + MAX_PHYSICAL_SECTION_BYTES + 1).is_err());
+
+        let gap = layout_catalog(vec![layout_entry(1_006_001, 5, 1)]);
+        assert!(validate_catalog_layout(&gap, 6).is_err());
+
+        let trailing = layout_catalog(vec![layout_entry(1_006_001, 4, 1)]);
+        assert!(validate_catalog_layout(&trailing, 6).is_err());
     }
 }

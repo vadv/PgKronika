@@ -4,10 +4,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_layout::{DataRoot, LayoutLimits};
-use kronika_registry::Section;
-use kronika_registry::Ts;
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 use kronika_registry::pg_log::PgLogLifecycleV1;
+use kronika_registry::{Section, Ts};
 use kronika_writer::{Journal, JournalConfig, seal};
 
 use super::*;
@@ -15,11 +14,38 @@ use crate::{FactOrigin, LIMIT};
 
 /// Build one minimal valid part with a real section.
 fn make_part(min_ts: i64, max_ts: i64, source_id: u64) -> Vec<u8> {
-    let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+    make_part_with_timed(min_ts, max_ts, source_id, 0)
+}
+
+fn make_part_with_timed(
+    min_ts: i64,
+    max_ts: i64,
+    source_id: u64,
+    checkpoints_timed: i64,
+) -> Vec<u8> {
+    let row = BgwriterCheckpointer {
+        ts: Ts(min_ts),
+        checkpoints_timed,
+        checkpoints_req: 0,
+        checkpoint_write_time: 0.0,
+        checkpoint_sync_time: 0.0,
+        buffers_checkpoint: 0,
+        restartpoints_timed: None,
+        restartpoints_req: None,
+        restartpoints_done: None,
+        buffers_clean: 0,
+        maxwritten_clean: 0,
+        buffers_backend: Some(0),
+        buffers_backend_fsync: Some(0),
+        buffers_alloc: 0,
+        bgwriter_stats_reset: Ts(min_ts),
+        checkpointer_stats_reset: None,
+    };
+    let body = BgwriterCheckpointer::encode(&[row]).expect("encode section");
     build_part(
         &[SectionInput {
             type_id: 1_006_001,
-            rows: 0,
+            rows: 1,
             body: &body,
         }],
         PartMeta {
@@ -178,8 +204,7 @@ fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
 fn exact_active_part_open_is_independent_of_query_unit_deduplication() {
     let source = tempfile::tempdir().expect("source directory");
     let bytes = lifecycle_part(7);
-    write_segment(source.path(), 1_500, &bytes);
-    fs::write(source.path().join("active.parts"), journal(&bytes)).expect("write active part");
+    seal_parts_without_reset(source.path(), 1_500, &[&bytes]);
 
     let mut snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
     assert_eq!(snapshot.units().len(), 1, "query view suppresses duplicate");
@@ -195,13 +220,16 @@ fn exact_active_part_open_is_independent_of_query_unit_deduplication() {
         .open_active_part(descriptor)
         .expect("open exact active part");
     assert_eq!(active.catalog().source_id, 7);
+    let sealed = snapshot
+        .unit_catalog(0)
+        .expect("read sealed catalog")
+        .expect("sealed catalog");
+    assert_eq!(sealed.source_id, active.catalog().source_id);
     assert_eq!(
-        active.catalog(),
-        &snapshot
-            .unit_catalog(0)
-            .expect("read sealed catalog")
-            .expect("sealed catalog")
+        (sealed.min_ts, sealed.max_ts),
+        (active.catalog().min_ts, active.catalog().max_ts)
     );
+    assert_eq!(sealed.entries[0].rows, active.catalog().entries[0].rows);
 }
 
 #[test]
@@ -535,11 +563,9 @@ fn stable_active_corruption_remains_an_error() {
 fn exact_sealed_active_catalog_is_deduped_no_double() {
     let dir = tempfile::tempdir().unwrap();
     let part = make_part(1000, 2000, 42);
-    // Write the same data as a sealed .pgm.
-    write_segment(dir.path(), 1_000, &part);
-    // And as the exact same active part.
-    let journal = journal(&part);
-    fs::write(dir.path().join("active.parts"), &journal).unwrap();
+    // Production sealing publishes the canonical PGM and deliberately leaves
+    // the exact source journal in the crash window exercised here.
+    seal_parts_without_reset(dir.path(), 1_000, &[&part]);
 
     let snap = LocalDirSnapshot::open(dir.path()).unwrap();
     let units = snap.units();
@@ -567,13 +593,47 @@ fn exact_sealed_multi_part_aggregate_is_deduped_as_one_segment() {
 }
 
 #[test]
+fn same_catalog_envelope_with_changed_value_does_not_hide_active_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = make_part(1000, 2000, 42);
+    let second = make_part(3000, 4000, 42);
+    seal_parts_without_reset(dir.path(), 1_000, &[&first, &second]);
+
+    let changed_second = make_part_with_timed(3000, 4000, 42, 1);
+    let segment_id = SegmentId::new(1_000).expect("test segment id");
+    fs::write(
+        dir.path().join("active.parts"),
+        crate::test_layout::journal_bytes(segment_id, &[&first, &changed_second]),
+    )
+    .expect("replace active journal with a same-envelope generation");
+
+    let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+    assert_eq!(
+        snap.units().len(),
+        3,
+        "an exact body mismatch must keep the sealed segment and every active part visible"
+    );
+    assert!(!snap.units()[0].live);
+    assert!(snap.units()[1..].iter().all(|unit| unit.live));
+}
+
+#[test]
 fn dictionary_only_aggregate_uses_the_sealers_zero_interval() {
     let dir = tempfile::tempdir().unwrap();
+    let mut interner = Interner::new(DictLimits::new(256, 1 << 20).expect("limits"));
+    interner
+        .intern(b"dictionary-only")
+        .expect("intern dictionary-only value");
+    let dictionary = dict::encode(interner.window())
+        .expect("encode dictionary")
+        .into_iter()
+        .find(|section| section.type_id == DICT_STRINGS_TYPE_ID)
+        .expect("string dictionary section");
     let dictionary_only = build_part(
         &[SectionInput {
-            type_id: kronika_registry::DICT_STRINGS_TYPE_ID,
-            rows: 0,
-            body: b"dictionary",
+            type_id: dictionary.type_id,
+            rows: dictionary.rows,
+            body: &dictionary.body,
         }],
         PartMeta {
             min_ts: i64::MAX,
@@ -1605,8 +1665,10 @@ fn an_incomplete_active_baseline_forces_full_descriptor_recovery() {
     let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
     Arc::make_mut(&mut snap.scan.active).clear();
     snap.scan.warnings.push(StoreWarning {
-        path: journal_path,
-        reason: "simulated scan race omitted the validated prefix".to_owned(),
+        affected: StoreObject::ActiveJournal,
+        reason: StoreWarningReason::ActiveJournal(kronika_store::ActiveJournalWarningReason::Io),
+        identity: None,
+        failure: None,
     });
     snap.journal_descriptors_complete = false;
     snap.delta_initialized = true;
@@ -1627,7 +1689,7 @@ fn an_incomplete_active_baseline_forces_full_descriptor_recovery() {
 }
 
 #[test]
-fn damaged_sealed_file_fails_closed_and_recovery_replaces_its_identity() {
+fn damaged_sealed_file_is_excluded_until_a_valid_identity_returns() {
     let dir = tempfile::tempdir().unwrap();
     let valid_segment = make_part(1000, 2000, 1);
     let sealed_path = write_segment(dir.path(), 1_000, &valid_segment);
@@ -1637,41 +1699,49 @@ fn damaged_sealed_file_fails_closed_and_recovery_replaces_its_identity() {
     let generation = snap.view_generation();
 
     fs::write(&sealed_path, b"not a pgm segment").unwrap();
-    let unavailable = snap
+    let excluded = snap
         .refresh_incremental_delta()
-        .expect_err("a damaged sealed segment is fatal");
-    assert_eq!(unavailable.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(snap.view_generation(), generation);
-    assert_eq!(snap.units().len(), 1);
+        .expect("damage is localized to the invalid segment");
+    assert!(excluded.view_changed);
+    assert_eq!(excluded.sealed_added.len(), 0);
+    assert_eq!(excluded.sealed_removed.len(), 1);
+    assert!(snap.view_generation() > generation);
+    assert!(snap.units().is_empty());
+    assert!(matches!(
+        snap.warnings(),
+        [StoreWarning {
+            affected: StoreObject::Segment(_),
+            reason: StoreWarningReason::InvalidPgm(_),
+            ..
+        }]
+    ));
 
     fs::write(&sealed_path, &valid_segment).unwrap();
     let recovered = snap.refresh_incremental_delta().expect("readable recovery");
     assert!(recovered.view_changed);
     assert_eq!(recovered.sealed_added.len(), 1);
-    assert_eq!(recovered.sealed_removed.len(), 1);
-    assert_eq!(
-        recovered.sealed_added[0].catalog_digest,
-        recovered.sealed_removed[0].catalog_digest
-    );
-    assert_ne!(
-        recovered.sealed_added[0].file_identity,
-        recovered.sealed_removed[0].file_identity
-    );
+    assert!(recovered.sealed_removed.is_empty());
+    assert!(snap.warnings().is_empty());
 
     fs::write(&sealed_path, b"not a pgm segment").unwrap();
-    let unavailable_again = snap
+    let excluded_again = snap
         .refresh_incremental_delta()
-        .expect_err("second damage remains fatal");
-    assert_eq!(unavailable_again.kind(), io::ErrorKind::InvalidData);
+        .expect("second damage is localized again");
+    assert!(excluded_again.view_changed);
+    assert_eq!(excluded_again.sealed_removed.len(), 1);
+    assert!(excluded_again.sealed_added.is_empty());
 
     fs::remove_file(&sealed_path).unwrap();
     let absent = snap
         .refresh_incremental_delta()
         .expect("authoritative absence");
-    assert_eq!(
-        absent.sealed_removed.len(),
-        1,
-        "the preserved descriptor is removed exactly once"
+    assert!(
+        absent.sealed_removed.is_empty(),
+        "the invalid descriptor was already removed exactly once"
+    );
+    assert!(
+        snap.warnings().is_empty(),
+        "absence clears the invalid-file warning"
     );
     let repeated = snap.refresh_incremental_delta().expect("repeated absence");
     assert!(repeated.sealed_removed.is_empty());
@@ -1701,7 +1771,6 @@ fn same_name_sealed_replacement_reports_remove_and_add() {
 
 #[test]
 fn sealed_delta_compares_compact_scans_without_a_full_descriptor_baseline() {
-    let dir = tempfile::tempdir().unwrap();
     let catalog = PgmUnit::open(make_part(1000, 2000, 1).as_slice())
         .expect("unit")
         .catalog()
@@ -1775,12 +1844,16 @@ fn sealed_delta_compares_compact_scans_without_a_full_descriptor_baseline() {
 
     let journal_warning = LocalScan {
         warnings: vec![StoreWarning {
-            path: dir.path().join("active.parts"),
-            reason: "journal unavailable".to_owned(),
+            affected: StoreObject::ActiveJournal,
+            reason: StoreWarningReason::ActiveJournal(
+                kronika_store::ActiveJournalWarningReason::Io,
+            ),
+            identity: None,
+            failure: None,
         }],
         ..empty_scan
     };
-    assert!(!journal_descriptors_complete(&journal_warning, dir.path()));
+    assert!(!journal_descriptors_complete(&journal_warning));
 }
 
 #[test]
@@ -1901,6 +1974,51 @@ fn repeated_identity_churn_is_bounded() {
 
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(attempts.get(), MAX_CONSISTENT_SCAN_ATTEMPTS);
+}
+
+#[test]
+fn stale_proof_retry_succeeds_after_one_interruption() {
+    let attempts = std::cell::Cell::new(0_usize);
+
+    let value = retry_stale_proof(|| {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() == 1 {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "stale proof"))
+        } else {
+            Ok(attempts.get())
+        }
+    })
+    .expect("the proof settles on the second attempt");
+
+    assert_eq!(value, 2);
+}
+
+#[test]
+fn stale_proof_retry_is_bounded() {
+    let attempts = std::cell::Cell::new(0_usize);
+
+    let error = retry_stale_proof(|| -> io::Result<()> {
+        attempts.set(attempts.get() + 1);
+        Err(io::Error::new(io::ErrorKind::Interrupted, "stale proof"))
+    })
+    .expect_err("a persistently changing journal is reported");
+
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(attempts.get(), MAX_CONSISTENT_SCAN_ATTEMPTS);
+}
+
+#[test]
+fn stale_proof_retry_keeps_other_errors_unretried() {
+    let attempts = std::cell::Cell::new(0_usize);
+
+    let error = retry_stale_proof(|| -> io::Result<()> {
+        attempts.set(attempts.get() + 1);
+        Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt sealed"))
+    })
+    .expect_err("corruption is not retried");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(attempts.get(), 1);
 }
 
 #[test]

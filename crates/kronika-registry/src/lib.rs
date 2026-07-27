@@ -31,6 +31,7 @@ extern crate self as kronika_registry;
 mod codec;
 mod contract;
 mod generic;
+mod parquet_preflight;
 mod pool;
 mod section;
 mod type_id;
@@ -47,11 +48,14 @@ mod sealed {
 
 pub use codec::pg_locks::{PgLocksV1, PgLocksV2};
 pub use codec::{
-    CodecError, DecodeStats, DecodedSection, ListColumn, MAX_ROW_GROUPS, MAX_SECTION_BYTES,
-    MAX_SECTION_ROWS, VerifiedSection, arrow_schema, nullable_bool, nullable_column, opt_bool,
-    opt_primitive, read_list_i32, required_bool, required_column, write_bool, write_bool_nullable,
+    CodecError, DecodeStats, DecodedSection, ListColumn, MAX_DECODED_SECTION_BYTES, MAX_ROW_GROUPS,
+    MAX_SECTION_BYTES, MAX_SECTION_ROWS, SEALED_DATA_PAGE_BYTES, SEALED_ZSTD_LEVEL,
+    SealedPlainColumnSize, VerifiedSection, arrow_schema, encode_sealed_batches, nullable_bool,
+    nullable_column, opt_bool, opt_primitive, read_list_i32, required_bool, required_column,
+    sealed_data_body_bound, sealed_plain_body_bound, write_bool, write_bool_nullable,
     write_list_i32, write_nullable, write_required,
 };
+pub use parquet_preflight::{validate_parquet_decode_work, validate_plain_parquet_decode_work};
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{
     bgwriter_checkpointer, collection_coverage, incident_gauges, instance_metadata, os_cgroup_cpu,

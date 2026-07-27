@@ -1518,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn symlink_pgm_fails_closed_and_returns_rebuilt_facts() {
+    fn symlink_pgm_is_rejected_without_touching_its_target() {
         let directory = TempDir::new().expect("data directory");
         let outside = TempDir::new().expect("outside directory");
         let bytes = lifecycle_pgm(7);
@@ -1531,7 +1531,10 @@ mod tests {
             .load_or_build(&unit(&bytes), &context(), &LIMIT)
             .expect("source build remains available");
         assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
-        assert_eq!(loaded.persist_error(), Some(PersistError::UnsafePath));
+        assert_eq!(
+            loaded.persist_error(),
+            Some(PersistError::InvalidSidecarState)
+        );
         assert_eq!(std::fs::read(&outside_pgm).expect("outside PGM"), bytes);
         assert_eq!(store.fallback_stats().inserts, 0);
         assert_eq!(store.fallback_stats().resident_entries, 0);

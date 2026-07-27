@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use kronika_format::{
     Catalog, Crc32c, DecodeError, ENTRY_LEN, Entry, FORMAT_VERSION, MAGIC, META_LEN,
-    TAIL_INDEX_LEN, TailIndex, crc32c,
+    TAIL_INDEX_LEN, TailIndex, crc32c, validate_catalog_layout,
 };
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
@@ -275,13 +275,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
         let descriptor = crate::ManifestEntryDescriptor::from_verified(entry, body.as_ref());
         let rows = decode_rows(entry.type_id, verified).map_err(ReadError::Codec)?;
         let decoded = u64::try_from(rows.len()).map_err(|_error| ReadError::CounterOverflow)?;
-        if decoded != u64::from(entry.rows) {
-            return Err(ReadError::CatalogRowCountMismatch {
-                type_id: entry.type_id,
-                declared: entry.rows,
-                decoded,
-            });
-        }
+        Self::validate_catalog_row_count(entry, decoded)?;
         Ok((descriptor, rows))
     }
 
@@ -299,7 +293,12 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
                 type_id: entry.type_id,
             });
         }
-        decode_any(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)
+        let decoded =
+            decode_any(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)?;
+        let rows =
+            u64::try_from(decoded.stats.rows).map_err(|_error| ReadError::CounterOverflow)?;
+        Self::validate_catalog_row_count(entry, rows)?;
+        Ok(decoded)
     }
 
     /// Read and decode one section as named-cell rows.
@@ -316,7 +315,11 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
                 type_id: entry.type_id,
             });
         }
-        decode_rows(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)
+        let rows =
+            decode_rows(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)?;
+        let decoded = u64::try_from(rows.len()).map_err(|_error| ReadError::CounterOverflow)?;
+        Self::validate_catalog_row_count(entry, decoded)?;
+        Ok(rows)
     }
 
     /// Read the container's dictionary sections into a `str_id` -> bytes map.
@@ -331,24 +334,33 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
                 continue;
             }
             let body = self.verified_body(entry)?.into_bytes();
-            for (str_id, value) in
-                decode_dictionary(body, entry.type_id).map_err(ReadError::Codec)?
-            {
+            let (decoded, rows) =
+                decode_dictionary(body, entry.type_id).map_err(ReadError::Codec)?;
+            Self::validate_catalog_row_count(entry, rows)?;
+            for (str_id, value) in decoded {
                 match by_id.entry(str_id) {
                     MapEntry::Vacant(slot) => {
                         slot.insert(value);
                     }
-                    // A later part may move the same id from `dict.strings` to
-                    // `dict.blobs`; the blob carries truncation metadata, so it wins.
-                    MapEntry::Occupied(mut slot) => {
-                        if matches!(value, Stored::Blob { .. }) {
-                            slot.insert(value);
-                        }
+                    MapEntry::Occupied(_) => {
+                        return Err(ReadError::DictionaryConflict { str_id });
                     }
                 }
             }
         }
         Ok(Dictionary { by_id })
+    }
+
+    pub(crate) fn validate_catalog_row_count(entry: &Entry, decoded: u64) -> Result<(), ReadError> {
+        if decoded == u64::from(entry.rows) {
+            Ok(())
+        } else {
+            Err(ReadError::CatalogRowCountMismatch {
+                type_id: entry.type_id,
+                declared: entry.rows,
+                decoded,
+            })
+        }
     }
 
     /// Read and CRC-check a section body.
@@ -480,7 +492,6 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
             version: format_version,
         });
     }
-    validate_entry_bounds(&entries, catalog_at)?;
     let catalog = Catalog {
         entries,
         min_ts: i64_at(&meta, 0),
@@ -488,6 +499,7 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
         source_id: u64_at(&meta, 16),
         format_version,
     };
+    validate_catalog_layout(&catalog, catalog_at).map_err(ReadError::Layout)?;
     Ok(OpenedCatalog {
         catalog,
         source_descriptor: crate::SourceDescriptor::finish(source_descriptor),
@@ -506,22 +518,6 @@ const fn admitted_entries_bytes(catalog_len: usize) -> Result<usize, DecodeError
         });
     }
     Ok(entries_bytes)
-}
-
-fn validate_entry_bounds(entries: &[Entry], catalog_at: u64) -> Result<(), ReadError> {
-    for entry in entries {
-        let in_bounds = entry.offset >= MAGIC.len() as u64
-            && entry
-                .offset
-                .checked_add(entry.len)
-                .is_some_and(|end| end <= catalog_at);
-        if !in_bounds {
-            return Err(ReadError::SectionOutOfBounds {
-                type_id: entry.type_id,
-            });
-        }
-    }
-    Ok(())
 }
 
 fn decode_catalog_entry(bytes: &[u8]) -> Entry {
@@ -552,9 +548,10 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use kronika_format::{PartMeta, ReadAt, SectionInput, build_part};
-    use kronika_registry::Section;
-    use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_format::{DictLimits, PartMeta, ReadAt, SectionInput, build_part};
+    use kronika_registry::os_loadavg::OsLoadavg;
+    use kronika_registry::{Section, Ts};
+    use kronika_writer::{Interner, dict};
 
     use super::*;
 
@@ -628,13 +625,26 @@ mod tests {
         }
     }
 
+    fn data_body() -> Vec<u8> {
+        OsLoadavg::encode(&[OsLoadavg {
+            ts: Ts(5),
+            load1: 0.15,
+            load5: 0.10,
+            load15: 0.05,
+            running: 2,
+            total: 345,
+            scope: 0,
+        }])
+        .expect("encode data section")
+    }
+
     /// Build a minimal, structurally valid PGM part with one real section.
     fn a_part() -> Vec<u8> {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode empty section");
+        let body = data_body();
         build_part(
             &[SectionInput {
-                type_id: 1_006_001,
-                rows: 0,
+                type_id: OsLoadavg::CONTRACT.type_id.get(),
+                rows: 1,
                 body: &body,
             }],
             PartMeta {
@@ -645,27 +655,22 @@ mod tests {
         )
     }
 
-    fn catalog_only_part(entry_count: usize) -> (Vec<u8>, Catalog) {
-        let catalog = Catalog {
-            entries: vec![
-                Entry {
-                    type_id: 1_006_001,
-                    flags: 0,
-                    offset: MAGIC.len() as u64,
-                    len: 0,
-                    rows: 0,
-                    crc32c: 0,
-                };
-                entry_count
-            ],
-            min_ts: 5,
-            max_ts: 6,
-            source_id: 1,
-            format_version: FORMAT_VERSION,
-        };
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&catalog.encode());
-        (bytes, catalog)
+    fn large_catalog_part(entry_count: usize) -> Vec<u8> {
+        let sections = (0..entry_count)
+            .map(|index| SectionInput {
+                type_id: 2_000_000 + u32::try_from(index).expect("test entry count fits u32"),
+                rows: 1,
+                body: b"x",
+            })
+            .collect::<Vec<_>>();
+        build_part(
+            &sections,
+            PartMeta {
+                min_ts: 5,
+                max_ts: 6,
+                source_id: 1,
+            },
+        )
     }
 
     #[test]
@@ -763,8 +768,37 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_duplicate_physical_sections() {
+        let body = data_body();
+        let bytes = build_part(
+            &[
+                SectionInput {
+                    type_id: OsLoadavg::CONTRACT.type_id.get(),
+                    rows: 1,
+                    body: &body,
+                },
+                SectionInput {
+                    type_id: OsLoadavg::CONTRACT.type_id.get(),
+                    rows: 1,
+                    body: &body,
+                },
+            ],
+            PartMeta {
+                min_ts: 5,
+                max_ts: 6,
+                source_id: 1,
+            },
+        );
+
+        assert!(matches!(
+            PgmUnit::open(bytes.as_slice()),
+            Err(ReadError::Layout(_))
+        ));
+    }
+
+    #[test]
     fn streaming_catalog_matches_monolithic_decode_across_chunk_boundary() {
-        let (bytes, encoded_catalog) = catalog_only_part(CATALOG_READ_CHUNK_BYTES / ENTRY_LEN + 1);
+        let bytes = large_catalog_part(CATALOG_READ_CHUNK_BYTES / ENTRY_LEN + 1);
         let tail_at = bytes.len() - TAIL_INDEX_LEN;
         let tail_bytes: [u8; TAIL_INDEX_LEN] = bytes[tail_at..].try_into().expect("tail bytes");
         let tail = TailIndex::decode(tail_bytes).expect("tail");
@@ -772,7 +806,6 @@ mod tests {
             tail_at - usize::try_from(tail.catalog_len).expect("catalog length fits usize");
         let expected_catalog =
             Catalog::decode(&bytes[catalog_at..tail_at]).expect("monolithic catalog decode");
-        assert_eq!(expected_catalog, encoded_catalog);
         let expected_descriptor = crate::SourceDescriptor::derive(
             bytes.len() as u64,
             &tail_bytes,
@@ -802,7 +835,7 @@ mod tests {
 
     #[test]
     fn corrupt_catalog_crc_is_rejected_after_streaming_read() {
-        let (mut bytes, _) = catalog_only_part(CATALOG_READ_CHUNK_BYTES / ENTRY_LEN + 1);
+        let mut bytes = large_catalog_part(CATALOG_READ_CHUNK_BYTES / ENTRY_LEN + 1);
         let tail_at = bytes.len() - TAIL_INDEX_LEN;
         let tail_bytes: [u8; TAIL_INDEX_LEN] = bytes[tail_at..].try_into().expect("tail bytes");
         let tail = TailIndex::decode(tail_bytes).expect("tail");
@@ -813,6 +846,106 @@ mod tests {
         assert!(matches!(
             PgmUnit::open(bytes.as_slice()),
             Err(ReadError::Catalog(DecodeError::BadCrc { .. }))
+        ));
+    }
+
+    #[test]
+    fn dictionary_rejects_cross_placement_overlap() {
+        let limits = DictLimits::new(4_096, 1 << 20).expect("dictionary limits");
+        let mut strings = Interner::new(limits);
+        let str_id = strings.intern(b"same-id").expect("string value");
+        let strings = dict::encode(strings.window()).expect("strings section");
+        let mut blobs = Interner::new(limits);
+        assert_eq!(blobs.intern_blob(b"same-id").expect("blob value"), str_id);
+        let blobs = dict::encode(blobs.window()).expect("blobs section");
+        let sections = [
+            SectionInput {
+                type_id: strings[0].type_id,
+                rows: strings[0].rows,
+                body: &strings[0].body,
+            },
+            SectionInput {
+                type_id: blobs[0].type_id,
+                rows: blobs[0].rows,
+                body: &blobs[0].body,
+            },
+        ];
+        let bytes = build_part(
+            &sections,
+            PartMeta {
+                min_ts: i64::MAX,
+                max_ts: i64::MIN,
+                source_id: 1,
+            },
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("canonical catalog");
+        assert!(matches!(
+            unit.dictionary(),
+            Err(ReadError::DictionaryConflict { str_id: got }) if got == str_id.get()
+        ));
+    }
+
+    #[test]
+    fn all_data_decode_paths_reject_catalog_row_mismatch() {
+        let body = data_body();
+        let bytes = build_part(
+            &[SectionInput {
+                type_id: OsLoadavg::CONTRACT.type_id.get(),
+                rows: 2,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: 5,
+                max_ts: 6,
+                source_id: 1,
+            },
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open mismatched catalog");
+        let entry = &unit.catalog().entries[0];
+        let mismatch = |result: Result<(), ReadError>| {
+            assert!(matches!(
+                result,
+                Err(ReadError::CatalogRowCountMismatch {
+                    type_id,
+                    declared: 2,
+                    decoded: 1,
+                }) if type_id == OsLoadavg::CONTRACT.type_id.get()
+            ));
+        };
+
+        mismatch(unit.decode(entry).map(|_| ()));
+        mismatch(unit.decode_rows(entry).map(|_| ()));
+        mismatch(unit.decode_overview_rows(0).map(|_| ()));
+    }
+
+    #[test]
+    fn dictionary_rejects_catalog_row_mismatch() {
+        let limits = DictLimits::new(4_096, 1 << 20).expect("dictionary limits");
+        let mut interner = Interner::new(limits);
+        interner.intern(b"one").expect("intern value");
+        let encoded = dict::encode(interner.window()).expect("dictionary section");
+        let section = &encoded[0];
+        let bytes = build_part(
+            &[SectionInput {
+                type_id: section.type_id,
+                rows: section.rows + 1,
+                body: &section.body,
+            }],
+            PartMeta {
+                min_ts: i64::MAX,
+                max_ts: i64::MIN,
+                source_id: 1,
+            },
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open mismatched dictionary catalog");
+
+        assert!(matches!(
+            unit.dictionary(),
+            Err(ReadError::CatalogRowCountMismatch {
+                type_id,
+                declared: 2,
+                decoded: 1,
+            }) if type_id == section.type_id
         ));
     }
 

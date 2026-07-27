@@ -14,7 +14,9 @@ use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 use kronika_store::CatalogSummary;
 use tower::ServiceExt as _;
 
-use super::{assert_problem, capture_json, test_metrics_handle, write_bgwriter_segment};
+use super::{
+    assert_problem, bgwriter_row, capture_json, test_metrics_handle, write_bgwriter_segment,
+};
 use crate::overview::admission::ColdWorkWeight;
 use crate::overview::selection::{
     ABSOLUTE_MAX_SELECTED_SEGMENTS, SelectedSealedPlan, SelectionError,
@@ -42,11 +44,11 @@ fn synthetic_entries(
     max_ts: i64,
     ordinal_base: usize,
 ) -> Vec<DescriptorEntry> {
-    let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+    let body = BgwriterCheckpointer::encode(&[bgwriter_row(min_ts)]).expect("encode section");
     let bytes = build_part(
         &[SectionInput {
             type_id: 1_006_001,
-            rows: 0,
+            rows: 1,
             body: &body,
         }],
         PartMeta {
@@ -325,11 +327,11 @@ fn unavailable_descriptors_mark_a_gap_without_consuming_the_limit() {
 #[test]
 fn live_parts_are_not_counted_as_sealed_segments() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+    let body = BgwriterCheckpointer::encode(&[bgwriter_row(0)]).expect("encode section");
     let part = build_part(
         &[SectionInput {
             type_id: 1_006_001,
-            rows: 0,
+            rows: 1,
             body: &body,
         }],
         PartMeta {

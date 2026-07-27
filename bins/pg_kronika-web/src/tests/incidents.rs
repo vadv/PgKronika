@@ -116,24 +116,24 @@ fn write_section_with_source_and_node(
     }
     let dictionary = kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
     let metadata = InstanceMetadata::encode(&[metadata]).expect("encode metadata");
-    let mut sections: Vec<SectionInput<'_>> = dictionary
-        .iter()
-        .map(|section| SectionInput {
-            type_id: section.type_id,
-            rows: section.rows,
-            body: &section.body,
-        })
-        .collect();
-    sections.push(SectionInput {
-        type_id,
-        rows,
-        body,
-    });
-    sections.push(SectionInput {
-        type_id: 1_021_001,
-        rows: 1,
-        body: &metadata,
-    });
+    let mut sections = vec![
+        SectionInput {
+            type_id,
+            rows,
+            body,
+        },
+        SectionInput {
+            type_id: 1_021_001,
+            rows: 1,
+            body: &metadata,
+        },
+    ];
+    sections.sort_unstable_by_key(|section| section.type_id);
+    sections.extend(dictionary.iter().map(|section| SectionInput {
+        type_id: section.type_id,
+        rows: section.rows,
+        body: &section.body,
+    }));
     let bytes = build_part(
         &sections,
         PartMeta {

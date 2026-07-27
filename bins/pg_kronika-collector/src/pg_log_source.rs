@@ -59,6 +59,7 @@ pub(crate) async fn run_log_only_cycle(
         ts,
         due.forced(),
         &flushed,
+        &interner,
     )
     .context("append the log-only collection window")?;
     commit_log_collection(log_collector, Some(&collection), config);

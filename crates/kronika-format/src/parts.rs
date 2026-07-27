@@ -7,7 +7,10 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use crate::{Catalog, DecodeError, Entry, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex, crc32c};
+use crate::{
+    Catalog, CatalogLayoutError, DecodeError, Entry, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex,
+    crc32c, validate_catalog_layout,
+};
 
 /// Magic bytes opening every journal frame.
 pub const FRAME_MAGIC: [u8; 4] = *b"PGMP";
@@ -38,6 +41,15 @@ pub const MAX_PART_LEN: u64 = 64 * 1024 * 1024;
 
 /// Hard version-1 admission limit for valid frames in one active journal.
 pub const MAX_JOURNAL_PARTS: usize = 1_000_000;
+
+/// Fixed read-buffer size used by the streaming recovery scanner.
+///
+/// Candidate part bodies are separately bounded by [`JournalLimits`].
+pub const RECOVERY_SCAN_CHUNK_LEN: usize = 64 * 1024;
+
+/// Hard cap on candidate frame headers examined while resynchronizing one
+/// damaged journal generation.
+pub const MAX_RECOVERY_CANDIDATES: usize = 1_000_000;
 
 /// Whether a version-1 journal is empty or belongs to one active segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,6 +435,8 @@ pub enum PartError {
     },
     /// The catalog failed to decode.
     Catalog(DecodeError),
+    /// The catalog does not describe the canonical physical section layout.
+    Layout(CatalogLayoutError),
     /// A catalog entry points outside the section area of the body.
     SectionOutOfBounds {
         /// `type_id` of the entry that failed validation.
@@ -453,6 +467,7 @@ impl fmt::Display for PartError {
                 write!(f, "part catalog_len {catalog_len} does not fit the body")
             }
             Self::Catalog(err) => write!(f, "part catalog: {err}"),
+            Self::Layout(err) => write!(f, "part section layout: {err}"),
             Self::SectionOutOfBounds { type_id } => {
                 write!(f, "section {type_id} points outside the part body")
             }
@@ -545,18 +560,7 @@ fn decode_and_bound(bytes: &[u8]) -> Result<Catalog, PartError> {
 
     let catalog = Catalog::decode(&bytes[catalog_start..body_end]).map_err(PartError::Catalog)?;
 
-    for entry in &catalog.entries {
-        let in_bounds = entry.offset >= MAGIC.len() as u64
-            && entry
-                .offset
-                .checked_add(entry.len)
-                .is_some_and(|end| end <= catalog_start as u64);
-        if !in_bounds {
-            return Err(PartError::SectionOutOfBounds {
-                type_id: entry.type_id,
-            });
-        }
-    }
+    validate_catalog_layout(&catalog, catalog_start as u64).map_err(PartError::Layout)?;
 
     Ok(catalog)
 }
@@ -713,6 +717,211 @@ pub enum JournalScanError {
     },
 }
 
+/// Explicit work limits for best-effort journal recovery.
+///
+/// These limits are an internal admission contract, not operator tuning. The
+/// scanner keeps at most one part body plus [`RECOVERY_SCAN_CHUNK_LEN`] bytes
+/// in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryScanLimits {
+    /// Frame-body admission limit.
+    pub journal: JournalLimits,
+    /// Maximum physical bytes examined after `start_at`.
+    pub max_scan_bytes: u64,
+    /// Maximum complete verified frames returned.
+    pub max_parts: usize,
+    /// Maximum possible frame headers validated while searching past damage.
+    pub max_candidates: usize,
+    /// Maximum header plus part-body bytes validated across all candidates.
+    pub max_candidate_bytes: u64,
+}
+
+impl Default for RecoveryScanLimits {
+    fn default() -> Self {
+        Self {
+            journal: JournalLimits::default(),
+            max_scan_bytes: MAX_JOURNAL_LEN as u64,
+            max_parts: MAX_JOURNAL_PARTS,
+            max_candidates: MAX_RECOVERY_CANDIDATES,
+            max_candidate_bytes: MAX_JOURNAL_LEN as u64,
+        }
+    }
+}
+
+/// Coarse, payload-free reason that a physical byte range was discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryDamageReason {
+    /// Fewer than [`FRAME_HEADER_LEN`] bytes remain.
+    TornFrameHeader,
+    /// A valid frame header declares a body beyond the scanned bytes.
+    TornFrameBody,
+    /// Frame magic or the frame-header CRC is invalid.
+    InvalidFrameHeader,
+    /// The frame declares a body above the configured admission limit.
+    PartTooLarge,
+    /// The complete frame body is not a fully valid canonical PGM part.
+    InvalidPart,
+    /// A configured recovery work bound left this suffix unexamined.
+    WorkLimit,
+}
+
+/// Half-open physical byte range discarded by best-effort recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryDamageRegion {
+    /// First discarded byte, absolute from the start of the source.
+    pub from: u64,
+    /// First byte after the discarded range.
+    pub to: u64,
+    /// Payload-free damage classification.
+    pub reason: RecoveryDamageReason,
+}
+
+/// Why a bounded recovery scan stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryScanStop {
+    /// The complete physical source was examined.
+    EndOfSource,
+    /// Examining more physical bytes would exceed the configured byte cap.
+    ScanByteLimit {
+        /// Maximum bytes examined after the requested start.
+        limit: u64,
+    },
+    /// Returning another complete verified frame would exceed the part cap.
+    PartLimit {
+        /// Maximum number of recovered frames.
+        limit: usize,
+    },
+    /// Validating another possible frame header would exceed the candidate cap.
+    CandidateLimit {
+        /// Maximum candidate headers examined during resynchronization.
+        limit: usize,
+    },
+    /// Validating another possible frame would exceed the candidate byte cap.
+    CandidateByteLimit {
+        /// Maximum cumulative candidate header and body bytes.
+        limit: u64,
+    },
+}
+
+/// Result of a bounded, resynchronizing recovery scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryScanReport {
+    /// Complete verified PGM part bodies, in physical journal order.
+    pub parts: Vec<PartRef>,
+    /// Discarded physical regions, in source order.
+    pub damages: Vec<RecoveryDamageRegion>,
+    /// Physical source length observed at both scan boundaries.
+    pub physical_len: u64,
+    /// Total accepted PGM part-body bytes.
+    pub recovered_part_bytes: u64,
+    /// Sum of catalog row counts across all accepted parts.
+    pub recovered_rows: u64,
+    /// Exact physical bytes after `start_at` not belonging to accepted frames.
+    pub discarded_bytes: u64,
+    /// Exact physical suffix bytes after the last accepted complete frame.
+    pub discarded_suffix_bytes: u64,
+    /// Candidate headers examined only while resynchronizing past damage.
+    pub candidate_headers_examined: usize,
+    /// Header plus part-body bytes validated while resynchronizing.
+    pub candidate_validation_bytes: u64,
+    /// Typed bounded-scan stop outcome.
+    pub stop: RecoveryScanStop,
+}
+
+impl RecoveryScanReport {
+    /// Number of complete verified frames accepted.
+    #[must_use]
+    pub const fn recovered_frames(&self) -> usize {
+        self.parts.len()
+    }
+}
+
+/// Failure before a stable bounded recovery report can be produced.
+#[derive(Debug)]
+pub enum RecoveryScanError {
+    /// The byte source could not be read.
+    Io(io::Error),
+    /// The source length changed during the scan.
+    SourceLengthChanged {
+        /// Length observed before scanning.
+        before: u64,
+        /// Length observed after scanning.
+        after: u64,
+    },
+    /// Checked recovery accounting exceeded the representable range.
+    AccountingOverflow {
+        /// Counter whose checked arithmetic overflowed.
+        quantity: &'static str,
+    },
+    /// A public recovery bound is outside the version-1 hard admission range.
+    InvalidLimits {
+        /// Bound that failed validation.
+        kind: RecoveryLimitKind,
+        /// Supplied value.
+        value: u64,
+        /// Smallest accepted value.
+        minimum: u64,
+        /// Largest accepted value.
+        maximum: u64,
+    },
+}
+
+/// Recovery work bound rejected before source bytes are examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryLimitKind {
+    /// Maximum PGM part-body length.
+    PartBytes,
+    /// Maximum physical tail bytes scanned.
+    ScanBytes,
+    /// Maximum accepted frame count.
+    Parts,
+    /// Maximum candidate-header count.
+    Candidates,
+    /// Maximum cumulative candidate-validation bytes.
+    CandidateBytes,
+}
+
+impl fmt::Display for RecoveryScanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "journal recovery scan I/O: {error}"),
+            Self::SourceLengthChanged { before, after } => write!(
+                f,
+                "journal source length changed during recovery scan from {before} to {after} bytes"
+            ),
+            Self::AccountingOverflow { quantity } => {
+                write!(f, "journal recovery {quantity} accounting overflow")
+            }
+            Self::InvalidLimits {
+                kind,
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                f,
+                "journal recovery {kind:?} limit {value} is outside {minimum}..={maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for RecoveryScanError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::SourceLengthChanged { .. }
+            | Self::AccountingOverflow { .. }
+            | Self::InvalidLimits { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for RecoveryScanError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 impl fmt::Display for JournalScanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -838,7 +1047,7 @@ pub fn scan_journal_streaming_strict_from<R: ReadAt>(
 
     while pos < total_len {
         match streaming_frame_at(reader, total_len, pos, limits, &mut part_buf)? {
-            StreamingFrame::Valid { body_len } => {
+            StreamingFrame::Valid { body_len, .. } => {
                 if report.parts.len() >= max_parts {
                     return Err(JournalScanError::PartLimitExceeded { limit: max_parts });
                 }
@@ -849,14 +1058,17 @@ pub fn scan_journal_streaming_strict_from<R: ReadAt>(
                 pos += FRAME_HEADER_LEN + body_len;
                 report.valid_len = pos;
             }
-            StreamingFrame::Torn => {
+            StreamingFrame::Damaged {
+                reason: RecoveryDamageReason::TornFrameHeader | RecoveryDamageReason::TornFrameBody,
+                ..
+            } => {
                 report.damages.push(DamageRegion {
                     from: pos,
                     kind: DamageKind::TornTail,
                 });
                 return Ok(report);
             }
-            StreamingFrame::Damaged { implied_end } => {
+            StreamingFrame::Damaged { implied_end, .. } => {
                 let kind = if implied_end == Some(total_len) {
                     DamageKind::TornTail
                 } else {
@@ -871,11 +1083,301 @@ pub fn scan_journal_streaming_strict_from<R: ReadAt>(
     Ok(report)
 }
 
+/// Best-effort scans a physical journal tail and resynchronizes after damage.
+///
+/// Unlike [`scan_journal_streaming_strict_from`], this additive recovery API
+/// searches past invalid bytes for later complete frames. A frame is returned
+/// only after its header CRC, complete body, canonical catalog layout, and
+/// every section CRC validate. Search uses a fixed-size buffer and explicit
+/// byte, part, and candidate-work caps.
+///
+/// `start_at` is normally [`JOURNAL_HEADER_LEN`]. This function deliberately
+/// knows nothing about the root header or segment identity; callers must trust
+/// an identity only after separately decoding a complete [`JournalHeader`].
+///
+/// # Errors
+///
+/// Returns [`RecoveryScanError::SourceLengthChanged`] if the source length
+/// changes across the scan, or [`RecoveryScanError::Io`] for source failures.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the scanner keeps validation, resynchronization, and exact accounting in one auditable state machine"
+)]
+pub fn scan_journal_streaming_recovery_from<R: ReadAt>(
+    reader: &R,
+    start_at: u64,
+    limits: RecoveryScanLimits,
+) -> Result<RecoveryScanReport, RecoveryScanError> {
+    validate_recovery_limits(limits)?;
+    let physical_len = reader.byte_len()?;
+    if start_at > physical_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "start_at is beyond the journal source",
+        )
+        .into());
+    }
+    let scan_end = start_at
+        .saturating_add(limits.max_scan_bytes)
+        .min(physical_len);
+    let scan_end_usize = usize::try_from(scan_end).map_err(|_overflow| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recovery scan end does not fit the address space",
+        )
+    })?;
+    let mut pos = usize::try_from(start_at).map_err(|_overflow| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "start_at does not fit the address space",
+        )
+    })?;
+    let mut parts = Vec::new();
+    let mut damages = Vec::new();
+    let mut recovered_part_bytes = 0_u64;
+    let mut recovered_rows = 0_u64;
+    let mut candidate_headers_examined = 0_usize;
+    let mut candidate_validation_bytes = 0_u64;
+    let mut part_buf = Vec::new();
+    let mut stop = RecoveryScanStop::EndOfSource;
+
+    while pos < scan_end_usize {
+        match streaming_frame_at(reader, scan_end_usize, pos, limits.journal, &mut part_buf)? {
+            StreamingFrame::Valid { body_len, rows } => {
+                if parts.len() >= limits.max_parts {
+                    stop = RecoveryScanStop::PartLimit {
+                        limit: limits.max_parts,
+                    };
+                    damages.push(RecoveryDamageRegion {
+                        from: recovery_offset(pos, "part-limit offset")?,
+                        to: physical_len,
+                        reason: RecoveryDamageReason::WorkLimit,
+                    });
+                    break;
+                }
+                parts.push(PartRef {
+                    offset: pos + FRAME_HEADER_LEN,
+                    len: body_len,
+                });
+                recovered_part_bytes = recovered_part_bytes
+                    .checked_add(u64::try_from(body_len).map_err(|_overflow| {
+                        RecoveryScanError::AccountingOverflow {
+                            quantity: "part byte",
+                        }
+                    })?)
+                    .ok_or(RecoveryScanError::AccountingOverflow {
+                        quantity: "part byte",
+                    })?;
+                recovered_rows = recovered_rows
+                    .checked_add(rows)
+                    .ok_or(RecoveryScanError::AccountingOverflow { quantity: "row" })?;
+                pos += FRAME_HEADER_LEN + body_len;
+            }
+            StreamingFrame::Damaged {
+                reason,
+                implied_end,
+                can_resync,
+            } => {
+                let outcome = streaming_resync(
+                    reader,
+                    pos,
+                    scan_end_usize,
+                    implied_end,
+                    limits,
+                    &mut part_buf,
+                    &mut candidate_headers_examined,
+                    &mut candidate_validation_bytes,
+                    can_resync,
+                )?;
+                match outcome {
+                    StreamingResync::Found(next) => {
+                        damages.push(RecoveryDamageRegion {
+                            from: recovery_offset(pos, "damage offset")?,
+                            to: recovery_offset(next, "resumption offset")?,
+                            reason,
+                        });
+                        pos = next;
+                    }
+                    StreamingResync::NoCandidate { searched_to } => {
+                        push_stopped_damage(&mut damages, pos, searched_to, physical_len, reason)?;
+                        if scan_end < physical_len {
+                            stop = RecoveryScanStop::ScanByteLimit {
+                                limit: limits.max_scan_bytes,
+                            };
+                        }
+                        break;
+                    }
+                    StreamingResync::CandidateLimit { searched_to } => {
+                        push_stopped_damage(&mut damages, pos, searched_to, physical_len, reason)?;
+                        stop = RecoveryScanStop::CandidateLimit {
+                            limit: limits.max_candidates,
+                        };
+                        break;
+                    }
+                    StreamingResync::CandidateByteLimit { searched_to } => {
+                        push_stopped_damage(&mut damages, pos, searched_to, physical_len, reason)?;
+                        stop = RecoveryScanStop::CandidateByteLimit {
+                            limit: limits.max_candidate_bytes,
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if pos == scan_end_usize && scan_end < physical_len {
+        damages.push(RecoveryDamageRegion {
+            from: scan_end,
+            to: physical_len,
+            reason: RecoveryDamageReason::WorkLimit,
+        });
+        stop = RecoveryScanStop::ScanByteLimit {
+            limit: limits.max_scan_bytes,
+        };
+    }
+    coalesce_recovery_damages(&mut damages);
+
+    let accepted_header_bytes = u64::try_from(parts.len())
+        .map_err(|_overflow| RecoveryScanError::AccountingOverflow {
+            quantity: "frame header",
+        })?
+        .checked_mul(FRAME_HEADER_LEN as u64)
+        .ok_or(RecoveryScanError::AccountingOverflow {
+            quantity: "frame header",
+        })?;
+    let accepted_frame_bytes = recovered_part_bytes
+        .checked_add(accepted_header_bytes)
+        .ok_or(RecoveryScanError::AccountingOverflow {
+            quantity: "accepted frame byte",
+        })?;
+    let physical_tail_bytes = physical_len - start_at;
+    let discarded_bytes = physical_tail_bytes
+        .checked_sub(accepted_frame_bytes)
+        .ok_or(RecoveryScanError::AccountingOverflow {
+            quantity: "discarded byte",
+        })?;
+    let accepted_end = parts.last().map_or(Ok(start_at), |part| {
+        part.offset
+            .checked_add(part.len)
+            .and_then(|end| u64::try_from(end).ok())
+            .ok_or(RecoveryScanError::AccountingOverflow {
+                quantity: "accepted suffix offset",
+            })
+    })?;
+    let discarded_suffix_bytes =
+        physical_len
+            .checked_sub(accepted_end)
+            .ok_or(RecoveryScanError::AccountingOverflow {
+                quantity: "discarded suffix byte",
+            })?;
+
+    let after = reader.byte_len()?;
+    if after != physical_len {
+        return Err(RecoveryScanError::SourceLengthChanged {
+            before: physical_len,
+            after,
+        });
+    }
+    Ok(RecoveryScanReport {
+        parts,
+        damages,
+        physical_len,
+        recovered_part_bytes,
+        recovered_rows,
+        discarded_bytes,
+        discarded_suffix_bytes,
+        candidate_headers_examined,
+        candidate_validation_bytes,
+        stop,
+    })
+}
+
+fn recovery_offset(value: usize, quantity: &'static str) -> Result<u64, RecoveryScanError> {
+    u64::try_from(value).map_err(|_overflow| RecoveryScanError::AccountingOverflow { quantity })
+}
+
+fn push_stopped_damage(
+    damages: &mut Vec<RecoveryDamageRegion>,
+    from: usize,
+    searched_to: usize,
+    physical_len: u64,
+    reason: RecoveryDamageReason,
+) -> Result<(), RecoveryScanError> {
+    let from = recovery_offset(from, "damage offset")?;
+    let searched_to = recovery_offset(searched_to, "search stop offset")?.min(physical_len);
+    if from < searched_to {
+        damages.push(RecoveryDamageRegion {
+            from,
+            to: searched_to,
+            reason,
+        });
+    }
+    if searched_to < physical_len {
+        damages.push(RecoveryDamageRegion {
+            from: searched_to,
+            to: physical_len,
+            reason: RecoveryDamageReason::WorkLimit,
+        });
+    }
+    Ok(())
+}
+
+fn validate_recovery_limits(limits: RecoveryScanLimits) -> Result<(), RecoveryScanError> {
+    validate_recovery_limit(
+        RecoveryLimitKind::PartBytes,
+        limits.journal.max_part_len,
+        MAX_PART_LEN,
+    )?;
+    validate_recovery_limit(
+        RecoveryLimitKind::ScanBytes,
+        limits.max_scan_bytes,
+        MAX_JOURNAL_LEN as u64,
+    )?;
+    validate_recovery_limit(
+        RecoveryLimitKind::Parts,
+        u64::try_from(limits.max_parts).unwrap_or(u64::MAX),
+        MAX_JOURNAL_PARTS as u64,
+    )?;
+    validate_recovery_limit(
+        RecoveryLimitKind::Candidates,
+        u64::try_from(limits.max_candidates).unwrap_or(u64::MAX),
+        MAX_RECOVERY_CANDIDATES as u64,
+    )?;
+    validate_recovery_limit(
+        RecoveryLimitKind::CandidateBytes,
+        limits.max_candidate_bytes,
+        MAX_JOURNAL_LEN as u64,
+    )
+}
+
+const fn validate_recovery_limit(
+    kind: RecoveryLimitKind,
+    value: u64,
+    maximum: u64,
+) -> Result<(), RecoveryScanError> {
+    if value == 0 || value > maximum {
+        return Err(RecoveryScanError::InvalidLimits {
+            kind,
+            value,
+            minimum: 1,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
 /// Outcome of checking one frame position in the streaming scanner.
 enum StreamingFrame {
-    Valid { body_len: usize },
-    Torn,
-    Damaged { implied_end: Option<usize> },
+    Valid {
+        body_len: usize,
+        rows: u64,
+    },
+    Damaged {
+        reason: RecoveryDamageReason,
+        implied_end: Option<usize>,
+        can_resync: bool,
+    },
 }
 
 fn streaming_frame_at<R: ReadAt>(
@@ -887,30 +1389,266 @@ fn streaming_frame_at<R: ReadAt>(
 ) -> io::Result<StreamingFrame> {
     let rem = total_len - pos;
     if rem < FRAME_HEADER_LEN {
-        return Ok(StreamingFrame::Torn);
+        return Ok(StreamingFrame::Damaged {
+            reason: RecoveryDamageReason::TornFrameHeader,
+            implied_end: None,
+            can_resync: false,
+        });
     }
     let mut header_bytes = [0_u8; FRAME_HEADER_LEN];
     reader.read_exact_at(&mut header_bytes, pos as u64)?;
     let Ok(header) = FrameHeader::decode(header_bytes) else {
-        return Ok(StreamingFrame::Damaged { implied_end: None });
+        return Ok(StreamingFrame::Damaged {
+            reason: RecoveryDamageReason::InvalidFrameHeader,
+            implied_end: None,
+            can_resync: true,
+        });
     };
     if header.part_len > limits.max_part_len {
-        return Ok(StreamingFrame::Damaged { implied_end: None });
+        let implied_end = usize::try_from(header.part_len)
+            .ok()
+            .and_then(|body_len| {
+                pos.checked_add(FRAME_HEADER_LEN)
+                    .and_then(|body_at| body_at.checked_add(body_len))
+            })
+            .filter(|end| *end <= total_len);
+        return Ok(StreamingFrame::Damaged {
+            reason: RecoveryDamageReason::PartTooLarge,
+            implied_end,
+            can_resync: implied_end.is_some(),
+        });
     }
     let Ok(body_len) = usize::try_from(header.part_len) else {
-        return Ok(StreamingFrame::Damaged { implied_end: None });
+        return Ok(StreamingFrame::Damaged {
+            reason: RecoveryDamageReason::PartTooLarge,
+            implied_end: None,
+            can_resync: false,
+        });
     };
     if rem - FRAME_HEADER_LEN < body_len {
-        return Ok(StreamingFrame::Torn);
+        return Ok(StreamingFrame::Damaged {
+            reason: RecoveryDamageReason::TornFrameBody,
+            implied_end: None,
+            can_resync: false,
+        });
     }
     part_buf.resize(body_len, 0);
     reader.read_exact_at(&mut part_buf[..body_len], (pos + FRAME_HEADER_LEN) as u64)?;
-    if validate_part(&part_buf[..body_len]).is_err() {
+    let Ok(catalog) = validate_part(&part_buf[..body_len]) else {
         return Ok(StreamingFrame::Damaged {
+            reason: RecoveryDamageReason::InvalidPart,
             implied_end: Some(pos + FRAME_HEADER_LEN + body_len),
+            can_resync: true,
+        });
+    };
+    let Some(rows) = catalog
+        .entries
+        .iter()
+        .try_fold(0_u64, |rows, entry| rows.checked_add(u64::from(entry.rows)))
+    else {
+        return Ok(StreamingFrame::Damaged {
+            reason: RecoveryDamageReason::InvalidPart,
+            implied_end: Some(pos + FRAME_HEADER_LEN + body_len),
+            can_resync: true,
+        });
+    };
+    Ok(StreamingFrame::Valid { body_len, rows })
+}
+
+enum StreamingResync {
+    Found(usize),
+    NoCandidate { searched_to: usize },
+    CandidateLimit { searched_to: usize },
+    CandidateByteLimit { searched_to: usize },
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the recovery scanner passes explicit source, bounds, buffers, and work accounting"
+)]
+fn streaming_resync<R: ReadAt>(
+    reader: &R,
+    damaged_at: usize,
+    scan_end: usize,
+    implied_end: Option<usize>,
+    limits: RecoveryScanLimits,
+    part_buf: &mut Vec<u8>,
+    candidates: &mut usize,
+    candidate_bytes: &mut u64,
+    can_resync: bool,
+) -> Result<StreamingResync, RecoveryScanError> {
+    if !can_resync {
+        return Ok(StreamingResync::NoCandidate {
+            searched_to: scan_end,
         });
     }
-    Ok(StreamingFrame::Valid { body_len })
+    if let Some(boundary) = implied_end
+        && boundary
+            .checked_add(FRAME_HEADER_LEN)
+            .is_some_and(|header_end| header_end <= scan_end)
+    {
+        match check_recovery_candidate(
+            reader,
+            boundary,
+            scan_end,
+            limits,
+            part_buf,
+            candidates,
+            candidate_bytes,
+        )? {
+            CandidateCheck::Valid => return Ok(StreamingResync::Found(boundary)),
+            CandidateCheck::Invalid => {}
+            CandidateCheck::Limit => {
+                return Ok(StreamingResync::CandidateLimit {
+                    searched_to: boundary,
+                });
+            }
+            CandidateCheck::ByteLimit => {
+                return Ok(StreamingResync::CandidateByteLimit {
+                    searched_to: boundary,
+                });
+            }
+        }
+    }
+
+    let search_start = implied_end.map_or_else(
+        || damaged_at.saturating_add(1).min(scan_end),
+        |boundary| boundary.checked_add(1).unwrap_or(scan_end).min(scan_end),
+    );
+    let mut chunk_at = search_start;
+    let mut carry = [0_u8; FRAME_MAGIC.len() - 1];
+    let mut carry_len = 0_usize;
+    let mut chunk = vec![0_u8; RECOVERY_SCAN_CHUNK_LEN + carry.len()];
+
+    while chunk_at < scan_end {
+        let read_len = (scan_end - chunk_at).min(RECOVERY_SCAN_CHUNK_LEN);
+        chunk[..carry_len].copy_from_slice(&carry[..carry_len]);
+        reader.read_exact_at(&mut chunk[carry_len..carry_len + read_len], chunk_at as u64)?;
+        let available = carry_len + read_len;
+        let absolute_start = chunk_at - carry_len;
+        let mut search_at = 0_usize;
+        while search_at + FRAME_MAGIC.len() <= available {
+            let Some(relative) = find_magic(&chunk[search_at..available]) else {
+                break;
+            };
+            let found = search_at + relative;
+            let candidate_at = absolute_start + found;
+            if candidate_at >= search_start && candidate_at + FRAME_HEADER_LEN <= scan_end {
+                match check_recovery_candidate(
+                    reader,
+                    candidate_at,
+                    scan_end,
+                    limits,
+                    part_buf,
+                    candidates,
+                    candidate_bytes,
+                )? {
+                    CandidateCheck::Valid => return Ok(StreamingResync::Found(candidate_at)),
+                    CandidateCheck::Invalid => {}
+                    CandidateCheck::Limit => {
+                        return Ok(StreamingResync::CandidateLimit {
+                            searched_to: candidate_at,
+                        });
+                    }
+                    CandidateCheck::ByteLimit => {
+                        return Ok(StreamingResync::CandidateByteLimit {
+                            searched_to: candidate_at,
+                        });
+                    }
+                }
+            }
+            search_at = found + 1;
+        }
+
+        carry_len = available.min(carry.len());
+        carry[..carry_len].copy_from_slice(&chunk[available - carry_len..available]);
+        chunk_at += read_len;
+    }
+    Ok(StreamingResync::NoCandidate {
+        searched_to: scan_end,
+    })
+}
+
+enum CandidateCheck {
+    Valid,
+    Invalid,
+    Limit,
+    ByteLimit,
+}
+
+fn check_recovery_candidate<R: ReadAt>(
+    reader: &R,
+    at: usize,
+    scan_end: usize,
+    limits: RecoveryScanLimits,
+    part_buf: &mut Vec<u8>,
+    candidates: &mut usize,
+    candidate_bytes: &mut u64,
+) -> Result<CandidateCheck, RecoveryScanError> {
+    let Some(header_end) = at.checked_add(FRAME_HEADER_LEN) else {
+        return Ok(CandidateCheck::Invalid);
+    };
+    if header_end > scan_end {
+        return Ok(CandidateCheck::Invalid);
+    }
+    if *candidates >= limits.max_candidates {
+        return Ok(CandidateCheck::Limit);
+    }
+    *candidates += 1;
+    let header_bytes = FRAME_HEADER_LEN as u64;
+    let Some(after_header) = candidate_bytes.checked_add(header_bytes) else {
+        return Ok(CandidateCheck::ByteLimit);
+    };
+    if after_header > limits.max_candidate_bytes {
+        return Ok(CandidateCheck::ByteLimit);
+    }
+    *candidate_bytes = after_header;
+
+    let mut encoded = [0_u8; FRAME_HEADER_LEN];
+    reader.read_exact_at(&mut encoded, at as u64)?;
+    let Ok(header) = FrameHeader::decode(encoded) else {
+        return Ok(CandidateCheck::Invalid);
+    };
+    if header.part_len > limits.journal.max_part_len {
+        return Ok(CandidateCheck::Invalid);
+    }
+    let Ok(body_len) = usize::try_from(header.part_len) else {
+        return Ok(CandidateCheck::Invalid);
+    };
+    if scan_end - header_end < body_len {
+        return Ok(CandidateCheck::Invalid);
+    }
+    let Some(after_body) = candidate_bytes.checked_add(header.part_len) else {
+        return Ok(CandidateCheck::ByteLimit);
+    };
+    if after_body > limits.max_candidate_bytes {
+        return Ok(CandidateCheck::ByteLimit);
+    }
+    *candidate_bytes = after_body;
+    part_buf.resize(body_len, 0);
+    reader.read_exact_at(part_buf, (at + FRAME_HEADER_LEN) as u64)?;
+    Ok(if validate_part(part_buf).is_ok() {
+        CandidateCheck::Valid
+    } else {
+        CandidateCheck::Invalid
+    })
+}
+
+fn coalesce_recovery_damages(damages: &mut Vec<RecoveryDamageRegion>) {
+    let mut write = 0_usize;
+    for read in 0..damages.len() {
+        let damage = damages[read];
+        if write > 0
+            && damages[write - 1].to == damage.from
+            && damages[write - 1].reason == damage.reason
+        {
+            damages[write - 1].to = damage.to;
+        } else {
+            damages[write] = damage;
+            write += 1;
+        }
+    }
+    damages.truncate(write);
 }
 
 /// Outcome of checking one frame position.
@@ -993,6 +1731,8 @@ fn find_magic(haystack: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod streaming_tests {
+    use std::cell::Cell;
+
     use super::*;
 
     const TEST_MAX_PARTS: usize = 16;
@@ -1004,6 +1744,13 @@ mod streaming_tests {
             JournalLimits::default(),
             TEST_MAX_PARTS,
         )
+    }
+
+    fn scan_recovery(
+        bytes: &[u8],
+        limits: RecoveryScanLimits,
+    ) -> Result<RecoveryScanReport, RecoveryScanError> {
+        scan_journal_streaming_recovery_from(&bytes, 0, limits)
     }
 
     #[test]
@@ -1062,11 +1809,7 @@ mod streaming_tests {
     }
     fn sample_part() -> Vec<u8> {
         build_part(
-            &[SectionInput {
-                type_id: 1_006_001,
-                rows: 0,
-                body: b"",
-            }],
+            &[],
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
@@ -1172,6 +1915,347 @@ mod streaming_tests {
             panic!("invalid start offset must be reported as an I/O validation error");
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recovery_scan_accounts_clean_frames_exactly() {
+        let part = sample_part();
+        let bytes = framed(&[&part, &part]);
+        let report = scan_recovery(&bytes, RecoveryScanLimits::default()).unwrap();
+
+        assert_eq!(report.recovered_frames(), 2);
+        assert_eq!(report.recovered_part_bytes, 2 * part.len() as u64);
+        assert_eq!(report.recovered_rows, 0);
+        assert_eq!(report.discarded_bytes, 0);
+        assert_eq!(report.discarded_suffix_bytes, 0);
+        assert_eq!(report.candidate_headers_examined, 0);
+        assert_eq!(report.candidate_validation_bytes, 0);
+        assert_eq!(report.stop, RecoveryScanStop::EndOfSource);
+        assert!(report.damages.is_empty());
+    }
+
+    #[test]
+    fn recovery_scan_resynchronizes_after_an_invalid_complete_part() {
+        let part = sample_part();
+        let one = framed(&[&part]);
+        let mut bytes = one.clone();
+        let damaged_at = bytes.len();
+        let mut damaged = one.clone();
+        damaged[FRAME_HEADER_LEN + MAGIC.len()] ^= 0x01;
+        bytes.extend_from_slice(&damaged);
+        let resumed_at = bytes.len();
+        bytes.extend_from_slice(&one);
+
+        let report = scan_recovery(&bytes, RecoveryScanLimits::default()).unwrap();
+        assert_eq!(report.recovered_frames(), 2);
+        assert_eq!(report.discarded_bytes, one.len() as u64);
+        assert_eq!(report.discarded_suffix_bytes, 0);
+        assert_eq!(
+            report.damages,
+            vec![RecoveryDamageRegion {
+                from: damaged_at as u64,
+                to: resumed_at as u64,
+                reason: RecoveryDamageReason::InvalidPart,
+            }]
+        );
+        assert_eq!(report.candidate_headers_examined, 1);
+    }
+
+    #[test]
+    fn recovery_does_not_validate_a_short_header_after_an_invalid_part() {
+        let part = sample_part();
+        let mut damaged = framed(&[&part]);
+        damaged[FRAME_HEADER_LEN + MAGIC.len()] ^= 0x01;
+        let damaged_len = damaged.len();
+
+        for short_header_len in 1..FRAME_HEADER_LEN {
+            let mut bytes = damaged.clone();
+            bytes.extend(std::iter::repeat_n(0xA5, short_header_len));
+
+            let report = scan_recovery(&bytes, RecoveryScanLimits::default())
+                .expect("a torn trailing header is damage, not an I/O failure");
+            assert_eq!(report.recovered_frames(), 0);
+            assert_eq!(report.candidate_headers_examined, 0);
+            assert_eq!(report.discarded_bytes, bytes.len() as u64);
+            assert_eq!(
+                report.damages,
+                vec![RecoveryDamageRegion {
+                    from: 0,
+                    to: bytes.len() as u64,
+                    reason: RecoveryDamageReason::InvalidPart,
+                }],
+                "short trailing header length {short_header_len}"
+            );
+            assert!(bytes.len() > damaged_len);
+        }
+    }
+
+    #[test]
+    fn recovery_never_validates_a_header_beyond_the_scan_cap() {
+        let part = sample_part();
+        let mut damaged = framed(&[&part]);
+        damaged[FRAME_HEADER_LEN + MAGIC.len()] ^= 0x01;
+        let damaged_len = damaged.len();
+        let mut bytes = damaged;
+        bytes.extend_from_slice(&framed(&[&part]));
+
+        for short_header_len in 1..FRAME_HEADER_LEN {
+            let scan_limit = damaged_len + short_header_len;
+            let report = scan_recovery(
+                &bytes,
+                RecoveryScanLimits {
+                    max_scan_bytes: scan_limit as u64,
+                    ..RecoveryScanLimits::default()
+                },
+            )
+            .expect("candidate validation stays inside the bounded scan window");
+            assert_eq!(
+                report.stop,
+                RecoveryScanStop::ScanByteLimit {
+                    limit: scan_limit as u64,
+                }
+            );
+            assert_eq!(report.recovered_frames(), 0);
+            assert_eq!(report.candidate_headers_examined, 0);
+            assert_eq!(report.discarded_bytes, bytes.len() as u64);
+            assert_eq!(
+                report.damages,
+                vec![
+                    RecoveryDamageRegion {
+                        from: 0,
+                        to: scan_limit as u64,
+                        reason: RecoveryDamageReason::InvalidPart,
+                    },
+                    RecoveryDamageRegion {
+                        from: scan_limit as u64,
+                        to: bytes.len() as u64,
+                        reason: RecoveryDamageReason::WorkLimit,
+                    },
+                ],
+                "short bounded header length {short_header_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_search_finds_magic_split_across_scan_chunks() {
+        let part = sample_part();
+        let candidate_at = RECOVERY_SCAN_CHUNK_LEN - 1;
+        let mut bytes = vec![0xA5; candidate_at];
+        bytes.extend_from_slice(&framed(&[&part]));
+
+        let report = scan_recovery(&bytes, RecoveryScanLimits::default()).unwrap();
+        assert_eq!(report.recovered_frames(), 1);
+        assert_eq!(report.parts[0].offset, candidate_at + FRAME_HEADER_LEN);
+        assert_eq!(report.discarded_bytes, candidate_at as u64);
+        assert_eq!(report.discarded_suffix_bytes, 0);
+        assert_eq!(report.candidate_headers_examined, 1);
+    }
+
+    #[test]
+    fn recovery_does_not_search_inside_a_declared_oversized_body() {
+        let part = sample_part();
+        let embedded = framed(&[&part]);
+        let mut oversized_body = embedded;
+        oversized_body.extend_from_slice(b"not-a-frame");
+        let mut bytes = FrameHeader {
+            part_len: oversized_body.len() as u64,
+        }
+        .encode()
+        .to_vec();
+        bytes.extend_from_slice(&oversized_body);
+        let resumed_at = bytes.len();
+        bytes.extend_from_slice(&framed(&[&part]));
+        let limits = RecoveryScanLimits {
+            journal: JournalLimits {
+                max_part_len: part.len() as u64,
+            },
+            ..RecoveryScanLimits::default()
+        };
+
+        let report = scan_recovery(&bytes, limits).unwrap();
+        assert_eq!(report.recovered_frames(), 1);
+        assert_eq!(
+            report.parts[0].offset,
+            resumed_at + FRAME_HEADER_LEN,
+            "the embedded valid-looking frame is not interpreted"
+        );
+        assert_eq!(report.candidate_headers_examined, 1);
+        assert_eq!(report.damages[0].reason, RecoveryDamageReason::PartTooLarge);
+    }
+
+    #[test]
+    fn recovery_does_not_accept_an_embedded_frame_from_a_torn_declared_body() {
+        let part = sample_part();
+        let embedded = framed(&[&part]);
+        let mut bytes = FrameHeader {
+            part_len: (embedded.len() + 100) as u64,
+        }
+        .encode()
+        .to_vec();
+        bytes.extend_from_slice(&embedded);
+
+        let report = scan_recovery(&bytes, RecoveryScanLimits::default()).unwrap();
+        assert_eq!(report.recovered_frames(), 0);
+        assert_eq!(report.candidate_headers_examined, 0);
+        assert_eq!(report.discarded_bytes, bytes.len() as u64);
+        assert_eq!(report.discarded_suffix_bytes, bytes.len() as u64);
+        assert_eq!(
+            report.damages,
+            vec![RecoveryDamageRegion {
+                from: 0,
+                to: bytes.len() as u64,
+                reason: RecoveryDamageReason::TornFrameBody,
+            }]
+        );
+    }
+
+    #[test]
+    fn recovery_candidate_count_and_byte_work_are_bounded() {
+        let part = sample_part();
+        let invalid = FrameHeader { part_len: 0 }.encode();
+        let mut count_limited = vec![0xA5; FRAME_HEADER_LEN];
+        count_limited.extend_from_slice(&invalid);
+        count_limited.extend_from_slice(&invalid);
+        let count_report = scan_recovery(
+            &count_limited,
+            RecoveryScanLimits {
+                max_candidates: 1,
+                ..RecoveryScanLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            count_report.stop,
+            RecoveryScanStop::CandidateLimit { limit: 1 }
+        );
+        assert_eq!(count_report.candidate_headers_examined, 1);
+
+        let candidate_at = FRAME_HEADER_LEN;
+        let mut byte_limited = vec![0xA5; candidate_at];
+        byte_limited.extend_from_slice(&framed(&[&part]));
+        let byte_limit = FRAME_HEADER_LEN as u64 + part.len() as u64 - 1;
+        let byte_report = scan_recovery(
+            &byte_limited,
+            RecoveryScanLimits {
+                max_candidate_bytes: byte_limit,
+                ..RecoveryScanLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            byte_report.stop,
+            RecoveryScanStop::CandidateByteLimit { limit: byte_limit }
+        );
+        assert_eq!(byte_report.recovered_frames(), 0);
+        assert_eq!(
+            byte_report.candidate_validation_bytes,
+            FRAME_HEADER_LEN as u64
+        );
+    }
+
+    #[test]
+    fn recovery_part_and_scan_byte_limits_account_the_suffix() {
+        let part = sample_part();
+        let one = framed(&[&part]);
+        let bytes = framed(&[&part, &part]);
+        let part_report = scan_recovery(
+            &bytes,
+            RecoveryScanLimits {
+                max_parts: 1,
+                ..RecoveryScanLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(part_report.stop, RecoveryScanStop::PartLimit { limit: 1 });
+        assert_eq!(part_report.recovered_frames(), 1);
+        assert_eq!(part_report.discarded_bytes, one.len() as u64);
+        assert_eq!(part_report.discarded_suffix_bytes, one.len() as u64);
+
+        let byte_report = scan_recovery(
+            &bytes,
+            RecoveryScanLimits {
+                max_scan_bytes: one.len() as u64,
+                ..RecoveryScanLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            byte_report.stop,
+            RecoveryScanStop::ScanByteLimit {
+                limit: one.len() as u64,
+            }
+        );
+        assert_eq!(byte_report.recovered_frames(), 1);
+        assert_eq!(byte_report.discarded_bytes, one.len() as u64);
+        assert_eq!(byte_report.discarded_suffix_bytes, one.len() as u64);
+        assert_eq!(
+            byte_report.damages,
+            vec![RecoveryDamageRegion {
+                from: one.len() as u64,
+                to: bytes.len() as u64,
+                reason: RecoveryDamageReason::WorkLimit,
+            }]
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_limits_outside_the_v1_hard_caps() {
+        let limits = RecoveryScanLimits {
+            max_candidate_bytes: MAX_JOURNAL_LEN as u64 + 1,
+            ..RecoveryScanLimits::default()
+        };
+        assert!(matches!(
+            scan_recovery(&[], limits),
+            Err(RecoveryScanError::InvalidLimits {
+                kind: RecoveryLimitKind::CandidateBytes,
+                ..
+            })
+        ));
+
+        let limits = RecoveryScanLimits {
+            journal: JournalLimits { max_part_len: 0 },
+            ..RecoveryScanLimits::default()
+        };
+        assert!(matches!(
+            scan_recovery(&[], limits),
+            Err(RecoveryScanError::InvalidLimits {
+                kind: RecoveryLimitKind::PartBytes,
+                ..
+            })
+        ));
+    }
+
+    struct ChangingLength<'a> {
+        bytes: &'a [u8],
+        byte_len_calls: Cell<usize>,
+    }
+
+    impl ReadAt for ChangingLength<'_> {
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            self.bytes.read_exact_at(buf, offset)
+        }
+
+        fn byte_len(&self) -> io::Result<u64> {
+            let call = self.byte_len_calls.get();
+            self.byte_len_calls.set(call + 1);
+            Ok(self.bytes.len() as u64 + u64::from(call > 0))
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_a_source_length_change() {
+        let part = sample_part();
+        let bytes = framed(&[&part]);
+        let source = ChangingLength {
+            bytes: &bytes,
+            byte_len_calls: Cell::new(0),
+        };
+        assert!(matches!(
+            scan_journal_streaming_recovery_from(&source, 0, RecoveryScanLimits::default()),
+            Err(RecoveryScanError::SourceLengthChanged { before, after })
+                if before == bytes.len() as u64 && after == before + 1
+        ));
     }
 }
 
@@ -1286,6 +2370,64 @@ mod tests {
             validate_part_catalog(&bad_magic),
             Err(PartError::BadMagic { .. })
         ));
+    }
+
+    #[test]
+    fn part_validation_rejects_duplicate_section_types() {
+        let part = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 1,
+                    body: b"first",
+                },
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 1,
+                    body: b"second",
+                },
+            ],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 0,
+            },
+        );
+
+        assert!(matches!(
+            validate_part_catalog(&part),
+            Err(PartError::Layout(_))
+        ));
+    }
+
+    #[test]
+    fn part_validation_accepts_canonical_dictionary_tail() {
+        let part = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 1,
+                    body: b"data",
+                },
+                SectionInput {
+                    type_id: 3_001_001,
+                    rows: 1,
+                    body: b"strings",
+                },
+                SectionInput {
+                    type_id: 3_002_001,
+                    rows: 1,
+                    body: b"blobs",
+                },
+            ],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 0,
+            },
+        );
+
+        assert!(validate_part(&part).is_ok());
     }
 
     #[test]

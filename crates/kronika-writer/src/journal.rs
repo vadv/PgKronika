@@ -19,7 +19,9 @@ use kronika_format::{
     MAX_JOURNAL_PARTS, MAX_PART_LEN, PartError, PartRef, RESET_MARKER_LEN, ResetMarker,
     scan_journal_streaming_strict_from, validate_part,
 };
-use kronika_layout::{LayoutError, SegmentId, WriterLease, WriterOwner};
+use kronika_layout::{
+    FileIdentity, JournalRotation, JournalSlot, LayoutError, SegmentId, WriterLease, WriterOwner,
+};
 
 static NEXT_JOURNAL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -245,6 +247,11 @@ pub enum JournalError {
     ResetIncomplete(std::io::Error),
     /// A previous operation left the open journal in an indeterminate state.
     Poisoned,
+    /// A writer-owned rotated generation is not the canonical empty bytes.
+    FreshGenerationInvalid {
+        /// Observed file length.
+        len: u64,
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -339,6 +346,10 @@ impl fmt::Display for JournalError {
             Self::Poisoned => {
                 f.write_str("journal is poisoned after an incomplete persistence operation")
             }
+            Self::FreshGenerationInvalid { len } => write!(
+                f,
+                "fresh rotated journal generation is not the canonical empty file ({len} bytes)"
+            ),
         }
     }
 }
@@ -366,7 +377,8 @@ impl Error for JournalError {
             | Self::PartTooLarge { .. }
             | Self::Full { .. }
             | Self::StalePartRef { .. }
-            | Self::Poisoned => None,
+            | Self::Poisoned
+            | Self::FreshGenerationInvalid { .. } => None,
         }
     }
 }
@@ -428,6 +440,63 @@ pub struct Journal {
 }
 
 impl Journal {
+    /// Initializes a layout-owned fresh journal slot durably.
+    ///
+    /// This is the alternate-generation counterpart of
+    /// [`prepare_rotation`](Self::prepare_rotation). Repeating the call after
+    /// the canonical empty header was synchronized is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed I/O error or [`JournalError::FreshGenerationInvalid`].
+    pub fn prepare_slot(slot: &mut JournalSlot) -> Result<(), JournalError> {
+        prepare_fresh_file(slot.file_mut())
+    }
+
+    /// Initializes a layout-owned fresh rotation descriptor durably.
+    ///
+    /// Repeating this call after the exact empty header was synchronized is
+    /// idempotent. Any other existing bytes are preserved and rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed I/O error or [`JournalError::FreshGenerationInvalid`].
+    pub fn prepare_rotation(rotation: &mut JournalRotation) -> Result<(), JournalError> {
+        prepare_fresh_file(rotation.fresh_file_mut())
+    }
+
+    /// Opens an activated canonical or recognized alternate fresh generation.
+    ///
+    /// The layout slot transfers its exact writable descriptor and writer-lock
+    /// lease. Only the synchronized canonical empty header is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed configuration, I/O, or fresh-generation error.
+    pub fn open_slot(slot: JournalSlot, config: JournalConfig) -> Result<Self, JournalError> {
+        validate_config(config)?;
+        let (file, owner_lease) = slot.into_file_and_lease();
+        let identity = FileIdentity::from_file(&file)?;
+        if identity.len != JOURNAL_HEADER_LEN as u64 {
+            return Err(JournalError::FreshGenerationInvalid { len: identity.len });
+        }
+        let mut encoded = [0_u8; JOURNAL_HEADER_LEN];
+        file.read_exact_at(&mut encoded, 0)?;
+        if encoded != JournalHeader::EMPTY.encode() || FileIdentity::from_file(&file)? != identity {
+            return Err(JournalError::FreshGenerationInvalid { len: identity.len });
+        }
+        Ok(Self {
+            _owner_lease: owner_lease,
+            file,
+            end: JOURNAL_HEADER_LEN,
+            config,
+            parts: Vec::new(),
+            generation: next_journal_generation(),
+            segment_id: None,
+            poisoned: false,
+        })
+    }
+
     /// Opens or initializes the root journal through a writer-owner capability.
     ///
     /// Existing files are validated without truncation or repair. A newly
@@ -505,15 +574,15 @@ impl Journal {
                     config.max_parts,
                 )
                 .map_err(map_scan_error)?;
-                if scan.parts.is_empty() {
-                    return Err(JournalError::ActiveWithoutFirstFrame);
-                }
                 if !scan.damages.is_empty()
                     || u64::try_from(scan.valid_len).unwrap_or(u64::MAX) != file_len
                 {
                     return Err(JournalError::DamagedBody {
                         damages: scan.damages,
                     });
+                }
+                if scan.parts.is_empty() {
+                    return Err(JournalError::ActiveWithoutFirstFrame);
                 }
                 (Some(segment_id), scan.parts)
             }
@@ -588,12 +657,16 @@ impl Journal {
                 max: self.config.limits.max_part_len,
             });
         }
+        // Validate before flow control. A full journal must not cause the
+        // caller to publish/reset valid accumulated data for an invalid
+        // incoming part.
+        validate_part(part).map_err(JournalError::InvalidPart)?;
+
         if self.parts.len() >= self.config.max_parts {
             return Err(JournalError::TooManyParts {
                 max: self.config.max_parts,
             });
         }
-        validate_part(part).map_err(JournalError::InvalidPart)?;
         let frame_len = FRAME_HEADER_LEN
             .checked_add(part.len())
             .ok_or(JournalError::Full {
@@ -616,7 +689,6 @@ impl Journal {
                 max: self.config.max_journal_len,
             });
         }
-
         let frame_header = FrameHeader { part_len }.encode();
         let old_header = self.current_header();
         let body_len = u64::try_from(next_end - JOURNAL_HEADER_LEN).map_err(|_overflow| {
@@ -702,6 +774,40 @@ impl Journal {
     /// Returns [`JournalError::StalePartRef`] for a reference from another
     /// generation, or an I/O error.
     pub fn read_part(&self, part: JournalPartRef) -> Result<Vec<u8>, JournalError> {
+        self.check_part_ref(part)?;
+        let mut body = vec![0_u8; part.raw.len];
+        self.file.read_exact_at(&mut body, part.raw.offset as u64)?;
+        Ok(body)
+    }
+
+    /// Read a bounded byte range relative to one part body.
+    ///
+    /// Sealing uses this after catalog validation so each Parquet body is read
+    /// once without allocating the rest of its journal part again.
+    pub(crate) fn read_part_range(
+        &self,
+        part: JournalPartRef,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, JournalError> {
+        self.check_part_ref(part)?;
+        let Some(relative_end) = offset.checked_add(len) else {
+            return Err(JournalError::StalePartRef { offset, len });
+        };
+        if relative_end > part.raw.len {
+            return Err(JournalError::StalePartRef { offset, len });
+        }
+        let absolute = part
+            .raw
+            .offset
+            .checked_add(offset)
+            .ok_or(JournalError::StalePartRef { offset, len })?;
+        let mut body = vec![0_u8; len];
+        self.file.read_exact_at(&mut body, absolute as u64)?;
+        Ok(body)
+    }
+
+    fn check_part_ref(&self, part: JournalPartRef) -> Result<(), JournalError> {
         self.ensure_healthy()?;
         let minimum = JOURNAL_HEADER_LEN + FRAME_HEADER_LEN;
         let is_member = part.generation == self.generation
@@ -721,9 +827,7 @@ impl Journal {
                 len: part.raw.len,
             });
         }
-        let mut body = vec![0_u8; part.raw.len];
-        self.file.read_exact_at(&mut body, part.raw.offset as u64)?;
-        Ok(body)
+        Ok(())
     }
 
     /// Commits a reset marker, then reduces the journal to the synchronized
@@ -830,6 +934,27 @@ fn write_header(file: &mut File, header: JournalHeader) -> Result<(), std::io::E
     file.write_all(&header.encode())
 }
 
+fn prepare_fresh_file(file: &mut File) -> Result<(), JournalError> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        write_header(file, JournalHeader::EMPTY)?;
+        file.set_len(JOURNAL_HEADER_LEN as u64)?;
+        file.sync_data()?;
+        return Ok(());
+    }
+    if len != JOURNAL_HEADER_LEN as u64 {
+        return Err(JournalError::FreshGenerationInvalid { len });
+    }
+    let identity = FileIdentity::from_file(file)?;
+    let mut encoded = [0_u8; JOURNAL_HEADER_LEN];
+    file.read_exact_at(&mut encoded, 0)?;
+    if encoded != JournalHeader::EMPTY.encode() || FileIdentity::from_file(file)? != identity {
+        return Err(JournalError::FreshGenerationInvalid { len });
+    }
+    file.sync_data()?;
+    Ok(())
+}
+
 fn rollback(file: &mut File, end: usize, header: JournalHeader) -> Result<(), std::io::Error> {
     journal_failpoint!(RollbackTruncate);
     file.set_len(end as u64)?;
@@ -839,7 +964,7 @@ fn rollback(file: &mut File, end: usize, header: JournalHeader) -> Result<(), st
     file.sync_data()
 }
 
-const fn validate_config(config: JournalConfig) -> Result<(), JournalError> {
+pub(crate) const fn validate_config(config: JournalConfig) -> Result<(), JournalError> {
     if config.max_journal_len < JOURNAL_HEADER_LEN || config.max_journal_len > MAX_JOURNAL_LEN {
         return Err(JournalError::InvalidMaxJournalLen {
             value: config.max_journal_len,
@@ -965,10 +1090,11 @@ fn recover_committed_reset(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt as _;
 
     use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, crc32c};
-    use kronika_layout::{DataRoot, LayoutLimits, OwnerKind};
+    use kronika_layout::{ACTIVE_JOURNAL_NAME, DataRoot, LayoutLimits, OwnerKind};
 
     use super::*;
 
@@ -1025,6 +1151,141 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    #[test]
+    fn append_read_reopen_roundtrip() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let owner = owner(&directory);
+        let part = sample_part();
+        let segment_id = id(1_000);
+
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open");
+        let first = journal.append(segment_id, &part).expect("append");
+        let second = journal.append(segment_id, &part).expect("append");
+        assert_eq!(journal.parts(), &[first, second]);
+        assert_eq!(journal.read_part(first).expect("read"), part);
+        assert_eq!(
+            journal
+                .read_part_range(first, MAGIC.len(), 4)
+                .expect("read range"),
+            b"data"
+        );
+        assert!(matches!(
+            journal.read_part_range(first, part.len() - 1, 2),
+            Err(JournalError::StalePartRef { .. })
+        ));
+
+        drop(journal);
+        let journal = Journal::open(&owner, JournalConfig::default()).expect("reopen");
+        assert_eq!(journal.parts().len(), 2);
+        assert_eq!(journal.read_part(journal.parts()[1]).expect("read"), part);
+    }
+
+    #[test]
+    fn prepared_rotated_slot_opens_as_a_fresh_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        drop(journal);
+
+        let mut rotation = owner.begin_journal_rotation().unwrap();
+        Journal::prepare_rotation(&mut rotation).unwrap();
+        Journal::prepare_rotation(&mut rotation).expect("preparation is restart-idempotent");
+        let outcome = rotation.activate();
+        let journal = Journal::open_slot(outcome.fresh, JournalConfig::default()).unwrap();
+
+        assert!(journal.is_empty());
+        assert_eq!(journal.segment_id(), None);
+        assert_eq!(journal.len(), JOURNAL_HEADER_LEN);
+        assert_eq!(
+            outcome.evidence.file().metadata().unwrap().len(),
+            JOURNAL_HEADER_LEN as u64
+        );
+    }
+
+    #[test]
+    fn rotation_preparation_preserves_and_rejects_unexpected_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = owner(&directory);
+        let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
+        drop(journal);
+
+        let mut rotation = owner.begin_journal_rotation().unwrap();
+        rotation.fresh_file_mut().write_all(b"x").unwrap();
+        assert!(matches!(
+            Journal::prepare_rotation(&mut rotation),
+            Err(JournalError::FreshGenerationInvalid { len: 1 })
+        ));
+        assert_eq!(rotation.fresh_file_mut().metadata().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn incomplete_final_frame_is_rejected_and_preserved_on_open() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let owner = owner(&directory);
+        let path = directory.path().join(ACTIVE_JOURNAL_NAME);
+        let part = sample_part();
+
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open");
+        journal.append(id(1_000), &part).expect("append");
+        drop(journal);
+
+        let mut file = OpenOptions::new().append(true).open(&path).expect("raw");
+        let partial_frame_header = FrameHeader {
+            part_len: part.len() as u64,
+        }
+        .encode();
+        file.write_all(&partial_frame_header).expect("write");
+        file.write_all(&part[..part.len() / 2]).expect("write");
+        drop(file);
+        let before = std::fs::read(&path).expect("read damaged journal");
+
+        assert!(matches!(
+            Journal::open(&owner, JournalConfig::default()),
+            Err(JournalError::BodyLengthMismatch { .. })
+        ));
+        assert_eq!(std::fs::read(path).expect("read preserved journal"), before);
+    }
+
+    #[test]
+    fn damaged_frame_is_rejected_and_preserved_on_open() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let owner = owner(&directory);
+        let path = directory.path().join(ACTIVE_JOURNAL_NAME);
+        let part = sample_part();
+
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open");
+        let part_ref = journal.append(id(1_000), &part).expect("append");
+        drop(journal);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("raw");
+        let frame_at = part_ref.offset() - FRAME_HEADER_LEN;
+        file.write_all_at(&[0], frame_at as u64)
+            .expect("damage frame magic");
+        file.sync_all().expect("persist damage");
+        let before = std::fs::read(&path).expect("read damaged journal");
+
+        assert!(matches!(
+            Journal::open(&owner, JournalConfig::default()),
+            Err(JournalError::DamagedBody { .. })
+        ));
+        assert_eq!(std::fs::read(path).expect("read preserved journal"), before);
+    }
+
+    #[test]
+    fn reset_empties_the_journal() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let owner = owner(&directory);
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open");
+        journal.append(id(1_000), &sample_part()).expect("append");
+        journal.reset().expect("reset");
+        assert!(journal.is_empty());
+        assert_eq!(journal.len(), JOURNAL_HEADER_LEN);
     }
 
     #[test]
@@ -1829,7 +2090,7 @@ mod tests {
         let owner = owner(&directory);
         let journal = Journal::open(&owner, JournalConfig::default()).unwrap();
         drop(journal);
-        let file = std::fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .open(directory.path().join("active.parts"))
             .unwrap();
@@ -1845,5 +2106,30 @@ mod tests {
             std::fs::read(directory.path().join("active.parts")).unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn reset_final_sync_failure_reopens_as_logically_empty() {
+        const INJECTED_EIO: i32 = 5;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let owner = owner(&directory);
+        let part = sample_part();
+        let mut journal = Journal::open(&owner, JournalConfig::default()).expect("open");
+        let stale = journal.append(id(1_000), &part).expect("append");
+        let faults = arm_journal_faults([(JournalFaultPoint::ResetFinalSync, INJECTED_EIO)]);
+
+        let err = journal.reset().expect_err("sync failure is reported");
+        assert_eq!(injected_operation_raw_os_error(&err), Some(INJECTED_EIO));
+        assert!(journal.is_poisoned());
+        assert!(matches!(
+            journal.read_part(stale),
+            Err(JournalError::Poisoned)
+        ));
+        faults.assert_consumed();
+        drop(journal);
+
+        let reopened = Journal::open(&owner, JournalConfig::default()).expect("reopen");
+        assert!(reopened.is_empty());
+        assert_eq!(reopened.len(), JOURNAL_HEADER_LEN);
     }
 }

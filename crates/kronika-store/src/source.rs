@@ -1,10 +1,11 @@
 //! Storage unit types returned by the store scan.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use kronika_format::{Catalog, DamageRegion, PartRef};
-use kronika_layout::{FileIdentity, LayoutError, SegmentAddress, SegmentId};
+use kronika_layout::{
+    FileIdentity, ForeignEntryReason, LayoutError, PathIdentity, SegmentAddress, SegmentId,
+};
 
 use crate::{CatalogDigest, CatalogSummary};
 
@@ -108,12 +109,156 @@ pub struct LocalScan {
 }
 
 /// A non-fatal storage diagnostic retained in the scan API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreWarning {
-    /// Path of the file that triggered the warning.
-    pub path: PathBuf,
-    /// Human-readable diagnostic reason.
-    pub reason: String,
+    /// Typed identity of the affected owned-store object.
+    pub affected: StoreObject,
+    /// Low-cardinality reason that never retains source bytes or error text.
+    pub reason: StoreWarningReason,
+    /// Exact filesystem identity when discovery reached a concrete inode.
+    pub identity: Option<FileIdentity>,
+    /// Bounded OS failure details for a localized I/O warning.
+    pub failure: Option<StoreIoFailure>,
+}
+
+/// An owned-store object affected by a non-fatal diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoreObject {
+    /// One canonical sealed PGM address.
+    Segment(SegmentAddress),
+    /// The root-level `active.parts` journal.
+    ActiveJournal,
+    /// One unsupported tree entry that discovery did not follow or interpret.
+    Foreign(PathIdentity),
+}
+
+/// Low-cardinality reason for a non-fatal store diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoreWarningReason {
+    /// A stable sealed PGM failed complete format validation and was excluded.
+    InvalidPgm(InvalidPgmReason),
+    /// The live journal could not be admitted; sealed discovery continued.
+    ActiveJournal(ActiveJournalWarningReason),
+    /// One tree entry was excluded from the supported owned-store grammar.
+    ForeignEntry(ForeignEntryReason),
+}
+
+impl StoreWarningReason {
+    /// Stable low-cardinality code suitable for logs and metric labels.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidPgm(reason) => reason.code(),
+            Self::ActiveJournal(ActiveJournalWarningReason::Corrupt) => "active_journal_corrupt",
+            Self::ActiveJournal(ActiveJournalWarningReason::Io) => "active_journal_io",
+            Self::ForeignEntry(ForeignEntryReason::UnsupportedName) => {
+                "foreign_entry_unsupported_name"
+            }
+            Self::ForeignEntry(ForeignEntryReason::UnsupportedType) => {
+                "foreign_entry_unsupported_type"
+            }
+            Self::ForeignEntry(ForeignEntryReason::SymbolicLink) => "foreign_entry_symbolic_link",
+            Self::ForeignEntry(ForeignEntryReason::UnsupportedFlatArtifact) => {
+                "foreign_entry_unsupported_flat_artifact"
+            }
+            Self::ForeignEntry(ForeignEntryReason::NonAsciiName) => "foreign_entry_non_ascii_name",
+            Self::ForeignEntry(ForeignEntryReason::MisbucketedSegment) => {
+                "foreign_entry_misbucketed_segment"
+            }
+        }
+    }
+}
+
+/// Why a strict live-journal scan degraded to sealed-only discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveJournalWarningReason {
+    /// Journal framing or committed bytes were structurally invalid.
+    Corrupt,
+    /// A localized journal open or read operation failed.
+    Io,
+}
+
+/// Stable format failure observed for a sealed PGM.
+///
+/// Variants deliberately omit corrupt bytes, raw decoder messages, untrusted
+/// numeric fields, checksums, and paths so callers can log or count them
+/// without leaking telemetry or creating unbounded metric labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidPgmReason {
+    /// The file is too short to contain the required framing.
+    TooSmall,
+    /// The opening PGM magic is invalid.
+    BadMagic,
+    /// The trailing tail index is malformed.
+    TailIndex,
+    /// The catalog uses an unsupported container version.
+    UnsupportedFormat,
+    /// The tail index declares an impossible or excessive catalog length.
+    BadCatalogLength,
+    /// The catalog framing, entry count, or checksum is invalid.
+    Catalog,
+    /// Catalog entries do not describe canonical section geometry.
+    CanonicalLayout,
+    /// At least one complete section body has a mismatched CRC32C.
+    SectionChecksum,
+    /// A positional read reached stable end-of-file before required bytes.
+    Truncated,
+    /// A localized file open, read, or metadata operation failed.
+    Io,
+}
+
+/// Stage of a localized, non-fatal store I/O failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreIoOperation {
+    /// Opening one already-discovered object.
+    Open,
+    /// Reading format bytes from one opened object.
+    Read,
+    /// Revalidating one opened object's filesystem identity.
+    Metadata,
+}
+
+/// Bounded, payload-free details for a localized store I/O failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreIoFailure {
+    /// Operation that failed.
+    pub operation: StoreIoOperation,
+    /// Portable I/O error category.
+    pub error_kind: std::io::ErrorKind,
+    /// Platform error number, when available.
+    pub raw_os_error: Option<i32>,
+}
+
+impl StoreIoFailure {
+    pub(crate) fn from_error(operation: StoreIoOperation, error: &std::io::Error) -> Self {
+        Self {
+            operation,
+            error_kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+}
+
+impl InvalidPgmReason {
+    /// Stable low-cardinality code suitable for logs and metric labels.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::TooSmall => "invalid_pgm_too_small",
+            Self::BadMagic => "invalid_pgm_bad_magic",
+            Self::TailIndex => "invalid_pgm_tail_index",
+            Self::UnsupportedFormat => "invalid_pgm_unsupported_format",
+            Self::BadCatalogLength => "invalid_pgm_bad_catalog_length",
+            Self::Catalog => "invalid_pgm_catalog",
+            Self::CanonicalLayout => "invalid_pgm_canonical_layout",
+            Self::SectionChecksum => "invalid_pgm_section_checksum",
+            Self::Truncated => "invalid_pgm_truncated",
+            Self::Io => "invalid_pgm_io",
+        }
+    }
 }
 
 /// Why a storage read failed.
@@ -134,6 +279,8 @@ pub enum StoreError {
     TooSmall,
     /// The first four bytes are not the PGM magic.
     BadMagic,
+    /// The trailing PGM tail index failed to decode.
+    TailIndex(kronika_format::DecodeError),
     /// The catalog declares a format version this build does not support.
     UnsupportedFormat {
         /// The `format_version` found in the catalog.
@@ -143,8 +290,15 @@ pub enum StoreError {
     BadCatalogLen,
     /// The catalog bytes failed to decode.
     Catalog(kronika_format::DecodeError),
+    /// The catalog does not describe the canonical physical section layout.
+    SectionLayout(kronika_format::CatalogLayoutError),
     /// A catalog entry points outside the section area.
     OutOfBounds,
+    /// A complete section body does not match its catalog checksum.
+    SectionChecksum {
+        /// Section type whose CRC32C did not match.
+        type_id: u32,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -160,12 +314,20 @@ impl std::fmt::Display for StoreError {
             }
             Self::TooSmall => write!(f, "source is too small for a PGM segment"),
             Self::BadMagic => write!(f, "source does not start with PGM1 magic"),
+            Self::TailIndex(err) => write!(f, "tail index decode failed: {err}"),
             Self::UnsupportedFormat { version } => {
                 write!(f, "unsupported format version {version}")
             }
             Self::BadCatalogLen => write!(f, "catalog_len does not fit in the source"),
             Self::Catalog(err) => write!(f, "catalog decode failed: {err}"),
+            Self::SectionLayout(err) => write!(f, "invalid section layout: {err}"),
             Self::OutOfBounds => write!(f, "a catalog entry points outside the section area"),
+            Self::SectionChecksum { type_id } => {
+                write!(
+                    f,
+                    "section {type_id} body checksum does not match its catalog"
+                )
+            }
         }
     }
 }
@@ -174,14 +336,16 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
+            Self::SectionLayout(err) => Some(err),
+            Self::Catalog(err) | Self::TailIndex(err) => Some(err),
             Self::Layout(err) => Some(err),
-            Self::Catalog(err) => Some(err),
             Self::ActivePartTooLarge { .. }
             | Self::TooSmall
             | Self::BadMagic
             | Self::UnsupportedFormat { .. }
             | Self::BadCatalogLen
-            | Self::OutOfBounds => None,
+            | Self::OutOfBounds
+            | Self::SectionChecksum { .. } => None,
         }
     }
 }

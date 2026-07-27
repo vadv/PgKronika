@@ -285,20 +285,12 @@ async fn sections_batch_returns_a_page_per_name() {
     let dir = tempfile::tempdir().expect("tempdir");
     let archiver = PgStatArchiver::encode(&[archiver_row(1_000, 1), archiver_row(1_100, 2)])
         .expect("encode archiver");
-    let prepared = PgPreparedXacts::encode(&[]).expect("encode prepared_xacts");
     let bytes = build_part(
-        &[
-            SectionInput {
-                type_id: 1_008_001,
-                rows: 2,
-                body: &archiver,
-            },
-            SectionInput {
-                type_id: 1_010_001,
-                rows: 0,
-                body: &prepared,
-            },
-        ],
+        &[SectionInput {
+            type_id: 1_008_001,
+            rows: 2,
+            body: &archiver,
+        }],
         PartMeta {
             min_ts: 1_000,
             max_ts: 2_000,
@@ -325,7 +317,7 @@ async fn sections_batch_returns_a_page_per_name() {
     assert_eq!(
         body["pg_prepared_xacts"]["rows"],
         serde_json::json!([]),
-        "a section with no rows is still present in the batch"
+        "an uncollected requested section is still present in the batch"
     );
 }
 

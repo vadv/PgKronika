@@ -2,9 +2,9 @@
 //!
 //! A reference may occur in `dict.strings` or `dict.blobs`; the split threshold
 //! is not part of the reader contract. The resolver reads both section kinds
-//! and copies only requested values. Equivalent repeated IDs and full-value
-//! placement upgrades are reconciled; contradictory values or invalid
-//! truncation metadata make the dictionary inconsistent.
+//! and copies only requested values. Every id must occur exactly once across
+//! both sections; duplicate ids, placement conflicts, or invalid truncation
+//! metadata make the dictionary inconsistent.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,6 +83,7 @@ impl ResolvedPattern {
                 bytes,
                 full_len,
                 truncated,
+                ..
             } => Self::Blob {
                 bytes,
                 full_len,
@@ -134,10 +135,48 @@ pub fn resolve_targeted(
         return Ok(BTreeMap::new());
     }
     let mut resolved: BTreeMap<u64, ResolvedPattern> = BTreeMap::new();
+    let mut scanned_ids = BTreeSet::new();
+    let mut scanned_types = BTreeSet::new();
     let mut retained_bytes = 0_u64;
+    let mut rows_scanned = 0_u64;
+    let mut decoded_bytes = 0_u64;
     for (type_id, body) in dict_sections {
-        let (entries, _rows_scanned, _decoded_bytes) =
-            decode_dictionary_selected(body, type_id, Some(wanted), bounds)?;
+        if !scanned_types.insert(type_id) {
+            return Err(CodecError::SchemaMismatch);
+        }
+        let section_bounds = remaining_row_bounds(bounds, rows_scanned)?;
+        let (entries, section_ids, section_rows, section_bytes) =
+            decode_dictionary_selected(body, type_id, Some(wanted), &section_bounds)?;
+        rows_scanned = rows_scanned
+            .checked_add(section_rows)
+            .ok_or(CodecError::TooManyRows {
+                rows: usize::MAX,
+                max: usize::try_from(bounds.items_per_block).unwrap_or(usize::MAX),
+            })?;
+        if rows_scanned > bounds.items_per_block {
+            return Err(CodecError::TooManyRows {
+                rows: usize::try_from(rows_scanned).unwrap_or(usize::MAX),
+                max: usize::try_from(bounds.items_per_block).unwrap_or(usize::MAX),
+            });
+        }
+        decoded_bytes =
+            decoded_bytes
+                .checked_add(section_bytes)
+                .ok_or(CodecError::SectionTooLarge {
+                    len: usize::MAX,
+                    max: usize::try_from(bounds.decoded_file_bytes).unwrap_or(usize::MAX),
+                })?;
+        if decoded_bytes > bounds.decoded_file_bytes {
+            return Err(CodecError::SectionTooLarge {
+                len: usize::try_from(decoded_bytes).unwrap_or(usize::MAX),
+                max: usize::try_from(bounds.decoded_file_bytes).unwrap_or(usize::MAX),
+            });
+        }
+        for str_id in section_ids {
+            if !scanned_ids.insert(str_id) {
+                return Err(CodecError::SchemaMismatch);
+            }
+        }
         for (str_id, stored) in entries {
             insert_bounded(
                 &mut resolved,
@@ -165,6 +204,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
     ) -> Result<TargetedDictionaryRead, ReadError> {
         validate_request(wanted, bounds).map_err(ReadError::Codec)?;
         let mut values = BTreeMap::new();
+        let mut scanned_ids = BTreeSet::new();
         let mut stats = TargetedDictionaryStats::default();
         let mut retained_bytes = 0_u64;
         if wanted.is_empty() {
@@ -178,6 +218,18 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             ) {
                 continue;
             }
+            let section_bounds =
+                remaining_row_bounds(bounds, stats.rows_scanned).map_err(ReadError::Codec)?;
+            let projected_rows = stats
+                .rows_scanned
+                .checked_add(u64::from(entry.rows))
+                .ok_or(ReadError::CounterOverflow)?;
+            if projected_rows > bounds.items_per_block {
+                return Err(ReadError::Codec(CodecError::TooManyRows {
+                    rows: usize::try_from(projected_rows).unwrap_or(usize::MAX),
+                    max: usize::try_from(bounds.items_per_block).unwrap_or(usize::MAX),
+                }));
+            }
             let body = self.verified_body(entry)?.into_bytes();
             stats.sections_read = stats
                 .sections_read
@@ -187,15 +239,14 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
                 .stored_bytes_read
                 .checked_add(entry.len)
                 .ok_or(ReadError::CounterOverflow)?;
-            let (selected, rows_scanned, decoded_bytes) =
-                decode_dictionary_selected(body, entry.type_id, Some(wanted), bounds)
+            let (selected, section_ids, rows_scanned, decoded_bytes) =
+                decode_dictionary_selected(body, entry.type_id, Some(wanted), &section_bounds)
                     .map_err(ReadError::Codec)?;
-            if rows_scanned != u64::from(entry.rows) {
-                return Err(ReadError::CatalogRowCountMismatch {
-                    type_id: entry.type_id,
-                    declared: entry.rows,
-                    decoded: rows_scanned,
-                });
+            Self::validate_catalog_row_count(entry, rows_scanned)?;
+            for str_id in section_ids {
+                if !scanned_ids.insert(str_id) {
+                    return Err(ReadError::DictionaryConflict { str_id });
+                }
             }
             stats.rows_scanned = stats
                 .rows_scanned
@@ -272,40 +323,27 @@ fn insert_bounded(
             }
             entry.insert(value);
         }
-        Entry::Occupied(mut entry) => {
-            let replace =
-                reconcile_repeat(entry.get(), &value).ok_or(CodecError::SchemaMismatch)?;
-            if replace {
-                entry.insert(value);
-            }
-        }
+        Entry::Occupied(_) => return Err(CodecError::SchemaMismatch),
     }
     Ok(())
 }
 
-fn reconcile_repeat(existing: &ResolvedPattern, incoming: &ResolvedPattern) -> Option<bool> {
-    if existing == incoming {
-        return Some(false);
-    }
-    match (existing, incoming) {
-        (
-            ResolvedPattern::Text(existing),
-            ResolvedPattern::Blob {
-                bytes,
-                full_len,
-                truncated: false,
-            },
-        ) if existing == bytes && *full_len == bytes.len() as u64 => Some(true),
-        (
-            ResolvedPattern::Blob {
-                bytes,
-                full_len,
-                truncated: false,
-            },
-            ResolvedPattern::Text(incoming),
-        ) if bytes == incoming && *full_len == bytes.len() as u64 => Some(false),
-        _ => None,
-    }
+fn remaining_row_bounds(
+    bounds: &crate::Bounds,
+    rows_scanned: u64,
+) -> Result<crate::Bounds, CodecError> {
+    let remaining =
+        bounds
+            .items_per_block
+            .checked_sub(rows_scanned)
+            .ok_or(CodecError::TooManyRows {
+                rows: usize::try_from(rows_scanned).unwrap_or(usize::MAX),
+                max: usize::try_from(bounds.items_per_block).unwrap_or(usize::MAX),
+            })?;
+    Ok(crate::Bounds {
+        items_per_block: remaining,
+        ..*bounds
+    })
 }
 
 #[cfg(test)]
@@ -385,23 +423,41 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_repeated_sections_do_not_double_count_retained_bytes() {
+    fn targeted_resolution_enforces_the_aggregate_scan_budget() {
+        let (sections, short_id, _long_id) = dictionary_sections();
+        let tight = crate::Bounds {
+            items_per_block: 1,
+            ..crate::LIMIT
+        };
+        let result = resolve_targeted(
+            sections
+                .into_iter()
+                .map(|(type_id, _rows, body)| (type_id, body)),
+            &BTreeSet::from([short_id]),
+            &tight,
+        );
+        assert!(matches!(
+            result,
+            Err(kronika_registry::CodecError::TooManyRows { rows: 1, max: 0 })
+        ));
+    }
+
+    #[test]
+    fn equivalent_repeated_sections_are_rejected() {
         let (sections, short_id, _long_id) = dictionary_sections();
         let wanted = BTreeSet::from([short_id]);
         let repeated: Vec<_> = sections
             .into_iter()
             .flat_map(|(type_id, _rows, body)| [(type_id, body.clone()), (type_id, body)])
             .collect();
-        let resolved =
-            resolve_targeted(repeated, &wanted, &crate::LIMIT).expect("resolve repeated sections");
-        assert_eq!(
-            resolved.get(&short_id),
-            Some(&ResolvedPattern::Text(b"idx_orders_pkey".to_vec()))
-        );
+        assert!(matches!(
+            resolve_targeted(repeated, &wanted, &crate::LIMIT),
+            Err(kronika_registry::CodecError::SchemaMismatch)
+        ));
     }
 
     #[test]
-    fn a_full_blob_upgrade_replaces_equivalent_string_placement() {
+    fn cross_placement_repeat_is_rejected_transactionally() {
         let mut resolved = BTreeMap::new();
         let mut retained_bytes = 0;
         let text = b"same value".to_vec();
@@ -413,25 +469,21 @@ mod tests {
             &mut retained_bytes,
         )
         .expect("insert string");
-        insert_bounded(
-            &mut resolved,
-            7,
-            ResolvedPattern::Blob {
-                bytes: text.clone(),
-                full_len: text.len() as u64,
-                truncated: false,
-            },
-            &crate::LIMIT,
-            &mut retained_bytes,
-        )
-        .expect("upgrade placement");
-        assert!(matches!(
-            resolved.get(&7),
-            Some(ResolvedPattern::Blob {
-                truncated: false,
-                ..
-            })
-        ));
+        assert!(
+            insert_bounded(
+                &mut resolved,
+                7,
+                ResolvedPattern::Blob {
+                    bytes: text.clone(),
+                    full_len: text.len() as u64,
+                    truncated: false,
+                },
+                &crate::LIMIT,
+                &mut retained_bytes,
+            )
+            .is_err()
+        );
+        assert_eq!(resolved.get(&7), Some(&ResolvedPattern::Text(text.clone())));
         assert_eq!(retained_bytes, text.len() as u64);
     }
 
@@ -498,7 +550,7 @@ mod tests {
         let unrelated = vec![0xA5; 128];
         let mut sections = vec![SectionInput {
             type_id: 1_006_001,
-            rows: 0,
+            rows: 1,
             body: &unrelated,
         }];
         sections.extend(dictionary.iter().map(|(type_id, rows, body)| SectionInput {
@@ -600,5 +652,52 @@ mod tests {
         assert_eq!(result.stats, super::TargetedDictionaryStats::default());
         assert_eq!(reads.borrow().len(), reads_before);
         assert_eq!(byte_len_calls.get(), 1);
+    }
+
+    #[test]
+    fn pgm_dictionary_budget_rejects_the_next_catalog_entry_before_reading_it() {
+        let (dictionary, short_id, _long_id) = dictionary_sections();
+        let sections: Vec<_> = dictionary
+            .iter()
+            .map(|(type_id, rows, body)| SectionInput {
+                type_id: *type_id,
+                rows: *rows,
+                body: body.as_ref(),
+            })
+            .collect();
+        let bytes = build_part(
+            &sections,
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 7,
+            },
+        );
+        let reads = Rc::new(RefCell::new(Vec::new()));
+        let byte_len_calls = Rc::new(Cell::new(0));
+        let unit = PgmUnit::open(CountingReader {
+            bytes,
+            reads: Rc::clone(&reads),
+            byte_len_calls,
+        })
+        .expect("open");
+        let reads_before = reads.borrow().len();
+        let tight = crate::Bounds {
+            items_per_block: 1,
+            ..crate::LIMIT
+        };
+
+        let result = unit.resolve_overview_dictionary(&BTreeSet::from([short_id]), &tight);
+        assert!(matches!(
+            result,
+            Err(crate::ReadError::Codec(
+                kronika_registry::CodecError::TooManyRows { rows: 2, max: 1 }
+            ))
+        ));
+        assert_eq!(
+            reads.borrow().len() - reads_before,
+            1,
+            "the second dictionary body must be rejected from its catalog row claim"
+        );
     }
 }

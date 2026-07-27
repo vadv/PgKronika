@@ -6,6 +6,7 @@
 //! manifest and, where it belongs to the target factor inventory, is emitted as
 //! explicit unsupported coverage rather than a fabricated zero.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
@@ -198,7 +199,7 @@ fn latest_at<T>(values: &[T], ts_us: i64, timestamp: impl Fn(&T) -> i64) -> Opti
         .map(|index| &values[index])
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CoverageRecord {
     ts_us: i64,
     read_state: u8,
@@ -1326,13 +1327,17 @@ fn insert_coverage(
     source_type: u32,
     record: CoverageRecord,
 ) -> Result<(), BuildError> {
-    if coverage
-        .insert((source_type, record.ts_us), record)
-        .is_some()
-    {
-        return Err(BuildError::Source(SourceError::Corrupt));
+    match coverage.entry((source_type, record.ts_us)) {
+        Entry::Vacant(slot) => {
+            slot.insert(record);
+            Ok(())
+        }
+        // A truncated read is legitimately restated by both the snapshot and
+        // the collection coverage sections; only a conflicting restatement of
+        // the same source and timestamp is corruption.
+        Entry::Occupied(slot) if *slot.get() == record => Ok(()),
+        Entry::Occupied(_) => Err(BuildError::Source(SourceError::Corrupt)),
     }
-    Ok(())
 }
 
 #[allow(
@@ -1819,6 +1824,104 @@ mod tests {
             collected: population,
             total_exact: true,
         }
+    }
+
+    #[test]
+    fn identical_coverage_restatement_is_not_corruption() {
+        let mut canonical = BTreeMap::new();
+        let record = CoverageRecord {
+            ts_us: 100,
+            read_state: 1,
+            visibility: 0,
+            source_total: 888,
+            collected: 707,
+            total_exact: true,
+        };
+        insert_coverage(&mut canonical, 1_002_005, record).expect("first statement");
+        insert_coverage(&mut canonical, 1_002_005, record)
+            .expect("the collection section restates the snapshot record");
+        assert_eq!(canonical.len(), 1);
+
+        let conflicting = CoverageRecord {
+            collected: 706,
+            ..record
+        };
+        assert!(matches!(
+            insert_coverage(&mut canonical, 1_002_005, conflicting),
+            Err(BuildError::Source(SourceError::Corrupt))
+        ));
+    }
+
+    #[test]
+    fn snapshot_and_collection_coverage_of_one_truncated_read_extract_together() {
+        use kronika_format::crc32c;
+        use kronika_registry::collection_coverage::CollectionCoverageV1;
+        use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
+        use kronika_registry::{Bytes, Section, StrId, Ts, VerifiedSection, decode_rows};
+
+        let statements = 1_002_005_u32;
+        let ts = 1_785_151_906_420_414_i64;
+        let snapshot = SnapshotCoverageV1 {
+            ts: Ts(ts),
+            source_type_id: statements,
+            collector_pid: 42,
+            collector_started_at: Ts(1),
+            read_state: 1,
+            visibility: 0,
+            source_total: 888,
+            collected: 707,
+        };
+        let collection = CollectionCoverageV1 {
+            ts: Ts(ts),
+            source_type_id: statements,
+            total: 888,
+            unknown_total: false,
+            collected: 707,
+            max_n: 707,
+            order_by: StrId(1),
+            cutoff_value: Some(12.5),
+            reason: 0,
+        };
+        let decode = |type_id: u32, body: Vec<u8>| {
+            let verified =
+                VerifiedSection::verify(Bytes::from(body.clone()), crc32c(&body), crc32c)
+                    .expect("section CRC matches");
+            DecodedMetricSection {
+                type_id,
+                rows: decode_rows(type_id, verified).expect("decode coverage section"),
+            }
+        };
+        let snapshot_section = || {
+            decode(
+                SNAPSHOT_COVERAGE,
+                SnapshotCoverageV1::encode(&[snapshot]).expect("encode snapshot coverage"),
+            )
+        };
+
+        let coverage = source_coverage(&[
+            snapshot_section(),
+            decode(
+                COLLECTION_COVERAGE,
+                CollectionCoverageV1::encode(&[collection]).expect("encode collection coverage"),
+            ),
+        ])
+        .expect("both restatements of one truncated read extract together");
+        assert_eq!(coverage[&statements].len(), 1);
+
+        let conflicting = CollectionCoverageV1 {
+            collected: 706,
+            ..collection
+        };
+        assert!(matches!(
+            source_coverage(&[
+                snapshot_section(),
+                decode(
+                    COLLECTION_COVERAGE,
+                    CollectionCoverageV1::encode(&[conflicting]).expect("encode conflicting"),
+                ),
+            ]),
+            Err(BuildError::Source(SourceError::Corrupt))
+        ));
     }
 
     #[test]

@@ -28,6 +28,12 @@ pub trait Section: crate::sealed::Sealed + Sized {
 
     /// Timestamp range for catalog metadata.
     fn ts_range(rows: &[Self]) -> Option<(i64, i64)>;
+
+    /// Total child values stored by all `ListI32` columns in `rows`.
+    ///
+    /// The generated implementation saturates at [`usize::MAX`] so callers
+    /// performing bounded admission cannot underestimate work on overflow.
+    fn list_i32_child_value_count(rows: &[Self]) -> usize;
 }
 
 /// Shared roundtrip assertion for generated codecs.

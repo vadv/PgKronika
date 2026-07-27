@@ -2591,24 +2591,23 @@ mod tests {
         let archiver = kronika_registry::pg_stat_archiver::PgStatArchiver::encode(rows)
             .expect("encode archiver");
         let metadata = InstanceMetadata::encode(&[metadata]).expect("encode metadata");
-        let mut sections: Vec<SectionInput<'_>> = dictionary
-            .iter()
-            .map(|section| SectionInput {
-                type_id: section.type_id,
-                rows: section.rows,
-                body: &section.body,
-            })
-            .collect();
-        sections.push(SectionInput {
-            type_id: 1_008_001,
-            rows: u32::try_from(rows.len()).expect("fixture row count"),
-            body: &archiver,
-        });
-        sections.push(SectionInput {
-            type_id: 1_021_001,
-            rows: 1,
-            body: &metadata,
-        });
+        let mut sections = vec![
+            SectionInput {
+                type_id: 1_008_001,
+                rows: u32::try_from(rows.len()).expect("fixture row count"),
+                body: &archiver,
+            },
+            SectionInput {
+                type_id: 1_021_001,
+                rows: 1,
+                body: &metadata,
+            },
+        ];
+        sections.extend(dictionary.iter().map(|section| SectionInput {
+            type_id: section.type_id,
+            rows: section.rows,
+            body: &section.body,
+        }));
         let bytes = kronika_format::build_part(
             &sections,
             PartMeta {

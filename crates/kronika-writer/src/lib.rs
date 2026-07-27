@@ -9,26 +9,38 @@
 //! [`Journal`] appends self-contained PGM parts as synchronized `PGMP` frames
 //! after a checksummed version-1 header in `active.parts`. Opening validates
 //! the complete header and body without repairing or truncating damage.
+//! After layout atomically retains exact damaged evidence, [`JournalRecovery`]
+//! can inspect it with bounded streaming resynchronization and replay only
+//! complete verified frames through the normal [`Journal::append`] contract.
 //! [`JournalConfig::max_journal_len`] is the hard growth bound, reported as
 //! [`JournalError::Full`] so the collector can seal early.
 //!
-//! [`seal`] streams one journal part at a time into a temporary file in the
-//! segment's UTC day, writes and synchronizes the end catalog, and publishes
-//! the result without overwriting another identity. Recovery accepts an
-//! existing final file only after exact comparison. It never resets the
-//! journal; the caller does so only after a successful seal.
+//! [`seal`] validates and decodes journal bodies, coalesces each registered
+//! type, normalizes dictionaries, and emits canonical Parquet 1.0 bodies with
+//! PLAIN values and Zstandard level 6. It writes a temporary file in the
+//! segment's UTC day and publishes without overwriting another identity.
+//! Recovery accepts an existing final file only after exact comparison. Seal
+//! never resets the journal, so the caller does so only after `Ok`.
 
 mod buffer;
 pub mod dict;
 mod interner;
 mod journal;
+mod recovery;
 mod segment;
 
 pub use buffer::{FlushSummary, FlushedPart, SectionBuffers, SectionFlushSummary};
 pub use interner::{FlushedEntry, Interner, SealedSegment};
 pub use journal::{Journal, JournalConfig, JournalError, JournalPartRef};
 pub use kronika_format::{MAX_JOURNAL_LEN, MAX_JOURNAL_PARTS, MAX_PART_LEN};
+pub use recovery::{
+    JournalRecovery, JournalRecoveryError, JournalRecoveryReason, JournalRecoverySummary,
+    JournalReplaySummary,
+};
 pub use segment::{SealError, SealSummary, seal};
+
+#[cfg(test)]
+use kronika_reader as _;
 
 #[cfg(test)]
 mod composition_tests {

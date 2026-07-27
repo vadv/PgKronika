@@ -226,13 +226,15 @@ mod tests {
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 
     use super::*;
+    use crate::tests::bgwriter_row;
 
     fn fixture(seed: u8) -> (FactBuildKey, Arc<SegmentFacts>) {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+        let body =
+            BgwriterCheckpointer::encode(&[bgwriter_row(i64::from(seed))]).expect("encode section");
         let bytes = build_part(
             &[SectionInput {
                 type_id: 1_006_001,
-                rows: 0,
+                rows: 1,
                 body: &body,
             }],
             PartMeta {

@@ -2,8 +2,8 @@ use crate::buffering::push_activity;
 use crate::plans_source::PlansSourceCache;
 use crate::scheduler::{Intervals, Scheduler, SourceKind};
 use crate::segments::{
-    SegmentState, open_collector_journal, seal_open_segment_with_reset, seal_reason,
-    validate_existing_segments,
+    SegmentState, open_collector_journal, quarantine_invalid_segments,
+    seal_open_segment_with_reset, seal_reason,
 };
 use crate::source_contracts::activity_dict_limits;
 use crate::{
@@ -13,6 +13,19 @@ use crate::{
 use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId};
 use kronika_source_pg::{ActivityRow, ActivityVersion};
 use kronika_writer::{Interner, JournalError, SectionBuffers, dict};
+
+fn quarantine_payloads(root: &std::path::Path) -> Vec<Vec<u8>> {
+    let quarantine = root.join(".pgkronika-quarantine-v1");
+    let mut payloads = std::fs::read_dir(quarantine)
+        .expect("read quarantine")
+        .map(|entry| {
+            std::fs::read(entry.expect("read quarantine entry").path())
+                .expect("read quarantined evidence")
+        })
+        .collect::<Vec<_>>();
+    payloads.sort();
+    payloads
+}
 
 #[test]
 fn segment_seals_on_force_zero_cap_size_or_age() {
@@ -294,6 +307,56 @@ fn startup_seals_windows_a_dead_process_left_in_the_journal() {
 }
 
 #[test]
+fn startup_finishes_a_segment_published_before_journal_reset() {
+    use kronika_writer::{Journal, JournalConfig, seal};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let segment_id = SegmentId::new(1_000).expect("valid segment id");
+    let address = SegmentAddress::new(segment_id).expect("valid UTC address");
+    let dest = root.diagnostic_file_path(address, kronika_layout::FileKind::Pgm);
+    {
+        let mut journal =
+            Journal::open(&owner, JournalConfig::default()).expect("open the journal");
+        journal
+            .append(segment_id, &activity_window_at(999))
+            .expect("append");
+        seal(&journal, &owner, address).expect("publish before simulated crash");
+        assert!(!journal.parts().is_empty(), "the crash precedes reset");
+    }
+    let published = std::fs::read(&dest).expect("read published segment");
+
+    let (journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("finish interrupted publication");
+    assert_eq!(recovered, Some(dest.clone()));
+    assert!(journal.parts().is_empty());
+    assert_eq!(
+        std::fs::read(dest).expect("read recovered segment"),
+        published
+    );
+    let data_address =
+        SegmentAddress::new(SegmentId::new(999).expect("valid earlier data timestamp"))
+            .expect("valid earlier data address");
+    assert!(
+        !root
+            .diagnostic_file_path(data_address, kronika_layout::FileKind::Pgm)
+            .exists(),
+        "recovery must not derive a second destination from the earlier data timestamp"
+    );
+    assert_eq!(
+        root.scan(LayoutLimits::default())
+            .expect("scan recovered root")
+            .segments
+            .len(),
+        1,
+        "the interrupted publication leaves exactly one canonical PGM"
+    );
+}
+
+#[test]
 fn startup_with_an_empty_journal_recovers_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = DataRoot::open(dir.path()).expect("open data root");
@@ -306,7 +369,179 @@ fn startup_with_an_empty_journal_recovers_nothing() {
 }
 
 #[test]
-fn startup_removes_only_stale_writer_temporaries() {
+fn startup_quarantines_a_torn_header_and_accepts_future_windows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let evidence = b"PGKJNL1".to_vec();
+    std::fs::write(dir.path().join("active.parts"), &evidence).expect("write torn header");
+
+    let (mut journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("recover torn journal header");
+
+    assert!(recovered.is_none());
+    assert!(journal.parts().is_empty());
+    assert_eq!(quarantine_payloads(dir.path()), vec![evidence]);
+    journal
+        .append(SegmentId::new(2_000).unwrap(), &activity_window())
+        .expect("collection continues in the fresh journal");
+}
+
+#[test]
+fn startup_recovers_complete_frames_despite_a_wrong_recorded_body_length() {
+    use kronika_format::{JOURNAL_HEADER_LEN, JournalHeader, JournalState};
+    use kronika_writer::{Journal, JournalConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let segment_id = SegmentId::new(1_000).unwrap();
+    {
+        let mut journal =
+            Journal::open(&owner, JournalConfig::default()).expect("open the journal");
+        journal
+            .append(segment_id, &activity_window())
+            .expect("append valid frame");
+    }
+    let active = dir.path().join("active.parts");
+    let mut evidence = std::fs::read(&active).expect("read active journal");
+    let physical_body_len = u64::try_from(evidence.len() - JOURNAL_HEADER_LEN).unwrap();
+    evidence[..JOURNAL_HEADER_LEN].copy_from_slice(
+        &JournalHeader {
+            state: JournalState::Active {
+                segment_id: segment_id.get(),
+            },
+            body_len: physical_body_len + 17,
+        }
+        .encode(),
+    );
+    std::fs::write(&active, &evidence).expect("write mismatched header");
+
+    let (journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("recover verified physical frame");
+
+    assert!(journal.parts().is_empty());
+    assert!(recovered.expect("verified frame is sealed").is_file());
+    assert_eq!(quarantine_payloads(dir.path()), vec![evidence]);
+}
+
+#[test]
+fn startup_finishes_recovery_pending_evidence_after_activation() {
+    use kronika_writer::{Journal, JournalConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let segment_id = SegmentId::new(1_000).unwrap();
+    {
+        let mut journal =
+            Journal::open(&owner, JournalConfig::default()).expect("open the journal");
+        journal
+            .append(segment_id, &activity_window())
+            .expect("append valid frame");
+    }
+    let evidence = std::fs::read(dir.path().join("active.parts")).expect("read evidence");
+    let mut rotation = owner
+        .begin_journal_rotation()
+        .expect("begin exact-evidence rotation");
+    Journal::prepare_rotation(&mut rotation).expect("prepare fresh journal");
+    let activated = rotation.activate();
+    drop(activated);
+
+    let (journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("finish pending evidence recovery");
+
+    assert!(journal.parts().is_empty());
+    assert!(recovered.expect("pending evidence is sealed").is_file());
+    assert_eq!(quarantine_payloads(dir.path()), vec![evidence]);
+}
+
+#[test]
+fn startup_recovers_a_pending_alternate_generation() {
+    use kronika_writer::{Journal, JournalConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let canonical =
+        Journal::open(&owner, JournalConfig::default()).expect("create canonical journal");
+    drop(canonical);
+    let mut generation = owner
+        .create_journal_generation()
+        .expect("create alternate generation");
+    Journal::prepare_slot(&mut generation.slot).expect("prepare alternate generation");
+    let mut alternate = Journal::open_slot(generation.slot, JournalConfig::default())
+        .expect("open alternate generation");
+    alternate
+        .append(SegmentId::new(1_000).unwrap(), &activity_window())
+        .expect("append alternate frame");
+    drop(alternate);
+
+    let (journal, recovered) =
+        open_collector_journal(&owner, 1 << 30).expect("recover pending generation");
+
+    assert!(journal.parts().is_empty());
+    assert!(recovered.expect("pending generation is sealed").is_file());
+    assert_eq!(quarantine_payloads(dir.path()).len(), 1);
+}
+
+#[test]
+fn failed_recovery_seal_preserves_evidence_and_continues_empty() {
+    use kronika_format::{PartMeta, SectionInput, build_part};
+    use kronika_writer::{Journal, JournalConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = DataRoot::open(dir.path()).expect("open data root");
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
+    let path = dir.path().join("active.parts");
+    let segment_id = SegmentId::new(123).expect("valid segment id");
+    let part = build_part(
+        &[SectionInput {
+            type_id: 9_999_999,
+            rows: 1,
+            body: b"not a registered Parquet section",
+        }],
+        PartMeta {
+            min_ts: 123,
+            max_ts: 123,
+            source_id: 7,
+        },
+    );
+    {
+        let mut journal =
+            Journal::open(&owner, JournalConfig::default()).expect("open the journal");
+        journal
+            .append(segment_id, &part)
+            .expect("append a structurally valid part");
+    }
+    let expected_evidence = std::fs::read(&path).expect("read exact journal evidence");
+
+    let (mut journal, recovered) = open_collector_journal(&owner, 1 << 30)
+        .expect("an unknown recovered section degrades locally");
+    assert!(recovered.is_none());
+    assert!(journal.parts().is_empty());
+    assert_eq!(
+        quarantine_payloads(dir.path()),
+        vec![expected_evidence],
+        "the exact unsealable journal is preserved"
+    );
+    journal
+        .append(SegmentId::new(456).unwrap(), &activity_window())
+        .expect("fresh collection continues");
+}
+
+#[test]
+fn startup_quarantines_only_stale_writer_temporaries() {
     let dir = tempfile::tempdir().expect("tempdir");
     let day = dir.path().join("1970/01/01");
     std::fs::create_dir_all(&day).expect("create canonical day");
@@ -324,6 +559,12 @@ fn startup_removes_only_stale_writer_temporaries() {
         1
     );
     assert!(!stale_pgm.exists());
+    assert!(
+        quarantine_payloads(dir.path())
+            .iter()
+            .any(|bytes| bytes == b"incomplete PGM"),
+        "the stale writer temporary is preserved as evidence"
+    );
     assert!(
         overview_temp.exists(),
         "the collector must not clean another owner's temporary"
@@ -379,7 +620,7 @@ fn published_pgm_with_failed_reset_requires_restart_before_another_append() {
 }
 
 #[test]
-fn startup_validation_reads_catalogs_without_hashing_section_bodies() {
+fn startup_validation_quarantines_body_and_catalog_corruption() {
     use kronika_format::{MAGIC, TAIL_INDEX_LEN, TailIndex};
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -397,27 +638,34 @@ fn startup_validation_reads_catalogs_without_hashing_section_bodies() {
     body_corrupt[MAGIC.len()] ^= 0xff;
     std::fs::write(&path, &body_corrupt).expect("write body-corrupt PGM");
 
+    let owner = root
+        .acquire_writer(LayoutLimits::default())
+        .expect("acquire writer");
     assert_eq!(
-        validate_existing_segments(&root, LayoutLimits::default())
-            .expect("startup validation is structural"),
-        1
+        quarantine_invalid_segments(&owner, LayoutLimits::default())
+            .expect("quarantine body-corrupt PGM"),
+        0
     );
+    assert!(!path.exists());
 
-    let mut catalog_corrupt = body_corrupt;
+    let mut catalog_corrupt = activity_window();
+    let tail_at = catalog_corrupt.len() - TAIL_INDEX_LEN;
+    let tail =
+        TailIndex::decode(catalog_corrupt[tail_at..].try_into().unwrap()).expect("valid tail");
+    let catalog_at = tail_at - usize::try_from(tail.catalog_len).unwrap();
     catalog_corrupt[catalog_at] ^= 0xff;
     std::fs::write(&path, catalog_corrupt).expect("write catalog-corrupt PGM");
-    let error = validate_existing_segments(&root, LayoutLimits::default())
-        .expect_err("catalog corruption remains fatal");
-    let error_chain = format!("{error:#}");
-    assert!(
-        error_chain.contains("decode PGM catalog")
-            && error_chain.contains("catalog crc32c mismatch"),
-        "catalog CRC failure remains visible: {error_chain}"
+    assert_eq!(
+        quarantine_invalid_segments(&owner, LayoutLimits::default())
+            .expect("quarantine catalog-corrupt PGM"),
+        0
     );
+    assert!(!path.exists());
+    assert_eq!(quarantine_payloads(dir.path()).len(), 2);
 }
 
 #[test]
-fn corrupt_existing_pgm_fails_before_active_journal_recovery() {
+fn corrupt_existing_pgm_does_not_block_active_journal_recovery() {
     use kronika_writer::{Journal, JournalConfig};
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -433,37 +681,32 @@ fn corrupt_existing_pgm_fails_before_active_journal_recovery() {
             .append(active_id, &activity_window())
             .expect("append recoverable window");
     }
-    let journal_path = dir.path().join("active.parts");
-    let journal_before = std::fs::read(&journal_path).expect("read active journal");
-
     let corrupt_address = SegmentAddress::new(SegmentId::new(1_000).unwrap()).unwrap();
     let corrupt_path = root.diagnostic_file_path(corrupt_address, kronika_layout::FileKind::Pgm);
     std::fs::create_dir_all(corrupt_path.parent().expect("PGM has a day directory"))
         .expect("create canonical day");
     std::fs::write(&corrupt_path, b"not a PGM").expect("write corrupt canonical PGM");
 
-    let error = prepare_collector_storage(&owner, LayoutLimits::default(), 1 << 30)
-        .expect_err("corrupt existing PGM must reject startup");
-    assert!(
-        error.to_string().contains("validate existing segment"),
-        "startup error identifies the corrupt canonical PGM: {error:#}"
-    );
-    assert_eq!(
-        std::fs::read(&journal_path).expect("reread active journal"),
-        journal_before,
-        "startup validation runs before active journal recovery"
-    );
+    let (journal, recovered) = prepare_collector_storage(&owner, LayoutLimits::default(), 1 << 30)
+        .expect("localized PGM corruption does not reject startup");
+    assert!(journal.parts().is_empty());
     let active_address = SegmentAddress::new(active_id).unwrap();
     assert!(
-        !root
-            .diagnostic_file_path(active_address, kronika_layout::FileKind::Pgm)
+        root.diagnostic_file_path(active_address, kronika_layout::FileKind::Pgm)
             .exists(),
-        "the active journal was not sealed after corrupt-root rejection"
+        "the valid active journal is still sealed"
+    );
+    assert!(recovered.is_some());
+    assert!(!corrupt_path.exists());
+    assert!(
+        quarantine_payloads(dir.path())
+            .iter()
+            .any(|bytes| bytes == b"not a PGM")
     );
 }
 
 #[test]
-fn corrupt_existing_pgm_fails_before_creating_the_writer_lock() {
+fn corrupt_existing_pgm_does_not_block_writer_ownership() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = DataRoot::open(dir.path()).expect("open data root");
     let corrupt_address = SegmentAddress::new(SegmentId::new(1_000).unwrap()).unwrap();
@@ -472,17 +715,18 @@ fn corrupt_existing_pgm_fails_before_creating_the_writer_lock() {
         .expect("create canonical day");
     std::fs::write(&corrupt_path, b"not a PGM").expect("write corrupt canonical PGM");
 
-    let error = acquire_collector_writer(&root, LayoutLimits::default())
-        .expect_err("corrupt existing PGM must reject startup");
-
+    let owner = acquire_collector_writer(&root, LayoutLimits::default())
+        .expect("localized PGM corruption must not reject writer ownership");
     assert!(
-        error.to_string().contains("validate existing segment"),
-        "startup error identifies the corrupt canonical PGM: {error:#}"
-    );
-    assert!(
-        !dir.path()
+        dir.path()
             .join(kronika_layout::WRITER_OWNER_LOCK_NAME)
             .exists(),
-        "preflight validation must not create a writer lock"
+        "writer ownership uses the persistent lock"
     );
+    assert_eq!(
+        quarantine_invalid_segments(&owner, LayoutLimits::default())
+            .expect("quarantine invalid PGM"),
+        0
+    );
+    assert!(!corrupt_path.exists());
 }

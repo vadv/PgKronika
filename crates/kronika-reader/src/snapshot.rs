@@ -4,20 +4,25 @@
 //! one list, suppresses exact sealed/live duplicates, and decodes both through
 //! `PgmUnit`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read as _};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kronika_format::{
-    Catalog, DamageRegion, ENTRY_LEN, Entry, JOURNAL_HEADER_LEN, JournalHeader, JournalState,
-    MAGIC, META_LEN, RESET_MARKER_LEN, ResetMarker, TAIL_INDEX_LEN,
+    Catalog, DamageRegion, Entry, JOURNAL_HEADER_LEN, JournalHeader, JournalState, MAGIC,
+    RESET_MARKER_LEN, ResetMarker, TAIL_INDEX_LEN,
 };
 use kronika_layout::SegmentId;
-use kronika_registry::{DecodedSection, Row};
+use kronika_registry::{
+    Bytes, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
+    MAX_SECTION_ROWS, Row, VerifiedSection, decode_any, encode_sealed_batches,
+    sealed_data_body_bound,
+};
 use kronika_store::{
     ActivePart, CatalogSummary, JournalScan, LocalDir, LocalScan, SealedUnit, StoreError,
-    StoreWarning, catalog_digests, is_active_journal_scan_error,
+    StoreObject, StoreWarning, StoreWarningReason, is_active_journal_scan_error,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -28,6 +33,7 @@ use crate::refresh::{
 };
 use crate::{
     Bounds, BuildError, Dictionary, FactLoad, FactStore, PgmUnit, ReadError, SegmentContext,
+    Stored, decode_dictionary,
 };
 
 const JOURNAL_PREFIX_DOMAIN: &[u8] = b"pgk-overview-journal-prefix-v1\0";
@@ -226,6 +232,9 @@ pub struct LocalDirSnapshot {
     delta_initialized: bool,
     /// Unvalidated bytes after the current journal watermark.
     tail_pending: Option<ByteRange>,
+    /// Exact proof that the current sealed segment is the canonical form of
+    /// every active part carrying the same persisted segment identity.
+    sealed_active_generation_match: bool,
 }
 
 /// Why a sealed snapshot unit could not produce persistent overview facts.
@@ -316,9 +325,15 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be opened or scanned.
     pub fn open(root: &Path) -> io::Result<Self> {
         let dir = LocalDir::open(root)?;
-        let (scan, journal_identity, journal_prefix_digest) = full_scan_consistent(&dir, &[])?;
+        let (scan, journal_identity, journal_prefix_digest, sealed_active_generation_match) =
+            retry_stale_proof(|| {
+                let (scan, identity, prefix_digest) = full_scan_consistent(&dir, &[])?;
+                let matched =
+                    prove_sealed_generation_matches_active(&dir, &scan, identity, prefix_digest)?;
+                Ok((scan, identity, prefix_digest, matched))
+            })?;
         let last_valid_len = scan.valid_len;
-        let journal_descriptors_complete = journal_descriptors_complete(&scan, root);
+        let journal_descriptors_complete = journal_descriptors_complete(&scan);
         let tail_pending = tail_pending(journal_identity, last_valid_len);
         Ok(Self {
             dir,
@@ -332,6 +347,7 @@ impl LocalDirSnapshot {
             journal_descriptors_complete,
             delta_initialized: false,
             tail_pending,
+            sealed_active_generation_match,
         })
     }
 
@@ -351,9 +367,10 @@ impl LocalDirSnapshot {
     ///
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh(&mut self) -> io::Result<()> {
-        let (scan, identity, transition, prefix_digest) = self.scan_full_consistent()?;
-        self.install_baseline(scan, identity, prefix_digest, transition)?;
-        Ok(())
+        retry_stale_proof(|| {
+            let (scan, identity, transition, prefix_digest) = self.scan_full_consistent()?;
+            self.install_baseline(scan, identity, prefix_digest, transition)
+        })
     }
 
     /// Re-scan the store incrementally, reading only the journal tail.
@@ -371,9 +388,10 @@ impl LocalDirSnapshot {
     ///
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh_incremental(&mut self) -> io::Result<()> {
-        let (scan, identity, transition, prefix_digest) = self.scan_incremental_consistent()?;
-        self.install_baseline(scan, identity, prefix_digest, transition)?;
-        Ok(())
+        retry_stale_proof(|| {
+            let (scan, identity, transition, prefix_digest) = self.scan_incremental_consistent()?;
+            self.install_baseline(scan, identity, prefix_digest, transition)
+        })
     }
 
     /// Re-scan incrementally and report the semantic delta of the scan.
@@ -390,6 +408,10 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be re-scanned or if a
     /// generation counter would overflow.
     pub fn refresh_incremental_delta(&mut self) -> io::Result<RefreshDelta> {
+        retry_stale_proof(|| self.refresh_incremental_delta_attempt())
+    }
+
+    fn refresh_incremental_delta_attempt(&mut self) -> io::Result<RefreshDelta> {
         let previous_valid_len = self.last_valid_len;
         let previous_sealed = Arc::clone(&self.scan.sealed);
         let previous_view_generation = self.view_generation;
@@ -437,7 +459,13 @@ impl LocalDirSnapshot {
         }
 
         let sealed = sealed_delta(&scan, previous_sealed.as_slice());
-        let current_parts_complete = journal_descriptors_complete(&scan, &self.root);
+        let current_parts_complete = journal_descriptors_complete(&scan);
+        let current_sealed_active_generation_match = prove_sealed_generation_matches_active(
+            &self.dir,
+            &scan,
+            current_identity,
+            prefix_digest,
+        )?;
 
         let changed = !completed_parts.is_empty()
             || !sealed.added.is_empty()
@@ -448,6 +476,7 @@ impl LocalDirSnapshot {
             || current_tail_pending != self.tail_pending
             || scan.damages != self.scan.damages
             || current_parts_complete != self.journal_descriptors_complete
+            || current_sealed_active_generation_match != self.sealed_active_generation_match
             || (bootstrap
                 && (current_tail_pending.is_some()
                     || !scan.damages.is_empty()
@@ -468,6 +497,7 @@ impl LocalDirSnapshot {
         self.view_generation = new_view_generation;
         self.delta_initialized = true;
         self.tail_pending = current_tail_pending;
+        self.sealed_active_generation_match = current_sealed_active_generation_match;
 
         Ok(RefreshDelta {
             previous_view_generation,
@@ -524,7 +554,7 @@ impl LocalDirSnapshot {
             same_committed_reset,
         );
         let scan = self.dir.complete_scan_cached(journal, &self.scan.sealed)?;
-        let transition = if journal_descriptors_complete(&scan, &self.root) {
+        let transition = if journal_descriptors_complete(&scan) {
             transition
         } else {
             PartTransition::Uncertain
@@ -572,7 +602,7 @@ impl LocalDirSnapshot {
             same_committed_reset,
         );
         let scan = self.dir.complete_scan_cached(journal, &self.scan.sealed)?;
-        let transition = if journal_descriptors_complete(&scan, &self.root) {
+        let transition = if journal_descriptors_complete(&scan) {
             transition
         } else {
             PartTransition::Uncertain
@@ -628,8 +658,10 @@ impl LocalDirSnapshot {
             JournalGenerationId(bump(self.journal_generation.0)?)
         };
         let sealed = sealed_delta(&scan, self.scan.sealed.as_slice());
-        let current_parts_complete = journal_descriptors_complete(&scan, &self.root);
+        let current_parts_complete = journal_descriptors_complete(&scan);
         let current_tail_pending = tail_pending(identity, scan.valid_len);
+        let current_sealed_active_generation_match =
+            prove_sealed_generation_matches_active(&self.dir, &scan, identity, prefix_digest)?;
         let changed = !same_active_parts(&self.scan, &scan)
             || !same_sealed_units(&self.scan, &scan)
             || !same_warnings(&self.scan.warnings, &scan.warnings)
@@ -638,6 +670,7 @@ impl LocalDirSnapshot {
             || scan.damages != self.scan.damages
             || current_tail_pending != self.tail_pending
             || current_parts_complete != self.journal_descriptors_complete
+            || current_sealed_active_generation_match != self.sealed_active_generation_match
             || !transition.preserves_generation();
         let view_generation = if changed {
             bump(self.view_generation)?
@@ -654,6 +687,7 @@ impl LocalDirSnapshot {
         self.view_generation = view_generation;
         self.delta_initialized = false;
         self.tail_pending = current_tail_pending;
+        self.sealed_active_generation_match = current_sealed_active_generation_match;
         Ok(())
     }
 
@@ -673,6 +707,21 @@ impl LocalDirSnapshot {
     #[must_use]
     pub fn warnings(&self) -> &[StoreWarning] {
         &self.scan.warnings
+    }
+
+    /// Whether the current scan excluded this canonical segment as invalid.
+    ///
+    /// Callers may retain the last verified descriptor as unavailable while
+    /// the warning remains, without treating an authoritative deletion as a
+    /// permanent gap.
+    #[must_use]
+    pub fn has_invalid_segment_warning(&self, locator: SealedLocator) -> bool {
+        self.scan.warnings.iter().any(|warning| {
+            matches!(
+                warning.affected,
+                StoreObject::Segment(address) if address.id == locator.segment_id()
+            ) && matches!(warning.reason, StoreWarningReason::InvalidPgm(_))
+        })
     }
 
     /// Damaged byte ranges recorded for this snapshot.
@@ -1123,7 +1172,7 @@ impl LocalDirSnapshot {
     /// Iterator over handles in the same order as `units()`.
     fn handles(&self) -> impl Iterator<Item = UnitHandle> + '_ {
         let sealed_iter = (0..self.scan.sealed.len()).map(UnitHandle::Sealed);
-        let suppress_active_generation = sealed_generation_matches_active(&self.scan);
+        let suppress_active_generation = self.sealed_active_generation_match;
 
         let active_iter = self
             .scan
@@ -1137,45 +1186,114 @@ impl LocalDirSnapshot {
     }
 }
 
-/// Whether sealing every active part for one segment produces this sealed catalog.
+/// Proves that the rare same-id sealed/live pair contains exactly one logical
+/// generation.
 ///
-/// The sealer relocates section bodies into one PGM, so a multi-part active
-/// catalog cannot be compared to the sealed catalog one part at a time.
-fn sealed_generation_matches_active(scan: &LocalScan) -> bool {
+/// Coalescing changes catalog multiplicity, Parquet bytes, and dictionary
+/// placement. Metadata alone cannot prove the crash-window duplicate. This
+/// path therefore reproduces each canonical data body and compares exact bytes,
+/// then compares normalized dictionary records including full blob hashes.
+/// The normal case (no sealed file sharing the active `SegmentId`) performs no
+/// body I/O.
+fn prove_sealed_generation_matches_active(
+    dir: &LocalDir,
+    scan: &LocalScan,
+    expected_journal_identity: Option<JournalIdentity>,
+    expected_prefix_digest: JournalPrefixDigest,
+) -> io::Result<bool> {
     let Some(segment_id) = scan.active.first().map(|active| active.segment_id) else {
-        return false;
+        return Ok(false);
     };
+    if scan
+        .active
+        .iter()
+        .any(|active| active.segment_id != segment_id)
+    {
+        return Ok(false);
+    }
     let Some(sealed) = scan
         .sealed
         .iter()
         .find(|sealed| sealed.address.id == segment_id)
     else {
-        return false;
+        return Ok(false);
     };
-    aggregate_catalog_matches(&sealed.summary, &scan.active, segment_id)
+    if !aggregate_envelope_matches(&sealed.summary, &scan.active) {
+        return Ok(false);
+    }
+
+    let Some(expected_journal_identity) = expected_journal_identity else {
+        return Err(stale_generation_proof(
+            "active descriptors exist without a journal identity",
+        ));
+    };
+    verify_journal_proof_identity(
+        dir,
+        expected_journal_identity,
+        scan.valid_len,
+        expected_prefix_digest,
+    )?;
+
+    let journal = dir
+        .open_active()?
+        .ok_or_else(|| stale_generation_proof("active.parts disappeared during proof"))?;
+    let sealed_file = dir.open_sealed(sealed)?;
+    let sealed_unit =
+        PgmUnit::open(sealed_file.try_clone()?).map_err(generation_proof_read_error)?;
+    let sealed_data_types = sealed_unit
+        .catalog()
+        .entries
+        .iter()
+        .filter(|entry| !matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID))
+        .map(|entry| entry.type_id)
+        .collect::<BTreeSet<_>>();
+    let active_data_types = scan
+        .active
+        .iter()
+        .flat_map(|active| active.catalog.entries.iter())
+        .filter(|entry| !matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID))
+        .map(|entry| entry.type_id)
+        .collect::<BTreeSet<_>>();
+    if sealed_data_types != active_data_types {
+        return Ok(false);
+    }
+
+    for type_id in active_data_types {
+        if !canonical_data_body_matches(&journal, &scan.active, &sealed_unit, type_id)? {
+            return Ok(false);
+        }
+    }
+
+    let active_dictionary = normalized_active_dictionary(&journal, &scan.active)?;
+    let sealed_dictionary = sealed_unit
+        .dictionary()
+        .map_err(generation_proof_read_error)?
+        .by_id
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    if active_dictionary != sealed_dictionary {
+        return Ok(false);
+    }
+
+    dir.validate_sealed_file(&sealed_file, sealed)?;
+    verify_journal_proof_identity(
+        dir,
+        expected_journal_identity,
+        scan.valid_len,
+        expected_prefix_digest,
+    )?;
+    Ok(true)
 }
 
-/// Mirrors the catalog transformation performed by `kronika_writer::seal`.
-fn aggregate_catalog_matches(
-    sealed: &CatalogSummary,
-    active: &[ActivePart],
-    segment_id: SegmentId,
-) -> bool {
-    if active.is_empty() {
-        return false;
-    }
+fn aggregate_envelope_matches(sealed: &CatalogSummary, active: &[ActivePart]) -> bool {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     let mut source_id = 0_u64;
-    let format_version = active[0].catalog.format_version;
-    let mut entry_count = 0_usize;
-    let mut body_end = MAGIC.len() as u64;
-
-    for active_part in active {
-        if active_part.segment_id != segment_id {
-            return false;
-        }
-        let catalog = &active_part.catalog;
+    let Some(format_version) = active.first().map(|part| part.catalog.format_version) else {
+        return false;
+    };
+    for part in active {
+        let catalog = &part.catalog;
         if catalog.format_version != format_version {
             return false;
         }
@@ -1187,64 +1305,182 @@ fn aggregate_catalog_matches(
             }
             source_id = catalog.source_id;
         }
-        entry_count = match entry_count.checked_add(catalog.entries.len()) {
-            Some(count) => count,
-            None => return false,
-        };
-        for entry in &catalog.entries {
-            body_end = match body_end.checked_add(entry.len) {
-                Some(next) => next,
-                None => return false,
-            };
-        }
     }
-
     if min_ts > max_ts {
         min_ts = 0;
         max_ts = 0;
     }
-    let Ok(entry_count_u32) = u32::try_from(entry_count) else {
-        return false;
-    };
-    let Some(catalog_len) = entry_count
-        .checked_mul(ENTRY_LEN)
-        .and_then(|entries_len| META_LEN.checked_add(entries_len))
-        .and_then(|len| u32::try_from(len).ok())
-    else {
-        return false;
-    };
-    let mut relocated_offset = MAGIC.len() as u64;
-    let relocated_entries = active
-        .iter()
-        .flat_map(|part| part.catalog.entries.iter().copied())
-        .map(|entry| {
-            let relocated = Entry {
-                offset: relocated_offset,
-                ..entry
-            };
-            relocated_offset = relocated_offset
-                .checked_add(entry.len)
-                .expect("aggregate body length was checked above");
-            relocated
-        });
-    let (logical_digest, layout_digest) = catalog_digests(
-        source_id,
-        min_ts,
-        max_ts,
-        format_version,
-        entry_count_u32,
-        relocated_entries,
-    );
+    (
+        sealed.min_ts,
+        sealed.max_ts,
+        sealed.source_id,
+        sealed.format_version,
+    ) == (min_ts, max_ts, source_id, format_version)
+}
 
-    sealed.min_ts == min_ts
-        && sealed.max_ts == max_ts
-        && sealed.source_id == source_id
-        && sealed.entry_count == entry_count_u32
-        && sealed.format_version == format_version
-        && sealed.catalog_len == catalog_len
-        && sealed.logical_digest == logical_digest
-        && sealed.layout_digest == layout_digest
-        && body_end >= MAGIC.len() as u64
+fn canonical_data_body_matches(
+    journal: &std::fs::File,
+    active: &[ActivePart],
+    sealed: &PgmUnit<std::fs::File>,
+    type_id: u32,
+) -> io::Result<bool> {
+    let mut batches = Vec::new();
+    let mut decoded_rows = 0_usize;
+    let mut list_i32_child_values = 0_usize;
+    for part in active {
+        let Some(entry) = part
+            .catalog
+            .entries
+            .iter()
+            .find(|entry| entry.type_id == type_id)
+        else {
+            continue;
+        };
+        let decoded = decode_any(type_id, verified_active_body(journal, part, entry)?)
+            .map_err(generation_proof_codec_error)?;
+        if decoded.stats.rows != entry.rows as usize {
+            return Err(generation_proof_invalid(format!(
+                "active section {type_id} decoded {} rows but declares {}",
+                decoded.stats.rows, entry.rows
+            )));
+        }
+        decoded_rows = decoded_rows
+            .checked_add(decoded.stats.rows)
+            .ok_or_else(|| generation_proof_invalid("aggregate row count overflow"))?;
+        list_i32_child_values = list_i32_child_values
+            .checked_add(decoded.stats.list_i32_child_values)
+            .ok_or_else(|| generation_proof_invalid("aggregate list count overflow"))?;
+        sealed_data_body_bound(type_id, decoded_rows, list_i32_child_values)
+            .map_err(generation_proof_codec_error)?;
+        batches.extend(decoded.batches);
+    }
+    let body = encode_sealed_batches(type_id, batches).map_err(generation_proof_codec_error)?;
+    let Some(entry) = sealed
+        .catalog()
+        .entries
+        .iter()
+        .find(|entry| entry.type_id == type_id)
+    else {
+        return Ok(false);
+    };
+    if usize::try_from(entry.rows).ok() != Some(decoded_rows) {
+        return Ok(false);
+    }
+    let sealed_body = sealed
+        .verified_body(entry)
+        .map_err(generation_proof_read_error)?;
+    Ok(sealed_body.into_bytes().as_ref() == body.as_slice())
+}
+
+fn normalized_active_dictionary(
+    journal: &std::fs::File,
+    active: &[ActivePart],
+) -> io::Result<BTreeMap<u64, Stored>> {
+    let mut normalized = BTreeMap::new();
+    let mut string_rows = 0_usize;
+    let mut blob_rows = 0_usize;
+    let mut string_bytes = 0_usize;
+    let mut blob_bytes = 0_usize;
+    for part in active {
+        for entry in &part.catalog.entries {
+            if !matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
+                continue;
+            }
+            let body = verified_active_body(journal, part, entry)?.into_bytes();
+            let (values, rows) =
+                decode_dictionary(body, entry.type_id).map_err(generation_proof_codec_error)?;
+            if rows != u64::from(entry.rows) {
+                return Err(generation_proof_invalid(format!(
+                    "active dictionary {} decoded {rows} rows but declares {}",
+                    entry.type_id, entry.rows
+                )));
+            }
+            for (str_id, value) in values {
+                match normalized.get(&str_id) {
+                    Some(existing) if existing == &value => continue,
+                    Some(_) => {
+                        return Err(generation_proof_invalid(format!(
+                            "dictionary id {str_id} has conflicting values"
+                        )));
+                    }
+                    None => {}
+                }
+                let (rows, bytes, value_bytes) = match &value {
+                    Stored::String(value) => (&mut string_rows, &mut string_bytes, value.len()),
+                    Stored::Blob { bytes, .. } => (&mut blob_rows, &mut blob_bytes, bytes.len()),
+                };
+                *rows = rows
+                    .checked_add(1)
+                    .filter(|&rows| rows <= MAX_SECTION_ROWS)
+                    .ok_or_else(|| generation_proof_invalid("dictionary row bound exceeded"))?;
+                *bytes = bytes
+                    .checked_add(value_bytes)
+                    .filter(|&bytes| bytes <= MAX_SECTION_BYTES)
+                    .ok_or_else(|| generation_proof_invalid("dictionary byte bound exceeded"))?;
+                normalized.insert(str_id, value);
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn verified_active_body(
+    journal: &std::fs::File,
+    part: &ActivePart,
+    entry: &Entry,
+) -> io::Result<VerifiedSection> {
+    let len = usize::try_from(entry.len)
+        .ok()
+        .filter(|&len| len <= MAX_SECTION_BYTES)
+        .ok_or_else(|| generation_proof_invalid("active section length exceeds its bound"))?;
+    let part_len = u64::try_from(part.part.len)
+        .map_err(|_overflow| generation_proof_invalid("active part length overflow"))?;
+    let end = entry
+        .offset
+        .checked_add(entry.len)
+        .filter(|&end| end <= part_len)
+        .ok_or_else(|| generation_proof_invalid("active section is outside its part"))?;
+    let _ = end;
+    let body_at = u64::try_from(part.part.offset)
+        .ok()
+        .and_then(|part_at| part_at.checked_add(entry.offset))
+        .ok_or_else(|| generation_proof_invalid("active section offset overflow"))?;
+    let mut body = vec![0_u8; len];
+    journal.read_exact_at(&mut body, body_at)?;
+    VerifiedSection::verify(Bytes::from(body), entry.crc32c, kronika_format::crc32c)
+        .map_err(generation_proof_codec_error)
+}
+
+fn verify_journal_proof_identity(
+    dir: &LocalDir,
+    expected: JournalIdentity,
+    valid_len: u64,
+    expected_prefix: JournalPrefixDigest,
+) -> io::Result<()> {
+    if journal_identity(dir)? != Some(expected)
+        || journal_prefix_digest(dir, valid_len)? != expected_prefix
+    {
+        return Err(stale_generation_proof(
+            "active.parts changed during sealed/live equivalence proof",
+        ));
+    }
+    Ok(())
+}
+
+fn generation_proof_read_error(error: ReadError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn generation_proof_codec_error(error: kronika_registry::CodecError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+fn generation_proof_invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn stale_generation_proof(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, message)
 }
 
 fn descriptor_for_sealed(sealed: &SealedUnit) -> SegmentDescriptor {
@@ -1302,12 +1538,11 @@ fn sealed_delta(scan: &LocalScan, previous: &[SealedUnit]) -> SealedDeltaState {
     SealedDeltaState { added, removed }
 }
 
-fn journal_descriptors_complete(scan: &LocalScan, root: &Path) -> bool {
-    let journal_path = root.join("active.parts");
+fn journal_descriptors_complete(scan: &LocalScan) -> bool {
     !scan
         .warnings
         .iter()
-        .any(|warning| warning.path == journal_path)
+        .any(|warning| matches!(warning.affected, StoreObject::ActiveJournal))
 }
 
 fn part_descriptors(
@@ -1422,6 +1657,19 @@ fn with_stable_journal_identity<T>(
             "active.parts changed during {MAX_CONSISTENT_SCAN_ATTEMPTS} consecutive scan attempts"
         ),
     ))
+}
+
+/// Retries an `Interrupted` scan-plus-proof up to
+/// `MAX_CONSISTENT_SCAN_ATTEMPTS` times: the sealed/active equivalence proof
+/// races with seal→reset and must observe a settled journal.
+fn retry_stale_proof<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for _attempt in 1..MAX_CONSISTENT_SCAN_ATTEMPTS {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+    operation()
 }
 
 fn journal_prefix_digest(dir: &LocalDir, valid_len: u64) -> io::Result<JournalPrefixDigest> {
@@ -1588,11 +1836,7 @@ fn same_sealed_units(previous: &LocalScan, current: &LocalScan) -> bool {
 }
 
 fn same_warnings(previous: &[StoreWarning], current: &[StoreWarning]) -> bool {
-    previous.len() == current.len()
-        && previous
-            .iter()
-            .zip(current)
-            .all(|(left, right)| left.path == right.path && left.reason == right.reason)
+    previous == current
 }
 
 #[cfg(test)]

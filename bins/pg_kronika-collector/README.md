@@ -10,8 +10,9 @@ condition fires.
 
 The daemon prints `ready` and `sealed ...` state changes to stdout. Structured
 logfmt diagnostics go to stderr. A failed collection cycle is logged and
-retried; a configuration, initial connection, or journal-open error stops
-startup.
+retried. Configuration and initial-connection errors stop startup; localized
+tree, PGM, journal-recovery, or quarantine damage is reported and excluded
+while valid storage and future collection continue.
 
 ## Required configuration
 
@@ -33,6 +34,7 @@ The supported local layout is fixed:
 ```text
 KRONIKA_OUT_DIR/
 ├── active.parts
+├── .pgkronika-quarantine-v1/
 ├── .pgkronika-writer.owner.lock
 ├── .pgkronika-overview.owner.lock
 └── YYYY/
@@ -52,20 +54,28 @@ The collector writes `active.parts`, the writer lock, and PGM files. The web
 process may add the overview lock and derived `N.ovf` siblings. One collector
 holds `.pgkronika-writer.owner.lock` for the lifetime of the process, so two
 collectors cannot write the same data root. Use a separate `KRONIKA_OUT_DIR`
-for each collector. After acquiring that lock, startup removes only recognized
+for each collector. After acquiring that lock, startup quarantines recognized
 stale PGM publication temporaries. OVF and overview-probe temporaries remain
 under the overview owner's control.
 
 `active.parts` uses journal version 1 with magic `PGKJNL1\0`. Its checksummed
 header stores the active `SegmentId`; the first id and frame are synchronized
-together. A zero-length, headerless, differently versioned, torn, or damaged
-journal stops startup and is left unchanged. After successful PGM publication,
-the file becomes a synchronized valid empty version-1 journal.
+together. A zero-length file is initialized in place. For other localized
+format damage, startup first preserves the exact original inode without
+overwrite. A bounded physical scan publishes only complete frames with valid
+frame, PGM, catalog, and section CRCs under the trusted header `SegmentId`;
+bytes that cannot be admitted are counted. A fresh canonical or fallback
+journal generation then accepts new windows, so manual deletion is not
+required. After successful PGM publication, the active generation becomes a
+synchronized valid empty version-1 journal.
 
-The root has a closed grammar. Root-level `.pgm` or `.ovf` files, symbolic
-links, unknown entries, malformed dates, and misplaced segment ids stop
-startup. This is the first supported layout in the unreleased project.
-Recreate development and test data that does not satisfy this contract.
+Canonical data has a closed grammar. Root-level `.pgm` or `.ovf` files,
+symbolic links, unknown entries, malformed dates, and misplaced segment ids
+are never followed or interpreted. The writer attempts a bounded,
+collision-safe atomic quarantine rename; otherwise the entry is ignored with
+a typed diagnostic. An invalid PGM is quarantined whole and excluded. Neither
+case blocks valid segments or startup. The quarantine directory is opaque to
+normal scans and is never removed automatically.
 
 ## Connection and query guards
 

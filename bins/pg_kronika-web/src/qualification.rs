@@ -2259,7 +2259,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_contiguous_partition_reconciles_to_exact_cold_sealed_facts",
                 ),
                 ("mode", "qualification", "oracle-profile"),
             ],
@@ -2272,7 +2272,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_contiguous_partition_reconciles_to_exact_cold_sealed_facts",
                 ),
                 (
                     "rust_test",
@@ -2388,7 +2388,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_contiguous_partition_reconciles_to_exact_cold_sealed_facts",
                 ),
                 (
                     "rust_test",
@@ -2449,7 +2449,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_contiguous_partition_reconciles_to_exact_cold_sealed_facts",
                 ),
             ],
             timeline_bdd: false,
@@ -2614,7 +2614,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/gc/tests.rs",
-                    "a_sidecar_symlink_makes_gc_fail_closed_without_removing_sources",
+                    "a_foreign_sidecar_symlink_is_skipped_without_blocking_gc",
                 ),
                 (
                     "rust_test",

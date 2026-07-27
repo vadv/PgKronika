@@ -1419,6 +1419,7 @@ dependencies = [
  "bytes",
  "kronika-derive",
  "parquet",
+ "thrift",
 ]
 
 [[package]]
@@ -1471,6 +1472,7 @@ dependencies = [
  "arrow-schema",
  "kronika-format",
  "kronika-layout",
+ "kronika-reader",
  "kronika-registry",
  "parquet",
  "sha2 0.10.9",
