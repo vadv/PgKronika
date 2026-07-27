@@ -1853,6 +1853,78 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_and_collection_coverage_of_one_truncated_read_extract_together() {
+        use kronika_format::crc32c;
+        use kronika_registry::collection_coverage::CollectionCoverageV1;
+        use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
+        use kronika_registry::{Bytes, Section, StrId, Ts, VerifiedSection, decode_rows};
+
+        let statements = 1_002_005_u32;
+        let ts = 1_785_151_906_420_414_i64;
+        let snapshot = SnapshotCoverageV1 {
+            ts: Ts(ts),
+            source_type_id: statements,
+            collector_pid: 42,
+            collector_started_at: Ts(1),
+            read_state: 1,
+            visibility: 0,
+            source_total: 888,
+            collected: 707,
+        };
+        let collection = CollectionCoverageV1 {
+            ts: Ts(ts),
+            source_type_id: statements,
+            total: 888,
+            unknown_total: false,
+            collected: 707,
+            max_n: 707,
+            order_by: StrId(1),
+            cutoff_value: Some(12.5),
+            reason: 0,
+        };
+        let decode = |type_id: u32, body: Vec<u8>| {
+            let verified =
+                VerifiedSection::verify(Bytes::from(body.clone()), crc32c(&body), crc32c)
+                    .expect("section CRC matches");
+            DecodedMetricSection {
+                type_id,
+                rows: decode_rows(type_id, verified).expect("decode coverage section"),
+            }
+        };
+        let snapshot_section = || {
+            decode(
+                SNAPSHOT_COVERAGE,
+                SnapshotCoverageV1::encode(&[snapshot]).expect("encode snapshot coverage"),
+            )
+        };
+
+        let coverage = source_coverage(&[
+            snapshot_section(),
+            decode(
+                COLLECTION_COVERAGE,
+                CollectionCoverageV1::encode(&[collection]).expect("encode collection coverage"),
+            ),
+        ])
+        .expect("both restatements of one truncated read extract together");
+        assert_eq!(coverage[&statements].len(), 1);
+
+        let conflicting = CollectionCoverageV1 {
+            collected: 706,
+            ..collection
+        };
+        assert!(matches!(
+            source_coverage(&[
+                snapshot_section(),
+                decode(
+                    COLLECTION_COVERAGE,
+                    CollectionCoverageV1::encode(&[conflicting]).expect("encode conflicting"),
+                ),
+            ]),
+            Err(BuildError::Source(SourceError::Corrupt))
+        ));
+    }
+
+    #[test]
     fn context_falls_forward_only_when_the_epoch_predates_the_sample() {
         let timeline = ResetTimeline {
             pg: vec![(200, 50, Some(150))],
