@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 pub(crate) enum Output {
     Tree(TreeOutput),
     Pgm(PgmOutput),
+    Ovf(OvfOutput),
     Journal(JournalOutput),
 }
 
@@ -70,6 +71,48 @@ pub(crate) struct PgmOutput {
     pub(crate) dictionary: DictionaryOutput,
     pub(crate) sections: Vec<SectionOutput>,
     pub(crate) totals: TotalsOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfHeaderOutput {
+    pub(crate) fact_schema_version: u32,
+    pub(crate) extractor_semantics_version: u32,
+    pub(crate) registry_contract_version: u32,
+    pub(crate) source_format_version: u32,
+    pub(crate) pgm_source_id: u64,
+    pub(crate) source_min_ts_us: i64,
+    pub(crate) source_max_ts_us: i64,
+    pub(crate) source_file_len: u64,
+    pub(crate) source_descriptor: String,
+    pub(crate) fact_key: String,
+    pub(crate) segment_lineage_id: String,
+    pub(crate) directory_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfBlockOutput {
+    pub(crate) kind: Option<&'static str>,
+    pub(crate) kind_code: u32,
+    pub(crate) logical_id: u32,
+    pub(crate) schema_version: u16,
+    pub(crate) required: bool,
+    pub(crate) sorted: bool,
+    pub(crate) has_time_range: bool,
+    pub(crate) codec: &'static str,
+    pub(crate) stored_bytes: u64,
+    pub(crate) decoded_bytes: u64,
+    pub(crate) items: u32,
+    pub(crate) min_ts_us: Option<i64>,
+    pub(crate) max_ts_us: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfOutput {
+    pub(crate) kind: &'static str,
+    pub(crate) path: String,
+    pub(crate) file_bytes: u64,
+    pub(crate) header: OvfHeaderOutput,
+    pub(crate) blocks: Vec<OvfBlockOutput>,
 }
 
 #[derive(Debug, Serialize)]

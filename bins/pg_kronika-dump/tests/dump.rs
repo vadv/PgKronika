@@ -10,12 +10,17 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use kronika_analytics::overview::SegmentIdentity;
 use kronika_format::{
     DictLimits, FRAME_HEADER_LEN, FrameHeader, JOURNAL_HEADER_LEN, JournalHeader, JournalState,
     MAGIC, PartMeta, SectionInput, build_part,
 };
 use kronika_layout::{
     DataRoot, LayoutLimits, QUARANTINE_DIRECTORY_NAME, SegmentAddress, SegmentId,
+};
+use kronika_reader::{
+    BlockContent, CatalogEntryDescriptor, FactFile, HeaderIdentity, LIMIT, ManifestEntryDescriptor,
+    SourceDescriptor, SourceManifestBlock,
 };
 use kronika_registry::os_loadavg::OsLoadavg;
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
@@ -67,6 +72,45 @@ fn part_with_loadavg(min_ts: i64, max_ts: i64, rows: &[i64]) -> (Vec<u8>, Vec<u8
     (part, body)
 }
 
+fn ovf_fixture() -> Vec<u8> {
+    let descriptor = SourceDescriptor([0x22; 32]);
+    let lineage = SegmentIdentity::sealed(7, descriptor.0);
+    let identity = HeaderIdentity::from_current_contract(
+        kronika_format::FORMAT_VERSION,
+        7,
+        10,
+        30,
+        4_096,
+        descriptor,
+        lineage.id(),
+    );
+    let manifest = SourceManifestBlock::new(
+        7,
+        kronika_format::FORMAT_VERSION,
+        10,
+        30,
+        4_096,
+        vec![ManifestEntryDescriptor {
+            catalog: CatalogEntryDescriptor {
+                type_id: OsLoadavg::CONTRACT.type_id.get(),
+                flags: 0,
+                body_len: 128,
+                rows: 3,
+                body_crc32c: 0x1234_5678,
+            },
+            section_body_id: None,
+        }],
+        &LIMIT,
+    )
+    .expect("OVF manifest");
+    FactFile::build(
+        &identity,
+        vec![BlockContent::SourceManifest(Box::new(manifest))],
+        &LIMIT,
+    )
+    .expect("build OVF fixture")
+}
+
 fn run_json(arguments: impl IntoIterator<Item = OsString>) -> (ExitCode, Value, String) {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -75,6 +119,17 @@ fn run_json(arguments: impl IntoIterator<Item = OsString>) -> (ExitCode, Value, 
     (
         status,
         output,
+        String::from_utf8(stderr).expect("diagnostic is UTF-8"),
+    )
+}
+
+fn run_raw(arguments: impl IntoIterator<Item = OsString>) -> (ExitCode, Vec<u8>, String) {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = run(arguments, &mut stdout, &mut stderr);
+    (
+        status,
+        stdout,
         String::from_utf8(stderr).expect("diagnostic is UTF-8"),
     )
 }
@@ -89,6 +144,51 @@ fn write_segment(root: &Path, id: i64, bytes: &[u8]) -> PathBuf {
     let path = day.join(address.pgm_name());
     fs::write(&path, bytes).expect("write PGM");
     path
+}
+
+#[test]
+fn ovf_name_selects_metadata_dump_without_reading_bodies() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let bytes = ovf_fixture();
+    let path = directory.path().join("segment.ovf");
+    fs::write(&path, &bytes).expect("write OVF");
+
+    let (status, output, stderr) = run_json([path.into_os_string()]);
+
+    assert_eq!(status, ExitCode::SUCCESS, "{stderr}");
+    assert!(stderr.is_empty());
+    assert_eq!(output["kind"], "ovf");
+    assert_eq!(output["file_bytes"], bytes.len());
+    assert_eq!(output["header"]["pgm_source_id"], 7);
+    assert!(
+        output["blocks"]
+            .as_array()
+            .is_some_and(|blocks| !blocks.is_empty())
+    );
+    assert!(
+        output["blocks"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .all(|block| block.get("content").is_none())
+    );
+}
+
+#[test]
+fn file_mode_is_selected_by_name_without_magic_fallback() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (pgm, _body) = part_with_loadavg(10, 10, &[10]);
+    let pgm_as_ovf = directory.path().join("renamed.ovf");
+    fs::write(&pgm_as_ovf, pgm).expect("write renamed PGM");
+    let (status, stdout, _stderr) = run_raw([pgm_as_ovf.into_os_string()]);
+    assert_eq!(status, ExitCode::from(1));
+    assert!(stdout.is_empty());
+
+    let ovf_as_journal = directory.path().join("renamed.parts");
+    fs::write(&ovf_as_journal, ovf_fixture()).expect("write renamed OVF");
+    let (status, output, stderr) = run_json([ovf_as_journal.into_os_string()]);
+    assert_eq!(status, ExitCode::SUCCESS, "{stderr}");
+    assert_eq!(output["kind"], "journal");
 }
 
 #[test]

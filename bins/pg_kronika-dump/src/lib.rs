@@ -2,6 +2,7 @@
 
 mod journal;
 mod model;
+mod ovf;
 mod pgm;
 mod tree;
 
@@ -12,7 +13,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use kronika_format::{MAGIC, ReadAt as _};
 use rustix::fs::{Mode, OFlags};
 
 use crate::model::Output;
@@ -131,14 +131,14 @@ where
         ));
     }
     let file = open_regular_input(&arguments.path)?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| DumpError::input("stat input file", error))?
-        .len();
-    if has_pgm_magic(&file, file_len)? {
-        pgm::inspect_file(file, &arguments.path, arguments.options).map(Output::Pgm)
-    } else {
-        journal::inspect_file(&file, &arguments.path, arguments.options).map(Output::Journal)
+    match arguments.path.extension() {
+        Some(extension) if extension == OsStr::new("pgm") => {
+            pgm::inspect_file(file, &arguments.path, arguments.options).map(Output::Pgm)
+        }
+        Some(extension) if extension == OsStr::new("ovf") => {
+            ovf::inspect_file(file, &arguments.path, arguments.options).map(Output::Ovf)
+        }
+        _ => journal::inspect_file(&file, &arguments.path, arguments.options).map(Output::Journal),
     }
 }
 
@@ -169,16 +169,6 @@ fn open_regular_input(path: &Path) -> Result<File, DumpError> {
     } else {
         Err(DumpError::message("input path is not a regular file"))
     }
-}
-
-fn has_pgm_magic(file: &File, len: u64) -> Result<bool, DumpError> {
-    if len < MAGIC.len() as u64 {
-        return Ok(false);
-    }
-    let mut magic = [0_u8; MAGIC.len()];
-    file.read_exact_at(&mut magic, 0)
-        .map_err(|error| DumpError::input("read input magic", error))?;
-    Ok(magic == MAGIC)
 }
 
 struct Arguments {

@@ -158,7 +158,7 @@ git commit -m "feat(reader): admit standalone OVF metadata"
 - Produces: `ovf::inspect_file(file, path, options) -> Result<OvfOutput, DumpError>`.
 - Produces: `Output::Ovf(OvfOutput)` with `kind: "ovf"`.
 
-- [ ] **Step 1: Write failing filename and metadata tests**
+- [x] **Step 1: Write failing filename and metadata tests**
 
 Build a bounded OVF fixture through `FactFile::build`, write it as
 `segment.ovf`, and assert:
@@ -187,7 +187,7 @@ fn ovf_name_selects_metadata_dump_without_reading_bodies() {
 Add separate assertions that a valid PGM named `.ovf` fails as OVF and a valid
 OVF named `.parts` fails as journal. This proves there is no magic fallback.
 
-- [ ] **Step 2: Run dump integration tests and verify RED**
+- [x] **Step 2: Run dump integration tests and verify RED**
 
 ```bash
 cargo test -p pg_kronika-dump ovf_name_selects \
@@ -196,7 +196,7 @@ cargo test -p pg_kronika-dump ovf_name_selects \
 
 Expected: failure because `.ovf` is routed to journal and `Output::Ovf` is absent.
 
-- [ ] **Step 3: Add filename dispatch**
+- [x] **Step 3: Add filename dispatch**
 
 Replace magic-based PGM selection with exact final suffix selection:
 
@@ -211,7 +211,7 @@ match arguments.path.extension().and_then(OsStr::to_str) {
 Keep each selected decoder responsible for validating its own magic and
 framing. Remove `has_pgm_magic`.
 
-- [ ] **Step 4: Add metadata model and converter**
+- [x] **Step 4: Add metadata model and converter**
 
 Define serializable `OvfOutput`, `OvfHeaderOutput`, and `OvfBlockOutput`.
 `OvfBlockOutput.content` is `None` in this task. Convert binary identifiers with
@@ -232,7 +232,7 @@ Map every known `BlockKind` to stable snake_case; retain unknown kinds as
 `None`. Map `BlockCodec::{None,Zstd}` to `"none"` and `"zstd"`. Serialize
 directory timestamps as `Option<i64>` when `has_time_range` is false.
 
-- [ ] **Step 5: Run metadata tests and verify GREEN**
+- [x] **Step 5: Run metadata tests and verify GREEN**
 
 ```bash
 cargo test -p pg_kronika-dump ovf_name_selects \
@@ -243,7 +243,7 @@ cargo test -p pg_kronika-dump filename \
 
 Expected: filename and metadata tests pass.
 
-- [ ] **Step 6: Commit metadata mode**
+- [x] **Step 6: Commit metadata mode**
 
 ```bash
 git add bins/pg_kronika-dump/src/lib.rs \
