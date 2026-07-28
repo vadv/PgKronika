@@ -67,50 +67,41 @@ pub enum IdentityQuality {
     Approximate,
 }
 
-/// A lineage together with the numeric source and quality it proves.
+/// A lineage together with the identity quality it proves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentIdentity {
     id: SegmentLineageId,
-    source_id: u64,
     quality: IdentityQuality,
 }
 
 impl SegmentIdentity {
     /// Derives a rebuild-stable lineage from sealed PGM metadata.
     #[must_use]
-    pub fn sealed(source_id: u64, source_descriptor: [u8; 32]) -> Self {
+    pub fn sealed(source_descriptor: [u8; 32]) -> Self {
         let id = SegmentLineageId(sha256::digest_parts(&[
             LINEAGE_DOMAIN_TAG,
-            &source_id.to_le_bytes(),
             &source_descriptor,
         ]));
         Self {
             id,
-            source_id,
             quality: IdentityQuality::ContentDerived,
         }
     }
 
     /// Derives a view-scoped lineage when a future sealed locator is unknown.
     #[must_use]
-    pub fn live_approximate(
-        source_id: u64,
-        journal_generation: u64,
-        first_part_descriptor: &[u8],
-    ) -> Self {
+    pub fn live_approximate(journal_generation: u64, first_part_descriptor: &[u8]) -> Self {
         let descriptor_len = u64::try_from(first_part_descriptor.len())
             .unwrap_or(u64::MAX)
             .to_le_bytes();
         let id = SegmentLineageId(sha256::digest_parts(&[
             LIVE_LINEAGE_DOMAIN_TAG,
-            &source_id.to_le_bytes(),
             &journal_generation.to_le_bytes(),
             &descriptor_len,
             first_part_descriptor,
         ]));
         Self {
             id,
-            source_id,
             quality: IdentityQuality::Approximate,
         }
     }
@@ -126,24 +117,18 @@ impl SegmentIdentity {
     pub const fn quality(self) -> IdentityQuality {
         self.quality
     }
-
-    /// Numeric PGM source carried by this lineage.
-    #[must_use]
-    pub const fn source_id(self) -> u64 {
-        self.source_id
-    }
 }
 
 impl ObservationId {
     fn derive(
         lineage: SegmentLineageId,
-        source_type_id: u32,
+        section_type_id: u32,
         provenance: &ObservationProvenance,
     ) -> Self {
         Self(sha256::digest_parts(&[
             OBSERVATION_DOMAIN_TAG,
             &lineage.0,
-            &source_type_id.to_le_bytes(),
+            &section_type_id.to_le_bytes(),
             &provenance.section_body_id.0,
             &provenance.catalog_entry_ordinal.to_le_bytes(),
             &provenance.row_ordinal.to_le_bytes(),
@@ -734,8 +719,7 @@ pub enum InvalidObservation {
 pub struct EventObservation {
     observation_id: ObservationId,
     identity_quality: IdentityQuality,
-    source_id: u64,
-    source_type_id: u32,
+    section_type_id: u32,
     provenance: ObservationProvenance,
     shape: ObservationShape,
     time: ObservationTime,
@@ -758,7 +742,7 @@ impl EventObservation {
     )]
     pub fn new(
         lineage: SegmentIdentity,
-        source_type_id: u32,
+        section_type_id: u32,
         provenance: ObservationProvenance,
         shape: ObservationShape,
         time: ObservationTime,
@@ -815,12 +799,11 @@ impl EventObservation {
         if !time_quality_is_valid_for_payload {
             return Err(InvalidObservation::TimeQualityShapeMismatch);
         }
-        let observation_id = ObservationId::derive(lineage.id, source_type_id, &provenance);
+        let observation_id = ObservationId::derive(lineage.id, section_type_id, &provenance);
         Ok(Self {
             observation_id,
             identity_quality: lineage.quality,
-            source_id: lineage.source_id,
-            source_type_id,
+            section_type_id,
             provenance,
             shape,
             time,
@@ -844,16 +827,10 @@ impl EventObservation {
         self.identity_quality
     }
 
-    /// Numeric PGM source ID.
+    /// Physical section type ID.
     #[must_use]
-    pub const fn source_id(&self) -> u64 {
-        self.source_id
-    }
-
-    /// Source type ID.
-    #[must_use]
-    pub const fn source_type_id(&self) -> u32 {
-        self.source_type_id
+    pub const fn section_type_id(&self) -> u32 {
+        self.section_type_id
     }
 
     /// Provenance record.
@@ -978,8 +955,8 @@ mod tests {
         out
     }
 
-    fn lineage(source_id: u64) -> SegmentIdentity {
-        SegmentIdentity::sealed(source_id, [2; 32])
+    fn lineage() -> SegmentIdentity {
+        SegmentIdentity::sealed([2; 32])
     }
 
     fn provenance(row_ordinal: u32) -> ObservationProvenance {
@@ -1031,7 +1008,7 @@ mod tests {
         payload: ObservationPayload,
     ) -> Result<EventObservation, InvalidObservation> {
         EventObservation::new(
-            lineage(1),
+            lineage(),
             7,
             provenance,
             shape,
@@ -1080,7 +1057,7 @@ mod tests {
             + retained.iter().map(|text| text.len()).sum::<usize>()
             + loss.reasons.capacity() * size_of::<LossReason>();
         let observation = EventObservation::new(
-            lineage(1),
+            lineage(),
             7,
             provenance(1),
             ObservationShape::GroupedCount,
@@ -1115,35 +1092,34 @@ mod tests {
     }
 
     #[test]
-    fn sealed_lineage_uses_source_and_descriptors() {
-        let base = lineage(1).id();
-        assert_ne!(base, lineage(2).id());
-        let changed_descriptor = SegmentIdentity::sealed(1, [9; 32]);
+    fn sealed_lineage_uses_descriptor() {
+        let base = lineage().id();
+        let changed_descriptor = SegmentIdentity::sealed([9; 32]);
         assert_ne!(base, changed_descriptor.id());
     }
 
     #[test]
     fn unproven_live_lineage_is_separate_and_approximate() {
-        let live = SegmentIdentity::live_approximate(1, 8, b"first-part");
+        let live = SegmentIdentity::live_approximate(8, b"first-part");
         assert_eq!(live.quality(), IdentityQuality::Approximate);
-        assert_ne!(live.id(), lineage(1).id());
+        assert_ne!(live.id(), lineage().id());
     }
 
     #[test]
     fn identity_preimages_are_pinned() {
-        let sealed = lineage(1);
+        let sealed = lineage();
         assert_eq!(
             sealed.id().0,
-            hex32("5677d10066c36f8f6d7e1f9d44760765e92d00d5001a6a4ec1afaf7c565beb7c")
+            hex32("2cb944e1f06ceb2069c5e7931ac80bc206a26513f0e5592fb20868b1ce52854e")
         );
-        let live = SegmentIdentity::live_approximate(1, 8, b"first-part");
+        let live = SegmentIdentity::live_approximate(8, b"first-part");
         assert_eq!(
             live.id().0,
-            hex32("eb3ce89fcfd67c743f4a6d024ec46f1aa989a064e43a2928aeec77060eced58b")
+            hex32("60e4a66c0d01fe9c6e69881645285da2ca8e8dad9deb09adf5499592eb805175")
         );
         assert_eq!(
             individual(4).observation_id().0,
-            hex32("3f7200f165fd26338b3f2d8aa29eeccdd5f007c2b0ff7761273205e41d4352e7")
+            hex32("74124478ec65817220e82e961c33760b1659c79f4ac1e90de4d6737ea159d7f8")
         );
     }
 
@@ -1153,7 +1129,7 @@ mod tests {
         let mut other_provenance = provenance(4);
         other_provenance.catalog_entry_ordinal = 1;
         let other = EventObservation::new(
-            lineage(1),
+            lineage(),
             7,
             other_provenance,
             ObservationShape::Individual,
@@ -1315,7 +1291,7 @@ mod tests {
         });
         let interval = CoverageSpan::new(10, 30).expect("valid span");
         let observation = EventObservation::new(
-            lineage(1),
+            lineage(),
             7,
             provenance(0),
             ObservationShape::Gap,

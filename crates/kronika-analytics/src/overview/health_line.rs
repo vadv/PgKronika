@@ -227,7 +227,7 @@ mod tests {
     }
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(1, [2; 32])
+        SegmentIdentity::sealed([2; 32])
     }
 
     fn provenance(row: u32) -> ObservationProvenance {
