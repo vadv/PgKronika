@@ -1843,8 +1843,8 @@ audit и read-only transport; write/remediation tools не входят.
 ## 10. Non-goals и отклонённые варианты
 
 - Нет внешнего опционального PostgreSQL snapshot store.
-- Нет второго Prometheus/Victoria контура как источника истины; PgKronika
-  вычисляет историю из собственных сохранённых фактов.
+- Нет второго контура метрик как источника истины; PgKronika вычисляет
+  историю из собственных сохранённых фактов.
 - Нет набора несвязанных generic pages: каждый экран реализует описанный
   investigation workflow и stable URL.
 - Нет raw free-form `reason`/`context`, backend English prose или translation
