@@ -2,7 +2,7 @@
 
 Дата: 2026-07-28. Статус: верхнеуровневая дорожная карта для серии
 implementation PR. Текущее состояние сверено с `origin/main` на
-`0bba2d02901b88792f35b801c2c9cc65bdcf5352`.
+`5b72cf9d3dd0782b456efdce0d35f69c92eb613c`.
 
 ## Что ещё предстоит
 
@@ -19,13 +19,15 @@ bounded machine API/UI`.
    canonical extractors, перераспределение доступных весов, completeness и
    critical ceiling. Уже работающие strict coverage, typed diff и event floor
    не реализуются повторно.
-2. **Machine contract (начало B).** Завершить `HS-004`, `UX-004` и
-   `UX-005`: зафиксировать score/detail/history/per-database/evidence
-   services, согласовать runtime IDs с OpenAPI, затем сгенерировать client.
+2. **Health machine contract (начало B).** Завершить `HS-004`: добавить
+   target score/detail/history/per-database/evidence services и согласовать
+   их runtime IDs с OpenAPI. Работающие generic UI-data routes остаются
+   baseline и не заменяют Health contract.
 3. **Universal coverage.** Завершить `DATA-002`: сохранять attempt,
    population и per-database outcome для каждого используемого PostgreSQL/OS
    source. Все последующие sources используют этот контракт.
-4. **Health UI (остаток B).** Поставить EN/RU UI, accessibility, stable URL,
+4. **Production frontend (остаток B).** Завершить `UX-004` и `UX-005`:
+   сгенерировать client/models, поставить EN/RU UI, accessibility, stable URL,
    одну IANA timezone и bounded investigation context. До завершения coverage
    UI явно показывает partial/unavailable.
 5. **Core facts.** Выполнить оставшиеся T1 gaps в порядке
@@ -55,6 +57,11 @@ bounded machine API/UI`.
 Сводка 50 активных IDs: `implemented=0`, `partial=23`, `future=27`,
 `superseded/rejected=0`. Реализованные prerequisites вынесены в нижний
 baseline и не считаются активными задачами.
+
+Текущий `main` также содержит server-side foundation для девяти UI-проекций:
+OVF-блоки `UiSummary`/`EntitySeries`, selective reads и catalog/summary/heatmap
+routes. Он не меняет классификацию: target Health services, browser URL state,
+generated client/frontend, compare и log-search workflows отсутствуют.
 
 Подробные контракты:
 
@@ -118,3 +125,7 @@ PR; общая инфраструктура получает отдельный 
 | `BASE-003` | Частичные collection/snapshot coverage и bounded top-N accounting | `crates/kronika-registry/src/codec/collection_coverage.rs`, `crates/kronika-registry/src/codec/snapshot_coverage.rs`, `bins/pg_kronika-collector/src/coverage.rs` | `crates/kronika-bdd/features/collection_coverage.feature`, `docs/type-registry/semantics.md` |
 | `BASE-004` | Vacuum progress, включая PG18 `delay_time` | `crates/kronika-source-pg/src/progress_vacuum.rs`, `crates/kronika-registry/src/codec/pg_stat_progress_vacuum.rs`, `bins/pg_kronika-collector/src/main_sources.rs` | `crates/kronika-bdd/features/pg_stat_progress_vacuum.feature`, `docs/type-registry/postgresql.md` |
 | `BASE-005` | Bounded GET machine API с Basic Auth и authenticated timeline cursor | `bins/pg_kronika-web/src/lib.rs`, `bins/pg_kronika-web/src/auth.rs`, `bins/pg_kronika-web/src/overview/cursor.rs` | `bins/pg_kronika-web/src/tests/overview_timeline.rs`, `bins/pg_kronika-web/src/tests/overview_admission.rs`, `bins/pg_kronika-web/src/tests/auth_static.rs`, `bins/pg_kronika-web/openapi.json` |
+| `BASE-006` | Server-side UI-data foundation: единый реестр девяти проекций, OVF summary/top-K series, selective reads и hard-capped catalog/summary/heatmap responses | `crates/kronika-analytics/src/web_projection.rs`, `crates/kronika-reader/src/overview/web_index/{build,read,series,summary}.rs`, `bins/pg_kronika-web/src/ui/{catalog,data,handlers,heatmap}.rs` | `crates/kronika-analytics/tests/web_projection.rs`, web-index/snapshot tests в `kronika-reader`, `bins/pg_kronika-web/src/tests/{ui_catalog,ui_data}.rs`, `bins/pg_kronika-web/openapi.json` |
+
+`BASE-006` — server-side data/API primitive, а не production browser
+frontend. Он не закрывает `HS-004`, `UX-004` или `UX-005`.

@@ -2,7 +2,7 @@
 
 Дата: 2026-07-28. Статус: целевая design/spec для последовательных
 implementation PR. Текущее покрытие сверено с `origin/main` на
-`0bba2d02901b88792f35b801c2c9cc65bdcf5352`.
+`5b72cf9d3dd0782b456efdce0d35f69c92eb613c`.
 
 ## 1. Решение и границы
 
@@ -51,12 +51,25 @@ production-wired часть контракта подтверждена, но н
 | Будущее | 3 | `DATA-004`, `DATA-010`, `UX-005` |
 | Отклонено/заменено | 0 | — |
 
+На этом `main` уже работают shared `web_projection`, OVF
+`UiSummary`/`EntitySeries`, selective reads и server-side
+`/v1/ui/catalog`, `/v1/views/summary`, `/v1/timeline/heatmap` с committed
+OpenAPI и hard format/read/request/response caps. Это data/API primitives для
+существующих фактов, а не `health_score_v1`, target Health history,
+per-database/evidence services, production browser state или generated
+frontend client. Поэтому статусы и количества target IDs не меняются.
+Positive-delta formulas этих проекций не заменяют canonical typed Health
+window diff, а projection revisions/labels не являются persisted lifecycle
+identity или lazy/redaction contract; `DATA-001`, `SAFE-002` и `SAFE-003`
+также остаются частично реализованными.
+
 Остаток выполняется в dependency order:
 
 1. additive Health Score 0–100, canonical extractors, availability,
    completeness и critical ceiling (`HS-001..003`, `DATA-001`);
-2. score/history/per-database/evidence machine contract, runtime/OpenAPI ID
-   parity и затем generated client/UI (`HS-004`, `UX-004`, `UX-005`);
+2. target score/history/per-database/evidence machine contract,
+   runtime/OpenAPI ID parity и затем generated client/production UI
+   (`HS-004`, `UX-004`, `UX-005`);
 3. universal attempt/population/per-database coverage (`DATA-002`);
 4. reloption-aware maintenance, sequences, complete horizon/worst axes и
    structural catalog с observation episodes (`DATA-003..007`,
@@ -1102,14 +1115,17 @@ explicit grant, 0/partial/100% scan, timeout/cancel/load guard. Resource test
 ## 5. Product actions
 
 Ниже перечислены только ещё отсутствующие product actions. Работающие
-timeline/anomaly/incident/raw-section primitives перечислены в baseline
-раздела 12.
+timeline/anomaly/incident/raw-section и server-side UI
+catalog/summary/heatmap primitives перечислены в baseline раздела 12.
 
 ### 5.1. Health history, per-database и drilldown
 
 | Осталось | Target contract | Acceptance | Order |
 | --- | --- | --- | --- |
 | Перейти на target formula и добавить category history, per-database score и rule evidence route. | `GET /v1/health/score` — одна подробная evaluation; новый `/v1/health/history` — bounded score/category history; `/v1/health/evidence` — cursor-bound rule/evidence detail. Существующий timeline contract не меняется. `scope=instance|database`; database выбирается opaque episode ID. | Detail и history с одинаковым `evaluation_id` совпадают; per-database isolation; instance-only evidence не размножается по базам; cursor связывает source, scope, policy, fact set, filters и redaction revision. | B |
+
+Существующий `/v1/views/summary` возвращает population/status/notable для
+generic UI views и не является Health evaluation или category history.
 
 Instance score не усредняет базы. Для database-scoped factor сначала строится
 penalty каждой покрытой базы, затем instance category берёт worst penalty и
@@ -1146,6 +1162,9 @@ completeness и времени; среднее не скрывает корот�
 | Осталось | Target contract | Acceptance | Order |
 | --- | --- | --- | --- |
 | Добавить двухоконный domain API, continuity-aware matching, общее coverage и UI поверх stored statements/plans/diff. | `GET /v1/compare/queries` принимает один source, database episode и окна A/B. Обе стороны вычисляются только из stored facts через typed diff; query/plan text загружается отдельным detail. | Все `Value/Reset/Gap/FirstPoint/Anomaly/NotCollected`; stable match/sort/cursor; plan absent; top-N partial; privacy/redaction; resource benchmark двух максимальных окон. | E |
+
+Один или два независимых запроса текущего heatmap route не образуют
+continuity-aware query A/B contract.
 
 Основная identity: поддерживаемые поля соответствующего
 `pg_stat_statements` contract — database, role, query ID и `toplevel`.
@@ -1224,6 +1243,10 @@ episode.
 | --- | --- | --- | --- |
 | Добавить production URL state, одну IANA timezone и воспроизводимый sanitized context export. | URL хранит source, database/scope, A/B ranges, active view/tab, category/rule/entity, filters, sort, page/cursor, zoom, locale и один `tz` — каноническое IANA name. Sensitive literal search хранится только в local fragment; wire timestamps остаются UTC. | Property tests URL encode/decode, reload, back/forward, fragment roundtrip, invalid IANA fallback, DST boundary и EN/RU parity. | B, расширение в E |
 
+Query parameters текущих HTTP routes не являются browser URL-state
+implementation: отсутствуют client codec, reload/back-forward state, IANA
+timezone и context export.
+
 В приложении одновременно действует ровно одна IANA timezone. Компонент не
 может иметь скрытый локальный timezone override. Абсолютные timestamps,
 duration и server-provided values не смешиваются.
@@ -1243,6 +1266,10 @@ HTTP-серверу; действие copy/share по умолчанию уда�
 | --- | --- | --- | --- |
 | Создать production frontend и generated client/models; существующий committed OpenAPI является только prerequisite. | Client и models генерируются только из committed OpenAPI. Product view models могут оборачивать generated types, но не повторяют wire enums вручную. | Clean generation diff, OpenAPI↔Rust registry tests, exhaustive category/rule/reason handling и CI failure при stale generated files. | B |
 
+Текущие Rust-модули `ui::{catalog,data,handlers,heatmap}` и описанные в
+OpenAPI server routes не содержат generated client/models, browser build или
+production frontend и не меняют статус `UX-005`.
+
 API следует действующему контракту
 `docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md`:
 `Accept-Language` не влияет на success/problem data, backend не возвращает
@@ -1254,6 +1281,9 @@ Frontend содержит полные EN/RU catalogs по stable IDs.
 | Осталось | Target contract | Acceptance | Order |
 | --- | --- | --- | --- |
 | Добавить text search, histogram/zoom, facets, event dedup, scan accounting и log-search cursor, связанный с body/facets/redaction. Существующий authenticated timeline cursor переиспользуется как primitive, но не считается готовым search contract. | `POST /v1/logs/search` работает только по stored facts. Bounded text в JSON body плюс allowlisted typed include/exclude facets; regex отсутствует. Histogram и rows закреплены на одном `fact_set_id`. | Histogram/rows consistency, zoom, include/exclude, identity dedup, cursor binding, gap/partial/scanned, redaction и worst-range benchmark. | E |
+
+Текущий events count heatmap не принимает текст, facets или search cursor и
+не является log search.
 
 Response shape:
 
@@ -1340,7 +1370,7 @@ Additive contract получает `score_contract="health_score_v1"`, но не
 
 В target response schema `factor_set_id`, `fact_set_id`, `evaluation_id`,
 `evidence_id`, `finding_id`, query/object/database episode IDs получают форму
-`B64UrlSha256`: 43 символа unpadded base64url. Первый machine-contract PR
+`B64UrlSha256`: 43 символа unpadded base64url. Первый Health machine-contract PR
 исправляет несовпадение текущего 22-символьного runtime `FactorSetId` с этим
 OpenAPI contract. К IDs не добавляются текстовые prefix. Cursor использует
 отдельный versioned authenticated
@@ -1520,6 +1550,11 @@ Collector PR переиспользует уже настроенные owner bu
 | Log search | 200 rows, 256 histogram buckets, 1024 query bytes, 32 facets |
 | Object inspector | один base object; отдельные пагинируемые collections |
 | On-demand physical scan | один relation, concurrency 1 на target |
+
+Текущие hard caps `UiSummary`/`EntitySeries` и трёх UI-data routes относятся
+только к baseline раздела 12. Они не заменяют qualification каждого нового
+target path и не доказывают bounds peak memory, concurrency и wall time для
+web-index builder, поэтому `SAFE-001` остаётся частично реализованным.
 
 Caps являются initial policy и могут быть ужесточены owner configuration.
 Превышение request bound даёт существующий typed Problem; достижение scan/top-N
@@ -1710,25 +1745,25 @@ exact head. Нельзя утверждать production bound только по
 | `HS-001` kernel | Частично | Additive formula, target scale/categories и real extractors | Additive 0–100, восемь weights, max rule penalty, fixed-point | Unit/property formula suite | A |
 | `HS-002` availability | Частично | Category availability, completeness и universal persisted source coverage | weight=0 для unavailable/N/A, redistribution, typed reason, completeness | All state combinations, no false zero | A + C coverage |
 | `HS-003` ceiling | Частично | Шесть catastrophic rules, separate findings и ceiling 30 | Fact/policy provenance и critical ceiling | Golden critical fixtures, null-score case | A; sequence rule activates in C |
-| `HS-004` history | Частично | Новые score/history/per-db/evidence services | Score/category history, per-db, evidence refs | Point/detail identity, database isolation | B |
+| `HS-004` history | Частично | Target `/v1/health/{score,history,databases,evidence}` services; generic view summary/heatmap остаются baseline | Score/category history, per-db, evidence refs | Point/detail identity, database isolation | B |
 | `DATA-001` diff | Частично | Подключить все factors к canonical typed window path | Только window diff для cumulative inputs | Reset/gap/first/not-collected matrix | A |
-| `DATA-002` coverage | Частично | Universal attempt/population/database outcomes | Universal attempt/population/database markers | Empty/full/partial/failure BDD | C foundation |
+| `DATA-002` coverage | Частично | Universal persisted attempt/population/database outcomes; UI-index quality не заменяет collector coverage | Universal attempt/population/database markers | Empty/full/partial/failure BDD | C foundation |
 | `DATA-003` autovacuum | Частично | Полный effective reloptions/eligibility/backlog/off inventory | PG15–18 reloption-aware vacuum/analyze contracts | Major BDD и exact formula golden | C |
 | `DATA-004` sequence | Будущее | Весь sequence source | Direction/cache/cycle/ownership/type bounds | Arithmetic property + PG15–18 BDD | C |
 | `DATA-005` horizon | Частично | Total/tail, global clamp и полный drilldown | Расширенная coverage существующей model | DB/table/TOAST/pool BDD | C |
-| `DATA-006` worst tables | Частично | Guaranteed dead/HOT/newpage worst axes | Complete-or-partial boundary population, typed interval diff и deterministic axes | Outside-old-axis/reset/zero-denominator fixtures | C |
+| `DATA-006` worst tables | Частично | Guaranteed full-or-explicit-partial dead/HOT/newpage axes; текущий tables heatmap ранжирует уже retained rows | Complete-or-partial boundary population, typed interval diff и deterministic axes | Outside-old-axis/reset/zero-denominator fixtures | C |
 | `DATA-007` schema | Частично | Full structural catalog/history и episodes | Index/FK/constraint fingerprints и episodes | Structural golden + major BDD | C |
 | `DATA-008` progress | Частично | Create-index/analyze/cluster/basebackup sources | Четыре versioned stored sources | Phase/visibility/PID/gap BDD | D |
-| `DATA-009` inspector | Частично | Bounded exact-object projection и async refresh | Stored-first exact-object inspector | Caps, pagination, RBAC, recreate | D |
+| `DATA-009` inspector | Частично | Bounded exact-object projection и async refresh; UI projection catalog описывает views, не PostgreSQL objects | Stored-first exact-object inspector | Caps, pagination, RBAC, recreate | D |
 | `DATA-010` physical | Будущее | Весь optional physical evidence path | Explicit optional `pgstattuple_approx` | Present/absent/privilege/load BDD | D |
-| `UX-001` query A/B | Частично | Arbitrary A/B windows, matching, domain API/cursor/UI | Two stored windows, typed operands, plan/buffer evidence | Diff/privacy/cursor/resource suite | E |
+| `UX-001` query A/B | Частично | Arbitrary A/B windows, matching, domain API/cursor/UI; single-range heatmap остаётся baseline | Two stored windows, typed operands, plan/buffer evidence | Diff/privacy/cursor/resource suite | E |
 | `UX-002` settings | Частично | Exact-moment A/B resolver, change states и UI | Exact stored moments and change enum | Segment/gap/extension fixtures | E |
 | `UX-003` schema history | Частично | Structural finding episodes и workflow | Open/close/reopen/uncertain findings | Rename/recreate/upgrade fixtures | C API |
-| `UX-004` state | Частично | Production URL/timezone/context | Full URL state, one IANA timezone, bounded context | Roundtrip/DST/clipboard/accessibility | B/E |
-| `UX-005` client | Будущее | Весь generated frontend client/build | Generated client/models only | Generation clean + registry parity | B |
-| `UX-006` logs | Частично | Search body/facets/histogram/dedup/scanned и search-specific cursor | Histogram/zoom/facets/dedup/cursor/partial/scanned | Same fact set, budget and redaction | E |
+| `UX-004` state | Частично | Browser URL/timezone/context; HTTP query params не являются client state | Full URL state, one IANA timezone, bounded context | Roundtrip/DST/clipboard/accessibility | B/E |
+| `UX-005` client | Будущее | Весь generated frontend client/models/build и production frontend; server-side Rust UI data/OpenAPI остаются baseline | Generated client/models only | Generation clean + registry parity | B |
+| `UX-006` logs | Частично | Search body/facets/histogram/dedup/scanned и search-specific cursor; events heatmap не является search | Histogram/zoom/facets/dedup/cursor/partial/scanned | Same fact set, budget and redaction | E |
 | `EXT-001` external | Частично | Scoped RBAC, audit, isolation и будущие service surfaces | Same bounded services, typed provenance, read-only | RBAC/audit/isolation/parity | F |
-| `SAFE-001` bounds | Частично | Qualification каждого нового source/endpoint | Rows/bytes/time/work/concurrency everywhere | Resource qualification | all |
+| `SAFE-001` bounds | Частично | Qualification каждого нового source/endpoint и peak-memory/admission/wall-time web-index builder; текущие format/read/request/response caps остаются baseline | Rows/bytes/time/work/concurrency everywhere | Resource qualification | all |
 | `SAFE-002` identity | Частично | Persisted database/object episodes и lifecycle semantics | Observation episodes and uncertain gaps | Lifecycle property/BDD | C |
 | `SAFE-003` privacy | Частично | Lazy literals, redaction revision, opaque listings/exports | Lazy literals, redaction revision, opaque IDs | Leakage/security fixtures | B–F |
 
@@ -1895,3 +1930,7 @@ Baseline ниже объясняет доступные building blocks и не 
 | `BASE-H06` | Stored statements/plans/settings и generic section diff | `crates/kronika-source-pg/src/statements.rs`, `crates/kronika-source-pg/src/store_plans.rs`, `crates/kronika-source-pg/src/settings.rs`, `bins/pg_kronika-web/src/handlers/v1.rs` | `crates/kronika-bdd/features/pg_stat_statements.feature`, `crates/kronika-bdd/features/pg_store_plans.feature`, `crates/kronika-bdd/features/pg_settings.feature`, `bins/pg_kronika-web/src/tests/version_diff.rs` |
 | `BASE-H07` | Typed logs, fact-set-bound timeline и HMAC-authenticated cursor | `crates/kronika-source-log/src`, `bins/pg_kronika-web/src/overview/cursor.rs`, `bins/pg_kronika-web/src/overview/handlers.rs` | `crates/kronika-bdd/features/pg_log.feature`, `crates/kronika-bdd/features/timeline_overview.feature`, `bins/pg_kronika-web/src/tests/overview_timeline.rs` |
 | `BASE-H08` | GET-only machine API, Basic Auth и действующие collector/web limits | `bins/pg_kronika-web/src/lib.rs`, `bins/pg_kronika-web/src/auth.rs`, `bins/pg_kronika-collector/src/config.rs`, `crates/kronika-source-pg/src/pool.rs` | `bins/pg_kronika-web/src/tests/auth_static.rs`, `bins/pg_kronika-web/src/tests/overview_admission.rs`, tests in `bins/pg_kronika-collector/src/config.rs` |
+| `BASE-H09` | Server-side UI-data foundation: единый реестр девяти проекций, OVF summary/top-K series, selective reads и hard-capped catalog/summary/heatmap responses | `crates/kronika-analytics/src/web_projection.rs`, `crates/kronika-reader/src/overview/web_index/{build,read,series,summary}.rs`, `bins/pg_kronika-web/src/ui/{catalog,data,handlers,heatmap}.rs` | `crates/kronika-analytics/tests/web_projection.rs`, web-index/snapshot tests в `kronika-reader`, `bins/pg_kronika-web/src/tests/{ui_catalog,ui_data}.rs`, `bins/pg_kronika-web/openapi.json` |
+
+`BASE-H09` не содержит target Health services, production browser frontend,
+URL/IANA/context state или generated client.
