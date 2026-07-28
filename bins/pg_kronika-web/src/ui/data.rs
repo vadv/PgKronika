@@ -1,9 +1,11 @@
-//! OVF-only DTO assembly for UI data endpoints.
+//! Web-index-only DTO assembly for UI data endpoints.
 
 use std::collections::BTreeSet;
 
 use kronika_analytics::web_projection::web_views;
-use kronika_reader::{IndexStatus, LIMIT, LocalDirSnapshot, WebIndexReadError};
+use kronika_reader::{
+    IndexStatus, LIMIT, LiveState, LiveView, LocalDirSnapshot, UiSummaryBlock, WebIndexReadError,
+};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -35,12 +37,13 @@ struct SummaryQuality {
 
 #[derive(Clone, Copy)]
 struct ResolvedView {
-    snapshot: Option<(i64, u64)>,
+    snapshot: Option<(i64, u64, bool)>,
     status: IndexStatus,
 }
 
 pub(crate) fn view_summary(
     snapshot: &LocalDirSnapshot,
+    live: &LiveView,
     source: u64,
     at_us: i64,
 ) -> Result<Option<ViewSummaryResponse>, WebIndexReadError> {
@@ -48,38 +51,34 @@ pub(crate) fn view_summary(
         .sealed_descriptors()
         .filter(|descriptor| descriptor.source_id == source)
         .collect::<Vec<_>>();
-    if descriptors.is_empty() {
+    let live_source = live.source_id() == Some(source);
+    if descriptors.is_empty() && !live_source {
         return Ok(None);
     }
     descriptors
         .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
 
     let mut resolved = vec![None; web_views().len()];
+    let mut active_tail = false;
+    if live_source && live.state() == LiveState::Current {
+        for facts in live.chunks().iter().rev().filter(|facts| {
+            let identity = facts.identity();
+            identity.pgm_source_id == source && identity.source_min_ts_us <= at_us
+        }) {
+            active_tail = true;
+            resolve_summary(facts.ui_summary(), at_us, &mut resolved);
+            if resolved.iter().all(Option::is_some) {
+                break;
+            }
+        }
+    }
     for descriptor in descriptors
         .iter()
         .rev()
         .filter(|descriptor| descriptor.min_ts <= at_us)
     {
         let (summary, _stats) = snapshot.read_ui_summary(descriptor, &LIMIT)?;
-        for (index, view) in web_views().iter().enumerate() {
-            if resolved[index].is_some() {
-                continue;
-            }
-            let Some(block_view) = summary
-                .views()
-                .iter()
-                .find(|candidate| candidate.view_code() == view.code)
-            else {
-                continue;
-            };
-            let exact = summary.snapshot_at(view.code, at_us);
-            if exact.is_some() || block_view.status() != IndexStatus::Complete {
-                resolved[index] = Some(ResolvedView {
-                    snapshot: exact,
-                    status: block_view.status(),
-                });
-            }
-        }
+        resolve_summary(&summary, at_us, &mut resolved);
         if resolved.iter().all(Option::is_some) {
             break;
         }
@@ -96,7 +95,7 @@ pub(crate) fn view_summary(
             let resolved = resolved[index].as_ref();
             let status = resolved.map_or("unavailable", |resolved| status_code(resolved.status));
             let exact = resolved.and_then(|resolved| resolved.snapshot);
-            if let Some((timestamp, _population)) = exact {
+            if let Some((timestamp, _population, _notable)) = exact {
                 snapshots.insert(timestamp);
             }
             match resolved.map(|resolved| resolved.status) {
@@ -107,17 +106,19 @@ pub(crate) fn view_summary(
             }
             ViewSummaryItem {
                 view: view.name,
-                snapshot_ts_us: exact.map(|(timestamp, _population)| timestamp.to_string()),
-                population: exact.map(|(_timestamp, population)| population),
+                snapshot_ts_us: exact
+                    .map(|(timestamp, _population, _notable)| timestamp.to_string()),
+                population: exact.map(|(_timestamp, population, _notable)| population),
                 status,
-                notable: false,
+                notable: exact.is_some_and(|(_timestamp, _population, notable)| notable),
             }
         })
         .collect();
     let partial = resolved.iter().any(Option::is_none)
         || !gated.is_empty()
         || !unavailable_revision.is_empty()
-        || !resource_limited.is_empty();
+        || !resource_limited.is_empty()
+        || (live_source && !matches!(live.state(), LiveState::Empty | LiveState::Current));
 
     Ok(Some(ViewSummaryResponse {
         at_us: at_us.to_string(),
@@ -129,9 +130,31 @@ pub(crate) fn view_summary(
             gated,
             unavailable_revision,
             resource_limited,
-            active_tail: false,
+            active_tail,
         },
     }))
+}
+
+fn resolve_summary(summary: &UiSummaryBlock, at_us: i64, resolved: &mut [Option<ResolvedView>]) {
+    for (index, view) in web_views().iter().enumerate() {
+        if resolved[index].is_some() {
+            continue;
+        }
+        let Some(block_view) = summary
+            .views()
+            .iter()
+            .find(|candidate| candidate.view_code() == view.code)
+        else {
+            continue;
+        };
+        let exact = summary.snapshot_state_at(view.code, at_us);
+        if exact.is_some() || block_view.status() != IndexStatus::Complete {
+            resolved[index] = Some(ResolvedView {
+                snapshot: exact,
+                status: block_view.status(),
+            });
+        }
+    }
 }
 
 const fn status_code(status: IndexStatus) -> &'static str {

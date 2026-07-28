@@ -190,6 +190,22 @@ impl EntitySeries {
         &self.quantized_values
     }
 
+    /// Iterates observed bucket indexes and reconstructed values in one pass.
+    pub fn observed_values(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+        let mut value_index = 0_usize;
+        (0..self.present_mask.len() * 8).filter_map(move |bucket| {
+            if !bit_is_set(&self.present_mask, bucket) {
+                return None;
+            }
+            let value = self
+                .quantized_values
+                .get(value_index)
+                .map(|value| f64::from(*value) / 255.0 * self.max_bucket_value);
+            value_index += 1;
+            value.map(|value| (bucket, value))
+        })
+    }
+
     /// Reconstructs a bucket, preserving missing values as `None`.
     #[must_use]
     pub fn value_at(&self, bucket: usize) -> Option<f64> {
@@ -852,6 +868,12 @@ mod tests {
         assert_eq!(decoded, block);
         assert_eq!(decoded.metrics()[0].series()[0].value_at(0), None);
         assert_eq!(decoded.metrics()[0].series()[0].value_at(1), Some(0.0));
+        assert_eq!(
+            decoded.metrics()[0].series()[0]
+                .observed_values()
+                .collect::<Vec<_>>(),
+            vec![(1, 0.0)]
+        );
     }
 
     #[test]

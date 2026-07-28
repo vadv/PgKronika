@@ -12,6 +12,7 @@ pub struct ViewSummary {
     view_revision: u16,
     status: IndexStatus,
     snapshot_presence: Vec<u8>,
+    notable_presence: Vec<u8>,
     populations: Vec<u64>,
     coverage_mask: Vec<u8>,
 }
@@ -51,6 +52,7 @@ impl ViewSummary {
         view_revision: u16,
         status: IndexStatus,
         snapshot_presence: Vec<u8>,
+        notable_presence: Vec<u8>,
         populations: Vec<u64>,
         bounds: &Bounds,
     ) -> Result<Self, BlockError> {
@@ -61,8 +63,16 @@ impl ViewSummary {
             usize::try_from(bounds.web_summary_timestamps)
                 .map_err(|_error| BlockError::AboveBound)?,
         );
-        if snapshot_presence.len() > maximum_mask {
+        if snapshot_presence.len() > maximum_mask || notable_presence.len() > maximum_mask {
             return Err(BlockError::AboveBound);
+        }
+        if snapshot_presence.len() != notable_presence.len()
+            || notable_presence
+                .iter()
+                .zip(&snapshot_presence)
+                .any(|(notable, present)| notable & !present != 0)
+        {
+            return Err(BlockError::Malformed);
         }
         let set_bits = snapshot_presence
             .iter()
@@ -76,6 +86,7 @@ impl ViewSummary {
             view_revision,
             status,
             snapshot_presence,
+            notable_presence,
             populations,
             coverage_mask: Vec::new(),
         })
@@ -103,6 +114,12 @@ impl ViewSummary {
     #[must_use]
     pub fn snapshot_presence(&self) -> &[u8] {
         &self.snapshot_presence
+    }
+
+    /// Notable bits over the summary's shared timestamp table.
+    #[must_use]
+    pub fn notable_presence(&self) -> &[u8] {
+        &self.notable_presence
     }
 
     /// Population values ordered by set bits in the shared timestamp mask.
@@ -277,6 +294,8 @@ impl UiSummaryBlock {
             let status = IndexStatus::from_code(reader.u8()?)?;
             let presence = reader.take(presence_len)?.to_vec();
             validate_mask(&presence, snapshot_times.len())?;
+            let notable = reader.take(presence_len)?.to_vec();
+            validate_mask(&notable, snapshot_times.len())?;
             let population_count = reader.u32_le()?;
             let expected_count = presence.iter().map(|byte| byte.count_ones()).sum::<u32>();
             if population_count != expected_count {
@@ -295,6 +314,7 @@ impl UiSummaryBlock {
                 view_revision,
                 status,
                 presence,
+                notable,
                 populations,
                 bounds,
             )?);
@@ -341,6 +361,13 @@ impl UiSummaryBlock {
     /// Last exact snapshot timestamp and population at or before `at_us`.
     #[must_use]
     pub fn snapshot_at(&self, view_code: u16, at_us: i64) -> Option<(i64, u64)> {
+        self.snapshot_state_at(view_code, at_us)
+            .map(|(timestamp, population, _notable)| (timestamp, population))
+    }
+
+    /// Last exact snapshot timestamp, population, and notable state.
+    #[must_use]
+    pub fn snapshot_state_at(&self, view_code: u16, at_us: i64) -> Option<(i64, u64, bool)> {
         let view = self
             .views
             .binary_search_by_key(&view_code, ViewSummary::view_code)
@@ -350,8 +377,13 @@ impl UiSummaryBlock {
             .snapshot_times
             .partition_point(|timestamp| *timestamp <= at_us);
         (0..upper).rev().find_map(|index| {
-            view.population_at_index(index)
-                .map(|population| (self.snapshot_times[index], population))
+            view.population_at_index(index).map(|population| {
+                (
+                    self.snapshot_times[index],
+                    population,
+                    bit_is_set(&view.notable_presence, index),
+                )
+            })
         })
     }
 
@@ -380,6 +412,7 @@ impl UiSummaryBlock {
         let view_heap = self.views.iter().try_fold(0_usize, |total, view| {
             total
                 .checked_add(view.snapshot_presence.capacity())?
+                .checked_add(view.notable_presence.capacity())?
                 .checked_add(view.populations.capacity().checked_mul(size_of::<u64>())?)?
                 .checked_add(view.coverage_mask.capacity())
         })?;
@@ -413,6 +446,7 @@ impl UiSummaryBlock {
             writer.u16_le(view.view_revision);
             writer.u8(view.status.code());
             writer.bytes(&view.snapshot_presence);
+            writer.bytes(&view.notable_presence);
             writer.u32_le(len_u32(view.populations.len()));
             for population in &view.populations {
                 writer.uvarint(*population);
@@ -459,6 +493,7 @@ mod tests {
             4,
             IndexStatus::Complete,
             vec![0b0000_0101],
+            vec![0b0000_0100],
             vec![10, 12],
             &LIMIT,
         )
@@ -468,6 +503,7 @@ mod tests {
             7,
             IndexStatus::Complete,
             vec![0b0000_0010],
+            vec![0],
             vec![3],
             &LIMIT,
         )
@@ -495,6 +531,7 @@ mod tests {
             1,
             IndexStatus::Complete,
             vec![0b0000_0011],
+            vec![0b0000_0010],
             vec![7, 11],
             &LIMIT,
         )
@@ -506,6 +543,14 @@ mod tests {
         assert_eq!(block.population_at(1, 49_999_999), Some(7));
         assert_eq!(block.population_at(1, 50_000_000), Some(11));
         assert_eq!(block.snapshot_at(1, 49_999_999), Some((10_000_000, 7)));
+        assert_eq!(
+            block.snapshot_state_at(1, 10_000_000),
+            Some((10_000_000, 7, false))
+        );
+        assert_eq!(
+            block.snapshot_state_at(1, 50_000_000),
+            Some((50_000_000, 11, true))
+        );
     }
 
     #[test]
@@ -516,6 +561,23 @@ mod tests {
                 1,
                 IndexStatus::Complete,
                 vec![0b0000_0101],
+                vec![0],
+                vec![10],
+                &LIMIT,
+            ),
+            Err(BlockError::Malformed)
+        );
+    }
+
+    #[test]
+    fn ui_summary_rejects_notable_without_a_snapshot() {
+        assert_eq!(
+            ViewSummary::new(
+                1,
+                1,
+                IndexStatus::Complete,
+                vec![0b0000_0001],
+                vec![0b0000_0010],
                 vec![10],
                 &LIMIT,
             ),
@@ -541,6 +603,7 @@ mod tests {
             1,
             IndexStatus::Complete,
             vec![0b0000_0011],
+            vec![0],
             vec![7, 11],
             &LIMIT,
         )
@@ -554,6 +617,7 @@ mod tests {
                 .iter()
                 .map(|view| {
                     view.snapshot_presence.capacity()
+                        + view.notable_presence.capacity()
                         + view.populations.capacity() * size_of::<u64>()
                         + view.coverage_mask.capacity()
                 })

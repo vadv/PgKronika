@@ -2,13 +2,10 @@
 
 use std::sync::Arc;
 
-use kronika_analytics::overview::{SegmentIdentity, SegmentLineageId};
 use kronika_format::{Catalog, DamageRegion};
 use kronika_layout::{FileIdentity, SegmentId};
 pub use kronika_store::CatalogDigest;
 use kronika_store::{CatalogLayoutDigest, CatalogSummary};
-
-use crate::overview::SourceDescriptor;
 
 /// Stable logical identity of one sealed segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -132,10 +129,6 @@ pub struct SegmentDescriptor {
     pub catalog_layout_digest: CatalogLayoutDigest,
     /// PGM container version captured with the validated catalog.
     pub source_format_version: u32,
-    /// Exact PGM tail/catalog identity used by the sibling OVF header.
-    pub source_descriptor: SourceDescriptor,
-    /// Sealed lineage derivable without reopening the PGM, when non-empty.
-    pub segment_lineage_id: Option<SegmentLineageId>,
     /// Filesystem identity pinned by the scan that produced this descriptor.
     pub file_identity: FileIdentity,
 }
@@ -143,21 +136,11 @@ pub struct SegmentDescriptor {
 impl SegmentDescriptor {
     /// Derives a segment descriptor from compact validated PGM metadata.
     #[must_use]
-    pub fn from_summary(
+    pub const fn from_summary(
         locator: SealedLocator,
         file_identity: FileIdentity,
         summary: &CatalogSummary,
     ) -> Self {
-        let source_descriptor = SourceDescriptor(*summary.source_digest.as_bytes());
-        let segment_lineage_id = summary.first_entry.map(|first| {
-            SegmentIdentity::sealed(
-                summary.source_id,
-                source_descriptor.0,
-                first.type_id,
-                &first.canonical_bytes(),
-            )
-            .id()
-        });
         Self {
             locator,
             source_id: summary.source_id,
@@ -166,8 +149,6 @@ impl SegmentDescriptor {
             catalog_digest: summary.logical_digest,
             catalog_layout_digest: summary.layout_digest,
             source_format_version: summary.format_version,
-            source_descriptor,
-            segment_lineage_id,
             file_identity,
         }
     }

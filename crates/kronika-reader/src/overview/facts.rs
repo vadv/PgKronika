@@ -458,16 +458,11 @@ impl SegmentFacts {
         unit: &PgmUnit<R>,
     ) -> Result<(HeaderIdentity, SegmentIdentity), BuildError> {
         let catalog = unit.catalog();
-        let first = catalog
+        catalog
             .entries
             .first()
             .ok_or(BuildError::Source(SourceError::UnsupportedLayout))?;
-        let lineage = SegmentIdentity::sealed(
-            catalog.source_id,
-            unit.source_descriptor().0,
-            first.type_id,
-            &CatalogEntryDescriptor::of(first).canonical_bytes(),
-        );
+        let lineage = SegmentIdentity::sealed(catalog.source_id, unit.source_descriptor().0);
         let identity = HeaderIdentity::from_current_contract(
             catalog.format_version,
             catalog.source_id,
@@ -2136,6 +2131,7 @@ mod tests {
 
     use super::super::limits::LIMIT;
     use super::super::qualification_fixture::{ALL_FAMILY_SCHEMA_VERSION, all_family_fixture};
+    use super::super::web_index::EntitySeries;
     use super::*;
 
     const LIMITS: OracleLimits = OracleLimits {
@@ -3321,7 +3317,16 @@ mod tests {
         let series =
             EntitySeriesBlock::decode(&series_body, &LIMIT).expect("decode events entity series");
         assert_eq!(series.view_code(), 9);
-        assert_eq!(series.metrics()[0].series().len(), 4);
+        assert_eq!(series.metrics()[0].series().len(), 3);
+        assert_eq!(
+            series.metrics()[0]
+                .series()
+                .iter()
+                .map(EntitySeries::exact_score)
+                .collect::<Vec<_>>(),
+            vec![2.0, 1.0, 1.0],
+            "event rows are grouped by stable category before top-K ranking"
+        );
     }
 
     #[test]

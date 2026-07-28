@@ -554,7 +554,7 @@ mod tests {
     };
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(1, [2; 32], 7, b"type=7 rows=3 crc=abc")
+        SegmentIdentity::sealed(1, [2; 32])
     }
 
     fn provenance(row_ordinal: u32) -> ObservationProvenance {
@@ -612,7 +612,7 @@ mod tests {
     fn public_event_identity_ignores_lineage_but_retains_content() {
         let first = error_group(0, 1_000, Severity::Panic, ErrorCategory::System, None);
         let same_content = EventObservation::new(
-            SegmentIdentity::sealed(1, [9; 32], 7, b"alternate"),
+            SegmentIdentity::sealed(1, [9; 32]),
             first.source_type_id(),
             ObservationProvenance {
                 section_body_id: SectionBodyId([0xCC; 32]),

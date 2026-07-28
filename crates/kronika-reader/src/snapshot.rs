@@ -34,8 +34,8 @@ use crate::refresh::{
 };
 use crate::{
     Bounds, BuildError, CacheReadError, Dictionary, EntitySeriesBlock, FactLoad, FactReadStats,
-    FactStore, HeaderIdentity, PgmUnit, ReadError, SegmentContext, Stored, UiSummaryBlock,
-    decode_dictionary,
+    FactStore, HeaderIdentity, PgmUnit, ReadError, SegmentContext, SourceDescriptor, Stored,
+    UiSummaryBlock, decode_dictionary,
 };
 
 const JOURNAL_PREFIX_DOMAIN: &[u8] = b"pgk-overview-journal-prefix-v1\0";
@@ -276,8 +276,6 @@ pub enum SealedFactError {
 pub enum WebIndexReadError {
     /// The descriptor is absent or changed in the pinned snapshot.
     Descriptor(SealedFactError),
-    /// An empty PGM cannot have a sealed fact lineage.
-    MissingLineage,
     /// The OVF is missing, incompatible, corrupt, oversized, or unreadable.
     Cache(CacheReadError),
 }
@@ -286,7 +284,6 @@ impl std::fmt::Display for WebIndexReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Descriptor(error) => write!(f, "{error}"),
-            Self::MissingLineage => f.write_str("sealed descriptor has no fact lineage"),
             Self::Cache(error) => write!(f, "{error}"),
         }
     }
@@ -297,7 +294,6 @@ impl std::error::Error for WebIndexReadError {
         match self {
             Self::Descriptor(error) => Some(error),
             Self::Cache(error) => Some(error),
-            Self::MissingLineage => None,
         }
     }
 }
@@ -853,16 +849,19 @@ impl LocalDirSnapshot {
         let context = self
             .sealed_context(descriptor)
             .map_err(WebIndexReadError::Descriptor)?;
-        let lineage = descriptor
-            .segment_lineage_id
-            .ok_or(WebIndexReadError::MissingLineage)?;
+        let source_descriptor = SourceDescriptor(*descriptor.catalog_layout_digest.as_bytes());
+        let lineage = kronika_analytics::overview::SegmentIdentity::sealed(
+            descriptor.source_id,
+            source_descriptor.0,
+        )
+        .id();
         let expected = HeaderIdentity::from_current_contract(
             descriptor.source_format_version,
             descriptor.source_id,
             descriptor.min_ts,
             descriptor.max_ts,
             descriptor.file_identity.len,
-            descriptor.source_descriptor,
+            source_descriptor,
             lineage,
         );
         Ok((context, expected))

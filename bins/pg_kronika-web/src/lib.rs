@@ -828,6 +828,7 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .route("/v1/timeline/overview", get(overview::handlers::overview))
         .route("/v1/timeline/events", get(overview::handlers::events))
         .route("/v1/timeline/health", get(overview::handlers::health))
+        .route("/v1/timeline/heatmap", get(ui::handlers::heatmap))
         .route("/v1/anomalies", get(handlers::anomalies::anomalies))
         .route("/v1/incidents", get(handlers::incidents::incidents))
         .route("/v1/sources", get(handlers::v1::sources))

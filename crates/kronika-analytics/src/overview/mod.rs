@@ -96,7 +96,7 @@ pub const FACT_SCHEMA_VERSION: u32 = 4;
 ///
 /// Version 6 materializes the canonical web projection registry into indexed
 /// summary and entity-series blocks.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 6;
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 7;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///

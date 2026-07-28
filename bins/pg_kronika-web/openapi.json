@@ -156,6 +156,63 @@
         }
       }
     },
+    "/v1/views/summary": {
+      "get": {
+        "operationId": "viewSummary",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/at" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact per-view populations from the selective OVF summary",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UiViewSummaryResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/timeline/heatmap": {
+      "get": {
+        "operationId": "timelineHeatmap",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/view" },
+          { "$ref": "#/components/parameters/metric" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/buckets" },
+          { "$ref": "#/components/parameters/top" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded merge of one view metric from selective OVF entity-series blocks",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UiHeatmapResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
     "/v1/sections": {
       "get": {
         "operationId": "sections",
@@ -488,8 +545,13 @@
     "parameters": {
       "name": { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
       "source": { "name": "source", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0 } },
+      "at": { "name": "at", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
       "from": { "name": "from", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
       "to": { "name": "to", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
+      "view": { "name": "view", "in": "query", "required": true, "schema": { "type": "string" } },
+      "metric": { "name": "metric", "in": "query", "required": true, "schema": { "type": "string" } },
+      "buckets": { "name": "buckets", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 256, "default": 56 } },
+      "top": { "name": "top", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8 } },
       "window": { "name": "window", "in": "query", "required": false, "schema": { "type": "string" } },
       "step": { "name": "step", "in": "query", "required": false, "schema": { "type": "string" } },
       "threshold": { "name": "threshold", "in": "query", "required": false, "schema": { "type": "number", "minimum": 0 } },
@@ -896,6 +958,150 @@
             "maxItems": 9,
             "items": { "$ref": "#/components/schemas/UiView" }
           }
+        }
+      },
+      "UiIndexStatus": {
+        "type": "string",
+        "enum": ["complete", "empty", "gated", "unsupported_type", "resource_limited", "unavailable"]
+      },
+      "UiViewSummaryItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["view", "snapshot_ts_us", "population", "status", "notable"],
+        "properties": {
+          "view": { "type": "string" },
+          "snapshot_ts_us": {
+            "type": ["string", "null"],
+            "pattern": "^-?[0-9]+$"
+          },
+          "population": { "type": ["integer", "null"], "minimum": 0 },
+          "status": { "$ref": "#/components/schemas/UiIndexStatus" },
+          "notable": { "type": "boolean" }
+        }
+      },
+      "UiRangeGap": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from_us", "to_us"],
+        "properties": {
+          "from_us": { "type": "string", "pattern": "^-?[0-9]+$" },
+          "to_us": { "type": "string", "pattern": "^-?[0-9]+$" }
+        }
+      },
+      "UiDataQuality": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "snapshots", "gaps", "gated", "unavailable_revision", "resource_limited", "active_tail"],
+        "properties": {
+          "status": { "type": "string", "enum": ["complete", "partial", "unavailable"] },
+          "snapshots": { "type": "integer", "minimum": 0 },
+          "gaps": {
+            "type": "array",
+            "maxItems": 4097,
+            "items": { "$ref": "#/components/schemas/UiRangeGap" }
+          },
+          "gated": { "type": "array", "items": { "type": "string" } },
+          "unavailable_revision": { "type": "array", "items": { "type": "string" } },
+          "resource_limited": { "type": "array", "items": { "type": "string" } },
+          "active_tail": { "type": "boolean" }
+        }
+      },
+      "UiViewSummaryResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at_us", "views", "quality"],
+        "properties": {
+          "at_us": { "type": "string", "pattern": "^-?[0-9]+$" },
+          "views": {
+            "type": "array",
+            "minItems": 9,
+            "maxItems": 9,
+            "items": { "$ref": "#/components/schemas/UiViewSummaryItem" }
+          },
+          "quality": { "$ref": "#/components/schemas/UiDataQuality" }
+        }
+      },
+      "UiHeatmapGrid": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from_us", "to_us", "bucket_count"],
+        "properties": {
+          "from_us": { "type": "string", "pattern": "^-?[0-9]+$" },
+          "to_us": { "type": "string", "pattern": "^-?[0-9]+$" },
+          "bucket_count": { "type": "integer", "minimum": 1, "maximum": 256 }
+        }
+      },
+      "UiHeatmapRanking": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["exact", "unseen_upper"],
+        "properties": {
+          "exact": { "type": "boolean" },
+          "unseen_upper": { "type": "number", "minimum": 0 }
+        }
+      },
+      "UiScoreBounds": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lower", "upper"],
+        "properties": {
+          "lower": { "type": "number", "minimum": 0 },
+          "upper": { "type": "number", "minimum": 0 }
+        }
+      },
+      "UiHeatmapRow": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entity", "label", "unit", "score", "values"],
+        "properties": {
+          "entity": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+          "label": { "type": "string", "maxLength": 160 },
+          "unit": { "type": "string" },
+          "score": { "$ref": "#/components/schemas/UiScoreBounds" },
+          "values": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": { "type": ["number", "null"] }
+          }
+        }
+      },
+      "UiHeatmapQuality": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "snapshots", "gaps", "gated", "unavailable_revision", "resource_limited", "unbounded_segments", "active_tail"],
+        "properties": {
+          "status": { "type": "string", "enum": ["complete", "partial", "unavailable"] },
+          "snapshots": { "type": "integer", "minimum": 0 },
+          "gaps": {
+            "type": "array",
+            "maxItems": 4097,
+            "items": { "$ref": "#/components/schemas/UiRangeGap" }
+          },
+          "gated": { "type": "array", "items": { "type": "string" } },
+          "unavailable_revision": { "type": "array", "items": { "type": "string" } },
+          "resource_limited": { "type": "array", "items": { "type": "string" } },
+          "unbounded_segments": {
+            "type": "array",
+            "maxItems": 4096,
+            "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" }
+          },
+          "active_tail": { "type": "boolean" }
+        }
+      },
+      "UiHeatmapResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["grid", "ranking", "rows", "quality"],
+        "properties": {
+          "grid": { "$ref": "#/components/schemas/UiHeatmapGrid" },
+          "ranking": { "$ref": "#/components/schemas/UiHeatmapRanking" },
+          "rows": {
+            "type": "array",
+            "maxItems": 64,
+            "items": { "$ref": "#/components/schemas/UiHeatmapRow" }
+          },
+          "quality": { "$ref": "#/components/schemas/UiHeatmapQuality" }
         }
       },
       "Sections": {
@@ -2650,11 +2856,11 @@
       },
       "KnownParameter": {
         "type": "string",
-        "enum": ["source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
+        "enum": ["source", "at", "from", "to", "view", "metric", "buckets", "top", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
       },
       "AnyParameterLocation": {
         "type": "string",
-        "enum": ["query", "source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
+        "enum": ["query", "source", "at", "from", "to", "view", "metric", "buckets", "top", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
       },
       "EmptyParams": {
         "type": "object",
@@ -2675,7 +2881,7 @@
           "parameter": { "$ref": "#/components/schemas/AnyParameterLocation" },
           "expected": {
             "type": "string",
-            "enum": ["url_encoded_query", "uint64", "int64", "positive_duration", "positive_integer", "non_negative_finite_number", "non_negative_integer", "section_list", "severity"]
+            "enum": ["url_encoded_query", "uint64", "int64", "positive_duration", "positive_integer", "non_negative_finite_number", "non_negative_integer", "section_list", "severity", "projection_code"]
           }
         }
       },

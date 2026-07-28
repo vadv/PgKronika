@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kronika_analytics::overview::EventObservation;
+use kronika_analytics::overview::{EventObservation, NotablePolicy};
 use kronika_analytics::web_projection::{
     WebAggregation, WebFormula, WebInput, WebMetric, WebView, web_views,
 };
@@ -207,6 +207,12 @@ fn build_summary(
 ) -> Result<(UiSummaryBlock, Vec<SummaryInput>), BuildError> {
     let mut all_times = BTreeSet::new();
     let mut inputs = Vec::with_capacity(web_views().len());
+    let notable_policy = NotablePolicy::v1();
+    let notable_buckets = observations
+        .iter()
+        .filter(|observation| notable_policy.classify(observation).is_some())
+        .filter_map(|observation| grid.bucket_index(observation.time().sort_ts_us))
+        .collect::<BTreeSet<_>>();
     for view in web_views() {
         let mut populations = BTreeMap::<i64, u64>::new();
         if view.name == "events" {
@@ -246,10 +252,17 @@ fn build_summary(
     let mut views = Vec::with_capacity(inputs.len());
     for input in &inputs {
         let mut presence = vec![0_u8; mask_len(snapshot_times.len())];
+        let mut notable = vec![0_u8; presence.len()];
         let mut populations = Vec::with_capacity(input.populations.len());
         for (index, ts) in snapshot_times.iter().enumerate() {
             if let Some(population) = input.populations.get(ts) {
                 presence[index / 8] |= 1 << (index % 8);
+                if grid
+                    .bucket_index(*ts)
+                    .is_some_and(|bucket| notable_buckets.contains(&bucket))
+                {
+                    notable[index / 8] |= 1 << (index % 8);
+                }
                 populations.push(*population);
             }
         }
@@ -259,6 +272,7 @@ fn build_summary(
                 input.view_revision,
                 input.status,
                 presence,
+                notable,
                 populations,
                 bounds,
             )
@@ -417,24 +431,29 @@ fn build_event_series(
     bounds: &Bounds,
 ) -> Result<EntitySeriesBlock, BuildError> {
     let metric = view.metrics.first().ok_or(BuildError::Internal)?;
-    let mut candidates = observations
-        .iter()
-        .map(|observation| {
-            let mut buckets = empty_buckets(grid);
-            insert_bucket(
-                &mut buckets,
-                grid,
-                observation.time().sort_ts_us,
-                observation.occurrence_count() as f64,
-                metric.aggregation,
-            )?;
-            candidate(
-                observation.observation_id().0.to_vec(),
-                bounded_label(observation.payload().kind_code(), 160),
-                buckets,
-                metric.aggregation,
-            )
-        })
+    let mut categories = BTreeMap::<Vec<u8>, (String, Vec<Option<f64>>)>::new();
+    for observation in observations {
+        let category = observation.payload().kind_code();
+        let category_len =
+            u16::try_from(category.len()).map_err(|_error| BuildError::LimitExceeded)?;
+        let mut key = Vec::with_capacity(4 + category.len());
+        key.extend_from_slice(&view.identity_revision.to_le_bytes());
+        key.extend_from_slice(&category_len.to_le_bytes());
+        key.extend_from_slice(category.as_bytes());
+        let entry = categories
+            .entry(key)
+            .or_insert_with(|| (bounded_label(category, 160), empty_buckets(grid)));
+        insert_bucket(
+            &mut entry.1,
+            grid,
+            observation.time().sort_ts_us,
+            observation.occurrence_count() as f64,
+            metric.aggregation,
+        )?;
+    }
+    let mut candidates = categories
+        .into_iter()
+        .map(|(key, (label, buckets))| candidate(key, label, buckets, metric.aggregation))
         .collect::<Result<Vec<_>, BuildError>>()?;
     candidates.sort_by(|left, right| {
         right

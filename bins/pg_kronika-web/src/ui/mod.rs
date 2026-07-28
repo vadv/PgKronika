@@ -3,3 +3,4 @@
 pub(crate) mod catalog;
 pub(crate) mod data;
 pub(crate) mod handlers;
+pub(crate) mod heatmap;

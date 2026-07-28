@@ -494,7 +494,7 @@ mod tests {
         occurrence_count: u64,
         payload: ObservationPayload,
     ) -> EventObservation {
-        let lineage = SegmentIdentity::sealed(1, [2; 32], 7, b"fixture");
+        let lineage = SegmentIdentity::sealed(1, [2; 32]);
         let shape = match payload {
             ObservationPayload::ErrorGroup(_) | ObservationPayload::SlowQueryGroup(_) => {
                 ObservationShape::GroupedCount

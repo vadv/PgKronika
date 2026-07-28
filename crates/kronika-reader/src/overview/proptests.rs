@@ -33,7 +33,7 @@ fn identity() -> HeaderIdentity {
 }
 
 fn lineage() -> SegmentIdentity {
-    SegmentIdentity::sealed(7, [0x22; 32], 7, b"descriptor")
+    SegmentIdentity::sealed(7, [0x22; 32])
 }
 
 fn manifest() -> BlockContent {

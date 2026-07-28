@@ -1053,9 +1053,11 @@ fn assert_v1_documented_paths(document: &serde_json::Value) {
             "/v1/sources",
             "/v1/timeline/events",
             "/v1/timeline/health",
+            "/v1/timeline/heatmap",
             "/v1/timeline/overview",
             "/v1/ui/catalog",
             "/v1/version",
+            "/v1/views/summary",
         ]
     );
 
@@ -1071,7 +1073,9 @@ fn assert_v1_documented_paths(document: &serde_json::Value) {
         ("/v1/timeline/overview", "TimelineOverviewResponse"),
         ("/v1/timeline/events", "TimelineEventsResponse"),
         ("/v1/timeline/health", "TimelineHealthResponse"),
+        ("/v1/timeline/heatmap", "UiHeatmapResponse"),
         ("/v1/ui/catalog", "UiProjectionCatalog"),
+        ("/v1/views/summary", "UiViewSummaryResponse"),
         ("/v1/anomalies", "AnomalyResponse"),
         ("/v1/incidents", "IncidentResponse"),
     ];

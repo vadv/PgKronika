@@ -78,22 +78,11 @@ pub struct SegmentIdentity {
 impl SegmentIdentity {
     /// Derives a rebuild-stable lineage from sealed PGM metadata.
     #[must_use]
-    pub fn sealed(
-        source_id: u64,
-        source_descriptor: [u8; 32],
-        first_entry_type: u32,
-        first_entry_content_descriptor: &[u8],
-    ) -> Self {
-        let descriptor_len = u64::try_from(first_entry_content_descriptor.len())
-            .unwrap_or(u64::MAX)
-            .to_le_bytes();
+    pub fn sealed(source_id: u64, source_descriptor: [u8; 32]) -> Self {
         let id = SegmentLineageId(sha256::digest_parts(&[
             LINEAGE_DOMAIN_TAG,
             &source_id.to_le_bytes(),
             &source_descriptor,
-            &first_entry_type.to_le_bytes(),
-            &descriptor_len,
-            first_entry_content_descriptor,
         ]));
         Self {
             id,
@@ -990,7 +979,7 @@ mod tests {
     }
 
     fn lineage(source_id: u64) -> SegmentIdentity {
-        SegmentIdentity::sealed(source_id, [2; 32], 7, b"type=7 rows=3 crc=abc")
+        SegmentIdentity::sealed(source_id, [2; 32])
     }
 
     fn provenance(row_ordinal: u32) -> ObservationProvenance {
@@ -1129,7 +1118,7 @@ mod tests {
     fn sealed_lineage_uses_source_and_descriptors() {
         let base = lineage(1).id();
         assert_ne!(base, lineage(2).id());
-        let changed_descriptor = SegmentIdentity::sealed(1, [9; 32], 7, b"type=7 rows=3 crc=abc");
+        let changed_descriptor = SegmentIdentity::sealed(1, [9; 32]);
         assert_ne!(base, changed_descriptor.id());
     }
 
@@ -1145,7 +1134,7 @@ mod tests {
         let sealed = lineage(1);
         assert_eq!(
             sealed.id().0,
-            hex32("f052afe0372083f5587c769eaa9c34210ddb6bf11c011bc40f2e3c7a6f74a24a")
+            hex32("5677d10066c36f8f6d7e1f9d44760765e92d00d5001a6a4ec1afaf7c565beb7c")
         );
         let live = SegmentIdentity::live_approximate(1, 8, b"first-part");
         assert_eq!(
@@ -1154,7 +1143,7 @@ mod tests {
         );
         assert_eq!(
             individual(4).observation_id().0,
-            hex32("879aefc0c073af22ba581e9f2b4aa7176f57fe2148886b398291a3edd558d550")
+            hex32("3f7200f165fd26338b3f2d8aa29eeccdd5f007c2b0ff7761273205e41d4352e7")
         );
     }
 

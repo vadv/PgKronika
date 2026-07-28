@@ -1744,7 +1744,7 @@ mod tests {
         count: u64,
     ) -> EventObservation {
         EventObservation::new(
-            SegmentIdentity::sealed(1, [2; 32], 7, b"entry"),
+            SegmentIdentity::sealed(1, [2; 32]),
             7,
             ObservationProvenance {
                 section_body_id: SectionBodyId([4; 32]),

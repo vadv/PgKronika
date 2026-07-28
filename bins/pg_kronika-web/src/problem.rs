@@ -111,6 +111,10 @@ closed_string_enum! {
         At => "at",
         From => "from",
         To => "to",
+        View => "view",
+        Metric => "metric",
+        Buckets => "buckets",
+        Top => "top",
         Window => "window",
         Step => "step",
         Threshold => "threshold",
@@ -133,6 +137,10 @@ impl QueryParameter {
             b"at" => Some(Self::At),
             b"from" => Some(Self::From),
             b"to" => Some(Self::To),
+            b"view" => Some(Self::View),
+            b"metric" => Some(Self::Metric),
+            b"buckets" => Some(Self::Buckets),
+            b"top" => Some(Self::Top),
             b"window" => Some(Self::Window),
             b"step" => Some(Self::Step),
             b"threshold" => Some(Self::Threshold),
@@ -193,6 +201,7 @@ closed_string_enum! {
         NonNegativeInteger => "non_negative_integer",
         SectionList => "section_list",
         Severity => "severity",
+        ProjectionCode => "projection_code",
     }
 }
 
