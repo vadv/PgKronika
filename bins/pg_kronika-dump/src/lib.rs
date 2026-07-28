@@ -18,6 +18,8 @@ use rustix::fs::{Mode, OFlags};
 use crate::model::Output;
 
 #[cfg(test)]
+use kronika_analytics as _;
+#[cfg(test)]
 use kronika_writer as _;
 #[cfg(test)]
 use tempfile as _;

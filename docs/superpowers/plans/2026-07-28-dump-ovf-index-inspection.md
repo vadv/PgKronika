@@ -267,7 +267,7 @@ git commit -m "feat(dump): inspect OVF metadata by filename"
 - Produces: `OvfBlockOutput.content: Option<OvfBlockContentOutput>`.
 - Preserves: bodies are never read when `Options.rows == false`.
 
-- [ ] **Step 1: Write failing logical-content tests**
+- [x] **Step 1: Write failing logical-content tests**
 
 Create a fixture with one summary view and one entity metric containing both a
 missing bucket and an observed zero. Assert:
@@ -296,7 +296,7 @@ fn ovf_rows_decodes_web_index_and_preserves_missing_zero() {
 Add a two-series fixture and run with `--rows --limit 1`; assert one returned
 series, `truncated: true`, and full dictionary length.
 
-- [ ] **Step 2: Run logical-content tests and verify RED**
+- [x] **Step 2: Run logical-content tests and verify RED**
 
 ```bash
 cargo test -p pg_kronika-dump ovf_rows \
@@ -305,7 +305,7 @@ cargo test -p pg_kronika-dump ovf_rows \
 
 Expected: failure because OVF blocks have no `content`.
 
-- [ ] **Step 3: Implement UiSummary conversion**
+- [x] **Step 3: Implement UiSummary conversion**
 
 Read only `(BlockKind::UiSummary, logical_id=0)` through the typed reader method:
 
@@ -317,7 +317,7 @@ Expand snapshot presence/notable masks against `snapshot_times()` into arrays of
 `Option<u64>` and `Option<bool>`. Expand coverage to `bucket_count` booleans.
 The canonical empty summary emits `grid: null`, empty snapshots, and empty views.
 
-- [ ] **Step 4: Implement EntitySeries conversion**
+- [x] **Step 4: Implement EntitySeries conversion**
 
 For every directory entry with `BlockKind::EntitySeries`, call
 `read_entity_series(view_code, &LIMIT)` and serialize dictionary, metrics and at
@@ -334,7 +334,7 @@ let values = (0..usize::from(block.grid().bucket_count()))
 
 Set `truncated` to `metric.series().len() > options.limit`.
 
-- [ ] **Step 5: Run logical-content and package tests and verify GREEN**
+- [x] **Step 5: Run logical-content and package tests and verify GREEN**
 
 ```bash
 cargo test -p pg_kronika-dump ovf_rows \
@@ -345,7 +345,7 @@ cargo test -p pg_kronika-dump \
 
 Expected: all dump tests pass.
 
-- [ ] **Step 6: Commit logical contents**
+- [x] **Step 6: Commit logical contents**
 
 ```bash
 git add bins/pg_kronika-dump/src/model.rs \
