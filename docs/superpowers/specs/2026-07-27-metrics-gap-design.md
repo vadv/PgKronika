@@ -1,12 +1,30 @@
-# Расширение сбора: каталог недостающих линз
+# Расширение сбора: оставшиеся диагностические линзы
 
-Дата: 2026-07-27. Базируется на main после #132. Определяет состав и
-порядок серии PR по добавлению линз; каждая линза поставляется отдельным
-PR по действующему плейбуку one-PR-per-metric.
+Дата: 2026-07-27. Статус и остаток работ сверены с `origin/main` на
+`0bba2d02901b88792f35b801c2c9cc65bdcf5352`. Определяет состав и порядок
+серии PR по добавлению ещё отсутствующих линз; каждый logical source
+поставляется отдельным PR по действующему плейбуку one-PR-per-metric.
 
 Общий междокументный порядок, зависимости и границы пересекающихся работ
 задаёт
 [`2026-07-28-diagnostics-roadmap-design.md`](2026-07-28-diagnostics-roadmap-design.md).
+
+## Что ещё предстоит
+
+На current main ни один активный `T*` ID не закрыт целиком. Два пункта
+частично реализованы, и ниже для них оставлен только остаток:
+
+| Статус | Количество | IDs |
+| --- | ---: | --- |
+| Частично реализовано | 2 | `T1-5`, `T3-3` |
+| Будущее | 24 | `T1-1`, `T1-2`, `T1-3`, `T1-4`, `T1-6`, `T1-7`, `T1-8`, `T1-9`; `T2-1`, `T2-2`, `T2-3`, `T2-4`, `T2-5`, `T2-6`, `T2-7`, `T2-8`, `T2-9`, `T2-10`, `T2-11`; `T3-1`, `T3-2`, `T3-4`, `T3-5`, `T3-6` |
+| Реализовано среди активных IDs | 0 | — |
+| Отклонено/заменено среди активных IDs | 0 | — |
+
+Приоритет: сначала Tier 1, затем обнаруживаемые Tier 2; `T2-10` предшествует
+extension-dependent источникам. Tier 3 поставляется после inventory
+расширений, work bounds и production-path fixture. Общая dependency-очередь
+с Health Score и product actions задана верхнеуровневой дорожной картой.
 
 ## Задача
 
@@ -45,13 +63,6 @@ PgKronika — диагностическая история («чёрный ящ
 registry/source контрактами. Версии появления и изменения схем
 представлений PostgreSQL сверены по release notes и официальной
 документации 15–18 (<https://www.postgresql.org/docs/>).
-
-## Существующая база
-
-PSI, полный cgroup v2, дерево блокировок с глубиной, per-table freeze
-horizon, учёт дыр в логе, provenance-секции покрытия и ускорение activity
-до 1 секунды под нагрузкой остаются базой программы. Каталог ниже закрывает
-точечные пробелы, а не перестраивает сбор.
 
 ## Не цели
 
@@ -111,10 +122,10 @@ layout'ов `pg_stat_statements`). Изменения схем каталожн�
 **Лог-линзы.** Контракт локали: шаблоны разбираются для en и ru (по
 существующей конвенции парсера); на прочих локалях линза деградирует в
 событие без структурного разбора, что видно в статусе источника.
-Многострочные записи (DETAIL дедлока, планы auto_explain) требуют режима
-продолжения «строка с табуляцией без префикса принадлежит предыдущей
-записи» — parser сегодня такие строки отбрасывает; структурное извлечение
-выполняется до усечения текстовых полей.
+Существующий parser уже сохраняет многострочные
+DETAIL/HINT/CONTEXT/STATEMENT continuations. Новая линза выполняет
+структурное извлечение до усечения текстовых полей и не дублирует этот
+механизм.
 
 **Управляемость и стоимость.** Дорогие и включаемые-по-обнаружению линзы
 получают env-выключатель (контракт «интервал 0 = выключено»
@@ -135,7 +146,12 @@ T3-2), записывают его одним физическим типом, �
 вопрос, на который отвечает запись. Семантики — существующие в registry:
 snapshot_full, conditional_full, on_change, event_stream.
 
-### Tier 1 — консенсус-ядро
+Составные `T1-4`, `T1-8` и `T2-2` являются coordination IDs: каждый
+logical source или независимое расширение поставляется отдельным PR, который
+называет parent ID и свою точную slice. Для `T1-1` source/registry предшествует
+отдельному scheduler fast-path PR.
+
+### Tier 1 — оставшееся консенсус-ядро
 
 Закрывает наиболее важные невосстановимые постфактум классы аварий. Новых
 зависимостей сверх уже используемых не добавляется: каталожные
@@ -145,8 +161,9 @@ snapshot_full, conditional_full, on_change, event_stream.
 
 **T1-1. `pg_wal_storage` — физика WAL и очередь архивации.**
 Кластер, snapshot_full. Ответ на «pg_wal съел диск»: три горизонта
-удержания — min(`restart_lsn`) слотов (уже пишется в `1_017`), очередь
-архивации и REDO последнего чекпойнта (`pg_control_checkpoint()`).
+удержания — min(`restart_lsn`) слотов, очередь архивации и REDO последнего
+чекпойнта (`pg_control_checkpoint()`). Новая секция связывает существующие
+slot/archiver сигналы с ещё отсутствующими физическими фактами.
 
 Механика фиксируется спекой, потому что наивная реализация опасна ровно
 во время целевого инцидента (сотни тысяч файлов в `pg_wal` и
@@ -184,33 +201,31 @@ PG17 переименовал значения `name` (`Xact`→`transaction` и
 `confl_active_logicalslot` (PG16+ — версионный layout 15 / 16+). База,
 snapshot_full, 30 с. Записывается **всегда**, не только в recovery:
 строки существуют и на праймери, а последний всплеск отмен перед
-промоутом — самое ценное окно форензики failover'а. Сейчас пишется
-только суммарный `conflicts` из `pg_stat_database`.
+промоутом — самое ценное окно форензики failover'а. Существующий суммарный
+`pg_stat_database.conflicts` остаётся отдельным baseline-сигналом.
 
 **T1-4. Остальные прогресс-представления: `pg_stat_progress_analyze`,
 `_cluster`, `_create_index`, `_basebackup`, `_copy`.**
-Процесс, conditional_full (строки только при активной операции —
-механика идентична существующему `pg_stat_progress_vacuum`), 10 с.
+Процесс, conditional_full (строки только при активной операции), 10 с.
 Версионные layout'ы внутри матрицы: `_copy` — PG17 добавил
 `tuples_skipped`; `_analyze` — PG18 добавил `delay_time`. Отвечает:
 «почему CREATE INDEX CONCURRENTLY стоит и кого ждёт» (`lockers_total`),
 «сколько осталось COPY/базовому бэкапу».
 
 **T1-5. `pg_log_deadlocks` — типизированное событие дедлока.**
-Лог-линза, event_stream. Из сообщения `deadlock detected` и
-многострочного DETAIL извлекаются участники: pid'ы, рёбра «кто кого
-ждал», запросы сторон, жертва. Требования: режим многострочного
-продолжения в парсере (см. сквозные контракты), структурное извлечение
-до усечения текстового лимита, en+ru шаблоны тела DETAIL, fallback при
-отсутствии `%p` в `log_line_prefix` — событие без pid жертвы честнее
-эвристики. Счётчик `deadlocks` в `pg_stat_database` остаётся числом —
-событие даёт разбор.
+**Осталось:** поверх уже сохраняемых многострочных DETAIL/STATEMENT создать
+отдельную event_stream-линзу. Из `deadlock detected` и DETAIL до усечения
+извлекаются участники, pid'ы, рёбра «кто кого ждал», запросы сторон и жертва.
+Нужны en+ru structural templates и fallback при отсутствии `%p` в
+`log_line_prefix`: событие без pid жертвы честнее эвристики. Существующий
+счётчик `pg_stat_database.deadlocks` остаётся агрегатным baseline.
 
 **T1-6. Расширение выборки кандидатов `pg_stat_statements`: топ по
 `wal_bytes` и по `temp_blks_written`.**
-Не новая линза — два новых плеча отбора кандидатов. Отвечает: «какой
-запрос генерит WAL» и «кто пишет temp» — генератор WAL с редкими
-вызовами в текущую выборку не попадает. Реализация — один
+Не новая линза — остаётся добавить два плеча отбора кандидатов поверх уже
+сохраняемых полей. Они отвечают: «какой запрос генерит WAL» и «кто пишет
+temp» — редкий генератор может не попасть в текущие top-N времени/calls.
+Реализация — один
 материализованный скан `pg_stat_statements` и четыре top-N поверх него
 (каждое UNION-плечо в лоб — отдельная материализация SRF, их станет
 не две, а четыре); ось `wal_bytes` гейтится по extversion (pgss 1.8+);
@@ -218,17 +233,12 @@ snapshot_full, 30 с. Записывается **всегда**, не тольк
 
 **T1-7. Держатели xmin-горизонта — колонки в существующих линзах.**
 `xmin` и `catalog_xmin` в `pg_replication_slots` (`1_017`),
-`backend_xmin` walsender'а в `pg_stat_replication` (`1_016`). Закрывает
-вторую половину квадранта «кто держал горизонт» (первая — возраст
-`backend_xmin` в activity и 2PC-агрегат): без этих колонок вопрос
-«почему vacuum не чистил» отвечается в двух случаях из четырёх.
-Registry уже держит закладки на оба поля.
+`backend_xmin` walsender'а в `pg_stat_replication` (`1_016`). Они закрывают
+недостающие slot/walsender стороны вопроса «кто держал горизонт».
 
 **T1-8. Мелкие колонки и оси в существующих линзах.**
-- `pg_stat_user_indexes`: `indisvalid` уже записывается — гап в другом:
-  брошенный CIC-индекс мал и не сканируется, он не попадает ни в одну
-  top-N ось отбора. Добавляется гарантированная ось для
-  `NOT indisvalid` (таких индексов единицы);
+- `pg_stat_user_indexes`: добавить гарантированную ось `NOT indisvalid`,
+  чтобы небольшой брошенный CIC-индекс не терялся за текущими top-N;
 - `pg_storage_mount`: inode-счётчики из statvfs, nullable — на btrfs
   `f_files = 0`, ноль не означает «inode кончились»;
 - `pg_stat_user_tables`: `relpersistence` — после crash unlogged-таблицы
@@ -244,7 +254,7 @@ Registry уже держит закладки на оба поля.
 skip-счётчики). Startup process частично виден в activity по wait events;
 пункт включён за дешевизну и стоит в хвосте тира.
 
-### Tier 2 — по обнаружению объекта или включённой настройки
+### Tier 2 — оставшееся по обнаружению объекта или включённой настройки
 
 **T2-1. `pg_stat_replication_slots` — spill/stream логического
 декодирования (PG14+).**
@@ -295,9 +305,8 @@ password в OPTIONS user mapping маскируются на парсере — 
 
 **T2-6. Лог-линза сбоя архивации.**
 `archive command failed` + stderr архив-команды из лога: причина отказа
-(нет места, auth, сеть), которой нет в счётчиках `1_008`. Закрывает
-вторую половину вопроса T1-1 «архивация стоит — почему». Общая механика
-лог-линз поставляется до отдельных PR T2-4, T2-5 и T2-6.
+(нет места, auth, сеть), которой нет в существующих archiver counters.
+Закрывает вторую половину вопроса T1-1 «архивация стоит — почему».
 
 **T2-7. `pg_sequence_health` — запас последовательностей.**
 `pg_sequences`: остаток до предела, топ-N худших; предел считается по
@@ -321,19 +330,23 @@ toast при стабильном heap), нестандартные типы и�
 цикла.
 
 **T2-9. Детализация prepared transactions: gid и owner.**
-`pg_prepared_xacts` построчно (gid, owner, database, prepared_at),
-conditional_full — строки только при наличии 2PC; максимум
-`max_prepared_transactions` строк. Существующий агрегат `1_010` говорит
-«в базе X висит 2PC шесть часов», но не «чей»: gid — имя от transaction
-manager, прямой указатель на виновное приложение. Registry держит
-закладку «может стать отдельным типом» — это она.
+Остаётся отдельный per-transaction contract: `pg_prepared_xacts` построчно
+(gid, owner, database, prepared_at), conditional_full — строки только при
+наличии 2PC; максимум `max_prepared_transactions` строк. Он дополняет
+существующий aggregate: gid и owner дают указатель на приложение/transaction
+manager, которого в агрегате нет.
 
 **T2-10. Инвентарь расширений — `pg_extension` on_change.**
 Имя и версия по базам. Помимо «обновляли ли расширение между
 сегментами», это базис интерпретации Tier 3: счётчики kcache и
 wait_sampling трактуются через историю extversion.
 
-### Tier 3 — продвинутая форензика, по обнаружению
+**T2-11. `db_size_approx` — дешёвая оценка размера базы.**
+Добавить к существующей database-линзе оценку по `pg_class.relpages` с
+явной семантикой approximation и coverage по базам. `pg_database_size()` не
+используется: обход большого числа файлов не соответствует фоновому бюджету.
+
+### Tier 3 — оставшаяся продвинутая форензика, по обнаружению
 
 **T3-1. `pg_wait_sampling` — профиль ожиданий.**
 При обнаруженном расширении. Дизайн зафиксирован спекой, потому что
@@ -356,13 +369,12 @@ blk-времён из total_time. Версионируется по версии
 записей kcache читается как Reset и документируется.
 
 **T3-3. `pg_log_explain_plans` — планы auto_explain из лога.**
-При включённом auto_explain его вывод уже попадает в тейлящийся stderr.
-План — многострочный и регулярно больше текстового лимита секции:
-хранение — через `dict.blobs` с потолком размера и дедупликацией по
-хэшу плана; ротация лога посреди плана даёт событие «план усечён», не
-тихий мусор; queryid — при `auto_explain.log_verbose`. Это план
-фактического медленного выполнения с runtime-статистикой — то, чего нет
-в pg_store_plans (агрегаты).
+**Осталось:** распознавать auto_explain в уже тейлящемся stderr, выделять
+границы плана, создавать `pg_log_explain_plans` и сохранять payload через
+существующий bounded/deduplicated `dict.blobs`. Ротация посреди плана даёт
+событие «план усечён», не тихий мусор; queryid извлекается при
+`auto_explain.log_verbose`. Нужны source/registry wiring и BDD для границ,
+усечения и queryid.
 
 **T3-4. PG18: per-backend I/O и WAL.**
 `pg_stat_get_backend_io()` / `pg_stat_get_backend_wal()` — атрибуция
@@ -380,22 +392,10 @@ PSI io); права — `pg_read_all_stats`; кардинальность огр
 `io_max_concurrency × backends`. Форензика зависаний AIO-подсистемы.
 
 **T3-6. `pg_visibility_map_summary()` — доля all-visible/all-frozen.**
-Для топ-N таблиц из существующего freeze horizon, 3600 с, при
+Для top-N таблиц из сохранённого freeze-horizon baseline, 3600 с, при
 установленном contrib pg_visibility; доступ — `pg_stat_scan_tables`
 (входит в `pg_monitor`), читаются только VM-форки. Отвечает: «почему
 VACUUM не двигает frozen horizon — сколько реально осталось заморозить».
-
-## Пересмотр существующего
-
-- `pg_database_size()` исключён из линзы database осознанно (стоимость
-  на каталогах с большим числом файлов). Дешёвая оценка по
-  `pg_class.relpages` (`db_size_approx`) остаётся кандидатом в колонку
-  существующей линзы database.
-- `pg_stat_progress_vacuum` (`1_012`) уже хранит PG18 `delay_time` в
-  отдельном version adapter; T1-4 добавляет только отсутствующие
-  progress-представления.
-- Суммарный `pg_stat_database.conflicts` после появления T1-3 остаётся:
-  счётчик дешевле для трендов, разбивка — для разбора.
 
 ## Порядок поставки
 
@@ -416,12 +416,12 @@ publisher/subscriber, T3-1/T3-2 — расширений в Nix-образе.
 Порядок:
 
 1. Tier 1: T1-1 (`pg_wal_storage`) → T1-6 (топы WAL/temp) →
-   T1-5 (deadlock) → T1-2 (SLRU) → T1-3 (conflicts) → T1-4 (прогрессы,
-   кроме уже реализованного vacuum) → T1-7 (xmin-квадрант) → T1-8
-   (колонки) → T1-9 (prefetch).
-2. Tier 2: T2-1 → T2-2 → T2-3 → общая механика лог-линз → T2-4 →
-   T2-5 → T2-6 → T2-7 → T2-8 → T2-9 → T2-10.
-3. Tier 3 — по мере появления потребности; T3-4/T3-5 после появления
+   T1-5 (deadlock) → T1-2 (SLRU) → T1-3 (conflicts) → T1-4 (пять новых
+   progress sources) → T1-7 (xmin-квадрант) → T1-8 (колонки) →
+   T1-9 (prefetch).
+2. Tier 2: T2-10 → T2-1 → T2-2 → T2-3 → T2-4 → T2-5 → T2-6 →
+   T2-7 → T2-8 → T2-9 → T2-11.
+3. Tier 3 — после T2-10 и по мере появления потребности; T3-4/T3-5 после появления
    PG18 в проде у первых пользователей.
 
 Tier 1 не требует новых зависимостей; изменения конфигурации PostgreSQL
@@ -431,3 +431,25 @@ auto_explain) — рекомендуемый GUC-baseline с указанием 
 результаты только после полного успешного attempt; иначе сохраняют typed
 `partial`, `not_collected`, `unavailable` или `not_applicable` с coverage,
 когда объект, настройка или права не обнаружены.
+
+## Реализовано на current main
+
+Baseline ниже не входит в активную очередь и не повторяется в будущих PR.
+
+| ID | Возможность | Production evidence | Test/BDD/docs evidence |
+| --- | --- | --- | --- |
+| `BASE-M01` | Суммарные database conflicts | `crates/kronika-registry/src/codec/pg_stat_database.rs`, `crates/kronika-source-pg/src/database.rs` | `crates/kronika-bdd/features/pg_stat_database.feature`, `docs/type-registry/postgresql.md` |
+| `BASE-M02` | Vacuum progress, включая PG18 `delay_time` | `crates/kronika-source-pg/src/progress_vacuum.rs`, `crates/kronika-registry/src/codec/pg_stat_progress_vacuum.rs`, `bins/pg_kronika-collector/src/main_sources.rs` | `crates/kronika-bdd/features/pg_stat_progress_vacuum.feature`, `docs/type-registry/postgresql.md` |
+| `BASE-M03` | Multiline DETAIL/HINT/CONTEXT/STATEMENT и bounded log ingestion | `crates/kronika-source-log/src/collector.rs`, `crates/kronika-registry/src/codec/pg_log.rs` | `crates/kronika-bdd/features/pg_log.feature`, source-log unit tests |
+| `BASE-M04` | Statements содержат WAL/temp поля, но кандидаты пока выбираются только по времени/calls | `crates/kronika-source-pg/src/statements.rs`, `crates/kronika-registry/src/codec/pg_stat_statements.rs` | `crates/kronika-bdd/features/pg_stat_statements.feature`, `docs/type-registry/postgresql.md` |
+| `BASE-M05` | Operational index flags, включая `indisvalid`/`indisready` | `crates/kronika-source-pg/src/user_indexes.rs`, `crates/kronika-registry/src/codec/pg_stat_user_indexes.rs` | `crates/kronika-bdd/features/user_tables.feature`, `docs/type-registry/postgresql.md` |
+| `BASE-M06` | Aggregate prepared transactions | `crates/kronika-source-pg/src/prepared_xacts.rs`, `crates/kronika-registry/src/codec/pg_prepared_xacts.rs`, `bins/pg_kronika-collector/src/main_sources.rs` | `crates/kronika-bdd/features/pg_prepared_xacts.feature`, `docs/type-registry/postgresql.md` |
+| `BASE-M07` | Точечные extversion probes для statements/store-plans | `crates/kronika-source-pg/src/statements.rs`, `crates/kronika-source-pg/src/store_plans.rs`, `bins/pg_kronika-collector/src/statements_source.rs`, `bins/pg_kronika-collector/src/plans_source.rs` | unit tests в обоих source-модулях; `crates/kronika-bdd/features/pg_stat_statements.feature`, `crates/kronika-bdd/features/pg_store_plans.feature`, `docs/type-registry/postgresql.md` |
+| `BASE-M08` | Freeze-horizon top-N | `crates/kronika-source-pg/src/incident_gauges.rs`, `crates/kronika-registry/src/codec/incident_gauges.rs`, `bins/pg_kronika-collector/src/{pool_sources.rs,buffering.rs}` | unit tests в source/registry-модулях; `bins/pg_kronika-web/src/tests/incidents.rs`, `docs/type-registry/postgresql.md` |
+
+Закрытое решение `DEC-M01` (`Отклонено`): `pg_database_size()` не
+добавляется. Production contract находится в
+`crates/kronika-source-pg/src/database.rs::database_query`, а тест
+`query_includes_version_specific_columns` явно запрещает вызов во всех
+layout. Будущий `T2-11` использует approximate contract и не возвращает exact
+bytes.

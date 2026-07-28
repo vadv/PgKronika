@@ -14,7 +14,7 @@ PgKronika развивает существующую модель «типиз�
 
 Документ фиксирует:
 
-- точное текущее покрытие и подтверждённые пробелы;
+- только оставшиеся target gaps и компактный evidence-backed baseline;
 - целевой контракт Health Score v1;
 - будущие SQL/data contracts для недостающих фактов;
 - API/UI-сценарии, ограничения безопасности и производительности;
@@ -38,51 +38,39 @@ Production code в рамках этого документа не меняет�
 - **ложный ноль** — ноль, полученный из отсутствия строки, неполной выборки,
   отказа в доступе, reset или разрыва.
 
-## 2. Текущее покрытие
+## 2. Что ещё предстоит
 
-Источником истины для физической схемы остаётся реестр в
-`crates/kronika-registry/src/codec`; обзор типов находится в
-`docs/type-registry/postgresql.md`, `docs/type-registry/os.md` и
-`docs/type-registry/semantics.md`. Сбор PostgreSQL описывают
-`crates/kronika-source-pg/src` и `bins/pg_kronika-collector/src`, а оконные
-разности — `crates/kronika-analytics/src/diff` и
-`crates/kronika-reader/src/query`.
+Все 24 target IDs остаются открытыми. Статус `частично` означает, что
+production-wired часть контракта подтверждена, но ниже планируется только
+остаток; prerequisite сам по себе не снижает target.
 
-Классы дальнейшей работы:
+| Статус main | Количество | IDs |
+| --- | ---: | --- |
+| Реализовано | 0 | — |
+| Частично | 21 | `HS-001..004`, `DATA-001..003`, `DATA-005..009`, `UX-001..004`, `UX-006`, `EXT-001`, `SAFE-001..003` |
+| Будущее | 3 | `DATA-004`, `DATA-010`, `UX-005` |
+| Отклонено/заменено | 0 | — |
 
-- **existing-data** — достаточно существующих сохранённых данных; нужны
-  analytics/API/UI;
-- **coverage-extension** — значения сохраняются, но строгий вывод требует
-  расширить persisted coverage, identity или отбор кандидатов;
-- **new-source** — нужен новый versioned stored type/source.
+Остаток выполняется в dependency order:
 
-| Область | Current coverage и пути | Confirmed gap | Класс |
-| --- | --- | --- | --- |
-| Действующая health-line | `crates/kronika-analytics/src/overview/health.rs` реализует строгую factor coverage, максимум factor penalty внутри домена и формулу `product(1 - domain_penalty)` на шкале 0–1. Текущие IDs: `database_error_pressure`, `connection_capacity`, `contention`, `cpu_pressure`, `memory_pressure`, `storage_pressure`, `maintenance`, `replication`. `crates/kronika-analytics/src/overview/health_line.rs` пока получает только event evidence; обязательный continuous factor не покрыт, поэтому numeric score равен `None`. `bins/pg_kronika-web/src/overview/health.rs` выдаёт это как `null`. | Нет требуемой формулы 0–100, весов восьми целевых категорий, перераспределения веса и critical ceiling 30. Существующая исполняемая линия не даёт числовой оценки ресурсов. | existing-data для kernel, coverage-extension для полной coverage |
-| Connections и activity | `1_001_003` хранит PID, базу, роль, state/wait, query/query ID, `backend_xid_age`, `backend_xmin_age`, времена backend/transaction/query/state. `1_005` хранит `numbackends`, пределы подключения и session counters. Пути: `crates/kronika-registry/src/codec/pg_stat_activity.rs`, `crates/kronika-registry/src/codec/pg_stat_database.rs`, `crates/kronika-source-pg/src/activity.rs`, `crates/kronika-source-pg/src/database.rs`, `bins/pg_kronika-collector/src/main_sources.rs`. | Нужны rule extraction, privacy/redaction и строгая проверка `snapshot_coverage`; activity сверх guard не может выглядеть пустой. | existing-data |
-| Idle-in-transaction и long transaction | `xact_start`, `state`, `state_change`, XID/XMIN age уже присутствуют в `1_001`; cumulative `idle_in_transaction_time` присутствует в `1_005`. | Gauge длительности можно строить сразу; cumulative время допустимо только через typed diff. Порог длительности является политикой, а не фактом PostgreSQL. | existing-data |
-| Cache hit | `1_005` содержит `blks_hit/read`; `1_013` — heap/index/TOAST read/hit; `1_014` — index read/hit; `1_002` — block counters запросов. Пути: `crates/kronika-registry/src/codec/pg_stat_database.rs`, `crates/kronika-registry/src/codec/pg_stat_user_tables.rs`, `crates/kronika-registry/src/codec/pg_stat_user_indexes.rs`, `crates/kronika-registry/src/codec/pg_stat_statements.rs`; SQL sources: `crates/kronika-source-pg/src/database.rs`, `crates/kronika-source-pg/src/user_tables.rs`, `crates/kronika-source-pg/src/user_indexes.rs`, `crates/kronika-source-pg/src/statements.rs`. | Instance/database ratio доступен. Таблицы, индексы и statements являются top-N: отсутствие объекта не доказывает нулевую нагрузку или отсутствие худшего объекта. | existing-data для database, coverage-extension для полного object evidence |
-| Dead/HOT/newpage tables | `1_013` хранит cumulative DML/HOT, `n_tup_newpage_upd` с PG16, gauge live/dead/mod-since-analyze/ins-since-vacuum, vacuum/analyze times и counts, размеры, XID/MXID age и `reltuples`. Сбор: `crates/kronika-source-pg/src/user_tables.rs`. | Union top-N по reads, writes, `relpages`, dead tuples, XID и MXID не гарантирует глобально худший dead/HOT/newpage ratio. В PG15 newpage unavailable, а не zero. | existing-data для худших сохранённых строк, coverage-extension для гарантированного worst set |
-| Replication | `1_015` описывает роль экземпляра; `1_016` — senders; `1_017` — slots; `1_033` — физические LSN gaps и lag; `1_034` — удержание WAL и slot state. Пути: `crates/kronika-registry/src/codec/replication_instance.rs`, `crates/kronika-registry/src/codec/replication_replicas.rs`, `crates/kronika-registry/src/codec/replication_slots.rs`, `crates/kronika-registry/src/codec/incident_gauges.rs`; `crates/kronika-source-pg/src/replication_instance.rs`, `crates/kronika-source-pg/src/replication_details.rs`, `crates/kronika-source-pg/src/incident_gauges.rs`; `bins/pg_kronika-collector/src/main_sources.rs`. | Метрик достаточно, но для всех наборов нет универсального population marker. Пустой набор без доказанной полноты не определяет standalone topology. | existing-data для метрик, coverage-extension для applicability |
-| XID/MXID и horizon | `1_005` хранит database ages; `1_013` — table ages; `1_010` — prepared xacts. `1_031` хранит database row и bounded oldest table rows с отдельными XID/MXID ages, global GUC и разобранными per-table/TOAST freeze reloptions. Пути: `crates/kronika-registry/src/codec/incident_gauges.rs` и `crates/kronika-source-pg/src/incident_gauges.rs`. | `1_031` ограничен 128 кандидатами на каждую шкалу без persisted `source_total`; relation max-age ещё нужно ограничить global max-age и отделить от effective failsafe. Полного drilldown и отрицательного вывода «риска нет» пока нет. | coverage-extension |
-| Checkpoints и WAL | `1_006` объединяет bgwriter/checkpointer PG15–18; `1_007` хранит WAL counters, а `1_009` покрывает PG18 WAL I/O. GUC-gated timings и reset metadata уже есть. Пути: `crates/kronika-registry/src/codec/bgwriter_checkpointer.rs`, `crates/kronika-registry/src/codec/pg_stat_wal.rs`, `crates/kronika-registry/src/codec/pg_stat_io.rs`; `crates/kronika-source-pg/src/lib.rs`, `crates/kronika-source-pg/src/wal.rs`, `crates/kronika-source-pg/src/io.rs`; `bins/pg_kronika-collector/src/main_sources.rs`. | Нет category extraction для нового score. | existing-data |
-| Locks и `pg_blocking_pids` | `1_011` хранит направленный `blocked_by`, root/depth, lock identity, wait start, activity/query и XID context. Пути: `crates/kronika-registry/src/codec/pg_locks.rs`, `crates/kronika-source-pg/src/locks.rs`, `bins/pg_kronika-collector/src/main_sources.rs`. | Guard, ошибка запроса и пустой граф не всегда различимы сохранённым marker. Нельзя превращать отсутствие секции в ноль без доказательства успешной проверки. | coverage-extension |
-| Deadlocks | `1_005.deadlocks` — cumulative counter; structured log facts могут сохранить событие. Оконные reset-aware факты уже строит `crates/kronika-reader/src/overview/metric_extract.rs`. | Нужен только score rule поверх typed diff. После разрешения deadlock полный граф нельзя восстанавливать без соответствующего log evidence. | existing-data |
-| Checksums | PG12+ `1_005.checksum_failures/checksum_last_failure`; `1_019` хранит read-only `data_checksums`. Текущий `crates/kronika-source-pg/src/database.rs` нормализует PostgreSQL `NULL` counter в `0`. | Подтверждённое приращение можно использовать при co-temporal `data_checksums=on`; при `off` rule неприменим, а при неизвестной настройке unavailable. Один сохранённый ноль не доказывает отсутствие failures. Абсолютный since-reset counter запрещён. | existing-data |
-| OS CPU/load/disk | `1_102` хранит CPU ticks, `1_103` runnable/blocked processes, `1_105` load average, `1_108` diskstats, `1_112` mountinfo; `1_036` связывает PostgreSQL storage с локальным mount/device и хранит `total_bytes`/`available_bytes` по `f_bavail`. Пути: `crates/kronika-registry/src/codec/os_cpu.rs`, `crates/kronika-registry/src/codec/os_stat.rs`, `crates/kronika-registry/src/codec/os_loadavg.rs`, `crates/kronika-registry/src/codec/os_diskstats.rs`, `crates/kronika-registry/src/codec/os_mountinfo.rs`, `crates/kronika-registry/src/codec/incident_gauges.rs`; `crates/kronika-source-os/src/proc/stat.rs`, `crates/kronika-source-os/src/proc/loadavg.rs`, `crates/kronika-source-os/src/proc/diskstats.rs`, `crates/kronika-source-os/src/mount.rs`, `crates/kronika-source-os/src/fs.rs`; `bins/pg_kronika-collector/src/os_sources.rs`, `bins/pg_kronika-collector/src/os_sources/procfs_sections.rs`. | Значения есть, но строгая persisted coverage неодинакова для OS и local mapping failures; canonical health extraction ещё не поддерживает эти factors. | existing-data для значений, coverage-extension для строгой полноты |
-| Settings | `1_019` — on-change снимок `pg_settings` с материализацией в каждом сегменте; `1_020` — reset/gating context; `1_021` — instance identity/version. Пути: `crates/kronika-registry/src/codec/pg_settings.rs`, `crates/kronika-registry/src/codec/reset_metadata.rs`, `crates/kronika-registry/src/codec/instance_metadata.rs`; `crates/kronika-source-pg/src/settings.rs`, `crates/kronika-source-pg/src/reset_metadata.rs`; `bins/pg_kronika-collector/src/service_sections.rs`. | Достаточно для compare moments и global GUC. Нет общего per-table reloptions snapshot. | existing-data для settings, new-source для reloptions |
-| Reset и coverage | Typed diff различает `Reset`, `Gap`, `FirstPoint`, `Anomaly`, `NotCollected`. `1_023` хранит top-N totals/cutoff/reason; `1_038` — read state, visibility и population. Пути: `crates/kronika-analytics/src/diff/pair.rs`, `crates/kronika-reader/src/query/diff.rs`, `crates/kronika-reader/src/query/gating.rs`, `crates/kronika-registry/src/codec/collection_coverage.rs`, `crates/kronika-registry/src/codec/snapshot_coverage.rs`, `bins/pg_kronika-collector/src/coverage.rs`. | Coverage markers пока не охватывают одинаково locks, horizons, replication и все PostgreSQL/OS snapshots. Пул обслуживает не более 20 баз; непокрытая база и budget deferral не должны выглядеть пустыми. | coverage-extension, приоритетно |
-| Index/schema inventory | `1_014` хранит operational top-N: scans, size, last scan, AM, unique/primary/exclusion, `indisvalid`, `indisready` и display `indexdef`. Пути: `crates/kronika-registry/src/codec/pg_stat_user_indexes.rs`, `crates/kronika-source-pg/src/user_indexes.rs`, `bins/pg_kronika-collector/src/pool_sources.rs`. | Нет полного structural catalog: keys/expressions/opclasses/collations/order/predicate/INCLUDE, constraint ownership, partition hierarchy, FKs и constraints. Display text не является identity; OID без observation episode не защищает долгую историю от reuse/drop-recreate. | new-source |
-| Sequences | В registry и `crates/kronika-source-pg/src` нет sequence type/source. | Нет type bounds, direction, cycle, cached `last_value`, identity/ownership и typed privilege state. | new-source |
-| Progress | Есть только `1_012 pg_stat_progress_vacuum`. | Нет create-index, analyze, cluster и basebackup progress. | new-source |
-| Object inspector и physical bloat | Исторические table/index stats и размеры существуют. | Нет bounded catalog-backed inspector и опционального on-demand `pgstattuple_approx` path. | new-source |
-| Query compare | Statements, plans, block/temp/WAL counters и typed window diff уже есть. | Нет domain API/UI для A/B двух сохранённых окон, устойчивого matching и общей coverage. | existing-data |
-| Logs | Typed log types `1_022`, `1_024`–`1_030`, source status `1_039`, timeline events и incident facts существуют. | Нет search histogram, include/exclude, dedup, cursor, `partial/scanned` и действий с диапазоном в буфере обмена. | existing-data |
+1. additive Health Score 0–100, canonical extractors, availability,
+   completeness и critical ceiling (`HS-001..003`, `DATA-001`);
+2. score/history/per-database/evidence machine contract, runtime/OpenAPI ID
+   parity и затем generated client/UI (`HS-004`, `UX-004`, `UX-005`);
+3. universal attempt/population/per-database coverage (`DATA-002`);
+4. reloption-aware maintenance, sequences, complete horizon/worst axes и
+   structural catalog с observation episodes (`DATA-003..007`,
+   `SAFE-002`);
+5. четыре ещё отсутствующих progress sources, inspector и опциональное
+   physical evidence (`DATA-008..010`);
+6. query/settings compare, schema history и остаток log search
+   (`UX-001..003`, `UX-006`);
+7. resource/privacy qualification каждого нового path (`SAFE-001`,
+   `SAFE-003`) и scoped RBAC/audit/isolation поверх read-only machine API
+   (`EXT-001`).
 
-Следствие: tranche A может вычислять kernel на сохранённых фактах, но обязана
-возвращать partial/unavailable там, где нет доказанной coverage. Первыми
-изменениями хранения должны стать единая snapshot/population coverage и
-покрытие баз; sequence и structural catalog требуют отдельных новых типов.
+Точные уже работающие части и evidence вынесены в раздел 12. Они не являются
+задачами траншей.
 
 ## 3. Health Score v1
 
@@ -629,15 +617,10 @@ coverage и запрещают вывод «проблем нет».
 
 ### 4.1. Reloption-aware autovacuum и autoanalyze
 
-**Current coverage.** `1_013` уже хранит `n_dead_tup`,
-`n_ins_since_vacuum`, `n_mod_since_analyze`, `reltuples`, vacuum/analyze times
-и counts. `1_019` хранит global GUC. `1_031` уже умеет разбирать несколько
-freeze reloptions для horizon.
-
-**Confirmed gap.** Нет согласованного снимка всех effective autovacuum
-параметров на уровне таблицы/TOAST, exact eligibility, backlog и полного
-инвентаря отключённых таблиц. Соединять on-change global settings и top-N
-table rows постфактум недостаточно для строгого вывода.
+**Осталось.** Создать согласованный снимок всех effective autovacuum
+параметров на уровне таблицы/TOAST, exact eligibility, backlog и полный
+инвентарь отключённых таблиц. Нельзя строить строгий вывод простым
+соединением уже сохранённых global settings и top-N table rows.
 
 **Target contract.** Новый per-database source сохраняет bounded relation
 inventory для ordinary/materialized relations и отдельно описывает
@@ -737,11 +720,9 @@ foundation.
 
 ### 4.2. Sequence и identity exhaustion
 
-**Current coverage.** Stored sequence source отсутствует.
-
-**Confirmed gap.** Нельзя определить declared range, direction, cycle, cached
-disk value, ownership/identity, privilege state и самый узкий подтверждённый
-предел.
+**Осталось.** Создать sequence source: declared range, direction, cycle,
+cached disk value, ownership/identity, privilege state и самый узкий
+подтверждённый предел.
 
 **Target contract.** Новый per-database catalog source объединяет семантику
 `pg_sequence`, `pg_sequences`, `pg_attribute.attidentity` и dependency
@@ -815,15 +796,10 @@ effective bound, cache, cycle и privilege/coverage.
 
 ### 4.3. XID/MXID drilldown и worst tables
 
-**Current coverage.** `1_031` уже сохраняет global GUC, table/TOAST
-reloptions и bounded oldest XID/MXID candidates; `1_013` содержит
-dead/HOT/newpage counters и sizes. Текущие значения relation freeze limit
-нельзя считать окончательным effective contract без ограничения global
-maximum.
-
-**Confirmed gap.** Нет `source_total`/tail для horizon candidates и отдельных
-гарантированных осей worst dead ratio, HOT failure и newpage update. Текущий
-top-N не доказывает полноту такого ранжирования.
+**Осталось.** Дополнить существующие horizon/table facts: сохранить
+`source_total`/tail для horizon candidates, применить global clamp и добавить
+гарантированные оси worst dead ratio, HOT failure и newpage update.
+Существующий top-N не доказывает полноту такого ранжирования.
 
 **Target contract.**
 
@@ -885,11 +861,9 @@ Relation freeze limit не заменяет failsafe threshold и возвращ
 
 ### 4.4. Index states, constraints и structural hygiene
 
-**Current coverage.** `1_014` сохраняет несколько index flags и display
-definition для operational top-N.
-
-**Confirmed gap.** Нужен полный bounded catalog source. Статистический top-N и
-display text недостаточны для исторического schema finding.
+**Осталось.** Создать полный bounded catalog source с structural identity,
+constraints/FK/index fingerprints и episodes. Существующих operational top-N
+flags и display text недостаточно для исторического schema finding.
 
 **Target contract.** Per-database schema snapshot хранит normalized catalog
 facts и materialized finding rows. Общая object identity следует envelope из
@@ -1032,11 +1006,9 @@ catalog facts → stable identity/history → findings/API.
 
 ### 4.5. Progress views
 
-**Current coverage.** Сохраняется только `pg_stat_progress_vacuum`.
-
-**Confirmed gap.** Нет stored types, version adapters и исторических episodes
-для create-index, analyze, cluster и basebackup; UI не может отличить
-невидимую операцию от отсутствующей.
+**Осталось.** Добавить stored types, version adapters и исторические episodes
+для create-index, analyze, cluster и basebackup; UI должен отличать невидимую
+операцию от отсутствующей. Существующий vacuum source не переделывается.
 
 **Target contract.** Добавить cluster-sampled stored types для:
 
@@ -1072,12 +1044,9 @@ layout.
 
 ### 4.6. Bounded object inspector
 
-**Current coverage.** Исторические table/index stats, sizes и часть catalog
-labels сохраняются, но готового inspector contract нет.
-
-**Confirmed gap.** Нет одной object identity, которая связывает columns,
-types, indexes, checks, обе стороны FK, partition hierarchy, sizes и
-maintenance state с bounded coverage.
+**Осталось.** Создать bounded inspector и одну object identity, связывающую
+columns, types, indexes, checks, обе стороны FK, partition hierarchy, sizes и
+maintenance state. Он использует существующие stored stats только как вход.
 
 **Target contract.** UI передаёт opaque typed object ID; server разрешает его
 в exact database/object episode. Free-form SQL и интерполяция имени
@@ -1107,11 +1076,9 @@ object/segment/catalog budget.
 
 ### 4.7. Опциональный `pgstattuple_approx`
 
-**Current coverage.** Extension-derived physical bloat facts не собираются.
-
-**Confirmed gap.** Нет policy-gated одиночного physical scan с typed
-privilege/load/timeout outcomes; текущие table estimates не заменяют такой
-факт.
+**Осталось.** Создать policy-gated одиночный physical scan с typed
+privilege/load/timeout outcomes. Существующие table estimates не заменяют
+такой факт.
 
 **Target contract.** Путь выключен по умолчанию и доступен только явным
 on-demand запросом для одного allowlisted ordinary/materialized relation OID.
@@ -1134,19 +1101,15 @@ explicit grant, 0/partial/100% scan, timeout/cancel/load guard. Resource test
 
 ## 5. Product actions
 
-На текущем `main` доступны timeline/anomaly/incident/raw-section routes,
-перечисленные в `bins/pg_kronika-web/src/lib.rs`. Health drilldown, query
-compare, settings compare и log search routes отсутствуют. Production
-frontend также отсутствует: `bins/pg_kronika-web/static/index.html` является
-минимальной заглушкой. Документ
-`docs/superpowers/specs/2026-07-28-web-ui-api-design.md` задаёт целевую bounded
-архитектуру, но не считается current implementation.
+Ниже перечислены только ещё отсутствующие product actions. Работающие
+timeline/anomaly/incident/raw-section primitives перечислены в baseline
+раздела 12.
 
 ### 5.1. Health history, per-database и drilldown
 
-| Current coverage | Confirmed gap | Target contract | Acceptance | Order |
-| --- | --- | --- | --- | --- |
-| `/v1/timeline/health` уже имеет bounded range и points, а analytics хранит factor/floor IDs. | Numeric points используют другую формулу и сейчас `null`; нет category history, per-database score и rule evidence route. | `GET /v1/health/score` — одна подробная evaluation; новый `/v1/health/history` — bounded score/category history; `/v1/health/evidence` — cursor-bound rule/evidence detail. Существующий timeline contract не меняется. `scope=instance|database`; database выбирается opaque episode ID. | Detail и history с одинаковым `evaluation_id` совпадают; per-database isolation; instance-only evidence не размножается по базам; cursor связывает source, scope, policy, fact set, filters и redaction revision. | B |
+| Осталось | Target contract | Acceptance | Order |
+| --- | --- | --- | --- |
+| Перейти на target formula и добавить category history, per-database score и rule evidence route. | `GET /v1/health/score` — одна подробная evaluation; новый `/v1/health/history` — bounded score/category history; `/v1/health/evidence` — cursor-bound rule/evidence detail. Существующий timeline contract не меняется. `scope=instance|database`; database выбирается opaque episode ID. | Detail и history с одинаковым `evaluation_id` совпадают; per-database isolation; instance-only evidence не размножается по базам; cursor связывает source, scope, policy, fact set, filters и redaction revision. | B |
 
 Instance score не усредняет базы. Для database-scoped factor сначала строится
 penalty каждой покрытой базы, затем instance category берёт worst penalty и
@@ -1180,9 +1143,9 @@ completeness и времени; среднее не скрывает корот�
 
 ### 5.2. Query A/B по двум сохранённым окнам
 
-| Current coverage | Confirmed gap | Target contract | Acceptance | Order |
-| --- | --- | --- | --- | --- |
-| `pg_stat_statements`, plan facts, buffers/temp/WAL counters и typed diff существуют. | Нет двухоконного domain API, matching, общего coverage и UI. | `GET /v1/compare/queries` принимает один source, database episode и окна A/B. Обе стороны вычисляются только из stored facts через typed diff; query/plan text загружается отдельным detail. | Все `Value/Reset/Gap/FirstPoint/Anomaly/NotCollected`; stable match/sort/cursor; plan absent; top-N partial; privacy/redaction; resource benchmark двух максимальных окон. | E |
+| Осталось | Target contract | Acceptance | Order |
+| --- | --- | --- | --- |
+| Добавить двухоконный domain API, continuity-aware matching, общее coverage и UI поверх stored statements/plans/diff. | `GET /v1/compare/queries` принимает один source, database episode и окна A/B. Обе стороны вычисляются только из stored facts через typed diff; query/plan text загружается отдельным detail. | Все `Value/Reset/Gap/FirstPoint/Anomaly/NotCollected`; stable match/sort/cursor; plan absent; top-N partial; privacy/redaction; resource benchmark двух максимальных окон. | E |
 
 Основная identity: поддерживаемые поля соответствующего
 `pg_stat_statements` contract — database, role, query ID и `toplevel`.
@@ -1237,9 +1200,9 @@ canonical entity ID. Comparison не утверждает причинность
 
 ### 5.3. `pg_settings` compare
 
-| Current coverage | Confirmed gap | Target contract | Acceptance | Order |
-| --- | --- | --- | --- | --- |
-| `1_019` сохраняет last-known settings в каждом сегменте. | Нет выбора двух moments и объяснения границ materialization. | `GET /v1/compare/settings` выбирает ближайшие допустимые сохранённые снимки не позже A/B, возвращает requested/sample time, value/unit/source/pending restart и `added|removed|changed|unchanged`. | Segment boundary, absent old setting, extension setting, pending restart, partial segment, stable pagination и отсутствие server-side prose. | E |
+| Осталось | Target contract | Acceptance | Order |
+| --- | --- | --- | --- |
+| Добавить выбор двух moments и typed объяснение границ materialization поверх last-known settings. | `GET /v1/compare/settings` выбирает ближайшие допустимые сохранённые снимки не позже A/B, возвращает requested/sample time, value/unit/source/pending restart и `added|removed|changed|unchanged`. | Segment boundary, absent old setting, extension setting, pending restart, partial segment, stable pagination и отсутствие server-side prose. | E |
 
 Сравнение не читает live `pg_settings`. Если last-known snapshot нельзя
 доказать в пределах выбранного fact set, сторона unavailable. File path
@@ -1247,9 +1210,9 @@ canonical entity ID. Comparison не утверждает причинность
 
 ### 5.4. Исторические schema problems
 
-| Current coverage | Confirmed gap | Target contract | Acceptance | Order |
-| --- | --- | --- | --- | --- |
-| Исторические operational index/table rows частичны. | Нет полного catalog snapshot, finding episode и structural fingerprint. | После tranche C UI показывает появление, изменение, исчезновение и uncertain gap для invalid indexes, unvalidated constraints, FK/index advisories. Finding ID включает rule revision и object episodes. | Rename/rewrite/drop-recreate, major upgrade, partial database, finding open/close/reopen, stable URL и evidence drilldown. | C API после catalog facts |
+| Осталось | Target contract | Acceptance | Order |
+| --- | --- | --- | --- |
+| Добавить полный catalog snapshot, finding episodes и structural fingerprints. | После tranche C UI показывает появление, изменение, исчезновение и uncertain gap для invalid indexes, unvalidated constraints, FK/index advisories. Finding ID включает rule revision и object episodes. | Rename/rewrite/drop-recreate, major upgrade, partial database, finding open/close/reopen, stable URL и evidence drilldown. | C API после catalog facts |
 
 История не ретроспективно применяет новую rule revision к старым findings без
 явного recompute marker. «Не найдено» при partial coverage не закрывает
@@ -1257,9 +1220,9 @@ episode.
 
 ### 5.5. URL, timezone и investigation context
 
-| Current coverage | Confirmed gap | Target contract | Acceptance | Order |
-| --- | --- | --- | --- | --- |
-| API использует UTC microseconds; полноценного frontend нет. | Нет complete URL state, общей timezone и воспроизводимого context export. | URL хранит source, database/scope, A/B ranges, active view/tab, category/rule/entity, filters, sort, page/cursor, zoom, locale и один `tz` — каноническое IANA name. Sensitive literal search хранится только в local fragment; wire timestamps остаются UTC. | Property tests URL encode/decode, reload, back/forward, fragment roundtrip, invalid IANA fallback, DST boundary и EN/RU parity. | B, расширение в E |
+| Осталось | Target contract | Acceptance | Order |
+| --- | --- | --- | --- |
+| Добавить production URL state, одну IANA timezone и воспроизводимый sanitized context export. | URL хранит source, database/scope, A/B ranges, active view/tab, category/rule/entity, filters, sort, page/cursor, zoom, locale и один `tz` — каноническое IANA name. Sensitive literal search хранится только в local fragment; wire timestamps остаются UTC. | Property tests URL encode/decode, reload, back/forward, fragment roundtrip, invalid IANA fallback, DST boundary и EN/RU parity. | B, расширение в E |
 
 В приложении одновременно действует ровно одна IANA timezone. Компонент не
 может иметь скрытый локальный timezone override. Абсолютные timestamps,
@@ -1276,9 +1239,9 @@ HTTP-серверу; действие copy/share по умолчанию уда�
 
 ### 5.6. OpenAPI-generated frontend
 
-| Current coverage | Confirmed gap | Target contract | Acceptance | Order |
-| --- | --- | --- | --- | --- |
-| `bins/pg_kronika-web/openapi.json` проверяется против Rust registries; production frontend client/models отсутствуют. | Ручное дублирование wire types быстро рассинхронизирует enums/reasons. | Client и models генерируются только из committed OpenAPI. Product view models могут оборачивать generated types, но не повторяют wire enums вручную. | Clean generation diff, OpenAPI↔Rust registry tests, exhaustive category/rule/reason handling и CI failure при stale generated files. | B |
+| Осталось | Target contract | Acceptance | Order |
+| --- | --- | --- | --- |
+| Создать production frontend и generated client/models; существующий committed OpenAPI является только prerequisite. | Client и models генерируются только из committed OpenAPI. Product view models могут оборачивать generated types, но не повторяют wire enums вручную. | Clean generation diff, OpenAPI↔Rust registry tests, exhaustive category/rule/reason handling и CI failure при stale generated files. | B |
 
 API следует действующему контракту
 `docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md`:
@@ -1288,9 +1251,9 @@ Frontend содержит полные EN/RU catalogs по stable IDs.
 
 ### 5.7. Log search
 
-| Current coverage | Confirmed gap | Target contract | Acceptance | Order |
-| --- | --- | --- | --- | --- |
-| Typed events, source status, gap facts и timeline events сохраняются. | Нет search/histogram/facets/dedup/cursor и количественного scan contract. | `POST /v1/logs/search` работает только по stored facts. Bounded text в JSON body плюс allowlisted typed include/exclude facets; regex отсутствует. Histogram и rows закреплены на одном `fact_set_id`. | Histogram/rows consistency, zoom, include/exclude, identity dedup, cursor binding, gap/partial/scanned, redaction и worst-range benchmark. | E |
+| Осталось | Target contract | Acceptance | Order |
+| --- | --- | --- | --- |
+| Добавить text search, histogram/zoom, facets, event dedup, scan accounting и log-search cursor, связанный с body/facets/redaction. Существующий authenticated timeline cursor переиспользуется как primitive, но не считается готовым search contract. | `POST /v1/logs/search` работает только по stored facts. Bounded text в JSON body плюс allowlisted typed include/exclude facets; regex отсутствует. Histogram и rows закреплены на одном `fact_set_id`. | Histogram/rows consistency, zoom, include/exclude, identity dedup, cursor binding, gap/partial/scanned, redaction и worst-range benchmark. | E |
 
 Response shape:
 
@@ -1355,13 +1318,13 @@ segments/rows/bytes, gaps и dedup occurrence count.
 
 ### 5.8. Read-only external investigation interface
 
-| Current coverage | Confirmed gap | Target contract | Acceptance | Order |
-| --- | --- | --- | --- | --- |
-| Machine HTTP API и Basic Auth существуют. | Нет устойчивого внешнего investigation contract и отдельного RBAC. | Поздний read-only MCP либо эквивалентный интерфейс вызывает те же bounded application services, возвращает stable IDs, typed provenance/coverage и никогда не выполняет write/remediation methods. | RBAC deny-by-default, source/database isolation, audit, redaction, cursor/budget parity с HTTP, prompt/input text не становится SQL. | F |
+| Осталось | Target contract | Acceptance | Order |
+| --- | --- | --- | --- |
+| Добавить scoped deny-by-default RBAC, source/database isolation, audit и покрытие будущих Health/compare/log services. Новый transport не обязателен. | Существующий read-only HTTP либо отдельный adapter вызывает те же bounded application services, возвращает stable IDs, typed provenance/coverage и никогда не выполняет write/remediation methods. | RBAC deny-by-default, source/database isolation, audit, redaction и cursor/budget parity. | F |
 
-Интерфейс появляется только после стабилизации Health/compare/log APIs. Он не
-получает прямой доступ к live PostgreSQL, filesystem или внутренним reader
-типам и не обходит application admission.
+Расширение внешнего доступа выполняется только после стабилизации
+Health/compare/log APIs. Оно не получает прямой доступ к live PostgreSQL,
+filesystem или внутренним reader типам и не обходит application admission.
 
 ## 6. Stable IDs, reasons и i18n
 
@@ -1375,10 +1338,12 @@ Additive contract получает `score_contract="health_score_v1"`, но не
 `registry_contract_version`, `fact_set_id` и `evaluation_id` остаются
 раздельными осями.
 
-`factor_set_id`, `fact_set_id`, `evaluation_id`, `evidence_id`,
-`finding_id`, query/object/database episode IDs имеют действующую форму
-`B64UrlSha256`: 43 символа unpadded base64url. К ним не добавляются текстовые
-prefix. Cursor использует отдельный versioned authenticated
+В target response schema `factor_set_id`, `fact_set_id`, `evaluation_id`,
+`evidence_id`, `finding_id`, query/object/database episode IDs получают форму
+`B64UrlSha256`: 43 символа unpadded base64url. Первый machine-contract PR
+исправляет несовпадение текущего 22-символьного runtime `FactorSetId` с этим
+OpenAPI contract. К IDs не добавляются текстовые prefix. Cursor использует
+отдельный versioned authenticated
 `OpaqueCursorV1`, base64url длиной `64..1024`; он не является durable ID.
 Registry IDs (`rule_id`, `input_id`, `policy_id`) ограничены 96 ASCII
 символами и pattern
@@ -1740,32 +1705,32 @@ exact head. Нельзя утверждать production bound только по
 
 ### 8.2. Traceability matrix
 
-| ID | Current coverage | Confirmed gap | Target contract | Acceptance | Order |
+| ID | Статус main | Остаток | Target contract | Acceptance | Order |
 | --- | --- | --- | --- | --- | --- |
-| `HS-001` kernel | Existing strict health/factor engine; numeric event line `null` | Другая формула и шкала | Additive 0–100, восемь weights, max rule penalty, fixed-point | Unit/property formula suite | A |
-| `HS-002` availability | Factor coverage types существуют | Не все sources имеют persisted completeness | weight=0 для unavailable/N/A, redistribution, typed reason, completeness | All state combinations, no false zero | A + C coverage |
-| `HS-003` ceiling | Trusted floors существуют, текущий floor делает score 0 | Нет требуемых catastrophic rules/ceiling 30 | Шесть initial rules, fact/policy provenance, separate findings | Golden critical fixtures, null-score case | A; sequence rule activates in C |
-| `HS-004` history | Bounded timeline route | Нет category/per-db/drilldown | Score/category history, per-db, evidence refs | Point/detail identity, database isolation | B |
-| `DATA-001` diff | Typed diff/reset/gates | Не все factors подключены к canonical path | Только window diff для cumulative inputs | Reset/gap/first/not-collected matrix | A |
-| `DATA-002` coverage | `1_023`, `1_038`, pool logs | Неравномерное persisted coverage | Universal attempt/population/database markers | Empty/full/partial/failure BDD | C foundation |
-| `DATA-003` autovacuum | Table stats, settings, partial freeze reloptions | Нет exact effective eligibility/backlog/off inventory | PG15–18 reloption-aware vacuum/analyze contracts | Major BDD и exact formula golden | C |
-| `DATA-004` sequence | Нет source | Нет exhaustion/identity/permission facts | Direction/cache/cycle/ownership/type bounds | Arithmetic property + PG15–18 BDD | C |
-| `DATA-005` horizon | Bounded `1_031` | Нет total/tail и полного drilldown | Расширенная coverage существующей model | DB/table/TOAST/pool BDD | C |
-| `DATA-006` worst tables | `1_013` six-axis top-N | Нет guaranteed dead/HOT/newpage worst | Complete-or-partial boundary population, typed interval diff и deterministic axes | Outside-old-axis/reset/zero-denominator fixtures | C |
-| `DATA-007` schema | Operational index flags | Нет full structural catalog/history | Index/FK/constraint fingerprints и episodes | Structural golden + major BDD | C |
-| `DATA-008` progress | Vacuum progress | Нет index/analyze/cluster/basebackup | Четыре versioned stored sources | Phase/visibility/PID/gap BDD | D |
-| `DATA-009` inspector | Stats/sizes частично | Нет bounded object projection | Stored-first exact-object inspector | Caps, pagination, RBAC, recreate | D |
-| `DATA-010` physical | Нет extension path | Нет bounded physical evidence | Explicit optional `pgstattuple_approx` | Present/absent/privilege/load BDD | D |
-| `UX-001` query A/B | Stored counters/plans/diff | Нет domain compare | Two stored windows, typed operands, plan/buffer evidence | Diff/privacy/cursor/resource suite | E |
-| `UX-002` settings | On-change snapshots | Нет moments compare | Exact stored moments and change enum | Segment/gap/extension fixtures | E |
-| `UX-003` schema history | Нет finding episodes | Нет historical workflow | Open/close/reopen/uncertain findings | Rename/recreate/upgrade fixtures | C API |
-| `UX-004` state | UTC API | Нет complete URL/timezone/context | Full URL state, one IANA timezone, bounded context | Roundtrip/DST/clipboard/accessibility | B/E |
-| `UX-005` client | OpenAPI tests | Нет generated frontend client | Generated client/models only | Generation clean + registry parity | B |
-| `UX-006` logs | Typed stored events | Нет search UX contract | Histogram/zoom/facets/dedup/cursor/partial/scanned | Same fact set, budget and redaction | E |
-| `EXT-001` external | Machine HTTP API | Нет external read-only RBAC interface | Same bounded services, typed provenance, read-only | RBAC/audit/isolation/parity | F |
-| `SAFE-001` bounds | Existing collector/web limits | Нет contracts для новых paths | Rows/bytes/time/work/concurrency everywhere | Resource qualification | all |
-| `SAFE-002` identity | Source/database/object labels | OID reuse/drop-recreate risk | Observation episodes and uncertain gaps | Lifecycle property/BDD | C |
-| `SAFE-003` privacy | Some query/log truncation and neutral Problems | Новые details/exports увеличивают поверхность | Lazy literals, redaction revision, opaque IDs | Leakage/security fixtures | B–F |
+| `HS-001` kernel | Частично | Additive formula, target scale/categories и real extractors | Additive 0–100, восемь weights, max rule penalty, fixed-point | Unit/property formula suite | A |
+| `HS-002` availability | Частично | Category availability, completeness и universal persisted source coverage | weight=0 для unavailable/N/A, redistribution, typed reason, completeness | All state combinations, no false zero | A + C coverage |
+| `HS-003` ceiling | Частично | Шесть catastrophic rules, separate findings и ceiling 30 | Fact/policy provenance и critical ceiling | Golden critical fixtures, null-score case | A; sequence rule activates in C |
+| `HS-004` history | Частично | Новые score/history/per-db/evidence services | Score/category history, per-db, evidence refs | Point/detail identity, database isolation | B |
+| `DATA-001` diff | Частично | Подключить все factors к canonical typed window path | Только window diff для cumulative inputs | Reset/gap/first/not-collected matrix | A |
+| `DATA-002` coverage | Частично | Universal attempt/population/database outcomes | Universal attempt/population/database markers | Empty/full/partial/failure BDD | C foundation |
+| `DATA-003` autovacuum | Частично | Полный effective reloptions/eligibility/backlog/off inventory | PG15–18 reloption-aware vacuum/analyze contracts | Major BDD и exact formula golden | C |
+| `DATA-004` sequence | Будущее | Весь sequence source | Direction/cache/cycle/ownership/type bounds | Arithmetic property + PG15–18 BDD | C |
+| `DATA-005` horizon | Частично | Total/tail, global clamp и полный drilldown | Расширенная coverage существующей model | DB/table/TOAST/pool BDD | C |
+| `DATA-006` worst tables | Частично | Guaranteed dead/HOT/newpage worst axes | Complete-or-partial boundary population, typed interval diff и deterministic axes | Outside-old-axis/reset/zero-denominator fixtures | C |
+| `DATA-007` schema | Частично | Full structural catalog/history и episodes | Index/FK/constraint fingerprints и episodes | Structural golden + major BDD | C |
+| `DATA-008` progress | Частично | Create-index/analyze/cluster/basebackup sources | Четыре versioned stored sources | Phase/visibility/PID/gap BDD | D |
+| `DATA-009` inspector | Частично | Bounded exact-object projection и async refresh | Stored-first exact-object inspector | Caps, pagination, RBAC, recreate | D |
+| `DATA-010` physical | Будущее | Весь optional physical evidence path | Explicit optional `pgstattuple_approx` | Present/absent/privilege/load BDD | D |
+| `UX-001` query A/B | Частично | Arbitrary A/B windows, matching, domain API/cursor/UI | Two stored windows, typed operands, plan/buffer evidence | Diff/privacy/cursor/resource suite | E |
+| `UX-002` settings | Частично | Exact-moment A/B resolver, change states и UI | Exact stored moments and change enum | Segment/gap/extension fixtures | E |
+| `UX-003` schema history | Частично | Structural finding episodes и workflow | Open/close/reopen/uncertain findings | Rename/recreate/upgrade fixtures | C API |
+| `UX-004` state | Частично | Production URL/timezone/context | Full URL state, one IANA timezone, bounded context | Roundtrip/DST/clipboard/accessibility | B/E |
+| `UX-005` client | Будущее | Весь generated frontend client/build | Generated client/models only | Generation clean + registry parity | B |
+| `UX-006` logs | Частично | Search body/facets/histogram/dedup/scanned и search-specific cursor | Histogram/zoom/facets/dedup/cursor/partial/scanned | Same fact set, budget and redaction | E |
+| `EXT-001` external | Частично | Scoped RBAC, audit, isolation и будущие service surfaces | Same bounded services, typed provenance, read-only | RBAC/audit/isolation/parity | F |
+| `SAFE-001` bounds | Частично | Qualification каждого нового source/endpoint | Rows/bytes/time/work/concurrency everywhere | Resource qualification | all |
+| `SAFE-002` identity | Частично | Persisted database/object episodes и lifecycle semantics | Observation episodes and uncertain gaps | Lifecycle property/BDD | C |
+| `SAFE-003` privacy | Частично | Lazy literals, redaction revision, opaque listings/exports | Lazy literals, redaction revision, opaque IDs | Leakage/security fixtures | B–F |
 
 Traceability row считается закрытой только ссылками на implementation commit,
 tests и qualification artifact. Статус документа сам по себе не является
@@ -1779,7 +1744,7 @@ tests и qualification artifact. Статус документа сам по с�
 
 1. `health_score_v1` domain types, policy/rule registry и версия 2;
 2. canonical extractors для существующих inputs и typed coverage adapters;
-3. property/golden tests и internal evaluation artifact.
+3. target formula/ceiling и property/golden qualification.
 
 Gate: формула, redistribution, typed unavailability, source window,
 raw evidence refs, critical ceiling и no-false-zero проходят тесты. API/UI и
@@ -1815,7 +1780,8 @@ commit set и PG15–18 BDD gate. Большой combined collector PR не до
 
 Зависит от catalog identity C. Порядок:
 
-1. progress stored types;
+1. четыре новых progress stored types (create-index, analyze, cluster,
+   basebackup);
 2. stored-first object inspector;
 3. asynchronous bounded refresh;
 4. optional `pgstattuple_approx`.
@@ -1827,15 +1793,18 @@ qualification.
 
 Query A/B и settings compare зависят от typed diff/coverage A–C. Log UX может
 разрабатываться параллельно, но публикуется с теми же cursor/privacy/budget
-правилами. Отдельные PR для compare API, log search API и UI.
+правилами и переиспользует authenticated timeline cursor primitive. Отдельные
+PR для compare API, log search API и UI.
 
 Gate: две stored windows, plan/buffer provenance, all nodata states,
 histogram/rows fact-set identity, partial/scanned, URL roundtrip и privacy.
 
 ### F. External read-only investigation
 
-Зависит от стабильных application services A–E. Отдельный PR вводит RBAC,
-audit и read-only transport; write/remediation tools не входят.
+Зависит от стабильных application services A–E. Отдельный PR вводит scoped
+RBAC, audit и source/database isolation для существующего read-only HTTP.
+Дополнительный transport появляется только при подтверждённой необходимости;
+write/remediation methods не входят.
 
 Каждая tranche оставляет отдельные implementation PR и acceptance gates.
 Исследовательский PR не содержит попытки реализовать production code.
@@ -1910,3 +1879,19 @@ audit и read-only transport; write/remediation tools не входят.
 Version-specific links являются основанием SQL/data contracts. Числовые
 health weights, product thresholds, penalties, caps и UI decisions остаются
 явно versioned политикой PgKronika.
+
+## 12. Реализовано на current main
+
+Baseline ниже объясняет доступные building blocks и не является активной
+траншей. Ни одна строка не закрывает целиком соответствующий target ID.
+
+| ID | Возможность | Production evidence | Test/BDD/docs evidence |
+| --- | --- | --- | --- |
+| `BASE-H01` | Strict factor coverage и health kernel 0–1; event floor; честный numeric `null` при неполном continuous input | `crates/kronika-analytics/src/overview/health.rs`, `crates/kronika-analytics/src/overview/health_line.rs`, `bins/pg_kronika-web/src/overview/health.rs` | unit/property tests в analytics-модулях; `bins/pg_kronika-web/src/tests/overview_timeline.rs` |
+| `BASE-H02` | Bounded `/v1/timeline/health` | `bins/pg_kronika-web/src/lib.rs`, `bins/pg_kronika-web/src/overview/handlers.rs` | `bins/pg_kronika-web/src/tests/overview_timeline.rs`, `bins/pg_kronika-web/openapi.json` |
+| `BASE-H03` | Typed diff: value/reset/gap/first/anomaly/not-collected | `crates/kronika-analytics/src/diff/pair.rs`, `crates/kronika-reader/src/query/diff.rs`, `crates/kronika-reader/src/query/gating.rs` | `bins/pg_kronika-web/src/tests/version_diff.rs`, `bins/pg_kronika-web/src/tests/anomalies.rs` |
+| `BASE-H04` | Частичные collection/snapshot coverage `1_023`/`1_038` | `crates/kronika-registry/src/codec/collection_coverage.rs`, `crates/kronika-registry/src/codec/snapshot_coverage.rs`, `bins/pg_kronika-collector/src/coverage.rs` | `crates/kronika-bdd/features/collection_coverage.feature`, `docs/type-registry/semantics.md` |
+| `BASE-H05` | Table/index stats, bounded freeze horizon и vacuum progress | `crates/kronika-source-pg/src/user_tables.rs`, `crates/kronika-source-pg/src/user_indexes.rs`, `crates/kronika-source-pg/src/incident_gauges.rs`, `crates/kronika-source-pg/src/progress_vacuum.rs`, соответствующие codecs и `bins/pg_kronika-collector/src/{pool_sources.rs,main_sources.rs,buffering.rs}` | `crates/kronika-bdd/features/user_tables.feature`, `crates/kronika-bdd/features/pg_stat_progress_vacuum.feature`, `docs/type-registry/postgresql.md` |
+| `BASE-H06` | Stored statements/plans/settings и generic section diff | `crates/kronika-source-pg/src/statements.rs`, `crates/kronika-source-pg/src/store_plans.rs`, `crates/kronika-source-pg/src/settings.rs`, `bins/pg_kronika-web/src/handlers/v1.rs` | `crates/kronika-bdd/features/pg_stat_statements.feature`, `crates/kronika-bdd/features/pg_store_plans.feature`, `crates/kronika-bdd/features/pg_settings.feature`, `bins/pg_kronika-web/src/tests/version_diff.rs` |
+| `BASE-H07` | Typed logs, fact-set-bound timeline и HMAC-authenticated cursor | `crates/kronika-source-log/src`, `bins/pg_kronika-web/src/overview/cursor.rs`, `bins/pg_kronika-web/src/overview/handlers.rs` | `crates/kronika-bdd/features/pg_log.feature`, `crates/kronika-bdd/features/timeline_overview.feature`, `bins/pg_kronika-web/src/tests/overview_timeline.rs` |
+| `BASE-H08` | GET-only machine API, Basic Auth и действующие collector/web limits | `bins/pg_kronika-web/src/lib.rs`, `bins/pg_kronika-web/src/auth.rs`, `bins/pg_kronika-collector/src/config.rs`, `crates/kronika-source-pg/src/pool.rs` | `bins/pg_kronika-web/src/tests/auth_static.rs`, `bins/pg_kronika-web/src/tests/overview_admission.rs`, tests in `bins/pg_kronika-collector/src/config.rs` |

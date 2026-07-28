@@ -1,49 +1,72 @@
-# Единая программа диагностики PgKronika
+# Оставшиеся работы по диагностике PgKronika
 
 Дата: 2026-07-28. Статус: верхнеуровневая дорожная карта для серии
 implementation PR. Текущее состояние сверено с `origin/main` на
 `0bba2d02901b88792f35b801c2c9cc65bdcf5352`.
 
-## Назначение
+## Что ещё предстоит
 
-Программа развивает один путь данных:
+Работы идут по одному пути данных:
 
 `versioned stored fact → typed coverage/diff → findings и Health Score →
 bounded machine API/UI`.
 
-Health Score остаётся производной проекцией сохранённых фактов. Он не заменяет
-состояние источников, completeness, critical findings, degradations и raw
-evidence. Обычный запрос расследования читает историю и не заполняет пробел
-live-запросом к PostgreSQL.
+Зависимость сильнее номера tier. Внутри одного dependency band сохраняется
+порядок профильной спецификации.
 
-Подробные контракты разделены по одной работе на документ:
+1. **Score foundation (A).** Завершить `HS-001..003`, `DATA-001`,
+   `SAFE-001` и `SAFE-003`: добавить additive score 0–100, восемь категорий,
+   canonical extractors, перераспределение доступных весов, completeness и
+   critical ceiling. Уже работающие strict coverage, typed diff и event floor
+   не реализуются повторно.
+2. **Machine contract (начало B).** Завершить `HS-004`, `UX-004` и
+   `UX-005`: зафиксировать score/detail/history/per-database/evidence
+   services, согласовать runtime IDs с OpenAPI, затем сгенерировать client.
+3. **Universal coverage.** Завершить `DATA-002`: сохранять attempt,
+   population и per-database outcome для каждого используемого PostgreSQL/OS
+   source. Все последующие sources используют этот контракт.
+4. **Health UI (остаток B).** Поставить EN/RU UI, accessibility, stable URL,
+   одну IANA timezone и bounded investigation context. До завершения coverage
+   UI явно показывает partial/unavailable.
+5. **Core facts.** Выполнить оставшиеся T1 gaps в порядке
+   `T1-1 → T1-6 → T1-5 → T1-2 → T1-3 → T1-7 → T1-8 → T1-9`.
+   `T1-4` поставляется в band D вместе с остальными progress sources.
+6. **Catalog foundation (C).** `DATA-003` → единый sequence source
+   `T2-7`/`DATA-004` → `DATA-005` → `DATA-006` → `DATA-007`/`SAFE-002` →
+   finding history `UX-003`. Каждый шаг сохраняет population/tail и
+   observation episodes.
+7. **Progress и object evidence (D).** Единый scope `T1-4`/`DATA-008`,
+   включая COPY → `DATA-009` stored-first inspector → асинхронный bounded
+   refresh → опциональный `DATA-010`.
+8. **Оставшиеся Tier 2 и product actions (E).** Сначала общий inventory
+   расширений `T2-10`, затем зависящие от него extension sources; остальные
+   T2 идут в локальном порядке каталога. Параллельно после готовности typed
+   coverage/identity можно поставлять `UX-001`, `UX-002` и остаток
+   `UX-006`.
+9. **Tier 3.** Поставлять только после inventory расширений, work bounds и
+   production-path fixture. В `T3-3` остаётся только auto_explain-specific
+   parsing и хранение: generic multiline continuation и blob storage уже
+   являются baseline.
+10. **External access (F).** Завершить `EXT-001` поверх стабильных bounded
+    services A–E: scoped RBAC, audit, isolation и parity с HTTP. Новый
+    transport необязателен, если эти свойства обеспечивает существующий
+    read-only HTTP-контракт.
+
+Сводка 50 активных IDs: `implemented=0`, `partial=23`, `future=27`,
+`superseded/rejected=0`. Реализованные prerequisites вынесены в нижний
+baseline и не считаются активными задачами.
+
+Подробные контракты:
 
 - [`2026-07-27-metrics-gap-design.md`](2026-07-27-metrics-gap-design.md)
-  владеет каталогом недостающих линз, их cadence, source semantics и локальным
+  владеет только оставшимися линзами, cadence, source semantics и локальным
   приоритетом T1–T3;
 - [`2026-07-28-health-score-diagnostics-design.md`](2026-07-28-health-score-diagnostics-design.md)
-  владеет формулой и версиями Health Score, общим envelope новых фактов,
-  catalog identity, API/UI, safety и подробной приёмкой A–F.
+  владеет формулой Health Score, envelope новых фактов, catalog identity,
+  API/UI, safety и приёмкой A–F.
 
-Эта дорожная карта владеет только общим порядком, зависимостями, разрешением
-пересечений и definition of done. Формулы, схемы строк и полные матрицы
-приёмки остаются в подробных документах. При расхождении порядка применяется
-эта карта; при расхождении точного контракта применяется профильная
-спецификация и текущий код с тестами.
-
-## Проверенная исходная точка
-
-- В коде уже есть строгий health kernel и event-driven health line, но
-  обязательный continuous factor не покрыт, поэтому текущая линия намеренно
-  возвращает `null`, а не числовую оценку 0–100.
-- `snapshot_coverage`, `collection_coverage`, typed diff и bounded top-N
-  accounting уже существуют, но attempt/population/per-database coverage пока
-  не универсальна.
-- Из progress views сохраняется `pg_stat_progress_vacuum`, включая PG18
-  adapter; остальные перечисленные progress sources ещё не реализованы.
-
-Следовательно, target score, новые линзы и новые API являются планом, а не
-описанием уже работающего поведения.
+Эта карта владеет общим порядком, зависимостями и definition of done. Формулы,
+схемы строк и полные матрицы приёмки остаются в подробных документах.
 
 ## Разрешение пересечений
 
@@ -61,44 +84,6 @@ live-запросом к PostgreSQL.
 Одна реализация закрывает все относящиеся к ней `T*`, `HS-*`, `DATA-*`,
 `UX-*`, `SAFE-*` и `EXT-*` IDs. Один logical source/type поставляется одним
 PR; общая инфраструктура получает отдельный предшествующий PR.
-
-## Единый порядок implementation PR
-
-Зависимость сильнее номера tier. Внутри одного dependency band сохраняется
-порядок профильной спецификации.
-
-1. **Score foundation (A).** Domain types, policy/rule registry,
-   `health_policy_version=2`, kernel и extractors на существующих stored
-   facts; затем property/golden gates. Результат может быть partial, но не
-   выдаёт ложный ноль.
-2. **Machine-contract foundation (начало B).** Score/history/evidence services,
-   stable IDs и Rust/OpenAPI contract. Это фиксирует внешние identities до
-   расширения хранения.
-3. **Universal coverage (`DATA-002`).** Attempt, population и per-database
-   outcomes для empty/full/partial/failure. Все последующие новые sources
-   используют этот фундамент.
-4. **Завершение B.** Per-database drilldown, generated client, EN/RU UI,
-   accessibility, URL/timezone и bounded investigation context. До расширения
-   coverage UI явно показывает partial.
-5. **Tier 1 без catalog-зависимостей.** T1-1 → T1-6 → T1-5 → T1-2 → T1-3 →
-   T1-7 → inode/`relpersistence`/NOTIFY части T1-8 → T1-9. Каждый новый
-   source следует universal coverage; расширения существующих sources не
-   заявляют полноту сверх сохранённого population marker.
-6. **Coverage и catalog sources (остальная C).** Reloption-aware
-   autovacuum/autoanalyze → единый sequence source T2-7/`DATA-004` →
-   horizon/worst-table coverage → structural schema catalog, включая
-   invalid-index scope T1-8 → finding history/API.
-7. **Progress и object evidence (D).** Единый progress scope
-   T1-4/`DATA-008`, включая COPY → stored-first inspector → asynchronous
-   bounded refresh → optional `pgstattuple_approx`.
-8. **Оставшийся Tier 2.** Сохраняется локальный порядок каталога; общая
-   log-parser/redaction инфраструктура предшествует отдельным log-lens PR.
-   Compare и log UX из E могут идти параллельно после готовности их typed
-   coverage, identity, privacy и cursor dependencies.
-9. **Tier 3.** Только после extension inventory, work bounds и нужной
-   production-path test fixture.
-10. **External read-only investigation (F).** Только поверх стабильных
-    bounded application services A–E, с отдельными RBAC и audit.
 
 ## Traceability и definition of done
 
@@ -121,3 +106,15 @@ PR; общая инфраструктура получает отдельный 
 Статус traceability row меняется на `verified` только при наличии всех трёх
 ссылок: implementation, tests и qualification. Слияние документа само по себе
 не закрывает ни один implementation ID.
+
+## Реализовано на current main
+
+Это evidence-backed baseline, а не активный план.
+
+| ID | Возможность | Production evidence | Test/BDD/docs evidence |
+| --- | --- | --- | --- |
+| `BASE-001` | Strict health/factor kernel, event floors и честный `null` при неполном continuous input | `crates/kronika-analytics/src/overview/health.rs`, `crates/kronika-analytics/src/overview/health_line.rs`, `bins/pg_kronika-web/src/overview/health.rs` | unit/property tests в тех же analytics-модулях; `bins/pg_kronika-web/src/tests/overview_timeline.rs` |
+| `BASE-002` | Typed diff с reset/gap/first/not-collected | `crates/kronika-analytics/src/diff/pair.rs`, `crates/kronika-reader/src/query/diff.rs` | `bins/pg_kronika-web/src/tests/version_diff.rs`, `bins/pg_kronika-web/src/tests/anomalies.rs` |
+| `BASE-003` | Частичные collection/snapshot coverage и bounded top-N accounting | `crates/kronika-registry/src/codec/collection_coverage.rs`, `crates/kronika-registry/src/codec/snapshot_coverage.rs`, `bins/pg_kronika-collector/src/coverage.rs` | `crates/kronika-bdd/features/collection_coverage.feature`, `docs/type-registry/semantics.md` |
+| `BASE-004` | Vacuum progress, включая PG18 `delay_time` | `crates/kronika-source-pg/src/progress_vacuum.rs`, `crates/kronika-registry/src/codec/pg_stat_progress_vacuum.rs`, `bins/pg_kronika-collector/src/main_sources.rs` | `crates/kronika-bdd/features/pg_stat_progress_vacuum.feature`, `docs/type-registry/postgresql.md` |
+| `BASE-005` | Bounded GET machine API с Basic Auth и authenticated timeline cursor | `bins/pg_kronika-web/src/lib.rs`, `bins/pg_kronika-web/src/auth.rs`, `bins/pg_kronika-web/src/overview/cursor.rs` | `bins/pg_kronika-web/src/tests/overview_timeline.rs`, `bins/pg_kronika-web/src/tests/overview_admission.rs`, `bins/pg_kronika-web/src/tests/auth_static.rs`, `bins/pg_kronika-web/openapi.json` |
