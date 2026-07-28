@@ -502,7 +502,6 @@ mod tests {
             PartMeta {
                 min_ts,
                 max_ts: min_ts,
-                source_id: 0,
             },
         )
     }
@@ -523,7 +522,7 @@ mod tests {
                 btime: Ts(1),
             })
             .unwrap();
-        buffers.flush(&[], 0).unwrap().unwrap()
+        buffers.flush(&[]).unwrap().unwrap()
     }
 
     fn frame(part: &[u8]) -> Vec<u8> {

@@ -1113,7 +1113,6 @@ mod tests {
             }],
             min_ts: 1,
             max_ts: 2,
-            source_id: 0,
             format_version: FORMAT_VERSION,
             window_count: 1,
         };

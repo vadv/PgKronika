@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
         // sources fail or return no rows must still close an expired segment.
         let age = Duration::from_secs(config.segment_max_age_secs);
         if segment.age_expired(Instant::now(), age) {
-            match seal_open_segment(&mut journal, &writer_owner, &config, &mut segment, "age") {
+            match seal_open_segment(&mut journal, &writer_owner, &mut segment, "age") {
                 Ok(dest) => {
                     sched.mark_segment_opened();
                     announce(&format!("sealed {} reason=age", dest.display()));
@@ -666,7 +666,7 @@ async fn snapshot_and_seal(
             replication_hot,
         });
     }
-    let flushed = encode_window(buffers, &interner, config)?;
+    let flushed = encode_window(buffers, &interner)?;
     let sealed = append_window_and_maybe_seal(
         journal,
         writer_owner,

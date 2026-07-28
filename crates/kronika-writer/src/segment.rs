@@ -134,13 +134,6 @@ pub enum SealError {
     },
     /// Reserving bounded memory for the combined section catalog failed.
     CatalogAllocation(std::collections::TryReserveError),
-    /// Two parts carry different non-zero `source_id`s.
-    SourceIdMismatch {
-        /// The first non-zero source id seen.
-        expected: u64,
-        /// A later, conflicting source id.
-        got: u64,
-    },
     /// A journal part uses a different internal format version.
     UnsupportedFormat {
         /// Version read from the part catalog.
@@ -209,9 +202,6 @@ impl fmt::Display for SealError {
             Self::CatalogAllocation(error) => {
                 write!(f, "reserving the bounded segment catalog failed: {error}")
             }
-            Self::SourceIdMismatch { expected, got } => {
-                write!(f, "journal mixes source_id {expected} and {got}")
-            }
             Self::UnsupportedFormat { version } => {
                 write!(f, "journal part uses unsupported format version {version}")
             }
@@ -252,7 +242,6 @@ impl Error for SealError {
             | Self::ExistingSegmentInvalid
             | Self::ExistingSegmentMismatch
             | Self::CatalogTooLarge { .. }
-            | Self::SourceIdMismatch { .. }
             | Self::UnsupportedFormat { .. }
             | Self::RowCountMismatch { .. }
             | Self::DictionaryConflict { .. }
@@ -475,7 +464,6 @@ struct SegmentPlan {
     by_type: BTreeMap<u32, Vec<SectionDescriptor>>,
     min_ts: i64,
     max_ts: i64,
-    source_id: u64,
     window_count: u32,
 }
 
@@ -562,7 +550,6 @@ fn write_tmp(journal: &Journal, temporary: &mut PgmTemp<'_>) -> Result<SealSumma
         entries,
         min_ts: plan.min_ts,
         max_ts: plan.max_ts,
-        source_id: plan.source_id,
         format_version: FORMAT_VERSION,
         window_count: plan.window_count,
     };
@@ -584,7 +571,6 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
     let mut section_count = 0_usize;
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    let mut source_id = 0_u64;
     let window_count =
         u32::try_from(journal.parts().len()).map_err(|_error| SealError::ArithmeticOverflow {
             what: "window count",
@@ -601,15 +587,6 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
         }
         min_ts = min_ts.min(catalog.min_ts);
         max_ts = max_ts.max(catalog.max_ts);
-        if catalog.source_id != 0 {
-            if source_id != 0 && source_id != catalog.source_id {
-                return Err(SealError::SourceIdMismatch {
-                    expected: source_id,
-                    got: catalog.source_id,
-                });
-            }
-            source_id = catalog.source_id;
-        }
         for entry in catalog.entries {
             section_count = section_count
                 .checked_add(1)
@@ -640,7 +617,6 @@ fn plan_segment(journal: &Journal) -> Result<SegmentPlan, SealError> {
         by_type,
         min_ts,
         max_ts,
-        source_id,
         window_count,
     })
 }
@@ -1104,7 +1080,7 @@ mod tests {
     fn append_window(journal: &mut Journal, ts: i64) {
         let mut buffers = SectionBuffers::new();
         buffers.push(bgwriter(ts)).expect("buffer not full");
-        let part = buffers.flush(&[], 0).expect("encode").expect("a part");
+        let part = buffers.flush(&[]).expect("encode").expect("a part");
         journal
             .append(address().id, &part)
             .expect("append under the segment identity");
@@ -1159,7 +1135,7 @@ mod tests {
                 .push(pg_locks(ts + i64::from(row), first_pid + row))
                 .expect("lock row fits");
         }
-        let part = buffers.flush(&[], 0).expect("encode").expect("a part");
+        let part = buffers.flush(&[]).expect("encode").expect("a part");
         journal
             .append(address().id, &part)
             .expect("append lock window");
@@ -1269,7 +1245,7 @@ mod tests {
             buffers.push(row.clone()).expect("lock row fits");
         }
         let part = buffers
-            .flush(&dictionary, 7)
+            .flush(&dictionary)
             .expect("encode fixture part")
             .expect("fixture part has rows");
         journal
@@ -1360,7 +1336,7 @@ mod tests {
         let mut buffers = SectionBuffers::new();
         buffers.push(bgwriter(1_000)).expect("buffer not full");
         let part = buffers
-            .flush(&dict_sections, 0)
+            .flush(&dict_sections)
             .expect("flush")
             .expect("a part");
         journal.append(address().id, &part).expect("append");
