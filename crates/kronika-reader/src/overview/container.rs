@@ -685,9 +685,10 @@ impl<R: ReadAt> FactFileReader<R> {
         let mut header_bytes = [0_u8; HEADER_LEN];
         reader.read_exact_at(&mut header_bytes, 0)?;
         let (header, directory_crc) = decode_header(&header_bytes)?;
-        validate_api_inputs(&header.identity, bounds)?;
         if let Some(expected) = expected {
             verify_identity(&header.identity, expected)?;
+        } else {
+            validate_api_inputs(&header.identity, bounds)?;
         }
         if header.file_len != file_len {
             return Err(CacheReadError::Corrupt);
@@ -2703,6 +2704,18 @@ mod tests {
         assert!(matches!(
             FactFileReader::inspect(bytes.as_slice(), &LIMIT),
             Err(CacheReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn positional_reader_classifies_a_foreign_descriptor_before_internal_identity() {
+        let mut bytes = valid_file();
+        bytes[64] ^= 1;
+        reseal_header(&mut bytes);
+
+        assert!(matches!(
+            FactFileReader::open(bytes.as_slice(), &identity(), &LIMIT),
+            Err(CacheReadError::WrongSource)
         ));
     }
 
