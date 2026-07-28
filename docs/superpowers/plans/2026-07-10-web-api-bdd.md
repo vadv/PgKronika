@@ -1,5 +1,15 @@
 # PR-B: pg_kronika-web (HTTP /v1/* над ридером) + инкрементальный refresh + BDD-heavy
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** T1-T6 — инкрементальный refresh, production `/v1`,
+  ограничения запросов и in-process collector → reader → HTTP BDD harness.
+- **Осталось:** только T7 — live HTTP BDD для `[from,to]`, порядка sort key,
+  totals `/v1/segments`, двух страниц cursor через границу сегментов без
+  дублей, batch и gaps; representative multi-row coverage для
+  `pg_stat_activity`, обоих layouts `pg_store_plans_vadv`/`pg_store_plans_ossc`
+  и одной OS multi-scope секции.
+
 > REQUIRED SUB-SKILL: superpowers:subagent-driven-development.
 
 **Goal:** тонкий read-only HTTP-слой `pg_kronika-web` (axum) поверх query-слоя из

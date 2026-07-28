@@ -1,5 +1,15 @@
 # pg_stat_user_tables (1_013) Design
 
+**Status: PARTIAL.**
+
+- **Shipped baseline:** V1-V4 collection, six bounded candidate axes,
+  per-database timeout/retry handling, buffering, V3/V4 codec round-trips, and
+  the PostgreSQL 17/V3 live BDD.
+- **Remaining scope:** add explicit V1/V2 encode/decode round-trips; extend
+  live BDD to PostgreSQL 15, 16, and 18 with two-database, type-ID, and
+  dictionary-name assertions; align the obsolete PostgreSQL 14 clause with the
+  supported 15-18 matrix.
+
 ## Purpose
 
 `pg_stat_user_tables` records table-level PostgreSQL statistics per database.

@@ -6,9 +6,20 @@
 
 Дерево базы: `e9b935d13eb0602a81cca1d073a78588e25a432b`
 
-Статус: исследование, рекомендация и критерии будущей реализации
+Исходный статус исследования: рекомендация и критерии будущей реализации
 
 Изменение поведения в этой ветке: отсутствует
+
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** одна sealed section на непустой `type_id`,
+  консолидированные словари, каноническая сортировка, PLAIN/RLE и Zstd-6.
+- **Осталось:** полный per-major producer → restart → section/diff/timeline/
+  anomaly/incident → OVF сценарий; ext4/XFS crash/fsync/strace qualification;
+  natural-corpus gates для размера, RSS и I/O, включая ≤600 000 байт, ≥32×,
+  1 GiB и измерения реального процесса. Checked-in 6,079× synthetic report эти
+  строки не закрывает. Clean-break magic/version, rejection прежней раскладки
+  и external spill pipeline отклонены и не входят в остаток.
 
 Машиночитаемые исходные числа находятся в
 [`pgm-size-reduction-v1.json`](../../qualification/pgm-size-reduction-v1.json).

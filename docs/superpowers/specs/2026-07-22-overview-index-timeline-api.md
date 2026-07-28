@@ -2,7 +2,18 @@
 
 Версия: 0.5
 Дата: 2026-07-25
-Статус: реализованный контракт `parity-v1`, ожидающий итоговой проверки
+Исходный статус документа: реализованный контракт `parity-v1`, ожидающий
+итоговой проверки.
+
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** весь `parity-v1`; все 18 строк приёмки закрыты и
+  связаны с executable evidence.
+- **Осталось:** четыре решения §23 — калиброванные factor
+  curves/profiles/thresholds; deployment limits для disk/RSS/FD/queue/cursor
+  TTL; maintenance/topology для planned shutdown и replication participants;
+  будущие UI rendering/localization. Также нужно согласовать устаревшие
+  flat-child/flat-scan clauses с UTC-раскладкой.
 
 ## 1. Цель и статус решений
 

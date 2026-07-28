@@ -7,6 +7,16 @@
 реализуются одновременно по этой спецификации. Номера revision ниже
 нужны только для будущих независимых расширений блоков, view и метрик.
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** OVF codecs и selective addresses, projection registry,
+  producer, `UiSummary`/`EntitySeries` и summary/heatmap consumers.
+- **Осталось:** cross-segment predecessor/reset/gap/absent handling;
+  multi-input Activity CPU/I/O; per-view decoded-byte/map/≤100-MiB budgets с
+  `resource_limited` вместо отказа всей сборки; обязательная predecessor,
+  churn/end-leader, truth-bound, top-K, all-cap, 96/1 440-segment, size,
+  peak-RSS, read/decompression и ranking-error qualification.
+
 ## Цель
 
 OVF должен закрывать горячие запросы интерфейса на интервале до суток:

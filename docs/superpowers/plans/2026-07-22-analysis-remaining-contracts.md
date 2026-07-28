@@ -1,6 +1,23 @@
 # План закрытия оставшихся аналитических контрактов
 
-Статус: нормативный план реализации.
+Исходный статус документа: нормативный план реализации.
+
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** anomaly completeness/plan evidence и P0 incident
+  observability; все 24 strict `EntityJoin` честно видны как unavailable.
+- **Осталось:** общий typed-identity foundation, bounded relation/mapping
+  admission, request provenance/coverage и positive/negative storage → HTTP
+  tests; шесть adapter-first требований (`PG-TEMP-003`, `PG-VACUUM-005`,
+  `PG-REPL-015`, `PG-SYNC-018`, `OS-BLOCK-024`, `OS-FS-027`);
+  shared-snapshot producer для `PG-WAIT-019`; восемь partial-input mappings
+  (`PG-FREEZE-006`, `PG-IO-011`, `PG-SLOT-016`, `OS-CPU-020`,
+  `OS-CGRP-021`, `OS-MEM-022`, `OS-CGMEM-023`, `OS-IOWHO-026`);
+  producer/schema или narrowing для девяти требований (`PG-ANALYZE-004`,
+  `PG-HOT-007`, `PG-WAL-009`, `PG-CACHE-010`, `PG-HORIZON-013`,
+  `PG-CONN-014`, `PG-ARCH-017`, `OS-WB-025`, `OS-NET-028`); bounded
+  gaps/coverage/completeness в single и batch diff; Overview/Health/Index с
+  browser/BDD либо явное narrowing продукта до shell и API.
 
 ## Назначение и границы
 
