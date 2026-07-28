@@ -1,0 +1,1317 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PgKronika — макет v5 (v4 + выравнивание осей, baseline-курсор)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0a0d12; --bg-deep:#070a13; --panel:#0b1020; --card:#0e1425; --card2:#111a2e;
+  --chip:#162035; --sunken:#0a0f1c;
+  --line-outer:rgba(148,163,184,.16); --line:rgba(148,163,184,.12); --line-row:rgba(148,163,184,.07);
+  --text:#e6ecf3; --text-dim:#a9b6c6; --text-mute:#93a1b3; --text-faint:#8593a6;
+  --accent:#22d3ee; --accent-hi:#67e8f9;
+  --ok:#34d399; --warn:#fbbf24; --crit:#f87171; --down:#38bdf8; --vio:#a78bfa;
+  --mono:'JetBrains Mono',monospace; --ui:'Outfit',sans-serif;
+}
+*{box-sizing:border-box; margin:0; padding:0;}
+html,body{height:100%;}
+body{background:var(--bg); font-family:var(--ui); color:var(--text);}
+::selection{background:rgba(34,211,238,.28);}
+button{font:inherit; color:inherit; background:none; border:none; cursor:pointer; text-align:left;}
+input{font:inherit; color:inherit;}
+:focus-visible{outline:2px solid var(--accent); outline-offset:1px; border-radius:4px;}
+.scrolly{overflow:auto;}
+.scrolly::-webkit-scrollbar{width:9px; height:9px;}
+.scrolly::-webkit-scrollbar-thumb{background:rgba(148,163,184,.18); border-radius:5px;}
+.scrolly::-webkit-scrollbar-track{background:transparent;}
+
+#app{width:100vw; height:100dvh; display:flex; flex-direction:column; position:relative; overflow:hidden;}
+
+/* ---------- header ---------- */
+#hdr{display:flex; align-items:center; gap:10px; padding:8px 16px; background:var(--card); border-bottom:1px solid var(--line); flex:none; flex-wrap:wrap;}
+.chip{display:flex; align-items:center; gap:8px; padding:6px 11px; background:var(--chip); border:1px solid rgba(148,163,184,.14); border-radius:8px; min-height:32px;}
+.chip .nm{font:600 13px var(--mono);}
+.chip .lbl{font:500 10.5px var(--ui); color:var(--text-mute);}
+.chip:hover{border-color:rgba(148,163,184,.3);}
+.dhealth{display:flex; align-items:center; gap:7px; padding:6px 11px; border-radius:8px; border:1px solid rgba(251,191,36,.25); background:rgba(251,191,36,.07); min-height:32px;}
+.dhealth.ok{border-color:rgba(52,211,153,.25); background:rgba(52,211,153,.07);}
+.dhealth .sq{width:7px; height:7px; border-radius:2px; flex:none;}
+.dhealth .t{font:600 11.5px var(--ui); color:var(--text);}
+.dhealth .s{font:500 10.5px var(--mono); color:var(--text-mute);}
+.cond{display:flex; align-items:center; gap:6px; padding:6px 10px; border-radius:8px; min-height:32px; border:1px solid var(--line);}
+.cond.crit{border-color:rgba(248,113,113,.3); background:rgba(248,113,113,.09);}
+.cond.warn{border-color:rgba(251,191,36,.28); background:rgba(251,191,36,.08);}
+.cond.ok{border-color:rgba(52,211,153,.25); background:rgba(52,211,153,.07);}
+.cond .n{font:700 12.5px var(--mono);}
+.cond .w{font:600 11px var(--ui); color:var(--text-dim);}
+#hdr-clock{font:500 11.5px var(--mono); color:var(--text-mute); white-space:nowrap;}
+.hdr-btn{display:flex; align-items:center; gap:6px; padding:7px 11px; border:1px solid var(--line-outer); border-radius:8px; color:var(--text-dim); font:600 12px var(--ui); min-height:32px;}
+.hdr-btn:hover{color:var(--text); border-color:rgba(148,163,184,.3);}
+
+/* stale / collector banners */
+#alertbar{display:none; align-items:center; gap:9px; padding:6px 16px; flex:none; font:500 12px var(--ui);}
+#alertbar.on{display:flex;}
+#alertbar.stale{background:rgba(251,191,36,.07); border-bottom:1px solid rgba(251,191,36,.25); color:#f3d389;}
+#alertbar.down{background:rgba(248,113,113,.08); border-bottom:1px solid rgba(248,113,113,.3); color:#f5a3a3;}
+#alertbar .mono{font:600 11px var(--mono);}
+
+/* ---------- spine ---------- */
+#spine{flex:none; background:var(--panel); border-bottom:1px solid var(--line); padding:7px 16px 5px;}
+#spine-top{display:flex; align-items:center; gap:10px; margin-bottom:4px; flex-wrap:wrap;}
+#spine-top .cap{font:600 9.5px var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--text-mute);}
+.tmode{display:flex; align-items:center; gap:8px; padding:4px 10px; border-radius:7px; border:1px solid var(--line-outer); min-height:28px;}
+.tmode .m{font:700 10px var(--mono); letter-spacing:.08em;}
+.tmode.replay .m{color:var(--warn);}
+.tmode.live .m{color:var(--ok);}
+.tmode .t{font:600 11.5px var(--mono); color:var(--text);}
+.zoom{display:flex; border:1px solid var(--line-outer); border-radius:6px; overflow:hidden;}
+.zoom button{padding:4px 10px; font:600 10.5px var(--mono); color:var(--text-mute); border-left:1px solid var(--line-row); min-height:26px;}
+.zoom button:first-child{border-left:none;}
+.zoom button.on{background:var(--chip); color:var(--accent-hi);}
+.ev-hint{font:500 10px var(--mono); color:var(--text-faint);}
+#spine-svg-wrap{position:relative; height:60px; margin-left:158px;}
+#spine svg{display:block; width:100%; height:60px;}
+.spine-gut-label{position:absolute; left:-158px; top:0; width:150px; height:100%; display:flex; align-items:center; justify-content:flex-end; font:600 10px var(--mono); color:var(--text-dim); pointer-events:none;}
+.inc-marker{position:absolute; top:0; transform:translateX(-50%); display:flex; flex-direction:column; align-items:center; gap:2px; padding-top:2px;}
+.inc-marker .tick{width:2px; height:52px; border-radius:1px;}
+.inc-marker .lbl{font:700 9px var(--mono); padding:1px 5px; border-radius:4px; white-space:nowrap;}
+#cursor-line{position:absolute; top:0; bottom:0; width:2px; background:var(--accent); pointer-events:none;}
+#cursor-line::after{content:''; position:absolute; top:-1px; left:-4px; width:10px; height:10px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 3px rgba(34,211,238,.2);}
+#vline{position:absolute; width:1.5px; background:var(--accent); opacity:.55; pointer-events:none; z-index:5; display:none;}
+#baseline-line{position:absolute; top:0; bottom:0; width:0; border-left:2px dashed #a78bfa; pointer-events:none; display:none;}
+#baseline-line::after{content:'B'; position:absolute; top:1px; left:-6px; width:12px; height:12px; border-radius:50%; background:#a78bfa; color:#0d1420; font:700 8px/12px var(--mono); text-align:center;}
+#delta-legend{display:none; align-items:center; gap:6px; font:600 10px var(--mono); color:#a78bfa;}
+#delta-legend button{color:#a78bfa; border:1px solid rgba(167,139,250,.4); border-radius:4px; padding:0 5px; font:600 10px var(--mono);}
+#delta-legend button:hover{color:#fff;}
+
+/* ---------- focus bar ---------- */
+#focusbar{display:none; align-items:center; gap:10px; padding:4px 16px; background:rgba(34,211,238,.06); border-bottom:1px solid rgba(34,211,238,.25); flex:none;}
+#focusbar.on{display:flex;}
+#focusbar .tag{font:700 9px var(--mono); letter-spacing:.12em; color:var(--accent-hi); background:rgba(34,211,238,.14); padding:2px 7px; border-radius:5px;}
+#focusbar .txt{font:500 12px var(--ui); color:var(--text);}
+#focusbar .win{font:600 11px var(--mono); color:var(--text-dim);}
+#focusbar button{margin-left:auto; border:1px solid rgba(34,211,238,.3); color:var(--accent-hi); border-radius:6px; font:600 11px var(--ui); padding:4px 10px;}
+
+/* ---------- tabs ---------- */
+#tabbar{display:flex; align-items:flex-end; padding:0 14px; background:var(--panel); border-bottom:1px solid var(--line); flex:none; overflow-x:auto; scrollbar-width:none;}
+#tabbar::-webkit-scrollbar{display:none;}
+.tgroup{display:flex; align-items:flex-end; flex:none;}
+.tgroup + .tgroup{margin-left:14px; padding-left:14px; border-left:1px solid var(--line-row);}
+.tg-label{font:600 8.5px var(--mono); letter-spacing:.14em; text-transform:uppercase; color:var(--text-faint); padding:0 8px 9px 2px; align-self:flex-end;}
+.tab{display:flex; flex-direction:column; gap:6px; padding:9px 10px 0; min-width:0; flex:none;}
+.tab .r1{display:flex; align-items:center; gap:6px; white-space:nowrap;}
+.tab .code{font:700 12px var(--mono); color:var(--text-mute);}
+.tab .name{font:500 12px var(--ui); color:var(--text-mute);}
+.tab .cnt{font:500 9.5px var(--mono); color:var(--text-faint);}
+.tab.on .code, .tab.on .name{color:var(--text);}
+.tab .bar{height:2px; border-radius:2px 2px 0 0; background:transparent;}
+.tab.on .bar{background:var(--accent);}
+.tab:hover:not(.on) .code{color:var(--text-dim);}
+.tab .dot{width:6px; height:6px; border-radius:50%; flex:none;}
+.tab .fbadge{font:700 9px var(--mono); color:var(--accent-hi); background:rgba(34,211,238,.14); border-radius:4px; padding:0 4px;}
+#tabbar .spacer{flex:1; min-width:12px;}
+#tabmeta{font:600 10.5px var(--mono); color:var(--text-faint); padding-bottom:9px; white-space:nowrap; align-self:flex-end;}
+
+/* ---------- heatmap ---------- */
+#heat{flex:none; background:var(--bg); border-bottom:1px solid var(--line); padding:6px 16px 8px;}
+#heat-head{display:flex; align-items:center; gap:10px;}
+#heat-head .t{font:600 9.5px var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--text-mute);}
+#heat-toggle{font:600 11px var(--ui); color:var(--text-dim); padding:2px 6px; border-radius:5px;}
+#heat-toggle:hover{color:var(--text);}
+.hswitch{display:flex; border:1px solid var(--line-outer); border-radius:6px; overflow:hidden; margin-left:auto;}
+.hswitch button{padding:3px 9px; font:600 10px var(--mono); color:var(--text-mute); border-left:1px solid var(--line-row);}
+.hswitch button:first-child{border-left:none;}
+.hswitch button.on{background:var(--chip); color:var(--accent-hi);}
+#heat-rows{margin-top:5px;}
+#heat.collapsed #heat-rows{display:none;}
+.heat-row{display:flex; align-items:center; gap:8px; height:12px; margin-bottom:3px;}
+.heat-row .id{flex:none; width:150px; text-align:right; font:600 10px var(--mono); color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.heat-row .id:hover{color:var(--accent-hi);}
+.heat-row .id.hot{color:var(--warn);}
+.heat-row .id.sel{color:var(--accent-hi);}
+.heat-cells{flex:1; min-width:0; height:100%; display:flex; gap:1.5px;}
+.heat-cells div{flex:1; border-radius:1px;}
+#heat-axis{position:relative; margin-left:158px; height:13px; display:flex; justify-content:space-between; font:500 9px var(--mono); color:var(--text-faint);}
+#heat-axis .hc{position:absolute; top:0; transform:translateX(-50%); color:var(--accent-hi);}
+
+/* ---------- toolbar ---------- */
+#toolbar{display:flex; align-items:center; gap:10px; padding:7px 16px; background:var(--card); border-bottom:1px solid var(--line); flex:none; flex-wrap:wrap;}
+.presets{display:flex; border:1px solid var(--line-outer); border-radius:7px; overflow:hidden;}
+.presets button{padding:6px 12px; font:600 11.5px var(--ui); color:var(--text-mute); border-left:1px solid var(--line-row);}
+.presets button:first-child{border-left:none;}
+.presets button.on{background:var(--accent); color:#061016;}
+.tchip{display:flex; align-items:center; gap:6px; padding:5px 10px; border-radius:7px; font:600 11px var(--mono); min-height:28px;}
+.tchip.scope{background:rgba(34,211,238,.08); border:1px solid rgba(34,211,238,.24); color:var(--accent-hi);}
+.tchip.scope .from{color:#5f7a86; font-weight:500;}
+.tchip.na{background:var(--sunken); border:1px dashed rgba(148,163,184,.25); color:var(--text-mute); font-family:var(--ui); font-weight:500;}
+#filterbox{display:flex; align-items:center; gap:7px; padding:0 10px; background:var(--sunken); border:1px solid var(--line); border-radius:7px; min-height:28px; min-width:190px;}
+#filterbox input{background:none; border:none; outline:none; font:500 11.5px var(--mono); color:var(--text); width:100%;}
+#filterbox input::placeholder{color:var(--text-faint);}
+#rowcount{font:500 11px var(--mono); color:var(--text-faint); white-space:nowrap;}
+
+/* ---------- body / table ---------- */
+#body{flex:1; min-height:0; display:flex; position:relative;}
+#main{flex:1; min-width:0; display:flex; flex-direction:column;}
+#table-scroll{flex:1; min-height:0; overflow:auto;}
+#table-inner{min-width:100%;}
+.thead, .trow{display:grid; gap:9px; padding-left:16px; padding-right:16px; align-items:center;}
+.thead{position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid rgba(148,163,184,.14); padding-top:9px; padding-bottom:9px; font:600 9.5px var(--mono); letter-spacing:.05em; text-transform:uppercase; color:var(--text-mute);}
+.thead .sorted{color:var(--accent);}
+.trow{padding-top:7px; padding-bottom:7px; border-bottom:1px solid var(--line-row); border-left:2px solid transparent; cursor:pointer;}
+.trow:hover{background:rgba(148,163,184,.04);}
+.trow:focus-visible{outline-offset:-2px;}
+.trow.sel{background:rgba(34,211,238,.08); border-left-color:var(--accent);}
+.trow.rel{background:rgba(34,211,238,.04);}
+.c{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:500 12px var(--mono); color:var(--text-dim);}
+.c.id{font:600 12.5px var(--mono); color:#ccd6e2;}
+.c.r{text-align:right;}
+.c.strong{font-weight:600; color:var(--text);}
+.c.mute{color:var(--text-mute);}
+.c.faint{color:#8090a2;}
+.c.crit{color:var(--crit); font-weight:600;}
+.c.warn{color:var(--warn); font-weight:600;}
+.c.ok{color:var(--ok);}
+.c.accent{color:var(--accent-hi); font-weight:600;}
+.c .verb{color:var(--accent-hi); font-weight:600;}
+.pill{display:inline-block; padding:1px 5px; border-radius:4px;}
+.pill.crit{background:rgba(248,113,113,.13); color:var(--crit); font-weight:600;}
+.pill.warn{background:rgba(251,191,36,.11); color:var(--warn); font-weight:600;}
+.pctcell{display:flex; align-items:center; gap:6px; justify-content:flex-end;}
+.pctcell .tr{width:26px; height:5px; border-radius:3px; background:var(--sunken); overflow:hidden; flex:none;}
+.pctcell .fl{display:block; height:100%; border-radius:3px; background:var(--accent); opacity:.75;}
+.empty-state{padding:44px 20px; text-align:center; color:var(--text-mute); font:500 12.5px/1.6 var(--ui);}
+
+/* ---------- dock ---------- */
+#dock{display:none; width:clamp(400px, 32vw, 560px); flex:none; border-left:1px solid var(--line); background:var(--panel); flex-direction:column; min-height:0;}
+#dock.open{display:flex;}
+#dock-tabs{display:flex; gap:2px; padding:9px 12px 0; border-bottom:1px solid var(--line); flex:none; align-items:center;}
+.dtab{padding:8px 12px; font:600 12.5px var(--ui); color:var(--text-mute); border-bottom:2px solid transparent;}
+.dtab.on{color:var(--text); border-bottom-color:var(--accent);}
+.dtab .n{font:700 10px var(--mono); margin-left:5px;}
+#dock-close{margin-left:auto; font:500 15px var(--mono); color:var(--text-mute); padding:3px 8px;}
+#dock-close:hover{color:var(--text);}
+.status-banner{display:flex; align-items:center; gap:9px; margin:11px 14px 0; padding:9px 12px; border-radius:9px; flex-wrap:wrap;}
+.status-banner .dot{width:8px; height:8px; border-radius:50%; flex:none;}
+.status-banner .lb{font:600 11.5px var(--mono);}
+.status-banner .dq{margin-left:auto; font:500 10px var(--mono); color:var(--text-mute);}
+.dock-sec{padding:12px 14px 4px; flex:none;}
+.dock-h{font:600 9.5px var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--text-mute); margin-bottom:9px;}
+.inc-card{display:flex; align-items:center; gap:10px; width:100%; padding:10px 12px; margin-bottom:6px; background:var(--card); border:1px solid rgba(148,163,184,.1); border-left:2px solid var(--sev); border-radius:9px; min-height:44px;}
+.inc-card.on{background:rgba(34,211,238,.07); border-color:rgba(34,211,238,.25); border-left-color:var(--sev);}
+.inc-card .ttl{font:600 13px var(--ui); color:#c8d2de; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.inc-card.on .ttl{color:var(--text);}
+.inc-card .meta{display:flex; gap:8px; margin-top:3px; font:500 10px var(--mono); color:var(--text-mute);}
+.inc-card .chev{font:600 15px var(--mono); color:#3a4658; flex:none;}
+.inc-card.on .chev{color:var(--accent);}
+
+/* findings: evidence-группа, рёбра только с provenance */
+.flist{padding-left:2px;}
+.fcard{padding:12px 13px; background:var(--card); border:1px solid var(--line); border-left:2px solid; border-radius:10px; margin-bottom:2px;}
+.fedge{display:flex; align-items:center; gap:8px; padding:7px 2px 7px 14px;}
+.fedge .ln{width:2px; height:16px; flex:none; margin-left:5px;}
+.fedge.prov .ln{background:var(--accent);}
+.fedge.corr .ln{background:repeating-linear-gradient(180deg, rgba(148,163,184,.5) 0 3px, transparent 3px 6px);}
+.fedge .via{font:600 10px var(--mono); color:var(--accent-hi); background:rgba(34,211,238,.08); border:1px solid rgba(34,211,238,.2); padding:2px 8px; border-radius:5px;}
+.fedge .no{font:500 10px var(--mono); color:var(--text-mute); border:1px dashed rgba(148,163,184,.25); padding:2px 8px; border-radius:5px;}
+.role{padding:2px 7px; border-radius:5px; font:700 9px var(--mono); letter-spacing:.06em; text-transform:uppercase;}
+.fcard .lens{font:600 10px var(--mono); color:var(--text-mute);}
+.fcard .ft{font:600 13.5px var(--ui); color:var(--text); margin:9px 0 2px;}
+.fcard .slug{font:500 10px var(--mono); color:var(--text-faint); margin-bottom:11px;}
+.conf-row{display:flex; align-items:center; justify-content:space-between; margin-bottom:5px;}
+.conf-row .k{font:600 9px var(--mono); letter-spacing:.06em; text-transform:uppercase; color:var(--text-mute);}
+.conf-row .v{font:600 10px var(--mono);}
+.conf-track{position:relative; height:7px; border-radius:4px; background:var(--sunken); border:1px solid rgba(148,163,184,.1); overflow:hidden;}
+.scopechips{display:flex; align-items:center; gap:5px; flex-wrap:wrap; margin-top:11px;}
+.schip{padding:3px 8px; border-radius:5px; font:500 10px var(--mono); background:var(--sunken); border:1px solid rgba(148,163,184,.14); color:#b3bfd0;}
+.schip.col{background:rgba(34,211,238,.08); border-color:rgba(34,211,238,.2); color:var(--accent-hi); font-weight:600;}
+.schip.jump{background:none; border:none; color:var(--accent); font:600 11.5px var(--mono); padding:3px 6px;}
+.evi{display:flex; align-items:center; gap:6px; margin-top:9px; flex-wrap:wrap;}
+.evi .k{font:600 9px var(--mono); text-transform:uppercase; letter-spacing:.06em; color:var(--text-faint);}
+.evi span.e{padding:2px 7px; border-radius:5px; background:var(--sunken); border:1px solid var(--line); font:500 9.5px var(--mono); color:var(--text-dim);}
+.capnote{margin-top:10px; padding-top:9px; border-top:1px solid rgba(148,163,184,.08); font:400 11px/1.5 var(--ui); color:var(--text-mute);}
+.coinc{margin-top:12px; padding:12px 13px; border:1px dashed rgba(148,163,184,.22); border-radius:10px; background:rgba(148,163,184,.02);}
+.lensrow{display:flex; align-items:center; gap:8px; padding:7px 9px; background:var(--sunken); border:1px dashed rgba(148,163,184,.18); border-radius:7px; margin-bottom:5px;}
+.kv{display:grid; grid-template-columns:130px 1fr; gap:6px 12px; padding:2px 0;}
+.kv .k{font:500 10.5px var(--mono); color:var(--text-faint); text-align:right;}
+.kv .v{font:500 11.5px var(--mono); color:var(--text-dim); overflow:hidden; text-overflow:ellipsis;}
+.sqlbox{margin-top:10px; padding:10px 12px; background:var(--sunken); border:1px solid var(--line); border-radius:8px; font:500 11px/1.6 var(--mono); color:var(--text-dim); white-space:pre-wrap;}
+.drillbtns{display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;}
+.drillbtns button{padding:5px 11px; border-radius:6px; background:rgba(34,211,238,.08); border:1px solid rgba(34,211,238,.2); font:600 11px var(--ui); color:var(--accent-hi);}
+.danger{padding:5px 11px; border-radius:6px; background:rgba(248,113,113,.08); border:1px solid rgba(248,113,113,.3); font:600 11px var(--ui); color:var(--crit);}
+.danger-note{font:400 10px/1.5 var(--ui); color:var(--text-mute); margin-top:6px;}
+
+/* ---------- hints ---------- */
+#hints{flex:none; display:flex; align-items:center; gap:16px; padding:6px 16px; background:var(--card); border-top:1px solid var(--line); flex-wrap:wrap;}
+.hk{display:flex; align-items:center; gap:6px; font:500 11px var(--ui); color:var(--text-mute);}
+.hk b{font:600 10px var(--mono); color:var(--text-dim); background:var(--sunken); border:1px solid var(--line); border-radius:4px; padding:1px 5px;}
+#demo-state{margin-left:auto; display:flex; align-items:center; gap:7px; font:500 10.5px var(--ui); color:var(--text-faint);}
+#demo-state select{background:var(--sunken); color:var(--text-dim); border:1px solid var(--line); border-radius:6px; font:600 10.5px var(--ui); padding:3px 7px;}
+
+/* ---------- popovers / menu / notes ---------- */
+.pop{position:absolute; z-index:30; background:var(--card2); border:1px solid var(--line-outer); border-radius:11px; box-shadow:0 14px 40px rgba(0,0,0,.55); padding:14px 16px; display:none;}
+.pop.on{display:block;}
+#dhealth-pop{top:52px; left:230px; width:380px; max-width:calc(100vw - 24px);}
+.dh-row{display:flex; align-items:flex-start; gap:9px; margin-bottom:9px;}
+.dh-row .ic{width:8px; height:8px; border-radius:2px; margin-top:4px; flex:none;}
+.dh-row .tx{flex:1;}
+.dh-row .t1{font:600 11.5px var(--ui); color:var(--text);}
+.dh-row .t2{font:400 10.5px/1.45 var(--ui); color:var(--text-mute); margin-top:2px;}
+#menu{top:52px; right:14px; width:280px; padding:6px;}
+#menu button{display:flex; width:100%; align-items:center; gap:9px; padding:9px 11px; border-radius:7px; font:500 12.5px var(--ui); color:var(--text-dim);}
+#menu button:hover{background:rgba(148,163,184,.06); color:var(--text);}
+#menu .sep{height:1px; background:var(--line-row); margin:5px 8px;}
+#menu .cap{padding:7px 11px 3px; font:600 9px var(--mono); letter-spacing:.1em; text-transform:uppercase; color:var(--text-faint);}
+
+#notes{position:absolute; top:0; right:0; bottom:0; width:min(580px, 94vw); z-index:40; background:var(--panel); border-left:1px solid var(--line-outer); box-shadow:-24px 0 60px rgba(0,0,0,.5); display:none; flex-direction:column;}
+#notes.on{display:flex;}
+#notes .nhead{display:flex; align-items:center; gap:10px; padding:14px 20px; border-bottom:1px solid var(--line);}
+#notes .nbody{flex:1; overflow:auto; padding:18px 22px 30px;}
+.ndec{margin-bottom:16px; padding:14px 16px; background:var(--card); border:1px solid var(--line); border-left:2px solid var(--accent); border-radius:10px;}
+.ndec.acc{border-left-color:var(--ok);}
+.ndec.par{border-left-color:var(--warn);}
+.ndec h4{font:600 13.5px var(--ui); color:var(--text); margin-bottom:6px;}
+.ndec p{font:400 11.5px/1.55 var(--ui); color:var(--text-dim);}
+.ndec p b{color:#ccd6e2;}
+
+/* ---------- responsive ---------- */
+@media (max-width:1280px){
+  #dock{position:absolute; right:0; top:0; bottom:0; z-index:20; box-shadow:-24px 0 50px rgba(0,0,0,.5); width:min(480px, 92vw);}
+  .tab .name{display:none;}
+}
+@media (max-width:960px){
+  .tg-label{display:none;}
+  #tabmeta{display:none;}
+  #hints .hk.opt{display:none;}
+}
+@media (max-width:760px){
+  #tabbar, #heat, #toolbar, #main, #hints{display:none;}
+  #dock{position:static; width:100%; border-left:none; box-shadow:none; display:flex;}
+  #hdr{padding:8px 10px; gap:8px;}
+  #spine{padding:6px 10px 4px;}
+  #spine-svg-wrap{height:44px; margin-left:0;}
+  #spine svg{height:44px;}
+  .spine-gut-label{display:none;}
+  body .triage-note{display:flex;}
+  #vline{display:none !important;}
+}
+.triage-note{display:none; align-items:center; gap:8px; margin:10px 14px 0; padding:10px 12px; border:1px dashed var(--line-outer); border-radius:9px; font:500 11.5px/1.5 var(--ui); color:var(--text-mute);}
+.why{cursor:help; text-decoration:underline dotted rgba(148,163,184,.45); text-underline-offset:3px;}
+#whypop{max-width:340px; font:500 11.5px/1.55 var(--ui); color:var(--text-dim); padding:11px 13px;}
+#toast{position:fixed; left:50%; bottom:26px; transform:translateX(-50%); background:var(--card2); border:1px solid var(--line-outer); color:var(--text); font:600 11.5px var(--ui); padding:8px 14px; border-radius:8px; opacity:0; pointer-events:none; transition:opacity .15s; z-index:60;}
+#toast.on{opacity:1;}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ================= HEADER ================= -->
+  <div id="hdr">
+    <button class="chip" title="Источник данных: один коллектор = один инстанс">
+      <span style="width:7px;height:7px;border-radius:50%;background:var(--ok);"></span>
+      <span class="lbl">инстанс</span>
+      <span class="nm">orders-db</span>
+      <span style="font:500 10px var(--mono); color:var(--text-faint);">▾</span>
+    </button>
+    <button class="chip" id="db-chip-hdr" title="Фильтр по базе: применяется к db-scope вкладкам">
+      <span class="lbl">база</span>
+      <span class="nm">все</span>
+      <span style="font:500 10px var(--mono); color:var(--text-faint);">▾</span>
+    </button>
+    <button class="chip" title="Роль узла и репликация · pg_stat_replication (типы 1_015–1_017)">
+      <span class="lbl">роль</span>
+      <span class="nm" style="color:var(--ok);">primary</span>
+      <span class="lbl">2 реплики · lag 0.4s</span>
+    </button>
+    <button class="dhealth" id="dhealth-chip" title="Качество данных коллектора — не путать с состоянием БД">
+      <span class="sq" id="dh-sq" style="background:var(--warn);"></span>
+      <span class="t">данные</span>
+      <span class="s" id="dh-s">snap 12s · 1 gap</span>
+    </button>
+    <button class="cond crit" id="cond-crit" title="Открыть инциденты">
+      <span class="n" style="color:var(--crit);">1</span><span class="w">critical</span>
+    </button>
+    <button class="cond warn" id="cond-warn" title="Открыть инциденты">
+      <span class="n" style="color:var(--warn);">2</span><span class="w">warning</span>
+    </button>
+    <span style="flex:1;"></span>
+    <span id="hdr-clock"></span>
+    <button class="hdr-btn" id="btn-link" title="Скопировать ссылку на текущее состояние: время, окно, вкладка, инцидент">⧉ ссылка</button>
+    <button class="hdr-btn" id="btn-menu" aria-haspopup="true">⋯</button>
+    <button class="hdr-btn" id="btn-notes" style="border-color:rgba(167,139,250,.35); color:var(--vio);" title="Панель дизайн-решений — артефакт макета, в продукт не входит">◈ Решения</button>
+  </div>
+
+  <!-- ================= ALERT BAR (stale / collector down) ================= -->
+  <div id="alertbar" role="alert"></div>
+
+  <!-- ================= SPINE ================= -->
+  <div id="spine">
+    <div id="spine-top">
+      <span class="cap">Запись · ср 02 июл</span>
+      <button class="tmode replay" id="mode-btn" title="Единый контрол режима времени: live-лента или воспроизведение записи">
+        <span class="m" id="mode-m">REPLAY</span>
+        <span class="t" id="mode-t">03:46:12 MSK</span>
+      </button>
+      <div class="zoom" id="zoom" role="group" aria-label="Длина окна">
+        <button data-span="900">15м</button><button data-span="3600" class="on">1ч</button><button data-span="21600">6ч</button><button data-span="86400">24ч</button>
+      </div>
+      <button class="ev-hint" id="psi-chip" title="PSI /proc/pressure/io · some=34% за 10s: доля времени, когда хотя бы одна задача ждала I/O. Лучший единичный сигнал «виноват ли хост». Клик → вкладка prc" style="color:var(--warn); padding:2px 6px;">psi io some 34%</button>
+      <span id="spine-clock" style="font:600 11.5px var(--mono); color:var(--text-dim);"></span>
+      <span style="flex:1;"></span>
+      <button class="ev-hint" id="ev-legend" title="Легенда событий и их источники — клик" style="padding:2px 6px;">▲ ● ⚑ ◆ события</button>
+    </div>
+    <div id="spine-svg-wrap">
+      <span class="spine-gut-label">нагрузка · load=nproc · 16 vCPU</span>
+      <svg id="spine-svg" viewBox="0 0 1440 64" preserveAspectRatio="none" role="img" aria-label="Лента записи за сутки: нагрузка, события, инциденты"></svg>
+      <div id="inc-markers"></div>
+      <div id="cursor-line"></div>
+      <div id="baseline-line"></div>
+    </div>
+  </div>
+  <div id="vline"></div>
+
+  <!-- ================= FOCUS BAR ================= -->
+  <div id="focusbar" aria-live="polite">
+    <span class="tag">ФОКУС</span>
+    <span class="txt" id="focus-title"></span>
+    <span class="win" id="focus-win"></span>
+    <span class="win" id="focus-scope" style="color:var(--accent-hi);"></span>
+    <button id="focus-exit">✕ выйти (Esc)</button>
+  </div>
+
+  <!-- ================= TAB BAR ================= -->
+  <div id="tabbar" role="tablist"></div>
+
+  <!-- ================= HEATMAP ================= -->
+  <div id="heat">
+    <div id="heat-head">
+      <button id="heat-toggle" aria-expanded="true">▾ активность сущностей</button>
+      <span class="t">· ось общая с лентой записи</span>
+      <span id="delta-legend">Δ к <b id="delta-t"></b> · зелёный ниже baseline, красный выше <button id="delta-clear" title="Снять baseline-курсор">✕</button></span>
+      <div class="hswitch" id="hswitch" role="group" aria-label="Метрика heatmap"></div>
+    </div>
+    <div id="heat-rows"></div>
+  </div>
+
+  <!-- ================= TOOLBAR ================= -->
+  <div id="toolbar">
+    <div class="presets" id="presets" role="group" aria-label="Пресеты колонок"></div>
+    <span class="tchip scope" id="scope-chip" style="display:none;">◂ <span id="scope-txt"></span> <span class="from">из инцидента</span></span>
+    <span class="tchip na" id="dbscope-chip" style="display:none;"></span>
+    <div id="filterbox">
+      <span style="color:var(--text-faint); font:500 11px var(--mono);">⚲</span>
+      <input type="text" placeholder="filter… glob, col=value" aria-label="Фильтр строк">
+    </div>
+    <span style="flex:1;"></span>
+    <button class="hdr-btn" style="padding:5px 10px; font:500 11px var(--mono); min-height:28px;">⌗ columns</button>
+    <span id="rowcount"></span>
+  </div>
+
+  <!-- ================= BODY ================= -->
+  <div id="body">
+    <div id="main">
+      <div class="scrolly" id="table-scroll">
+        <div id="table-inner"><div id="table" role="table" aria-label="Данные вкладки"></div></div>
+      </div>
+    </div>
+
+    <!-- ================= DOCK ================= -->
+    <div id="dock">
+      <div id="dock-tabs">
+        <button class="dtab on" data-dock="incident">Инциденты</button>
+        <button class="dtab" data-dock="row">Строка</button>
+        <button id="dock-close" aria-label="Закрыть панель">×</button>
+      </div>
+      <div class="triage-note">Мобильный режим — triage: статус, инциденты, findings. <span style="color:var(--accent-hi);">Полное расследование — на desktop →</span></div>
+      <div class="status-banner" id="status-banner"></div>
+      <div class="scrolly" style="flex:1; min-height:0;">
+        <div id="dock-body"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= HINTS ================= -->
+  <div id="hints">
+    <span class="hk"><b>1–9</b> вкладки</span>
+    <span class="hk"><b>← →</b> ±снапшот</span>
+    <span class="hk opt"><b>shift+клик</b> baseline</span>
+    <span class="hk opt"><b>⇧← →</b> ±час</span>
+    <span class="hk opt"><b>space</b> live / пауза</span>
+    <span class="hk"><b>j k</b> строки</span>
+    <span class="hk"><b>enter</b> деталь</span>
+    <span class="hk"><b>esc</b> выход из фокуса</span>
+    <span class="hk opt"><b>?</b> справка</span>
+    <div id="demo-state">
+      демо-состояние
+      <select id="state-sel" aria-label="Демо-состояние данных">
+        <option value="norm">norm · инциденты</option>
+        <option value="calm">calm · проверено, спокойно</option>
+        <option value="stale">stale · данные устарели</option>
+        <option value="down">collector down</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- data health popover -->
+  <div class="pop" id="dhealth-pop" role="dialog" aria-label="Качество данных">
+    <div style="font:600 10px var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--text-mute); margin-bottom:12px;">Качество данных · коллектор</div>
+    <div class="dh-row"><span class="ic" style="background:var(--ok);"></span><div class="tx">
+      <div class="t1">Свежесть: снапшот 12s назад</div>
+      <div class="t2">Интервал сбора 10s · задержка в норме.</div></div></div>
+    <div class="dh-row"><span class="ic" style="background:var(--ok);"></span><div class="tx">
+      <div class="t1">Покрытие: 42 из 45 снапшотов за окно</div>
+      <div class="t2">Полнота влияет на confidence линз.</div></div></div>
+    <div class="dh-row"><span class="ic" style="background:var(--warn);"></span><div class="tx">
+      <div class="t1">Gap 03:21–03:24 · 3 снапшота</div>
+      <div class="t2">Причина: рестарт коллектора (deploy). На ленте — серая полоса.</div></div></div>
+    <div class="dh-row"><span class="ic" style="background:var(--warn);"></span><div class="tx">
+      <div class="t1">2 линзы пропущены</div>
+      <div class="t2">PG-LOCK-012 — нет сэмплинга pg_locks в этом окне · OS-NET-028 — /proc/net недоступен (container).</div></div></div>
+    <div class="dh-row"><span class="ic" style="background:var(--ok);"></span><div class="tx">
+      <div class="t1">Диск: 18.4 / 50 GB · retention 30d</div>
+      <div class="t2">Прогноз: при текущем темпе записи хватит на 41 день.</div></div></div>
+    <div class="dh-row" style="margin-bottom:0;"><span class="ic" style="background:var(--ok);"></span><div class="tx">
+      <div class="t1">Хранилище: сегменты целы, CRC ок</div>
+      <div class="t2">Это качество <b>данных</b>. Состояние БД — отдельно: чипы critical/warning слева.</div></div></div>
+  </div>
+
+  <!-- menu -->
+  <div class="pop" id="menu" role="menu">
+    <div class="cap">Действия</div>
+    <button id="menu-ai" title="Контракт: константы нормализованы, литералы вырезаны; состав — вкладка, окно, findings, топ строк без значений параметров">⧉ Скопировать контекст для AI<span style="margin-left:auto; font:500 9.5px var(--mono); color:var(--text-faint);">без секретов</span></button>
+    <button>◫ Каталог линз<span style="margin-left:auto; font:600 9.5px var(--mono); color:var(--ok);">4 applied</span></button>
+    <button>⛭ Настройки · тема, таймзона</button>
+    <div class="sep"></div>
+    <div class="cap">Экспорт</div>
+    <button>↗ Grafana с этим окном</button>
+    <button>↓ Дамп снапшота (JSON)</button>
+  </div>
+
+  <!-- design notes -->
+  <div id="notes">
+    <div class="nhead">
+      <span style="font:700 15px var(--ui);">Решения v4 · ответ на ревью + история v3</span>
+      <span style="flex:1;"></span>
+      <button style="font:500 15px var(--mono); color:var(--text-mute);" id="notes-close">×</button>
+    </div>
+    <div class="nbody" id="notes-body"></div>
+  </div>
+</div>
+<script>
+/* ============================================================
+   PgKronika UI v3 — fluid shell, честная evidence-модель
+   ============================================================ */
+const $ = (s) => document.querySelector(s);
+const el = (html) => { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; };
+const rng = (s0) => { let s = (s0 * 2654435761) >>> 0 || 1; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; };
+
+const STATE = {
+  tab: 'pgs', dock: 'incident', incident: null, rowSel: null,
+  heatMetric: 'time', span: 3600, cursor: 0.157, live: false,
+  demo: 'norm', heatOpen: window.innerWidth > 1280,
+  baseline: null, preset: {},
+};
+
+/* ============================================================
+   ДАННЫЕ: вкладки (scope: db | host | instance)
+   ============================================================ */
+const TABS = [
+ { key:'pga', group:'Нагрузка', name:'Activity', count:'142', scope:'db', heat:['wait','cpu','io'],
+   cols:[
+     {l:'pid', w:'56px', id:1},{l:'user', w:'76px'},{l:'db', w:'66px'},{l:'application', w:'112px'},
+     {l:'state', w:'92px'},{l:'wait_event', w:'124px'},{l:'query', w:'1fr'},
+     {l:'q_dur', w:'58px', r:1},{l:'tx_dur', w:'58px', r:1},{l:'cpu%', w:'48px', r:1},{l:'trend', w:'60px', r:1}],
+   presets:['Sessions','Waits','Resources','Txn age','Repl'],
+   rows:[
+     [{v:'4821',cls:'id'},'app_rw','orders','order-api',{v:'active',cls:'ok'},{v:'Lock:tuple',cls:'warn',title:'warn: ожидание Lock:tuple > 3s · окно 30s'},{v:'UPDATE',verb:1,tail:' inventory SET qty=qty-$1 WHERE sku=$2'},{v:'4.2s',cls:'warn',title:'q_dur = now()−query_start · warn: > 2s для OLTP-вызова'},{v:'4.2s',title:'tx_dur = now()−xact_start'},{v:'31'},{spark:7,up:1,hot:1}],
+     [{v:'4822',cls:'id'},'app_ro','orders','order-api',{v:'active',cls:'ok'},{v:'IO:DataFileRead',cls:'crit',title:'crit: чтение с диска доминирует 5 снапшотов подряд'},{v:'SELECT',verb:1,tail:' o.* FROM orders WHERE status=$1 AND …'},{v:'2.8s',cls:'warn',title:'q_dur = now()−query_start'},{v:'2.8s',title:'tx_dur = now()−xact_start'},{v:'44'},{spark:9,up:1,hot:1}],
+     [{v:'5177',cls:'id'},'app_ro','orders','report-worker',{v:'active',cls:'ok'},'—',{v:'SELECT',verb:1,tail:' … FROM orders o JOIN order_items …'},{v:'1.9s',title:'q_dur = now()−query_start'},{v:'1.9s',title:'tx_dur = now()−xact_start'},{v:'58'},{spark:5,up:1}],
+     [{v:'5210',cls:'id'},'app_rw','orders','billing',{v:'idle in tx',cls:'warn',title:'warn: idle in transaction > 60s · держит xmin'},'—',{v:'UPDATE',verb:1,tail:' customers SET last_seen=now() …'},{v:'—',cls:'faint',title:'запрос не выполняется — транзакция простаивает'},{v:'6m12s',cls:'crit',title:'crit: tx_dur (xact_start) > 5m · держит xmin — блокирует vacuum и tuple-локи'},{v:'2'},{spark:3}],
+     [{v:'5355',cls:'id'},'postgres','orders','psql',{v:'idle',cls:'mute'},'—','',{v:'—',cls:'faint'},{v:'—',cls:'faint',title:'вне транзакции · возраст сессии 12m (backend_start)'},{v:'0'},{spark:2}],
+     [{v:'5401',cls:'id'},'app_ro','analytics','metabase',{v:'active',cls:'ok'},'CPU',{v:'SELECT',verb:1,tail:' sum(total) FROM payments WHERE created_at>$1'},{v:'880ms',title:'q_dur = now()−query_start'},{v:'880ms',title:'tx_dur = now()−xact_start'},{v:'71'},{spark:6,up:1}],
+     [{v:'5402',cls:'id'},'replicator','—','walreceiver',{v:'—',cls:'mute',title:'backend_type = walreceiver · state в pg_stat_activity = NULL. Статус репликации — в пресете Repl (pg_stat_wal_receiver), а не выдуманный state'},'—','',{v:'—',cls:'faint'},{v:'—',cls:'faint'},{v:'1'},{spark:2}],
+     [{v:'5419',cls:'id'},'autovac','orders','autovacuum',{v:'active',cls:'ok'},'CPU',{v:'VACUUM',verb:1,tail:' ANALYZE public.order_items'},{v:'41s',title:'q_dur = now()−query_start'},{v:'41s',title:'tx_dur = now()−xact_start'},{v:'12'},{spark:4}],
+   ]},
+ { key:'pgs', group:'Нагрузка', name:'Statements', count:'500', scope:'db', heat:['time','calls','io','temp'],
+   cols:[
+     {l:'queryid', w:'62px', id:1},{l:'query', w:'1fr'},{l:'calls', w:'56px', r:1},{l:'total', w:'66px', r:1, sorted:1},
+     {l:'mean', w:'58px', r:1},{l:'rows', w:'56px', r:1},{l:'hit%', w:'52px', r:1},{l:'blks_read', w:'66px', r:1},
+     {l:'temp_w', w:'58px', r:1},{l:'wal_w', w:'58px', r:1},{l:'%time', w:'64px', r:1},{l:'trend', w:'56px', r:1}],
+   presets:['Time','I/O','Temp','WAL'],
+   views:{ 'Time':null, 'I/O':[0,1,2,6,7,10,11], 'Temp':[0,1,2,8,10,11], 'WAL':[0,1,2,9,3,11] },
+   rows:[
+     [{v:'77de',cls:'id',scope:1},{v:'SELECT',verb:1,tail:' … FROM orders o JOIN order_items …'},'840',{v:'28.4s',cls:'warn',title:'warn: total > 5% времени окна · порог пересчитывается от зума (сейчас 1ч)'},{v:'34ms'},{v:'41k',cls:'mute'},{v:'88.2',cls:'warn',title:'warn: hit% < 90 · baseline окна 96.4'},{v:'1.8M',cls:'crit',pill:1,title:'crit: blks_read > 1M/окно · рост ×6 к baseline'},{v:'—',cls:'faint'},{v:'12M',cls:'mute',title:'wal_bytes за окно'},'18%',{spark:3,up:1,hot:1}],
+     [{v:'3f2a',cls:'id'},{v:'UPDATE',verb:1,tail:' inventory SET qty=qty-$1 WHERE sku=$2'},'1.2k',{v:'42.1s',cls:'crit',title:'crit: total > 10% времени окна · порог от зума (сейчас 1ч)'},'35ms',{v:'1.2k',cls:'mute'},{v:'96.4'},'210k',{v:'—',cls:'faint'},{v:'1.9G',cls:'crit',pill:1,title:'crit: wal_w > 1GB/окно · горячая строка inventory'},'26%',{spark:9}],
+     [{v:'a91c',cls:'id',scope:1},{v:'SELECT',verb:1,tail:' o.* FROM orders WHERE status=$1 AND …'},'200',{v:'22.3s',cls:'warn',title:'warn: total > 5% времени окна · порог от зума (сейчас 1ч)'},{v:'111ms',cls:'crit',title:'crit: mean > 100ms · baseline 9.5ms (×11.7) — регрессия плана'},{v:'41k',cls:'mute'},{v:'61.7',cls:'crit',title:'crit: hit% < 70'},{v:'1.7M',cls:'warn',title:'warn: blks_read > 1M/окно'},{v:'—',cls:'faint'},{v:'0',cls:'mute'},'14%',{spark:15,up:1,hot:1}],
+     [{v:'5b90',cls:'id'},{v:'INSERT',verb:1,tail:' INTO orders (…) VALUES ($1,$2,…)'},'8.4k','12.7s','1.5ms',{v:'8.4k',cls:'mute'},'99.1','90k',{v:'—',cls:'faint'},{v:'640M',cls:'warn',title:'warn: wal_w > 500MB/окно'},'8%',{spark:5}],
+     [{v:'c3f1',cls:'id'},{v:'SELECT',verb:1,tail:' * FROM order_items WHERE order_id = ANY($1)'},'3.1k','9.8s','3.2ms',{v:'210k',cls:'mute'},'93.0','820k',{v:'—',cls:'faint'},{v:'0',cls:'mute'},'6%',{spark:6}],
+     [{v:'e07b',cls:'id'},{v:'UPDATE',verb:1,tail:' customers SET last_seen=now() WHERE id=$1'},'22k','7.2s','0.3ms',{v:'22k',cls:'mute'},'99.9','44k',{v:'—',cls:'faint'},{v:'310M',cls:'mute'},'4%',{spark:2}],
+     [{v:'b214',cls:'id'},{v:'SELECT',verb:1,tail:' count(*) FROM sessions WHERE expires > now()'},'5.5k','5.1s','0.9ms',{v:'5.5k',cls:'mute'},'97.2','120k',{v:'—',cls:'faint'},{v:'0',cls:'mute'},'3%',{spark:4}],
+     [{v:'9de1',cls:'id'},{v:'DELETE',verb:1,tail:' FROM sessions WHERE expires < now()'},'120','3.4s','28ms',{v:'88k',cls:'mute'},'84.0','96k',{v:'12M',cls:'warn',title:'warn: temp spill > 10MB/окно · work_mem?'},{v:'88M',cls:'mute'},'2%',{spark:8,up:1}],
+     [{v:'f6a2',cls:'id'},{v:'SELECT',verb:1,tail:' sum(total) FROM payments WHERE created_at > $1'},'410','2.9s','7.1ms',{v:'410',cls:'mute'},'91.5','310k',{v:'48M',cls:'warn',title:'warn: temp spill > 10MB/окно'},{v:'0',cls:'mute'},'2%',{spark:7}],
+     [{v:'2c88',cls:'id'},{v:'SELECT',verb:1,tail:' * FROM inventory WHERE sku = $1'},'61k','2.1s','0.03ms',{v:'61k',cls:'mute'},'99.9','12k',{v:'—',cls:'faint'},{v:'0',cls:'mute'},'1%',{spark:1}],
+   ]},
+ { key:'pgp', group:'Нагрузка', name:'Plans', count:'83', scope:'db', sev:'var(--warn)', heat:['time','calls'],
+   cols:[
+     {l:'planid', w:'62px', id:1},{l:'plan', w:'1fr'},{l:'queryid', w:'62px'},{l:'calls', w:'56px', r:1},
+     {l:'mean', w:'62px', r:1, sorted:1},{l:'rows', w:'56px', r:1},{l:'shared_hit', w:'70px', r:1},{l:'first', w:'56px', r:1},{l:'last', w:'56px', r:1},{l:'trend', w:'56px', r:1}],
+   presets:['Time','I/O','Rows','Regression'],
+   rows:[
+     [{v:'pl-9f',cls:'id',scope:1},{v:'Seq Scan on orders · filter status',cls:'crit',title:'crit: смена плана в 03:46 · mean ×12 к прежнему'},{v:'a91c',cls:'accent'},'140',{v:'118ms',cls:'crit',pill:1,title:'crit: mean > 100ms · baseline 9.5ms'},{v:'41k',cls:'mute'},'1.6M',{v:'03:46',cls:'warn',title:'first_seen 03:46 — рядом деплой ◆ 03:44 на ленте'},'03:47',{spark:11,up:1,hot:1}],
+     [{v:'pl-41',cls:'id'},{v:'Index Scan idx_orders_status',cls:'ok'},{v:'a91c'},'60',{v:'9.5ms',cls:'ok'},{v:'41k',cls:'mute'},'210k','03:40',{v:'03:46',title:'last_seen 03:46 — вытеснен планом pl-9f'},{spark:4}],
+     [{v:'pl-77',cls:'id'},'Nested Loop + Index Scan',{v:'77de',cls:'accent'},'840','34ms',{v:'41k',cls:'mute'},'1.8M','03:40','03:47',{spark:6,up:1}],
+     [{v:'pl-c3',cls:'id'},'Bitmap Heap + Bitmap Index',{v:'c3f1'},'3.1k','3.2ms',{v:'210k',cls:'mute'},'820k','03:40','03:47',{spark:5}],
+     [{v:'pl-5b',cls:'id'},'Insert on orders',{v:'5b90'},'8.4k','1.5ms',{v:'8.4k',cls:'mute'},'90k','03:40','03:47',{spark:2}],
+   ]},
+ { key:'pgt', group:'Данные', name:'Tables', count:'64', scope:'db', heat:['io','writes','dead'],
+   cols:[
+     {l:'relation', w:'190px', id:1},{l:'size', w:'62px', r:1},{l:'seq_scan', w:'66px', r:1},{l:'idx_scan', w:'66px', r:1},
+     {l:'io_hit%', w:'60px', r:1},{l:'dead%', w:'56px', r:1, sorted:1},{l:'mod/anl', w:'62px', r:1},{l:'last_av', w:'62px', r:1},{l:'xid_age', w:'62px', r:1},{l:'trend', w:'56px', r:1}],
+   presets:['Activity','Writes','Maintenance','I/O','Size'],
+   rows:[
+     [{v:'public.orders',cls:'id',scope:1},'4.1G',{v:'1.2k',cls:'warn',title:'warn: seq_scan rate ×8 к baseline'},'84k',{v:'88.1',cls:'warn',title:'warn: io_hit% < 90'},{v:'14.2',cls:'warn',pill:1,title:'warn: dead% > 10 · последний vacuum 03:12'},'2.1M',{v:'03:12',title:'last_autovacuum (ручной VACUUM не запускался)'},{v:'161M',title:'age(relfrozenxid) · порог crit: autovacuum_freeze_max_age = 200M'},{spark:8,up:1,hot:1}],
+     [{v:'public.order_items',cls:'id'},'6.8G','120','210k','94.2',{v:'9.8',cls:'warn',title:'warn: dead% приближается к 10'},'1.4M','02:40',{v:'158M'},{spark:6,up:1}],
+     [{v:'public.inventory',cls:'id'},'310M','40','98k','97.8','2.1','900k','01:05',{v:'92M'},{spark:3}],
+     [{v:'public.sessions',cls:'id'},'1.2G',{v:'5.5k',cls:'warn'},'12k','91.0',{v:'22.4',cls:'crit',pill:1,title:'crit: dead% > 20 · vacuum не успевает'},'4.2M','04:01',{v:'201M',cls:'crit',pill:1,title:'crit: age(relfrozenxid) 201M > autovacuum_freeze_max_age 200M — агрессивный wraparound-vacuum неизбежен'},{spark:12,up:1,hot:1}],
+     [{v:'public.payments',cls:'id'},'2.9G','410','61k','93.3','4.4','410k','05:22',{v:'44M'},{spark:4}],
+     [{v:'public.customers',cls:'id'},'880M','30','44k','99.0','1.2','130k','06:10',{v:'12M'},{spark:2}],
+   ]},
+ { key:'pgi', group:'Данные', name:'Indexes', count:'121', scope:'db', heat:['io','scans'],
+   cols:[
+     {l:'index', w:'200px', id:1},{l:'table', w:'120px'},{l:'size', w:'62px', r:1},{l:'scans', w:'62px', r:1, sorted:1},
+     {l:'io_hit%', w:'60px', r:1},{l:'rows/scan', w:'66px', r:1},{l:'trend', w:'56px', r:1}],
+   presets:['Usage','Unused','Size','I/O'],
+   rows:[
+     [{v:'idx_orders_status',cls:'id',scope:1},'orders','210M',{v:'60',cls:'warn',title:'warn: scans упали ×14 после 03:46 — план сменился на Seq Scan'},'99.2','41k',{spark:13,down:1,hot:1}],
+     [{v:'orders_pkey',cls:'id'},'orders','640M','44k','99.8','1',{spark:3}],
+     [{v:'idx_order_items_oid',cls:'id'},'order_items','1.1G','3.1k','96.1','68',{spark:6,up:1}],
+     [{v:'idx_inventory_sku',cls:'id'},'inventory','42M','61k','99.9','1',{spark:2}],
+     [{v:'idx_sessions_exp',cls:'id'},'sessions','190M','5.6k','94.4','120',{spark:7,up:1}],
+     [{v:'idx_payments_created',cls:'id'},'payments','380M','410','90.2','410',{spark:5}],
+     [{v:'idx_legacy_code',cls:'id'},'customers','96M',{v:'0',cls:'crit',title:'crit: 0 scans за 7 дней · 96MB — кандидат на DROP'},'—','—',{spark:1}],
+   ]},
+ { key:'pgv', group:'Данные', name:'Vacuum', count:'2', scope:'db', heat:['progress'],
+   cols:[
+     {l:'pid', w:'56px', id:1},{l:'table', w:'180px'},{l:'phase', w:'150px'},{l:'progress', w:'1fr'},{l:'%', w:'52px', r:1},
+     {l:'dead_tuples', w:'80px', r:1},{l:'elapsed', w:'62px', r:1}],
+   presets:['Progress','Phase','Dead tuples'],
+   rows:[
+     [{v:'5419',cls:'id'},'public.order_items',{v:'scanning heap',cls:'ok'},{bar:67},{v:'67',cls:'strong'},'184k','41s'],
+     [{v:'—',cls:'faint'},'public.sessions',{v:'queued (autovac)',cls:'warn',title:'derived: вычислено из dead% и очереди воркеров — такой фазы нет в pg_stat_progress_vacuum · dead% 22.4'},{bar:0},{v:'0'},'—','—'],
+   ]},
+ { key:'prc', group:'Сервер', name:'Processes', count:'218', scope:'host', heat:['cpu','io'],
+   cols:[
+     {l:'pid', w:'56px', id:1},{l:'type', w:'120px'},{l:'cpu%', w:'54px', r:1, sorted:1},{l:'rss', w:'56px', r:1},{l:'pss', w:'56px', r:1},
+     {l:'rd_b/s', w:'62px', r:1},{l:'wr_b/s', w:'62px', r:1},{l:'blkdelay', w:'68px', r:1},{l:'query / cmd', w:'1fr'}],
+   presets:['CPU','Memory','Disk I/O','Cgroup','Threads'],
+   rows:[
+     [{v:'4822',cls:'id',scope:1},'backend · app_ro',{v:'44',cls:'warn'},{v:'182M',title:'RSS включает тронутые страницы shared_buffers — суммировать по бэкендам нельзя'},{v:'58M',title:'PSS: shared-страницы поделены между процессами · честная сумма по хосту (smaps_rollup, только top-N)'},{v:'41M',cls:'crit',pill:1,title:'crit: read_bytes (block layer, диск) > 40MB/s · baseline 6MB/s'},'2M',{v:'310ms',cls:'warn',title:'warn: blkdelay > 100ms — ждёт диск · источник delayacct (kernel.task_delayacct=1)'},{v:'SELECT',verb:1,tail:' o.* FROM orders WHERE status=$1 …'}],
+     [{v:'5177',cls:'id'},'backend · app_ro',{v:'58',cls:'warn',title:'warn: cpu > 50% одним бэкендом'},'240M',{v:'74M'},'18M','1M','40ms',{v:'SELECT',verb:1,tail:' … orders o JOIN order_items …'}],
+     [{v:'5419',cls:'id'},'autovacuum worker','12','96M',{v:'31M'},'8M','4M','12ms','vacuum order_items'],
+     [{v:'2331',cls:'id'},'checkpointer','3','44M',{v:'12M'},'—',{v:'22M',title:'ожидаемый писатель: оценивается против своего baseline, а не абсолютного порога'},'—',''],
+     [{v:'2330',cls:'id'},'bgwriter','1','38M',{v:'9M'},'—','6M','—',''],
+     [{v:'9002',cls:'id'},'node_exporter','2','28M',{v:'24M'},'—','—',{v:'—',cls:'faint',title:'/proc/9002/io: EACCES (чужой uid) → NULL, не 0'},''],
+   ]},
+ { key:'pgl', group:'Сервер', name:'Locks', count:'3', scope:'db', sev:'var(--warn)', heat:['wait'],
+   cols:[
+     {l:'tree', w:'30px'},{l:'pid', w:'56px', id:1},{l:'user / app', w:'150px'},{l:'lock', w:'190px'},
+     {l:'target', w:'150px'},{l:'wait / hold', w:'92px', r:1, sorted:1},{l:'query', w:'1fr'}],
+   presets:['Tree','Blockers','Waiters'],
+   rows:[
+     [{v:'▮',cls:'crit'},{v:'5210',cls:'id',scope:1},'app_rw · billing',{v:'RowExclusive · held',cls:'mute'},'inventory (tuple)',{v:'держит 6m12s',cls:'crit',title:'crit: удержание > 5m · блокирует 2 backend — это удержание, не ожидание'},{v:'UPDATE',verb:1,tail:' customers … — idle in tx!',title:'запрос — последний statement транзакции; лок на inventory взят ранее в этой же транзакции'}],
+     [{v:'└',cls:'mute'},{v:'4821',cls:'id',scope:1},'app_rw · order-api',{v:'Lock:tuple',cls:'warn'},'inventory (tuple)',{v:'ждёт 4.2s',cls:'warn'},{v:'UPDATE',verb:1,tail:' inventory SET qty=qty-$1 …'}],
+     [{v:' └',cls:'mute'},{v:'4830',cls:'id'},'app_rw · order-api',{v:'Lock:tuple',cls:'warn'},'inventory (tuple)',{v:'ждёт 2.9s',cls:'warn'},{v:'UPDATE',verb:1,tail:' inventory SET qty=qty-$1 …'}],
+   ]},
+ { key:'pge', group:'Сервер', name:'Events', count:'5', scope:'instance', sev:'var(--crit)', heat:['count'],
+   cols:[
+     {l:'time', w:'66px', id:1},{l:'sev', w:'62px'},{l:'type', w:'124px'},{l:'dur', w:'62px', r:1},{l:'message', w:'1fr'}],
+   presets:['Errors','Checkpoints','Vacuum','Slow'],
+   rows:[
+     [{v:'03:47:05',cls:'id'},{v:'FATAL',cls:'crit',pill:1},'connection',{v:'—'},'remaining connection slots are reserved for non-replication superuser connections'],
+     [{v:'03:46:58',cls:'id'},{v:'ERROR',cls:'crit'},'deadlock',{v:'—'},'deadlock detected · pid 4821 waits for ShareLock on transaction 88412'],
+     [{v:'03:46:12',cls:'id'},{v:'LOG',cls:'mute'},'slow query',{v:'9.8s'},'duration: 9812ms · statement: SELECT o.* FROM orders WHERE status=$1 …'],
+     [{v:'03:45:30',cls:'id'},{v:'LOG',cls:'mute'},'checkpoint',{v:'38s'},'checkpoint complete: wrote 18412 buffers (14.3%) · write 38.1s'],
+     [{v:'03:44:02',cls:'id'},{v:'LOG',cls:'mute'},'autovacuum',{v:'41s'},'automatic vacuum of table "orders.public.order_items"'],
+   ]},
+];
+
+/* ============================================================
+   ДАННЫЕ: инциденты — evidence-группа.
+   link != null только когда есть сохранённый join (provenance).
+   ============================================================ */
+const CONF = { low:{pct:34,c:'#fbbf24'}, medium:{pct:67,c:'#38bdf8'}, high:{pct:100,c:'#34d399'} };
+const SEV = { warning:'#fbbf24', critical:'#f87171', info:'#38bdf8' };
+
+const INCIDENTS = {
+  fatal: { title:'FATAL: лимит подключений', sev:'critical', cat:'PG Errors', time:'03:47', tpos:0.160,
+    window:'03:47:02 → 03:47:09', peak:'03:47:05', members:1, scopeTab:'pge', scopeNote:'событие 03:47:05',
+    findings:[
+      { sev:'critical', conf:'medium', cap:'medium', lens:'PG-CONN-014', slug:'connection_limit',
+        title:'Отказы подключений 53300 сгруппированы', sec:'pge · events', col:'sqlstate', ident:'53300',
+        evi:['grouped_count'], link:null,
+        capNote:'Потолок medium: identity сессии в stderr не сохраняется — видны отказы, но не их источник.' } ],
+    coincident:[] },
+  cache: { title:'Схлопывание кэша на orders', sev:'warning', cat:'PG Queries', time:'03:45–03:48', tpos:0.156,
+    window:'03:45:30 → 03:48:10', peak:'03:46:52', members:3, scopeTab:'pgs', scopeNote:'queryid 77de · a91c',
+    provenanceNote:'Связь сигналов — только совпадение во времени: снапшоты не сохраняют join «запрос → промах кэша → iowait». Направление не установлено.',
+    findings:[
+      { sev:'warning', conf:'medium', cap:'medium', lens:'PG-QRY-001', slug:'slow_query_scan',
+        title:'Тяжёлый скан по orders', sec:'pgs · statements', col:'total_exec_time', ident:'queryid 77de',
+        evi:['mean_ratio','calls_delta'], link:null },
+      { sev:'warning', conf:'medium', cap:'high', lens:'PG-CACHE-010', slug:'cache_miss_ratio',
+        title:'Промахи shared-буферов растут', sec:'pgt · tables', col:'io_hit%', ident:'public.orders',
+        evi:['ratio'], link:null },
+      { sev:'warning', conf:'low', cap:'medium', lens:'OS-DISK-021', slug:'iowait_rise',
+        title:'I/O wait поднялся в том же окне', sec:'prc · processes', col:'blkdelay', ident:'pid 4822',
+        evi:['delta'], link:null,
+        capNote:'Потолок medium: без per-PID I/O вклад БД не отделяется от фоновой нагрузки хоста.' } ],
+    coincident:[
+      { sev:'info', lens:'PG-VAC-019', title:'Autovacuum по order_items в том же окне' } ] },
+  plan: { title:'Регрессия плана a91c', sev:'warning', cat:'PG Plans', time:'03:46–03:47', tpos:0.158,
+    window:'03:46:00 → 03:47:40', peak:'03:46:40', members:2, scopeTab:'pgp', scopeNote:'planid pl-9f',
+    findings:[
+      { sev:'warning', conf:'high', cap:'high', lens:'PG-PLAN-006', slug:'plan_regression',
+        title:'Index Scan → Seq Scan', sec:'pgp · plans', col:'mean_time', ident:'queryid a91c',
+        evi:['plan_switch','time_ratio'],
+        link:{ via:'общий queryid a91c · pg_store_plans ⋈ pg_stat_statements' } },
+      { sev:'warning', conf:'medium', cap:'high', lens:'PG-QRY-001', slug:'query_slowdown',
+        title:'mean вырос 9.5ms → 111ms', sec:'pgs · statements', col:'mean_exec_time', ident:'queryid a91c',
+        evi:['mean_ratio'], link:null } ],
+    coincident:[] },
+};
+const INC_ORDER = ['fatal','cache','plan'];
+
+/* ============================================================
+   HEADER
+   ============================================================ */
+function clockStr(){
+  const totalMin = STATE.cursor * 24 * 60;
+  return String(Math.floor(totalMin/60)).padStart(2,'0') + ':' + String(Math.floor(totalMin%60)).padStart(2,'0') + ':12';
+}
+function renderClock(){
+  $('#mode-t').textContent = clockStr() + ' MSK';
+  $('#hdr-clock').textContent = 'Ср 02 июл · ' + clockStr() + ' MSK';
+  $('#spine-clock').innerHTML = 'окно <b style="color:var(--accent-hi);">03:00–04:00</b>';
+}
+$('#dhealth-chip').onclick = (e) => { e.stopPropagation(); $('#menu').classList.remove('on'); $('#dhealth-pop').classList.toggle('on'); };
+$('#btn-menu').onclick = (e) => { e.stopPropagation(); $('#dhealth-pop').classList.remove('on'); $('#menu').classList.toggle('on'); };
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.pop') && !e.target.closest('#dhealth-chip') && !e.target.closest('#btn-menu'))
+    { $('#dhealth-pop').classList.remove('on'); $('#menu').classList.remove('on'); }
+  if (!e.target.closest('.pop') && !e.target.closest('#ev-legend')){ const ep = $('#evpop'); if (ep) ep.classList.remove('on'); }
+});
+$('#cond-crit').onclick = () => openDockIncident('fatal');
+$('#cond-warn').onclick = () => openDockIncident('cache');
+
+function toast(t){
+  let x = $('#toast');
+  if (!x){ x = el(`<div id="toast"></div>`); document.body.appendChild(x); }
+  x.textContent = t; x.classList.add('on');
+  clearTimeout(x._t); x._t = setTimeout(() => x.classList.remove('on'), 1700);
+}
+function renderHealth(){
+  const sq = $('#dh-sq'), s = $('#dh-s');
+  if (STATE.demo === 'down'){ sq.style.background = 'var(--crit)'; s.textContent = 'нет данных с 03:42'; }
+  else if (STATE.demo === 'stale'){ sq.style.background = 'var(--warn)'; s.textContent = 'snap 4м 12с назад'; }
+  else { sq.style.background = 'var(--warn)'; s.textContent = 'snap 12s · 1 gap'; }
+}
+$('#btn-link').onclick = () => {
+  if (navigator.clipboard) navigator.clipboard.writeText(location.href);
+  toast('ссылка на состояние скопирована');
+};
+$('#psi-chip').onclick = () => { STATE.tab = 'prc'; STATE.rowSel = null; renderAll(); };
+const evPop = el(`<div class="pop" id="evpop" style="width:290px;">
+  <div style="font:600 10px var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--text-mute); margin-bottom:10px;">События на ленте · источник</div>
+  ${[['▲','checkpoint','#fbbf24','лог checkpointer'],['●','deadlock','#f87171','лог ошибок'],['⚑','autovacuum','#34d399','лог autovacuum'],['◆','deploy / аннотация','#a78bfa','POST /v1/annotations']].map(([g,n,c,src]) => `<div style="display:flex; align-items:center; gap:9px; margin-bottom:7px;"><span style="color:${c}; width:14px; text-align:center;">${g}</span><span style="font:600 11.5px var(--ui); color:var(--text);">${n}</span><span style="margin-left:auto; font:500 9.5px var(--mono); color:var(--text-faint);">${src}</span></div>`).join('')}
+</div>`);
+$('#app').appendChild(evPop);
+$('#ev-legend').onclick = (e) => {
+  e.stopPropagation();
+  const r = e.currentTarget.getBoundingClientRect();
+  evPop.style.left = Math.max(12, r.right - 290) + 'px';
+  evPop.style.top = (r.bottom + 8) + 'px';
+  $('#dhealth-pop').classList.remove('on'); $('#menu').classList.remove('on');
+  evPop.classList.toggle('on');
+};
+const whyPop = el(`<div class="pop" id="whypop"></div>`);
+$('#app').appendChild(whyPop);
+document.addEventListener('click', (e) => {
+  const w = e.target.closest('.why');
+  if (w && w.getAttribute('title')){
+    e.stopPropagation(); e.preventDefault();
+    const r = w.getBoundingClientRect();
+    whyPop.textContent = w.getAttribute('title');
+    whyPop.style.left = Math.min(window.innerWidth - 360, Math.max(10, r.left)) + 'px';
+    whyPop.style.top = (r.bottom + 8) + 'px';
+    whyPop.classList.add('on');
+  } else if (!e.target.closest('#whypop')) whyPop.classList.remove('on');
+}, true);
+
+/* ============================================================
+   SPINE
+   ============================================================ */
+(function spine(){
+  const svg = $('#spine-svg'), rr = rng(31), pts = [];
+  for (let i = 0; i <= 96; i++){
+    const x = i / 96;
+    let y = 0.30 + 0.13*Math.sin(x*Math.PI*7) + 0.06*rr();
+    const d = Math.abs(x - 0.157); if (d < 0.045) y += 0.55*(1 - d/0.045);
+    y = Math.max(0.04, Math.min(1, y));
+    pts.push([+(x*1440).toFixed(1), +((1-y)*54+3).toFixed(1)]);
+  }
+  const line = 'M' + pts.map(p => p.join(',')).join(' L');
+  const area = `M0,64 L${pts.map(p => p.join(',')).join(' L')} L1440,64 Z`;
+  const wPct = STATE.span / 86400 * 100, xPct = (4/24*100) - wPct;
+  svg.innerHTML = `
+    <defs><linearGradient id="wg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="rgba(34,211,238,.30)"/><stop offset="1" stop-color="rgba(34,211,238,.03)"/>
+    </linearGradient></defs>
+    ${[0,6,12,18,24].map(h => `<line x1="${h/24*1440}" y1="54" x2="${h/24*1440}" y2="60" stroke="rgba(148,163,184,.3)" stroke-width="1"/><text x="${h/24*1440+4}" y="62" font-family="JetBrains Mono" font-size="7.5" fill="#7b8a9c">${String(h).padStart(2,'0')}:00</text>`).join('')}
+    <rect x="${0.138*1440}" y="0" width="${0.0125*1440}" height="64" fill="rgba(148,163,184,.18)"><title>gap в данных 03:21–03:24 · рестарт коллектора</title></rect>
+    <rect x="${xPct/100*1440}" y="0" width="${wPct/100*1440}" height="64" fill="rgba(34,211,238,.05)" stroke="rgba(34,211,238,.35)" stroke-width="1" rx="3"/>
+    <path d="${area}" fill="url(#wg)"/>
+    <path d="${line}" fill="none" stroke="#67e8f9" stroke-width="1.4" vector-effect="non-scaling-stroke"/>
+    <line x1="0" y1="26" x2="1440" y2="26" stroke="rgba(148,163,184,.22)" stroke-dasharray="3 4" stroke-width="1"/>
+    <text x="${0.18*1440}" y="14" font-size="9" fill="#fbbf24"><title>checkpoint 04:19 · write 38.1s</title>▲</text>
+    <text x="${0.60*1440}" y="20" font-size="8" fill="#34d399"><title>autovacuum order_items · 41s</title>⚑</text>
+    <text x="${0.44*1440}" y="12" font-size="9" fill="#a78bfa"><title>deploy order-api 2.14.0 · внешняя аннотация: POST /v1/annotations из CI</title>◆</text>
+  `;
+  const CL = [];
+  INC_ORDER.forEach(k => {
+    const inc = INCIDENTS[k];
+    const last = CL[CL.length - 1];
+    if (last && Math.abs(inc.tpos - last.tpos) < 0.035) last.items.push(k);
+    else CL.push({ tpos: inc.tpos, items: [k] });
+  });
+  $('#inc-markers').innerHTML = CL.map(cl => {
+    const c = cl.items.length > 1 ? '#f87171' : SEV[INCIDENTS[cl.items[0]].sev];
+    const lbl = cl.items.length > 1 ? `${cl.items.length} инцидента` : (INCIDENTS[cl.items[0]].sev === 'critical' ? 'FATAL' : INCIDENTS[cl.items[0]].time);
+    const ticks = cl.items.map(k => `<span class="tick" style="background:${SEV[INCIDENTS[k].sev]}; opacity:.85; margin:0 1px;"></span>`).join('');
+    return `<button class="inc-marker" data-inc="${cl.items[0]}" style="left:${cl.tpos*100}%;" aria-label="Инцидент: ${INCIDENTS[cl.items[0]].title}">
+      <span class="lbl" style="background:${c}22; color:${c}; border:1px solid ${c}55;">${lbl}</span>
+      <span style="display:flex; height:52px;">${ticks}</span></button>`;
+  }).join('');
+  document.querySelectorAll('.inc-marker').forEach(m => m.onclick = (e) => { e.stopPropagation(); selectIncident(m.dataset.inc); });
+  positionCursor();
+  svg.addEventListener('click', (e) => {
+    const r = svg.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    if (e.shiftKey){
+      if (STATE.baseline != null && Math.abs(STATE.baseline - x) < 0.02){
+        STATE.baseline = null;
+        toast('baseline снят');
+      } else {
+        STATE.baseline = x;
+        toast('baseline ' + timeAt(x) + ' · heatmap в Δ-режиме · Shift+клик рядом — снять');
+      }
+      positionBaseline(); renderHeat(); return;
+    }
+    STATE.cursor = x;
+    positionCursor(); renderClock(); renderHeat(); writeHash();
+  });
+})();
+function timeAt(x){
+  const mins = Math.round(x * 24 * 60);
+  return String(Math.floor(mins / 60) % 24).padStart(2, '0') + ':' + String(mins % 60).padStart(2, '0');
+}
+function positionBaseline(){
+  const bl = $('#baseline-line'), dl = $('#delta-legend');
+  if (STATE.baseline == null){ bl.style.display = 'none'; dl.style.display = 'none'; return; }
+  bl.style.display = 'block';
+  bl.style.left = `calc(${STATE.baseline*100}% - 1px)`;
+  $('#delta-t').textContent = timeAt(STATE.baseline);
+  dl.style.display = 'inline-flex';
+}
+$('#delta-clear').onclick = () => { STATE.baseline = null; positionBaseline(); renderHeat(); };
+function positionCursor(){
+  $('#cursor-line').style.left = `calc(${STATE.cursor*100}% - 1px)`;
+  const hc = document.querySelector('#heat-axis .hc');
+  if (hc){ hc.style.left = (STATE.cursor*100).toFixed(2) + '%'; hc.textContent = clockStr().slice(0,5); }
+  const vl = $('#vline');
+  if (window.innerWidth <= 760 || !STATE.heatOpen){ vl.style.display = 'none'; return; }
+  const app = $('#app').getBoundingClientRect();
+  const sw = $('#spine-svg-wrap').getBoundingClientRect();
+  const hr = $('#heat-rows').getBoundingClientRect();
+  vl.style.display = 'block';
+  vl.style.left = (sw.left - app.left + sw.width * STATE.cursor - 0.75) + 'px';
+  vl.style.top = (sw.top - app.top) + 'px';
+  vl.style.height = (hr.bottom - sw.top) + 'px';
+}
+document.querySelectorAll('#zoom button').forEach(z => z.onclick = () => {
+  document.querySelectorAll('#zoom button').forEach(x => x.classList.remove('on'));
+  z.classList.add('on'); STATE.span = +z.dataset.span; writeHash();
+});
+$('#mode-btn').onclick = () => {
+  if (STATE.demo === 'down'){ toast('LIVE недоступен — нет свежих данных с 03:42'); return; }
+  STATE.live = !STATE.live;
+  const b = $('#mode-btn');
+  b.className = 'tmode ' + (STATE.live ? 'live' : 'replay');
+  $('#mode-m').textContent = STATE.live ? 'LIVE' : 'REPLAY';
+};
+
+/* ============================================================
+   TABS
+   ============================================================ */
+function renderTabs(){
+  const groups = [];
+  TABS.forEach(t => { if (!groups.includes(t.group)) groups.push(t.group); });
+  let html = '';
+  groups.forEach(g => {
+    html += `<div class="tgroup"><span class="tg-label">${g}</span>`;
+    TABS.filter(t => t.group === g).forEach(t => {
+      const hot = STATE.incident && INCIDENTS[STATE.incident].findings.some(f => f.sec.startsWith(t.key));
+      html += `<button class="tab ${STATE.tab===t.key?'on':''}" data-tab="${t.key}" role="tab" aria-selected="${STATE.tab===t.key}" title="${t.name}">
+        <div class="r1">
+          <span class="code">${t.key}</span><span class="name">${t.name}</span>
+          <span class="cnt">${t.count}</span>
+          ${t.sev ? `<span class="dot" style="background:${t.sev};" title="есть отклонения"></span>` : ''}
+          ${hot ? `<span class="fbadge" title="есть findings в фокусе">◂</span>` : ''}
+        </div><div class="bar"></div></button>`;
+    });
+    html += `</div>`;
+  });
+  $('#tabbar').innerHTML = html + `<span class="spacer"></span><span id="tabmeta">${tabMeta()}</span>`;
+  document.querySelectorAll('.tab').forEach(el => el.onclick = () => { STATE.tab = el.dataset.tab; STATE.rowSel = null; renderAll(); });
+}
+function tabMeta(){
+  const m = { pga:'pg_stat_activity · sort ↓ wait', pgs:'pg_stat_statements · sort ↓ total', pgp:'pg_store_plans · sort ↓ mean',
+    pgt:'pg_stat_user_tables · sort ↓ dead%', pgi:'pg_stat_user_indexes · sort ↓ scans', pgv:'pg_stat_progress_vacuum',
+    prc:'/proc · sort ↓ cpu', pgl:'pg_locks ⋈ activity', pge:'stderr log · 5 событий в часе' };
+  return m[STATE.tab] || '';
+}
+
+/* ============================================================
+   HEATMAP
+   ============================================================ */
+const HEAT_LABELS = { time:'time', calls:'calls', io:'i/o', temp:'temp', cpu:'cpu', wait:'wait', writes:'writes', dead:'dead', scans:'scans', progress:'%', count:'count' };
+function ramp(t){
+  t = Math.max(0, Math.min(1, t));
+  const st = [[0,[13,22,37]],[0.3,[22,74,104]],[0.55,[14,116,144]],[0.78,[251,191,36]],[1,[248,113,113]]];
+  let a = st[0], b = st[st.length-1];
+  for (let i = 0; i < st.length-1; i++) if (t >= st[i][0] && t <= st[i+1][0]) { a = st[i]; b = st[i+1]; break; }
+  const f = (t - a[0]) / ((b[0]-a[0]) || 1);
+  const c = a[1].map((v,i) => Math.round(v + (b[1][i]-v)*f));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+function deltaRamp(d){
+  const t = Math.min(1, Math.abs(d) / 0.5);
+  return d < 0
+    ? `rgba(52,211,153,${(0.12 + 0.8*t).toFixed(2)})`
+    : `rgba(248,113,113,${(0.12 + 0.8*t).toFixed(2)})`;
+}
+function renderHeat(){
+  const t = TABS.find(x => x.key === STATE.tab);
+  if (!t.heat.includes(STATE.heatMetric)) STATE.heatMetric = t.heat[0];
+  $('#heat').classList.toggle('collapsed', !STATE.heatOpen);
+  $('#heat-toggle').textContent = (STATE.heatOpen ? '▾' : '▸') + ' активность сущностей';
+  $('#heat-toggle').setAttribute('aria-expanded', STATE.heatOpen);
+  $('#hswitch').innerHTML = t.heat.map(h => `<button class="${h===STATE.heatMetric?'on':''}" data-h="${h}">${HEAT_LABELS[h]||h}</button>`).join('');
+  document.querySelectorAll('#hswitch button').forEach(s => s.onclick = () => { STATE.heatMetric = s.dataset.h; renderHeat(); positionCursor(); });
+  const rows = t.rows.slice(0, 6);
+  const bcol = STATE.baseline != null ? Math.round(STATE.baseline * 55) : null;
+  $('#heat-rows').innerHTML = rows.map((r, ri) => {
+    const rr = rng(ri*17 + t.key.charCodeAt(1)*7);
+    const idCell = r.find(c => c.cls === 'id');
+    const label = (idCell && idCell.v) || '?';
+    const vals = [];
+    for (let c = 0; c < 56; c++){
+      let v = (0.25 + 0.5*rr()) * (1 - ri*0.12);
+      const d = Math.abs(c - STATE.cursor*56);
+      if (d < 5) v += 0.4*(1 - d/5) * (ri < 3 ? 1 : 0.3);
+      vals.push(v);
+    }
+    let cells = '';
+    for (let c = 0; c < 56; c++){
+      const tm = timeAt(c / 56);
+      if (bcol != null){
+        const d = vals[c] - vals[bcol];
+        cells += `<div style="background:${deltaRamp(d)};" title="${tm} · ${STATE.heatMetric}: Δ ${(d*100).toFixed(0)}% к baseline ${timeAt(STATE.baseline)}"></div>`;
+      } else {
+        cells += `<div style="background:${ramp(vals[c])};" title="${tm} · ${STATE.heatMetric} ≈ ${(vals[c]*100).toFixed(0)}% от пика"></div>`;
+      }
+    }
+    const hot = r.some(c => c.scope);
+    const sel = STATE.rowSel === ri;
+    return `<div class="heat-row"><button class="id ${hot?'hot':''} ${sel?'sel':''}" data-heatrow="${ri}" title="открыть строку в таблице">${label}</button><div class="heat-cells">${cells}</div></div>`;
+  }).join('') + `<div id="heat-axis"><span>00:00</span><span class="hc" style="left:${(STATE.cursor*100).toFixed(2)}%;">${clockStr().slice(0,5)}</span><span>24:00</span></div>`;
+  document.querySelectorAll('[data-heatrow]').forEach(s => s.onclick = () => {
+    STATE.rowSel = +s.dataset.heatrow; STATE.dock = 'row';
+    openDock(); renderHeat(); renderTable(); renderDock(); positionCursor();
+  });
+}
+$('#heat-toggle').onclick = () => { STATE.heatOpen = !STATE.heatOpen; renderHeat(); positionCursor(); };
+
+/* ============================================================
+   TABLE
+   ============================================================ */
+function sparkPath(seed, up, down){
+  const rr = rng(seed*97+11), pts = [];
+  for (let i = 0; i < 24; i++){
+    const x = i/23;
+    let y = 0.4 + 0.25*rr();
+    if (up) y += 0.5*Math.pow(x, 2.2);
+    if (down) y -= 0.35*Math.pow(x, 1.8);
+    y = Math.max(0.05, Math.min(1, y));
+    pts.push([+(x*60).toFixed(1), +((1-y)*14).toFixed(1)]);
+  }
+  return 'M' + pts.map(p => p.join(',')).join(' L');
+}
+function cellHtml(c, col){
+  if (typeof c === 'string'){
+    const m = col && col.l === '%time' && c.match(/^(\d+)%$/);
+    if (m) return `<span class="pctcell why" tabindex="0" title="доля времени инстанса за окно · шкала линейна: полный бар = максимум в окне (26%)"><span class="tr"><span class="fl" style="width:${Math.min(100, +m[1]/26*100)}%;"></span></span>${c}</span>`;
+    return c;
+  }
+  if (c.spark !== undefined){
+    const col2 = c.hot ? '#f87171' : (c.up ? '#fbbf24' : '#8494a7');
+    return `<svg viewBox="0 0 60 14" preserveAspectRatio="none" style="width:100%; height:14px; display:block;" role="img" aria-label="тренд"><path d="${sparkPath(c.spark, c.up, c.down)}" fill="none" stroke="${col2}" stroke-width="1.3" vector-effect="non-scaling-stroke"/></svg>`;
+  }
+  if (c.bar !== undefined){
+    return `<span style="display:block; height:6px; border-radius:3px; background:var(--sunken); overflow:hidden;" role="img" aria-label="progress ${c.bar}%"><span style="display:block; height:100%; width:${c.bar}%; background:var(--ok); border-radius:3px;"></span></span>`;
+  }
+  let v = c.v ?? '';
+  const ttl = c.title ? ` title="${c.title}"` : '';
+  if (c.verb) v = `<span class="verb">${v}</span>${c.tail ? `<span style="color:var(--text-mute);">${c.tail}</span>` : ''}`;
+  if (c.pill) return `<span class="pill ${c.title?'why ':''}${c.cls||''}"${c.title?' tabindex="0"':''}${ttl}>${v}</span>`;
+  if (c.title) return `<span class="why" tabindex="0"${ttl}>${v}</span>`;
+  return v;
+}
+function renderTable(){
+  const t = TABS.find(x => x.key === STATE.tab);
+  const pi = STATE.preset[STATE.tab] || 0;
+  $('#presets').innerHTML = t.presets.map((p, i) => `<button class="${i===pi?'on':''}" data-p="${i}">${p}</button>`).join('');
+  document.querySelectorAll('#presets button').forEach(b => b.onclick = () => {
+    STATE.preset[STATE.tab] = +b.dataset.p; renderTable();
+  });
+  const viewIdx = (t.views && t.views[t.presets[pi]]) || t.cols.map((_, i) => i);
+  const cols = viewIdx.map(ci => t.cols[ci]);
+  const hasView = !!(t.views && t.views[t.presets[pi]]);
+  $('#rowcount').textContent = `${t.count} rows` + (hasView ? ` · ${cols.length}/${t.cols.length} cols` : '');
+  const gridCols = cols.map(c => c.w === '1fr' ? 'minmax(0,1fr)' : c.w).join(' ');
+  const minw = cols.reduce((a, c) => a + (c.w === '1fr' ? 380 : parseInt(c.w)), 32 + 9 * cols.length);
+  $('#table-inner').style.minWidth = minw + 'px';
+  const scopeOn = !!STATE.incident;
+  let html = `<div class="thead" role="row" style="grid-template-columns:${gridCols};">` +
+    cols.map(c => `<span class="${c.r?'c r':''} ${c.sorted?'sorted':''}" style="${c.r?'text-align:right;':''}">${c.l}${c.sorted?'↓':''}${c.id?' ⇲':''}</span>`).join('') + `</div>`;
+  t.rows.forEach((row, ri) => {
+    const scoped = row.some(c => c.scope);
+    const cls = [ 'trow', STATE.rowSel === ri ? 'sel' : '', scoped && scopeOn && STATE.rowSel !== ri ? 'rel' : '' ].join(' ');
+    html += `<div class="${cls}" role="row" tabindex="0" data-row="${ri}" style="grid-template-columns:${gridCols};">` +
+      viewIdx.map(ci => {
+        const c = row[ci];
+        const col = t.cols[ci];
+        const kls = ['c', col.r?'r':'', col.id?'id':'', (typeof c === 'object' && c.cls && !c.pill && !c.id && !c.verb) ? c.cls : ''].join(' ');
+        return `<span class="${kls}">${cellHtml(c, col)}</span>`;
+      }).join('') + `</div>`;
+  });
+  $('#table').innerHTML = html;
+  const activate = (r) => {
+    STATE.rowSel = +r.dataset.row; STATE.dock = 'row';
+    openDock(); renderHeat(); renderTable(); renderDock(); positionCursor();
+  };
+  document.querySelectorAll('.trow').forEach(r => {
+    r.onclick = () => activate(r);
+    r.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); activate(r); } };
+  });
+  document.querySelectorAll('#table .c.id').forEach(cid => cid.onclick = (e) => {
+    e.stopPropagation();
+    const txt = cid.textContent.trim();
+    if (navigator.clipboard) navigator.clipboard.writeText(txt);
+    toast('скопировано: ' + txt);
+  });
+  // scope-чип и db-scope-чип в тулбаре
+  const sc = $('#scope-chip');
+  if (scopeOn && STATE.incident && INCIDENTS[STATE.incident].findings.some(f => f.sec.startsWith(STATE.tab))){
+    sc.style.display = 'flex';
+    $('#scope-txt').textContent = 'scope: ' + INCIDENTS[STATE.incident].scopeNote;
+  } else sc.style.display = 'none';
+  const db = $('#dbscope-chip');
+  const scopeNames = { host:'host', instance:'инстанс' };
+  if (t.scope !== 'db'){
+    db.style.display = 'flex';
+    db.textContent = `scope: ${scopeNames[t.scope]} · фильтр «база» не применяется`;
+  } else db.style.display = 'none';
+}
+
+/* ============================================================
+   DOCK: findings как evidence-группа
+   ============================================================ */
+function findingCard(f){
+  const cf = CONF[f.conf], cap = CONF[f.cap], sc = SEV[f.sev] || '#64748b';
+  return `<div class="fcard" style="border-left-color:${sc};">
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span class="role" style="background:${sc}22; color:${sc};">${f.sev}</span>
+      <span style="flex:1;"></span><span class="lens">${f.lens}</span>
+    </div>
+    <div class="ft">${f.title}</div>
+    <div class="slug">${f.slug}</div>
+    <div class="conf-row"><span class="k">confidence · относится к finding</span><span class="v" style="color:${cf.c};">${f.conf} · cap ${f.cap}</span></div>
+    <div class="conf-track">
+      <div style="position:absolute; left:0; top:0; bottom:0; width:${cf.pct}%; background:${cf.c};"></div>
+      <div style="position:absolute; top:0; bottom:0; left:${cap.pct}%; right:0; background:repeating-linear-gradient(45deg, rgba(148,163,184,.15), rgba(148,163,184,.15) 3px, transparent 3px, transparent 6px);"></div>
+      <div style="position:absolute; top:-1px; bottom:-1px; left:${cap.pct}%; width:1.5px; background:#94a3b8;"></div>
+    </div>
+    <div class="scopechips">
+      <span class="schip">${f.sec}</span><span class="schip col">${f.col}</span><span class="schip">${f.ident}</span>
+      <button class="schip jump" data-jump="${f.sec.slice(0,3)}">↳ перейти</button>
+    </div>
+    <div class="evi"><span class="k">evidence</span>${f.evi.map(e => `<span class="e">${e}</span>`).join('')}</div>
+    ${f.capNote ? `<div class="capnote">⌾ ${f.capNote}</div>` : ''}
+  </div>`;
+}
+function edgeHtml(link){
+  if (link) return `<div class="fedge prov"><span class="ln"></span><span class="via" title="Связь подтверждена сохранённым join — provenance ребра">связь подтверждена: ${link.via}</span></div>`;
+  return `<div class="fedge corr"><span class="ln"></span><span class="no" title="Направление не установлено: снапшоты не хранят join между этими сигналами">корреляция по времени · связь не доказана</span></div>`;
+}
+function renderStatusBanner(){
+  const sb = $('#status-banner');
+  if (STATE.demo === 'calm'){
+    sb.style.cssText = 'background:rgba(52,211,153,.06); border:1px solid rgba(52,211,153,.22);';
+    sb.innerHTML = `<span class="dot" style="background:var(--ok);"></span>
+      <span class="lb" style="color:var(--text);">calm · проверено, инцидентов нет</span>
+      <span class="dq">42 snaps · 1 gap · 2 lenses skipped</span>`;
+  } else {
+    const inc = STATE.incident ? INCIDENTS[STATE.incident] : null;
+    const crit = inc && inc.sev === 'critical';
+    sb.style.cssText = `background:${crit?'rgba(248,113,113,.06)':'rgba(251,191,36,.06)'}; border:1px solid ${crit?'rgba(248,113,113,.22)':'rgba(251,191,36,.2)'};`;
+    sb.innerHTML = `<span class="dot" style="background:${crit?'var(--crit)':'var(--warn)'};"></span>
+      <span class="lb" style="color:var(--text);">incidents_detected · окно 03:40–03:50</span>
+      <span class="dq">42 snaps · 1 gap · 2 lenses skipped</span>`;
+  }
+}
+function renderIncList(){
+  if (STATE.demo === 'calm')
+    return `<div class="empty-state">За окно 03:40–03:50 findings не найдены.<br><span style="font:500 10.5px var(--mono); color:var(--text-faint);">это результат проверки, а не ошибка загрузки · 42 snaps · 1 gap · 2 lenses skipped</span></div>`;
+  return INC_ORDER.map(k => {
+    const i = INCIDENTS[k], on = STATE.incident === k;
+    return `<button class="inc-card ${on?'on':''}" data-inc="${k}" style="--sev:${SEV[i.sev]};">
+      <div style="min-width:0; flex:1;">
+        <div class="ttl">${i.title}</div>
+        <div class="meta"><span>${i.time}</span><span style="color:#3a4658;">·</span><span>${i.cat}</span><span style="color:#3a4658;">·</span><span>${i.findings.length + i.coincident.length} findings</span></div>
+      </div><span class="chev">›</span></button>`;
+  }).join('');
+}
+function renderDock(){
+  document.querySelectorAll('.dtab').forEach(d => d.classList.toggle('on', d.dataset.dock === STATE.dock));
+  renderStatusBanner();
+  if (STATE.dock === 'incident'){
+    let inner = `<div class="dock-sec"><div class="dock-h">Инциденты · окно 03:40–03:50</div>${renderIncList()}</div>`;
+    const inc = STATE.incident ? INCIDENTS[STATE.incident] : null;
+    if (inc && STATE.demo !== 'calm'){
+      inner += `<div class="dock-sec" style="padding-top:6px;">
+        <div style="display:flex; align-items:center; gap:9px; margin-bottom:5px;">
+          <span style="width:8px; height:8px; border-radius:2px; background:${SEV[inc.sev]};"></span>
+          <span style="font:600 15px var(--ui); color:#eef3f8;">${inc.title}</span>
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:6px;">
+          <span class="role" style="background:${SEV[inc.sev]}22; color:${SEV[inc.sev]};">${inc.sev}</span>
+          <span class="role" style="background:rgba(148,163,184,.1); color:#9aa8ba;">группа сигналов · не root cause</span>
+        </div>
+        <div style="font:500 10.5px var(--mono); color:var(--text-mute); margin-bottom:6px;">окно ${inc.window} · peak ${inc.peak} · members ${inc.members}</div>
+        ${inc.provenanceNote ? `<div style="font:400 11px/1.5 var(--ui); color:var(--text-mute); background:rgba(148,163,184,.05); border:1px dashed rgba(148,163,184,.2); border-radius:8px; padding:8px 10px; margin-bottom:12px;">⌾ ${inc.provenanceNote}</div>` : ''}
+        <div class="dock-h">Findings · сигналы и доказанные связи</div>
+        <div class="flist">${inc.findings.map((f, i) => findingCard(f) + (i < inc.findings.length - 1 ? edgeHtml(f.link) : '')).join('')}</div>
+        ${inc.coincident.length ? `<div class="coinc">
+          <div class="dock-h" style="margin-bottom:8px;">Совпало во времени · связь не доказана</div>
+          ${inc.coincident.map(f => `<div style="display:flex; align-items:center; gap:8px;">
+            <span class="role" style="background:rgba(148,163,184,.1); color:#9aa8ba;">coincident</span>
+            <span style="font:600 12px var(--ui); color:#b3bfd0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${f.title}</span>
+            <span style="font:600 10px var(--mono); color:var(--text-mute);">${f.lens}</span></div>`).join('')}
+        </div>` : ''}
+        <div style="margin-top:16px; padding:12px 13px; background:var(--card); border:1px solid var(--line); border-radius:11px;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font:600 12px var(--ui); color:#ccd6e2;">Каталог линз</span><span style="flex:1;"></span>
+            <span style="font:600 10px var(--mono); color:var(--ok);">4 applied</span>
+            <span style="font:600 10px var(--mono); color:var(--text-mute);">/ 3 dormant</span>
+          </div>
+          <div style="margin-top:10px;">
+            ${[['PG-LOCK-012','Граф ожидания блокировок','нет сэмплинга pg_locks'],['PG-TEMP-003','Спилл temp-файлов','1 вход ожидает'],['OS-NET-028','Ретрансмиты сети','/proc/net недоступен']]
+              .map(([id,tt,why]) => `<div class="lensrow"><span style="width:5px; height:5px; border-radius:50%; background:#5b6577;"></span>
+                <span style="font:600 10px var(--mono); color:var(--text-mute);">${id}</span>
+                <span style="font:500 11.5px var(--ui); color:var(--text-dim); flex:1;">${tt}</span>
+                <span style="font:500 9px var(--mono); color:#d4a843;" title="причина dormant">${why}</span></div>`).join('')}
+          </div>
+        </div>
+      </div>`;
+    }
+    $('#dock-body').innerHTML = inner;
+    document.querySelectorAll('#dock-body .inc-card').forEach(c => c.onclick = () => selectIncident(c.dataset.inc));
+    document.querySelectorAll('[data-jump]').forEach(b => b.onclick = () => {
+      STATE.tab = b.dataset.jump; renderAll();
+    });
+  } else {
+    const t = TABS.find(x => x.key === STATE.tab);
+    const row = STATE.rowSel != null ? t.rows[STATE.rowSel] : null;
+    if (!row){ $('#dock-body').innerHTML = `<div class="dock-sec" style="color:var(--text-faint); font:500 12px var(--ui);">Строка не выбрана — кликните по таблице или по id в heatmap.</div>`; return; }
+    const kv = row.map((c, i) => {
+      const col = t.cols[i]; if (col.l === 'trend') return '';
+      let v = typeof c === 'string' ? c : (c.v ?? '');
+      if (typeof c === 'object' && c.tail) v += ' ' + c.tail;
+      return `<span class="k">${col.l}</span><span class="v">${v}</span>`;
+    }).join('');
+    $('#dock-body').innerHTML = `
+      <div class="dock-sec" style="padding-top:14px;">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:9px;">
+          ${STATE.incident ? `<button id="dock-back" style="font:600 10.5px var(--mono); color:var(--accent-hi);">← к инциденту</button><span style="color:#3a4658;">·</span>` : ''}
+          <span class="dock-h" style="margin-bottom:0;">${t.key} · ${t.name} · все поля строки</span>
+        </div>
+        <div class="kv">${kv}</div>
+        ${STATE.tab === 'pgs' || STATE.tab === 'pga' ? `<div class="sqlbox">SELECT o.id, o.status, sum(oi.price)
+  FROM orders o
+  JOIN order_items oi ON oi.order_id = o.id
+ WHERE o.created_at > now() - interval '1 day'
+ GROUP BY 1, 2
+ ORDER BY 3 DESC;</div>` : ''}
+        <div class="drillbtns">
+          ${STATE.tab === 'pgs' ? '<button>→ pgp: планы этого queryid</button><button>→ pga: активные вызовы</button>' : ''}
+          ${STATE.tab === 'pgl' ? '<button>→ pga: сессия блокера</button>' : ''}
+          ${STATE.tab === 'pgt' ? '<button>→ pgi: индексы таблицы</button>' : ''}
+          ${!['pgs','pga','pgl','pgt'].includes(STATE.tab) ? '<button>→ связанные сущности</button>' : ''}
+        </div>
+        ${STATE.tab === 'pgl' && STATE.rowSel === 0 ? `
+        <div style="margin-top:14px;">
+          <button class="danger" disabled title="Недоступно в макете">⏹ terminate backend 5210</button>
+          <div class="danger-note">Опасное действие: требует отдельной роли, точной идентичности backend, причины, подтверждения и записи в audit log. Никогда не оформляется как обычный drill-down.</div>
+        </div>` : ''}
+      </div>`;
+    const back = $('#dock-back');
+    if (back) back.onclick = () => { STATE.dock = 'incident'; renderDock(); };
+  }
+}
+document.querySelectorAll('.dtab').forEach(d => d.onclick = () => { STATE.dock = d.dataset.dock; renderDock(); });
+
+/* ============================================================
+   ФОКУС / ДОК
+   ============================================================ */
+function openDock(){ $('#dock').classList.add('open'); positionCursor(); }
+function openDockIncident(k){ STATE.dock = 'incident'; openDock(); selectIncident(k); }
+function selectIncident(k){
+  STATE.incident = k; STATE.dock = 'incident';
+  const inc = INCIDENTS[k];
+  const fb = $('#focusbar');
+  fb.classList.add('on');
+  $('#focus-title').textContent = inc.title;
+  $('#focus-win').textContent = `окно ${inc.window} · peak ${inc.peak}`;
+  $('#focus-scope').textContent = `scope: ${inc.scopeNote}`;
+  openDock(); renderAll();
+}
+$('#focus-exit').onclick = exitFocus;
+function exitFocus(){
+  STATE.incident = null;
+  $('#focusbar').classList.remove('on');
+  renderAll();
+}
+$('#dock-close').onclick = () => { $('#dock').classList.remove('open'); positionCursor(); };
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.target.classList && e.target.classList.contains('why')){
+    if (e.key === 'Enter'){ e.preventDefault(); e.target.click(); }
+    return;
+  }
+  if (e.key === 'Escape'){
+    const wp = $('#whypop'); if (wp && wp.classList.contains('on')){ wp.classList.remove('on'); return; }
+    if ($('#dock').classList.contains('open')){ $('#dock').classList.remove('open'); positionCursor(); return; }
+    exitFocus(); return; }
+  const ti = '123456789'.indexOf(e.key);
+  if (ti > -1 && ti < TABS.length){ STATE.tab = TABS[ti].key; STATE.rowSel = null; renderAll(); return; }
+  const t = TABS.find(x => x.key === STATE.tab);
+  if (e.key === 'j' || e.key === 'k'){
+    const d = e.key === 'j' ? 1 : -1;
+    STATE.rowSel = Math.max(0, Math.min((STATE.rowSel ?? (d > 0 ? -1 : t.rows.length)) + d, t.rows.length - 1));
+    STATE.dock = 'row'; openDock();
+    renderHeat(); renderTable(); renderDock(); positionCursor();
+  }
+  if (e.key === 'Enter' && STATE.rowSel != null){ STATE.dock = 'row'; openDock(); renderDock(); }
+  if (e.key === 'ArrowRight'){ STATE.cursor = Math.min(1, STATE.cursor + 1/96); positionCursor(); renderClock(); renderHeat(); writeHash(); }
+  if (e.key === 'ArrowLeft'){ STATE.cursor = Math.max(0, STATE.cursor - 1/96); positionCursor(); renderClock(); renderHeat(); writeHash(); }
+});
+
+/* ============================================================
+   ДЕМО-СОСТОЯНИЯ
+   ============================================================ */
+$('#state-sel').onchange = (e) => {
+  STATE.demo = e.target.value;
+  const ab = $('#alertbar');
+  ab.className = ''; ab.innerHTML = '';
+  if (STATE.demo === 'stale'){
+    ab.className = 'on stale';
+    ab.innerHTML = `<span>⚠</span><span>Данные устарели — последний снапшот <span class="mono">4м 12с</span> назад. Коллектор жив, основное подключение к PG не отвечает. Показана запись, не live.</span>`;
+  }
+  if (STATE.demo === 'down'){
+    ab.className = 'on down';
+    ab.innerHTML = `<span>●</span><span>Collector недоступен с <span class="mono">03:42</span>. Показана запись до 03:42 · сегменты целы · свежих данных не будет до восстановления.</span>`;
+  }
+  if (STATE.demo === 'calm'){ STATE.incident = null; $('#focusbar').classList.remove('on'); }
+  if (STATE.demo === 'norm' && !STATE.incident && $('#dock').classList.contains('open')){ /* оставляем как есть */ }
+  renderHealth();
+  const mb = $('#mode-btn');
+  mb.style.opacity = STATE.demo === 'down' ? '.45' : '1';
+  mb.title = STATE.demo === 'down' ? 'LIVE недоступен: нет свежих данных с 03:42' : 'Единый контрол режима времени: live-лента или воспроизведение записи';
+  if (STATE.demo === 'down' && STATE.live){ STATE.live = false; mb.className = 'tmode replay'; $('#mode-m').textContent = 'REPLAY'; }
+  renderAll();
+};
+
+/* ============================================================
+   NOTES
+   ============================================================ */
+const NOTES = [
+  ['acc','v5 · лента и heatmap снова на одной оси', 'В v4 гаттер 158px был только у heatmap: лента шла full-bleed, и один момент времени попадал в разные пиксели на ленте и на полосе, а vline при этом убрали — вертикаль глазом провести невозможно. Ленте дан тот же гаттер (подпись «нагрузка · load=nproc» слева, как у id-строк heatmap), <b>vline возвращён</b> и проводит вертикаль от курсора до конца heatmap. На ≤760px гаттер отключается.'],
+  ['acc','v5 · baseline-курсор (A/B сравнение)', '<b>Shift+клик по ленте</b> ставит фиолетовый baseline-курсор «B»; heatmap переключается в Δ-режим: цвет ячейки — отклонение от колонки baseline (зелёный — ниже, красный — выше), в заголовке — легенда «Δ к HH:MM». Повторный Shift+клик рядом или ✕ в легенде снимает. Закрывает сценарий «сравни это место с тем, что было до инцидента / в это же время вчера» — самый частый жест при расследовании.'],
+  ['acc','v5 · добиты упрощения v4', 'Hover ячейки heatmap показывает время и значение (в Δ-режиме — отклонение); кнопки зума подсвечиваются из URL при открытии ссылки; why-поповер открывается с клавиатуры (tabindex + Enter); psi-чип — кнопка, ведущая на вкладку prc; <b>пресеты pgs реально фильтруют колонки</b> (Time / I/O / Temp / WAL, добавлена колонка wal_w) как доказательство паттерна для остальных вкладок.'],
+  ['acc','v4 · pga: время разнесено по источникам', '«dur» разделён на <b>q_dur</b> (query_start) и <b>tx_dur</b> (xact_start): idle-in-tx показывает возраст транзакции как crit с пояснением про xmin. walreceiver больше не имеет выдуманного state «streaming» — state NULL честно, репликация уехала в пресет Repl. (DBA · blocker)'],
+  ['acc','v4 · пороги от активного окна', 'Формулировки переписаны на долю времени окна («total > 5% окна») вместо фиксированного «за 10м», противоречившего зуму. (DBA · major)'],
+  ['acc','v4 · pgl: держит ≠ ждёт', 'Колонка wait/hold: у блокера «держит 6m12s», у ожидающих «ждёт …». Tooltip объясняет, что query блокера — последний statement транзакции, а лок взят ранее. (DBA · major)'],
+  ['acc','v4 · URL-состояние и «⧉ ссылка»', 'time+span+вкладка+инцидент живут в hash и восстанавливаются при открытии; кнопка в шапке копирует ссылку. Инцидент можно кинуть в Slack. (DevOps · blocker)'],
+  ['acc','v4 · data-health связан со состояниями', 'Чип «данные» перерисовывается из того же состояния, что и баннеры stale/down; LIVE при collector down заблокирован с причиной. Добавлен чип «роль: primary · lag» и диск/retention в попап. (DevOps · major)'],
+  ['acc','v4 · prc: rss+pss, честные NULL, PSI, Cgroup', 'PSS-колонка закрывает RSS-ловушку shared_buffers; «—» с причиной (EACCES / delayacct) вместо нулей; psi io some — на ленте; пресет Cgroup; пороги ожидаемых писателей role-aware. (Linux · blocker/major)'],
+  ['acc','v4 · пороги обнаружимы', 'Цветные значения подчёркнуты пунктиром: клик (и touch) открывает поповер с порогом и baseline; native title — резерв. Шкала %time линейна от максимума окна. (UI/UX · major)'],
+  ['acc','v4 · heatmap: гаттер и ось', 'Подписи вынесены в левый гаттер и не закрывают данные; под полосой — ось 00:00…24:00 с меткой курсора; vline убран. Контраст faint поднят. pgt получил xid_age (wraparound), pgp — first/last seen плана и исправленную сетку (в v3 было 9 ячеек на 8 колонок). (UI/UX + DBA)'],
+  ['par','v4 · перенесено в реализацию', 'Клавиатурное открытие why-поповера, синхронизация кнопок зума из URL, ARIA-grid, виртуализация, i18n, skeleton, resizable-док — см. review-v3.md.'],
+  ['par','— ниже история решений v3 —', 'Сохранена для контекста: на неё опиралось ревью четырёх ролей.'],
+  ['acc','Адаптивная оболочка вместо фиксированного холста', 'Приложение занимает <b>100vw × 100dvh</b>, demo-padding убран. Док закрыт по умолчанию и открывается по выбору (клик по строке, heatmap, маркеру, чипам critical/warning). Ниже 1280px док — overlay, вкладки теряют подписи и скроллятся. Ниже 760px — отдельный <b>mobile triage</b>: статус, инциденты, findings, ссылка «полное расследование на desktop». Таблица скроллится горизонтально с min-width, ничего не обрезается. Проверено скриншотами на 1760 / 1440 / 768 / 390.'],
+  ['acc','Честная evidence-модель вместо causal chain', 'Рельс lead→amplifier→downstream убран: снапшоты не доказывают направление. Findings — <b>группа сигналов</b>; между карточками либо пунктир «корреляция по времени · связь не доказана», либо сплошное ребро с provenance («общий queryid a91c · pg_store_plans ⋈ pg_stat_statements»). Confidence относится к finding, provenance — к ребру. У «Схлопывания кэша» рёбер нет, у «Регрессии плана» ребро есть — разница видна в данных.'],
+  ['acc','Data health и состояние БД — раздельно', 'Игровой «health 94» убран. В шапке: чип <b>«данные»</b> (freshness, coverage 42/45, gap с причиной, skipped lenses с причинами, CRC хранилища) и отдельно <b>состояние БД</b> — кликабельные 1 critical / 2 warning, ведущие в инциденты. Зелёное число, совместимое с FATAL, больше невозможно.'],
+  ['acc','Типографика и контраст', 'База данных поднята: ячейки 12px, идентичность 12.5px, навигация 12–13px, мета 10.5–11px. Mute-цвета осветлены до ≥4.5:1 на фоне. Капс и mono оставлены только для значений, идентификаторов и необязательных отметок.'],
+  ['acc','Семантика и клавиатура', 'Вкладки, пресеты, zoom, heatmap-id, карточки инцидентов — настоящие <b>&lt;button&gt;</b>, фильтр — настоящий <b>&lt;input&gt;</b>. Видимый :focus-visible, строки таблицы фокусируются и активируются с Enter/Space, role-атрибуты на таблице, aria-live на фокус-плашке, aria-label на интерактивных глифах. Горячие клавиши — ускоритель, а не единственный способ. <b>Полная grid-семантика и скринридер-проход — задача реализации, в макете не имитируется.</b>'],
+  ['acc','Состояния продукта', 'Демо-переключатель в строке подсказок: <b>norm / calm / stale / collector down</b>. Calm показывает «проверено, спокойно» как результат, а не пустоту; stale и down — полосой под шапкой с причиной и последствиями. Loading, permission denied и деградация store — в список реализации.'],
+  ['acc','Явные scope и причины окраски', '«Инстанс» и «база» подписаны; на host/instance-вкладках (prc, pge) тулбар показывает «фильтр базы не применяется». Каждое цветное значение имеет tooltip с порогом, baseline и окном: «crit: mean > 100ms · baseline 9.5ms (×11.7)».'],
+  ['acc','Единый time-mode и язык', 'REPLAY/LIVE — один контрол на ленте с временем и MSK; дублирующий бейдж из чипа инстанса убран. «Жар» → «Активность сущностей», «AI-промпт» → «Скопировать контекст для AI» в ⋯-меню (с пометкой «без секретов»), terminate — отдельный danger-паттерн с audit-подписью.'],
+  ['par','Сознательно не в макете', 'Полная ARIA grid-семантика, виртуализация тысяч строк, skeleton-загрузка, i18n-каталог EN/RU, resizable-ручка дока, permission denied. Это требования к реализации, а не к макету — зафиксированы здесь, чтобы не потеряться.'],
+];
+$('#notes-body').innerHTML = NOTES.map(([cls, h, b]) =>
+  `<div class="ndec ${cls}"><h4>${h}</h4><p>${b}</p></div>`).join('');
+$('#btn-notes').onclick = () => $('#notes').classList.toggle('on');
+$('#notes-close').onclick = () => $('#notes').classList.remove('on');
+
+/* ============================================================
+   INIT — старт без фокуса и с закрытым доком
+   ============================================================ */
+function writeHash(){
+  const p = new URLSearchParams();
+  p.set('t', STATE.tab); p.set('c', STATE.cursor.toFixed(4)); p.set('s', String(STATE.span));
+  if (STATE.incident) p.set('inc', STATE.incident);
+  history.replaceState(null, '', '#' + p.toString());
+}
+function renderAll(){ renderTabs(); renderHeat(); renderTable(); renderDock(); positionCursor(); positionBaseline(); writeHash(); }
+(function initFromHash(){
+  const h = location.hash.slice(1);
+  if (!h) return;
+  if (h === 'inc'){ STATE.incident = 'cache'; return; }
+  const p = new URLSearchParams(h);
+  if (p.get('t') && TABS.some(t => t.key === p.get('t'))) STATE.tab = p.get('t');
+  if (p.get('c') != null) STATE.cursor = Math.max(0, Math.min(1, parseFloat(p.get('c')) || STATE.cursor));
+  if (p.get('s')) STATE.span = +p.get('s') || STATE.span;
+  if (p.get('inc') && INCIDENTS[p.get('inc')]) STATE.incident = p.get('inc');
+})();
+document.querySelectorAll('#zoom button').forEach(z => z.classList.toggle('on', +z.dataset.span === STATE.span));
+renderClock();
+renderHealth();
+if (STATE.incident) selectIncident(STATE.incident); else renderAll();
+window.addEventListener('resize', positionCursor);
+</script>
+</body>
+</html>
