@@ -127,6 +127,8 @@ pub struct SegmentDescriptor {
     pub catalog_digest: CatalogDigest,
     /// SHA-256 identity of the ordered catalog fields including body offsets.
     pub catalog_layout_digest: CatalogLayoutDigest,
+    /// PGM container version captured with the validated catalog.
+    pub source_format_version: u32,
     /// Filesystem identity pinned by the scan that produced this descriptor.
     pub file_identity: FileIdentity,
 }
@@ -146,6 +148,7 @@ impl SegmentDescriptor {
             max_ts: summary.max_ts,
             catalog_digest: summary.logical_digest,
             catalog_layout_digest: summary.layout_digest,
+            source_format_version: summary.format_version,
             file_identity,
         }
     }

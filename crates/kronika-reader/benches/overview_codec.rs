@@ -29,12 +29,13 @@ use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
+use zstd as _;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn fixture() -> (Vec<u8>, HeaderIdentity, SegmentIdentity) {
-    let lineage = SegmentIdentity::sealed(7, [0x22; 32], 1_006_001, b"first");
+    let lineage = SegmentIdentity::sealed(7, [0x22; 32]);
     let identity = HeaderIdentity::from_current_contract(
         1,
         7,

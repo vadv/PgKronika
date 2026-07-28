@@ -127,7 +127,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
         self.source_descriptor
     }
 
-    /// Exact PGM file length used by [`Self::source_descriptor`].
+    /// Exact PGM file length captured while opening the source.
     #[must_use]
     pub const fn source_file_len(&self) -> u64 {
         self.source_file_len
@@ -453,7 +453,6 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
     }
 
     let mut catalog_crc = Crc32c::new();
-    let mut source_descriptor = crate::SourceDescriptor::builder(len, &tail_bytes);
     let mut scratch = vec![0_u8; entries_bytes.min(CATALOG_READ_CHUNK_BYTES)].into_boxed_slice();
     let mut consumed = 0_usize;
     while consumed < entries_bytes {
@@ -464,12 +463,10 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
         let chunk = &mut scratch[..chunk_len];
         reader.read_exact_at(chunk, offset)?;
         catalog_crc.update(chunk);
-        crate::SourceDescriptor::update_catalog(&mut source_descriptor, chunk);
         entries.extend(chunk.chunks_exact(ENTRY_LEN).map(decode_catalog_entry));
         consumed = consumed.checked_add(chunk_len).ok_or_else(bad_len)?;
     }
 
-    crate::SourceDescriptor::update_catalog(&mut source_descriptor, &meta);
     catalog_crc.update(&meta[..META_CRC_AT]);
     catalog_crc.update(&[0_u8; 4]);
     catalog_crc.update(&meta[META_CRC_AT + 4..]);
@@ -502,9 +499,10 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
         window_count: u32_at(&meta, META_WINDOW_COUNT_AT),
     };
     validate_catalog_layout(&catalog, catalog_at).map_err(ReadError::Layout)?;
+    let source_descriptor = crate::SourceDescriptor::from_catalog(&catalog);
     Ok(OpenedCatalog {
         catalog,
-        source_descriptor: crate::SourceDescriptor::finish(source_descriptor),
+        source_descriptor,
     })
 }
 
@@ -691,19 +689,9 @@ mod tests {
         assert_eq!(mem.catalog(), file.catalog());
         assert_eq!(mem.source_descriptor(), file.source_descriptor());
         assert_eq!(mem.source_file_len(), bytes.len() as u64);
-        let tail_start = bytes.len() - TAIL_INDEX_LEN;
-        let raw_tail: [u8; TAIL_INDEX_LEN] =
-            bytes[tail_start..].try_into().expect("tail index bytes");
-        let tail = TailIndex::decode(raw_tail).expect("tail index");
-        let catalog_start =
-            tail_start - usize::try_from(tail.catalog_len).expect("catalog length fits usize");
         assert_eq!(
             mem.source_descriptor(),
-            crate::SourceDescriptor::derive(
-                bytes.len() as u64,
-                &raw_tail,
-                &bytes[catalog_start..tail_start],
-            )
+            crate::SourceDescriptor::from_catalog(mem.catalog())
         );
 
         let entry = &mem.catalog().entries[0];
@@ -808,11 +796,7 @@ mod tests {
             tail_at - usize::try_from(tail.catalog_len).expect("catalog length fits usize");
         let expected_catalog =
             Catalog::decode(&bytes[catalog_at..tail_at]).expect("monolithic catalog decode");
-        let expected_descriptor = crate::SourceDescriptor::derive(
-            bytes.len() as u64,
-            &tail_bytes,
-            &bytes[catalog_at..tail_at],
-        );
+        let expected_descriptor = crate::SourceDescriptor::from_catalog(&expected_catalog);
         let observation = Rc::new(ReadObservation::default());
 
         let unit = PgmUnit::open(CountingReader {

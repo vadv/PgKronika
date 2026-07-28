@@ -13,6 +13,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
+use zstd as _;
+
 use arrow_array as _;
 use arrow_schema as _;
 use criterion as _;

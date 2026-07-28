@@ -1228,7 +1228,7 @@ mod tests {
     use super::*;
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(1, [2; 32], 7, b"descriptor")
+        SegmentIdentity::sealed(1, [2; 32])
     }
 
     fn provenance(row_ordinal: u32) -> ObservationProvenance {
@@ -1506,7 +1506,7 @@ mod tests {
     #[test]
     fn decoding_derives_identity_from_the_validated_lineage_context() {
         let block = EventObservationsBlock::new(vec![ready(1)], &LIMIT).expect("valid");
-        let wrong = SegmentIdentity::sealed(1, [9; 32], 7, b"descriptor");
+        let wrong = SegmentIdentity::sealed(1, [9; 32]);
         let decoded =
             EventObservationsBlock::decode(&block.encode(), &wrong, block.string_table(), &LIMIT)
                 .expect("the enclosing container validates lineage");

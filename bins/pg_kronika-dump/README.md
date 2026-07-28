@@ -7,6 +7,7 @@ It is intended for operators and developers who need to:
 
 - inventory the segments and quarantined evidence in a data root;
 - find which sections occupy a PGM and how well they compress;
+- inspect an OVF header, block directory, and decoded web index;
 - print stored rows with dictionary references resolved;
 - identify intact `active.parts` frames and the first damaged region.
 
@@ -37,20 +38,22 @@ pg_kronika-dump <path> [--rows] [--limit N]
 
 | Argument | Meaning |
 | --- | --- |
-| `<path>` | A PgKronika data root, a `YYYY[/MM[/DD]]` calendar directory, one PGM, or an `active.parts`/quarantine journal. |
-| `--rows` | Add decoded rows to PGM sections or valid journal frames. It is rejected for a data root. |
-| `--limit N` | Emit at most `N` rows per section. The default is `1000`; the option requires `--rows`. `N=0` emits empty arrays and marks nonempty sections as truncated. |
+| `<path>` | A PgKronika data root, a `YYYY[/MM[/DD]]` calendar directory, one `.pgm` or `.ovf`, or an `active.parts`/quarantine journal. |
+| `--rows` | Add decoded PGM rows, journal-frame rows, or OVF web-index contents. It is rejected for a data root. |
+| `--limit N` | Emit at most `N` PGM rows per section or OVF series per metric. The default is `1000`; the option requires `--rows`. |
 
-The input mode is automatic:
+Regular-file mode is selected by the exact, case-sensitive final suffix:
 
 | Input | Mode |
 | --- | --- |
 | Data root or its `YYYY`, `YYYY/MM`, `YYYY/MM/DD` directory | Strict bounded tree traversal with an optional calendar filter. |
-| Regular file starting with `PGM1` | One sealed PGM or self-contained PGM part. |
-| Any other regular file | Version-1 journal forensics. |
+| `*.pgm` | One sealed PGM or self-contained PGM part. |
+| `*.ovf` | One standalone overview/web-index file. |
+| Any other regular-file name | Version-1 journal forensics. |
 
-A symbolic-link `<path>` is rejected. If a file changes during inspection, the
-command reports an error instead of combining two states.
+The selected decoder validates its own magic and framing; the command does not
+fall back to a different mode based on file contents. A symbolic-link `<path>`
+is rejected.
 
 ## Data root
 
@@ -154,6 +157,52 @@ JSON cannot represent as numbers are emitted as `"NaN"`, `"Infinity"`, and
 Section-level `truncated: true` only means `--limit` hid decoded rows. It is
 independent of the `truncated` flag inside a `dict.blobs` value.
 
+## One OVF
+
+```sh
+pg_kronika-dump \
+  /var/lib/pg_kronika/2026/07/28/1785200000000000.ovf |
+  jq '{header, blocks}'
+
+pg_kronika-dump \
+  /var/lib/pg_kronika/2026/07/28/1785200000000000.ovf \
+  --rows --limit 10 |
+  jq '.blocks[] | select(.content != null)'
+```
+
+Without `--rows`, the command reads only the fixed OVF header and bounded block
+directory. `header` reports the source and contract identity. `blocks` preserves
+directory order and reports kind/code, logical id, schema, flags, codec, stored
+and decoded bytes, item count, and optional time range. Unknown optional kinds
+remain visible with `kind: null`.
+
+Metadata-only inspection validates header and directory CRCs, framing, versions,
+flags, lengths, ordering, and embedded fact/lineage identities. It does not read
+block bodies and therefore does not verify their CRCs.
+
+With `--rows`, known web-index blocks gain `content`:
+
+- `ui_summary` contains the shared grid, snapshot timestamps, per-view status,
+  nullable populations and notable state, and bucket coverage;
+- each `entity_series` contains its view identity, observed range, grid,
+  coverage, complete typed-identity dictionary, metric metadata, cutoff score,
+  and retained series;
+- each series contains the exact score, dictionary key/label, and one value per
+  bucket. A missing observation is JSON `null`; an observed zero is `0.0`.
+
+`--limit N` applies independently to the series array of every metric.
+`truncated: true` means additional retained series exist. The dictionary is
+always complete so every returned `entity_ref`, key, and label remains
+self-contained.
+
+Body reads use the canonical `kronika-reader` decoder and verify CRC,
+decompression bounds, logical ordering, and agreement with the directory
+descriptor. Other OVF block kinds remain metadata-only.
+
+Standalone OVF inspection proves internal integrity. It does not open the
+sibling PGM and therefore does not prove that a copied OVF belongs to a
+particular neighboring PGM.
+
 ## Journal damage
 
 ```sh
@@ -190,11 +239,12 @@ each section in each frame.
 | 1 | Input cannot be read or violates its structural, CRC, or dictionary-reference contract. |
 | 2 | Invalid arguments or an unsupported option combination. |
 
-The command inherits the normal layout, format, registry, and reader bounds:
-a PGM catalog is at most 64 MiB, an encoded section at most 8 MiB, and admitted
-decode work at most 128 MiB per section. `--rows` output can contain SQL,
-plans, object names, process arguments, and PostgreSQL log text; protect it as
-you protect the source data root.
+The command inherits the normal layout, format, registry, and reader bounds,
+including all OVF directory, block, dictionary, metric, series, and bucket
+limits. A PGM catalog is at most 64 MiB, an encoded section at most 8 MiB, and
+admitted decode work at most 128 MiB per section. `--rows` output can contain
+SQL, plans, object names, process arguments, entity labels, and PostgreSQL log
+text; protect it as you protect the source data root.
 
 `pg_kronika-dump` does not filter by value or time, export CSV/Parquet, compare
 segments, or modify files.

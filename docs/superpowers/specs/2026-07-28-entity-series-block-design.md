@@ -57,14 +57,15 @@ OVF должен закрывать горячие запросы интерфе
 является минимальной единицей, которая сохраняет локальность и
 дедупликацию ключей при мгновенном переключении метрики.
 
-Directory entry содержит:
+Directory entry имеет фиксированный размер 64 байта:
 
 ```text
 block_kind       u32
-block_revision   u16
-codec            u8       # none | zstd
-flags            u16      # bit 0: has_time_range
+block_schema_version u16
+flags            u16      # bit 0: required, bit 1: sorted,
+                           # bit 2: has_time_range, bits 8..11: codec
 logical_id       u32
+reserved         u32      # всегда 0
 offset           u64
 stored_len       u64
 decoded_len      u64
@@ -73,6 +74,9 @@ crc32c           u32      # от stored bytes
 min_ts_us        i64      # фактический первый снимок блока
 max_ts_us        i64      # фактический последний снимок блока
 ```
+
+Для `UiSummary` `item_count` равен числу view, для `EntitySeries` —
+числу метрик.
 
 При снятом `has_time_range` оба timestamp равны нулю. При
 установленном флаге `min_ts_us <= max_ts_us`, и обе границы лежат
@@ -91,8 +95,9 @@ Writer сначала строит каноническое тело. Для `En
 
 Reader до выделения памяти проверяет `decoded_len` по bound,
 выделяет ровно этот объём и требует точного размера результата.
-CRC проверяется до декомпрессии. Dictionary или trailing bytes,
-выходящие за объявленное тело, делают OVF повреждённым.
+Окно Zstd ограничено 512 КиБ. CRC проверяется до декомпрессии.
+Dictionary или trailing bytes, выходящие за объявленное тело,
+делают OVF повреждённым.
 
 ## Сетка времени
 
@@ -177,6 +182,8 @@ header:
   view_revision          u16
   identity_revision      u16
   status                 u8
+  observed_min_ts_us     i64
+  observed_max_ts_us     i64
   grid_start_us          i64
   bucket_width_s         u32
   bucket_count           u16
@@ -213,6 +220,11 @@ series (series_count раз):
 канонический порядок словаря. Метрики сортируются по `metric_code`,
 серии — по убыванию `exact_score`, затем по `entity_ref`.
 
+`observed_min_ts_us` и `observed_max_ts_us` равны фактическим
+границам снимков блока и совпадают с directory. Обе границы лежат
+внутри grid; bucket первого и последнего timestamp установлен в
+`coverage_mask`.
+
 `metric.status` использует `complete`, `gated`, `unsupported_type` и
 `resource_limited`. При статусе, отличном от `complete`,
 `series_count = 0`, а `cutoff_score = 0`.
@@ -237,9 +249,12 @@ q = round(value / max_bucket_value * 255)  otherwise
 value' = q / 255 * max_bucket_value
 ```
 
-Значения конечны и неотрицательны. Ошибка одного восстановленного
-bucket не превышает `max_bucket_value / 255`. `exact_score` не
-квантуется и используется для отбора и оценки качества range top.
+Значения конечны и неотрицательны. При `max_bucket_value > 0`
+каноническая серия содержит хотя бы один `q = 255`; иначе заявленный
+максимум не заякорен наблюдаемым bucket и блок отвергается. Ошибка одного
+восстановленного bucket не превышает `max_bucket_value / 255`.
+`exact_score` не квантуется и используется для отбора и оценки качества
+range top.
 
 ## Identity сущности
 
@@ -415,11 +430,16 @@ API возвращает для неё `unavailable_revision`; фоновая п
 | dictionary entries на view | 1024 |
 | decoded `UiSummary` | 64 КиБ |
 | decoded `EntitySeries` view | 256 КиБ |
-| stored `EntitySeries` view | 128 КиБ |
+| stored `EntitySeries` view | 256 КиБ |
+| окно Zstd decompressor | 512 КиБ |
 | decoded source rows одного view | 64 МиБ |
 | дополнительная память builder `UiSummary` | 4 МиБ |
 | дополнительная память builder одного view | 32 МиБ |
 | одновременно строящихся view на writer | 1 |
+
+Stored-cap равен decoded-cap, поэтому валидный, но плохо сжимаемый view
+может быть записан без codec. Writer всё равно выбирает Zstd, когда он
+уменьшает тело хотя бы на минимальный установленный порог.
 
 Oversized directory entry отвергается до чтения тела. Декомпрессия,
 которая не укладывается в `decoded_len` или bound, прекращается

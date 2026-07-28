@@ -32,6 +32,7 @@ mod proptests;
 mod publish;
 #[cfg(any(test, feature = "qualification"))]
 mod qualification_fixture;
+mod web_index;
 
 pub use block::{
     BlockCodec, BlockError, BlockFlags, BlockKind, CounterSamplesBlock, EntityStateRecord,
@@ -73,6 +74,11 @@ pub use publish::{
     QUALIFICATION_PUBLISH_BARRIER_ENV, QUALIFICATION_PUBLISH_BARRIER_READY,
     QUALIFICATION_PUBLISH_BARRIER_RELEASE, QUALIFICATION_PUBLISH_FAULT_ENV,
 };
+pub use web_index::{
+    EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, IndexStatus,
+    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, TimeGrid, UiSummaryBlock, ViewSummary,
+};
+pub(crate) use web_index::{read_entity_series, read_ui_summary};
 
 #[cfg(feature = "qualification")]
 pub(crate) fn qualification_all_family_pgm() -> Vec<u8> {

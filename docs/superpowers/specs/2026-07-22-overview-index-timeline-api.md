@@ -492,10 +492,7 @@ ObservationProvenance {
 segment_lineage_id = SHA-256(
   "pgk-overview-lineage-v1" ||
   source_id ||
-  source_descriptor ||
-  first_catalog_entry_type ||
-  first_catalog_entry_descriptor_len_le ||
-  first_catalog_entry_content_descriptor
+  source_descriptor
 )
 
 observation_id = SHA-256(
@@ -509,14 +506,12 @@ observation_id = SHA-256(
 )
 ```
 
-`first_catalog_entry_content_descriptor` строится из полей каталога, не
-зависящих от смещения: `type`, `schema`, `flags`, `body_len`, `rows` и
-`body_crc32c`. Поэтому для вычисления происхождения не нужно читать
-не относящиеся к нему тела. `section_body_id` хеширует точное тело нужной
-секции вместе с `type_id` и длиной. `catalog_entry_ordinal` считается по всему
-каталогу сегмента и вместе с `row_ordinal` различает повторения одинакового
-тела внутри одного происхождения. Порядковые номера сохраняются после обычного
-запечатывания.
+`source_descriptor` уже включает упорядоченную раскладку всех записей
+каталога, поэтому отдельная копия первой записи в retained metadata не нужна.
+`section_body_id` хеширует точное тело нужной секции вместе с `type_id` и
+длиной. `catalog_entry_ordinal` считается по всему каталогу сегмента и вместе с
+`row_ordinal` различает повторения одинакового тела внутри одного
+происхождения. Порядковые номера сохраняются после обычного запечатывания.
 
 Гарантия ограничена текущим контрактом источника:
 
@@ -1118,17 +1113,24 @@ FactBuildKey = (FactKey, SegmentLineageId)
 
 ```text
 source_descriptor = SHA-256(
-  "pgk-pgm-catalog-descriptor-v1" ||
-  source_file_len_le ||
-  exact_tail_index_bytes ||
-  exact_raw_catalog_block_bytes
+  "pgk-pgm-catalog-layout-v1\0" ||
+  source_id_le ||
+  min_ts_le ||
+  max_ts_le ||
+  format_version_le ||
+  window_count_le ||
+  entry_count_u128_le ||
+  for each ordered entry (
+    offset_le || type_id_le || flags_le ||
+    body_len_le || rows_le || body_crc32c_le
+  )
 )
 ```
 
-Исходный каталог содержит идентификатор источника, диапазон, формат, а для
-каждой секции — тип, смещение, длину, число строк и CRC32C. Дескриптор тем
-самым связан с содержимым PGM в пределах модели целостности каталога и
-обнаруживает обычную замену или повреждение без чтения тел секций.
+Это тот же 32-байтовый `CatalogLayoutDigest`, который уже хранится в
+`CatalogSummary` и `SegmentDescriptor`; второй digest на каждый сегмент не
+удерживается. Дескриптор связан с содержимым PGM в пределах модели целостности
+каталога и обнаруживает обычную замену или повреждение без чтения тел секций.
 
 Модель угроз v1 предполагает, что PGM и OVF принадлежат одному доверенному
 пользователю операционной системы, а PGM после публикации неизменяем. CRC32C
