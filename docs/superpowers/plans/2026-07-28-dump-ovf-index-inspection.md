@@ -366,7 +366,7 @@ git commit -m "feat(dump): decode OVF web indexes"
 - Documents: filename dispatch, metadata output, `--rows`, `--limit`, and the
   absence of sibling provenance verification.
 
-- [ ] **Step 1: Update both READMEs**
+- [x] **Step 1: Update both READMEs**
 
 Add runnable examples:
 
@@ -383,7 +383,7 @@ State that `.ovf` selection is filename-based, metadata mode does not read
 bodies, and standalone inspection proves internal integrity but not sibling PGM
 ownership.
 
-- [ ] **Step 2: Run complete verification**
+- [x] **Step 2: Run complete verification**
 
 ```bash
 cargo fmt --all -- --check
