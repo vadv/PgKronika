@@ -110,6 +110,52 @@
         }
       }
     },
+    "/v1/ui/catalog": {
+      "get": {
+        "operationId": "uiCatalog",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/source" },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Source-aware stable UI projection catalog",
+            "headers": {
+              "ETag": {
+                "required": true,
+                "schema": { "type": "string", "pattern": "^\"sha256-[A-Za-z0-9_-]{43}\"$" }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UiProjectionCatalog" }
+              }
+            }
+          },
+          "304": {
+            "description": "The source-aware catalog matches If-None-Match",
+            "headers": {
+              "ETag": {
+                "required": true,
+                "schema": { "type": "string", "pattern": "^\"sha256-[A-Za-z0-9_-]{43}\"$" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
     "/v1/sections": {
       "get": {
         "operationId": "sections",
@@ -682,6 +728,173 @@
                 "pg_log": { "$ref": "#/components/schemas/PgLogSourceStatus" }
               }
             }
+          }
+        }
+      },
+      "UiAvailability": {
+        "type": "string",
+        "enum": ["available", "gated", "not_collected", "unsupported_type"]
+      },
+      "UiScope": {
+        "type": "string",
+        "enum": ["database", "host", "instance"]
+      },
+      "UiValueType": {
+        "type": "string",
+        "enum": ["i64", "u64", "f64", "bool", "text", "timestamp"]
+      },
+      "UiInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "logical_sections", "type_ids", "availability"],
+        "properties": {
+          "code": { "type": "string" },
+          "logical_sections": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "type_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "integer", "minimum": 1 }
+          },
+          "availability": { "$ref": "#/components/schemas/UiAvailability" }
+        }
+      },
+      "UiJoin": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["left", "right", "fields", "cardinality", "provenance"],
+        "properties": {
+          "left": { "type": "string" },
+          "right": { "type": "string" },
+          "fields": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "cardinality": { "type": "string" },
+          "provenance": { "type": "string" }
+        }
+      },
+      "UiMetric": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "revision", "unit", "aggregation", "formula", "requires", "availability"],
+        "properties": {
+          "code": { "type": "string" },
+          "revision": { "type": "integer", "minimum": 1 },
+          "unit": { "type": "string" },
+          "aggregation": { "type": "string" },
+          "formula": { "type": "string" },
+          "requires": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "availability": { "$ref": "#/components/schemas/UiAvailability" }
+        }
+      },
+      "UiColumn": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "type", "lazy", "requires", "availability"],
+        "properties": {
+          "code": { "type": "string" },
+          "type": { "$ref": "#/components/schemas/UiValueType" },
+          "source": { "type": "string" },
+          "formula": { "type": "string" },
+          "lazy": { "type": "boolean" },
+          "requires": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "availability": { "$ref": "#/components/schemas/UiAvailability" }
+        },
+        "anyOf": [
+          { "required": ["source"] },
+          { "required": ["formula"] }
+        ]
+      },
+      "UiSort": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["column", "order"],
+        "properties": {
+          "column": { "type": "string" },
+          "order": { "type": "string", "enum": ["asc", "desc"] }
+        }
+      },
+      "UiPreset": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "columns", "sort"],
+        "properties": {
+          "code": { "type": "string" },
+          "columns": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string" }
+          },
+          "sort": { "$ref": "#/components/schemas/UiSort" }
+        }
+      },
+      "UiView": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["view_code", "code", "view_revision", "scope", "identity_revision", "availability", "inputs", "joins", "metrics", "columns", "presets", "canonical_metric"],
+        "properties": {
+          "view_code": { "type": "integer", "minimum": 1, "maximum": 9 },
+          "code": {
+            "type": "string",
+            "enum": ["activity", "statements", "plans", "tables", "indexes", "vacuum", "processes", "locks", "events"]
+          },
+          "view_revision": { "type": "integer", "minimum": 1 },
+          "scope": { "$ref": "#/components/schemas/UiScope" },
+          "identity_revision": { "type": "integer", "minimum": 1 },
+          "availability": { "$ref": "#/components/schemas/UiAvailability" },
+          "inputs": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/components/schemas/UiInput" }
+          },
+          "joins": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/UiJoin" }
+          },
+          "metrics": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": { "$ref": "#/components/schemas/UiMetric" }
+          },
+          "columns": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/components/schemas/UiColumn" }
+          },
+          "presets": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/components/schemas/UiPreset" }
+          },
+          "canonical_metric": { "type": "string" }
+        }
+      },
+      "UiProjectionCatalog": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["revision", "views"],
+        "properties": {
+          "revision": { "type": "integer", "const": 1 },
+          "views": {
+            "type": "array",
+            "minItems": 9,
+            "maxItems": 9,
+            "items": { "$ref": "#/components/schemas/UiView" }
           }
         }
       },
@@ -2493,6 +2706,14 @@
           "section": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" }
         }
       },
+      "SourceParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source"],
+        "properties": {
+          "source": { "type": "integer", "minimum": 0 }
+        }
+      },
       "LimitParams": {
         "type": "object",
         "additionalProperties": false,
@@ -2528,6 +2749,7 @@
               "https://pgkronika.dev/problems/unknown-query-parameter",
               "https://pgkronika.dev/problems/duplicate-query-parameter",
               "https://pgkronika.dev/problems/invalid-query-constraint",
+              "https://pgkronika.dev/problems/unknown-source",
               "https://pgkronika.dev/problems/unknown-section",
               "https://pgkronika.dev/problems/invalid-cursor",
               "https://pgkronika.dev/problems/cursor-query-mismatch",
@@ -2544,7 +2766,7 @@
           "status": { "type": "integer", "enum": [400, 401, 404, 405, 410, 413, 500, 503] },
           "code": {
             "type": "string",
-            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "cold_build_overloaded", "store_read_failed", "internal_error"]
+            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_source", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "cold_build_overloaded", "store_read_failed", "internal_error"]
           },
           "params": { "type": "object" },
           "instance": { "type": "string", "format": "uri", "pattern": "^https://pgkronika\\.dev/problems/occurrences/[0-9a-f]{32}$" }
@@ -2558,6 +2780,7 @@
           { "if": { "properties": { "code": { "const": "unknown_query_parameter" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-query-parameter" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/UnknownParameterParams" } } } },
           { "if": { "properties": { "code": { "const": "duplicate_query_parameter" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/duplicate-query-parameter" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ParameterParams" } } } },
           { "if": { "properties": { "code": { "const": "invalid_query_constraint" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-query-constraint" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ConstraintParams" } } } },
+          { "if": { "properties": { "code": { "const": "unknown_source" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-source" }, "status": { "const": 404 }, "params": { "$ref": "#/components/schemas/SourceParams" } } } },
           { "if": { "properties": { "code": { "const": "unknown_section" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-section" }, "status": { "const": 404 }, "params": { "$ref": "#/components/schemas/SectionParams" } } } },
           { "if": { "properties": { "code": { "const": "invalid_cursor" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-cursor" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "cursor_query_mismatch" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-query-mismatch" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },

@@ -149,9 +149,9 @@ without arming global backoff.
 
 ## Endpoints
 
-For an unfamiliar store, start with `/v1/sources`, `/v1/sections`, and
-`/v1/segments`. They show what data exists before you request rows or run an
-analysis.
+For an unfamiliar store, start with `/v1/sources`, `/v1/ui/catalog`,
+`/v1/sections`, and `/v1/segments`. They show what data exists before you
+request rows or run an analysis.
 
 | Endpoint | Parameters | What the operator gets |
 | --- | --- | --- |
@@ -160,6 +160,7 @@ analysis.
 | `GET /metrics` | none | Exposes Prometheus metrics for reader errors, data age, HTTP requests, RSS, and open file descriptors. |
 | `GET /v1/version` | none | Identifies the JSON API version and the PGM format version served by this build. |
 | `GET /v1/sources` | none | Lists the collector sources present in the store, with the earliest and latest timestamp and the segment count for each source. |
+| `GET /v1/ui/catalog` | `source`; optional `If-None-Match` header | Returns the nine stable UI views with source-aware inputs, joins, metric formulas, columns, presets, and availability. It reads PGM catalog metadata only, returns a strong ETag, and answers a matching validator with `304`. |
 | `GET /v1/sections` | none | Shows which logical datasets can be queried and gives each dataset's semantics, sort key, and union of registered columns. |
 | `GET /v1/segments` | `source`, `from`, `to` | Shows which segments overlap the requested period and how many rows each section contains. It reads catalog metadata, not section bodies. |
 | `GET /v1/section/{name}` | `source`, `from`, `to`; optional `limit`, `cursor` | Returns the selected dataset as time-ordered rows. The response also names unreadable or missing intervals in `gaps` and supplies `next_cursor` when more rows remain. |
@@ -178,6 +179,13 @@ signed Unix timestamps in microseconds. Duration parameters accept `250ms`,
 `90s`, `15m`, `2h`, or bare seconds. Row endpoints return 1,000 rows by default
 and clamp `limit` to 10,000. Treat a cursor as opaque and pass it back unchanged
 on the next request.
+
+The UI catalog uses the closed availability set `available`, `gated`,
+`not_collected`, and `unsupported_type`. `processes.pss` remains
+`not_collected` until the collector writes bounded `smaps_rollup`; Activity
+CPU and I/O require both activity and process inputs. The serialized catalog
+has a 512 KiB hard ceiling. An absent source returns `404` with
+`code=unknown_source`.
 
 Timeline `from`/`to` ranges are half-open and limited to 31 days. Overview and
 health reject missing or repeated `source`; events canonicalizes a repeatable

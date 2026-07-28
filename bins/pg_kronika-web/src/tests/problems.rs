@@ -34,6 +34,10 @@ fn problem_example(code: ProblemCode) -> (ApiProblem, serde_json::Value) {
             ApiProblem::invalid_query_constraint(QueryConstraint::FromBeforeTo),
             serde_json::json!({ "constraint": "from_before_to" }),
         ),
+        ProblemCode::UnknownSource => (
+            ApiProblem::unknown_source(7),
+            serde_json::json!({ "source": 7 }),
+        ),
         ProblemCode::UnknownSection => (
             ApiProblem::unknown_section("unknown_section"),
             serde_json::json!({ "section": "unknown_section" }),
@@ -1050,6 +1054,7 @@ fn assert_v1_documented_paths(document: &serde_json::Value) {
             "/v1/timeline/events",
             "/v1/timeline/health",
             "/v1/timeline/overview",
+            "/v1/ui/catalog",
             "/v1/version",
         ]
     );
@@ -1066,6 +1071,7 @@ fn assert_v1_documented_paths(document: &serde_json::Value) {
         ("/v1/timeline/overview", "TimelineOverviewResponse"),
         ("/v1/timeline/events", "TimelineEventsResponse"),
         ("/v1/timeline/health", "TimelineHealthResponse"),
+        ("/v1/ui/catalog", "UiProjectionCatalog"),
         ("/v1/anomalies", "AnomalyResponse"),
         ("/v1/incidents", "IncidentResponse"),
     ];
@@ -1126,6 +1132,17 @@ fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
             .as_object()
             .expect("operation responses")
         {
+            if path == "/v1/ui/catalog" && status == "304" {
+                assert!(
+                    response["headers"]["ETag"]["schema"]["pattern"].is_string(),
+                    "catalog 304 repeats its strong ETag"
+                );
+                assert!(
+                    response.get("content").is_none(),
+                    "catalog 304 carries no representation body"
+                );
+                continue;
+            }
             if status != "200" {
                 let expected = match status.as_str() {
                     "401" => "#/components/responses/UnauthorizedProblem",

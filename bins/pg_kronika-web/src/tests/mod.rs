@@ -30,6 +30,7 @@ mod overview_timeline;
 mod probes_metrics;
 mod problems;
 mod sections;
+mod ui_catalog;
 mod version_diff;
 
 /// Process-global Prometheus recorder installed once for all tests.
