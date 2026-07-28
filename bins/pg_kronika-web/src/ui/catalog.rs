@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use kronika_analytics::web_projection::{WebView, web_view_by_name};
 use kronika_registry::registry;
 use serde::Serialize;
 
@@ -282,22 +283,30 @@ fn input(code: &'static str, logical_sections: &[&'static str]) -> InputSpec {
     }
 }
 
-fn metric(
-    code: &'static str,
-    unit: &'static str,
-    aggregation: &'static str,
-    formula: &'static str,
-    requires: &[&'static str],
-) -> MetricSpec {
-    MetricSpec {
-        code,
-        revision: 1,
-        unit,
-        aggregation,
-        formula,
-        requires: requires.to_vec(),
-        availability: Availability::Gated,
-    }
+fn projection(name: &str) -> &'static WebView {
+    web_view_by_name(name).expect("catalog view must exist in the shared projection registry")
+}
+
+fn projection_inputs(view: &WebView) -> Vec<InputSpec> {
+    view.inputs
+        .iter()
+        .map(|input_spec| input(input_spec.code, input_spec.sections))
+        .collect()
+}
+
+fn projection_metrics(view: &WebView) -> Vec<MetricSpec> {
+    view.metrics
+        .iter()
+        .map(|metric| MetricSpec {
+            code: metric.name,
+            revision: metric.revision,
+            unit: metric.unit.as_str(),
+            aggregation: metric.aggregation.as_str(),
+            formula: metric.formula.as_str(),
+            requires: metric.requires.to_vec(),
+            availability: Availability::Gated,
+        })
+        .collect()
 }
 
 fn raw_column(
@@ -367,35 +376,32 @@ fn preset(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ViewMeta {
-    view_code: u16,
-    code: &'static str,
+fn view(
+    projection: &'static WebView,
     scope: Scope,
-    canonical_metric: &'static str,
-}
-
-const fn view(
-    meta: ViewMeta,
-    inputs: Vec<InputSpec>,
     joins: Vec<JoinSpec>,
-    metrics: Vec<MetricSpec>,
     columns: Vec<ColumnSpec>,
     presets: Vec<PresetSpec>,
 ) -> ViewSpec {
+    let canonical_metric = projection
+        .metrics
+        .iter()
+        .find(|metric| metric.canonical)
+        .expect("shared projection has one canonical metric")
+        .name;
     ViewSpec {
-        view_code: meta.view_code,
-        code: meta.code,
-        view_revision: 1,
-        scope: meta.scope,
-        identity_revision: 1,
+        view_code: projection.code,
+        code: projection.name,
+        view_revision: projection.revision,
+        scope,
+        identity_revision: projection.identity_revision,
         availability: Availability::Gated,
-        inputs,
+        inputs: projection_inputs(projection),
         joins,
-        metrics,
+        metrics: projection_metrics(projection),
         columns,
         presets,
-        canonical_metric: meta.canonical_metric,
+        canonical_metric,
     }
 }
 
@@ -404,10 +410,7 @@ const fn view(
     reason = "the view is a declarative projection registry kept together for review"
 )]
 fn activity_view() -> ViewSpec {
-    let inputs = vec![
-        input("activity", &["pg_stat_activity"]),
-        input("process", &["os_process"]),
-    ];
+    let projection = projection("activity");
     let joins = vec![JoinSpec {
         left: "activity",
         right: "process",
@@ -415,36 +418,6 @@ fn activity_view() -> ViewSpec {
         cardinality: "zero_or_one",
         provenance: "pid_and_process_start_match",
     }];
-    let metrics = vec![
-        metric(
-            "wait",
-            "us",
-            "sum",
-            "sum(observed_wait_duration_us)",
-            &["activity"],
-        ),
-        metric(
-            "cpu",
-            "ratio",
-            "max",
-            "positive_delta(utime + stime) / elapsed",
-            &["activity", "process"],
-        ),
-        metric(
-            "io",
-            "bytes_per_second",
-            "max",
-            "positive_delta(read_bytes + write_bytes) / elapsed",
-            &["activity", "process"],
-        ),
-        metric(
-            "active_fraction",
-            "ratio",
-            "max",
-            "active_samples / observed_samples",
-            &["activity"],
-        ),
-    ];
     let columns = vec![
         raw_column("pid", ValueType::I64, "activity.pid", false, &["activity"]),
         raw_column(
@@ -547,19 +520,7 @@ fn activity_view() -> ViewSpec {
             "desc",
         ),
     ];
-    view(
-        ViewMeta {
-            view_code: 1,
-            code: "activity",
-            scope: Scope::Database,
-            canonical_metric: "active_fraction",
-        },
-        inputs,
-        joins,
-        metrics,
-        columns,
-        presets,
-    )
+    view(projection, Scope::Database, joins, columns, presets)
 }
 
 #[allow(
@@ -567,36 +528,7 @@ fn activity_view() -> ViewSpec {
     reason = "the view is a declarative projection registry kept together for review"
 )]
 fn statements_view() -> ViewSpec {
-    let metrics = vec![
-        metric(
-            "time",
-            "us",
-            "sum",
-            "sum(positive_delta(total_exec_time))",
-            &["statements"],
-        ),
-        metric(
-            "calls",
-            "count",
-            "sum",
-            "sum(positive_delta(calls))",
-            &["statements"],
-        ),
-        metric(
-            "io",
-            "blocks",
-            "sum",
-            "sum(positive_delta(shared_blks_read + local_blks_read))",
-            &["statements"],
-        ),
-        metric(
-            "temp",
-            "blocks",
-            "sum",
-            "sum(positive_delta(temp_blks_written))",
-            &["statements"],
-        ),
-    ];
+    let projection = projection("statements");
     let columns = vec![
         raw_column(
             "queryid",
@@ -687,50 +619,14 @@ fn statements_view() -> ViewSpec {
             "desc",
         ),
     ];
-    view(
-        ViewMeta {
-            view_code: 2,
-            code: "statements",
-            scope: Scope::Database,
-            canonical_metric: "time",
-        },
-        vec![input("statements", &["pg_stat_statements"])],
-        Vec::new(),
-        metrics,
-        columns,
-        presets,
-    )
+    view(projection, Scope::Database, Vec::new(), columns, presets)
 }
 
 fn plans_view() -> ViewSpec {
     view(
-        ViewMeta {
-            view_code: 3,
-            code: "plans",
-            scope: Scope::Database,
-            canonical_metric: "time",
-        },
-        vec![input(
-            "plans",
-            &["pg_store_plans_ossc", "pg_store_plans_vadv"],
-        )],
+        projection("plans"),
+        Scope::Database,
         Vec::new(),
-        vec![
-            metric(
-                "time",
-                "us",
-                "sum",
-                "sum(positive_delta(total_time)) * 1000",
-                &["plans"],
-            ),
-            metric(
-                "calls",
-                "count",
-                "sum",
-                "sum(positive_delta(calls))",
-                &["plans"],
-            ),
-        ],
         vec![
             raw_column("planid", ValueType::I64, "plans.planid", false, &["plans"]),
             raw_column("plan", ValueType::Text, "plans.plan", true, &["plans"]),
@@ -780,37 +676,9 @@ fn plans_view() -> ViewSpec {
 
 fn tables_view() -> ViewSpec {
     view(
-        ViewMeta {
-            view_code: 4,
-            code: "tables",
-            scope: Scope::Database,
-            canonical_metric: "writes",
-        },
-        vec![input("tables", &["pg_stat_user_tables"])],
+        projection("tables"),
+        Scope::Database,
         Vec::new(),
-        vec![
-            metric(
-                "io",
-                "blocks",
-                "sum",
-                "sum(positive_delta(heap_blks_read + idx_blks_read + toast_blks_read + tidx_blks_read))",
-                &["tables"],
-            ),
-            metric(
-                "writes",
-                "count",
-                "sum",
-                "sum(positive_delta(n_tup_ins + n_tup_upd + n_tup_del))",
-                &["tables"],
-            ),
-            metric(
-                "dead",
-                "ratio",
-                "max",
-                "max(n_dead_tup / max(n_live_tup + n_dead_tup, 1))",
-                &["tables"],
-            ),
-        ],
         vec![
             derived_column(
                 "relation",
@@ -872,30 +740,9 @@ fn tables_view() -> ViewSpec {
 
 fn indexes_view() -> ViewSpec {
     view(
-        ViewMeta {
-            view_code: 5,
-            code: "indexes",
-            scope: Scope::Database,
-            canonical_metric: "scans",
-        },
-        vec![input("indexes", &["pg_stat_user_indexes"])],
+        projection("indexes"),
+        Scope::Database,
         Vec::new(),
-        vec![
-            metric(
-                "io",
-                "blocks",
-                "sum",
-                "sum(positive_delta(idx_blks_read))",
-                &["indexes"],
-            ),
-            metric(
-                "scans",
-                "count",
-                "sum",
-                "sum(positive_delta(idx_scan))",
-                &["indexes"],
-            ),
-        ],
         vec![
             raw_column(
                 "index",
@@ -939,21 +786,9 @@ fn indexes_view() -> ViewSpec {
 
 fn vacuum_view() -> ViewSpec {
     view(
-        ViewMeta {
-            view_code: 6,
-            code: "vacuum",
-            scope: Scope::Database,
-            canonical_metric: "progress",
-        },
-        vec![input("vacuum", &["pg_stat_progress_vacuum"])],
+        projection("vacuum"),
+        Scope::Database,
         Vec::new(),
-        vec![metric(
-            "progress",
-            "ratio",
-            "max",
-            "max(heap_blks_scanned / max(heap_blks_total, 1))",
-            &["vacuum"],
-        )],
         vec![
             raw_column("pid", ValueType::I64, "vacuum.pid", false, &["vacuum"]),
             raw_column("table", ValueType::U64, "vacuum.relid", false, &["vacuum"]),
@@ -1047,30 +882,9 @@ fn processes_view() -> ViewSpec {
     ];
     columns.shrink_to_fit();
     view(
-        ViewMeta {
-            view_code: 7,
-            code: "processes",
-            scope: Scope::Host,
-            canonical_metric: "cpu",
-        },
-        vec![input("process", &["os_process"])],
+        projection("processes"),
+        Scope::Host,
         Vec::new(),
-        vec![
-            metric(
-                "cpu",
-                "ratio",
-                "max",
-                "positive_delta(utime + stime) / elapsed",
-                &["process"],
-            ),
-            metric(
-                "io",
-                "bytes_per_second",
-                "max",
-                "positive_delta(read_bytes + write_bytes) / elapsed",
-                &["process"],
-            ),
-        ],
         columns,
         vec![
             preset(
@@ -1104,21 +918,9 @@ fn processes_view() -> ViewSpec {
 
 fn locks_view() -> ViewSpec {
     view(
-        ViewMeta {
-            view_code: 8,
-            code: "locks",
-            scope: Scope::Database,
-            canonical_metric: "wait",
-        },
-        vec![input("locks", &["pg_locks"])],
+        projection("locks"),
+        Scope::Database,
         Vec::new(),
-        vec![metric(
-            "wait",
-            "us",
-            "max",
-            "max(proven_wait_or_hold_duration_us)",
-            &["locks"],
-        )],
         vec![
             raw_column("pid", ValueType::I64, "locks.pid", false, &["locks"]),
             derived_column(
@@ -1179,29 +981,10 @@ fn locks_view() -> ViewSpec {
 }
 
 fn events_view() -> ViewSpec {
-    let event_sections: Vec<&'static str> = registry()
-        .iter()
-        .filter(|contract| contract.name.starts_with("pg_log_"))
-        .map(|contract| contract.name)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
     view(
-        ViewMeta {
-            view_code: 9,
-            code: "events",
-            scope: Scope::Instance,
-            canonical_metric: "count",
-        },
-        vec![input("events", &event_sections)],
+        projection("events"),
+        Scope::Instance,
         Vec::new(),
-        vec![metric(
-            "count",
-            "count",
-            "sum",
-            "count(events)",
-            &["events"],
-        )],
         vec![
             raw_column(
                 "time",
