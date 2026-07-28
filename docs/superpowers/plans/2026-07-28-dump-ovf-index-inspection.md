@@ -34,7 +34,7 @@
 - Produces: `FactFileReader<R>::read_entity_series(view_code, bounds) -> Result<Option<EntitySeriesBlock>, CacheReadError>`.
 - Preserves: `open` продолжает возвращать `WrongSource` при несовпадении expected identity.
 
-- [ ] **Step 1: Write failing reader tests**
+- [x] **Step 1: Write failing reader tests**
 
 Добавить рядом с тестами `FactFileReader::open`:
 
@@ -60,7 +60,7 @@ fn positional_inspection_rejects_an_invalid_embedded_fact_key() {
 }
 ```
 
-- [ ] **Step 2: Run the focused reader tests and verify RED**
+- [x] **Step 2: Run the focused reader tests and verify RED**
 
 ```bash
 cargo test -p kronika-reader overview::container::tests::positional_inspection \
@@ -69,7 +69,7 @@ cargo test -p kronika-reader overview::container::tests::positional_inspection \
 
 Expected: compile failure because `FactFileReader::inspect` does not exist.
 
-- [ ] **Step 3: Factor common metadata admission**
+- [x] **Step 3: Factor common metadata admission**
 
 Implement:
 
@@ -103,7 +103,7 @@ if lineage.id() != header.identity.segment_lineage_id {
 
 and invokes `verify_identity` only when `expected` is present.
 
-- [ ] **Step 4: Add typed web-index reads**
+- [x] **Step 4: Add typed web-index reads**
 
 Move the body of the current crate-private `read_ui_summary` and
 `read_entity_series` helpers into public inherent methods on
@@ -124,7 +124,7 @@ let summary = fact_reader.read_ui_summary(bounds)?;
 Ok((summary, fact_reader.stats()))
 ```
 
-- [ ] **Step 5: Run reader tests and verify GREEN**
+- [x] **Step 5: Run reader tests and verify GREEN**
 
 ```bash
 cargo test -p kronika-reader overview::container::tests::positional_inspection \
@@ -135,7 +135,7 @@ cargo test -p kronika-reader overview::container \
 
 Expected: both commands pass.
 
-- [ ] **Step 6: Commit reader API**
+- [x] **Step 6: Commit reader API**
 
 ```bash
 git add crates/kronika-reader/src/overview/container.rs \

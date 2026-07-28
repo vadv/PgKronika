@@ -632,6 +632,26 @@ pub struct FactFileReader<R: ReadAt> {
 }
 
 impl<R: ReadAt> FactFileReader<R> {
+    /// Reads fixed metadata and validates the identity carried by the file.
+    ///
+    /// Unlike [`Self::open`], standalone inspection does not bind the fact file
+    /// to an externally supplied PGM identity. It still verifies the
+    /// content-derived fact key and sealed segment lineage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheReadError`] when metadata, embedded identity, or a safety
+    /// bound is invalid.
+    pub fn inspect(reader: R, bounds: &Bounds) -> Result<Self, CacheReadError> {
+        let file = Self::open_inner(reader, None, bounds)?;
+        let identity = &file.header.identity;
+        let lineage = SegmentIdentity::sealed(identity.pgm_source_id, identity.source_descriptor.0);
+        if lineage.id() != identity.segment_lineage_id {
+            return Err(CacheReadError::Corrupt);
+        }
+        Ok(file)
+    }
+
     /// Reads only the fixed header and bounded directory.
     ///
     /// # Errors
@@ -643,6 +663,17 @@ impl<R: ReadAt> FactFileReader<R> {
         bounds: &Bounds,
     ) -> Result<Self, CacheReadError> {
         validate_api_inputs(expected, bounds)?;
+        Self::open_inner(reader, Some(expected), bounds)
+    }
+
+    fn open_inner(
+        reader: R,
+        expected: Option<&HeaderIdentity>,
+        bounds: &Bounds,
+    ) -> Result<Self, CacheReadError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(CacheReadError::Oversized);
+        }
         let file_len = reader.byte_len()?;
         if file_len > bounds.fact_file_len {
             return Err(CacheReadError::Oversized);
@@ -654,7 +685,10 @@ impl<R: ReadAt> FactFileReader<R> {
         let mut header_bytes = [0_u8; HEADER_LEN];
         reader.read_exact_at(&mut header_bytes, 0)?;
         let (header, directory_crc) = decode_header(&header_bytes)?;
-        verify_identity(&header.identity, expected)?;
+        validate_api_inputs(&header.identity, bounds)?;
+        if let Some(expected) = expected {
+            verify_identity(&header.identity, expected)?;
+        }
         if header.file_len != file_len {
             return Err(CacheReadError::Corrupt);
         }
@@ -2653,6 +2687,26 @@ mod tests {
     }
 
     #[test]
+    fn positional_inspection_admits_metadata_without_external_identity() {
+        let bytes = valid_file();
+        let reader = FactFileReader::inspect(bytes.as_slice(), &LIMIT).expect("inspect");
+        assert_eq!(reader.header().file_len, bytes.len() as u64);
+        assert_eq!(reader.directory().len(), BlockKind::BASELINE.len());
+        assert_eq!(reader.stats().read_calls, 2);
+    }
+
+    #[test]
+    fn positional_inspection_rejects_an_invalid_embedded_fact_key() {
+        let mut bytes = valid_file();
+        bytes[96] ^= 1;
+        reseal_header(&mut bytes);
+        assert!(matches!(
+            FactFileReader::inspect(bytes.as_slice(), &LIMIT),
+            Err(CacheReadError::Corrupt)
+        ));
+    }
+
+    #[test]
     fn positional_reader_reads_only_metadata_and_selected_bodies() {
         let bytes = valid_file();
         let calls = Rc::new(Cell::new(0));
@@ -2768,6 +2822,39 @@ mod tests {
             series
                 .iter()
                 .all(|entry| entry.flags.codec == BlockCodec::Zstd)
+        );
+    }
+
+    #[test]
+    fn positional_inspection_reads_typed_web_index_blocks() {
+        let bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::EntitySeries(Box::new(web_series_block(1, 1))),
+            ],
+            &LIMIT,
+        )
+        .expect("build web index");
+        let mut reader = FactFileReader::inspect(bytes.as_slice(), &LIMIT).expect("inspect");
+
+        assert!(
+            reader
+                .read_ui_summary(&LIMIT)
+                .expect("summary")
+                .views()
+                .is_empty()
+        );
+        let series = reader
+            .read_entity_series(1, &LIMIT)
+            .expect("series read")
+            .expect("series block");
+        assert_eq!(series.view_code(), 1);
+        assert_eq!(
+            reader
+                .read_entity_series(2, &LIMIT)
+                .expect("missing series"),
+            None
         );
     }
 
