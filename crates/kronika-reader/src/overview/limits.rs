@@ -32,6 +32,28 @@ pub struct Bounds {
     pub pattern_bytes: u64,
     /// Largest accepted decoded string-table size, bytes.
     pub string_table_bytes: u64,
+    /// Largest accepted view count in one web summary.
+    pub web_summary_views: u64,
+    /// Largest accepted union timestamp count in one web summary.
+    pub web_summary_timestamps: u64,
+    /// Largest accepted metric count in one entity-series view.
+    pub web_metrics_per_view: u64,
+    /// Largest accepted retained series count for one metric.
+    pub web_series_per_metric: u64,
+    /// Largest accepted bucket count in one web-index grid.
+    pub web_buckets: u64,
+    /// Largest accepted typed entity identity, bytes.
+    pub web_identity_bytes: u64,
+    /// Largest accepted entity display label, bytes.
+    pub web_label_bytes: u64,
+    /// Largest accepted entity dictionary entry count in one view.
+    pub web_dictionary_entries: u64,
+    /// Largest accepted decoded `UiSummary` body, bytes.
+    pub web_summary_decoded_bytes: u64,
+    /// Largest accepted decoded `EntitySeries` body, bytes.
+    pub web_series_decoded_bytes: u64,
+    /// Largest accepted stored `EntitySeries` body, bytes.
+    pub web_series_stored_bytes: u64,
 }
 
 impl Bounds {
@@ -48,6 +70,17 @@ impl Bounds {
             && self.coverage_spans <= LIMIT.coverage_spans
             && self.pattern_bytes <= LIMIT.pattern_bytes
             && self.string_table_bytes <= LIMIT.string_table_bytes
+            && self.web_summary_views <= LIMIT.web_summary_views
+            && self.web_summary_timestamps <= LIMIT.web_summary_timestamps
+            && self.web_metrics_per_view <= LIMIT.web_metrics_per_view
+            && self.web_series_per_metric <= LIMIT.web_series_per_metric
+            && self.web_buckets <= LIMIT.web_buckets
+            && self.web_identity_bytes <= LIMIT.web_identity_bytes
+            && self.web_label_bytes <= LIMIT.web_label_bytes
+            && self.web_dictionary_entries <= LIMIT.web_dictionary_entries
+            && self.web_summary_decoded_bytes <= LIMIT.web_summary_decoded_bytes
+            && self.web_series_decoded_bytes <= LIMIT.web_series_decoded_bytes
+            && self.web_series_stored_bytes <= LIMIT.web_series_stored_bytes
     }
 
     pub(crate) const fn admits_profile(self, admitted: Self) -> bool {
@@ -65,10 +98,21 @@ impl Bounds {
             && self.coverage_spans >= admitted.coverage_spans
             && self.pattern_bytes >= admitted.pattern_bytes
             && self.string_table_bytes >= admitted.string_table_bytes
+            && self.web_summary_views >= admitted.web_summary_views
+            && self.web_summary_timestamps >= admitted.web_summary_timestamps
+            && self.web_metrics_per_view >= admitted.web_metrics_per_view
+            && self.web_series_per_metric >= admitted.web_series_per_metric
+            && self.web_buckets >= admitted.web_buckets
+            && self.web_identity_bytes >= admitted.web_identity_bytes
+            && self.web_label_bytes >= admitted.web_label_bytes
+            && self.web_dictionary_entries >= admitted.web_dictionary_entries
+            && self.web_summary_decoded_bytes >= admitted.web_summary_decoded_bytes
+            && self.web_series_decoded_bytes >= admitted.web_series_decoded_bytes
+            && self.web_series_stored_bytes >= admitted.web_series_stored_bytes
     }
 }
 
-/// The version-1 admission bounds.
+/// The format admission bounds.
 pub const LIMIT: Bounds = Bounds {
     fact_file_len: 512 * MIB,
     directory_entries: 4096,
@@ -82,6 +126,17 @@ pub const LIMIT: Bounds = Bounds {
     coverage_spans: 262_144,
     pattern_bytes: 64 * KIB,
     string_table_bytes: 64 * MIB,
+    web_summary_views: 32,
+    web_summary_timestamps: 4_096,
+    web_metrics_per_view: 16,
+    web_series_per_metric: 64,
+    web_buckets: 256,
+    web_identity_bytes: 256,
+    web_label_bytes: 160,
+    web_dictionary_entries: 1_024,
+    web_summary_decoded_bytes: 64 * KIB,
+    web_series_decoded_bytes: 256 * KIB,
+    web_series_stored_bytes: 128 * KIB,
 };
 
 const KIB: u64 = 1_024;
@@ -106,5 +161,16 @@ mod tests {
         assert_eq!(LIMIT.coverage_spans, 262_144);
         assert_eq!(LIMIT.pattern_bytes, 65_536);
         assert_eq!(LIMIT.string_table_bytes, 67_108_864);
+        assert_eq!(LIMIT.web_summary_views, 32);
+        assert_eq!(LIMIT.web_summary_timestamps, 4_096);
+        assert_eq!(LIMIT.web_metrics_per_view, 16);
+        assert_eq!(LIMIT.web_series_per_metric, 64);
+        assert_eq!(LIMIT.web_buckets, 256);
+        assert_eq!(LIMIT.web_identity_bytes, 256);
+        assert_eq!(LIMIT.web_label_bytes, 160);
+        assert_eq!(LIMIT.web_dictionary_entries, 1_024);
+        assert_eq!(LIMIT.web_summary_decoded_bytes, 65_536);
+        assert_eq!(LIMIT.web_series_decoded_bytes, 262_144);
+        assert_eq!(LIMIT.web_series_stored_bytes, 131_072);
     }
 }

@@ -29,6 +29,7 @@ use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
+use zstd as _;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;

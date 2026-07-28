@@ -2061,6 +2061,7 @@ mod tests {
 
     use super::super::limits::LIMIT;
     use super::super::qualification_fixture::{ALL_FAMILY_SCHEMA_VERSION, all_family_fixture};
+    use super::super::web_index::UiSummaryBlock;
     use super::*;
 
     const LIMITS: OracleLimits = OracleLimits {
@@ -3181,6 +3182,22 @@ mod tests {
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
         let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let encoded = raw.encode(&LIMIT).expect("encode fact file");
+        let admitted =
+            FactFile::admit(&encoded, raw.identity(), raw.lineage(), &LIMIT).expect("admit OVF");
+        let summary_entry = admitted
+            .directory()
+            .iter()
+            .find(|entry| entry.block_kind == BlockKind::UiSummary.code())
+            .expect("mandatory UI summary");
+        assert_eq!(summary_entry.logical_id, 0);
+        let summary = UiSummaryBlock::decode(
+            admitted
+                .block_body(BlockKind::UiSummary)
+                .expect("uncompressed UI summary body"),
+            &LIMIT,
+        )
+        .expect("decode UI summary");
+        assert_eq!(summary, UiSummaryBlock::empty());
         let index = SegmentFacts::from_bytes(
             &encoded,
             raw.identity(),
@@ -3396,7 +3413,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.block_kind)
                 .collect::<Vec<_>>(),
-            BlockKind::ALL
+            BlockKind::BASELINE
                 .into_iter()
                 .map(BlockKind::code)
                 .collect::<Vec<_>>(),
@@ -3405,10 +3422,10 @@ mod tests {
 
         for entry in admitted.directory() {
             if entry.stored_len == 0 {
-                assert_eq!(
-                    entry.block_kind,
-                    BlockKind::StringTable.code(),
-                    "only the fixture's intentionally text-free string table is empty"
+                assert!(
+                    [BlockKind::StringTable.code(), BlockKind::UiSummary.code()]
+                        .contains(&entry.block_kind),
+                    "only the text-free string table and unbuilt web summary are empty"
                 );
                 continue;
             }
@@ -3441,7 +3458,7 @@ mod tests {
             .entries
             .clone();
         assert!(
-            catalog.len() > BlockKind::ALL.len(),
+            catalog.len() > BlockKind::BASELINE.len(),
             "the source fixture must exercise repeated section layouts"
         );
 

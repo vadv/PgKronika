@@ -21,6 +21,8 @@
 use std::io::Write as _;
 use std::path::Path;
 
+use zstd as _;
+
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
 use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId, WriterOwner};

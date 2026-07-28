@@ -17,6 +17,7 @@ use super::container::{BlockContent, FactFile, HeaderIdentity};
 use super::descriptors::{ManifestEntryDescriptor, SourceDescriptor};
 use super::limits::LIMIT;
 use super::observations::EventObservationsBlock;
+use super::web_index::{EntitySeriesBlock, UiSummaryBlock};
 
 fn identity() -> HeaderIdentity {
     let lineage = lineage();
@@ -101,6 +102,8 @@ proptest! {
             &strings,
             &LIMIT,
         ));
+        drop(UiSummaryBlock::decode(&bytes, &LIMIT));
+        drop(EntitySeriesBlock::decode(&bytes, &LIMIT));
     }
 
     #[test]

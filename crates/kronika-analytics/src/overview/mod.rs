@@ -88,8 +88,9 @@ pub const CONTAINER_VERSION: u16 = 2;
 
 /// Canonical fact schema version.
 ///
-/// Version 3 uses the numeric PGM source ID throughout canonical facts.
-pub const FACT_SCHEMA_VERSION: u32 = 3;
+/// The schema includes the mandatory web summary and view-addressed entity
+/// series blocks.
+pub const FACT_SCHEMA_VERSION: u32 = 4;
 
 /// Version for PGM-to-fact extraction and normalization.
 ///

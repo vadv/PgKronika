@@ -24,6 +24,7 @@ arrow-schema = "55"
 parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
 sha2 = "0.10"
 rustix = { version = "1", features = ["fs"] }
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 kronika-writer = { path = "../kronika-writer" }
