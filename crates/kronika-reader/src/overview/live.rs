@@ -212,7 +212,6 @@ pub struct LiveBuilder {
     folded_parts: Vec<PartDescriptor>,
     chunks: Vec<Arc<SegmentFacts>>,
     usage: LiveUsage,
-    source_id: Option<u64>,
     watermark_us: Option<i64>,
     folded_through_offset: u64,
     completed_tail_pending: Option<ByteRange>,
@@ -240,7 +239,6 @@ impl LiveBuilder {
             folded_parts: Vec::new(),
             chunks: Vec::new(),
             usage: LiveUsage::default(),
-            source_id: None,
             watermark_us: None,
             folded_through_offset: 0,
             completed_tail_pending: None,
@@ -528,19 +526,10 @@ impl LiveBuilder {
             return Err(LiveFoldError::DescriptorMismatch);
         }
         let catalog = unit.catalog();
-        if part.source_id != catalog.source_id
-            || part.min_ts != catalog.min_ts
+        if part.min_ts != catalog.min_ts
             || part.max_ts != catalog.max_ts
             || part.part_id.body_len != unit.source_file_len()
             || part.part_id.catalog_digest != refresh_catalog_digest(catalog)
-        {
-            self.invalidate_pending(LiveState::Incomplete);
-            return Err(LiveFoldError::DescriptorMismatch);
-        }
-        if part.source_id != 0
-            && self
-                .source_id
-                .is_some_and(|source_id| source_id != part.source_id)
         {
             self.invalidate_pending(LiveState::Incomplete);
             return Err(LiveFoldError::DescriptorMismatch);
@@ -583,9 +572,6 @@ impl LiveBuilder {
         self.folded_part_ids.insert(part.part_id);
         self.folded_parts.push(*part);
         self.usage = usage;
-        if part.source_id != 0 {
-            self.source_id = Some(part.source_id);
-        }
         if part.min_ts <= part.max_ts {
             self.watermark_us = Some(
                 self.watermark_us
@@ -602,7 +588,6 @@ impl LiveBuilder {
         self.folded_parts.clear();
         self.chunks.clear();
         self.usage = LiveUsage::default();
-        self.source_id = None;
         self.watermark_us = None;
         self.folded_through_offset = 0;
         self.completed_tail_pending = None;
@@ -624,7 +609,6 @@ impl LiveBuilder {
             view_generation: self.view_generation,
             generation: self.generation,
             state: self.state,
-            source_id: self.source_id,
             watermark_us: self.watermark_us,
             folded_through_offset: self.folded_through_offset,
             tail_pending: self.completed_tail_pending,
@@ -738,7 +722,6 @@ pub struct LiveView {
     view_generation: u64,
     generation: JournalGenerationId,
     state: LiveState,
-    source_id: Option<u64>,
     watermark_us: Option<i64>,
     folded_through_offset: u64,
     tail_pending: Option<ByteRange>,
@@ -762,12 +745,6 @@ impl LiveView {
     #[must_use]
     pub const fn state(&self) -> LiveState {
         self.state
-    }
-
-    /// Numeric source represented by the active journal, when established.
-    #[must_use]
-    pub const fn source_id(&self) -> Option<u64> {
-        self.source_id
     }
 
     /// Whether the view is a promotion-eligible `Current` view.
@@ -1027,11 +1004,7 @@ mod tests {
                 rows: u32::try_from(rows.len()).expect("row count fits"),
                 body: &body,
             }],
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: 7,
-            },
+            PartMeta { min_ts, max_ts },
         )
     }
 
@@ -1085,7 +1058,6 @@ mod tests {
             PartMeta {
                 min_ts: ts,
                 max_ts: ts,
-                source_id: 7,
             },
         );
         (bytes, sections)
@@ -1115,22 +1087,12 @@ mod tests {
             PartMeta {
                 min_ts: i64::MAX,
                 max_ts: i64::MIN,
-                source_id: 0,
             },
         );
         (bytes, sections)
     }
 
     fn seal_sections(sections: &[(u32, u32, Vec<u8>)], min_ts: i64, max_ts: i64) -> Vec<u8> {
-        seal_sections_for_source(sections, min_ts, max_ts, 7)
-    }
-
-    fn seal_sections_for_source(
-        sections: &[(u32, u32, Vec<u8>)],
-        min_ts: i64,
-        max_ts: i64,
-        source_id: u64,
-    ) -> Vec<u8> {
         let inputs: Vec<_> = sections
             .iter()
             .map(|(type_id, rows, body)| SectionInput {
@@ -1139,14 +1101,7 @@ mod tests {
                 body,
             })
             .collect();
-        build_part(
-            &inputs,
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id,
-            },
-        )
+        build_part(&inputs, PartMeta { min_ts, max_ts })
     }
 
     fn sealed_context() -> SegmentContext {
@@ -1176,7 +1131,6 @@ mod tests {
                 u64::try_from(bytes.len()).expect("len fits"),
                 unit.catalog(),
             ),
-            source_id: unit.catalog().source_id,
             min_ts: unit.catalog().min_ts,
             max_ts: unit.catalog().max_ts,
         }
@@ -1695,10 +1649,8 @@ mod tests {
         );
         let delta = complete_delta(&builder, vec![expected], PartTransition::Append);
         builder.begin_refresh(&delta).expect("begin refresh");
-        let descriptor = PartDescriptor {
-            source_id: unit.catalog().source_id + 1,
-            ..expected
-        };
+        let mut descriptor = expected;
+        descriptor.part_id.frame_offset += 1;
 
         assert_eq!(
             builder.fold_part(&descriptor, &unit),
@@ -1822,11 +1774,7 @@ mod tests {
                 rows: u32::try_from(rows.len()).expect("row count fits"),
                 body: &body,
             }],
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: 7,
-            },
+            PartMeta { min_ts, max_ts },
         )
     }
 
@@ -2008,9 +1956,9 @@ mod tests {
     }
 
     #[test]
-    fn source_zero_parts_promote_when_descriptors_match() {
+    fn matching_single_root_parts_promote() {
         let (dictionary_bytes, sections) = dictionary_only_part();
-        let sealed_bytes = seal_sections_for_source(&sections, 0, 0, 0);
+        let sealed_bytes = seal_sections(&sections, 0, 0);
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed dictionary");
         let mut builder = LiveBuilder::new(LIMIT).expect("valid live builder");
         fold_bytes(&mut builder, &[dictionary_bytes.as_slice()]);
@@ -2261,8 +2209,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SemanticEvent {
         event_id: [u8; 32],
-        source_id: u64,
-        source_type_id: u32,
+        section_type_id: u32,
         sort_ts_us: i64,
         occurrence_count: u64,
         payload: ObservationPayload,
@@ -2275,26 +2222,18 @@ mod tests {
             .map(|observation| SemanticEvent {
                 event_id: notable_event_id(observation)
                     .expect("lifecycle observations have a stable public identity"),
-                source_id: observation.source_id(),
-                source_type_id: observation.source_type_id(),
+                section_type_id: observation.section_type_id(),
                 sort_ts_us: observation.time().sort_ts_us,
                 occurrence_count: observation.occurrence_count(),
                 payload: observation.payload().clone(),
             })
             .collect::<Vec<_>>();
         events.sort_by(|left, right| {
-            (
-                left.sort_ts_us,
-                left.event_id,
-                left.source_id,
-                left.source_type_id,
-            )
-                .cmp(&(
-                    right.sort_ts_us,
-                    right.event_id,
-                    right.source_id,
-                    right.source_type_id,
-                ))
+            (left.sort_ts_us, left.event_id, left.section_type_id).cmp(&(
+                right.sort_ts_us,
+                right.event_id,
+                right.section_type_id,
+            ))
         });
         events
     }
@@ -2646,7 +2585,6 @@ mod tests {
             PartMeta {
                 min_ts: 1_500,
                 max_ts: 2_000,
-                source_id: 7,
             },
         )
     }
@@ -2680,7 +2618,6 @@ mod tests {
             PartMeta {
                 min_ts: i64::MAX,
                 max_ts: i64::MIN,
-                source_id: 7,
             },
         )
     }

@@ -49,7 +49,6 @@ use sha2 as _;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const SECTION: &str = "pg_stat_statements";
-const SOURCE: u64 = 7;
 const FIRST_WINDOW_US: i64 = 1_000;
 /// Query text interned per row so the `str_id` resolve path returns a real
 /// string; the row's `queryid` seeds it so distinct queries get distinct text.
@@ -322,14 +321,7 @@ fn build_fixture(dir: &Path, n: usize, shape: SortKeyShape) {
 
     let min_ts = base_ts;
     let max_ts = base_ts + i64::try_from(n).expect("row count fits i64");
-    let part = build_part(
-        &inputs,
-        PartMeta {
-            min_ts,
-            max_ts,
-            source_id: SOURCE,
-        },
-    );
+    let part = build_part(&inputs, PartMeta { min_ts, max_ts });
     let root = DataRoot::open(dir).expect("open fixture root");
     let owner = root
         .acquire_writer(LayoutLimits::default())
@@ -365,16 +357,8 @@ fn bench_section_query(c: &mut Criterion) {
             // Warm the page cache and the decode path once before measuring.
             {
                 let mut warm = snap.clone();
-                let warmed = section(
-                    &mut warm,
-                    SECTION,
-                    SOURCE,
-                    i64::MIN,
-                    i64::MAX,
-                    100_000,
-                    None,
-                )
-                .expect("warm section");
+                let warmed = section(&mut warm, SECTION, i64::MIN, i64::MAX, 100_000, None)
+                    .expect("warm section");
                 black_box(warmed);
             }
 
@@ -385,7 +369,7 @@ fn bench_section_query(c: &mut Criterion) {
                     // decode is `&self`, so a fresh clone per iteration keeps the
                     // read pure without touching the fixture on disk.
                     let mut s = snap.clone();
-                    let page = section(&mut s, SECTION, SOURCE, i64::MIN, i64::MAX, 100_000, None)
+                    let page = section(&mut s, SECTION, i64::MIN, i64::MAX, 100_000, None)
                         .expect("section");
                     black_box(page);
                 });
@@ -456,7 +440,6 @@ fn build_many_segments(dir: &Path, m: usize) {
             PartMeta {
                 min_ts: first_window_us,
                 max_ts: first_window_us,
-                source_id: SOURCE,
             },
         );
         publish_pgm(&owner, address, &part);

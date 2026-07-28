@@ -62,10 +62,9 @@ pub use overview::{
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
     OutRow, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SectionPage, SeriesDiff,
-    SeriesValues, SourceSummary, SourceSummaryError, SourceSummaryLimits, SourceSummaryResource,
-    Value, apply_collection_gating, apply_gating, diff_section, gate_readings, gauge_section,
-    latest_section_row, logical_section, section, section_with_limits, sections,
-    sections_with_limits, select_gate, source_summaries,
+    SeriesValues, Value, apply_collection_gating, apply_gating, diff_section, gate_readings,
+    gauge_section, latest_section_row, logical_section, section, section_with_limits, sections,
+    sections_with_limits, select_gate,
 };
 pub use refresh::{
     ByteRange, CatalogDigest, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor,
@@ -701,7 +700,6 @@ mod tests {
             PartMeta {
                 min_ts: 1_000,
                 max_ts: 2_000,
-                source_id: 7,
             },
         );
         let dir = tempfile::tempdir().expect("tempdir");
@@ -716,7 +714,6 @@ mod tests {
         let (_dir, path) = segment_with(&body, 1_006_001, 1);
 
         let segment = Segment::open(&path).expect("open");
-        assert_eq!(segment.catalog().source_id, 7);
         assert_eq!(segment.catalog().entries.len(), 1);
 
         let entry = segment.catalog().entries[0];
@@ -776,7 +773,6 @@ mod tests {
             PartMeta {
                 min_ts: 0,
                 max_ts: 0,
-                source_id: 0,
             },
         );
         let dir = tempfile::tempdir().expect("tempdir");

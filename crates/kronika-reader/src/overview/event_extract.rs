@@ -827,7 +827,7 @@ fn temp_file_observation(
 )]
 fn new_observation(
     lineage: SegmentIdentity,
-    source_type_id: u32,
+    section_type_id: u32,
     provenance: ObservationProvenance,
     shape: ObservationShape,
     time: ObservationTime,
@@ -838,7 +838,7 @@ fn new_observation(
 ) -> Result<EventObservation, BuildError> {
     EventObservation::new(
         lineage,
-        source_type_id,
+        section_type_id,
         provenance,
         shape,
         time,

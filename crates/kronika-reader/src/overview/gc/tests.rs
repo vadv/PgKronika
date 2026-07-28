@@ -13,7 +13,7 @@ fn context(stem: &str) -> SegmentContext {
     SegmentContext::new(crate::test_layout::named_address(stem))
 }
 
-fn lifecycle_pgm(source_id: u64) -> Vec<u8> {
+fn lifecycle_pgm(variant: u64) -> Vec<u8> {
     let rows = [
         PgLogLifecycleV1 {
             ts: Ts(1_500),
@@ -28,7 +28,7 @@ fn lifecycle_pgm(source_id: u64) -> Vec<u8> {
         PgLogLifecycleV1 {
             ts: Ts(1_700),
             kind: 0,
-            pid: Some(11),
+            pid: Some(i32::try_from(variant).expect("test variant fits i32")),
             signal: Some(6),
             shutdown_mode: None,
             message: None,
@@ -46,7 +46,6 @@ fn lifecycle_pgm(source_id: u64) -> Vec<u8> {
         PartMeta {
             min_ts: 1_500,
             max_ts: 1_700,
-            source_id,
         },
     )
 }
@@ -75,10 +74,10 @@ fn store(root: &std::path::Path, config: GcConfig) -> FactStore {
 fn published(
     store: &FactStore,
     directory: &TempDir,
-    source_id: u64,
+    variant: u64,
     stem: &str,
 ) -> (SegmentFacts, SegmentContext, std::path::PathBuf) {
-    let bytes = lifecycle_pgm(source_id);
+    let bytes = lifecycle_pgm(variant);
     let context = context(stem);
     crate::test_layout::write_pgm(directory.path(), context.address(), &bytes);
     let facts = facts(&bytes);

@@ -222,12 +222,7 @@ impl SegmentFacts {
         let (min_ts, max_ts) = (unit.catalog().min_ts, unit.catalog().max_ts);
         let (identity, lineage) = Self::provenance(unit)?;
         let mut extracted = extract_events(unit, lineage, bounds)?;
-        let metrics = extract_metrics(
-            unit,
-            identity.pgm_source_id,
-            segment_span(min_ts, max_ts)?,
-            bounds,
-        )?;
+        let metrics = extract_metrics(unit, segment_span(min_ts, max_ts)?, bounds)?;
         let web_index = build_web_index(unit, &extracted.observations, min_ts, max_ts, bounds)?;
         apply_descriptor_replacements(&mut extracted, &metrics)?;
         let pgm_body_read_stats = checked_add_read_stats(
@@ -268,14 +263,9 @@ impl SegmentFacts {
         if catalog.entries.is_empty() {
             return Err(BuildError::Source(SourceError::UnsupportedLayout));
         }
-        let lineage = SegmentIdentity::live_approximate(
-            catalog.source_id,
-            journal_generation,
-            part_discriminator,
-        );
+        let lineage = SegmentIdentity::live_approximate(journal_generation, part_discriminator);
         let identity = HeaderIdentity::from_current_contract(
             catalog.format_version,
-            catalog.source_id,
             catalog.min_ts,
             catalog.max_ts,
             unit.source_file_len(),
@@ -284,12 +274,7 @@ impl SegmentFacts {
         );
         let (min_ts, max_ts) = (catalog.min_ts, catalog.max_ts);
         let mut extracted = extract_events(unit, lineage, bounds)?;
-        let metrics = extract_metrics(
-            unit,
-            identity.pgm_source_id,
-            segment_span(min_ts, max_ts)?,
-            bounds,
-        )?;
+        let metrics = extract_metrics(unit, segment_span(min_ts, max_ts)?, bounds)?;
         let web_index = build_web_index(unit, &extracted.observations, min_ts, max_ts, bounds)?;
         apply_descriptor_replacements(&mut extracted, &metrics)?;
         Self::assemble(
@@ -349,13 +334,7 @@ impl SegmentFacts {
         };
 
         let (min_ts, max_ts) = (sealed_unit.catalog().min_ts, sealed_unit.catalog().max_ts);
-        let Some(metrics) = promote_metrics(
-            parts,
-            identity.pgm_source_id,
-            segment_span(min_ts, max_ts)?,
-            bounds,
-        )?
-        else {
+        let Some(metrics) = promote_metrics(parts, segment_span(min_ts, max_ts)?, bounds)? else {
             return Ok(None);
         };
         let web_index =
@@ -462,10 +441,9 @@ impl SegmentFacts {
             .entries
             .first()
             .ok_or(BuildError::Source(SourceError::UnsupportedLayout))?;
-        let lineage = SegmentIdentity::sealed(catalog.source_id, unit.source_descriptor().0);
+        let lineage = SegmentIdentity::sealed(unit.source_descriptor().0);
         let identity = HeaderIdentity::from_current_contract(
             catalog.format_version,
-            catalog.source_id,
             catalog.min_ts,
             catalog.max_ts,
             unit.source_file_len(),
@@ -646,7 +624,6 @@ impl SegmentFacts {
     /// invariant while encoding.
     pub fn encode(&self, bounds: &Bounds) -> Result<Vec<u8>, CacheReadError> {
         let manifest = SourceManifestBlock::new(
-            self.identity.pgm_source_id,
             self.identity.source_format_version,
             self.identity.source_min_ts_us,
             self.identity.source_max_ts_us,
@@ -790,12 +767,10 @@ impl SegmentFacts {
             singleton_body(&mut fact_reader, BlockKind::CounterSamples)?;
         let counter_samples = CounterSamplesBlock::decode(&counter_body, bounds)?;
         validate_block_descriptor(&counter_entry, &counter_samples)?;
-        validate_metric_source(counter_samples.series(), expected.pgm_source_id)?;
 
         let (gauge_entry, gauge_body) = singleton_body(&mut fact_reader, BlockKind::GaugeSamples)?;
         let gauge_samples = GaugeSamplesBlock::decode(&gauge_body, bounds)?;
         validate_block_descriptor(&gauge_entry, &gauge_samples)?;
-        validate_metric_source(gauge_samples.series(), expected.pgm_source_id)?;
 
         let (reset_entry, reset_body) = singleton_body(&mut fact_reader, BlockKind::ResetMarkers)?;
         let reset_markers = ResetMarkersBlock::decode(&reset_body, bounds)?;
@@ -812,7 +787,6 @@ impl SegmentFacts {
             &observations,
             &counter_samples,
             &gauge_samples,
-            expected.pgm_source_id,
         )?;
 
         let (summary_entry, summary_body) = singleton_body(&mut fact_reader, BlockKind::UiSummary)?;
@@ -905,11 +879,9 @@ fn promotion_source_matches(identity: HeaderIdentity, parts: &[&SegmentFacts]) -
     }
     min_ts == identity.source_min_ts_us
         && max_ts == identity.source_max_ts_us
-        && parts.iter().all(|part| {
-            part.identity.source_format_version == identity.source_format_version
-                && (part.identity.pgm_source_id == 0
-                    || part.identity.pgm_source_id == identity.pgm_source_id)
-        })
+        && parts
+            .iter()
+            .all(|part| part.identity.source_format_version == identity.source_format_version)
 }
 
 fn promotion_dictionary<R: ReadAt>(
@@ -1012,7 +984,7 @@ fn rekey_promoted_parts(
             observations.push(
                 EventObservation::new(
                     lineage,
-                    observation.source_type_id(),
+                    observation.section_type_id(),
                     provenance,
                     observation.shape(),
                     observation.time(),
@@ -1235,10 +1207,9 @@ fn derive_sender_disappearances(
     bounds: &Bounds,
     facts: &mut Vec<EventFact>,
 ) -> Result<(), BuildError> {
-    let mut boundaries =
-        BTreeMap::<(u64, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
+    let mut boundaries = BTreeMap::<u32, Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
     let mut snapshots = BTreeMap::<
-        (u64, u32, i64),
+        (u32, i64),
         BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
     >::new();
     for record in states.records() {
@@ -1247,23 +1218,19 @@ fn derive_sender_disappearances(
             Some(
                 kronika_analytics::overview::MetricFactor::PgReplicationSenderSnapshotPopulation,
             ) => boundaries
-                .entry((descriptor.source_id, descriptor.source_type_id))
+                .entry(descriptor.section_type_id)
                 .or_default()
                 .push((descriptor, *record)),
             Some(kronika_analytics::overview::MetricFactor::PgReplicationSenderState) => {
                 snapshots
-                    .entry((
-                        descriptor.source_id,
-                        descriptor.source_type_id,
-                        record.ts_us,
-                    ))
+                    .entry((descriptor.section_type_id, record.ts_us))
                     .or_default()
                     .insert(descriptor.series_id, (descriptor, *record));
             }
             _ => {}
         }
     }
-    for ((source_id, source_type), source_boundaries) in &mut boundaries {
+    for (section_type_id, source_boundaries) in &mut boundaries {
         source_boundaries.sort_unstable_by_key(|(_descriptor, record)| record.ts_us);
         for pair in source_boundaries.windows(2) {
             let (previous_descriptor, previous) = pair[0];
@@ -1275,10 +1242,10 @@ fn derive_sender_disappearances(
             }
             let empty = BTreeMap::new();
             let previous_entities = snapshots
-                .get(&(*source_id, *source_type, previous.ts_us))
+                .get(&(*section_type_id, previous.ts_us))
                 .unwrap_or(&empty);
             let current_entities = snapshots
-                .get(&(*source_id, *source_type, current.ts_us))
+                .get(&(*section_type_id, current.ts_us))
                 .unwrap_or(&empty);
             let current_sample = GaugeSample::new(
                 current_descriptor.series_id,
@@ -1360,7 +1327,6 @@ const fn block_build_error(error: super::block::BlockError) -> BuildError {
 )]
 fn promote_metrics(
     parts: &[&SegmentFacts],
-    expected_source_id: u64,
     interval: Option<CoverageSpan>,
     bounds: &Bounds,
 ) -> Result<Option<MetricExtraction>, BuildError> {
@@ -1400,15 +1366,9 @@ fn promote_metrics(
     let mut entity_states = Vec::new();
     let mut event_facts = Vec::new();
     for part in parts {
-        if !merge_metric_series(
-            &mut counter_series,
-            part.counter_samples.series(),
-            expected_source_id,
-        ) || !merge_metric_series(
-            &mut gauge_series,
-            part.gauge_samples.series(),
-            expected_source_id,
-        ) {
+        if !merge_metric_series(&mut counter_series, part.counter_samples.series())
+            || !merge_metric_series(&mut gauge_series, part.gauge_samples.series())
+        {
             return Ok(None);
         }
         checked_extend(
@@ -1550,7 +1510,7 @@ fn promoted_factor_coverage(
             .get(&state.series_id)
             .ok_or(BuildError::Internal)?;
         let latest = latest_population_by_source
-            .entry(descriptor.source_type_id)
+            .entry(descriptor.section_type_id)
             .or_insert((state.ts_us, state.population_total));
         if state.ts_us > latest.0 {
             *latest = (state.ts_us, state.population_total);
@@ -1599,13 +1559,13 @@ fn promoted_factor_coverage(
                 .values()
                 .chain(gauge_series.values())
                 .filter(|descriptor| descriptor.factor_id == factor_id)
-                .map(|descriptor| descriptor.source_type_id)
+                .map(|descriptor| descriptor.section_type_id)
                 .collect::<Vec<_>>();
             factor_sources.sort_unstable();
             factor_sources.dedup();
-            if let [source_type_id] = factor_sources.as_slice()
+            if let [section_type_id] = factor_sources.as_slice()
                 && let Some((_ts_us, population_total)) =
-                    latest_population_by_source.get(source_type_id)
+                    latest_population_by_source.get(section_type_id)
             {
                 source_population = Some(SourcePopulation {
                     collected: *population_total,
@@ -1734,13 +1694,10 @@ const fn unsupported_promoted_coverage(
 fn merge_metric_series(
     destination: &mut BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
     incoming: &[MetricSeriesDescriptor],
-    expected_source_id: u64,
 ) -> bool {
-    incoming.iter().all(|descriptor| {
-        if descriptor.source_id != expected_source_id {
-            return false;
-        }
-        match destination.entry(descriptor.series_id) {
+    incoming
+        .iter()
+        .all(|descriptor| match destination.entry(descriptor.series_id) {
             std::collections::btree_map::Entry::Occupied(existing) => {
                 *existing.get() == *descriptor
             }
@@ -1748,8 +1705,7 @@ fn merge_metric_series(
                 entry.insert(*descriptor);
                 true
             }
-        }
-    })
+        })
 }
 
 fn checked_extend<T: Clone>(
@@ -1783,19 +1739,6 @@ fn reset_markers_for_samples(samples: &[CounterSample]) -> Vec<ResetMarker> {
         }
     }
     markers
-}
-
-fn validate_metric_source(
-    series: &[MetricSeriesDescriptor],
-    expected_source_id: u64,
-) -> Result<(), CacheReadError> {
-    if series
-        .iter()
-        .any(|descriptor| descriptor.source_id != expected_source_id)
-    {
-        return Err(CacheReadError::WrongSource);
-    }
-    Ok(())
 }
 
 fn validate_reset_series(
@@ -1872,34 +1815,24 @@ fn validate_event_fact_evidence(
     observations: &EventObservationsBlock,
     counters: &CounterSamplesBlock,
     gauges: &GaugeSamplesBlock,
-    expected_source_id: u64,
 ) -> Result<(), CacheReadError> {
-    let mut source_ids = BTreeMap::<ObservationId, u64>::new();
+    let mut evidence_ids = DictionaryIdSet::<ObservationId>::new();
     for observation in observations.observations() {
-        insert_evidence_source(
-            &mut source_ids,
-            observation.observation_id(),
-            observation.source_id(),
-        )?;
+        insert_evidence_id(&mut evidence_ids, observation.observation_id())?;
     }
     for sample in counters.samples() {
-        insert_evidence_source(
-            &mut source_ids,
+        insert_evidence_id(
+            &mut evidence_ids,
             kronika_analytics::overview::counter_sample_observation_id(*sample),
-            metric_source(counters.series(), sample.series_id())?,
         )?;
     }
     for sample in gauges.samples() {
-        insert_evidence_source(
-            &mut source_ids,
+        insert_evidence_id(
+            &mut evidence_ids,
             kronika_analytics::overview::gauge_sample_observation_id(*sample),
-            metric_source(gauges.series(), sample.series_id())?,
         )?;
     }
     for fact in facts.facts() {
-        if fact.coverage().source_id != expected_source_id {
-            return Err(CacheReadError::WrongSource);
-        }
         if matches!(
             fact.kind(),
             kronika_analytics::overview::EventKind::CollectorSnapshotGap
@@ -1911,7 +1844,7 @@ fn validate_event_fact_evidence(
         if fact
             .supporting_observation_ids()
             .iter()
-            .any(|id| source_ids.get(id) != Some(&fact.coverage().source_id))
+            .any(|id| !evidence_ids.contains(id))
         {
             return Err(CacheReadError::Corrupt);
         }
@@ -1919,26 +1852,14 @@ fn validate_event_fact_evidence(
     Ok(())
 }
 
-fn insert_evidence_source(
-    source_ids: &mut BTreeMap<ObservationId, u64>,
+fn insert_evidence_id(
+    evidence_ids: &mut DictionaryIdSet<ObservationId>,
     id: ObservationId,
-    source_id: u64,
 ) -> Result<(), CacheReadError> {
-    if source_ids.insert(id, source_id).is_some() {
+    if !evidence_ids.insert(id) {
         return Err(CacheReadError::Corrupt);
     }
     Ok(())
-}
-
-fn metric_source(
-    descriptors: &[MetricSeriesDescriptor],
-    series_id: MetricSeriesId,
-) -> Result<u64, CacheReadError> {
-    descriptors
-        .binary_search_by_key(&series_id.0, |descriptor| descriptor.series_id.0)
-        .ok()
-        .map(|index| descriptors[index].source_id)
-        .ok_or(CacheReadError::Corrupt)
 }
 
 fn has_duplicate_fact_id(facts: &[EventFact]) -> bool {
@@ -2194,11 +2115,7 @@ mod tests {
                 rows: rows_len,
                 body: &body,
             }],
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: 7,
-            },
+            PartMeta { min_ts, max_ts },
         )
     }
 
@@ -2276,7 +2193,7 @@ mod tests {
     ) -> SnapshotCoverageV1 {
         SnapshotCoverageV1 {
             ts: Ts(ts_us),
-            source_type_id: 1_033_001,
+            section_type_id: 1_033_001,
             collector_pid: 99,
             collector_started_at: Ts(1),
             read_state,
@@ -2331,14 +2248,7 @@ mod tests {
                 body: &coverage_body,
             });
         }
-        build_part(
-            &sections,
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: 7,
-            },
-        )
+        build_part(&sections, PartMeta { min_ts, max_ts })
     }
 
     #[test]
@@ -2705,7 +2615,6 @@ mod tests {
             PartMeta {
                 min_ts: 1_100,
                 max_ts: 1_800,
-                source_id: 7,
             },
         )
     }
@@ -2895,7 +2804,6 @@ mod tests {
             PartMeta {
                 min_ts: 2_000,
                 max_ts: 9_000,
-                source_id: 7,
             },
         )
     }
@@ -2916,7 +2824,7 @@ mod tests {
         let error = facts
             .observations()
             .iter()
-            .find(|observation| observation.source_type_id() == 1_022_001)
+            .find(|observation| observation.section_type_id() == 1_022_001)
             .expect("error observation");
         assert_eq!(error.occurrence_count(), 3);
         assert_eq!(
@@ -2934,7 +2842,7 @@ mod tests {
         let slow = facts
             .observations()
             .iter()
-            .find(|observation| observation.source_type_id() == 1_026_001)
+            .find(|observation| observation.section_type_id() == 1_026_001)
             .expect("slow-query observation");
         assert_eq!(slow.time().quality, TimeQuality::MaxDurationSample);
         assert_eq!(slow.occurrence_count(), 2);
@@ -2942,7 +2850,7 @@ mod tests {
         let gap = facts
             .observations()
             .iter()
-            .find(|observation| observation.source_type_id() == 1_029_001)
+            .find(|observation| observation.section_type_id() == 1_029_001)
             .expect("gap observation");
         assert_eq!(gap.time().quality, TimeQuality::IntervalOnly);
         assert_eq!(gap.evidence_quality(), EvidenceQuality::DerivedExact);
@@ -3156,7 +3064,6 @@ mod tests {
             PartMeta {
                 min_ts: 1_000,
                 max_ts: 1_000,
-                source_id: 7,
             },
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
@@ -3218,7 +3125,6 @@ mod tests {
             PartMeta {
                 min_ts: 1_100,
                 max_ts: 1_100,
-                source_id: 7,
             },
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
@@ -3337,7 +3243,6 @@ mod tests {
     fn every_populated_canonical_block_matches_forced_raw_and_restart_warm() {
         let fixture = all_family_fixture();
         assert_eq!(fixture.schema_version, ALL_FAMILY_SCHEMA_VERSION);
-        assert_eq!(fixture.source_id, 7);
         assert_eq!(fixture.cadence_us, 10);
         let bytes = fixture.sealed_bytes();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
@@ -3432,7 +3337,6 @@ mod tests {
         );
         for descriptor in descriptors {
             let factor = MetricFactor::from_id(descriptor.factor_id).expect("known factor");
-            assert_eq!(descriptor.source_id, fixture.source_id);
             assert!(
                 descriptor.entity.is_some(),
                 "{} has no entity",

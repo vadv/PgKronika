@@ -1,6 +1,6 @@
 //! Batch section reads across the units of a snapshot.
 //!
-//! [`sections`] answers several logical sections for one source and time window
+//! [`sections`] answers several logical sections for one root and time window
 //! in a single pass over the snapshot's units: each in-window unit is opened
 //! once, its dictionary read once, and every requested section decoded from that
 //! one open. Rows are materialized onto each section's union columns, filtered by
@@ -26,13 +26,11 @@ const MAX_CATALOG_READ_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum dictionary body bytes admitted by one section query.
 const MAX_DICTIONARY_READ_BYTES: u64 = 64 * 1024 * 1024;
 
-/// One logical section's answer for a source and time window.
+/// One logical section's answer for a time window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SectionPage {
     /// Logical section name, e.g. `"pg_stat_activity"`.
     pub section: String,
-    /// Source the rows belong to.
-    pub source_id: u64,
     /// Rows on the section's union columns, ordered by its sort key.
     pub rows: Vec<OutRow>,
     /// Stretches of the window that no readable unit covers.
@@ -163,7 +161,7 @@ impl From<ReadError> for QueryError {
     }
 }
 
-/// Read one logical section for a source and window.
+/// Read one logical section for a window.
 ///
 /// Equivalent to [`sections`] with a single name, returning that name's page.
 /// A registered name always yields a page (possibly with no rows); an
@@ -173,14 +171,12 @@ impl From<ReadError> for QueryError {
 /// # Errors
 ///
 /// Returns [`QueryError::UnknownSection`] when `name` is not registered,
-/// [`QueryError::BadCursor`] when `cursor` targets another source, or
 /// [`QueryError::Read`] when a unit cannot be opened or decoded. Returns
 /// [`QueryError::ResultTooLarge`] before retaining more than the materialization
 /// budget, or [`QueryError::WorkLimitExceeded`] before exceeding read work.
 pub fn section(
     snap: &mut LocalDirSnapshot,
     name: &str,
-    source: u64,
     from: i64,
     to: i64,
     limit: usize,
@@ -189,7 +185,6 @@ pub fn section(
     section_with_limits(
         snap,
         name,
-        source,
         from,
         to,
         cursor,
@@ -208,7 +203,6 @@ pub fn section(
 pub fn section_with_limits(
     snap: &mut LocalDirSnapshot,
     name: &str,
-    source: u64,
     from: i64,
     to: i64,
     cursor: Option<Cursor>,
@@ -216,14 +210,14 @@ pub fn section_with_limits(
 ) -> Result<SectionPage, QueryError> {
     let cursors: BTreeMap<String, Cursor> =
         cursor.map(|c| (name.to_owned(), c)).into_iter().collect();
-    let pages = sections_with_limits(snap, source, from, to, &[name], &cursors, limits)?;
+    let pages = sections_with_limits(snap, from, to, &[name], &cursors, limits)?;
     pages
         .into_values()
         .next()
         .ok_or_else(|| QueryError::UnknownSection(name.to_owned()))
 }
 
-/// Read several logical sections for a source and window in one pass.
+/// Read several logical sections for a window in one pass.
 ///
 /// A section named in `cursors` resumes after the row its cursor pins: rows are
 /// ordered by the crate's full-row comparator, every row at or before the
@@ -234,13 +228,11 @@ pub fn section_with_limits(
 /// # Errors
 ///
 /// Returns [`QueryError::UnknownSection`] for the first unregistered name,
-/// [`QueryError::BadCursor`] when a cursor targets another source, or
 /// [`QueryError::Read`] when a unit cannot be opened or decoded. Returns
 /// [`QueryError::ResultTooLarge`] before retaining more than the materialization
 /// budget, or [`QueryError::WorkLimitExceeded`] before exceeding read work.
 pub fn sections(
     snap: &mut LocalDirSnapshot,
-    source: u64,
     from: i64,
     to: i64,
     names: &[&str],
@@ -249,7 +241,6 @@ pub fn sections(
 ) -> Result<BTreeMap<String, SectionPage>, QueryError> {
     sections_with_limits(
         snap,
-        source,
         from,
         to,
         names,
@@ -265,7 +256,6 @@ pub fn sections(
 /// Returns the same errors as [`sections`].
 pub fn sections_with_limits(
     snap: &mut LocalDirSnapshot,
-    source: u64,
     from: i64,
     to: i64,
     names: &[&str],
@@ -303,7 +293,6 @@ pub fn sections_with_limits(
     let (buffers, covered) = loop {
         let skip_stale = refreshed >= MAX_REFRESH;
         let query = GatherQuery {
-            source,
             from,
             to,
             requested: &requested,
@@ -351,12 +340,6 @@ pub fn sections_with_limits(
         rows.sort_by(|a, b| compare_full(a, b, &columns, logical.sort_key));
 
         if let Some(cursor) = cursors.get(&name) {
-            if cursor.source_id != source {
-                return Err(QueryError::BadCursor(format!(
-                    "cursor source {} does not match query source {source}",
-                    cursor.source_id
-                )));
-            }
             // Pair the cursor's values back with their column names so the same
             // total order compares the cursor against every candidate row.
             let cursor_row: OutRow = columns
@@ -376,13 +359,11 @@ pub fn sections_with_limits(
         // A cursor pins the last returned row, so an empty page (e.g. `limit`
         // of zero) never emits one, even when rows remain.
         let next_cursor = rows.last().filter(|_| has_more).map(|row| Cursor {
-            source_id: source,
             values: row.iter().map(|(_, v)| v.clone()).collect(),
         });
 
         let page = SectionPage {
             section: name.clone(),
-            source_id: source,
             rows,
             gaps: gaps.clone(),
             next_cursor,
@@ -474,7 +455,6 @@ fn charge_work(
 }
 
 struct GatherQuery<'a> {
-    source: u64,
     from: i64,
     to: i64,
     requested: &'a [(String, LogicalSection)],
@@ -489,7 +469,7 @@ struct MaterializationUsage {
     bytes: usize,
 }
 
-/// Decode every requested section from the source's in-window units in one pass.
+/// Decode every requested section from the root's in-window units in one pass.
 ///
 /// Catalog summaries reject definite type misses before open. A Bloom positive
 /// is confirmed against the opened catalog before its dictionary is read. With
@@ -505,9 +485,7 @@ fn gather(
     let mut materialization = MaterializationUsage::default();
 
     for descriptor in snap.unit_descriptors().filter(|descriptor| {
-        descriptor.meta.source_id == query.source
-            && descriptor.meta.max_ts >= query.from
-            && descriptor.meta.min_ts <= query.to
+        descriptor.meta.max_ts >= query.from && descriptor.meta.min_ts <= query.to
     }) {
         work_budget.charge_unit()?;
         let range = (descriptor.meta.min_ts, descriptor.meta.max_ts);
@@ -888,12 +866,7 @@ mod tests {
     }
 
     /// Build a part from already-encoded `(type_id, rows, body)` sections.
-    fn part_from(
-        sections: &[(u32, u32, Vec<u8>)],
-        min_ts: i64,
-        max_ts: i64,
-        source: u64,
-    ) -> Vec<u8> {
+    fn part_from(sections: &[(u32, u32, Vec<u8>)], min_ts: i64, max_ts: i64) -> Vec<u8> {
         let mut inputs: Vec<SectionInput<'_>> = sections
             .iter()
             .map(|(type_id, rows, body)| SectionInput {
@@ -903,14 +876,7 @@ mod tests {
             })
             .collect();
         inputs.sort_unstable_by_key(|section| section.type_id);
-        build_part(
-            &inputs,
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: source,
-            },
-        )
+        build_part(&inputs, PartMeta { min_ts, max_ts })
     }
 
     fn write_pgm(root: &std::path::Path, segment_id: i64, part: &[u8]) {
@@ -930,7 +896,7 @@ mod tests {
             1,
             b"not a parquet dictionary".to_vec(),
         ));
-        write_pgm(root, 5, &part_from(&sections, 0, 10, 7));
+        write_pgm(root, 5, &part_from(&sections, 0, 10));
     }
 
     /// Extract a named value out of one output row.
@@ -949,19 +915,17 @@ mod tests {
             archiver_row(2000, 2),
         ])
         .expect("encode");
-        let part = part_from(&[(1_008_001, 3, body)], 1000, 3000, 7);
+        let part = part_from(&[(1_008_001, 3, body)], 1000, 3000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 10_000, 100, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(
             ts,
             vec![&Value::Ts(1000), &Value::Ts(2000), &Value::Ts(3000)]
         );
         assert_eq!(page.section, "pg_stat_archiver");
-        assert_eq!(page.source_id, 7);
         // Window [0, 10_000] over coverage [1000, 3000] leaves edge gaps.
         assert_eq!(
             page.gaps,
@@ -981,12 +945,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
             .expect("encode");
-        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
+        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 10_000, 100, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(ts, vec![&Value::Ts(1000), &Value::Ts(2000)]);
     }
@@ -996,18 +959,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body_a = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(3000, 3)])
             .expect("encode");
-        let part_a = part_from(&[(1_008_001, 2, body_a)], 1000, 3000, 7);
+        let part_a = part_from(&[(1_008_001, 2, body_a)], 1000, 3000);
         write_pgm(dir.path(), 1000, &part_a);
 
         let body_b = PgStatArchiver::encode(&[archiver_row(2000, 2), archiver_row(4000, 4)])
             .expect("encode");
-        let part_b = part_from(&[(1_008_001, 2, body_b)], 2000, 4000, 7);
+        let part_b = part_from(&[(1_008_001, 2, body_b)], 2000, 4000);
         write_pgm(dir.path(), 2000, &part_b);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         assert_eq!(snap.units().len(), 2);
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 10_000, 100, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(
             ts,
@@ -1026,16 +988,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // V3 unit carries leader_pid; V1 unit does not.
         let body_v3 = PgStatActivityV3::encode(&[activity_v3(1000, 10, Some(9))]).expect("encode");
-        let part_v3 = part_from(&[(1_001_003, 1, body_v3)], 1000, 1000, 7);
+        let part_v3 = part_from(&[(1_001_003, 1, body_v3)], 1000, 1000);
         write_pgm(dir.path(), 1000, &part_v3);
 
         let body_v1 = PgStatActivityV1::encode(&[activity_v1(2000, 20)]).expect("encode");
-        let part_v1 = part_from(&[(1_001_001, 1, body_v1)], 2000, 2000, 7);
+        let part_v1 = part_from(&[(1_001_001, 1, body_v1)], 2000, 2000);
         write_pgm(dir.path(), 2000, &part_v1);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page =
-            section(&mut snap, "pg_stat_activity", 7, 0, 10_000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_activity", 0, 10_000, 100, None).expect("section");
         assert_eq!(page.rows.len(), 2);
 
         // The union carries leader_pid; ordering is by (ts, pid).
@@ -1069,18 +1030,17 @@ mod tests {
         write_pgm(
             dir.path(),
             1000,
-            &part_from(&[(1_001_003, 1, body_v3)], 1000, 1000, 7),
+            &part_from(&[(1_001_003, 1, body_v3)], 1000, 1000),
         );
         let body_v1 = PgStatActivityV1::encode(&[activity_v1(2000, 20)]).expect("encode");
         write_pgm(
             dir.path(),
             2000,
-            &part_from(&[(1_001_001, 1, body_v1)], 2000, 2000, 7),
+            &part_from(&[(1_001_001, 1, body_v1)], 2000, 2000),
         );
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page =
-            section(&mut snap, "pg_stat_activity", 7, 0, 10_000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_activity", 0, 10_000, 100, None).expect("section");
         assert_eq!(page.rows.len(), 2, "one row per layout version");
 
         let union: Vec<&str> = logical_section("pg_stat_activity")
@@ -1105,13 +1065,12 @@ mod tests {
             archiver_row(4000, 4),
         ])
         .expect("encode");
-        let part = part_from(&[(1_008_001, 4, body)], 1000, 4000, 7);
+        let part = part_from(&[(1_008_001, 4, body)], 1000, 4000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // Window [2000, 3000]: boundaries included, 1000 and 4000 excluded.
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 2000, 3000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 2000, 3000, 100, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(ts, vec![&Value::Ts(2000), &Value::Ts(3000)]);
     }
@@ -1125,11 +1084,11 @@ mod tests {
             archiver_row(3000, 3),
         ])
         .expect("encode");
-        let part = part_from(&[(1_008_001, 3, body)], 1000, 3000, 7);
+        let part = part_from(&[(1_008_001, 3, body)], 1000, 3000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 2, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 10_000, 2, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(
             ts,
@@ -1144,7 +1103,6 @@ mod tests {
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let err = sections(
             &mut snap,
-            7,
             0,
             10_000,
             &["no_such_section"],
@@ -1183,13 +1141,12 @@ mod tests {
     fn variable_width_budget_rejects_before_building_output_values() {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1_000, 1)]).expect("encode");
-        let part = part_from(&[(1_008_001, 1, body)], 1_000, 1_000, 7);
+        let part = part_from(&[(1_008_001, 1, body)], 1_000, 1_000);
         write_pgm(dir.path(), 1000, &part);
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let error = section_with_limits(
             &mut snap,
             "pg_stat_archiver",
-            7,
             0,
             10_000,
             None,
@@ -1214,7 +1171,7 @@ mod tests {
     fn catalog_summary_rejects_a_definite_type_miss_before_open() {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
-        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10, 7));
+        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10));
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let activity = logical_section("pg_stat_activity").expect("registered section");
         assert!(
@@ -1227,7 +1184,7 @@ mod tests {
         );
         OPEN_UNIT_CALLS.with(|calls| calls.set(0));
 
-        let page = section(&mut snap, "pg_stat_activity", 7, 0, 10, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_activity", 0, 10, 100, None).expect("section");
 
         assert!(page.rows.is_empty());
         assert!(page.gaps.is_empty());
@@ -1250,7 +1207,7 @@ mod tests {
         OPEN_UNIT_CALLS.with(|calls| calls.set(0));
 
         let page =
-            section(&mut snap, "pg_stat_archiver", 7, 0, 10, 100, None).expect("false positive");
+            section(&mut snap, "pg_stat_archiver", 0, 10, 100, None).expect("false positive");
 
         assert!(page.rows.is_empty());
         assert!(page.gaps.is_empty());
@@ -1261,7 +1218,7 @@ mod tests {
     fn unit_work_limit_precedes_catalog_opens() {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
-        let part = part_from(&[(1_008_001, 1, body)], 0, 10, 7);
+        let part = part_from(&[(1_008_001, 1, body)], 0, 10);
         write_pgm(dir.path(), 1, &part);
         write_pgm(dir.path(), 2, &part);
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
@@ -1270,7 +1227,6 @@ mod tests {
         let error = section_with_limits(
             &mut snap,
             "pg_stat_activity",
-            7,
             0,
             10,
             None,
@@ -1297,7 +1253,7 @@ mod tests {
     fn catalog_byte_limit_precedes_open() {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
-        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10, 7));
+        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10));
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let catalog_bytes = snap
             .unit_descriptors()
@@ -1309,7 +1265,6 @@ mod tests {
         let error = section_with_limits(
             &mut snap,
             "pg_stat_archiver",
-            7,
             0,
             10,
             None,
@@ -1351,7 +1306,6 @@ mod tests {
                 ],
                 0,
                 10,
-                7,
             ),
         );
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
@@ -1360,7 +1314,6 @@ mod tests {
         let error = section_with_limits(
             &mut snap,
             "pg_stat_archiver",
-            7,
             0,
             10,
             None,
@@ -1383,7 +1336,7 @@ mod tests {
     fn catalog_byte_budget_is_cumulative_across_stale_retries() {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(5, 1)]).expect("encode");
-        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10, 7));
+        write_pgm(dir.path(), 5, &part_from(&[(1_008_001, 1, body)], 0, 10));
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let catalog_bytes = snap
             .unit_descriptors()
@@ -1396,7 +1349,6 @@ mod tests {
         let error = section_with_limits(
             &mut snap,
             "pg_stat_archiver",
-            7,
             0,
             10,
             None,
@@ -1430,22 +1382,12 @@ mod tests {
         // Two sealed units, each carrying both sections.
         let arch_a = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
         let act_a = PgStatActivityV3::encode(&[activity_v3(1000, 5, None)]).expect("encode");
-        let part_a = part_from(
-            &[(1_008_001, 1, arch_a), (1_001_003, 1, act_a)],
-            1000,
-            1000,
-            7,
-        );
+        let part_a = part_from(&[(1_008_001, 1, arch_a), (1_001_003, 1, act_a)], 1000, 1000);
         write_pgm(dir.path(), 1000, &part_a);
 
         let arch_b = PgStatArchiver::encode(&[archiver_row(2000, 2)]).expect("encode");
         let act_b = PgStatActivityV3::encode(&[activity_v3(2000, 6, None)]).expect("encode");
-        let part_b = part_from(
-            &[(1_008_001, 1, arch_b), (1_001_003, 1, act_b)],
-            2000,
-            2000,
-            7,
-        );
+        let part_b = part_from(&[(1_008_001, 1, arch_b), (1_001_003, 1, act_b)], 2000, 2000);
         write_pgm(dir.path(), 2000, &part_b);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
@@ -1454,7 +1396,6 @@ mod tests {
         OPEN_UNIT_CALLS.with(|c| c.set(0));
         let pages = sections(
             &mut snap,
-            7,
             0,
             10_000,
             &["pg_stat_archiver", "pg_stat_activity"],
@@ -1486,14 +1427,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
             .expect("encode");
-        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
+        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let one = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        let one = section(&mut snap, "pg_stat_archiver", 0, 10_000, 100, None).expect("section");
         let many = sections(
             &mut snap,
-            7,
             0,
             10_000,
             &["pg_stat_archiver"],
@@ -1505,25 +1445,10 @@ mod tests {
     }
 
     #[test]
-    fn other_source_is_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
-        let part = part_from(&[(1_008_001, 1, body)], 1000, 1000, 42);
-        write_pgm(dir.path(), 1000, &part);
-
-        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        // Query source 7 — the only unit belongs to source 42.
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
-        assert!(page.rows.is_empty(), "no rows for a different source");
-        assert_eq!(page.source_id, 7);
-    }
-
-    #[test]
     fn active_unit_removed_mid_read_degrades_to_a_gap() {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
-        let part = part_from(&[(1_008_001, 1, body)], 1000, 1000, 7);
+        let part = part_from(&[(1_008_001, 1, body)], 1000, 1000);
         let journal_path = write_journal(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
@@ -1533,8 +1458,7 @@ mod tests {
 
         // The unit is gone; the retry refreshes, finds nothing, and the window
         // degrades to one uncovered gap instead of an error.
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 10_000, 100, None).expect("section");
         assert!(page.rows.is_empty());
         assert_eq!(
             page.gaps,
@@ -1700,11 +1624,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
             .expect("encode");
-        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
+        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 0, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 10_000, 0, None).expect("section");
         assert!(page.rows.is_empty(), "limit 0 yields no rows");
         // Coverage [1000, 2000] is read even at limit 0, so the window edges are gaps.
         assert_eq!(
@@ -1722,24 +1646,12 @@ mod tests {
 
     /// Read one archiver section, paging by `limit` and following `next_cursor`
     /// until it runs out. Returns each page's `archived_count` sequence.
-    fn page_archived_counts(
-        snap: &mut LocalDirSnapshot,
-        source: u64,
-        limit: usize,
-    ) -> Vec<Vec<i64>> {
+    fn page_archived_counts(snap: &mut LocalDirSnapshot, limit: usize) -> Vec<Vec<i64>> {
         let mut pages = Vec::new();
         let mut cursor: Option<Cursor> = None;
         loop {
-            let page = section(
-                snap,
-                "pg_stat_archiver",
-                source,
-                0,
-                10_000,
-                limit,
-                cursor.clone(),
-            )
-            .expect("section");
+            let page = section(snap, "pg_stat_archiver", 0, 10_000, limit, cursor.clone())
+                .expect("section");
             let counts: Vec<i64> = page
                 .rows
                 .iter()
@@ -1768,11 +1680,11 @@ mod tests {
             archiver_row(5000, 5),
         ])
         .expect("encode");
-        let part = part_from(&[(1_008_001, 5, body)], 1000, 5000, 7);
+        let part = part_from(&[(1_008_001, 5, body)], 1000, 5000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let pages = page_archived_counts(&mut snap, 7, 2);
+        let pages = page_archived_counts(&mut snap, 2);
         // limit 2 over 5 rows: [1,2], [3,4], [5], then the stream is exhausted.
         assert_eq!(pages, vec![vec![1, 2], vec![3, 4], vec![5]]);
     }
@@ -1784,17 +1696,17 @@ mod tests {
         // the boundary must merge both units, not restart per unit.
         let body_a = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(3000, 3)])
             .expect("encode");
-        let part_a = part_from(&[(1_008_001, 2, body_a)], 1000, 3000, 7);
+        let part_a = part_from(&[(1_008_001, 2, body_a)], 1000, 3000);
         write_pgm(dir.path(), 1000, &part_a);
 
         let body_b = PgStatArchiver::encode(&[archiver_row(2000, 2), archiver_row(4000, 4)])
             .expect("encode");
-        let part_b = part_from(&[(1_008_001, 2, body_b)], 2000, 4000, 7);
+        let part_b = part_from(&[(1_008_001, 2, body_b)], 2000, 4000);
         write_pgm(dir.path(), 2000, &part_b);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         assert_eq!(snap.units().len(), 2);
-        let pages = page_archived_counts(&mut snap, 7, 3);
+        let pages = page_archived_counts(&mut snap, 3);
         // Merged ts order 1000..4000: page1=[1,2,3] spans both units, page2=[4].
         assert_eq!(pages, vec![vec![1, 2, 3], vec![4]]);
     }
@@ -1806,13 +1718,13 @@ mod tests {
         // The total order must still split them so a cursor lands between.
         let body = PgStatArchiver::encode(&[archiver_row(5000, 1), archiver_row(5000, 2)])
             .expect("encode");
-        let part = part_from(&[(1_008_001, 2, body)], 5000, 5000, 7);
+        let part = part_from(&[(1_008_001, 2, body)], 5000, 5000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // limit 1 cuts between the two equal-ts rows.
         let page1 =
-            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 1, None).expect("section page1");
+            section(&mut snap, "pg_stat_archiver", 0, 10_000, 1, None).expect("section page1");
         assert_eq!(
             page1.rows.iter().map(|r| cell(r, "ts")).collect::<Vec<_>>(),
             vec![&Value::Ts(5000)]
@@ -1820,7 +1732,7 @@ mod tests {
         assert_eq!(cell(&page1.rows[0], "archived_count"), &Value::I64(1));
         let cursor = page1.next_cursor.expect("more rows remain after the tie");
 
-        let page2 = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 1, Some(cursor))
+        let page2 = section(&mut snap, "pg_stat_archiver", 0, 10_000, 1, Some(cursor))
             .expect("section page2");
         assert_eq!(
             cell(&page2.rows[0], "archived_count"),
@@ -1835,12 +1747,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
             .expect("encode");
-        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
+        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // limit equals the row count: the first page already drains the stream.
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 2, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 10_000, 2, None).expect("section");
         assert_eq!(page.rows.len(), 2);
         assert!(
             page.next_cursor.is_none(),
@@ -1851,32 +1763,6 @@ mod tests {
     #[test]
     fn broken_cursor_text_is_rejected() {
         let err = Cursor::decode("this is not a cursor").unwrap_err();
-        assert!(matches!(err, QueryError::BadCursor(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn cursor_from_another_source_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
-        let part = part_from(&[(1_008_001, 1, body)], 1000, 1000, 7);
-        write_pgm(dir.path(), 1000, &part);
-
-        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        // A cursor minted for source 42, replayed against source 7.
-        let foreign = Cursor {
-            source_id: 42,
-            values: vec![Value::Ts(1000)],
-        };
-        let err = section(
-            &mut snap,
-            "pg_stat_archiver",
-            7,
-            0,
-            10_000,
-            100,
-            Some(foreign),
-        )
-        .unwrap_err();
         assert!(matches!(err, QueryError::BadCursor(_)), "got {err:?}");
     }
 
@@ -1945,11 +1831,11 @@ mod tests {
     fn window_before_any_unit_is_one_gap_with_no_rows() {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(5000, 1)]).expect("encode");
-        let part = part_from(&[(1_008_001, 1, body)], 5000, 5000, 7);
+        let part = part_from(&[(1_008_001, 1, body)], 5000, 5000);
         write_pgm(dir.path(), 5000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 1000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 1000, 100, None).expect("section");
         assert!(page.rows.is_empty(), "unit lies outside the window");
         assert_eq!(page.gaps, vec![super::Gap { from: 0, to: 1000 }]);
     }
@@ -1959,12 +1845,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(2000, 1), archiver_row(3000, 2)])
             .expect("encode");
-        let part = part_from(&[(1_008_001, 2, body)], 2000, 3000, 7);
+        let part = part_from(&[(1_008_001, 2, body)], 2000, 3000);
         write_pgm(dir.path(), 2000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 1000, 4000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 1000, 4000, 100, None).expect("section");
         assert_eq!(page.rows.len(), 2);
         assert_eq!(
             page.gaps,
@@ -1988,18 +1873,17 @@ mod tests {
         write_pgm(
             dir.path(),
             1000,
-            &part_from(&[(1_008_001, 1, a)], 1000, 1000, 7),
+            &part_from(&[(1_008_001, 1, a)], 1000, 1000),
         );
         let b = PgStatArchiver::encode(&[archiver_row(5000, 2)]).expect("encode");
         write_pgm(
             dir.path(),
             5000,
-            &part_from(&[(1_008_001, 1, b)], 5000, 5000, 7),
+            &part_from(&[(1_008_001, 1, b)], 5000, 5000),
         );
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 1000, 5000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 1000, 5000, 100, None).expect("section");
         assert_eq!(page.rows.len(), 2, "both samples fall in the window");
         assert_eq!(
             page.gaps,
@@ -2015,12 +1899,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(4000, 2)])
             .expect("encode");
-        let part = part_from(&[(1_008_001, 2, body)], 1000, 4000, 7);
+        let part = part_from(&[(1_008_001, 2, body)], 1000, 4000);
         write_pgm(dir.path(), 1000, &part);
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 1000, 4000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 1000, 4000, 100, None).expect("section");
         assert!(page.gaps.is_empty(), "window equals coverage");
     }
 
@@ -2035,7 +1918,6 @@ mod tests {
             )],
             1000,
             1000,
-            7,
         );
         let journal = write_journal(dir.path(), 1000, &a);
 
@@ -2053,14 +1935,12 @@ mod tests {
             )],
             2000,
             2000,
-            7,
         );
         let replacement =
             crate::test_layout::journal_bytes(crate::test_layout::address(2000).id, &[&b]);
         fs::write(&journal, replacement).unwrap();
 
-        let page =
-            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 0, 10_000, 100, None).expect("section");
         assert_eq!(page.rows.len(), 1);
         assert_eq!(cell(&page.rows[0], "ts"), &Value::Ts(2000));
         assert_eq!(cell(&page.rows[0], "archived_count"), &Value::I64(9));

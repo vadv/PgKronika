@@ -26,7 +26,7 @@ fn collector_started_at_us() -> i64 {
 /// Build immutable provenance for one attempted multi-row snapshot.
 pub(crate) fn snapshot_coverage(
     ts: i64,
-    source_type_id: u32,
+    section_type_id: u32,
     read_state: u8,
     visibility: u8,
     source_total: u64,
@@ -34,7 +34,7 @@ pub(crate) fn snapshot_coverage(
 ) -> SnapshotCoverageV1 {
     SnapshotCoverageV1 {
         ts: Ts(ts),
-        source_type_id,
+        section_type_id,
         collector_pid: std::process::id(),
         collector_started_at: Ts(collector_started_at_us()),
         read_state,
@@ -90,7 +90,7 @@ impl SourceCoverage {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CoverageRecord {
     ts: i64,
-    source_type_id: u32,
+    section_type_id: u32,
     coverage: SourceCoverage,
     max_n: u32,
     order_by: &'static str,
@@ -116,7 +116,7 @@ pub(crate) fn collect_coverage_records(
     if inputs.tables.truncated() {
         records.push(CoverageRecord {
             ts: inputs.default_ts,
-            source_type_id: user_tables_type_id(major),
+            section_type_id: user_tables_type_id(major),
             coverage: inputs.tables,
             max_n: u32::try_from(config.max_tables).unwrap_or(u32::MAX),
             order_by: "reads|writes|relpages|n_dead_tup|xid_age|mxid_age",
@@ -126,7 +126,7 @@ pub(crate) fn collect_coverage_records(
     if inputs.indexes.truncated() {
         records.push(CoverageRecord {
             ts: inputs.default_ts,
-            source_type_id: user_indexes_type_id(major),
+            section_type_id: user_indexes_type_id(major),
             coverage: inputs.indexes,
             max_n: u32::try_from(config.max_indexes).unwrap_or(u32::MAX),
             order_by: user_indexes_order_by(major),
@@ -158,7 +158,7 @@ fn statements_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<C
     };
     coverage.truncated().then(|| CoverageRecord {
         ts: rows.first().map_or(inputs.default_ts, |row| row.ts),
-        source_type_id: statements_type_id(*version),
+        section_type_id: statements_type_id(*version),
         coverage,
         max_n: u32::try_from(config.max_statements).unwrap_or(u32::MAX),
         order_by: "total_exec_time|calls",
@@ -194,7 +194,7 @@ fn plans_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<Covera
     };
     coverage.truncated().then(|| CoverageRecord {
         ts: snapshot.snapshot_ts,
-        source_type_id: read.type_id(),
+        section_type_id: read.type_id(),
         coverage,
         max_n: u32::try_from(config.max_plans).unwrap_or(u32::MAX),
         order_by: "total_time",
@@ -231,7 +231,7 @@ pub(crate) fn push_coverage(
         let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
         let row = CollectionCoverageV1 {
             ts: Ts(record.ts),
-            source_type_id: record.source_type_id,
+            section_type_id: record.section_type_id,
             total: u32::try_from(record.coverage.total).unwrap_or(u32::MAX),
             unknown_total: record.coverage.unknown_total,
             collected: u32::try_from(record.coverage.collected).unwrap_or(u32::MAX),

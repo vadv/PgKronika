@@ -58,7 +58,6 @@ fn lifecycle_pgm() -> Vec<u8> {
         PartMeta {
             min_ts: 1_500,
             max_ts: 1_700,
-            source_id: 7,
         },
     )
 }

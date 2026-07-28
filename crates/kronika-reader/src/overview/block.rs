@@ -289,8 +289,7 @@ fn untyped_series(
         .map(|series_id| MetricSeriesDescriptor {
             series_id,
             factor_id: FactorId(0),
-            source_id: 0,
-            source_type_id: 0,
+            section_type_id: 0,
             unit: MetricUnit::Count,
             entity: None,
             reset_family: None,
@@ -341,8 +340,7 @@ fn write_series_descriptors(writer: &mut ByteWriter, series: &[MetricSeriesDescr
     for descriptor in series {
         write_series_id(writer, descriptor.series_id);
         writer.u32_le(descriptor.factor_id.0);
-        writer.u64_le(descriptor.source_id);
-        writer.u32_le(descriptor.source_type_id);
+        writer.u32_le(descriptor.section_type_id);
         writer.u8(descriptor.unit.code());
         match descriptor.entity {
             Some(entity) => {
@@ -371,8 +369,7 @@ fn read_series_descriptors(
     for _ in 0..count {
         let series_id = read_series_id(reader)?;
         let factor_id = FactorId(reader.u32_le()?);
-        let source_id = reader.u64_le()?;
-        let source_type_id = reader.u32_le()?;
+        let section_type_id = reader.u32_le()?;
         let unit = MetricUnit::from_code(reader.u8()?).ok_or(BlockError::InvalidEnum)?;
         let entity = match reader.u8()? {
             0 => None,
@@ -390,8 +387,7 @@ fn read_series_descriptors(
         series.push(MetricSeriesDescriptor {
             series_id,
             factor_id,
-            source_id,
-            source_type_id,
+            section_type_id,
             unit,
             entity,
             reset_family,
@@ -1776,7 +1772,6 @@ impl EncodableBlock for StringTableBlock {
 /// so this block is not reordered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceManifestBlock {
-    source_id: u64,
     source_format_version: u32,
     source_min_ts_us: i64,
     source_max_ts_us: i64,
@@ -1790,7 +1785,6 @@ impl SourceManifestBlock {
     /// # Errors
     /// Returns [`BlockError::AboveBound`] past the directory-entry bound.
     pub fn new(
-        source_id: u64,
         source_format_version: u32,
         source_min_ts_us: i64,
         source_max_ts_us: i64,
@@ -1808,7 +1802,6 @@ impl SourceManifestBlock {
             return Err(BlockError::Malformed);
         }
         Ok(Self {
-            source_id,
             source_format_version,
             source_min_ts_us,
             source_max_ts_us,
@@ -1821,12 +1814,6 @@ impl SourceManifestBlock {
     #[must_use]
     pub fn entries(&self) -> &[ManifestEntryDescriptor] {
         &self.entries
-    }
-
-    /// The PGM source ID.
-    #[must_use]
-    pub const fn source_id(&self) -> u64 {
-        self.source_id
     }
 
     /// The PGM file length recorded for the segment.
@@ -1857,7 +1844,6 @@ impl SourceManifestBlock {
             return Err(BlockError::AboveBound);
         }
         let mut reader = ByteReader::new(body);
-        let source_id = reader.u64_le()?;
         let source_format_version = reader.u32_le()?;
         let source_min_ts_us = reader.i64_le()?;
         let source_max_ts_us = reader.i64_le()?;
@@ -1891,7 +1877,6 @@ impl SourceManifestBlock {
         }
         reader.finish()?;
         Ok(Self {
-            source_id,
             source_format_version,
             source_min_ts_us,
             source_max_ts_us,
@@ -1920,7 +1905,6 @@ impl EncodableBlock for SourceManifestBlock {
 
     fn encode(&self) -> Vec<u8> {
         let mut writer = ByteWriter::new();
-        writer.u64_le(self.source_id);
         writer.u32_le(self.source_format_version);
         writer.i64_le(self.source_min_ts_us);
         writer.i64_le(self.source_max_ts_us);
@@ -2352,11 +2336,10 @@ mod tests {
             },
         ];
         let block =
-            SourceManifestBlock::new(7, 1, 1_000, 2_000, 65_536, entries, &BOUNDS).expect("valid");
+            SourceManifestBlock::new(1, 1_000, 2_000, 65_536, entries, &BOUNDS).expect("valid");
         let decoded = SourceManifestBlock::decode(&block.encode(), &BOUNDS).expect("decode");
         assert_eq!(decoded, block);
         assert_eq!(decoded.entries()[0].catalog.type_id, 1_022_001);
-        assert_eq!(decoded.source_id(), 7);
         assert_eq!(decoded.source_file_len(), 65_536);
     }
 }

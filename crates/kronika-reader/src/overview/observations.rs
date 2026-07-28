@@ -921,7 +921,7 @@ impl EventObservationsBlock {
         }
         if observations
             .iter()
-            .any(|observation| !is_event_source_type(observation.source_type_id()))
+            .any(|observation| !is_event_source_type(observation.section_type_id()))
         {
             return Err(BlockError::InvalidEnum);
         }
@@ -1007,7 +1007,7 @@ impl EventObservationsBlock {
             .ok_or(BlockError::AboveBound)?;
         let mut observations = Vec::with_capacity(count.min(4_096) as usize);
         for _ in 0..count {
-            let source_type_id = reader.u32_le()?;
+            let section_type_id = reader.u32_le()?;
             let provenance = read_provenance(&mut reader)?;
             let shape = shape_from(reader.u8()?)?;
             let time = read_time(&mut reader)?;
@@ -1021,7 +1021,7 @@ impl EventObservationsBlock {
             }
             let observation = EventObservation::new(
                 *lineage,
-                source_type_id,
+                section_type_id,
                 provenance,
                 shape,
                 time,
@@ -1087,7 +1087,7 @@ impl EncodableBlock for EventObservationsBlock {
         let mut writer = ByteWriter::new();
         writer.uvarint(self.observations.len() as u64);
         for observation in &self.observations {
-            writer.u32_le(observation.source_type_id());
+            writer.u32_le(observation.section_type_id());
             write_provenance(&mut writer, observation.provenance());
             writer.u8(shape_code(observation.shape()));
             write_time(&mut writer, observation.time());
@@ -1228,7 +1228,7 @@ mod tests {
     use super::*;
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(1, [2; 32])
+        SegmentIdentity::sealed([2; 32])
     }
 
     fn provenance(row_ordinal: u32) -> ObservationProvenance {
@@ -1506,7 +1506,7 @@ mod tests {
     #[test]
     fn decoding_derives_identity_from_the_validated_lineage_context() {
         let block = EventObservationsBlock::new(vec![ready(1)], &LIMIT).expect("valid");
-        let wrong = SegmentIdentity::sealed(1, [9; 32]);
+        let wrong = SegmentIdentity::sealed([9; 32]);
         let decoded =
             EventObservationsBlock::decode(&block.encode(), &wrong, block.string_table(), &LIMIT)
                 .expect("the enclosing container validates lineage");

@@ -1,7 +1,7 @@
 //! Logical identities for overview facts and in-process builds.
 //!
-//! A [`FactKey`] binds retained facts to the source ID, exact PGM descriptor,
-//! file kind, and contract versions that determine the logical fact bytes.
+//! A [`FactKey`] binds retained facts to the exact PGM descriptor, file kind,
+//! and contract versions that determine the logical fact bytes.
 //! It is stored and validated inside the sibling `.ovf`; it never determines
 //! the sidecar filename or directory layout.
 
@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::container::HeaderIdentity;
 use super::descriptors::SourceDescriptor;
 
-const FACT_KEY_TAG: &[u8] = b"pgk-overview-fact-key-v2";
+const FACT_KEY_TAG: &[u8] = b"pgk-overview-fact-key-v3";
 
 /// The logical kind of an overview fact file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,10 +47,9 @@ impl std::fmt::Debug for FactKey {
 }
 
 impl FactKey {
-    /// Derives a key from source provenance, file kind, and contract versions.
+    /// Derives a key from PGM provenance, file kind, and contract versions.
     #[must_use]
     pub fn derive(
-        pgm_source_id: u64,
         source_descriptor: SourceDescriptor,
         file_kind: FileKind,
         fact_schema_version: u32,
@@ -59,7 +58,6 @@ impl FactKey {
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(FACT_KEY_TAG);
-        hasher.update(pgm_source_id.to_le_bytes());
         hasher.update(source_descriptor.0);
         hasher.update(file_kind.code().to_le_bytes());
         hasher.update(fact_schema_version.to_le_bytes());
@@ -72,7 +70,6 @@ impl FactKey {
     #[must_use]
     pub fn for_identity(identity: &HeaderIdentity, file_kind: FileKind) -> Self {
         Self::derive(
-            identity.pgm_source_id,
             identity.source_descriptor,
             file_kind,
             identity.fact_schema_version,
@@ -83,9 +80,8 @@ impl FactKey {
 
     /// Derives the current `SegmentFacts` key for one exact PGM source.
     #[must_use]
-    pub fn for_current_segment(pgm_source_id: u64, source_descriptor: SourceDescriptor) -> Self {
+    pub fn for_current_segment(source_descriptor: SourceDescriptor) -> Self {
         Self::derive(
-            pgm_source_id,
             source_descriptor,
             FileKind::SegmentFacts,
             FACT_SCHEMA_VERSION,
@@ -148,33 +144,29 @@ mod tests {
 
     #[test]
     fn key_is_stable_for_identical_inputs() {
-        let left = FactKey::derive(1, descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
-        let right = FactKey::derive(1, descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
+        let left = FactKey::derive(descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
+        let right = FactKey::derive(descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
         assert_eq!(left, right);
     }
 
     #[test]
-    fn source_descriptor_and_each_contract_axis_change_the_key() {
-        let base = FactKey::derive(1, descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
+    fn descriptor_and_each_contract_axis_change_the_key() {
+        let base = FactKey::derive(descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
         assert_ne!(
             base,
-            FactKey::derive(2, descriptor(2), FileKind::SegmentFacts, 1, 1, 1)
+            FactKey::derive(descriptor(9), FileKind::SegmentFacts, 1, 1, 1)
         );
         assert_ne!(
             base,
-            FactKey::derive(1, descriptor(9), FileKind::SegmentFacts, 1, 1, 1)
+            FactKey::derive(descriptor(2), FileKind::SegmentFacts, 2, 1, 1)
         );
         assert_ne!(
             base,
-            FactKey::derive(1, descriptor(2), FileKind::SegmentFacts, 2, 1, 1)
+            FactKey::derive(descriptor(2), FileKind::SegmentFacts, 1, 2, 1)
         );
         assert_ne!(
             base,
-            FactKey::derive(1, descriptor(2), FileKind::SegmentFacts, 1, 2, 1)
-        );
-        assert_ne!(
-            base,
-            FactKey::derive(1, descriptor(2), FileKind::SegmentFacts, 1, 1, 2)
+            FactKey::derive(descriptor(2), FileKind::SegmentFacts, 1, 1, 2)
         );
     }
 }

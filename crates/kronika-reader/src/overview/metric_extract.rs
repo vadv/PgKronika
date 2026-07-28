@@ -249,11 +249,11 @@ impl MetricAccumulator {
         Ok(())
     }
 
-    fn register_factor(&mut self, factor: MetricFactor, source_type_id: u32) {
+    fn register_factor(&mut self, factor: MetricFactor, section_type_id: u32) {
         self.factor_sources
             .entry(factor.id())
             .or_default()
-            .insert(source_type_id);
+            .insert(section_type_id);
     }
 
     fn counter(
@@ -266,7 +266,7 @@ impl MetricAccumulator {
         self.factor_sources
             .entry(descriptor.factor_id)
             .or_default()
-            .insert(descriptor.source_type_id);
+            .insert(descriptor.section_type_id);
         if value < 0 {
             self.factor_losses
                 .entry(descriptor.factor_id)
@@ -275,7 +275,7 @@ impl MetricAccumulator {
             return Ok(());
         }
         self.admit_item(self.counters.len())?;
-        let alignment_id = derive_alignment(descriptor.source_id, descriptor.entity);
+        let alignment_id = derive_alignment(descriptor.entity);
         self.counters.push(CounterSample::new(
             descriptor.series_id,
             alignment_id,
@@ -299,7 +299,7 @@ impl MetricAccumulator {
         self.factor_sources
             .entry(descriptor.factor_id)
             .or_default()
-            .insert(descriptor.source_type_id);
+            .insert(descriptor.section_type_id);
         let Some(sample) = GaugeSample::new(descriptor.series_id, ts_us, value) else {
             return Err(BuildError::Source(SourceError::Corrupt));
         };
@@ -341,14 +341,13 @@ impl MetricAccumulator {
     fn snapshot_boundary(
         &mut self,
         factor: MetricFactor,
-        source_type_id: u32,
-        scope: u64,
+        section_type_id: u32,
         entity_kind: EntityKind,
         ts_us: i64,
         population_total: u64,
         postmaster_epoch: u64,
     ) -> Result<(), BuildError> {
-        let source_type = source_type_id.to_le_bytes();
+        let source_type = section_type_id.to_le_bytes();
         let epoch = postmaster_epoch.to_le_bytes();
         let identity = [
             b"complete-snapshot".as_slice(),
@@ -356,12 +355,11 @@ impl MetricAccumulator {
             epoch.as_slice(),
         ]
         .concat();
-        let entity = derive_entity(scope, entity_kind, &identity);
+        let entity = derive_entity(entity_kind, &identity);
         self.state(
             series(
                 factor,
-                scope,
-                source_type_id,
+                section_type_id,
                 MetricUnit::StateCode,
                 Some(entity),
                 None,
@@ -381,7 +379,6 @@ impl MetricAccumulator {
 )]
 pub(super) fn extract_metrics<R: ReadAt>(
     unit: &PgmUnit<R>,
-    source_id: u64,
     segment_range: Option<CoverageSpan>,
     bounds: &Bounds,
 ) -> Result<MetricExtraction, BuildError> {
@@ -451,36 +448,36 @@ pub(super) fn extract_metrics<R: ReadAt>(
         register_factor_inventory(&mut metrics, section.type_id);
         match section.type_id {
             type_id if PG_STAT_DATABASE_TYPES.contains(&type_id) => {
-                extract_pg_database(&mut metrics, section, source_id, &reset_timeline)?;
+                extract_pg_database(&mut metrics, section, &reset_timeline)?;
             }
             OS_CGROUP_MEMORY => {
-                extract_cgroup_memory(&mut metrics, section, source_id, &reset_timeline)?;
+                extract_cgroup_memory(&mut metrics, section, &reset_timeline)?;
             }
             OS_VMSTAT => {
-                extract_vmstat(&mut metrics, section, source_id, &reset_timeline)?;
+                extract_vmstat(&mut metrics, section, &reset_timeline)?;
             }
             REPLICATION_INSTANCE => {
-                extract_replication_instance(&mut metrics, section, source_id)?;
+                extract_replication_instance(&mut metrics, section)?;
             }
             PG_REPLICATION_PHYSICAL => {
-                extract_replication_senders(&mut metrics, section, source_id, &snapshot_coverage)?;
+                extract_replication_senders(&mut metrics, section, &snapshot_coverage)?;
             }
             type_id if PG_REPLICATION_SLOT_TYPES.contains(&type_id) => {
-                extract_replication_slots(&mut metrics, section, source_id, &snapshot_coverage)?;
+                extract_replication_slots(&mut metrics, section, &snapshot_coverage)?;
             }
             type_id if PG_STORAGE_MOUNT_TYPES.contains(&type_id) => {
-                extract_storage_mounts(&mut metrics, section, source_id)?;
+                extract_storage_mounts(&mut metrics, section)?;
             }
             PG_PROCESS_CGROUP_MEMORY => {
-                extract_process_cgroup_memory(&mut metrics, section, source_id)?;
+                extract_process_cgroup_memory(&mut metrics, section)?;
             }
             RESET_METADATA | INSTANCE_METADATA | COLLECTION_COVERAGE | SNAPSHOT_COVERAGE => {}
             _ => return Err(BuildError::Internal),
         }
     }
-    extract_reset_metadata(&mut metrics, &decoded, source_id)?;
-    extract_snapshot_boundaries(&mut metrics, &snapshot_coverage, source_id, &reset_timeline)?;
-    let event_facts = collector_event_facts(&snapshot_coverage, source_id, bounds)?;
+    extract_reset_metadata(&mut metrics, &decoded)?;
+    extract_snapshot_boundaries(&mut metrics, &snapshot_coverage, &reset_timeline)?;
+    let event_facts = collector_event_facts(&snapshot_coverage, bounds)?;
 
     if !reset_timeline.has_pg_context() {
         for factor in [
@@ -543,8 +540,8 @@ pub(super) fn extract_metrics<R: ReadAt>(
     })
 }
 
-fn register_factor_inventory(out: &mut MetricAccumulator, source_type_id: u32) {
-    let factors: &[MetricFactor] = if PG_STAT_DATABASE_TYPES.contains(&source_type_id) {
+fn register_factor_inventory(out: &mut MetricAccumulator, section_type_id: u32) {
+    let factors: &[MetricFactor] = if PG_STAT_DATABASE_TYPES.contains(&section_type_id) {
         &[
             MetricFactor::PgDatabaseDeadlocks,
             MetricFactor::PgDatabaseRecoveryConflicts,
@@ -557,38 +554,38 @@ fn register_factor_inventory(out: &mut MetricAccumulator, source_type_id: u32) {
             MetricFactor::PgDatabaseFrozenXidAge,
             MetricFactor::PgDatabaseMinMxidAge,
         ]
-    } else if source_type_id == RESET_METADATA {
+    } else if section_type_id == RESET_METADATA {
         &[
             MetricFactor::PgStatisticsResetAt,
             MetricFactor::PgPostmasterStartTime,
         ]
-    } else if source_type_id == REPLICATION_INSTANCE {
+    } else if section_type_id == REPLICATION_INSTANCE {
         &[
             MetricFactor::PgRecoveryRole,
             MetricFactor::PgTimeline,
             MetricFactor::PgReplicationReplayLag,
         ]
-    } else if source_type_id == PG_REPLICATION_PHYSICAL {
+    } else if section_type_id == PG_REPLICATION_PHYSICAL {
         &[
             MetricFactor::PgReplicationSenderState,
             MetricFactor::PgReplicationSenderSnapshotPopulation,
         ]
-    } else if PG_REPLICATION_SLOT_TYPES.contains(&source_type_id) {
+    } else if PG_REPLICATION_SLOT_TYPES.contains(&section_type_id) {
         &[
             MetricFactor::PgReplicationSlotState,
             MetricFactor::PgReplicationSlotSnapshotPopulation,
         ]
-    } else if PG_STORAGE_MOUNT_TYPES.contains(&source_type_id) {
+    } else if PG_STORAGE_MOUNT_TYPES.contains(&section_type_id) {
         &[
             MetricFactor::PgFilesystemTotalBytes,
             MetricFactor::PgFilesystemAvailableBytes,
         ]
-    } else if source_type_id == PG_PROCESS_CGROUP_MEMORY {
+    } else if section_type_id == PG_PROCESS_CGROUP_MEMORY {
         &[
             MetricFactor::OsCgroupMemoryCurrentBytes,
             MetricFactor::OsCgroupMemoryMaxBytes,
         ]
-    } else if source_type_id == OS_CGROUP_MEMORY {
+    } else if section_type_id == OS_CGROUP_MEMORY {
         &[
             MetricFactor::OsCgroupMemoryCurrentBytes,
             MetricFactor::OsCgroupMemoryMaxBytes,
@@ -597,26 +594,25 @@ fn register_factor_inventory(out: &mut MetricAccumulator, source_type_id: u32) {
             MetricFactor::OsCgroupOomEvents,
             MetricFactor::OsCgroupOomKills,
         ]
-    } else if source_type_id == OS_VMSTAT {
+    } else if section_type_id == OS_VMSTAT {
         &[MetricFactor::OsHostOomKills]
     } else {
         &[]
     };
     for factor in factors {
-        out.register_factor(*factor, source_type_id);
+        out.register_factor(*factor, section_type_id);
     }
 }
 
 fn extract_pg_database(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: u64,
     reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         let ts = required_ts(row, "ts")?;
         let datid = required_u32(row, "datid")?;
-        let entity = derive_entity(scope, EntityKind::Database, &datid.to_le_bytes());
+        let entity = derive_entity(EntityKind::Database, &datid.to_le_bytes());
         let context = reset.context_at(ts);
         let epoch = context.pg_database_epoch(optional_ts(row, "stats_reset")?, ts);
         for (factor, field) in [
@@ -644,7 +640,6 @@ fn extract_pg_database(
             }
             let descriptor = series(
                 factor,
-                scope,
                 section.type_id,
                 MetricUnit::Count,
                 Some(entity),
@@ -679,7 +674,6 @@ fn extract_pg_database(
                 out.gauge(
                     series(
                         factor,
-                        scope,
                         section.type_id,
                         unit,
                         Some(entity),
@@ -698,7 +692,6 @@ fn extract_pg_database(
 fn extract_cgroup_memory(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: u64,
     reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -711,7 +704,7 @@ fn extract_cgroup_memory(
             source_scope.to_le_bytes().as_slice(),
         ]
         .concat();
-        let entity = derive_entity(scope, EntityKind::Cgroup, &identity);
+        let entity = derive_entity(EntityKind::Cgroup, &identity);
         for (factor, field) in [
             (MetricFactor::OsCgroupMemoryCurrentBytes, "current"),
             (MetricFactor::OsCgroupMemoryMaxBytes, "max"),
@@ -720,7 +713,6 @@ fn extract_cgroup_memory(
                 out.gauge(
                     series(
                         factor,
-                        scope,
                         section.type_id,
                         MetricUnit::Bytes,
                         Some(entity),
@@ -748,7 +740,6 @@ fn extract_cgroup_memory(
             out.counter(
                 series(
                     factor,
-                    scope,
                     section.type_id,
                     MetricUnit::Count,
                     Some(entity),
@@ -767,7 +758,6 @@ fn extract_cgroup_memory(
 fn extract_vmstat(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: u64,
     reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -784,11 +774,10 @@ fn extract_vmstat(
         }
         let source_scope = required_u32(row, "scope")?;
         let identity = source_scope.to_le_bytes();
-        let entity = derive_entity(scope, EntityKind::Host, &identity);
+        let entity = derive_entity(EntityKind::Host, &identity);
         out.counter(
             series(
                 MetricFactor::OsHostOomKills,
-                scope,
                 section.type_id,
                 MetricUnit::Count,
                 Some(entity),
@@ -806,15 +795,13 @@ fn extract_vmstat(
 fn extract_replication_instance(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: u64,
 ) -> Result<(), BuildError> {
-    let entity = derive_entity(scope, EntityKind::Postmaster, b"instance");
+    let entity = derive_entity(EntityKind::Postmaster, b"instance");
     for row in &section.rows {
         let ts = required_ts(row, "ts")?;
         out.state(
             series(
                 MetricFactor::PgRecoveryRole,
-                scope,
                 section.type_id,
                 MetricUnit::StateCode,
                 Some(entity),
@@ -831,7 +818,6 @@ fn extract_replication_instance(
         out.state(
             series(
                 MetricFactor::PgTimeline,
-                scope,
                 section.type_id,
                 MetricUnit::StateCode,
                 Some(entity),
@@ -847,7 +833,6 @@ fn extract_replication_instance(
             out.gauge(
                 series(
                     MetricFactor::PgReplicationReplayLag,
-                    scope,
                     section.type_id,
                     MetricUnit::Microseconds,
                     Some(entity),
@@ -865,7 +850,6 @@ fn extract_replication_instance(
 fn extract_replication_senders(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: u64,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -878,7 +862,7 @@ fn extract_replication_senders(
             backend_start.to_le_bytes().as_slice(),
         ]
         .concat();
-        let entity = derive_entity(scope, EntityKind::ReplicationSender, &identity);
+        let entity = derive_entity(EntityKind::ReplicationSender, &identity);
         let state_code = required_u32(row, "state_code")?;
         if state_code > 5 {
             return Err(BuildError::Source(SourceError::Corrupt));
@@ -886,7 +870,6 @@ fn extract_replication_senders(
         out.state(
             series(
                 MetricFactor::PgReplicationSenderState,
-                scope,
                 section.type_id,
                 MetricUnit::StateCode,
                 Some(entity),
@@ -904,7 +887,6 @@ fn extract_replication_senders(
 fn extract_replication_slots(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: u64,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -912,7 +894,7 @@ fn extract_replication_slots(
         let population = proven_population(section.type_id, ts_us, coverage);
         let slot_name = required_str_id(row, "slot_name")?;
         let identity = slot_name.to_le_bytes();
-        let entity = derive_entity(scope, EntityKind::ReplicationSlot, &identity);
+        let entity = derive_entity(EntityKind::ReplicationSlot, &identity);
         let state_code = required_u32(row, "wal_status_code")?;
         if state_code > 4 {
             return Err(BuildError::Source(SourceError::Corrupt));
@@ -920,7 +902,6 @@ fn extract_replication_slots(
         out.state(
             series(
                 MetricFactor::PgReplicationSlotState,
-                scope,
                 section.type_id,
                 MetricUnit::StateCode,
                 Some(entity),
@@ -938,7 +919,6 @@ fn extract_replication_slots(
 fn extract_storage_mounts(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: u64,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         if required_u32(row, "mapping_state")? != 1 {
@@ -955,7 +935,7 @@ fn extract_storage_mounts(
         ] {
             identity.extend_from_slice(&required_u64(row, field)?.to_le_bytes());
         }
-        let entity = derive_entity(scope, EntityKind::Filesystem, &identity);
+        let entity = derive_entity(EntityKind::Filesystem, &identity);
         let ts = required_ts(row, "ts")?;
         for (factor, field) in [
             (MetricFactor::PgFilesystemTotalBytes, "total_bytes"),
@@ -968,7 +948,6 @@ fn extract_storage_mounts(
                 out.gauge(
                     series(
                         factor,
-                        scope,
                         section.type_id,
                         MetricUnit::Bytes,
                         Some(entity),
@@ -987,7 +966,6 @@ fn extract_storage_mounts(
 fn extract_process_cgroup_memory(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: u64,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         if required_u32(row, "mapping_state")? != 1 {
@@ -997,7 +975,7 @@ fn extract_process_cgroup_memory(
         for field in ["cgroup_hash_hi", "cgroup_hash_lo", "hierarchy"] {
             identity.extend_from_slice(&required_u64(row, field)?.to_le_bytes());
         }
-        let entity = derive_entity(scope, EntityKind::Cgroup, &identity);
+        let entity = derive_entity(EntityKind::Cgroup, &identity);
         let ts = required_ts(row, "ts")?;
         for (factor, field) in [
             (MetricFactor::OsCgroupMemoryCurrentBytes, "current_bytes"),
@@ -1007,7 +985,6 @@ fn extract_process_cgroup_memory(
                 out.gauge(
                     series(
                         factor,
-                        scope,
                         section.type_id,
                         MetricUnit::Bytes,
                         Some(entity),
@@ -1081,9 +1058,8 @@ fn reset_timeline(sections: &[DecodedMetricSection]) -> Result<ResetTimeline, Bu
 fn extract_reset_metadata(
     out: &mut MetricAccumulator,
     sections: &[DecodedMetricSection],
-    scope: u64,
 ) -> Result<(), BuildError> {
-    let entity = derive_entity(scope, EntityKind::Postmaster, b"instance");
+    let entity = derive_entity(EntityKind::Postmaster, b"instance");
     for section in sections
         .iter()
         .filter(|section| section.type_id == RESET_METADATA)
@@ -1093,7 +1069,6 @@ fn extract_reset_metadata(
             out.gauge(
                 series(
                     MetricFactor::PgPostmasterStartTime,
-                    scope,
                     section.type_id,
                     MetricUnit::Microseconds,
                     Some(entity),
@@ -1107,7 +1082,6 @@ fn extract_reset_metadata(
                 out.gauge(
                     series(
                         MetricFactor::PgStatisticsResetAt,
-                        scope,
                         section.type_id,
                         MetricUnit::Microseconds,
                         Some(entity),
@@ -1126,7 +1100,6 @@ fn extract_reset_metadata(
 fn extract_snapshot_boundaries(
     out: &mut MetricAccumulator,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
-    scope: u64,
     reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     let mut seen = BTreeSet::new();
@@ -1158,7 +1131,6 @@ fn extract_snapshot_boundaries(
             out.snapshot_boundary(
                 factor,
                 *source_type,
-                scope,
                 entity_kind,
                 record.ts_us,
                 record.source_total,
@@ -1171,7 +1143,6 @@ fn extract_snapshot_boundaries(
 
 fn collector_event_facts(
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
-    scope: u64,
     bounds: &Bounds,
 ) -> Result<Vec<EventFact>, BuildError> {
     let mut facts = Vec::new();
@@ -1196,7 +1167,6 @@ fn collector_event_facts(
             };
             if let Some((kind, reason)) = primary
                 && let Some(fact) = EventFact::from_collector_loss(
-                    scope,
                     *source_type,
                     record.ts_us,
                     kind,
@@ -1210,7 +1180,6 @@ fn collector_event_facts(
             if record.visibility != 0
                 && !matches!(primary, Some((EventKind::CollectorVisibilityRestricted, _)))
                 && let Some(fact) = EventFact::from_collector_loss(
-                    scope,
                     *source_type,
                     record.ts_us,
                     EventKind::CollectorVisibilityRestricted,
@@ -1258,7 +1227,7 @@ fn source_coverage(
         match section.type_id {
             SNAPSHOT_COVERAGE => {
                 for row in &section.rows {
-                    let source_type = required_u32(row, "source_type_id")?;
+                    let source_type = required_u32(row, "section_type_id")?;
                     let ts_us = required_ts(row, "ts")?;
                     let read_state = required_u32(row, "read_state")?;
                     let visibility = required_u32(row, "visibility")?;
@@ -1291,7 +1260,7 @@ fn source_coverage(
                         return Err(BuildError::Source(SourceError::Corrupt));
                     }
                     let unknown_total = required_bool(row, "unknown_total")?;
-                    let source_type = required_u32(row, "source_type_id")?;
+                    let source_type = required_u32(row, "section_type_id")?;
                     let source_total = u64::from(required_u32(row, "total")?);
                     let collected = u64::from(required_u32(row, "collected")?);
                     if collected > source_total {
@@ -1622,8 +1591,7 @@ fn insert_descriptor(
 
 fn series(
     factor: MetricFactor,
-    source_id: u64,
-    source_type_id: u32,
+    section_type_id: u32,
     unit: MetricUnit,
     entity: Option<kronika_analytics::overview::EntityRef>,
     reset_family: Option<ResetFamily>,
@@ -1631,8 +1599,7 @@ fn series(
 ) -> MetricSeriesDescriptor {
     MetricSeriesDescriptor::new(
         factor,
-        source_id,
-        source_type_id,
+        section_type_id,
         unit,
         entity,
         reset_family,
@@ -1863,7 +1830,7 @@ mod tests {
         let ts = 1_785_151_906_420_414_i64;
         let snapshot = SnapshotCoverageV1 {
             ts: Ts(ts),
-            source_type_id: statements,
+            section_type_id: statements,
             collector_pid: 42,
             collector_started_at: Ts(1),
             read_state: 1,
@@ -1873,7 +1840,7 @@ mod tests {
         };
         let collection = CollectionCoverageV1 {
             ts: Ts(ts),
-            source_type_id: statements,
+            section_type_id: statements,
             total: 888,
             unknown_total: false,
             collected: 707,
@@ -1947,10 +1914,8 @@ mod tests {
 
     #[test]
     fn expanded_metric_samples_stop_at_the_output_bound() {
-        let scope = 1;
         let descriptor = series(
             MetricFactor::PgDatabaseConnections,
-            scope,
             PG_STAT_DATABASE_TYPES[0],
             MetricUnit::Connections,
             None,

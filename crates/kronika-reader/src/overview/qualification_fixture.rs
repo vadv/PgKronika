@@ -58,7 +58,6 @@ pub(super) struct VersionedFixture {
     #[cfg(test)]
     pub schema_version: u16,
     #[cfg(test)]
-    pub source_id: u64,
     #[cfg(test)]
     pub cadence_us: i64,
     pub parts: Vec<FixturePart>,
@@ -136,7 +135,6 @@ pub(super) fn all_family_fixture() -> VersionedFixture {
         #[cfg(test)]
         schema_version: ALL_FAMILY_SCHEMA_VERSION,
         #[cfg(test)]
-        source_id: 7,
         #[cfg(test)]
         cadence_us: 10,
         parts: vec![
@@ -253,7 +251,6 @@ fn build_fixture_part(sections: &[FixtureSection], min_ts_us: i64, max_ts_us: i6
         PartMeta {
             min_ts: min_ts_us,
             max_ts: max_ts_us,
-            source_id: 7,
         },
     )
 }
@@ -505,20 +502,20 @@ fn coverage_rows(ts_us: i64, snapshot: u8) -> Vec<SnapshotCoverageV1> {
         1_202_001,
     ]
     .into_iter()
-    .map(|source_type_id| {
-        if snapshot == 2 && source_type_id == 1_005_004 {
-            coverage_row(source_type_id, ts_us, 3, 1, 0)
-        } else if snapshot >= 2 && source_type_id == 1_033_001 {
-            coverage_row(source_type_id, ts_us, 0, 0, 0)
+    .map(|section_type_id| {
+        if snapshot == 2 && section_type_id == 1_005_004 {
+            coverage_row(section_type_id, ts_us, 3, 1, 0)
+        } else if snapshot >= 2 && section_type_id == 1_033_001 {
+            coverage_row(section_type_id, ts_us, 0, 0, 0)
         } else {
-            coverage_row(source_type_id, ts_us, 0, 1, 1)
+            coverage_row(section_type_id, ts_us, 0, 1, 1)
         }
     })
     .collect()
 }
 
 const fn coverage_row(
-    source_type_id: u32,
+    section_type_id: u32,
     ts_us: i64,
     read_state: u8,
     source_total: u32,
@@ -526,7 +523,7 @@ const fn coverage_row(
 ) -> SnapshotCoverageV1 {
     SnapshotCoverageV1 {
         ts: Ts(ts_us),
-        source_type_id,
+        section_type_id,
         collector_pid: 99,
         collector_started_at: Ts(1),
         read_state,
