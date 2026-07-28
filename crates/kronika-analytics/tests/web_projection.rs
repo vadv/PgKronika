@@ -91,3 +91,22 @@ fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
         ]
     );
 }
+
+#[test]
+fn events_input_names_match_the_registry_contract_names() {
+    let events = web_view_by_name("events").expect("events view");
+    assert_eq!(
+        events.inputs[0].sections,
+        [
+            "pg_log_errors",
+            "pg_log_checkpoints",
+            "pg_log_autovacuum",
+            "pg_log_slow_queries",
+            "pg_log_lock_waits",
+            "pg_log_lifecycle",
+            "pg_log_gap",
+            "pg_log_temp_files",
+            "pg_log_source_status",
+        ]
+    );
+}

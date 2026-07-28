@@ -1,6 +1,8 @@
+mod build;
 mod series;
 mod summary;
 
+pub(super) use build::{WebIndexBlocks, build_web_index};
 pub use series::{
     EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, METRIC_FLAG_CANONICAL,
     MetricAggregation, MetricStatus,

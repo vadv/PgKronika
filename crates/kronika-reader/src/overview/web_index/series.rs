@@ -563,6 +563,41 @@ impl EntitySeriesBlock {
         &self.metrics
     }
 
+    pub(in crate::overview) fn resident_heap_bytes(&self) -> Option<usize> {
+        let dictionary_slots = self
+            .dictionary
+            .capacity()
+            .checked_mul(size_of::<EntityDictionaryEntry>())?;
+        let dictionary_heap = self.dictionary.iter().try_fold(0_usize, |total, entry| {
+            total
+                .checked_add(entry.key.capacity())?
+                .checked_add(entry.label.capacity())
+        })?;
+        let metric_slots = self
+            .metrics
+            .capacity()
+            .checked_mul(size_of::<EntityMetric>())?;
+        let metric_heap = self.metrics.iter().try_fold(0_usize, |total, metric| {
+            let series_slots = metric
+                .series
+                .capacity()
+                .checked_mul(size_of::<EntitySeries>())?;
+            let series_heap = metric.series.iter().try_fold(0_usize, |subtotal, series| {
+                subtotal
+                    .checked_add(series.present_mask.capacity())?
+                    .checked_add(series.quantized_values.capacity())
+            })?;
+            total.checked_add(series_slots)?.checked_add(series_heap)
+        })?;
+
+        self.coverage_mask
+            .capacity()
+            .checked_add(dictionary_slots)?
+            .checked_add(dictionary_heap)?
+            .checked_add(metric_slots)?
+            .checked_add(metric_heap)
+    }
+
     pub(super) fn encode_body(&self) -> Vec<u8> {
         let mut writer = ByteWriter::new();
         writer.u16_le(SERIES_BLOCK_REVISION);
@@ -896,5 +931,49 @@ mod tests {
         );
 
         assert_eq!(result, Err(BlockError::Malformed));
+    }
+
+    #[test]
+    fn entity_series_reports_all_owned_heap_capacity() {
+        let grid = TimeGrid::for_range(0, 60_000_000).expect("grid");
+        let series = EntitySeries::new(0, 1.0, 1.0, vec![0b0000_0011], vec![255, 0], &LIMIT)
+            .expect("series");
+        let block = EntitySeriesBlock::new(
+            1,
+            1,
+            1,
+            IndexStatus::Complete,
+            (0, 60_000_000),
+            grid,
+            vec![0b0000_0011],
+            vec![dictionary_entry(1)],
+            vec![complete_metric(vec![series])],
+            &LIMIT,
+        )
+        .expect("block");
+        let expected = block.coverage_mask.capacity()
+            + block.dictionary.capacity() * size_of::<EntityDictionaryEntry>()
+            + block
+                .dictionary
+                .iter()
+                .map(|entry| entry.key.capacity() + entry.label.capacity())
+                .sum::<usize>()
+            + block.metrics.capacity() * size_of::<EntityMetric>()
+            + block
+                .metrics
+                .iter()
+                .map(|metric| {
+                    metric.series.capacity() * size_of::<EntitySeries>()
+                        + metric
+                            .series
+                            .iter()
+                            .map(|series| {
+                                series.present_mask.capacity() + series.quantized_values.capacity()
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+
+        assert_eq!(block.resident_heap_bytes(), Some(expected));
     }
 }

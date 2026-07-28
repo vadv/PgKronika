@@ -94,8 +94,9 @@ pub const FACT_SCHEMA_VERSION: u32 = 4;
 
 /// Version for PGM-to-fact extraction and normalization.
 ///
-/// Version 5 derives sealed lineage from exact PGM metadata.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 5;
+/// Version 6 materializes the canonical web projection registry into indexed
+/// summary and entity-series blocks.
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 6;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///

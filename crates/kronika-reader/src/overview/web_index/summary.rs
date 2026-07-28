@@ -360,6 +360,27 @@ impl UiSummaryBlock {
             .zip(self.snapshot_times.last().copied())
     }
 
+    pub(in crate::overview) fn resident_heap_bytes(&self) -> Option<usize> {
+        let snapshot_times = self
+            .snapshot_times
+            .capacity()
+            .checked_mul(size_of::<i64>())?;
+        let view_slots = self
+            .views
+            .capacity()
+            .checked_mul(size_of::<ViewSummary>())?;
+        let view_heap = self.views.iter().try_fold(0_usize, |total, view| {
+            total
+                .checked_add(view.snapshot_presence.capacity())?
+                .checked_add(view.populations.capacity().checked_mul(size_of::<u64>())?)?
+                .checked_add(view.coverage_mask.capacity())
+        })?;
+
+        snapshot_times
+            .checked_add(view_slots)?
+            .checked_add(view_heap)
+    }
+
     pub(super) fn encode_body(&self) -> Vec<u8> {
         let Some(grid) = self.grid else {
             return Vec::new();
@@ -501,5 +522,34 @@ mod tests {
         assert!(grid.bucket_count() <= 256);
         assert_eq!(grid.bucket_width_s() % 60, 0);
         assert!(grid.bucket_end_us().expect("grid end") > last);
+    }
+
+    #[test]
+    fn ui_summary_reports_all_owned_heap_capacity() {
+        let grid = TimeGrid::for_range(0, 60_000_000).expect("grid");
+        let view = ViewSummary::new(
+            1,
+            1,
+            IndexStatus::Complete,
+            vec![0b0000_0011],
+            vec![7, 11],
+            &LIMIT,
+        )
+        .expect("view");
+        let block =
+            UiSummaryBlock::new(grid, vec![0, 60_000_000], vec![view], &LIMIT).expect("summary");
+        let expected = block.snapshot_times.capacity() * size_of::<i64>()
+            + block.views.capacity() * size_of::<ViewSummary>()
+            + block
+                .views
+                .iter()
+                .map(|view| {
+                    view.snapshot_presence.capacity()
+                        + view.populations.capacity() * size_of::<u64>()
+                        + view.coverage_mask.capacity()
+                })
+                .sum::<usize>();
+
+        assert_eq!(block.resident_heap_bytes(), Some(expected));
     }
 }

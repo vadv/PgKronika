@@ -30,7 +30,7 @@ pub enum WebUnit {
     Microseconds,
     /// Dimensionless count.
     Count,
-    /// PostgreSQL blocks.
+    /// `PostgreSQL` blocks.
     Blocks,
     /// Dimensionless ratio.
     Ratio,
@@ -69,8 +69,8 @@ impl WebUnit {
 pub enum WebFormula {
     /// Sum positive deltas of the named cumulative fields.
     PositiveDeltaSum {
-        /// Cumulative fields added before differencing.
-        fields: &'static [&'static str],
+        /// Alternative cumulative field sets, newest compatible layout first.
+        field_sets: &'static [&'static [&'static str]],
         /// Multiplier applied after differencing.
         scale: f64,
         /// Normative catalog expression.
@@ -78,8 +78,8 @@ pub enum WebFormula {
     },
     /// Divide a positive cumulative delta by elapsed wall time.
     PositiveDeltaRate {
-        /// Cumulative fields added before differencing.
-        fields: &'static [&'static str],
+        /// Alternative cumulative field sets, newest compatible layout first.
+        field_sets: &'static [&'static [&'static str]],
         /// Normative catalog expression.
         expression: &'static str,
     },
@@ -218,14 +218,14 @@ const LOCK_INPUTS: &[WebInput] = &[WebInput {
 const EVENT_INPUTS: &[WebInput] = &[WebInput {
     code: "events",
     sections: &[
-        "pg_log_error",
-        "pg_log_checkpoint",
+        "pg_log_errors",
+        "pg_log_checkpoints",
         "pg_log_autovacuum",
-        "pg_log_slow_query",
-        "pg_log_lock_wait",
+        "pg_log_slow_queries",
+        "pg_log_lock_waits",
         "pg_log_lifecycle",
         "pg_log_gap",
-        "pg_log_temp_file",
+        "pg_log_temp_files",
         "pg_log_source_status",
     ],
 }];
@@ -250,7 +250,7 @@ const ACTIVITY_METRICS: &[WebMetric] = &[
         unit: WebUnit::Ratio,
         aggregation: WebAggregation::Max,
         formula: WebFormula::PositiveDeltaRate {
-            fields: &["utime", "stime"],
+            field_sets: &[&["utime", "stime"]],
             expression: "positive_delta(utime + stime) / elapsed",
         },
         requires: &["activity", "process"],
@@ -263,7 +263,7 @@ const ACTIVITY_METRICS: &[WebMetric] = &[
         unit: WebUnit::BytesPerSecond,
         aggregation: WebAggregation::Max,
         formula: WebFormula::PositiveDeltaRate {
-            fields: &["read_bytes", "write_bytes"],
+            field_sets: &[&["read_bytes", "write_bytes"]],
             expression: "positive_delta(read_bytes + write_bytes) / elapsed",
         },
         requires: &["activity", "process"],
@@ -291,7 +291,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
         unit: WebUnit::Microseconds,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["total_exec_time"],
+            field_sets: &[&["total_exec_time"], &["total_time"]],
             scale: 1.0,
             expression: "sum(positive_delta(total_exec_time))",
         },
@@ -305,7 +305,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
         unit: WebUnit::Count,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["calls"],
+            field_sets: &[&["calls"]],
             scale: 1.0,
             expression: "sum(positive_delta(calls))",
         },
@@ -319,7 +319,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
         unit: WebUnit::Blocks,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["shared_blks_read", "local_blks_read"],
+            field_sets: &[&["shared_blks_read", "local_blks_read"]],
             scale: 1.0,
             expression: "sum(positive_delta(shared_blks_read + local_blks_read))",
         },
@@ -333,7 +333,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
         unit: WebUnit::Blocks,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["temp_blks_written"],
+            field_sets: &[&["temp_blks_written"]],
             scale: 1.0,
             expression: "sum(positive_delta(temp_blks_written))",
         },
@@ -350,7 +350,7 @@ const PLAN_METRICS: &[WebMetric] = &[
         unit: WebUnit::Microseconds,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["total_time"],
+            field_sets: &[&["total_time"]],
             scale: 1_000.0,
             expression: "sum(positive_delta(total_time)) * 1000",
         },
@@ -364,7 +364,7 @@ const PLAN_METRICS: &[WebMetric] = &[
         unit: WebUnit::Count,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["calls"],
+            field_sets: &[&["calls"]],
             scale: 1.0,
             expression: "sum(positive_delta(calls))",
         },
@@ -381,12 +381,12 @@ const TABLE_METRICS: &[WebMetric] = &[
         unit: WebUnit::Blocks,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &[
+            field_sets: &[&[
                 "heap_blks_read",
                 "idx_blks_read",
                 "toast_blks_read",
                 "tidx_blks_read",
-            ],
+            ]],
             scale: 1.0,
             expression: "sum(positive_delta(heap_blks_read + idx_blks_read + toast_blks_read + tidx_blks_read))",
         },
@@ -400,7 +400,7 @@ const TABLE_METRICS: &[WebMetric] = &[
         unit: WebUnit::Count,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["n_tup_ins", "n_tup_upd", "n_tup_del"],
+            field_sets: &[&["n_tup_ins", "n_tup_upd", "n_tup_del"]],
             scale: 1.0,
             expression: "sum(positive_delta(n_tup_ins + n_tup_upd + n_tup_del))",
         },
@@ -431,7 +431,7 @@ const INDEX_METRICS: &[WebMetric] = &[
         unit: WebUnit::Blocks,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["idx_blks_read"],
+            field_sets: &[&["idx_blks_read"]],
             scale: 1.0,
             expression: "sum(positive_delta(idx_blks_read))",
         },
@@ -445,7 +445,7 @@ const INDEX_METRICS: &[WebMetric] = &[
         unit: WebUnit::Count,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
-            fields: &["idx_scan"],
+            field_sets: &[&["idx_scan"]],
             scale: 1.0,
             expression: "sum(positive_delta(idx_scan))",
         },
@@ -477,7 +477,7 @@ const PROCESS_METRICS: &[WebMetric] = &[
         unit: WebUnit::Ratio,
         aggregation: WebAggregation::Max,
         formula: WebFormula::PositiveDeltaRate {
-            fields: &["utime", "stime"],
+            field_sets: &[&["utime", "stime"]],
             expression: "positive_delta(utime + stime) / elapsed",
         },
         requires: &["process"],
@@ -490,7 +490,7 @@ const PROCESS_METRICS: &[WebMetric] = &[
         unit: WebUnit::BytesPerSecond,
         aggregation: WebAggregation::Max,
         formula: WebFormula::PositiveDeltaRate {
-            fields: &["read_bytes", "write_bytes"],
+            field_sets: &[&["read_bytes", "write_bytes"]],
             expression: "positive_delta(read_bytes + write_bytes) / elapsed",
         },
         requires: &["process"],
