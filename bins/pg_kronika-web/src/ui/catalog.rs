@@ -253,9 +253,10 @@ fn apply_availability(view: &mut ViewSpec, observed: &BTreeSet<u32>) {
         }
     }
     view.availability = view
-        .inputs
-        .first()
-        .map_or(Availability::Gated, |input| input.availability);
+        .metrics
+        .iter()
+        .find(|metric| metric.code == view.canonical_metric)
+        .map_or(Availability::Gated, |metric| metric.availability);
 }
 
 fn availability_for(required: &[&str], input_available: &impl Fn(&str) -> bool) -> Availability {
@@ -497,7 +498,14 @@ fn activity_view() -> ViewSpec {
         ),
         preset(
             "waits",
-            &["pid", "user", "database", "wait_event", "query"],
+            &[
+                "pid",
+                "user",
+                "database",
+                "wait_event",
+                "query",
+                "query_duration_us",
+            ],
             "query_duration_us",
             "desc",
         ),
@@ -571,7 +579,7 @@ fn statements_view() -> ViewSpec {
         derived_column(
             "hit_pct",
             ValueType::F64,
-            "100 * shared_blks_hit / max(shared_blks_hit + shared_blks_read, 1)",
+            "100 * positive_delta(shared_blks_hit) / max(positive_delta(shared_blks_hit + shared_blks_read), 1)",
             &["statements"],
         ),
         derived_column(
@@ -972,7 +980,14 @@ fn locks_view() -> ViewSpec {
             ),
             preset(
                 "waiters",
-                &["pid", "user_application", "lock", "target", "query"],
+                &[
+                    "pid",
+                    "user_application",
+                    "lock",
+                    "target",
+                    "query",
+                    "wait_or_hold_us",
+                ],
                 "wait_or_hold_us",
                 "desc",
             ),
@@ -1049,4 +1064,25 @@ fn events_view() -> ViewSpec {
             ),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_availability_does_not_depend_on_input_order() {
+        let process_type = registry()
+            .iter()
+            .find(|contract| contract.name == "os_process")
+            .expect("os_process contract")
+            .type_id
+            .get();
+        let mut activity = activity_view();
+        activity.inputs.swap(0, 1);
+
+        apply_availability(&mut activity, &BTreeSet::from([process_type]));
+
+        assert_eq!(activity.availability, Availability::Gated);
+    }
 }

@@ -45,6 +45,22 @@ fn catalog_exposes_all_nine_views_in_stable_code_order() {
 }
 
 #[test]
+fn every_preset_returns_its_sort_column() {
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    for view in catalog.views() {
+        for preset in &view.presets {
+            assert!(
+                preset.columns.contains(&preset.sort.column),
+                "{}.{} sorts by omitted column {}",
+                view.code,
+                preset.code,
+                preset.sort.column
+            );
+        }
+    }
+}
+
+#[test]
 fn statements_metrics_publish_explicit_formulas_and_units() {
     let observed = BTreeSet::from([first_type_id("pg_stat_statements")]);
     let catalog = ProjectionCatalog::for_type_ids(&observed);
@@ -92,6 +108,25 @@ fn statements_metrics_publish_explicit_formulas_and_units() {
                 Availability::Available,
             ),
         ]
+    );
+}
+
+#[test]
+fn statements_hit_percentage_uses_window_deltas() {
+    let observed = BTreeSet::from([first_type_id("pg_stat_statements")]);
+    let catalog = ProjectionCatalog::for_type_ids(&observed);
+    let hit_pct = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .and_then(|view| view.columns.iter().find(|column| column.code == "hit_pct"))
+        .expect("statements.hit_pct");
+
+    assert_eq!(
+        hit_pct.formula,
+        Some(
+            "100 * positive_delta(shared_blks_hit) / max(positive_delta(shared_blks_hit + shared_blks_read), 1)"
+        )
     );
 }
 
