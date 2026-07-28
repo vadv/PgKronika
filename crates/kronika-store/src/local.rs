@@ -1452,7 +1452,6 @@ fn read_validated_pgm_summary<R: ReadAt>(
         entries: view.entries().collect(),
         min_ts: view.min_ts,
         max_ts: view.max_ts,
-        source_id: view.source_id,
         format_version: view.format_version,
         window_count: view.window_count,
     };
@@ -1624,11 +1623,11 @@ mod tests {
     use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part, crc32c};
     use kronika_layout::SegmentAddress;
 
-    fn part(ts: i64, src: u64) -> Vec<u8> {
-        part_with_body(ts, src, b"baseline")
+    fn part(ts: i64) -> Vec<u8> {
+        part_with_body(ts, b"baseline")
     }
 
-    fn part_with_body(ts: i64, src: u64, body: &[u8]) -> Vec<u8> {
+    fn part_with_body(ts: i64, body: &[u8]) -> Vec<u8> {
         build_part(
             &[SectionInput {
                 type_id: 1_006_001,
@@ -1638,7 +1637,6 @@ mod tests {
             PartMeta {
                 min_ts: ts,
                 max_ts: ts + 1,
-                source_id: src,
             },
         )
     }
@@ -1773,7 +1771,6 @@ mod tests {
             entries: vec![],
             min_ts: 0,
             max_ts: 0,
-            source_id: 0,
             format_version,
             window_count: 0,
         };
@@ -1800,23 +1797,23 @@ mod tests {
         tail_at - catalog_len
     }
 
-    /// Offset of `format_version` within the meta block (28 bytes into meta).
+    /// Offset of `format_version` within the meta block (20 bytes into meta).
     fn format_version_offset(buf: &[u8]) -> usize {
         // meta block is the last META_LEN bytes of the catalog block (before the tail)
         let cat_start = catalog_offset(buf);
         let cat_end = tail_offset(buf);
         let cat_len = cat_end - cat_start;
         let entry_count = (cat_len - META_LEN) / ENTRY_LEN;
-        cat_start + entry_count * ENTRY_LEN + 28 // 28 = offset of format_version within meta
+        cat_start + entry_count * ENTRY_LEN + 20
     }
 
-    /// Offset of crc32c within the meta block (32 bytes into meta).
+    /// Offset of crc32c within the meta block (24 bytes into meta).
     fn meta_crc_offset(buf: &[u8]) -> usize {
         let cat_start = catalog_offset(buf);
         let cat_end = tail_offset(buf);
         let cat_len = cat_end - cat_start;
         let entry_count = (cat_len - META_LEN) / ENTRY_LEN;
-        cat_start + entry_count * ENTRY_LEN + 32 // 32 = META_CRC_OFFSET
+        cat_start + entry_count * ENTRY_LEN + 24
     }
 
     /// Recompute catalog CRC and patch it into `buf` at the crc field position.
@@ -1955,7 +1952,6 @@ mod tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 0,
             },
         );
         // Entry layout in catalog block: type_id(4) flags(4) offset(8) len(8) rows(4) crc32c(4)
@@ -1994,7 +1990,6 @@ mod tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 0,
             },
         );
 
@@ -2007,15 +2002,14 @@ mod tests {
     #[test]
     fn read_catalog_happy_path() {
         // Confirm a correctly built part round-trips through read_catalog.
-        let buf = part(1000, 42);
+        let buf = part(1000);
         let catalog = read_catalog(&buf.as_slice()).expect("valid part must decode");
         assert_eq!(catalog.min_ts, 1000);
-        assert_eq!(catalog.source_id, 42);
     }
 
     #[test]
     fn catalog_summary_transient_bytes_are_admitted_before_allocation() {
-        let buf = part(1000, 42);
+        let buf = part(1000);
         let error = read_validated_pgm_summary(&buf.as_slice(), 1, 1).unwrap_err();
         assert!(matches!(
             error,
@@ -2058,7 +2052,7 @@ mod tests {
 
     #[test]
     fn shared_active_clone_is_admitted_before_copy_on_write() {
-        let catalog = read_catalog(&part(1000, 42).as_slice()).expect("catalog");
+        let catalog = read_catalog(&part(1000).as_slice()).expect("catalog");
         let catalog_digest = CatalogDigest::from_catalog(&catalog);
         let mut active = Arc::new(vec![ActivePart {
             segment_id: SegmentId::new(1_000).unwrap(),
@@ -2108,7 +2102,7 @@ mod tests {
     fn read_active_part_rejects_oversized_ref_before_allocation() {
         let dir = tempfile::tempdir().unwrap();
         write_empty_journal(dir.path());
-        let catalog = read_catalog(&part(1000, 42).as_slice()).expect("catalog");
+        let catalog = read_catalog(&part(1000).as_slice()).expect("catalog");
         let catalog_digest = CatalogDigest::from_catalog(&catalog);
         let oversized_len = usize::try_from(MAX_PART_LEN).expect("part cap fits usize") + 1;
         let active = ActivePart {
@@ -2139,7 +2133,7 @@ mod tests {
     #[test]
     fn read_active_part_rejects_the_same_offset_and_catalog_in_a_new_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let bytes = part(1000, 42);
+        let bytes = part(1000);
         write_journal(dir.path(), 1_000, std::slice::from_ref(&bytes));
         let local = LocalDir::open(dir.path()).unwrap();
         let scan = local.scan().unwrap();
@@ -2155,8 +2149,8 @@ mod tests {
     #[test]
     fn read_active_part_ignores_an_uncommitted_append_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let first = part(1000, 42);
-        let later = part(2000, 42);
+        let first = part(1000);
+        let later = part(2000);
         write_journal(dir.path(), 1_000, std::slice::from_ref(&first));
         let journal_path = dir.path().join("active.parts");
         let local = LocalDir::open(dir.path()).unwrap();
@@ -2175,8 +2169,8 @@ mod tests {
     #[test]
     fn scan_lists_sealed_and_active_with_cheap_catalog() {
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 1_000, part(1000, 7));
-        write_journal(dir.path(), 2_000, &[part(2000, 7), part(3000, 7)]);
+        write_segment(dir.path(), 1_000, part(1000));
+        write_journal(dir.path(), 2_000, &[part(2000), part(3000)]);
         let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
         assert_eq!(scan.sealed.len(), 1, "one sealed segment");
         assert_eq!(scan.sealed[0].summary.min_ts, 1000, "sealed summary min_ts");
@@ -2196,7 +2190,7 @@ mod tests {
     #[test]
     fn cached_scan_reuses_summary_without_reading_the_catalog() {
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 1_000, part(1000, 7));
+        write_segment(dir.path(), 1_000, part(1000));
         let local = LocalDir::open(dir.path()).unwrap();
         let first = local.scan().unwrap();
 
@@ -2225,13 +2219,13 @@ mod tests {
     fn same_inode_metadata_change_invalidates_cached_and_opened_units() {
         let dir = tempfile::tempdir().unwrap();
         let path = segment_path(dir.path(), 1_000);
-        fs::write(&path, part(1000, 7)).unwrap();
+        fs::write(&path, part(1000)).unwrap();
         let local = LocalDir::open(dir.path()).unwrap();
         let first = local.scan().unwrap();
         let pinned = first.sealed[0].clone();
         let opened = local.open_sealed(&pinned).unwrap();
 
-        fs::write(&path, part_with_body(1000, 7, b"changed")).unwrap();
+        fs::write(&path, part_with_body(1000, b"changed")).unwrap();
         let current_identity = FileIdentity::from_file(&File::open(&path).unwrap()).unwrap();
         assert_eq!(pinned.identity.device, current_identity.device);
         assert_eq!(pinned.identity.inode, current_identity.inode);
@@ -2264,7 +2258,7 @@ mod tests {
     fn changed_identity_does_not_reuse_a_corrupt_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let path = segment_path(dir.path(), 1_000);
-        let valid = part(1000, 7);
+        let valid = part(1000);
         fs::write(&path, &valid).unwrap();
         let local = LocalDir::open(dir.path()).unwrap();
         let first = local.scan().unwrap();
@@ -2340,7 +2334,7 @@ mod tests {
     fn active_part_count_limit_is_stable_invalid_data() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
-        let bytes = journal(2_000, &[part(2000, 7), part(3000, 7)]);
+        let bytes = journal(2_000, &[part(2000), part(3000)]);
         let local = LocalDir::open(dir.path()).unwrap();
 
         let error = local
@@ -2360,8 +2354,8 @@ mod tests {
     fn incremental_scan_counts_cached_parts_toward_the_limit() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
-        let first_bytes = journal(2_000, &[part(2000, 7)]);
-        let complete_bytes = journal(2_000, &[part(2000, 7), part(3000, 7)]);
+        let first_bytes = journal(2_000, &[part(2000)]);
+        let complete_bytes = journal(2_000, &[part(2000), part(3000)]);
         let local = LocalDir::open(dir.path()).unwrap();
         let first = local
             .scan_journal_reader_bounded_from(
@@ -2390,7 +2384,7 @@ mod tests {
     #[test]
     fn corrupt_sealed_is_excluded_while_valid_segments_continue() {
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 1_000, part(1000, 7));
+        write_segment(dir.path(), 1_000, part(1000));
         write_segment(dir.path(), 2_000, b"not a pgm");
         let local = LocalDir::open(dir.path()).unwrap();
         let scan = local.scan().unwrap();
@@ -2411,7 +2405,7 @@ mod tests {
             (
                 2_000,
                 {
-                    let mut bytes = part(2_000, 7);
+                    let mut bytes = part(2_000);
                     let corrupt_at = catalog_offset(&bytes);
                     bytes[corrupt_at] ^= 0xff;
                     bytes
@@ -2421,7 +2415,7 @@ mod tests {
             (
                 3_000,
                 {
-                    let mut bytes = part(3_000, 7);
+                    let mut bytes = part(3_000);
                     let entry_offset_at = catalog_offset(&bytes) + 8;
                     bytes[entry_offset_at..entry_offset_at + 8]
                         .copy_from_slice(&5_u64.to_le_bytes());
@@ -2433,7 +2427,7 @@ mod tests {
             (
                 4_000,
                 {
-                    let mut bytes = part_with_body(4_000, 7, b"section-secret");
+                    let mut bytes = part_with_body(4_000, b"section-secret");
                     bytes[MAGIC.len()] ^= 0xff;
                     bytes
                 },
@@ -2442,7 +2436,7 @@ mod tests {
         ];
 
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 1_000, part(1_000, 7));
+        write_segment(dir.path(), 1_000, part(1_000));
         for (raw_id, bytes, _reason) in &cases {
             write_segment(dir.path(), *raw_id, bytes);
         }
@@ -2475,7 +2469,7 @@ mod tests {
             read_validated_pgm_summary(&file, 0, LayoutLimits::default().max_metadata_bytes);
         assert!(validation.is_err());
 
-        fs::write(&path, part(2_000, 7)).unwrap();
+        fs::write(&path, part(2_000)).unwrap();
         let error = classify_pgm_validation(&file, expected, address, validation).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
@@ -2485,9 +2479,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 1_000, part(1_000, 7));
+        write_segment(dir.path(), 1_000, part(1_000));
         let unreadable = segment_path(dir.path(), 2_000);
-        fs::write(&unreadable, part(2_000, 7)).unwrap();
+        fs::write(&unreadable, part(2_000)).unwrap();
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o0)).unwrap();
 
         let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
@@ -2505,7 +2499,7 @@ mod tests {
     #[test]
     fn foreign_file_and_directory_do_not_hide_valid_segments_or_leak_names() {
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 1_000, part(1_000, 7));
+        write_segment(dir.path(), 1_000, part(1_000));
         fs::create_dir(dir.path().join("lost+found")).unwrap();
         fs::write(dir.path().join(".nfs-private-name"), b"foreign-secret").unwrap();
 
@@ -2532,7 +2526,7 @@ mod tests {
     #[test]
     fn zero_length_active_journal_reads_as_empty() {
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 1_000, part(1000, 7));
+        write_segment(dir.path(), 1_000, part(1000));
         fs::write(dir.path().join("active.parts"), []).unwrap();
         let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
         assert_eq!(scan.sealed.len(), 1);
@@ -2543,8 +2537,8 @@ mod tests {
     #[test]
     fn torn_active_journal_degrades_to_sealed_only_scan() {
         let dir = tempfile::tempdir().unwrap();
-        write_segment(dir.path(), 1_000, part(1000, 7));
-        let unfinished_part = part(2000, 7);
+        write_segment(dir.path(), 1_000, part(1000));
+        let unfinished_part = part(2000);
         let body = FrameHeader {
             part_len: u64::try_from(unfinished_part.len()).expect("part length fits u64"),
         }
@@ -2579,7 +2573,7 @@ mod tests {
             CommittedHeaderPhase::Torn,
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let bytes = committed_reset_journal(2_000, &[part(2000, 7)], phase);
+            let bytes = committed_reset_journal(2_000, &[part(2000)], phase);
             fs::write(dir.path().join("active.parts"), &bytes).unwrap();
 
             let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
@@ -2597,7 +2591,7 @@ mod tests {
     fn committed_reset_marker_does_not_hide_corrupt_old_frames() {
         let dir = tempfile::tempdir().unwrap();
         let mut bytes =
-            committed_reset_journal(2_000, &[part(2000, 7)], CommittedHeaderPhase::Previous);
+            committed_reset_journal(2_000, &[part(2000)], CommittedHeaderPhase::Previous);
         bytes[JOURNAL_HEADER_LEN + FRAME_HEADER_LEN] ^= 0xff;
         fs::write(dir.path().join("active.parts"), bytes).unwrap();
 
@@ -2636,7 +2630,7 @@ mod tests {
     #[test]
     fn scan_from_unchanged_size_keeps_prev_and_reports_same_valid_len() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = journal(1_000, &[part(1000, 7)]);
+        let journal = journal(1_000, &[part(1000)]);
         fs::write(dir.path().join("active.parts"), &journal).unwrap();
         let local = LocalDir::open(dir.path()).unwrap();
 
@@ -2661,7 +2655,7 @@ mod tests {
     fn scan_from_appends_only_the_new_tail_part() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
-        let journal = journal(1_000, &[part(1000, 7)]);
+        let journal = journal(1_000, &[part(1000)]);
         fs::write(&journal_path, &journal).unwrap();
         let local = LocalDir::open(dir.path()).unwrap();
 
@@ -2671,7 +2665,7 @@ mod tests {
         let previous = Arc::clone(&first.active);
 
         // Append a second frame.
-        let buf = append_journal_part(&journal_path, 1_000, &part(3000, 7));
+        let buf = append_journal_part(&journal_path, 1_000, &part(3000));
 
         let scan = local
             .scan_from(first_valid, Arc::clone(&first.active))
@@ -2700,7 +2694,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
         // Two frames make the initial journal larger than one replacement frame.
-        let two = journal(1_000, &[part(1000, 7), part(2000, 7)]);
+        let two = journal(1_000, &[part(1000), part(2000)]);
         fs::write(&journal_path, &two).unwrap();
         let local = LocalDir::open(dir.path()).unwrap();
 
@@ -2709,7 +2703,7 @@ mod tests {
         let stale_valid = first.valid_len;
 
         // Truncate-in-place then write a smaller, different journal.
-        let replacement = journal(5_000, &[part(5000, 9)]);
+        let replacement = journal(5_000, &[part(5000)]);
         assert!(
             (replacement.len() as u64) < stale_valid,
             "replacement is smaller"
@@ -2729,7 +2723,7 @@ mod tests {
     fn scan_from_missing_journal_resets_to_empty() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
-        fs::write(&journal_path, journal(1_000, &[part(1000, 7)])).unwrap();
+        fs::write(&journal_path, journal(1_000, &[part(1000)])).unwrap();
         let local = LocalDir::open(dir.path()).unwrap();
         let first = local.scan().unwrap();
 
@@ -2748,14 +2742,14 @@ mod tests {
     fn scan_from_torn_tail_returns_a_typed_empty_live_generation() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
-        let journal = journal(1_000, &[part(1000, 7)]);
+        let journal = journal(1_000, &[part(1000)]);
         fs::write(&journal_path, &journal).unwrap();
         let local = LocalDir::open(dir.path()).unwrap();
         let first = local.scan().unwrap();
         let first_valid = first.valid_len;
 
         // Append a header for a body that is not fully written yet.
-        let next = part(3000, 7);
+        let next = part(3000);
         let mut buf = fs::read(&journal_path).unwrap();
         let full = frame(&next);
         buf.extend_from_slice(&full[..full.len() - 3]); // truncated tail frame
@@ -2786,12 +2780,12 @@ mod tests {
     fn scan_from_discovers_new_sealed_segment() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
-        fs::write(&journal_path, journal(1_000, &[part(1000, 7)])).unwrap();
+        fs::write(&journal_path, journal(1_000, &[part(1000)])).unwrap();
         let local = LocalDir::open(dir.path()).unwrap();
         let first = local.scan().unwrap();
         assert_eq!(first.sealed.len(), 0);
 
-        write_segment(dir.path(), 500, part(500, 7));
+        write_segment(dir.path(), 500, part(500));
 
         let scan = local.scan_from(first.valid_len, first.active).unwrap();
         assert_eq!(scan.sealed.len(), 1, "new sealed .pgm is discovered");
@@ -2829,7 +2823,7 @@ mod tests {
     fn scan_reports_journal_truncated_mid_frame_as_interrupted() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
-        let p = part(2000, 7);
+        let p = part(2000);
         let frame_header = FrameHeader {
             part_len: p.len() as u64,
         }
@@ -2865,7 +2859,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
 
-        let p1 = part(2000, 7);
+        let p1 = part(2000);
         let header1 = FrameHeader {
             part_len: p1.len() as u64,
         }
@@ -2936,7 +2930,7 @@ mod tests {
     fn scan_reports_journal_shrink_after_streaming_scan_as_interrupted() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
-        let p = part(2000, 7);
+        let p = part(2000);
         let data = journal(2_000, &[p]);
         let mock = ShrinksAfterScan {
             data,

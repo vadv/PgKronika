@@ -39,16 +39,14 @@ fn catalog_strategy() -> impl Strategy<Value = Catalog> {
         proptest::collection::vec(entry_strategy(), 0..64),
         any::<i64>(),
         any::<i64>(),
-        any::<u64>(),
         any::<u32>(),
         any::<u32>(),
     )
         .prop_map(
-            |(entries, min_ts, max_ts, source_id, format_version, window_count)| Catalog {
+            |(entries, min_ts, max_ts, format_version, window_count)| Catalog {
                 entries,
                 min_ts,
                 max_ts,
-                source_id,
                 format_version,
                 window_count,
             },

@@ -5,14 +5,14 @@
 //! The bytes were generated independently from the documented layout and
 //! checked against the canonical CRC32C test vector.
 //!
-//! Layout of the 88-byte file:
+//! Layout of the 80-byte file:
 //!
 //! ```text
 //!  0..4   magic "PGM1"
 //!  4..8   section body 01 02 03 04 (opaque to the container)
 //!  8..40  catalog entry: type_id 1_006_001, offset 4, len 4, rows 1
-//! 40..80  catalog meta: ts 1_000_000..2_000_000, 1 entry, version 1
-//! 80..88  tail index: catalog_len 72, magic "PGM1"
+//! 40..72  catalog meta: ts 1_000_000..2_000_000, 1 entry, version 2
+//! 72..80  tail index: catalog_len 64, magic "PGM1"
 //! ```
 
 use kronika_format::{Catalog, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
@@ -34,7 +34,7 @@ fn fixture_decodes_to_expected_catalog() {
         .try_into()
         .expect("fixed-size tail");
     let tail = TailIndex::decode(tail_bytes).expect("valid tail index");
-    assert_eq!(tail.catalog_len, 72);
+    assert_eq!(tail.catalog_len, 64);
 
     let catalog_start = SEGMENT.len() - TAIL_INDEX_LEN - tail.catalog_len as usize;
     let catalog = Catalog::decode(&SEGMENT[catalog_start..SEGMENT.len() - TAIL_INDEX_LEN])
@@ -54,8 +54,7 @@ fn fixture_decodes_to_expected_catalog() {
             }],
             min_ts: 1_000_000,
             max_ts: 2_000_000,
-            source_id: 0,
-            format_version: 1,
+            format_version: 2,
             window_count: 0,
         }
     );
