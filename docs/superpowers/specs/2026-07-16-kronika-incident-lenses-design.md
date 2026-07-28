@@ -2,6 +2,18 @@
 
 Дата: 2026-07-16.
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** production-каталог из 42 evaluators и 40 уникальных
+  IDs, HTTP/OpenAPI, integration tests и observability BDD.
+- **Осталось:** закрыть strict `EntityJoin`-зависимости 24 core IDs — всех,
+  кроме `PG-QRY-001`, `PG-PLAN-002`, `PG-CHKPT-008` и `PG-LOCK-012`: добавить
+  `track_planning`, runtime period/clock-domain provenance, entity joins,
+  attribution и принятую temporal role model. Нужны route-level BDD для
+  blocker/waiter, over-cap locks, dormant planning и PostgreSQL 15-18, а также
+  load/RSS qualification. Устаревшие response-shape и same-snapshot
+  temporal-direction обещания не входят в остаток.
+
 Workspace topology, ownership, resource model и migration contract заданы в
 [`2026-07-17-kronika-incident-implementation.md`](2026-07-17-kronika-incident-implementation.md).
 

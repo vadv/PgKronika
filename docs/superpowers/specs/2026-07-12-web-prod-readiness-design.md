@@ -1,5 +1,13 @@
 # Эксплуатационный контракт `pg_kronika-web`
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** probes, metrics, constant-time Basic Auth, RFC 9457
+  errors, embedded static files и защищённая маршрутизация.
+- **Осталось:** валидировать `KRONIKA_WEB_LOG` при разборе конфигурации,
+  завершать запуск ненулевым кодом при неверной директиве и добавить
+  соответствующий startup-тест.
+
 ## Пробы
 
 - `GET /healthz` возвращает `200`, пока процесс обслуживает HTTP.
@@ -48,7 +56,7 @@
 `route_not_found` с media type `application/problem+json`. `index.html`
 отдаётся с `no-cache`, хэшированные ассеты допускают длительное кэширование.
 Полный pre-release machine contract зафиксирован в
-`docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md`.
+`docs/superpowers/implemented/specs/2026-07-21-i18n-machine-api-contract.md`.
 
 ## Конфигурация и запуск
 

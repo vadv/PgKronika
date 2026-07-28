@@ -5,6 +5,17 @@
 
 OVF, reader, writer и API реализуются как один текущий контракт.
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** `/v1/ui/catalog`, `/v1/views/summary` и
+  `/v1/timeline/heatmap` с OpenAPI и integration tests.
+- **Осталось:** `/v1/ui/context`, `/v1/frame/{view}`,
+  `/v1/entity/{view}/{entity}` для point/history и `/v1/storage`;
+  predecessor-aware 1-2-PGM frames, server filter/sort/page counts, lazy
+  detail, bounded history, whole-storage/statvfs/write-rate data; три
+  byte-accounted cache с reservation/singleflight/cancellation и N=96/N=1 440
+  resource qualification. Это delivery steps 4-6.
+
 ## Задача
 
 Интерфейс одновременно показывает:

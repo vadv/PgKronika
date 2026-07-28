@@ -4,6 +4,15 @@
 journal v1) и предполагает мерж #126 (одно Parquet-тело на `type_id`,
 zstd-6, единый словарь сегмента).
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** canonical journal recovery/quarantine и dump CLI для
+  tree, PGM и journal с unit/integration coverage.
+- **Осталось:** PostgreSQL 15-18 production BDD из torn `active.parts`,
+  доказывающий readiness реального collector, сохранение улики, публикацию
+  следующего окна и web refresh с quarantine evidence без format warnings;
+  добавить quarantine-specific web test.
+
 ## Цель
 
 Один офлайн-инструмент, который отвечает на три вопроса без web-процесса

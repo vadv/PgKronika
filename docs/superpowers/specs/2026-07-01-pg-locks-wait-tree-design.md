@@ -1,5 +1,15 @@
 # `pg_locks` wait tree (`1_011`) design
 
+**Status: PARTIAL.**
+
+- **Shipped baseline:** V1/V2 graph layouts, recursive lock queries,
+  conversions, bounded collection, source tests, and PostgreSQL 17 live
+  row-lock and negative BDD.
+- **Remaining scope:** use a waiter signal independent of activity errors and
+  the 4,096-row activity cap; the existing `lock_waits_exist` precheck has no
+  production caller. Test the over-cap case, extend live BDD to PostgreSQL 15,
+  16, and 18, and align the stale PostgreSQL 14 clause.
+
 **Goal:** record the PostgreSQL lock-wait blocking graph as raw data. The
 read-side analyzer or web reader reconstructs and visualizes the wait tree from
 the stored nodes, edges, and lock context. This is an instance-wide (class A)

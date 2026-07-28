@@ -1,5 +1,17 @@
 # Web Index Producer And Consumers Implementation Plan
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** shared projection registry, bounded builder,
+  cold/live/restart wiring, selective OVF reads, summary/heatmap routes,
+  OpenAPI и endpoint tests.
+- **Осталось:** финальные `resource_limited` states вместо whole-build abort;
+  stable `corrupt_ovf`/`resource_limited`/`response_too_large` и OpenAPI;
+  producer acceptance с real statements series logical ID 2; hand-checked
+  multi-segment local-top-K merge с lower/truth/upper, `unseen_upper`,
+  exact/approx и missing ≠ zero; structural PGM-body-read/512-KiB
+  qualification и BDD/qualification для catalog, summary и heatmap.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Наполнять `UiSummary` и `EntitySeries` при построении OVF и обслуживать `GET /v1/views/summary` и `GET /v1/timeline/heatmap` без чтения PGM.
