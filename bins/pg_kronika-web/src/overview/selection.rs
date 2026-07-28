@@ -6,7 +6,7 @@ use kronika_analytics::overview::CoverageSpan;
 use kronika_reader::{LiveState, LiveView, SealedLocator, SegmentDescriptor};
 use sha2::{Digest, Sha256};
 
-use super::view::{DescriptorEntry, DescriptorSource, DescriptorView, SourceGap};
+use super::view::{DescriptorEntry, DescriptorFreshness, DescriptorView, OmittedRange};
 
 pub(crate) const DEFAULT_MAX_SELECTED_SEGMENTS: usize = 1_024;
 pub(crate) const ABSOLUTE_MAX_SELECTED_SEGMENTS: usize = 4_096;
@@ -18,17 +18,16 @@ const PARTIAL_FACT_SET_DOMAIN: &[u8] = b"pgk-overview-partial-fact-set-v1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelectionError {
     InvalidLimit,
-    SourcesNotCanonical,
     LimitExceeded { limit: usize },
 }
 
-/// Immutable, bounded descriptor plan for one canonical source/range request.
+/// Immutable, bounded descriptor plan for one root/range request.
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedSealedPlan {
     view: Arc<DescriptorView>,
     selected_indices: Vec<usize>,
-    source_descriptors: Vec<DescriptorSource>,
-    source_gaps: Vec<SourceGap>,
+    freshness: DescriptorFreshness,
+    omitted_ranges: Vec<OmittedRange>,
     range: CoverageSpan,
     fact_set_id: [u8; 32],
 }
@@ -36,39 +35,29 @@ pub(crate) struct SelectedSealedPlan {
 impl SelectedSealedPlan {
     pub(crate) fn build(
         view: Arc<DescriptorView>,
-        sources: &[u64],
         range: CoverageSpan,
         limit: usize,
     ) -> Result<Self, SelectionError> {
         if limit == 0 || limit > ABSOLUTE_MAX_SELECTED_SEGMENTS {
             return Err(SelectionError::InvalidLimit);
         }
-        if sources.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(SelectionError::SourcesNotCanonical);
-        }
-
         let stop_after = limit.checked_add(1).ok_or(SelectionError::InvalidLimit)?;
         let mut selected_indices = Vec::with_capacity(stop_after.min(64));
-        for source in sources {
-            if view.extend_selected_with_halo(*source, range, stop_after, &mut selected_indices) {
-                return Err(SelectionError::LimitExceeded { limit });
-            }
+        if view.extend_selected_with_halo(range, stop_after, &mut selected_indices) {
+            return Err(SelectionError::LimitExceeded { limit });
         }
 
-        let source_descriptors = view.sources_for(sources);
-        let mut source_gaps = Vec::new();
-        for source in sources {
-            if view.extend_unavailable_gaps(*source, range, stop_after, &mut source_gaps) {
-                return Err(SelectionError::LimitExceeded { limit });
-            }
+        let freshness = view.freshness();
+        let mut omitted_ranges = Vec::new();
+        if view.extend_unavailable_gaps(range, stop_after, &mut omitted_ranges) {
+            return Err(SelectionError::LimitExceeded { limit });
         }
-        let fact_set_id =
-            selected_fact_set_id(&view, sources, range, &selected_indices, &source_gaps);
+        let fact_set_id = selected_fact_set_id(&view, range, &selected_indices, &omitted_ranges);
         Ok(Self {
             view,
             selected_indices,
-            source_descriptors,
-            source_gaps,
+            freshness,
+            omitted_ranges,
             range,
             fact_set_id,
         })
@@ -87,14 +76,14 @@ impl SelectedSealedPlan {
 
     #[cfg(test)]
     pub(crate) const fn sealed_gap(&self) -> bool {
-        !self.source_gaps.is_empty()
+        !self.omitted_ranges.is_empty()
     }
 
-    pub(crate) fn source_gaps(&self) -> &[SourceGap] {
-        &self.source_gaps
+    pub(crate) fn omitted_ranges(&self) -> &[OmittedRange] {
+        &self.omitted_ranges
     }
 
-    pub(crate) fn gap_for(&self, descriptor: &SegmentDescriptor) -> SourceGap {
+    pub(crate) fn gap_for(&self, descriptor: &SegmentDescriptor) -> OmittedRange {
         let start = descriptor.min_ts.max(self.range.start_us());
         let end = descriptor.max_ts.saturating_add(1).min(self.range.end_us());
         let span = CoverageSpan::new(start, end).unwrap_or_else(|| {
@@ -117,11 +106,11 @@ impl SelectedSealedPlan {
                 .expect("a valid request range has a right boundary interval")
             }
         });
-        SourceGap::new(descriptor.source_id, span)
+        OmittedRange::new(span)
     }
 
-    pub(crate) fn fact_set_id_with_gaps(&self, gaps: &[SourceGap]) -> [u8; 32] {
-        if gaps == self.source_gaps {
+    pub(crate) fn fact_set_id_with_gaps(&self, gaps: &[OmittedRange]) -> [u8; 32] {
+        if gaps == self.omitted_ranges {
             return self.fact_set_id;
         }
         let mut hasher = Sha256::new();
@@ -129,7 +118,6 @@ impl SelectedSealedPlan {
         hasher.update(self.fact_set_id);
         hasher.update((gaps.len() as u64).to_le_bytes());
         for gap in gaps {
-            hasher.update(gap.source_id().to_le_bytes());
             hasher.update(gap.span().start_us().to_le_bytes());
             hasher.update(gap.span().end_us().to_le_bytes());
         }
@@ -144,8 +132,8 @@ impl SelectedSealedPlan {
         &self.view
     }
 
-    pub(crate) fn source_descriptors(&self) -> &[DescriptorSource] {
-        &self.source_descriptors
+    pub(crate) const fn freshness(&self) -> DescriptorFreshness {
+        self.freshness
     }
 
     pub(crate) fn store_data_through_us(&self) -> Option<i64> {
@@ -159,20 +147,15 @@ impl SelectedSealedPlan {
 
 fn selected_fact_set_id(
     view: &DescriptorView,
-    sources: &[u64],
     range: CoverageSpan,
     indices: &[usize],
-    source_gaps: &[SourceGap],
+    omitted_ranges: &[OmittedRange],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(SELECTED_FACT_SET_DOMAIN);
     hasher.update(view.view_generation().to_le_bytes());
     hasher.update(range.start_us().to_le_bytes());
     hasher.update(range.end_us().to_le_bytes());
-    hasher.update((sources.len() as u64).to_le_bytes());
-    for source in sources {
-        hasher.update(source.to_le_bytes());
-    }
     hasher.update((indices.len() as u64).to_le_bytes());
     for index in indices {
         let entry = view.entry(*index);
@@ -180,9 +163,8 @@ fn selected_fact_set_id(
         hasher.update(entry.fact_build_key().fact_key().as_bytes());
         hasher.update(entry.fact_build_key().segment_lineage_id().0);
     }
-    hasher.update((source_gaps.len() as u64).to_le_bytes());
-    for gap in source_gaps {
-        hasher.update(gap.source_id().to_le_bytes());
+    hasher.update((omitted_ranges.len() as u64).to_le_bytes());
+    for gap in omitted_ranges {
         hasher.update(gap.span().start_us().to_le_bytes());
         hasher.update(gap.span().end_us().to_le_bytes());
     }

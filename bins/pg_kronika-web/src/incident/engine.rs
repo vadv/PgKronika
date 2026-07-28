@@ -25,7 +25,6 @@ pub(crate) enum ClockRelation {
 pub(crate) struct EvalContext {
     pub incident_start_us: i64,
     pub incident_end_us: i64,
-    source_id: u64,
     node_self_id: Arc<str>,
     clock_relation: ClockRelation,
 }
@@ -38,7 +37,7 @@ impl EvalContext {
     }
 
     pub(crate) fn entity_scope(&self) -> Option<EntityScope<'_>> {
-        EntityScope::new(self.source_id, &self.node_self_id)
+        EntityScope::new(&self.node_self_id)
     }
 
     #[cfg(test)]
@@ -46,7 +45,6 @@ impl EvalContext {
         Self {
             incident_start_us: 0,
             incident_end_us: 10,
-            source_id: 1,
             node_self_id: Arc::from("node"),
             clock_relation,
         }
@@ -54,7 +52,6 @@ impl EvalContext {
 }
 
 pub(crate) struct IncidentConfig {
-    source_id: u64,
     node_self_id: Arc<str>,
     epsilon_us: i64,
     max_cluster_span_us: i64,
@@ -75,14 +72,12 @@ impl IncidentConfig {
     ///
     /// These values do not claim a resident-memory budget.
     pub(crate) fn production(
-        source_id: u64,
         node_self_id: &str,
         epsilon_us: i64,
         max_cluster_span_us: i64,
         clock_relation: ClockRelation,
     ) -> Self {
         Self {
-            source_id,
             node_self_id: Arc::from(node_self_id),
             epsilon_us,
             max_cluster_span_us,
@@ -110,7 +105,6 @@ impl IncidentConfig {
         clock_relation: ClockRelation,
     ) -> Self {
         Self {
-            source_id: 1,
             node_self_id: Arc::from(node_self_id),
             epsilon_us,
             max_cluster_span_us,
@@ -302,7 +296,6 @@ pub(crate) fn analyze(
         let context = EvalContext {
             incident_start_us: cluster.start_us,
             incident_end_us: cluster.end_us,
-            source_id: config.source_id,
             node_self_id: Arc::clone(&config.node_self_id),
             clock_relation: config.clock_relation,
         };
@@ -572,7 +565,6 @@ mod tests {
 
     fn config(work_limit: u64) -> IncidentConfig {
         IncidentConfig {
-            source_id: 1,
             node_self_id: Arc::from("node"),
             epsilon_us: 5,
             max_cluster_span_us: 1_000,

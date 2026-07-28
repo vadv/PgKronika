@@ -23,7 +23,7 @@ use crate::incident_input::{
 use crate::incident_response::{
     IdentityIssue, ResponseInput, build_response, identity_response, no_data_response,
 };
-use crate::params::{QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64, parse_u64};
+use crate::params::{QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64};
 use crate::problem::{ApiProblem, LimitResource, QueryConstraint, QueryParameter, count_u64};
 
 const WINDOW_DEFAULT_US: i64 = 300 * 1_000_000;
@@ -34,7 +34,6 @@ const MAX_CLUSTER_SPAN_DEFAULT_US: i64 = 3_600 * 1_000_000;
 /// Hard public interval for bounded store scans.
 const MAX_QUERY_SPAN_US: i64 = 24 * 3_600 * 1_000_000;
 const INCIDENT_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
     QueryParameter::From,
     QueryParameter::To,
     QueryParameter::Window,
@@ -53,12 +52,11 @@ struct IncidentParams {
 }
 
 struct ValidatedRequest {
-    source: u64,
     params: IncidentParams,
     sections: Vec<&'static str>,
 }
 
-/// `GET /v1/incidents?source&from&to` returns clustered incidents.
+/// `GET /v1/incidents?from&to` returns clustered incidents.
 ///
 /// Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `epsilon`,
 /// `max_cluster_span`, and `section`. All time inputs are unix microseconds.
@@ -88,11 +86,9 @@ pub(crate) async fn incidents(State(state): State<AppState>, RawQuery(raw): RawQ
 }
 
 fn validate_request(params: &QueryParams) -> Result<ValidatedRequest, ApiProblem> {
-    let source = parse_u64(params, QueryParameter::Source)?;
     let request = parse_incident_params(params, &InputLimits::production())?;
     let sections = resolve_sections(params)?;
     Ok(ValidatedRequest {
-        source,
         params: request,
         sections,
     })
@@ -100,28 +96,25 @@ fn validate_request(params: &QueryParams) -> Result<ValidatedRequest, ApiProblem
 
 fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiProblem> {
     let ValidatedRequest {
-        source,
         params: request,
         sections,
     } = request;
 
     let mut snap = state.snapshot().as_ref().clone();
-    let data_age = source_data_age(&snap, source);
+    let data_age = data_age(&snap);
 
     let prepared = match prepare_input(
         &mut snap,
-        source,
         &request.scan,
         &sections,
         &InputLimits::production(),
     ) {
         Ok(prepared) => prepared,
         Err(InputError::NoData) => {
-            return Ok(Json(no_data_response(source, &request.scan, data_age)));
+            return Ok(Json(no_data_response(&request.scan, data_age)));
         }
         Err(InputError::MissingNodeIdentity) => {
             return Ok(Json(identity_response(
-                source,
                 &request.scan,
                 data_age,
                 IdentityIssue::Missing,
@@ -129,7 +122,6 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiPr
         }
         Err(InputError::ConflictingNodeIdentity) => {
             return Ok(Json(identity_response(
-                source,
                 &request.scan,
                 data_age,
                 IdentityIssue::Conflicting,
@@ -139,7 +131,6 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiPr
     };
 
     let config = IncidentConfig::production(
-        prepared.source_id,
         &prepared.node_self_id,
         request.epsilon_us,
         request.max_cluster_span_us,
@@ -168,7 +159,6 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiPr
     .map_err(event_error_response)?;
 
     Ok(Json(build_response(
-        prepared.source_id,
         &request.scan,
         data_age,
         &outcome,
@@ -262,19 +252,14 @@ fn parse_incident_params(
     })
 }
 
-/// Seconds since the newest timestamp of any unit belonging to `source`, or
-/// `None` when the source has no units.
-fn source_data_age(snap: &LocalDirSnapshot, source: u64) -> Option<u64> {
+/// Seconds since the newest timestamp of any unit, or `None` when there are no
+/// units.
+fn data_age(snap: &LocalDirSnapshot) -> Option<u64> {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let max_ts = snap
-        .units()
-        .iter()
-        .filter(|unit| unit.source_id == source)
-        .map(|unit| unit.max_ts)
-        .max();
+    let max_ts = snap.units().iter().map(|unit| unit.max_ts).max();
     data_age_seconds(now_secs, max_ts)
 }
 

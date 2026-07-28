@@ -3,9 +3,9 @@ use super::*;
 #[tokio::test]
 async fn segments_outside_the_window_are_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "5000.pgm", 7, 5_000, 6_000);
+    write_bgwriter_segment(dir.path(), "5000.pgm", 5_000, 6_000);
 
-    let (status, body) = serve(dir.path(), "/v1/segments?source=7&from=0&to=1000").await;
+    let (status, body) = serve(dir.path(), "/v1/segments?from=0&to=1000").await;
     assert_eq!(status, StatusCode::OK, "segments responds 200");
     assert_eq!(
         body,
@@ -17,38 +17,38 @@ async fn segments_outside_the_window_are_empty() {
 #[tokio::test]
 async fn segments_missing_a_required_parameter_is_a_bad_request() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "1000.pgm", 1_000, 2_000);
 
-    let (status, body) = serve(dir.path(), "/v1/segments?from=0&to=1000").await;
+    let (status, body) = serve(dir.path(), "/v1/segments?from=0").await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a missing source is a client error"
+        "a missing range bound is a client error"
     );
     assert_problem(
         &body,
         status,
         "missing_query_parameter",
-        serde_json::json!({ "parameter": "source" }),
+        serde_json::json!({ "parameter": "to" }),
     );
 }
 
 #[tokio::test]
-async fn segments_non_numeric_parameter_is_a_bad_request() {
+async fn segments_rejects_the_removed_source_parameter() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "1000.pgm", 1_000, 2_000);
 
     let (status, body) = serve(dir.path(), "/v1/segments?source=abc&from=0&to=1000").await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a non-numeric source is a client error"
+        "the removed source parameter is a client error"
     );
     assert_problem(
         &body,
         status,
-        "invalid_query_parameter",
-        serde_json::json!({ "parameter": "source", "expected": "uint64" }),
+        "unknown_query_parameter",
+        serde_json::json!({ "parameter": "source" }),
     );
 }
 
@@ -56,7 +56,6 @@ async fn segments_non_numeric_parameter_is_a_bad_request() {
 fn write_archiver_segment(
     dir: &std::path::Path,
     file: &str,
-    source: u64,
     min_ts: i64,
     max_ts: i64,
     rows: &[PgStatArchiver],
@@ -68,11 +67,7 @@ fn write_archiver_segment(
             rows: u32::try_from(rows.len()).expect("row count fits u32"),
             body: &body,
         }],
-        PartMeta {
-            min_ts,
-            max_ts,
-            source_id: source,
-        },
+        PartMeta { min_ts, max_ts },
     );
     crate::test_layout::write_named_pgm(dir, file, &bytes);
 }
@@ -83,7 +78,6 @@ async fn section_serializes_rows_over_a_covered_window() {
     write_archiver_segment(
         dir.path(),
         "1000.pgm",
-        7,
         1_000,
         2_000,
         &[archiver_row(1_000, 5), archiver_row(1_100, 6)],
@@ -91,7 +85,7 @@ async fn section_serializes_rows_over_a_covered_window() {
 
     let (status, body) = serve(
         dir.path(),
-        "/v1/section/pg_stat_archiver?source=7&from=1000&to=2000&limit=10",
+        "/v1/section/pg_stat_archiver?from=1000&to=2000&limit=10",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "section responds 200");
@@ -99,7 +93,6 @@ async fn section_serializes_rows_over_a_covered_window() {
         body,
         serde_json::json!({
             "section": "pg_stat_archiver",
-            "source_id": 7,
             "rows": [
                 { "ts": 1_000, "archived_count": 5, "last_archived_wal": null, "last_archived_time": null, "failed_count": 0, "last_failed_wal": null, "last_failed_time": null, "stats_reset": null },
                 { "ts": 1_100, "archived_count": 6, "last_archived_wal": null, "last_archived_time": null, "failed_count": 0, "last_failed_wal": null, "last_failed_time": null, "stats_reset": null }
@@ -117,7 +110,6 @@ async fn section_reports_a_gap_for_an_uncovered_window() {
     write_archiver_segment(
         dir.path(),
         "1000.pgm",
-        7,
         1_000,
         2_000,
         &[archiver_row(1_000, 5)],
@@ -125,7 +117,7 @@ async fn section_reports_a_gap_for_an_uncovered_window() {
 
     let (status, body) = serve(
         dir.path(),
-        "/v1/section/pg_stat_archiver?source=7&from=5000&to=6000&limit=10",
+        "/v1/section/pg_stat_archiver?from=5000&to=6000&limit=10",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "section responds 200");
@@ -152,17 +144,12 @@ async fn section_unknown_name_is_not_found() {
     write_archiver_segment(
         dir.path(),
         "1000.pgm",
-        7,
         1_000,
         2_000,
         &[archiver_row(1_000, 5)],
     );
 
-    let (status, body) = serve(
-        dir.path(),
-        "/v1/section/does_not_exist?source=7&from=0&to=3000",
-    )
-    .await;
+    let (status, body) = serve(dir.path(), "/v1/section/does_not_exist?from=0&to=3000").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is 404");
     assert_problem(
         &body,
@@ -178,27 +165,22 @@ async fn section_bad_parameter_is_a_bad_request() {
     write_archiver_segment(
         dir.path(),
         "1000.pgm",
-        7,
         1_000,
         2_000,
         &[archiver_row(1_000, 5)],
     );
 
-    let (status, body) = serve(
-        dir.path(),
-        "/v1/section/pg_stat_archiver?source=abc&from=0&to=3000",
-    )
-    .await;
+    let (status, body) = serve(dir.path(), "/v1/section/pg_stat_archiver?from=abc&to=3000").await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "a non-numeric source is 400"
+        "a non-numeric range bound is 400"
     );
     assert_problem(
         &body,
         status,
         "invalid_query_parameter",
-        serde_json::json!({ "parameter": "source", "expected": "uint64" }),
+        serde_json::json!({ "parameter": "from", "expected": "int64" }),
     );
 }
 
@@ -208,7 +190,6 @@ async fn section_cursor_pages_across_segment_boundaries() {
     write_archiver_segment(
         dir.path(),
         "1000.pgm",
-        7,
         1_000,
         2_000,
         &[archiver_row(1_000, 1)],
@@ -216,7 +197,6 @@ async fn section_cursor_pages_across_segment_boundaries() {
     write_archiver_segment(
         dir.path(),
         "3000.pgm",
-        7,
         3_000,
         4_000,
         &[archiver_row(3_000, 2)],
@@ -224,7 +204,7 @@ async fn section_cursor_pages_across_segment_boundaries() {
 
     let (status, page1) = serve(
         dir.path(),
-        "/v1/section/pg_stat_archiver?source=7&from=0&to=5000&limit=1",
+        "/v1/section/pg_stat_archiver?from=0&to=5000&limit=1",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "page one responds 200");
@@ -244,7 +224,7 @@ async fn section_cursor_pages_across_segment_boundaries() {
 
     let (status, page2) = serve(
         dir.path(),
-        &format!("/v1/section/pg_stat_archiver?source=7&from=0&to=5000&limit=1&cursor={cursor}"),
+        &format!("/v1/section/pg_stat_archiver?from=0&to=5000&limit=1&cursor={cursor}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "page two responds 200");
@@ -261,7 +241,6 @@ async fn section_malformed_cursor_is_a_bad_request() {
     write_archiver_segment(
         dir.path(),
         "1000.pgm",
-        7,
         1_000,
         2_000,
         &[archiver_row(1_000, 1)],
@@ -269,7 +248,7 @@ async fn section_malformed_cursor_is_a_bad_request() {
 
     let (status, body) = serve(
         dir.path(),
-        "/v1/section/pg_stat_archiver?source=7&from=0&to=5000&cursor=notavalidcursor",
+        "/v1/section/pg_stat_archiver?from=0&to=5000&cursor=notavalidcursor",
     )
     .await;
     assert_eq!(
@@ -294,14 +273,13 @@ async fn sections_batch_returns_a_page_per_name() {
         PartMeta {
             min_ts: 1_000,
             max_ts: 2_000,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir.path(), "1000.pgm", &bytes);
 
     let (status, body) = serve(
         dir.path(),
-        "/v1/sections/batch?source=7&from=1000&to=2000&names=pg_stat_archiver,pg_prepared_xacts&limit=10",
+        "/v1/sections/batch?from=1000&to=2000&names=pg_stat_archiver,pg_prepared_xacts&limit=10",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "batch responds 200");
@@ -327,13 +305,12 @@ async fn sections_batch_without_names_is_a_bad_request() {
     write_archiver_segment(
         dir.path(),
         "1000.pgm",
-        7,
         1_000,
         2_000,
         &[archiver_row(1_000, 1)],
     );
 
-    let (status, body) = serve(dir.path(), "/v1/sections/batch?source=7&from=1000&to=2000").await;
+    let (status, body) = serve(dir.path(), "/v1/sections/batch?from=1000&to=2000").await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
@@ -353,17 +330,12 @@ async fn sections_batch_with_only_separators_is_a_bad_request() {
     write_archiver_segment(
         dir.path(),
         "1000.pgm",
-        7,
         1_000,
         2_000,
         &[archiver_row(1_000, 1)],
     );
 
-    let (status, body) = serve(
-        dir.path(),
-        "/v1/sections/batch?source=7&from=1000&to=2000&names=,,",
-    )
-    .await;
+    let (status, body) = serve(dir.path(), "/v1/sections/batch?from=1000&to=2000&names=,,").await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,

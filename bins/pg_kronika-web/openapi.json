@@ -88,34 +88,11 @@
         }
       }
     },
-    "/v1/sources": {
-      "get": {
-        "operationId": "sources",
-        "security": [{ "basicAuth": [] }, {}],
-        "responses": {
-          "200": {
-            "description": "Source catalog",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/Sources" }
-              }
-            }
-          },
-          "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
-          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
-          "413": { "$ref": "#/components/responses/ApplicationProblem" },
-          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" },
-          "500": { "$ref": "#/components/responses/ApplicationProblem" }
-        }
-      }
-    },
     "/v1/ui/catalog": {
       "get": {
         "operationId": "uiCatalog",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/source" },
           {
             "name": "If-None-Match",
             "in": "header",
@@ -139,7 +116,7 @@
             }
           },
           "304": {
-            "description": "The source-aware catalog matches If-None-Match",
+            "description": "The catalog matches If-None-Match",
             "headers": {
               "ETag": {
                 "required": true,
@@ -161,7 +138,6 @@
         "operationId": "viewSummary",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/at" }
         ],
         "responses": {
@@ -187,7 +163,6 @@
         "operationId": "timelineHeatmap",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/view" },
           { "$ref": "#/components/parameters/metric" },
           { "$ref": "#/components/parameters/from" },
@@ -239,7 +214,6 @@
         "operationId": "segments",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/from" },
           { "$ref": "#/components/parameters/to" }
         ],
@@ -266,7 +240,6 @@
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/name" },
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/from" },
           { "$ref": "#/components/parameters/to" },
           { "$ref": "#/components/parameters/limit" },
@@ -295,7 +268,6 @@
         "operationId": "sectionsBatch",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/from" },
           { "$ref": "#/components/parameters/to" },
           { "$ref": "#/components/parameters/names" },
@@ -325,7 +297,6 @@
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/name" },
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/from" },
           { "$ref": "#/components/parameters/to" }
         ],
@@ -352,7 +323,6 @@
         "operationId": "sectionsBatchDiff",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/from" },
           { "$ref": "#/components/parameters/to" },
           { "$ref": "#/components/parameters/names" }
@@ -378,10 +348,9 @@
     "/v1/timeline/overview": {
       "get": {
         "operationId": "timelineOverview",
-        "description": "Queries one half-open source range of at most 31 days. Before sidecar or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission. A selected source read failure returns an uncached partial 200 response with an explicit known gap; FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries one half-open root time range of at most 31 days. Before sidecar or input access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass build admission. A selected input read failure returns an uncached partial 200 response with an explicit known gap; FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/timelineSource" },
           { "$ref": "#/components/parameters/timelineFrom" },
           { "$ref": "#/components/parameters/timelineTo" }
         ],
@@ -406,10 +375,9 @@
     "/v1/timeline/events": {
       "get": {
         "operationId": "timelineEvents",
-        "description": "Queries a canonical source set over a half-open range of at most 31 days. Before sidecar or source access, one aggregate limit applies to intersecting sealed segments across the deduplicated source set (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission; selected source failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. A cursor pins a process-local view: after a process restart it returns cursor_expired with HTTP 410, while a new ordinary query can regenerate the same data. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries the root over a half-open range of at most 31 days. Before sidecar or input access, one aggregate limit applies to intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass build admission; selected input failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. A cursor pins a process-local view: after a process restart it returns cursor_expired with HTTP 410, while a new ordinary query can regenerate the same data. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/timelineEventSources" },
           { "$ref": "#/components/parameters/timelineFrom" },
           { "$ref": "#/components/parameters/timelineTo" },
           { "$ref": "#/components/parameters/timelineEventsLimit" },
@@ -439,10 +407,9 @@
     "/v1/timeline/health": {
       "get": {
         "operationId": "timelineHealth",
-        "description": "Queries one half-open source range of at most 31 days. Before sidecar or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission; selected source failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries one half-open root time range of at most 31 days. Before sidecar or input access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass build admission; selected input failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/timelineSource" },
           { "$ref": "#/components/parameters/timelineFrom" },
           { "$ref": "#/components/parameters/timelineTo" },
           { "$ref": "#/components/parameters/timelineHealthStep" }
@@ -470,7 +437,6 @@
         "operationId": "anomalies",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/from" },
           { "$ref": "#/components/parameters/to" },
           { "$ref": "#/components/parameters/window" },
@@ -504,7 +470,6 @@
         "operationId": "incidents",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
-          { "$ref": "#/components/parameters/source" },
           { "$ref": "#/components/parameters/from" },
           { "$ref": "#/components/parameters/to" },
           { "$ref": "#/components/parameters/window" },
@@ -544,7 +509,6 @@
     },
     "parameters": {
       "name": { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
-      "source": { "name": "source", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0 } },
       "at": { "name": "at", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
       "from": { "name": "from", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
       "to": { "name": "to", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
@@ -564,28 +528,6 @@
       "cursor": { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } },
       "minSeverity": { "name": "min_severity", "in": "query", "required": false, "schema": { "type": "string", "enum": ["error", "fatal", "panic", "warning", "log"] } },
       "kind": { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" } },
-      "timelineSource": {
-        "name": "source",
-        "in": "query",
-        "required": true,
-        "description": "Numeric source identifier",
-        "schema": { "type": "integer", "minimum": 0 }
-      },
-      "timelineEventSources": {
-        "name": "source",
-        "in": "query",
-        "required": true,
-        "description": "Canonical source set; repeat source once per identifier",
-        "style": "form",
-        "explode": true,
-        "schema": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 32,
-          "uniqueItems": true,
-          "items": { "type": "integer", "minimum": 0 }
-        }
-      },
       "timelineFrom": {
         "name": "from",
         "in": "query",
@@ -769,28 +711,6 @@
             "enum": ["stderr", "csvlog", "unknown", null]
           },
           "source_path": { "type": ["string", "null"] }
-        }
-      },
-      "Sources": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["sources"],
-        "properties": {
-          "sources": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["source_id", "min_ts", "max_ts", "segments", "pg_log"],
-              "properties": {
-                "source_id": { "type": "integer", "minimum": 0 },
-                "min_ts": { "type": "integer", "format": "int64" },
-                "max_ts": { "type": "integer", "format": "int64" },
-                "segments": { "type": "integer", "minimum": 0 },
-                "pg_log": { "$ref": "#/components/schemas/PgLogSourceStatus" }
-              }
-            }
-          }
         }
       },
       "UiAvailability": {
@@ -1159,10 +1079,9 @@
       "Segment": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["segment_id", "source_id", "min_ts", "max_ts", "sections"],
+        "required": ["segment_id", "min_ts", "max_ts", "sections"],
         "properties": {
           "segment_id": { "type": "string", "pattern": "^-?[0-9]+$" },
-          "source_id": { "type": "integer", "minimum": 0 },
           "min_ts": { "type": "integer", "format": "int64" },
           "max_ts": { "type": "integer", "format": "int64" },
           "sections": {
@@ -1257,9 +1176,8 @@
       "DiffResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["source_id", "section", "identity", "series"],
+        "required": ["section", "identity", "series"],
         "properties": {
-          "source_id": { "type": "integer", "minimum": 0 },
           "section": { "type": "string" },
           "identity": { "type": "array", "items": { "type": "string" } },
           "series": { "type": "array", "items": { "$ref": "#/components/schemas/DiffSeries" } }
@@ -1661,10 +1579,9 @@
       "AnomalyResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "source_id", "from", "to", "window_us", "step_us", "threshold", "eps_rel", "limit", "status", "complete", "coverage", "truncation", "episodes", "plan_signals", "sections", "plan_analysis", "skipped"],
+        "required": ["schema_version", "from", "to", "window_us", "step_us", "threshold", "eps_rel", "limit", "status", "complete", "coverage", "truncation", "episodes", "plan_signals", "sections", "plan_analysis", "skipped"],
         "properties": {
           "schema_version": { "type": "integer", "const": 1 },
-          "source_id": { "type": "integer", "minimum": 0 },
           "from": { "type": "integer", "format": "int64" },
           "to": { "type": "integer", "format": "int64" },
           "window_us": { "type": "integer", "format": "int64", "minimum": 1 },
@@ -1695,9 +1612,8 @@
       "IncidentResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["source_id", "from", "to", "complete", "clustering_complete", "analysis_status", "incidents", "coverage_by_section", "data_age_seconds", "catalog", "log", "data_quality", "skipped"],
+        "required": ["from", "to", "complete", "clustering_complete", "analysis_status", "incidents", "coverage_by_section", "data_age_seconds", "catalog", "log", "data_quality", "skipped"],
         "properties": {
-          "source_id": { "type": "integer", "minimum": 0 },
           "from": { "type": "integer", "format": "int64" },
           "to": { "type": "integer", "format": "int64" },
           "complete": { "type": "boolean" },
@@ -1939,9 +1855,9 @@
       "TimelineEventsCursor": {
         "type": "string",
         "description": "Versioned authenticated cursor for a process-local pinned timeline view; it is not durable across process restarts",
-        "minLength": 312,
-        "maxLength": 312,
-        "pattern": "^[A-Za-z0-9_-]{312}$"
+        "minLength": 270,
+        "maxLength": 270,
+        "pattern": "^[A-Za-z0-9_-]{270}$"
       },
       "CoverageSpan": {
         "type": "object",
@@ -1977,11 +1893,11 @@
           }
         }
       },
-      "TimelineSourceStatus": {
+      "TimelineStatus": {
         "type": "string",
         "enum": ["complete_for_contract", "partial", "warming", "gap", "unavailable"]
       },
-      "TimelineSourceCompleteness": {
+      "TimelineCompleteness": {
         "type": "string",
         "enum": ["full", "bounded_subset", "unknown"]
       },
@@ -1993,32 +1909,29 @@
         "type": "string",
         "enum": ["exact", "lower_bound", "unknown", "not_applicable"]
       },
-      "SourceFreshness": {
+      "TimelineFreshness": {
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "source_id",
           "data_through_us",
-          "source_status",
-          "source_completeness",
+          "status",
+          "completeness",
           "retained_exactness",
           "physical_count_semantics"
         ],
         "properties": {
-          "source_id": { "type": "integer", "minimum": 0 },
           "data_through_us": { "type": ["integer", "null"], "format": "int64" },
-          "source_status": { "$ref": "#/components/schemas/TimelineSourceStatus" },
-          "source_completeness": { "$ref": "#/components/schemas/TimelineSourceCompleteness" },
+          "status": { "$ref": "#/components/schemas/TimelineStatus" },
+          "completeness": { "$ref": "#/components/schemas/TimelineCompleteness" },
           "retained_exactness": { "$ref": "#/components/schemas/TimelineRetainedExactness" },
           "physical_count_semantics": { "$ref": "#/components/schemas/TimelinePhysicalCountSemantics" }
         }
       },
-      "SourceLoss": {
+      "TimelineLoss": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["source_id", "known_gaps", "dropped_count_lower_bound"],
+        "required": ["known_gaps", "dropped_count_lower_bound"],
         "properties": {
-          "source_id": { "type": "integer", "minimum": 0 },
           "known_gaps": {
             "type": "array",
             "maxItems": 262144,
@@ -2037,13 +1950,11 @@
           "requested_range",
           "effective_range",
           "effective_step_us",
-          "sources",
-          "available_sources",
           "data_through_us",
           "store_data_through_us",
           "tail_pending",
-          "source_status",
-          "source_freshness",
+          "status",
+          "freshness",
           "loss"
         ],
         "properties": {
@@ -2053,19 +1964,6 @@
           "requested_range": { "$ref": "#/components/schemas/CoverageSpan" },
           "effective_range": { "$ref": "#/components/schemas/CoverageSpan" },
           "effective_step_us": { "type": ["integer", "null"], "minimum": 1 },
-          "sources": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 32,
-            "uniqueItems": true,
-            "items": { "type": "integer", "minimum": 0 }
-          },
-          "available_sources": {
-            "type": "array",
-            "maxItems": 32,
-            "uniqueItems": true,
-            "items": { "type": "integer", "minimum": 0 }
-          },
           "data_through_us": { "type": ["integer", "null"], "format": "int64" },
           "store_data_through_us": { "type": ["integer", "null"], "format": "int64" },
           "tail_pending": {
@@ -2074,19 +1972,9 @@
               { "$ref": "#/components/schemas/TailPending" }
             ]
           },
-          "source_status": { "$ref": "#/components/schemas/TimelineSourceStatus" },
-          "source_freshness": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 32,
-            "items": { "$ref": "#/components/schemas/SourceFreshness" }
-          },
-          "loss": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 32,
-            "items": { "$ref": "#/components/schemas/SourceLoss" }
-          }
+          "status": { "$ref": "#/components/schemas/TimelineStatus" },
+          "freshness": { "$ref": "#/components/schemas/TimelineFreshness" },
+          "loss": { "$ref": "#/components/schemas/TimelineLoss" }
         }
       },
       "SupportingEvidence": {
@@ -2287,8 +2175,7 @@
         "required": [
           "event_id",
           "event_instance_id",
-          "source_id",
-          "source_type_id",
+          "section_type_id",
           "identity_quality",
           "sort_ts_us",
           "occurred_at_us",
@@ -2312,8 +2199,7 @@
             "allOf": [{ "$ref": "#/components/schemas/B64UrlSha256" }],
             "description": "Physical retained-observation identifier that distinguishes retained occurrences and their provenance"
           },
-          "source_id": { "type": "integer", "minimum": 0 },
-          "source_type_id": {
+          "section_type_id": {
             "type": ["integer", "null"],
             "minimum": 0,
             "maximum": 4294967295
@@ -2604,7 +2490,7 @@
           "loss_reasons",
           "lost_count_lower_bound",
           "retained_exactness",
-          "source_completeness",
+          "completeness",
           "physical_count_semantics",
           "boundary_quality"
         ],
@@ -2678,7 +2564,7 @@
             "type": "string",
             "enum": ["retained_exact", "lower_bound", "unknown"]
           },
-          "source_completeness": {
+          "completeness": {
             "type": "string",
             "enum": ["full", "bounded_subset", "unknown"]
           },
@@ -2800,7 +2686,7 @@
           "next_cursor",
           "omitted_by_response_filter",
           "retained_exactness",
-          "source_completeness",
+          "completeness",
           "physical_count_semantics",
           "coverage"
         ],
@@ -2820,7 +2706,7 @@
           },
           "omitted_by_response_filter": { "type": "integer", "minimum": 0 },
           "retained_exactness": { "$ref": "#/components/schemas/TimelineRetainedExactness" },
-          "source_completeness": { "$ref": "#/components/schemas/TimelineSourceCompleteness" },
+          "completeness": { "$ref": "#/components/schemas/TimelineCompleteness" },
           "physical_count_semantics": { "$ref": "#/components/schemas/TimelinePhysicalCountSemantics" },
           "coverage": {
             "type": "array",
@@ -2856,11 +2742,11 @@
       },
       "KnownParameter": {
         "type": "string",
-        "enum": ["source", "at", "from", "to", "view", "metric", "buckets", "top", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
+        "enum": ["at", "from", "to", "view", "metric", "buckets", "top", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
       },
       "AnyParameterLocation": {
         "type": "string",
-        "enum": ["query", "source", "at", "from", "to", "view", "metric", "buckets", "top", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
+        "enum": ["query", "at", "from", "to", "view", "metric", "buckets", "top", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
       },
       "EmptyParams": {
         "type": "object",
@@ -2912,14 +2798,6 @@
           "section": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" }
         }
       },
-      "SourceParams": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["source"],
-        "properties": {
-          "source": { "type": "integer", "minimum": 0 }
-        }
-      },
       "LimitParams": {
         "type": "object",
         "additionalProperties": false,
@@ -2955,7 +2833,6 @@
               "https://pgkronika.dev/problems/unknown-query-parameter",
               "https://pgkronika.dev/problems/duplicate-query-parameter",
               "https://pgkronika.dev/problems/invalid-query-constraint",
-              "https://pgkronika.dev/problems/unknown-source",
               "https://pgkronika.dev/problems/unknown-section",
               "https://pgkronika.dev/problems/invalid-cursor",
               "https://pgkronika.dev/problems/cursor-query-mismatch",
@@ -2972,7 +2849,7 @@
           "status": { "type": "integer", "enum": [400, 401, 404, 405, 410, 413, 500, 503] },
           "code": {
             "type": "string",
-            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_source", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "cold_build_overloaded", "store_read_failed", "internal_error"]
+            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "cold_build_overloaded", "store_read_failed", "internal_error"]
           },
           "params": { "type": "object" },
           "instance": { "type": "string", "format": "uri", "pattern": "^https://pgkronika\\.dev/problems/occurrences/[0-9a-f]{32}$" }
@@ -2986,7 +2863,6 @@
           { "if": { "properties": { "code": { "const": "unknown_query_parameter" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-query-parameter" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/UnknownParameterParams" } } } },
           { "if": { "properties": { "code": { "const": "duplicate_query_parameter" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/duplicate-query-parameter" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ParameterParams" } } } },
           { "if": { "properties": { "code": { "const": "invalid_query_constraint" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-query-constraint" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ConstraintParams" } } } },
-          { "if": { "properties": { "code": { "const": "unknown_source" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-source" }, "status": { "const": 404 }, "params": { "$ref": "#/components/schemas/SourceParams" } } } },
           { "if": { "properties": { "code": { "const": "unknown_section" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-section" }, "status": { "const": 404 }, "params": { "$ref": "#/components/schemas/SectionParams" } } } },
           { "if": { "properties": { "code": { "const": "invalid_cursor" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-cursor" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "cursor_query_mismatch" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-query-mismatch" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },

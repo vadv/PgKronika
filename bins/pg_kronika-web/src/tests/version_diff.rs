@@ -29,7 +29,7 @@ async fn section_diff_resolves_identity_and_columns_for_a_known_section() {
     // but the route, the registry column resolution, and the response shape
     // are all exercised.
     let (_dir, status, body) =
-        fixture_response("/v1/section/pg_stat_statements/diff?source=7&from=0&to=9000").await;
+        fixture_response("/v1/section/pg_stat_statements/diff?from=0&to=9000").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["section"], "pg_stat_statements");
     assert_eq!(
@@ -44,10 +44,9 @@ async fn section_diff_resolves_identity_and_columns_for_a_known_section() {
 async fn batch_diff_serves_each_requested_section_keyed_by_name() {
     // The fixture holds no rows for either section, so the series are empty —
     // but the batch route, name resolution, and per-name shape are exercised.
-    let (_dir, status, body) = fixture_response(
-        "/v1/sections/batch/diff?source=7&from=0&to=9000&names=pg_stat_wal,pg_stat_io",
-    )
-    .await;
+    let (_dir, status, body) =
+        fixture_response("/v1/sections/batch/diff?from=0&to=9000&names=pg_stat_wal,pg_stat_io")
+            .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["pg_stat_wal"]["section"], "pg_stat_wal");
     assert_eq!(body["pg_stat_wal"]["series"], serde_json::json!([]));
@@ -57,8 +56,7 @@ async fn batch_diff_serves_each_requested_section_keyed_by_name() {
 
 #[tokio::test]
 async fn batch_diff_rejects_a_missing_names_parameter() {
-    let (_dir, status, body) =
-        fixture_response("/v1/sections/batch/diff?source=7&from=0&to=9000").await;
+    let (_dir, status, body) = fixture_response("/v1/sections/batch/diff?from=0&to=9000").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_problem(
         &body,
@@ -84,7 +82,6 @@ fn snapshot_arc_swap_round_trips_and_clone_stays_queryable() {
         PartMeta {
             min_ts: 1_000,
             max_ts: 2_000,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir.path(), "143000.pgm", &bytes);
@@ -96,7 +93,6 @@ fn snapshot_arc_swap_round_trips_and_clone_stays_queryable() {
     let page = kronika_reader::section(
         &mut snap,
         "pg_stat_bgwriter + pg_stat_checkpointer",
-        7,
         i64::MIN,
         i64::MAX,
         10,

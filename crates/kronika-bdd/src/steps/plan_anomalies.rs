@@ -205,7 +205,7 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
         let row_count = if minute < 40 { 1 } else { 2 };
         coverage.push(SnapshotCoverageV1 {
             ts: Ts(ts),
-            source_type_id: 1_003_001,
+            section_type_id: 1_003_001,
             collector_pid: 42,
             collector_started_at: Ts(0),
             read_state: 0,

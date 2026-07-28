@@ -31,8 +31,7 @@ pub(crate) struct EventFactPosition {
 pub(crate) struct EventFact {
     pub(crate) event_id: String,
     pub(crate) event_instance_id: String,
-    pub(crate) source_id: u64,
-    pub(crate) source_type_id: Option<u32>,
+    pub(crate) section_type_id: Option<u32>,
     pub(crate) identity_quality: &'static str,
     pub(crate) sort_ts_us: i64,
     pub(crate) occurred_at_us: Option<i64>,
@@ -113,7 +112,7 @@ pub(crate) struct MarkerPayload {
     pub(crate) kind: &'static str,
 }
 
-/// Source-qualified entity identity.
+/// Entity identity.
 #[derive(Debug, Serialize)]
 pub(crate) struct EntityDto {
     pub(crate) kind: &'static str,
@@ -151,21 +150,19 @@ pub(crate) struct TailPendingDto {
     pub(crate) to_offset_bytes: u64,
 }
 
-/// Per-source publication freshness and independent quality axes.
+/// Publication freshness and independent quality axes.
 #[derive(Debug, Serialize)]
-pub(crate) struct SourceFreshnessDto {
-    pub(crate) source_id: u64,
+pub(crate) struct FreshnessDto {
     pub(crate) data_through_us: Option<i64>,
-    pub(crate) source_status: &'static str,
-    pub(crate) source_completeness: &'static str,
+    pub(crate) status: &'static str,
+    pub(crate) completeness: &'static str,
     pub(crate) retained_exactness: &'static str,
     pub(crate) physical_count_semantics: &'static str,
 }
 
-/// Proven loss for one selected source and request range.
+/// Proven loss for the request range.
 #[derive(Debug, Serialize)]
-pub(crate) struct SourceLossDto {
-    pub(crate) source_id: u64,
+pub(crate) struct LossDto {
     pub(crate) known_gaps: Vec<CoverageSpanDto>,
     pub(crate) dropped_count_lower_bound: Option<u64>,
 }
@@ -179,14 +176,12 @@ pub(crate) struct TimelineMetaDto {
     pub(crate) requested_range: CoverageSpanDto,
     pub(crate) effective_range: CoverageSpanDto,
     pub(crate) effective_step_us: Option<u64>,
-    pub(crate) sources: Vec<u64>,
-    pub(crate) available_sources: Vec<u64>,
     pub(crate) data_through_us: Option<i64>,
     pub(crate) store_data_through_us: Option<i64>,
     pub(crate) tail_pending: Option<TailPendingDto>,
-    pub(crate) source_status: &'static str,
-    pub(crate) source_freshness: Vec<SourceFreshnessDto>,
-    pub(crate) loss: Vec<SourceLossDto>,
+    pub(crate) status: &'static str,
+    pub(crate) freshness: FreshnessDto,
+    pub(crate) loss: LossDto,
 }
 
 /// One SQLSTATE digest entry.
@@ -247,7 +242,7 @@ pub(crate) struct NotablePreviewDto {
 }
 
 /// Typed overview response; health policy output stays owned by its policy
-/// serializer while the event/count/source contracts are compile-time types.
+/// serializer while the event and count contracts are compile-time types.
 #[derive(Debug, Serialize)]
 pub(crate) struct OverviewResponseDto {
     pub(crate) meta: TimelineMetaDto,
@@ -267,7 +262,7 @@ pub(crate) struct EventsResponseDto {
     pub(crate) next_cursor: Option<String>,
     pub(crate) omitted_by_response_filter: u64,
     pub(crate) retained_exactness: &'static str,
-    pub(crate) source_completeness: &'static str,
+    pub(crate) completeness: &'static str,
     pub(crate) physical_count_semantics: &'static str,
     pub(crate) coverage: Vec<Value>,
 }
@@ -296,7 +291,6 @@ impl EventFactProjection {
     pub(crate) fn project(
         observation: &EventObservation,
         class: NotableClass,
-        source_id: u64,
     ) -> Option<EventFact> {
         let position = Self::position(observation, class)?;
         let time = observation.time();
@@ -304,8 +298,7 @@ impl EventFactProjection {
         Some(EventFact {
             event_id: URL_SAFE_NO_PAD.encode(position.event_id),
             event_instance_id: URL_SAFE_NO_PAD.encode(position.event_instance_id),
-            source_id,
-            source_type_id: Some(observation.source_type_id()),
+            section_type_id: Some(observation.section_type_id()),
             identity_quality: identity_quality_name(observation.identity_quality()),
             sort_ts_us: time.sort_ts_us,
             occurred_at_us: time.occurred_at_us,
@@ -350,15 +343,13 @@ impl EventFactProjection {
     pub(crate) fn project_canonical(
         fact: &CanonicalEventFact,
         class: NotableClass,
-        source_id: u64,
     ) -> Option<EventFact> {
         let position = Self::canonical_position(fact);
         let interval = fact.interval();
         Some(EventFact {
             event_id: URL_SAFE_NO_PAD.encode(position.event_id),
             event_instance_id: URL_SAFE_NO_PAD.encode(position.event_instance_id),
-            source_id,
-            source_type_id: None,
+            section_type_id: None,
             identity_quality: "content_derived",
             sort_ts_us: interval.start_us(),
             occurred_at_us: Some(interval.start_us()),

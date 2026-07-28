@@ -15,28 +15,24 @@ fn problem_example(code: ProblemCode) -> (ApiProblem, serde_json::Value) {
             serde_json::json!({}),
         ),
         ProblemCode::MissingQueryParameter => (
-            ApiProblem::missing_query_parameter(QueryParameter::Source),
-            serde_json::json!({ "parameter": "source" }),
+            ApiProblem::missing_query_parameter(QueryParameter::From),
+            serde_json::json!({ "parameter": "from" }),
         ),
         ProblemCode::InvalidQueryParameter => (
-            ApiProblem::invalid_query_parameter(QueryParameter::Source, ExpectedValue::Uint64),
-            serde_json::json!({ "parameter": "source", "expected": "uint64" }),
+            ApiProblem::invalid_query_parameter(QueryParameter::From, ExpectedValue::Int64),
+            serde_json::json!({ "parameter": "from", "expected": "int64" }),
         ),
         ProblemCode::UnknownQueryParameter => (
             ApiProblem::unknown_query_parameter("unexpected"),
             serde_json::json!({ "parameter": "unexpected" }),
         ),
         ProblemCode::DuplicateQueryParameter => (
-            ApiProblem::duplicate_query_parameter(QueryParameter::Source),
-            serde_json::json!({ "parameter": "source" }),
+            ApiProblem::duplicate_query_parameter(QueryParameter::From),
+            serde_json::json!({ "parameter": "from" }),
         ),
         ProblemCode::InvalidQueryConstraint => (
             ApiProblem::invalid_query_constraint(QueryConstraint::FromBeforeTo),
             serde_json::json!({ "constraint": "from_before_to" }),
-        ),
-        ProblemCode::UnknownSource => (
-            ApiProblem::unknown_source(7),
-            serde_json::json!({ "source": 7 }),
         ),
         ProblemCode::UnknownSection => (
             ApiProblem::unknown_section("unknown_section"),
@@ -177,8 +173,8 @@ async fn accept_language_does_not_change_success_or_problem_semantics() {
         assert_problem(
             &response.body,
             StatusCode::BAD_REQUEST,
-            "invalid_query_parameter",
-            serde_json::json!({ "parameter": "source", "expected": "uint64" }),
+            "unknown_query_parameter",
+            serde_json::json!({ "parameter": "source" }),
         );
         assert!(response.headers.get(header::CONTENT_LANGUAGE).is_none());
         assert!(response.headers.get(header::VARY).is_none());
@@ -229,17 +225,15 @@ async fn routing_method_and_query_shape_use_the_closed_registry() {
         serde_json::json!({ "parameter": "locale" }),
     );
 
-    let (_dir, duplicate) =
-        fixture_captured("/v1/segments?source=7&source=8&from=0&to=1", &[]).await;
+    let (_dir, duplicate) = fixture_captured("/v1/segments?source=8&from=0&to=1", &[]).await;
     assert_problem(
         &duplicate.body,
         StatusCode::BAD_REQUEST,
-        "duplicate_query_parameter",
+        "unknown_query_parameter",
         serde_json::json!({ "parameter": "source" }),
     );
 
-    let (_dir, malformed_path) =
-        fixture_captured("/v1/section/%FF?source=7&from=0&to=1", &[]).await;
+    let (_dir, malformed_path) = fixture_captured("/v1/section/%FF?from=0&to=1", &[]).await;
     assert_problem(
         &malformed_path.body,
         StatusCode::NOT_FOUND,
@@ -804,8 +798,8 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
     let schemas = &document["components"]["schemas"];
     for schema in [
         "CoverageSpan",
-        "SourceFreshness",
-        "SourceLoss",
+        "TimelineFreshness",
+        "TimelineLoss",
         "TimelineMeta",
         "SupportingEvidence",
         "EventLoss",
@@ -858,7 +852,7 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
     assert_eq!(schemas["B64Url128"]["pattern"], "^[A-Za-z0-9_-]{22}$");
     assert_eq!(
         schemas["TimelineEventsCursor"]["pattern"],
-        "^[A-Za-z0-9_-]{312}$"
+        "^[A-Za-z0-9_-]{270}$"
     );
     let cursor_description = schemas["TimelineEventsCursor"]["description"]
         .as_str()
@@ -876,12 +870,13 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
         .expect("event instance ID description");
     assert!(event_instance_description.contains("retained occurrences"));
     assert!(event_instance_description.contains("provenance"));
-    assert_eq!(
-        schemas["EventFact"]["properties"]["source_id"]["type"],
-        "integer"
+    assert!(
+        schemas["EventFact"]["properties"]
+            .get("source_id")
+            .is_none()
     );
     assert_eq!(
-        schemas["EventFact"]["properties"]["source_type_id"]["type"],
+        schemas["EventFact"]["properties"]["section_type_id"]["type"],
         serde_json::json!(["integer", "null"])
     );
     assert_eq!(
@@ -950,16 +945,8 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
 
 fn assert_timeline_endpoint_contract(document: &serde_json::Value) {
     let parameters = &document["components"]["parameters"];
-    let event_sources = &parameters["timelineEventSources"];
-    assert_eq!(event_sources["name"], "source");
-    assert_eq!(event_sources["required"], true);
-    assert_eq!(event_sources["style"], "form");
-    assert_eq!(event_sources["explode"], true);
-    assert_eq!(event_sources["schema"]["type"], "array");
-    assert_eq!(event_sources["schema"]["minItems"], 1);
-    assert_eq!(event_sources["schema"]["maxItems"], 32);
-    assert_eq!(event_sources["schema"]["uniqueItems"], true);
-    assert_eq!(parameters["timelineSource"]["schema"]["type"], "integer");
+    assert!(parameters.get("timelineEventSources").is_none());
+    assert!(parameters.get("timelineSource").is_none());
     assert_eq!(parameters["timelineFrom"]["schema"]["format"], "int64");
     assert_eq!(parameters["timelineTo"]["schema"]["format"], "int64");
     assert_eq!(
@@ -974,19 +961,24 @@ fn assert_timeline_endpoint_contract(document: &serde_json::Value) {
     assert_eq!(
         paths["/v1/timeline/overview"]["get"]["parameters"],
         serde_json::json!([
-            { "$ref": "#/components/parameters/timelineSource" },
             { "$ref": "#/components/parameters/timelineFrom" },
             { "$ref": "#/components/parameters/timelineTo" }
         ])
     );
     assert_eq!(
-        paths["/v1/timeline/events"]["get"]["parameters"][0]["$ref"],
-        "#/components/parameters/timelineEventSources"
+        paths["/v1/timeline/events"]["get"]["parameters"],
+        serde_json::json!([
+            { "$ref": "#/components/parameters/timelineFrom" },
+            { "$ref": "#/components/parameters/timelineTo" },
+            { "$ref": "#/components/parameters/timelineEventsLimit" },
+            { "$ref": "#/components/parameters/timelineEventsCursor" },
+            { "$ref": "#/components/parameters/minSeverity" },
+            { "$ref": "#/components/parameters/kind" }
+        ])
     );
     assert_eq!(
         paths["/v1/timeline/health"]["get"]["parameters"],
         serde_json::json!([
-            { "$ref": "#/components/parameters/timelineSource" },
             { "$ref": "#/components/parameters/timelineFrom" },
             { "$ref": "#/components/parameters/timelineTo" },
             { "$ref": "#/components/parameters/timelineHealthStep" }
@@ -1050,7 +1042,6 @@ fn assert_v1_documented_paths(document: &serde_json::Value) {
             "/v1/sections/batch",
             "/v1/sections/batch/diff",
             "/v1/segments",
-            "/v1/sources",
             "/v1/timeline/events",
             "/v1/timeline/health",
             "/v1/timeline/heatmap",
@@ -1063,7 +1054,6 @@ fn assert_v1_documented_paths(document: &serde_json::Value) {
 
     let expected_success_schemas = [
         ("/v1/version", "Version"),
-        ("/v1/sources", "Sources"),
         ("/v1/sections", "Sections"),
         ("/v1/segments", "Segments"),
         ("/v1/section/{name}", "NeutralObject"),

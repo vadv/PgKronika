@@ -81,10 +81,6 @@ impl QueryParams {
     pub(crate) fn get(&self, parameter: QueryParameter) -> Option<&str> {
         self.values[parameter.index()].first().map(String::as_str)
     }
-
-    pub(crate) fn values(&self, parameter: QueryParameter) -> &[String] {
-        &self.values[parameter.index()]
-    }
 }
 
 fn validate_query_encoding(raw: &str) -> Result<(), ApiProblem> {
@@ -131,18 +127,6 @@ const fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
-}
-
-/// Parse a required unsigned query parameter.
-pub(crate) fn parse_u64(
-    params: &QueryParams,
-    parameter: QueryParameter,
-) -> Result<u64, ApiProblem> {
-    params
-        .get(parameter)
-        .ok_or_else(|| ApiProblem::missing_query_parameter(parameter))?
-        .parse()
-        .map_err(|_error| ApiProblem::invalid_query_parameter(parameter, ExpectedValue::Uint64))
 }
 
 /// Parse a required signed query parameter.
@@ -384,11 +368,11 @@ mod tests {
         let byte_error = QueryParams::parse(Some(&oversized), &[]).expect_err("byte ceiling");
         assert_eq!(byte_error.code(), ProblemCode::QueryLimitExceeded);
 
-        let too_many = std::iter::repeat_n("source=1", MAX_QUERY_PARAMETERS + 1)
+        let too_many = std::iter::repeat_n("from=1", MAX_QUERY_PARAMETERS + 1)
             .collect::<Vec<_>>()
             .join("&");
-        let pair_error = QueryParams::parse(Some(&too_many), &[QueryParameter::Source])
-            .expect_err("pair ceiling");
+        let pair_error =
+            QueryParams::parse(Some(&too_many), &[QueryParameter::From]).expect_err("pair ceiling");
         assert_eq!(pair_error.code(), ProblemCode::QueryLimitExceeded);
 
         let malformed_over_limit = std::iter::repeat_n("%FF", MAX_QUERY_PARAMETERS + 1)
@@ -401,16 +385,16 @@ mod tests {
 
     #[test]
     fn percent_triplets_and_decoded_utf8_are_strict() {
-        for malformed in ["%", "%0", "%GG", "%FF", "source=%C3", "source=%C3%28"] {
-            let error = QueryParams::parse(Some(malformed), &[QueryParameter::Source])
+        for malformed in ["%", "%0", "%GG", "%FF", "from=%C3", "from=%C3%28"] {
+            let error = QueryParams::parse(Some(malformed), &[QueryParameter::From])
                 .expect_err("malformed encoding");
             assert_eq!(error.code(), ProblemCode::InvalidQueryParameter);
         }
 
         let decoded = params("section=%D1%82", &[QueryParameter::Section]);
         assert_eq!(decoded.get(QueryParameter::Section), Some("т"));
-        let ascii = params("source=%37", &[QueryParameter::Source]);
-        assert_eq!(ascii.get(QueryParameter::Source), Some("7"));
+        let ascii = params("from=%37", &[QueryParameter::From]);
+        assert_eq!(ascii.get(QueryParameter::From), Some("7"));
     }
 
     #[test]

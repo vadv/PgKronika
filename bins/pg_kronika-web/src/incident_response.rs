@@ -16,10 +16,9 @@ use crate::incident_input::{
 };
 use crate::reason::{ApiReason, MaterializationResource};
 
-pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<u64>) -> Value {
+pub(crate) fn no_data_response(scan: &ScanParams, data_age: Option<u64>) -> Value {
     let quality = InputQuality::default();
     json!({
-        "source_id": source,
         "from": scan.from,
         "to": scan.to,
         "complete": false,
@@ -59,7 +58,6 @@ impl IdentityIssue {
 }
 
 pub(crate) fn identity_response(
-    source: u64,
     scan: &ScanParams,
     data_age: Option<u64>,
     issue: IdentityIssue,
@@ -67,7 +65,6 @@ pub(crate) fn identity_response(
     let quality = InputQuality::default();
     let analysis_status = issue.analysis_status();
     json!({
-        "source_id": source,
         "from": scan.from,
         "to": scan.to,
         "complete": false,
@@ -91,7 +88,6 @@ pub(crate) struct ResponseInput<'a> {
 }
 
 pub(crate) fn build_response(
-    source: u64,
     scan: &ScanParams,
     data_age: Option<u64>,
     outcome: &EngineOutcome,
@@ -117,7 +113,6 @@ pub(crate) fn build_response(
         "incidents_detected"
     };
     json!({
-        "source_id": source,
         "from": scan.from,
         "to": scan.to,
         "complete": false,
@@ -1146,7 +1141,6 @@ mod tests {
             evaluated_lens_ids: Vec::new(),
         };
         let body = build_response(
-            7,
             &scan(),
             None,
             &outcome,
@@ -1420,9 +1414,8 @@ mod tests {
 
     #[test]
     fn no_data_has_partial_envelope() {
-        let body = no_data_response(7, &scan(), None);
+        let body = no_data_response(&scan(), None);
         for field in [
-            "source_id",
             "from",
             "to",
             "complete",
@@ -1468,7 +1461,7 @@ mod tests {
             (IdentityIssue::Missing, "missing_node_identity"),
             (IdentityIssue::Conflicting, "conflicting_node_identity"),
         ] {
-            let body = identity_response(7, &scan(), None, issue);
+            let body = identity_response(&scan(), None, issue);
             assert_eq!(body["analysis_status"], expected);
             assert_eq!(body["data_quality"]["node_identity"], expected);
             assert_eq!(body["catalog"]["diagnosis_available"], false);
@@ -1482,7 +1475,7 @@ mod tests {
 
     #[test]
     fn global_catalog_readiness_is_not_a_request_skip() {
-        let body = no_data_response(7, &scan(), None);
+        let body = no_data_response(&scan(), None);
         assert!(
             body["skipped"]["analysis"]
                 .as_array()
@@ -1500,7 +1493,6 @@ mod tests {
             evaluated_lens_ids: Vec::new(),
         };
         let body = build_response(
-            7,
             &scan(),
             None,
             &outcome,
@@ -1536,7 +1528,6 @@ mod tests {
             evaluated_lens_ids: Vec::new(),
         };
         let body = build_response(
-            7,
             &scan(),
             None,
             &outcome,
@@ -1594,7 +1585,6 @@ mod tests {
             },
         ];
         let body = build_response(
-            7,
             &scan(),
             None,
             &outcome,
@@ -1634,7 +1624,6 @@ mod tests {
         };
 
         let body = build_response(
-            7,
             &scan(),
             None,
             &outcome,
@@ -1700,7 +1689,6 @@ mod tests {
         .expect("valid analysis");
 
         let body = build_response(
-            7,
             &scan(),
             None,
             &outcome,
@@ -1822,7 +1810,6 @@ mod tests {
         .expect("valid analysis");
 
         build_response(
-            7,
             &scan(),
             None,
             &outcome,

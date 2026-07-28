@@ -37,10 +37,7 @@ async fn auth_disabled_leaves_v1_open() {
 
 #[tokio::test]
 async fn auth_enabled_rejects_v1_without_credentials() {
-    for uri in [
-        "/v1/version",
-        "/v1/incidents?source=7&from=0&to=600000000&window=1m",
-    ] {
+    for uri in ["/v1/version", "/v1/incidents?from=0&to=600000000&window=1m"] {
         assert_eq!(
             auth_status(Some(AuthConfig::new("u", "p")), uri, None).await,
             StatusCode::UNAUTHORIZED,

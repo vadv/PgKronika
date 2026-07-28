@@ -137,9 +137,9 @@ pub(crate) enum InputError {
     UnknownSection(String),
     /// The period, window, or step cannot define a finite scan.
     InvalidScan,
-    /// No source unit overlaps the requested period.
+    /// No unit overlaps the requested period.
     NoData,
-    /// Too many source units overlap the request for bounded coverage output.
+    /// Too many units overlap the request for bounded coverage output.
     UnitLimit { observed: usize, limit: usize },
     /// The scan would materialize too many window positions.
     PositionLimit { observed: usize, limit: usize },
@@ -158,9 +158,9 @@ pub(crate) enum InputError {
         resource: MaterializationKind,
         limit: usize,
     },
-    /// No resolved node id covers the requested source and interval.
+    /// No resolved node id covers the requested interval.
     MissingNodeIdentity,
-    /// The interval spans more than one node id for the same source.
+    /// The interval spans more than one node id.
     ConflictingNodeIdentity,
     /// Node identity bytes exceeded the adapter ceiling.
     IdentityByteLimit { observed: usize, limit: usize },
@@ -214,7 +214,6 @@ pub(crate) enum SkipReason {
 
 /// Owned engine input, coverage, and exclusion counters.
 pub(crate) struct PreparedInput {
-    pub source_id: u64,
     pub node_self_id: String,
     pub episodes: Vec<EnrichedEpisode>,
     pub series: SeriesSet,
@@ -233,13 +232,12 @@ pub(crate) enum CapabilityInputState {
     NotCollected,
 }
 
-/// Read and scan `sections` for one source over `[from, to)`.
+/// Read and scan `sections` over `[from, to)`.
 ///
 /// Limits cover the whole call. An incomplete or locally oversized section is
 /// skipped; input, decode, and request-wide admission failures are typed errors.
 pub(crate) fn prepare_input(
     snap: &mut LocalDirSnapshot,
-    source: u64,
     scan: &ScanParams,
     sections: &[&'static str],
     limits: &InputLimits,
@@ -254,9 +252,7 @@ pub(crate) fn prepare_input(
     let overlapping_units = snap
         .units()
         .iter()
-        .filter(|unit| {
-            unit.source_id == source && unit.max_ts >= scan.from && unit.min_ts <= scan.to
-        })
+        .filter(|unit| unit.max_ts >= scan.from && unit.min_ts <= scan.to)
         .count();
     if overlapping_units > limits.units {
         return Err(InputError::UnitLimit {
@@ -264,7 +260,7 @@ pub(crate) fn prepare_input(
             limit: limits.units,
         });
     }
-    let mut input = read_input_pages(snap, source, scan, sections, limits)?;
+    let mut input = read_input_pages(snap, scan, sections, limits)?;
     let log_events = build_log_events(
         &input.pages,
         &input.skipped,
@@ -303,7 +299,6 @@ pub(crate) fn prepare_input(
     }
 
     Ok(PreparedInput {
-        source_id: source,
         node_self_id,
         episodes: state.episodes,
         series: state.series,
@@ -535,7 +530,6 @@ struct InputPages {
 
 fn read_input_pages(
     snap: &mut LocalDirSnapshot,
-    source: u64,
     scan: &ScanParams,
     sections: &[&'static str],
     limits: &InputLimits,
@@ -569,9 +563,7 @@ fn read_input_pages(
     let metadata_from = snap
         .units()
         .iter()
-        .filter(|unit| {
-            unit.source_id == source && unit.max_ts >= scan.from && unit.min_ts <= scan.to
-        })
+        .filter(|unit| unit.max_ts >= scan.from && unit.min_ts <= scan.to)
         .map(|unit| unit.min_ts)
         .min()
         .ok_or(InputError::NoData)?;
@@ -579,7 +571,6 @@ fn read_input_pages(
     let metadata_page = section_with_limits(
         snap,
         "instance_metadata",
-        source,
         metadata_from,
         scan.to,
         None,
@@ -595,7 +586,6 @@ fn read_input_pages(
     let read_names: Vec<&str> = read_names.into_iter().collect();
     let batch = sections_with_limits(
         snap,
-        source,
         scan.from,
         scan.to,
         &read_names,
@@ -606,7 +596,6 @@ fn read_input_pages(
         Ok(pages) => (pages, Vec::new()),
         Err(QueryError::ResultTooLarge { .. }) => read_partial_pages(
             snap,
-            source,
             scan,
             &read_names,
             remaining_cells,
@@ -632,7 +621,6 @@ fn read_input_pages(
 
 fn read_partial_pages(
     snap: &mut LocalDirSnapshot,
-    source: u64,
     scan: &ScanParams,
     names: &[&str],
     mut remaining_cells: usize,
@@ -654,7 +642,6 @@ fn read_partial_pages(
         match section_with_limits(
             snap,
             name,
-            source,
             scan.from,
             scan.to,
             None,
@@ -723,9 +710,9 @@ impl SnapshotProvenance {
             page.is_none_or(|page| page.next_cursor.is_some() || !page.gaps.is_empty());
         if let Some(page) = page {
             for row in &page.rows {
-                let (Some(ts), Some(source_type_id), Some(read_state), Some(visibility)) = (
+                let (Some(ts), Some(section_type_id), Some(read_state), Some(visibility)) = (
                     read_ts(row, "ts"),
-                    read_u64(row, "source_type_id").and_then(|value| u32::try_from(value).ok()),
+                    read_u64(row, "section_type_id").and_then(|value| u32::try_from(value).ok()),
                     read_u8(row, "read_state"),
                     read_u8(row, "visibility"),
                 ) else {
@@ -746,7 +733,7 @@ impl SnapshotProvenance {
                     (1..=4, _, _, true) => SnapshotMarkerState::Unavailable,
                     _ => SnapshotMarkerState::Unknown,
                 };
-                let target = match source_type_id {
+                let target = match section_type_id {
                     1_001_001..=1_001_003 => &mut activity,
                     1_002_001..=1_002_006 => &mut statements,
                     1_003_001 => &mut plans_ossc,
@@ -2608,14 +2595,7 @@ mod tests {
             rows: section.rows,
             body: &section.body,
         }));
-        let bytes = kronika_format::build_part(
-            &sections,
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: 7,
-            },
-        );
+        let bytes = kronika_format::build_part(&sections, PartMeta { min_ts, max_ts });
         let path = crate::test_layout::file_path(
             root,
             crate::test_layout::address(segment_id),
@@ -2680,7 +2660,6 @@ mod tests {
         let scan = spike_scan(to);
         let prepared = prepare_input(
             &mut snap,
-            7,
             &scan,
             &["pg_stat_archiver"],
             &InputLimits::for_test(),
@@ -2692,7 +2671,6 @@ mod tests {
             "the two segments read and scan cleanly: {:?}",
             prepared.skipped
         );
-        assert_eq!(prepared.source_id, 7);
         assert_eq!(prepared.node_self_id, "node-7");
         assert_eq!(prepared.quality.duplicate_timestamps, 1);
         let episode = prepared
@@ -2793,7 +2771,6 @@ mod tests {
         let scan = spike_scan(39 * MINUTE);
         let prepared = prepare_input(
             &mut snap,
-            7,
             &scan,
             &["pg_stat_archiver"],
             &InputLimits::for_test(),
@@ -2865,7 +2842,7 @@ mod tests {
             eps_rel: 0.05,
         };
 
-        let prepared = prepare_input(&mut snap, 7, &scan, &["pg_stat_archiver"], &limits)
+        let prepared = prepare_input(&mut snap, &scan, &["pg_stat_archiver"], &limits)
             .expect("metadata fits and oversized data is skipped");
         assert_eq!(
             prepared.skipped,
@@ -2919,7 +2896,7 @@ mod tests {
         limits.materialized_bytes = 1;
         let mut snap = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         assert!(matches!(
-            prepare_input(&mut snap, 7, &scan, &["pg_stat_archiver"], &limits),
+            prepare_input(&mut snap, &scan, &["pg_stat_archiver"], &limits),
             Err(InputError::MaterializationLimit {
                 resource: MaterializationKind::Bytes,
                 limit: 1,
@@ -2929,7 +2906,6 @@ mod tests {
         let mut snap = LocalDirSnapshot::open(dir.path()).expect("reopen snapshot");
         let (pages, skipped) = read_partial_pages(
             &mut snap,
-            7,
             &scan,
             &["pg_stat_archiver", "pg_stat_wal"],
             limits.materialized_cells,
@@ -2979,7 +2955,7 @@ mod tests {
             threshold: 3.5,
             eps_rel: 0.05,
         };
-        let error = prepare_input(&mut snap, 7, &scan, &["pg_stat_archiver"], &limits)
+        let error = prepare_input(&mut snap, &scan, &["pg_stat_archiver"], &limits)
             .err()
             .expect("unit admission rejects before metadata is required");
         assert!(matches!(
@@ -3055,7 +3031,7 @@ mod tests {
     ) -> OutRow {
         vec![
             cell("ts", Value::Ts(ts)),
-            cell("source_type_id", Value::U64(1_001_003)),
+            cell("section_type_id", Value::U64(1_001_003)),
             cell("collector_pid", Value::U64(42)),
             cell("collector_started_at", Value::Ts(1)),
             cell("read_state", Value::U64(read_state)),
@@ -3068,7 +3044,6 @@ mod tests {
     fn snapshot_marker_page(rows: Vec<OutRow>) -> SectionPage {
         SectionPage {
             section: SNAPSHOT_COVERAGE.to_owned(),
-            source_id: 7,
             rows,
             gaps: Vec::new(),
             next_cursor: None,
@@ -3352,7 +3327,6 @@ mod tests {
     fn log_page(section: &str, rows: Vec<OutRow>) -> SectionPage {
         SectionPage {
             section: section.to_owned(),
-            source_id: 7,
             rows,
             gaps: Vec::new(),
             next_cursor: None,

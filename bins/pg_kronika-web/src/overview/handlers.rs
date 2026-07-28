@@ -26,13 +26,13 @@ use crate::overview::cache::{CacheKey, Endpoint, ResponseKey};
 use crate::overview::cursor::{CursorError, EventsCursor};
 use crate::overview::dto::{
     CoverageSpanDto, EventDigestDto, EventFact, EventFactPosition, EventFactProjection,
-    EventsResponseDto, JointCountDto, LifecycleDigestDto, NotablePreviewDto, OverviewResponseDto,
-    SignalCountDto, SourceFreshnessDto, SourceLossDto, SqlstateCountDto, TailPendingDto,
-    TimelineMetaDto, category_name, severity_name, sqlstate_text,
+    EventsResponseDto, FreshnessDto, JointCountDto, LifecycleDigestDto, LossDto, NotablePreviewDto,
+    OverviewResponseDto, SignalCountDto, SqlstateCountDto, TailPendingDto, TimelineMetaDto,
+    category_name, severity_name, sqlstate_text,
 };
 use crate::overview::loader::FactLoadFailure;
 use crate::overview::selection::{SelectedSealedPlan, SelectionError};
-use crate::overview::view::{CanonicalFactQueryError, IndexView, SourceMetadata, SourceStatus};
+use crate::overview::view::{CanonicalFactQueryError, IndexView, TimelineMetadata, TimelineStatus};
 use crate::params::QueryParams;
 use crate::problem::{ApiProblem, QueryParameter};
 use crate::{AppState, TimelineFlightRole};
@@ -49,11 +49,7 @@ const HEALTH_POLICY_VERSION: u32 = kronika_analytics::overview::HEALTH_POLICY_VE
 /// Top-N sparse dimensions kept in the digest projection.
 const DIGEST_TOP_N: usize = 16;
 
-const OVERVIEW_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
-    QueryParameter::From,
-    QueryParameter::To,
-];
+const OVERVIEW_PARAMS: &[QueryParameter] = &[QueryParameter::From, QueryParameter::To];
 
 const QUERY_LIMITS: OracleLimits = OracleLimits {
     max_observations: 1_048_576,
@@ -73,7 +69,6 @@ const MAX_FACTOR_COVERAGE_RECORDS: usize = 65_536;
 #[derive(Debug, Clone, Copy)]
 struct OverviewRequest {
     range: CoverageSpan,
-    source: u64,
     from_us: i64,
     to_us: i64,
 }
@@ -89,7 +84,7 @@ pub(crate) async fn overview(State(state): State<AppState>, RawQuery(raw): RawQu
         Err(problem) => return problem.into_response(),
     };
     let (snapshot, view) = state.overview_request_view();
-    let plan = match select_plan(&state, view, &[request.source], request.range) {
+    let plan = match select_plan(&state, view, request.range) {
         Ok(plan) => plan,
         Err(problem) => return problem.into_response(),
     };
@@ -206,11 +201,10 @@ fn json_bytes_response(bytes: Arc<[u8]>) -> Response {
 fn select_plan(
     state: &AppState,
     view: Arc<crate::overview::view::DescriptorView>,
-    sources: &[u64],
     range: CoverageSpan,
 ) -> Result<SelectedSealedPlan, ApiProblem> {
     state
-        .select_overview(view, sources, range)
+        .select_overview(view, range)
         .map_err(|error| match error {
             SelectionError::LimitExceeded { limit } => {
                 metrics::counter!(
@@ -224,9 +218,7 @@ fn select_plan(
                     None,
                 )
             }
-            SelectionError::InvalidLimit | SelectionError::SourcesNotCanonical => {
-                ApiProblem::internal_error()
-            }
+            SelectionError::InvalidLimit => ApiProblem::internal_error(),
         })
 }
 
@@ -260,13 +252,12 @@ fn overview_key(fact_set_id: [u8; 32], request: OverviewRequest) -> ResponseKey 
         step_us: None,
         notable_policy_version: NotablePolicy::v1().version(),
         health_policy_version: HEALTH_POLICY_VERSION,
-        filters: source_filter(&[request.source]),
+        filters: String::new(),
         page: None,
     }
 }
 
 fn validate(params: &QueryParams) -> Result<OverviewRequest, ApiProblem> {
-    let source = parse_single_source(params)?;
     let from_us = crate::params::parse_i64(params, QueryParameter::From)?;
     let to_us = crate::params::parse_i64(params, QueryParameter::To)?;
     let Some(range) = CoverageSpan::new(from_us, to_us) else {
@@ -283,7 +274,6 @@ fn validate(params: &QueryParams) -> Result<OverviewRequest, ApiProblem> {
     }
     Ok(OverviewRequest {
         range,
-        source,
         from_us,
         to_us,
     })
@@ -294,27 +284,23 @@ fn render_overview(
     request: OverviewRequest,
 ) -> Result<OverviewResponseDto, ApiProblem> {
     let result = view
-        .query_range(&[request.source], request.range, QUERY_LIMITS)
+        .query_range(request.range, QUERY_LIMITS, QUERY_MATERIALIZED_BYTES)
         .map_err(oracle_problem)?;
 
     let policy = NotablePolicy::v1();
     let observations = result.observations();
     let digest = event_digest(result.counts(), observations)?;
     let notable_preview = notable_preview_dto(&policy, observations, request)?;
-    let meta = timeline_meta(view, request, &[request.source], None)?;
+    let meta = timeline_meta(view, request, None)?;
     let covered_duration_us = result.coverage().covered_duration_in(request.range);
     let (health_summary, _policy_coverage) =
         crate::overview::health::overview_health_summary(observations, request.range);
     let coverage = Value::Array(
-        view.query_factor_coverage(
-            &[request.source],
-            request.range,
-            MAX_FACTOR_COVERAGE_RECORDS,
-        )
-        .map_err(canonical_fact_problem)?
-        .iter()
-        .map(crate::overview::health::factor_coverage_json)
-        .collect(),
+        view.query_factor_coverage(request.range, MAX_FACTOR_COVERAGE_RECORDS)
+            .map_err(canonical_fact_problem)?
+            .iter()
+            .map(crate::overview::health::factor_coverage_json)
+            .collect(),
     );
 
     Ok(OverviewResponseDto {
@@ -328,7 +314,6 @@ fn render_overview(
 }
 
 const HEALTH_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
     QueryParameter::From,
     QueryParameter::To,
     QueryParameter::Step,
@@ -338,7 +323,6 @@ const HEALTH_PARAMS: &[QueryParameter] = &[
 #[derive(Debug, Clone, Copy)]
 struct HealthRequest {
     range: CoverageSpan,
-    source: u64,
     from_us: i64,
     to_us: i64,
     effective_step_us: u64,
@@ -355,7 +339,7 @@ pub(crate) async fn health(State(state): State<AppState>, RawQuery(raw): RawQuer
         Err(problem) => return problem.into_response(),
     };
     let (snapshot, view) = state.overview_request_view();
-    let plan = match select_plan(&state, view, &[request.source], request.range) {
+    let plan = match select_plan(&state, view, request.range) {
         Ok(plan) => plan,
         Err(problem) => return problem.into_response(),
     };
@@ -370,7 +354,6 @@ pub(crate) async fn health(State(state): State<AppState>, RawQuery(raw): RawQuer
 }
 
 fn validate_health(params: &QueryParams) -> Result<HealthRequest, ApiProblem> {
-    let source = parse_single_source(params)?;
     let from_us = crate::params::parse_i64(params, QueryParameter::From)?;
     let to_us = crate::params::parse_i64(params, QueryParameter::To)?;
     let Some(range) = CoverageSpan::new(from_us, to_us) else {
@@ -390,7 +373,6 @@ fn validate_health(params: &QueryParams) -> Result<HealthRequest, ApiProblem> {
         crate::overview::health::effective_step_us(from_us, to_us, requested_step);
     Ok(HealthRequest {
         range,
-        source,
         from_us,
         to_us,
         effective_step_us,
@@ -418,14 +400,14 @@ fn health_key(fact_set_id: [u8; 32], request: HealthRequest) -> ResponseKey {
         step_us: Some(request.effective_step_us),
         notable_policy_version: NotablePolicy::v1().version(),
         health_policy_version: HEALTH_POLICY_VERSION,
-        filters: source_filter(&[request.source]),
+        filters: String::new(),
         page: None,
     }
 }
 
 fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiProblem> {
     let result = view
-        .query_range(&[request.source], request.range, QUERY_LIMITS)
+        .query_range(request.range, QUERY_LIMITS, QUERY_MATERIALIZED_BYTES)
         .map_err(oracle_problem)?;
     let line = crate::overview::health::compute_health(
         result.observations(),
@@ -434,11 +416,7 @@ fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiP
     )
     .ok_or_else(ApiProblem::internal_error)?;
     let coverage = view
-        .query_factor_coverage(
-            &[request.source],
-            request.range,
-            MAX_FACTOR_COVERAGE_RECORDS,
-        )
+        .query_factor_coverage(request.range, MAX_FACTOR_COVERAGE_RECORDS)
         .map_err(canonical_fact_problem)?
         .iter()
         .map(crate::overview::health::factor_coverage_json)
@@ -448,11 +426,9 @@ fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiP
         view,
         OverviewRequest {
             range: request.range,
-            source: request.source,
             from_us: request.from_us,
             to_us: request.to_us,
         },
-        &[request.source],
         Some(request.effective_step_us),
     )?;
     Ok(json!({
@@ -465,7 +441,6 @@ fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiP
 }
 
 const EVENTS_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
     QueryParameter::From,
     QueryParameter::To,
     QueryParameter::Limit,
@@ -482,7 +457,6 @@ const EVENTS_MAX_LIMIT: usize = 1_000;
 #[derive(Debug, Clone)]
 struct EventsRequest {
     range: CoverageSpan,
-    sources: Vec<u64>,
     from_us: i64,
     to_us: i64,
     limit: usize,
@@ -502,21 +476,13 @@ impl EventsRequest {
             || "none".to_owned(),
             |value| format!("some:{}:{value}", value.len()),
         );
-        format!(
-            "{};limit={};min_severity={severity};kind={kind}",
-            source_filter(&self.sources),
-            self.limit
-        )
+        format!("limit={};min_severity={severity};kind={kind}", self.limit)
     }
 }
 
 /// `GET /v1/timeline/events?from=..&to=..&limit=..&cursor=..`.
 pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
-    let params = match QueryParams::parse_with_repeatable(
-        raw.as_deref(),
-        EVENTS_PARAMS,
-        &[QueryParameter::Source],
-    ) {
+    let params = match QueryParams::parse(raw.as_deref(), EVENTS_PARAMS) {
         Ok(params) => params,
         Err(problem) => return problem.into_response(),
     };
@@ -527,25 +493,18 @@ pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuer
     let policy = NotablePolicy::v1();
     let filters = request.filters();
     let query_hash = events_query_hash_bytes(&policy, request.from_us, request.to_us, &filters);
-    let source_set_hash = source_set_hash(&request.sources);
     let now_secs = cursor_now_secs();
     state.cursor_registry().prune(now_secs);
     let (view_source, start_after, fact_set_id) = if let Some(token) = request.cursor.as_deref() {
-        let cursor = match EventsCursor::decode(
-            token,
-            state.cursor_registry(),
-            query_hash,
-            source_set_hash,
-            now_secs,
-        ) {
-            Ok(cursor) => cursor,
-            Err(error) => return cursor_problem(error).into_response(),
-        };
-        let view = match state.cursor_registry().resolve(
-            cursor.lease.fact_set_id,
-            source_set_hash,
-            now_secs,
-        ) {
+        let cursor =
+            match EventsCursor::decode(token, state.cursor_registry(), query_hash, now_secs) {
+                Ok(cursor) => cursor,
+                Err(error) => return cursor_problem(error).into_response(),
+            };
+        let view = match state
+            .cursor_registry()
+            .resolve(cursor.lease.fact_set_id, now_secs)
+        {
             Ok(view) => view,
             Err(error) => return cursor_problem(error).into_response(),
         };
@@ -553,7 +512,7 @@ pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuer
         (TimelineViewSource::Loaded(view), Some(cursor), fact_set_id)
     } else {
         let (snapshot, view) = state.overview_request_view();
-        let plan = match select_plan(&state, view, &request.sources, request.range) {
+        let plan = match select_plan(&state, view, request.range) {
             Ok(plan) => plan,
             Err(problem) => return problem.into_response(),
         };
@@ -567,14 +526,7 @@ pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuer
     let key = events_key(fact_set_id, &request);
     let cursor_state = state.clone();
     serve(state, key, view_source, move |view| {
-        render_events(
-            view,
-            &request,
-            start_after,
-            query_hash,
-            source_set_hash,
-            &cursor_state,
-        )
+        render_events(view, &request, start_after, query_hash, &cursor_state)
     })
     .await
 }
@@ -595,7 +547,6 @@ fn events_key(fact_set_id: [u8; 32], request: &EventsRequest) -> ResponseKey {
 }
 
 fn validate_events(params: &QueryParams) -> Result<EventsRequest, ApiProblem> {
-    let sources = parse_sources(params)?;
     let from_us = crate::params::parse_i64(params, QueryParameter::From)?;
     let to_us = crate::params::parse_i64(params, QueryParameter::To)?;
     let Some(range) = CoverageSpan::new(from_us, to_us) else {
@@ -638,7 +589,6 @@ fn validate_events(params: &QueryParams) -> Result<EventsRequest, ApiProblem> {
     let kind = params.get(QueryParameter::Kind).map(Box::from);
     Ok(EventsRequest {
         range,
-        sources,
         from_us,
         to_us,
         limit,
@@ -677,26 +627,20 @@ fn render_events(
     request: &EventsRequest,
     start_after: Option<EventsCursor>,
     query_hash: [u8; 32],
-    source_set_hash: [u8; 32],
     state: &AppState,
 ) -> Result<EventsResponseDto, ApiProblem> {
     let result = view
-        .query_range(&request.sources, request.range, QUERY_LIMITS)
+        .query_range(request.range, QUERY_LIMITS, QUERY_MATERIALIZED_BYTES)
         .map_err(oracle_problem)?;
 
     let policy = NotablePolicy::v1();
 
-    let source_metadata = view
-        .selected_source_metadata(
-            &request.sources,
-            request.range,
-            QUERY_LIMITS.max_coverage_spans,
-        )
+    let metadata = view
+        .metadata(request.range, QUERY_LIMITS.max_coverage_spans)
         .map_err(|_error| ApiProblem::store_read_failed())?;
     let observations = result.observations();
     let canonical_facts = view
         .query_canonical_facts(
-            &request.sources,
             request.range,
             QUERY_LIMITS.max_observations,
             QUERY_LIMITS.max_observations,
@@ -730,7 +674,6 @@ fn render_events(
             position: fact_position,
             source: PageCandidateSource::Observation(observation),
             class,
-            source_id: observation.source_id(),
         };
         let retained_cap = request.limit.saturating_add(1);
         if notable.len() < retained_cap {
@@ -776,7 +719,6 @@ fn render_events(
             position,
             source: PageCandidateSource::Canonical(fact),
             class,
-            source_id: fact.coverage().source_id,
         };
         let retained_cap = request.limit.saturating_add(1);
         if notable.len() < retained_cap {
@@ -799,13 +741,11 @@ fn render_events(
         .map(|candidate| {
             match candidate.source {
                 PageCandidateSource::Observation(observation) => {
-                    EventFactProjection::project(observation, candidate.class, candidate.source_id)
+                    EventFactProjection::project(observation, candidate.class)
                 }
-                PageCandidateSource::Canonical(fact) => EventFactProjection::project_canonical(
-                    fact,
-                    candidate.class,
-                    candidate.source_id,
-                ),
+                PageCandidateSource::Canonical(fact) => {
+                    EventFactProjection::project_canonical(fact, candidate.class)
+                }
             }
             .ok_or_else(ApiProblem::store_read_failed)
         })
@@ -816,17 +756,14 @@ fn render_events(
         .map(|candidate| -> Result<String, CursorError> {
             let lease = start_after.map_or_else(
                 || {
-                    state.cursor_registry().pin(
-                        Arc::clone(view),
-                        source_set_hash,
-                        cursor_now_secs(),
-                    )
+                    state
+                        .cursor_registry()
+                        .pin(Arc::clone(view), cursor_now_secs())
                 },
                 |cursor| Ok(cursor.lease),
             )?;
             Ok(EventsCursor {
                 lease,
-                source_set_hash,
                 query_hash,
                 last_ts_us: candidate.position.sort_ts_us,
                 last_event_id: candidate.position.event_id,
@@ -837,11 +774,11 @@ fn render_events(
         .transpose()
         .map_err(cursor_problem)?;
 
-    let exactness = aggregate_retained_exactness(&source_metadata);
-    let completeness = aggregate_source_completeness(&source_metadata);
-    let physical_count = aggregate_physical_count(&source_metadata);
+    let exactness = metadata.retained_exactness;
+    let completeness = metadata.source_completeness;
+    let physical_count = metadata.physical_count;
     let coverage = view
-        .query_factor_coverage(&request.sources, request.range, MAX_FACTOR_COVERAGE_RECORDS)
+        .query_factor_coverage(request.range, MAX_FACTOR_COVERAGE_RECORDS)
         .map_err(canonical_fact_problem)?
         .iter()
         .map(crate::overview::health::factor_coverage_json)
@@ -850,13 +787,11 @@ fn render_events(
         view,
         OverviewRequest {
             range: request.range,
-            source: request.sources[0],
             from_us: request.from_us,
             to_us: request.to_us,
         },
-        &request.sources,
         None,
-        &source_metadata,
+        &metadata,
     );
     Ok(EventsResponseDto {
         meta,
@@ -865,7 +800,7 @@ fn render_events(
         next_cursor,
         omitted_by_response_filter,
         retained_exactness: retained_exactness_name(exactness),
-        source_completeness: source_completeness_name(completeness),
+        completeness: source_completeness_name(completeness),
         physical_count_semantics: physical_count_name(physical_count),
         coverage,
     })
@@ -875,7 +810,6 @@ struct PageCandidate<'a> {
     position: EventFactPosition,
     source: PageCandidateSource<'a>,
     class: NotableClass,
-    source_id: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -983,67 +917,47 @@ fn canonical_fact_problem(error: CanonicalFactQueryError) -> ApiProblem {
 fn timeline_meta(
     view: &IndexView,
     request: OverviewRequest,
-    sources: &[u64],
     effective_step_us: Option<u64>,
 ) -> Result<TimelineMetaDto, ApiProblem> {
-    let source_metadata = view
-        .selected_source_metadata(sources, request.range, QUERY_LIMITS.max_coverage_spans)
+    let metadata = view
+        .metadata(request.range, QUERY_LIMITS.max_coverage_spans)
         .map_err(|_error| ApiProblem::store_read_failed())?;
     Ok(timeline_meta_with_metadata(
         view,
         request,
-        sources,
         effective_step_us,
-        &source_metadata,
+        &metadata,
     ))
 }
 
 fn timeline_meta_with_metadata(
     view: &IndexView,
     request: OverviewRequest,
-    sources: &[u64],
     effective_step_us: Option<u64>,
-    source_metadata: &[SourceMetadata],
+    metadata: &TimelineMetadata,
 ) -> TimelineMetaDto {
-    let view_status = view.source_status();
-    let all_available = source_metadata
-        .iter()
-        .all(|source| source.data_through_us.is_some());
-    let source_status = if matches!(view_status, SourceStatus::Gap) || all_available {
+    let view_status = view.status();
+    let status = if matches!(view_status, TimelineStatus::Gap) || metadata.data_through_us.is_some()
+    {
         view_status.wire_code()
     } else {
         "unavailable"
     };
-    let source_freshness = source_metadata
-        .iter()
-        .map(|source| SourceFreshnessDto {
-            source_id: source.source_id,
-            data_through_us: source.data_through_us,
-            source_status: if !source.known_gaps.is_empty() || source.data_through_us.is_some() {
-                view_status.wire_code()
-            } else {
-                "unavailable"
-            },
-            source_completeness: source_completeness_name(source.source_completeness),
-            retained_exactness: retained_exactness_name(source.retained_exactness),
-            physical_count_semantics: physical_count_name(source.physical_count),
-        })
-        .collect();
-    let loss = source_metadata
-        .iter()
-        .map(|source| SourceLossDto {
-            source_id: source.source_id,
-            known_gaps: coverage_dtos(&source.known_gaps),
-            dropped_count_lower_bound: source.dropped_lower_bound,
-        })
-        .collect();
-    let available_sources = view
-        .source_ids()
-        .iter()
-        .copied()
-        .filter(|source| sources.binary_search(source).is_ok())
-        .collect();
-    let data_through_us = view.data_through_us_for(sources);
+    let freshness = FreshnessDto {
+        data_through_us: metadata.data_through_us,
+        status: if !metadata.known_gaps.is_empty() || metadata.data_through_us.is_some() {
+            view_status.wire_code()
+        } else {
+            "unavailable"
+        },
+        completeness: source_completeness_name(metadata.source_completeness),
+        retained_exactness: retained_exactness_name(metadata.retained_exactness),
+        physical_count_semantics: physical_count_name(metadata.physical_count),
+    };
+    let loss = LossDto {
+        known_gaps: coverage_dtos(&metadata.known_gaps),
+        dropped_count_lower_bound: metadata.dropped_lower_bound,
+    };
     TimelineMetaDto {
         response_schema_version: RESPONSE_SCHEMA_VERSION,
         view_generation: view.view_generation(),
@@ -1057,18 +971,14 @@ fn timeline_meta_with_metadata(
             to_us: request.to_us,
         },
         effective_step_us,
-        sources: sources.to_vec(),
-        available_sources,
-        data_through_us,
+        data_through_us: metadata.data_through_us,
         store_data_through_us: view.data_through_us(),
-        tail_pending: view
-            .live_tail_pending_for(sources)
-            .map(|pending| TailPendingDto {
-                from_offset_bytes: pending.start,
-                to_offset_bytes: pending.end,
-            }),
-        source_status,
-        source_freshness,
+        tail_pending: view.live_tail_pending().map(|pending| TailPendingDto {
+            from_offset_bytes: pending.start,
+            to_offset_bytes: pending.end,
+        }),
+        status,
+        freshness,
         loss,
     }
 }
@@ -1082,64 +992,6 @@ fn coverage_dtos(coverage: &kronika_analytics::overview::Coverage) -> Vec<Covera
             to_us: span.end_us(),
         })
         .collect()
-}
-
-fn aggregate_source_completeness(sources: &[SourceMetadata]) -> SourceCompleteness {
-    sources
-        .iter()
-        .fold(SourceCompleteness::Full, |total, source| {
-            match (total, source.source_completeness) {
-                (SourceCompleteness::Unknown, _) | (_, SourceCompleteness::Unknown) => {
-                    SourceCompleteness::Unknown
-                }
-                (SourceCompleteness::BoundedSubset, _) | (_, SourceCompleteness::BoundedSubset) => {
-                    SourceCompleteness::BoundedSubset
-                }
-                (SourceCompleteness::Full, SourceCompleteness::Full) => SourceCompleteness::Full,
-            }
-        })
-}
-
-fn aggregate_retained_exactness(sources: &[SourceMetadata]) -> RetainedExactness {
-    sources
-        .iter()
-        .fold(RetainedExactness::Exact, |total, source| {
-            match (total, source.retained_exactness) {
-                (RetainedExactness::Unknown, _) | (_, RetainedExactness::Unknown) => {
-                    RetainedExactness::Unknown
-                }
-                (RetainedExactness::LowerBound, _) | (_, RetainedExactness::LowerBound) => {
-                    RetainedExactness::LowerBound
-                }
-                (RetainedExactness::Exact, RetainedExactness::Exact) => RetainedExactness::Exact,
-            }
-        })
-}
-
-fn aggregate_physical_count(sources: &[SourceMetadata]) -> PhysicalCountSemantics {
-    let mut sources = sources.iter();
-    let Some(first) = sources.next() else {
-        return PhysicalCountSemantics::NotApplicable;
-    };
-    sources.fold(first.physical_count, |total, source| {
-        match (total, source.physical_count) {
-            (PhysicalCountSemantics::Unknown, _)
-            | (_, PhysicalCountSemantics::Unknown)
-            | (PhysicalCountSemantics::Exact, PhysicalCountSemantics::NotApplicable)
-            | (PhysicalCountSemantics::NotApplicable, PhysicalCountSemantics::Exact) => {
-                PhysicalCountSemantics::Unknown
-            }
-            (PhysicalCountSemantics::LowerBound, _) | (_, PhysicalCountSemantics::LowerBound) => {
-                PhysicalCountSemantics::LowerBound
-            }
-            (PhysicalCountSemantics::Exact, PhysicalCountSemantics::Exact) => {
-                PhysicalCountSemantics::Exact
-            }
-            (PhysicalCountSemantics::NotApplicable, PhysicalCountSemantics::NotApplicable) => {
-                PhysicalCountSemantics::NotApplicable
-            }
-        }
-    })
 }
 
 const fn source_completeness_name(completeness: SourceCompleteness) -> &'static str {
@@ -1373,7 +1225,6 @@ fn notable_preview_dto(
                 .ok_or_else(ApiProblem::store_read_failed)?,
             source: PageCandidateSource::Observation(observation),
             class,
-            source_id: request.source,
         };
         if selected.len() < policy.response_cap() {
             selected.push(candidate);
@@ -1394,7 +1245,7 @@ fn notable_preview_dto(
             let PageCandidateSource::Observation(observation) = candidate.source else {
                 return Err(ApiProblem::store_read_failed());
             };
-            EventFactProjection::project(observation, candidate.class, candidate.source_id)
+            EventFactProjection::project(observation, candidate.class)
                 .ok_or_else(ApiProblem::store_read_failed)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1424,20 +1275,6 @@ fn events_query_hash_bytes(
     hasher.finalize().into()
 }
 
-fn source_set_hash(sources: &[u64]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"pgk-overview-source-set-v1");
-    hasher.update(
-        u64::try_from(sources.len())
-            .expect("query parameter bound fits u64")
-            .to_le_bytes(),
-    );
-    for source in sources {
-        hasher.update(source.to_le_bytes());
-    }
-    hasher.finalize().into()
-}
-
 fn cursor_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1447,8 +1284,8 @@ fn cursor_now_secs() -> u64 {
 
 /// The filter string a default `/events` request produces, so the overview
 /// preview's `events_query_hash` matches an unfiltered first page.
-fn default_events_filters(source: u64) -> String {
-    format!("source={source};limit={EVENTS_DEFAULT_LIMIT};min_severity=none;kind=none")
+fn default_events_filters() -> String {
+    format!("limit={EVENTS_DEFAULT_LIMIT};min_severity=none;kind=none")
 }
 
 fn events_query_hash(policy: &NotablePolicy, request: OverviewRequest) -> String {
@@ -1456,81 +1293,21 @@ fn events_query_hash(policy: &NotablePolicy, request: OverviewRequest) -> String
         policy,
         request.from_us,
         request.to_us,
-        &default_events_filters(request.source),
+        &default_events_filters(),
     );
     URL_SAFE_NO_PAD.encode(hash)
-}
-
-impl IndexView {
-    /// Queries the range through the merged oracle.
-    fn query_range(
-        &self,
-        sources: &[u64],
-        range: CoverageSpan,
-        limits: OracleLimits,
-    ) -> Result<kronika_analytics::overview::OracleResult, OracleError> {
-        self.query_sources(sources, range, limits, QUERY_MATERIALIZED_BYTES)
-    }
-}
-
-fn parse_single_source(params: &QueryParams) -> Result<u64, ApiProblem> {
-    let sources = parse_sources(params)?;
-    if sources.len() != 1 {
-        return Err(ApiProblem::invalid_query_parameter(
-            QueryParameter::Source,
-            crate::problem::ExpectedValue::Uint64,
-        ));
-    }
-    Ok(sources[0])
-}
-
-fn parse_sources(params: &QueryParams) -> Result<Vec<u64>, ApiProblem> {
-    let values = params.values(QueryParameter::Source);
-    if values.is_empty() {
-        return Err(ApiProblem::missing_query_parameter(QueryParameter::Source));
-    }
-    let mut sources = values
-        .iter()
-        .map(|value| {
-            value.parse::<u64>().map_err(|_error| {
-                ApiProblem::invalid_query_parameter(
-                    QueryParameter::Source,
-                    crate::problem::ExpectedValue::Uint64,
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    sources.sort_unstable();
-    sources.dedup();
-    Ok(sources)
-}
-
-fn source_filter(sources: &[u64]) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::from("source=");
-    for (index, source) in sources.iter().enumerate() {
-        if index != 0 {
-            out.push(',');
-        }
-        let _ = write!(out, "{source}");
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         DIGEST_TOP_N, EVENTS_DEFAULT_LIMIT, EventsRequest, QUERY_MATERIALIZED_BYTES,
-        aggregate_physical_count, default_events_filters, joint_top_n, oracle_problem,
-        sqlstate_top_n,
+        default_events_filters, joint_top_n, oracle_problem, sqlstate_top_n,
     };
-    use crate::overview::view::SourceMetadata;
     use crate::problem::ProblemCode;
     use kronika_analytics::overview::{
-        CountLimits, Coverage, CoverageSpan, ErrorCategory, EventCounts, JointErrorKey,
-        LifecycleCounts, OracleError, OracleResource, PhysicalCountSemantics, RetainedExactness,
-        Severity, SourceCompleteness, SqlState,
+        CountLimits, CoverageSpan, ErrorCategory, EventCounts, JointErrorKey, LifecycleCounts,
+        OracleError, OracleResource, Severity, SqlState,
     };
 
     const LIMITS: CountLimits = CountLimits {
@@ -1546,7 +1323,6 @@ mod tests {
         // or a first-page cursor would not validate against the preview hint.
         let request = EventsRequest {
             range: CoverageSpan::new(0, 1).expect("valid range"),
-            sources: vec![7],
             from_us: 0,
             to_us: 1,
             limit: EVENTS_DEFAULT_LIMIT,
@@ -1554,14 +1330,13 @@ mod tests {
             min_severity: None,
             kind: None,
         };
-        assert_eq!(request.filters(), default_events_filters(7));
+        assert_eq!(request.filters(), default_events_filters());
     }
 
     #[test]
     fn an_absent_kind_cannot_alias_a_literal_asterisk_filter() {
         let base = EventsRequest {
             range: CoverageSpan::new(0, 1).expect("valid range"),
-            sources: vec![7],
             from_us: 0,
             to_us: 1,
             limit: EVENTS_DEFAULT_LIMIT,
@@ -1574,37 +1349,6 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base.filters(), literal.filters());
-    }
-
-    fn source_with_physical_count(physical_count: PhysicalCountSemantics) -> SourceMetadata {
-        SourceMetadata {
-            source_id: 7,
-            data_through_us: None,
-            covered: Coverage::empty(),
-            known_gaps: Coverage::empty(),
-            source_completeness: SourceCompleteness::Unknown,
-            retained_exactness: RetainedExactness::Unknown,
-            physical_count,
-            dropped_lower_bound: None,
-        }
-    }
-
-    #[test]
-    fn physical_count_reduction_has_no_sentinel_alias() {
-        let exact = source_with_physical_count(PhysicalCountSemantics::Exact);
-        let not_applicable = source_with_physical_count(PhysicalCountSemantics::NotApplicable);
-        assert_eq!(
-            aggregate_physical_count(std::slice::from_ref(&exact)),
-            PhysicalCountSemantics::Exact
-        );
-        assert_eq!(
-            aggregate_physical_count(std::slice::from_ref(&not_applicable)),
-            PhysicalCountSemantics::NotApplicable
-        );
-        assert_eq!(
-            aggregate_physical_count(&[exact, not_applicable]),
-            PhysicalCountSemantics::Unknown
-        );
     }
 
     #[test]

@@ -89,7 +89,7 @@ impl OverviewFactLoader {
             })
             .collect::<Vec<_>>();
         let mut loaded = vec![None; entries.len()];
-        let mut source_gaps = plan.source_gaps().to_vec();
+        let mut omitted_ranges = plan.omitted_ranges().to_vec();
         let mut workers = JoinSet::new();
         let mut next = 0;
 
@@ -110,8 +110,8 @@ impl OverviewFactLoader {
             match result {
                 Ok(entry) => loaded[index] = Some(entry),
                 Err(FactLoadFailure::Source(error)) => {
-                    record_source_failure(error);
-                    source_gaps.push(plan.gap_for(entries[index].0.descriptor()));
+                    record_input_failure(error);
+                    omitted_ranges.push(plan.gap_for(entries[index].0.descriptor()));
                     metrics::counter!(
                         "overview_source_read_failures_total",
                         "outcome" => "partial"
@@ -134,15 +134,15 @@ impl OverviewFactLoader {
         }
 
         let loaded = loaded.into_iter().flatten().collect();
-        source_gaps.sort_unstable();
-        source_gaps.dedup();
-        let fact_set_id = plan.fact_set_id_with_gaps(&source_gaps);
+        omitted_ranges.sort_unstable();
+        omitted_ranges.dedup();
+        let fact_set_id = plan.fact_set_id_with_gaps(&omitted_ranges);
         Ok(Arc::new(IndexView::from_selected(
             plan.view(),
             loaded,
-            source_gaps,
+            omitted_ranges,
             fact_set_id,
-            plan.source_descriptors().to_vec(),
+            plan.freshness(),
             plan.store_data_through_us(),
         )))
     }
@@ -515,7 +515,6 @@ fn record_load(load: &FactLoad) {
 }
 
 fn record_fact_quality(facts: &SegmentFacts) {
-    let source = facts.identity().pgm_source_id.to_string();
     for observation in facts.observations() {
         metrics::counter!(
             "overview_retained_observations_total",
@@ -529,7 +528,6 @@ fn record_fact_quality(facts: &SegmentFacts) {
         for reason in &coverage.loss_reasons {
             metrics::counter!(
                 "overview_coverage_loss_total",
-                "source" => source.clone(),
                 "factor" => factor,
                 "reason" => super::dto::loss_reason_name(*reason)
             )
@@ -538,7 +536,7 @@ fn record_fact_quality(facts: &SegmentFacts) {
     }
 }
 
-fn record_source_failure(error: SealedFactError) {
+fn record_input_failure(error: SealedFactError) {
     let reason = match error {
         SealedFactError::UnitOutOfRange { .. } => "unit_out_of_range",
         SealedFactError::LiveUnit { .. } => "live_unit",
@@ -557,7 +555,7 @@ fn record_source_failure(error: SealedFactError) {
         SealedFactError::Build(BuildError::Overflow) => "arithmetic_overflow",
         SealedFactError::Build(BuildError::Internal) => "internal",
     };
-    metrics::counter!("overview_source_failures_total", "reason" => reason).increment(1);
+    metrics::counter!("overview_input_failures_total", "reason" => reason).increment(1);
     match error {
         SealedFactError::Build(BuildError::LimitExceeded) => {
             metrics::counter!("overview_overflow_total", "kind" => "fact_limit").increment(1);

@@ -44,27 +44,21 @@ struct ResolvedView {
 pub(crate) fn view_summary(
     snapshot: &LocalDirSnapshot,
     live: &LiveView,
-    source: u64,
     at_us: i64,
-) -> Result<Option<ViewSummaryResponse>, WebIndexReadError> {
-    let mut descriptors = snapshot
-        .sealed_descriptors()
-        .filter(|descriptor| descriptor.source_id == source)
-        .collect::<Vec<_>>();
-    let live_source = live.source_id() == Some(source);
-    if descriptors.is_empty() && !live_source {
-        return Ok(None);
-    }
+) -> Result<ViewSummaryResponse, WebIndexReadError> {
+    let mut descriptors = snapshot.sealed_descriptors().collect::<Vec<_>>();
     descriptors
         .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
 
     let mut resolved = vec![None; web_views().len()];
     let mut active_tail = false;
-    if live_source && live.state() == LiveState::Current {
-        for facts in live.chunks().iter().rev().filter(|facts| {
-            let identity = facts.identity();
-            identity.pgm_source_id == source && identity.source_min_ts_us <= at_us
-        }) {
+    if live.state() == LiveState::Current {
+        for facts in live
+            .chunks()
+            .iter()
+            .rev()
+            .filter(|facts| facts.identity().source_min_ts_us <= at_us)
+        {
             active_tail = true;
             resolve_summary(facts.ui_summary(), at_us, &mut resolved);
             if resolved.iter().all(Option::is_some) {
@@ -118,9 +112,9 @@ pub(crate) fn view_summary(
         || !gated.is_empty()
         || !unavailable_revision.is_empty()
         || !resource_limited.is_empty()
-        || (live_source && !matches!(live.state(), LiveState::Empty | LiveState::Current));
+        || !matches!(live.state(), LiveState::Empty | LiveState::Current);
 
-    Ok(Some(ViewSummaryResponse {
+    Ok(ViewSummaryResponse {
         at_us: at_us.to_string(),
         views,
         quality: SummaryQuality {
@@ -132,7 +126,7 @@ pub(crate) fn view_summary(
             resource_limited,
             active_tail,
         },
-    }))
+    })
 }
 
 fn resolve_summary(summary: &UiSummaryBlock, at_us: i64, resolved: &mut [Option<ResolvedView>]) {

@@ -142,8 +142,8 @@ fn selected_segment_policy_exports_one_static_rejection_series_and_its_effective
         .build()
         .expect("current-thread runtime");
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
-    write_bgwriter_segment(dir.path(), "two.pgm", 7, 0, 1);
+    write_bgwriter_segment(dir.path(), "one.pgm", 0, 1);
+    write_bgwriter_segment(dir.path(), "two.pgm", 0, 1);
 
     metrics::with_local_recorder(&recorder, || {
         runtime.block_on(async {
@@ -161,7 +161,7 @@ fn selected_segment_policy_exports_one_static_rejection_series_and_its_effective
             let response = app(state, None, handle.clone())
                 .oneshot(
                     Request::builder()
-                        .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                        .uri("/v1/timeline/overview?from=0&to=2")
                         .body(Body::empty())
                         .expect("request"),
                 )

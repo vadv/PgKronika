@@ -7,7 +7,7 @@ use kronika_registry::{Section, Ts};
 
 use super::{AppState, assert_problem, serve, serve_state};
 
-fn event_segment_bytes(source: u64) -> Vec<u8> {
+fn event_segment_bytes() -> Vec<u8> {
     let body = PgLogLifecycleV1::encode(&[
         PgLogLifecycleV1 {
             ts: Ts(1_500),
@@ -40,13 +40,12 @@ fn event_segment_bytes(source: u64) -> Vec<u8> {
         PartMeta {
             min_ts: 1_500,
             max_ts: 1_600,
-            source_id: source,
         },
     )
 }
 
-fn write_event_segment(directory: &std::path::Path, source: u64) {
-    crate::test_layout::write_named_pgm(directory, "events.pgm", &event_segment_bytes(source));
+fn write_event_segment(directory: &std::path::Path) {
+    crate::test_layout::write_named_pgm(directory, "events.pgm", &event_segment_bytes());
 }
 
 fn publish_web_index(directory: &std::path::Path) {
@@ -62,10 +61,10 @@ fn publish_web_index(directory: &std::path::Path) {
 #[tokio::test]
 async fn ui_summary_returns_exact_event_population_and_all_views() {
     let directory = tempfile::tempdir().expect("tempdir");
-    write_event_segment(directory.path(), 7);
+    write_event_segment(directory.path());
     publish_web_index(directory.path());
 
-    let (status, body) = serve(directory.path(), "/v1/views/summary?source=7&at=1500").await;
+    let (status, body) = serve(directory.path(), "/v1/views/summary?at=1500").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["at_us"], "1500");
@@ -85,25 +84,21 @@ async fn ui_summary_returns_exact_event_population_and_all_views() {
 }
 
 #[tokio::test]
-async fn ui_summary_rejects_unknown_source_and_parameters() {
+async fn ui_summary_rejects_removed_and_unknown_parameters() {
     let directory = tempfile::tempdir().expect("tempdir");
-    write_event_segment(directory.path(), 7);
+    write_event_segment(directory.path());
     publish_web_index(directory.path());
 
     let (status, body) = serve(directory.path(), "/v1/views/summary?source=8&at=1500").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_problem(
         &body,
         status,
-        "unknown_source",
-        serde_json::json!({ "source": 8 }),
+        "unknown_query_parameter",
+        serde_json::json!({ "parameter": "source" }),
     );
 
-    let (status, body) = serve(
-        directory.path(),
-        "/v1/views/summary?source=7&at=1500&extra=1",
-    )
-    .await;
+    let (status, body) = serve(directory.path(), "/v1/views/summary?at=1500&extra=1").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_problem(
         &body,
@@ -116,12 +111,12 @@ async fn ui_summary_rejects_unknown_source_and_parameters() {
 #[tokio::test]
 async fn ui_heatmap_merges_the_selected_view_from_ovf() {
     let directory = tempfile::tempdir().expect("tempdir");
-    write_event_segment(directory.path(), 7);
+    write_event_segment(directory.path());
     publish_web_index(directory.path());
 
     let (status, body) = serve(
         directory.path(),
-        "/v1/timeline/heatmap?source=7&view=events&metric=count&from=1500&to=1601&buckets=2&top=8",
+        "/v1/timeline/heatmap?view=events&metric=count&from=1500&to=1601&buckets=2&top=8",
     )
     .await;
 
@@ -142,12 +137,12 @@ async fn ui_heatmap_merges_the_selected_view_from_ovf() {
 #[tokio::test]
 async fn ui_heatmap_enforces_range_and_projection_contracts() {
     let directory = tempfile::tempdir().expect("tempdir");
-    write_event_segment(directory.path(), 7);
+    write_event_segment(directory.path());
     publish_web_index(directory.path());
 
     let (status, body) = serve(
         directory.path(),
-        "/v1/timeline/heatmap?source=7&view=missing&metric=count&from=0&to=1",
+        "/v1/timeline/heatmap?view=missing&metric=count&from=0&to=1",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -160,7 +155,7 @@ async fn ui_heatmap_enforces_range_and_projection_contracts() {
 
     let (status, body) = serve(
         directory.path(),
-        "/v1/timeline/heatmap?source=7&view=events&metric=count&from=0&to=86400000001",
+        "/v1/timeline/heatmap?view=events&metric=count&from=0&to=86400000001",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -177,7 +172,7 @@ async fn ui_heatmap_enforces_range_and_projection_contracts() {
 
     let (status, body) = serve(
         directory.path(),
-        "/v1/timeline/heatmap?source=7&view=events&metric=count&from=60000000&to=120000000",
+        "/v1/timeline/heatmap?view=events&metric=count&from=60000000&to=120000000",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -192,7 +187,7 @@ async fn ui_heatmap_enforces_range_and_projection_contracts() {
 #[tokio::test]
 async fn ui_summary_and_heatmap_include_the_current_active_tail() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let part = event_segment_bytes(7);
+    let part = event_segment_bytes();
     crate::test_layout::write_journal(
         directory.path(),
         SegmentId::new(1_700_000_000_000_000).expect("segment id"),
@@ -201,7 +196,7 @@ async fn ui_summary_and_heatmap_include_the_current_active_tail() {
     let snapshot = LocalDirSnapshot::open(directory.path()).expect("open snapshot");
     let state = AppState::new(snapshot).expect("state");
 
-    let (status, summary) = serve_state(state.clone(), "/v1/views/summary?source=7&at=1600").await;
+    let (status, summary) = serve_state(state.clone(), "/v1/views/summary?at=1600").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(summary["quality"]["active_tail"], true);
     let events = summary["views"]
@@ -215,7 +210,7 @@ async fn ui_summary_and_heatmap_include_the_current_active_tail() {
 
     let (status, heatmap) = serve_state(
         state,
-        "/v1/timeline/heatmap?source=7&view=events&metric=count&from=0&to=60000000&buckets=2&top=8",
+        "/v1/timeline/heatmap?view=events&metric=count&from=0&to=60000000&buckets=2&top=8",
     )
     .await;
     assert_eq!(status, StatusCode::OK);

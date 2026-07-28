@@ -292,7 +292,7 @@ impl PlanContext {
                 Some(reason),
             ) = (
                 timestamp(row, "ts"),
-                unsigned(row, "source_type_id").and_then(|value| u32::try_from(value).ok()),
+                unsigned(row, "section_type_id").and_then(|value| u32::try_from(value).ok()),
                 unsigned(row, "total"),
                 boolean(row, "unknown_total"),
                 unsigned(row, "collected"),
@@ -517,7 +517,7 @@ fn gaps(page: &SectionPage) -> Vec<(i64, i64)> {
 
 fn snapshot_coverage_row(row: &OutRow) -> Option<(i64, u32, SnapshotCoverage)> {
     let ts = timestamp(row, "ts")?;
-    let type_id = u32::try_from(unsigned(row, "source_type_id")?).ok()?;
+    let type_id = u32::try_from(unsigned(row, "section_type_id")?).ok()?;
     let read_state = u8::try_from(unsigned(row, "read_state")?).ok()?;
     let visibility = u8::try_from(unsigned(row, "visibility")?).ok()?;
     Some((
@@ -2564,7 +2564,7 @@ mod tests {
         vec![
             ("ts".to_owned(), Value::Ts(ts)),
             (
-                "source_type_id".to_owned(),
+                "section_type_id".to_owned(),
                 Value::U64(u64::from(OSSC_TYPE_ID)),
             ),
             ("total".to_owned(), Value::U64(total)),
@@ -2581,7 +2581,6 @@ mod tests {
     fn top_n_provenance_is_exact_timestamp_and_conflict_safe() {
         let page = SectionPage {
             section: "collection_coverage".to_owned(),
-            source_id: 7,
             rows: vec![
                 collection_row(10, 100),
                 collection_row(20, 100),
@@ -2610,7 +2609,6 @@ mod tests {
             .1 = Value::U64(49);
         let page = SectionPage {
             section: "collection_coverage".to_owned(),
-            source_id: 7,
             rows: vec![short],
             gaps: Vec::new(),
             next_cursor: None,
@@ -2836,7 +2834,6 @@ mod tests {
     fn empty_plan_page() -> SectionPage {
         SectionPage {
             section: "pg_store_plans_ossc".to_owned(),
-            source_id: 7,
             rows: Vec::new(),
             gaps: Vec::new(),
             next_cursor: None,
@@ -2921,7 +2918,6 @@ mod tests {
         };
         let page = SectionPage {
             section: "reset_metadata".to_owned(),
-            source_id: 7,
             rows: vec![reset_row("auto"), reset_row("off")],
             gaps: Vec::new(),
             next_cursor: None,

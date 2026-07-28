@@ -54,7 +54,6 @@ use tracing_subscriber as _;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const SOURCE: u64 = 7;
 const SECOND: i64 = 1_000_000;
 /// Snapshot cadence: one collection every 10 s for two hours.
 const STEP: i64 = 10 * SECOND;
@@ -220,7 +219,7 @@ fn build_fixture(dir: &Path) {
             }
             plan_coverage.push(SnapshotCoverageV1 {
                 ts: Ts(ts),
-                source_type_id: 1_003_001,
+                section_type_id: 1_003_001,
                 collector_pid: 42,
                 collector_started_at: Ts(0),
                 read_state: 0,
@@ -367,7 +366,6 @@ fn build_fixture(dir: &Path) {
             PartMeta {
                 min_ts,
                 max_ts: (first_tick + SNAPSHOTS_PER_SEGMENT) * STEP,
-                source_id: SOURCE,
             },
         );
         let address = SegmentAddress::new(
@@ -398,8 +396,8 @@ fn bench_anomalies_endpoint(c: &mut Criterion) {
     // The default knobs (1h window, w/4 step) give ~5 positions over the
     // two-hour period — the typical UI request the budget is set for. The
     // 5m/75s variant slides 92 positions and is the stress case.
-    let default_knobs = format!("/v1/anomalies?source={SOURCE}&from=0&to={to}");
-    let stress = format!("/v1/anomalies?source={SOURCE}&from=0&to={to}&window=5m");
+    let default_knobs = format!("/v1/anomalies?from=0&to={to}");
+    let stress = format!("/v1/anomalies?from=0&to={to}&window=5m");
     let one = format!("{stress}&section=pg_stat_statements");
     let plan = format!("{default_knobs}&section=pg_store_plans_ossc");
     let plan_preflight = format!("{stress}&section=pg_store_plans_ossc");

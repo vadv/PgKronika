@@ -747,7 +747,7 @@ fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
         "event_id",
         "event_instance_id",
         "source_id",
-        "source_type_id",
+        "section_type_id",
         "identity_quality",
         "sort_ts_us",
         "occurred_at_us",
@@ -775,7 +775,7 @@ fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
         .as_str()
         .context("EventFact.event_instance_id is not a string")?;
     anyhow::ensure!(fact["source_id"] == source);
-    anyhow::ensure!(fact["source_type_id"].is_u64());
+    anyhow::ensure!(fact["section_type_id"].is_u64());
     anyhow::ensure!(fact["identity_quality"] == "content_derived");
     anyhow::ensure!(fact["sort_ts_us"].is_i64());
     anyhow::ensure!(fact["occurred_at_us"].is_i64() || fact["occurred_at_us"].is_null());

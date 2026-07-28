@@ -285,7 +285,6 @@ impl MergeState {
 
 #[derive(Clone, Copy)]
 pub(crate) struct HeatmapRequest {
-    pub(crate) source: u64,
     pub(crate) view: &'static WebView,
     pub(crate) metric: &'static WebMetric,
     pub(crate) from_us: i64,
@@ -302,9 +301,8 @@ pub(crate) fn heatmap(
     snapshot: &LocalDirSnapshot,
     live: &LiveView,
     request: HeatmapRequest,
-) -> Result<Option<HeatmapResponse>, HeatmapError> {
+) -> Result<HeatmapResponse, HeatmapError> {
     let HeatmapRequest {
-        source,
         view,
         metric,
         from_us,
@@ -312,29 +310,16 @@ pub(crate) fn heatmap(
         bucket_count,
         top,
     } = request;
-    let sealed_source_found = snapshot
-        .sealed_descriptors()
-        .any(|descriptor| descriptor.source_id == source);
-    let live_source = live.source_id() == Some(source);
-    if !sealed_source_found && !live_source {
-        return Ok(None);
-    }
     let mut descriptors = snapshot
         .sealed_descriptors()
-        .filter(|descriptor| {
-            descriptor.source_id == source
-                && descriptor.max_ts >= from_us
-                && descriptor.min_ts < to_us
-        })
+        .filter(|descriptor| descriptor.max_ts >= from_us && descriptor.min_ts < to_us)
         .collect::<Vec<_>>();
-    let live_chunks = if live_source && live.state() == LiveState::Current {
+    let live_chunks = if live.state() == LiveState::Current {
         live.chunks()
             .iter()
             .filter(|facts| {
                 let identity = facts.identity();
-                identity.pgm_source_id == source
-                    && identity.source_max_ts_us >= from_us
-                    && identity.source_min_ts_us < to_us
+                identity.source_max_ts_us >= from_us && identity.source_min_ts_us < to_us
             })
             .collect::<Vec<_>>()
     } else {
@@ -388,10 +373,9 @@ pub(crate) fn heatmap(
         )?;
     }
     let active_tail = !coverage_spans.is_empty()
-        && live_source
         && live.state() == LiveState::Current
         && coverage_spans.len() > descriptors.len();
-    if live_source && !matches!(live.state(), LiveState::Empty | LiveState::Current) {
+    if !matches!(live.state(), LiveState::Empty | LiveState::Current) {
         merged.mark_unbounded("active_tail".to_owned());
     }
 
@@ -440,7 +424,7 @@ pub(crate) fn heatmap(
         || !merged.resource_limited.is_empty()
         || !merged.unbounded_segments.is_empty();
 
-    Ok(Some(HeatmapResponse {
+    Ok(HeatmapResponse {
         grid: HeatmapGrid {
             from_us: from_us.to_string(),
             to_us: to_us.to_string(),
@@ -461,7 +445,7 @@ pub(crate) fn heatmap(
             unbounded_segments: merged.unbounded_segments,
             active_tail,
         },
-    }))
+    })
 }
 
 fn merge_values(

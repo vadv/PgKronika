@@ -8,23 +8,10 @@ fn write_archiver_with_node(
     min_ts: i64,
     max_ts: i64,
 ) {
-    write_archiver_with_source_and_node(dir, file, 7, node_self_id, rows, min_ts, max_ts);
-}
-
-fn write_archiver_with_source_and_node(
-    dir: &std::path::Path,
-    file: &str,
-    source_id: u64,
-    node_self_id: &str,
-    rows: &[PgStatArchiver],
-    min_ts: i64,
-    max_ts: i64,
-) {
     let archiver = PgStatArchiver::encode(rows).expect("encode archiver");
-    write_section_with_source_and_node(
+    write_section_with_node(
         dir,
         file,
-        source_id,
         node_self_id,
         1_008_001,
         u32::try_from(rows.len()).expect("fixture row count"),
@@ -41,34 +28,6 @@ fn write_archiver_with_source_and_node(
 fn write_section_with_node(
     dir: &std::path::Path,
     file: &str,
-    node_self_id: &str,
-    type_id: u32,
-    rows: u32,
-    body: &[u8],
-    min_ts: i64,
-    max_ts: i64,
-) {
-    write_section_with_source_and_node(
-        dir,
-        file,
-        7,
-        node_self_id,
-        type_id,
-        rows,
-        body,
-        min_ts,
-        max_ts,
-    );
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "fixture helper mirrors SectionInput and PartMeta fields"
-)]
-fn write_section_with_source_and_node(
-    dir: &std::path::Path,
-    file: &str,
-    source_id: u64,
     node_self_id: &str,
     type_id: u32,
     rows: u32,
@@ -134,14 +93,7 @@ fn write_section_with_source_and_node(
         rows: section.rows,
         body: &section.body,
     }));
-    let bytes = build_part(
-        &sections,
-        PartMeta {
-            min_ts,
-            max_ts,
-            source_id,
-        },
-    );
+    let bytes = build_part(&sections, PartMeta { min_ts, max_ts });
     crate::test_layout::write_named_pgm(dir, file, &bytes);
 }
 
@@ -268,7 +220,7 @@ async fn six_sqlstate_conditions_reach_the_http_log_projection() {
         to,
     );
 
-    let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=5m&step=1m");
+    let uri = format!("/v1/incidents?from=0&to={to}&window=5m&step=1m");
     let (status, response) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK, "{response}");
 
@@ -314,32 +266,27 @@ async fn assert_calm_incidents(uri: &str, to: i64) {
     }
 }
 
-async fn spiking_incident_for_source_and_node(
-    source_id: u64,
-    node_self_id: &str,
-) -> serde_json::Value {
+async fn spiking_incident_for_node(node_self_id: &str) -> serde_json::Value {
     let to = 39 * 60 * 1_000_000;
     let rows = archiver_rows(true);
     let dir = tempfile::tempdir().expect("tempdir");
-    write_archiver_with_source_and_node(
+    write_archiver_with_node(
         dir.path(),
         "0.pgm",
-        source_id,
         node_self_id,
         &rows[..21],
         0,
         20 * 60 * 1_000_000,
     );
-    write_archiver_with_source_and_node(
+    write_archiver_with_node(
         dir.path(),
         "1.pgm",
-        source_id,
         node_self_id,
         &rows[20..],
         20 * 60 * 1_000_000,
         to,
     );
-    let uri = format!("/v1/incidents?source={source_id}&from=0&to={to}&window=6m&step=2m");
+    let uri = format!("/v1/incidents?from=0&to={to}&window=6m&step=2m");
     let (status, response) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["analysis_status"], "incidents_detected");
@@ -347,22 +294,19 @@ async fn spiking_incident_for_source_and_node(
 }
 
 #[tokio::test]
-async fn incidents_propagate_storage_source_and_node_identity_to_engine_and_http() {
-    let first = spiking_incident_for_source_and_node(7, "node-a").await;
-    let same_node_other_source = spiking_incident_for_source_and_node(8, "node-a").await;
-    let same_source_other_node = spiking_incident_for_source_and_node(7, "node-b").await;
+async fn incidents_bind_identity_to_the_observed_node() {
+    let first = spiking_incident_for_node("node-a").await;
+    let other_node = spiking_incident_for_node("node-b").await;
 
-    assert_eq!(first["source_id"], 7);
-    assert_eq!(same_node_other_source["source_id"], 8);
-    assert_eq!(same_source_other_node["source_id"], 7);
-    for body in [&first, &same_node_other_source, &same_source_other_node] {
+    for body in [&first, &other_node] {
         assert_eq!(body["data_quality"]["node_identity"], "available");
+        assert!(body.get("source_id").is_none());
     }
 
     let first_key = first["incidents"][0]["incident_key"]
         .as_str()
         .expect("first storage-backed incident key");
-    let other_node_key = same_source_other_node["incidents"][0]["incident_key"]
+    let other_node_key = other_node["incidents"][0]["incident_key"]
         .as_str()
         .expect("other-node storage-backed incident key");
     assert_ne!(first_key, other_node_key);
@@ -419,7 +363,7 @@ fn assert_active_incident_catalog(body: &serde_json::Value) {
 #[tokio::test]
 async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
     let to = 39 * 60 * 1_000_000;
-    let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
+    let uri = format!("/v1/incidents?from=0&to={to}&window=6m&step=2m");
 
     let spiking = tempfile::tempdir().expect("tempdir");
     let spike_rows = archiver_rows(true);
@@ -534,7 +478,7 @@ async fn incidents_publish_numeric_gauge_evidence_from_reader_input() {
         to,
     );
 
-    let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m&section=os_meminfo");
+    let uri = format!("/v1/incidents?from=0&to={to}&window=6m&step=2m&section=os_meminfo");
     let (status, response) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let finding = response["incidents"]
@@ -592,7 +536,7 @@ async fn assert_contract_lens(
         0,
         to,
     );
-    let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m&section={section}");
+    let uri = format!("/v1/incidents?from=0&to={to}&window=6m&step=2m&section={section}");
     let (status, response) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK, "{section}: {response}");
     assert!(
@@ -817,26 +761,26 @@ async fn six_versioned_gauge_contracts_reach_http_findings() {
 #[tokio::test]
 async fn incidents_reject_degenerate_parameters() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "1000.pgm", 1_000, 2_000);
 
     for uri in [
-        "/v1/incidents?source=7&from=5&to=5",
-        "/v1/incidents?source=7&from=0&to=1000&window=1h",
-        "/v1/incidents?source=7&from=0&to=9000000000&window=0s",
-        "/v1/incidents?source=7&from=0&to=9000000000&threshold=-1",
-        "/v1/incidents?source=7&from=0&to=9000000000&eps_rel=NaN",
-        "/v1/incidents?source=7&from=-9223372036854775808&to=9223372036854775807",
-        "/v1/incidents?source=7&from=0&to=3600000000&max_cluster_span=2h",
-        "/v1/incidents?source=7&from=0&to=9000000000&unknown=1",
-        "/v1/incidents?source=7&source=8&from=0&to=9000000000",
+        "/v1/incidents?from=5&to=5",
+        "/v1/incidents?from=0&to=1000&window=1h",
+        "/v1/incidents?from=0&to=9000000000&window=0s",
+        "/v1/incidents?from=0&to=9000000000&threshold=-1",
+        "/v1/incidents?from=0&to=9000000000&eps_rel=NaN",
+        "/v1/incidents?from=-9223372036854775808&to=9223372036854775807",
+        "/v1/incidents?from=0&to=3600000000&max_cluster_span=2h",
+        "/v1/incidents?from=0&to=9000000000&unknown=1",
+        "/v1/incidents?source=8&from=0&to=9000000000",
     ] {
         let (status, _body) = serve(dir.path(), uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be rejected");
     }
 
     for uri in [
-        "/v1/incidents?source=7&from=0&to=86400000000&window=1s&step=1s",
-        "/v1/incidents?source=7&from=0&to=90000000000",
+        "/v1/incidents?from=0&to=86400000000&window=1s&step=1s",
+        "/v1/incidents?from=0&to=90000000000",
     ] {
         let (status, _body) = serve(dir.path(), uri).await;
         assert_eq!(
@@ -851,16 +795,12 @@ async fn incidents_reject_degenerate_parameters() {
 async fn incidents_distinguish_no_data_and_identity_quality() {
     const MINUTE: i64 = 60 * 1_000_000;
     let no_data = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(no_data.path(), "0.pgm", 7, 0, MINUTE);
-    let (status, body) = serve(
-        no_data.path(),
-        "/v1/incidents?source=8&from=600000000&to=1200000000",
-    )
-    .await;
+    write_bgwriter_segment(no_data.path(), "0.pgm", 0, MINUTE);
+    let (status, body) = serve(no_data.path(), "/v1/incidents?from=600000000&to=1200000000").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["analysis_status"], "no_data");
     assert_eq!(body["complete"], false);
-    assert_eq!(body["data_age_seconds"], serde_json::Value::Null);
+    assert!(body["data_age_seconds"].is_u64());
     assert_eq!(body["catalog"]["catalog_available"], true);
     assert_eq!(body["catalog"]["diagnosis_available"], false);
     assert_eq!(body["catalog"]["evaluated_lens_ids"], serde_json::json!([]));
@@ -869,7 +809,7 @@ async fn incidents_distinguish_no_data_and_identity_quality() {
 
     let missing = tempfile::tempdir().expect("tempdir");
     let to = write_archiver_spike_segment(missing.path());
-    let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
+    let uri = format!("/v1/incidents?from=0&to={to}&window=6m&step=2m");
     let (status, body) = serve(missing.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["analysis_status"], "missing_node_identity");
@@ -907,7 +847,7 @@ async fn incidents_distinguish_no_data_and_identity_quality() {
 #[tokio::test]
 async fn analytic_endpoints_share_fail_fast_admission() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "0.pgm", 7, 0, 10 * 60 * 1_000_000);
+    write_bgwriter_segment(dir.path(), "0.pgm", 0, 10 * 60 * 1_000_000);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
     let state = AppState::new(snapshot).expect("state");
     let _permit = state
@@ -915,11 +855,11 @@ async fn analytic_endpoints_share_fail_fast_admission() {
         .expect("reserve the shared analytic slot");
 
     for uri in [
-        "/v1/incidents?source=7&from=0&to=600000000&window=1m&step=1m",
-        "/v1/anomalies?source=7&from=0&to=600000000&window=1m&step=1m",
-        "/v1/timeline/overview?source=7&from=0&to=600000000",
-        "/v1/timeline/events?source=7&from=0&to=600000000",
-        "/v1/timeline/health?source=7&from=0&to=600000000&step=60000000",
+        "/v1/incidents?from=0&to=600000000&window=1m&step=1m",
+        "/v1/anomalies?from=0&to=600000000&window=1m&step=1m",
+        "/v1/timeline/overview?from=0&to=600000000",
+        "/v1/timeline/events?from=0&to=600000000",
+        "/v1/timeline/health?from=0&to=600000000&step=60000000",
     ] {
         let response = app(state.clone(), None, test_metrics_handle())
             .oneshot(
@@ -951,7 +891,7 @@ async fn incident_read_failure_is_sanitized() {
     let state = AppState::new(snapshot).expect("state");
     std::fs::remove_file(crate::test_layout::named_pgm_path(dir.path(), "0.pgm"))
         .expect("remove fixture after snapshot");
-    let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
+    let uri = format!("/v1/incidents?from=0&to={to}&window=6m&step=2m");
     let response = app(state, None, test_metrics_handle())
         .oneshot(
             Request::builder()

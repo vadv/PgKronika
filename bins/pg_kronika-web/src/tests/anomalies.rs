@@ -1,106 +1,8 @@
 use super::*;
-use kronika_registry::pg_log::PgLogSourceStatusV1;
-
-fn write_status_segment(
-    dir: &std::path::Path,
-    file: &str,
-    source: u64,
-    ts: i64,
-    state: u8,
-    reason: u8,
-    parser_kind: u8,
-) {
-    let body = PgLogSourceStatusV1::encode(&[PgLogSourceStatusV1 {
-        ts: Ts(ts),
-        state,
-        reason,
-        parser_kind,
-        source_path: None,
-        dict_dropped_fields: 0,
-    }])
-    .expect("encode status");
-    let part = build_part(
-        &[SectionInput {
-            type_id: 1_039_001,
-            rows: 1,
-            body: &body,
-        }],
-        PartMeta {
-            min_ts: ts,
-            max_ts: ts,
-            source_id: source,
-        },
-    );
-    crate::test_layout::write_named_pgm(dir, file, &part);
-}
-
-#[tokio::test]
-async fn sources_fold_each_source_into_one_span() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
-    write_bgwriter_segment(dir.path(), "3000.pgm", 7, 3_000, 4_000);
-    write_bgwriter_segment(dir.path(), "1500.pgm", 42, 1_500, 2_500);
-
-    let (status, body) = serve(dir.path(), "/v1/sources").await;
-    assert_eq!(status, StatusCode::OK, "sources responds 200");
-    assert_eq!(
-        body,
-        serde_json::json!({ "sources": [
-            {
-                "source_id": 7,
-                "min_ts": 1_000,
-                "max_ts": 4_000,
-                "segments": 2,
-                "pg_log": {
-                    "state": "unknown",
-                    "reason": "no_status",
-                    "observed_at": null,
-                    "parser": null,
-                    "source_path": null
-                }
-            },
-            {
-                "source_id": 42,
-                "min_ts": 1_500,
-                "max_ts": 2_500,
-                "segments": 1,
-                "pg_log": {
-                    "state": "unknown",
-                    "reason": "no_status",
-                    "observed_at": null,
-                    "parser": null,
-                    "source_path": null
-                }
-            }
-        ] }),
-        "each source folds its units into one span, ordered by source_id"
-    );
-}
-
-#[tokio::test]
-async fn sources_returns_the_latest_pg_log_status_per_source() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write_status_segment(dir.path(), "first.pgm", 7, 1_000, 0, 0, 0);
-    write_status_segment(dir.path(), "second.pgm", 7, 2_000, 2, 6, 0);
-
-    let (status, body) = serve(dir.path(), "/v1/sources").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body["sources"][0]["pg_log"],
-        serde_json::json!({
-            "state": "unavailable",
-            "reason": "permission_denied",
-            "observed_at": 2_000,
-            "parser": "stderr",
-            "source_path": null
-        })
-    );
-}
-
 #[tokio::test]
 async fn sections_catalog_exposes_pg_log_source_status() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_bgwriter_segment(dir.path(), "one.pgm", 0, 1);
     let (status, body) = serve(dir.path(), "/v1/sections").await;
     assert_eq!(status, StatusCode::OK);
     let source_status = body["sections"]
@@ -117,7 +19,7 @@ async fn sections_catalog_exposes_pg_log_source_status() {
 async fn sections_catalog_describes_archiver_from_the_registry() {
     // The catalog is static: it comes from the registry, not the fixture.
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "1000.pgm", 1_000, 2_000);
 
     let (status, body) = serve(dir.path(), "/v1/sections").await;
     assert_eq!(status, StatusCode::OK, "sections responds 200");
@@ -167,17 +69,16 @@ async fn segments_report_rows_for_canonical_sections() {
         PartMeta {
             min_ts: 1_000,
             max_ts: 2_000,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir.path(), "1000.pgm", &bytes);
 
-    let (status, body) = serve(dir.path(), "/v1/segments?source=7&from=0&to=3000").await;
+    let (status, body) = serve(dir.path(), "/v1/segments?from=0&to=3000").await;
     assert_eq!(status, StatusCode::OK, "segments responds 200");
     assert_eq!(
         body,
         serde_json::json!({ "segments": [
-            { "segment_id": "1000", "source_id": 7, "min_ts": 1_000, "max_ts": 2_000,
+            { "segment_id": "1000", "min_ts": 1_000, "max_ts": 2_000,
               "sections": [{ "name": "pg_stat_archiver", "rows": 3 }] }
         ] }),
         "canonical section rows are reported exactly"
@@ -188,7 +89,7 @@ async fn anomalies_rank_the_archiver_spike_first_and_count_honestly() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_archiver_spike_segment(dir.path());
 
-    let uri = format!("/v1/anomalies?source=7&from=0&to={to}&window=6m&step=2m");
+    let uri = format!("/v1/anomalies?from=0&to={to}&window=6m&step=2m");
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK, "anomalies responds 200");
 
@@ -257,7 +158,7 @@ async fn anomalies_scan_every_scannable_section_without_a_filter() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_archiver_spike_segment(dir.path());
 
-    let uri = format!("/v1/anomalies?source=7&from=0&to={to}&window=6m");
+    let uri = format!("/v1/anomalies?from=0&to={to}&window=6m");
     let (_status, body) = serve(dir.path(), &uri).await;
     let sections = body["sections"].as_object().expect("sections object");
     assert!(
@@ -330,7 +231,6 @@ fn write_two_section_spike_segment(dir: &std::path::Path) -> i64 {
         PartMeta {
             min_ts: 0,
             max_ts: to,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
@@ -342,7 +242,7 @@ async fn global_episode_truncation_is_counted_and_makes_the_result_partial() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_two_section_spike_segment(dir.path());
 
-    let uri = format!("/v1/anomalies?source=7&from=0&to={to}&window=6m&step=2m&limit=1");
+    let uri = format!("/v1/anomalies?from=0&to={to}&window=6m&step=2m&limit=1");
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["episodes"].as_array().map(Vec::len), Some(1));
@@ -556,7 +456,7 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
         };
         coverage_rows.push(SnapshotCoverageV1 {
             ts: Ts(ts),
-            source_type_id: 1_003_001,
+            section_type_id: 1_003_001,
             collector_pid: 42,
             collector_started_at: Ts(0),
             read_state: 0,
@@ -635,7 +535,6 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
         PartMeta {
             min_ts: 0,
             max_ts: to,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
@@ -736,7 +635,7 @@ fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
         ));
         coverage_rows.push(SnapshotCoverageV1 {
             ts: Ts(ts),
-            source_type_id: 1_004_001,
+            section_type_id: 1_004_001,
             collector_pid: 42,
             collector_started_at: Ts(0),
             read_state: 0,
@@ -806,7 +705,6 @@ fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
         PartMeta {
             min_ts: 0,
             max_ts: to,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
@@ -819,7 +717,7 @@ async fn plan_signals_follow_registry_storage_diff_and_http_with_typed_evidence(
     let to =
         write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::DistributionAndBufferShift);
     let uri = format!(
-        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+        "/v1/anomalies?from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
     );
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
@@ -898,7 +796,7 @@ async fn vadv_exposes_same_plan_buffers_without_claiming_query_mixture_identity(
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_vadv_plan_anomaly_segment(dir.path());
     let uri = format!(
-        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_vadv"
+        "/v1/anomalies?from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_vadv"
     );
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
@@ -936,7 +834,7 @@ async fn plan_distribution_uses_calls_since_first_observation_for_a_new_plan() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::PlanSetAddition);
     let uri = format!(
-        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+        "/v1/anomalies?from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
     );
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
@@ -965,7 +863,7 @@ async fn full_empty_snapshot_breaks_evicted_plan_counters_before_reentry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::EvictionAndReentry);
     let uri = format!(
-        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+        "/v1/anomalies?from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
     );
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
@@ -986,7 +884,7 @@ async fn compute_query_id_off_is_explicitly_not_applicable_for_ossc_distribution
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::ComputeQueryIdDisabled);
     let uri = format!(
-        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+        "/v1/anomalies?from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
     );
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
@@ -1008,7 +906,7 @@ async fn missing_system_identifier_makes_plan_evidence_partial() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::MissingSystemIdentity);
     let uri = format!(
-        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+        "/v1/anomalies?from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
     );
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
@@ -1030,7 +928,7 @@ async fn plan_signals_do_not_bridge_a_real_counter_reset() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::StableAcrossReset);
     let uri = format!(
-        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+        "/v1/anomalies?from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
     );
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
@@ -1093,7 +991,6 @@ fn write_gated_db_segment(dir: &std::path::Path) -> i64 {
         PartMeta {
             min_ts: 0,
             max_ts: to,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);
@@ -1105,7 +1002,7 @@ async fn diff_reports_not_collected_while_track_io_timing_is_off() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_gated_db_segment(dir.path());
 
-    let uri = format!("/v1/section/pg_stat_database/diff?source=7&from=0&to={to}");
+    let uri = format!("/v1/section/pg_stat_database/diff?from=0&to={to}");
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK, "diff responds 200");
 
@@ -1138,7 +1035,7 @@ async fn diff_reports_not_collected_while_track_io_timing_is_off() {
 async fn batch_diff_applies_collection_gates() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_gated_db_segment(dir.path());
-    let uri = format!("/v1/sections/batch/diff?source=7&from=0&to={to}&names=pg_stat_database");
+    let uri = format!("/v1/sections/batch/diff?from=0&to={to}&names=pg_stat_database");
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
     let points = body["pg_stat_database"]["series"][0]["columns"]["blk_read_time"]
@@ -1156,7 +1053,7 @@ async fn anomalies_count_gated_timings_as_nodata() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_gated_db_segment(dir.path());
 
-    let uri = format!("/v1/anomalies?source=7&from=0&to={to}&window=1m&section=pg_stat_database");
+    let uri = format!("/v1/anomalies?from=0&to={to}&window=1m&section=pg_stat_database");
     let (status, body) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK, "anomalies responds 200");
     let counters = &body["sections"]["pg_stat_database"];
@@ -1169,17 +1066,17 @@ async fn anomalies_count_gated_timings_as_nodata() {
 #[tokio::test]
 async fn anomalies_reject_degenerate_parameters() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "1000.pgm", 1_000, 2_000);
 
     for uri in [
         // window wider than the period
-        "/v1/anomalies?source=7&from=0&to=1000&window=1h",
+        "/v1/anomalies?from=0&to=1000&window=1h",
         // from at/after to
-        "/v1/anomalies?source=7&from=5&to=5",
+        "/v1/anomalies?from=5&to=5",
         // malformed knobs
-        "/v1/anomalies?source=7&from=0&to=9000000000&window=0s",
-        "/v1/anomalies?source=7&from=0&to=9000000000&threshold=-1",
-        "/v1/anomalies?source=7&from=0&to=9000000000&eps_rel=NaN",
+        "/v1/anomalies?from=0&to=9000000000&window=0s",
+        "/v1/anomalies?from=0&to=9000000000&threshold=-1",
+        "/v1/anomalies?from=0&to=9000000000&eps_rel=NaN",
     ] {
         let (status, _body) = serve(dir.path(), uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be rejected");
@@ -1187,7 +1084,7 @@ async fn anomalies_reject_degenerate_parameters() {
 
     let (status, body) = serve(
         dir.path(),
-        "/v1/anomalies?source=7&from=0&to=900000000000000000&window=1h&step=1s",
+        "/v1/anomalies?from=0&to=900000000000000000&window=1h&step=1s",
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -1204,7 +1101,7 @@ async fn anomalies_reject_degenerate_parameters() {
 
     let (status, body) = serve(
         dir.path(),
-        "/v1/anomalies?source=7&from=0&to=9000000000&section=nope",
+        "/v1/anomalies?from=0&to=9000000000&section=nope",
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is a 404");

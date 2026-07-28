@@ -43,7 +43,6 @@ fn write_overview_event_segment(dir: &std::path::Path) -> std::path::PathBuf {
         PartMeta {
             min_ts: 0,
             max_ts: 1,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir, "one.pgm", &bytes)
@@ -64,7 +63,7 @@ fn corrupt_first_section_body(path: &std::path::Path) {
 #[tokio::test]
 async fn a_metadata_only_fallback_keeps_the_snapshot_that_authorized_its_descriptors() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_bgwriter_segment(dir.path(), "one.pgm", 0, 1);
     let initial_snapshot =
         kronika_reader::LocalDirSnapshot::open(dir.path()).expect("initial snapshot");
     let state = AppState::with_overview_config(
@@ -75,7 +74,7 @@ async fn a_metadata_only_fallback_keeps_the_snapshot_that_authorized_its_descrip
     )
     .expect("state");
 
-    write_bgwriter_segment(dir.path(), "two.pgm", 7, 10, 11);
+    write_bgwriter_segment(dir.path(), "two.pgm", 10, 11);
     let fresh_snapshot =
         kronika_reader::LocalDirSnapshot::open(dir.path()).expect("fresh snapshot");
     assert_eq!(fresh_snapshot.units().len(), 2);
@@ -89,7 +88,7 @@ async fn a_metadata_only_fallback_keeps_the_snapshot_that_authorized_its_descrip
     let response = app(state, None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .uri("/v1/timeline/overview?from=0&to=2")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -115,7 +114,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
     let first = app(first_state, None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .uri("/v1/timeline/overview?from=0&to=2")
                 .body(Body::empty())
                 .expect("first request"),
         )
@@ -137,7 +136,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
     let restarted = app(restarted_state, None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .uri("/v1/timeline/overview?from=0&to=2")
                 .body(Body::empty())
                 .expect("restart request"),
         )
@@ -167,7 +166,7 @@ async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
     let response = app(state.clone(), None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .uri("/v1/timeline/overview?from=0&to=2")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -179,13 +178,10 @@ async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
         StatusCode::OK,
         "partial view remains queryable"
     );
-    assert_eq!(response.body["meta"]["source_status"], "gap");
+    assert_eq!(response.body["meta"]["status"], "gap");
+    assert_eq!(response.body["meta"]["freshness"]["status"], "gap");
     assert_eq!(
-        response.body["meta"]["source_freshness"][0]["source_status"],
-        "gap"
-    );
-    assert_eq!(
-        response.body["meta"]["loss"][0]["known_gaps"],
+        response.body["meta"]["loss"]["known_gaps"],
         serde_json::json!([{ "from_us": 0, "to_us": 2 }])
     );
     assert_eq!(
@@ -208,7 +204,7 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let complete = app(state.clone(), None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .uri("/v1/timeline/overview?from=0&to=2")
                 .body(Body::empty())
                 .expect("complete request"),
         )
@@ -216,10 +212,7 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
         .expect("complete route");
     let complete = capture_json(complete).await;
     assert_eq!(complete.status, StatusCode::OK);
-    assert_eq!(
-        complete.body["meta"]["source_status"],
-        "complete_for_contract"
-    );
+    assert_eq!(complete.body["meta"]["status"], "complete_for_contract");
     let cached_complete_responses = state.response_cache.len();
     assert_eq!(cached_complete_responses, 1);
 
@@ -235,7 +228,6 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let plan = state
         .select_overview(
             state.overview_view(),
-            &[7],
             kronika_analytics::overview::CoverageSpan::new(0, 2).expect("range"),
         )
         .expect("damaged source selection");
@@ -254,7 +246,6 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let repeated_plan = state
         .select_overview(
             state.overview_view(),
-            &[7],
             kronika_analytics::overview::CoverageSpan::new(0, 2).expect("range"),
         )
         .expect("persistently damaged source selection");
@@ -266,7 +257,7 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let damaged = app(state.clone(), None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/events?source=7&from=0&to=2")
+                .uri("/v1/timeline/events?from=0&to=2")
                 .body(Body::empty())
                 .expect("damaged request"),
         )
@@ -274,13 +265,10 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
         .expect("damaged route");
     let damaged = capture_json(damaged).await;
     assert_eq!(damaged.status, StatusCode::OK);
-    assert_eq!(damaged.body["meta"]["source_status"], "gap");
+    assert_eq!(damaged.body["meta"]["status"], "gap");
+    assert_eq!(damaged.body["meta"]["freshness"]["status"], "gap");
     assert_eq!(
-        damaged.body["meta"]["source_freshness"][0]["source_status"],
-        "gap"
-    );
-    assert_eq!(
-        damaged.body["meta"]["loss"][0]["known_gaps"],
+        damaged.body["meta"]["loss"]["known_gaps"],
         serde_json::json!([{ "from_us": 0, "to_us": 2 }])
     );
     assert_eq!(

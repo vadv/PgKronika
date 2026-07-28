@@ -14,7 +14,7 @@ use super::catalog::ProjectionCatalog;
 use super::data::view_summary;
 use super::heatmap::{HeatmapError, HeatmapRequest, heatmap as build_heatmap};
 use crate::AppState;
-use crate::params::{QueryParams, parse_i64, parse_u64};
+use crate::params::{QueryParams, parse_i64};
 use crate::problem::{
     ApiProblem, ExpectedValue, LimitResource, QueryConstraint, QueryParameter, count_u64,
 };
@@ -27,10 +27,9 @@ const DEFAULT_HEATMAP_BUCKETS: usize = 56;
 const MAX_HEATMAP_BUCKETS: usize = 256;
 const DEFAULT_HEATMAP_TOP: usize = 8;
 const MAX_HEATMAP_TOP: usize = 64;
-const CATALOG_PARAMS: &[QueryParameter] = &[QueryParameter::Source];
-const SUMMARY_PARAMS: &[QueryParameter] = &[QueryParameter::Source, QueryParameter::At];
+const CATALOG_PARAMS: &[QueryParameter] = &[];
+const SUMMARY_PARAMS: &[QueryParameter] = &[QueryParameter::At];
 const HEATMAP_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
     QueryParameter::View,
     QueryParameter::Metric,
     QueryParameter::From,
@@ -39,42 +38,38 @@ const HEATMAP_PARAMS: &[QueryParameter] = &[
     QueryParameter::Top,
 ];
 
-/// `GET /v1/views/summary?source=<id>&at=<us>` — exact indexed populations.
+/// `GET /v1/views/summary?at=<us>` — exact indexed populations.
 pub(crate) async fn summary(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
 ) -> Result<axum::Json<super::data::ViewSummaryResponse>, ApiProblem> {
     let params = QueryParams::parse(raw.as_deref(), SUMMARY_PARAMS)?;
-    let source = parse_u64(&params, QueryParameter::Source)?;
     let at_us = parse_i64(&params, QueryParameter::At)?;
     let (snapshot, descriptor_view) = state.overview_request_view();
     let live = Arc::clone(descriptor_view.live());
-    let response =
-        tokio::task::spawn_blocking(move || view_summary(&snapshot, &live, source, at_us))
-            .await
-            .map_err(|join| {
-                let problem = ApiProblem::internal_error();
-                tracing::error!(
-                    event = "api_ui_summary_worker_failed",
-                    request_id = problem.request_id(),
-                    error = ?join,
-                    "UI summary worker failed"
-                );
-                problem
-            })?
-            .map_err(|read| {
-                let problem = ApiProblem::store_read_failed();
-                tracing::error!(
-                    event = "api_ui_summary_read_failed",
-                    request_id = problem.request_id(),
-                    error = %read,
-                    source,
-                    at_us,
-                    "UI summary OVF read failed"
-                );
-                problem
-            })?
-            .ok_or_else(|| ApiProblem::unknown_source(source))?;
+    let response = tokio::task::spawn_blocking(move || view_summary(&snapshot, &live, at_us))
+        .await
+        .map_err(|join| {
+            let problem = ApiProblem::internal_error();
+            tracing::error!(
+                event = "api_ui_summary_worker_failed",
+                request_id = problem.request_id(),
+                error = ?join,
+                "UI summary worker failed"
+            );
+            problem
+        })?
+        .map_err(|read| {
+            let problem = ApiProblem::store_read_failed();
+            tracing::error!(
+                event = "api_ui_summary_read_failed",
+                request_id = problem.request_id(),
+                error = %read,
+                at_us,
+                "UI summary OVF read failed"
+            );
+            problem
+        })?;
     Ok(axum::Json(response))
 }
 
@@ -84,7 +79,6 @@ pub(crate) async fn heatmap(
     RawQuery(raw): RawQuery,
 ) -> Result<Response<Body>, ApiProblem> {
     let params = QueryParams::parse(raw.as_deref(), HEATMAP_PARAMS)?;
-    let source = parse_u64(&params, QueryParameter::Source)?;
     let from_us = parse_i64(&params, QueryParameter::From)?;
     let to_us = parse_i64(&params, QueryParameter::To)?;
     let span = to_us
@@ -132,7 +126,6 @@ pub(crate) async fn heatmap(
             &snapshot,
             &live,
             HeatmapRequest {
-                source,
                 view,
                 metric,
                 from_us,
@@ -153,8 +146,7 @@ pub(crate) async fn heatmap(
         );
         problem
     })?
-    .map_err(|error| heatmap_problem(&error))?
-    .ok_or_else(|| ApiProblem::unknown_source(source))?;
+    .map_err(|error| heatmap_problem(&error))?;
     let body = serde_json::to_vec(&response).map_err(|error| {
         let problem = ApiProblem::internal_error();
         tracing::error!(
@@ -230,16 +222,15 @@ fn heatmap_problem(error: &HeatmapError) -> ApiProblem {
     }
 }
 
-/// `GET /v1/ui/catalog?source=<id>` — source-aware stable UI projections.
+/// `GET /v1/ui/catalog` — stable UI projections.
 pub(crate) async fn catalog(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response<Body>, ApiProblem> {
-    let params = QueryParams::parse(raw.as_deref(), CATALOG_PARAMS)?;
-    let source = parse_u64(&params, QueryParameter::Source)?;
+    QueryParams::parse(raw.as_deref(), CATALOG_PARAMS)?;
     let snapshot = state.snapshot();
-    let observed = tokio::task::spawn_blocking(move || observed_type_ids(&snapshot, source))
+    let observed = tokio::task::spawn_blocking(move || observed_type_ids(&snapshot))
         .await
         .map_err(|join| {
             let problem = ApiProblem::internal_error();
@@ -257,12 +248,10 @@ pub(crate) async fn catalog(
                 event = "api_ui_catalog_read_failed",
                 request_id = problem.request_id(),
                 error = %read,
-                source,
                 "UI catalog metadata read failed"
             );
             problem
-        })?
-        .ok_or_else(|| ApiProblem::unknown_source(source))?;
+        })?;
 
     let catalog = ProjectionCatalog::for_type_ids(&observed);
     let body = serde_json::to_vec(&catalog).map_err(|error| {
@@ -299,28 +288,16 @@ pub(crate) async fn catalog(
 
 fn observed_type_ids(
     snapshot: &kronika_reader::LocalDirSnapshot,
-    source: u64,
-) -> Result<Option<BTreeSet<u32>>, kronika_reader::ReadError> {
+) -> Result<BTreeSet<u32>, kronika_reader::ReadError> {
     let units = snapshot.units();
-    let mut source_found = false;
     let mut observed = BTreeSet::new();
-    for (unit_idx, unit) in units.iter().enumerate() {
-        if unit.source_id != source {
-            continue;
-        }
-        source_found = true;
+    for unit_idx in 0..units.len() {
         let Some(catalog) = snapshot.unit_catalog(unit_idx)? else {
             continue;
         };
-        observed.extend(
-            catalog
-                .entries
-                .iter()
-                .filter(|entry| entry.rows != 0)
-                .map(|entry| entry.type_id),
-        );
+        observed.extend(catalog.entries.iter().map(|entry| entry.type_id));
     }
-    Ok(source_found.then_some(observed))
+    Ok(observed)
 }
 
 fn catalog_etag(body: &[u8]) -> HeaderValue {
