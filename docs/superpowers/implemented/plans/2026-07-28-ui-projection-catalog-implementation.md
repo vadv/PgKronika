@@ -124,7 +124,7 @@ Run the focused command from Step 2. Expected: all catalog tests pass.
 ```bash
 git add bins/pg_kronika-web/src/ui \
   bins/pg_kronika-web/src/lib.rs \
-  docs/superpowers/plans/2026-07-28-ui-projection-catalog-implementation.md
+  docs/superpowers/implemented/plans/2026-07-28-ui-projection-catalog-implementation.md
 git commit -m "feat(web): add UI projection catalog"
 ```
 

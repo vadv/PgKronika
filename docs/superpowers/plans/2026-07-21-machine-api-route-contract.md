@@ -1,7 +1,7 @@
 # Маршруты машинного API — план развития
 
 Статус: follow-up к
-[`2026-07-21-i18n-machine-api-contract.md`](../specs/2026-07-21-i18n-machine-api-contract.md).
+[`2026-07-21-i18n-machine-api-contract.md`](../implemented/specs/2026-07-21-i18n-machine-api-contract.md).
 Текущий `/v1` содержит только `GET`-ресурсы со стандартным `HEAD`; их
 `Allow: GET, HEAD` корректен.
 

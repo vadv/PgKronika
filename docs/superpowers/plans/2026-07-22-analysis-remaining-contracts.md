@@ -507,7 +507,7 @@ sections, и отдавать общий status, completeness и числа ус
 section, отказ по бюджету работы и любое усечение запрещают `complete=true`.
 Ранжирование остаётся ограниченным и детерминированным; требования к границе
 episode находятся в
-[контракте anomaly](../specs/2026-07-15-kronika-anomaly-design.md).
+[контракте anomaly](../implemented/specs/2026-07-15-kronika-anomaly-design.md).
 
 Специализированные plan signals считаются отдельным ограниченным набором:
 `limit` независимо применяется к episodes и plan signals, а section/global
@@ -529,7 +529,7 @@ work preflight. Любое усечение или неполная примен
 
 Локализованные подписи принадлежат UI; HTTP-ответы содержат только машинные
 значения по
-[контракту языка API](../specs/2026-07-21-i18n-machine-api-contract.md).
+[контракту языка API](../implemented/specs/2026-07-21-i18n-machine-api-contract.md).
 
 ## Порядок реализации
 

@@ -48,7 +48,7 @@
 `route_not_found` с media type `application/problem+json`. `index.html`
 отдаётся с `no-cache`, хэшированные ассеты допускают длительное кэширование.
 Полный pre-release machine contract зафиксирован в
-`docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md`.
+`docs/superpowers/implemented/specs/2026-07-21-i18n-machine-api-contract.md`.
 
 ## Конфигурация и запуск
 

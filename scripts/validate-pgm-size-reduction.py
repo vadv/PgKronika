@@ -36,7 +36,7 @@ FIXTURE_IDENTITY_FIELDS = (
 OWNER_CONTRACT_DOCS = (
     "crates/kronika-format/README.md",
     "crates/kronika-format/README.ru.md",
-    "docs/superpowers/plans/2026-07-24-pgm-compaction.md",
+    "docs/superpowers/archive/plans/2026-07-24-pgm-compaction.md",
     "docs/superpowers/specs/2026-07-26-pgm-size-reduction-research.md",
 )
 DEFAULT_SUMMARY = (

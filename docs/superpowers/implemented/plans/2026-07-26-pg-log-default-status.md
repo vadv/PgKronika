@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.96.0, Tokio, tokio-postgres, PGM v1, `kronika-registry` derive codecs, `kronika-writer`, `kronika-reader`, Axum, serde_json, Cucumber BDD.
 
-**Design:** `docs/superpowers/specs/2026-07-26-pg-log-default-status-design.md`.
+**Design:** `docs/superpowers/implemented/specs/2026-07-26-pg-log-default-status-design.md`.
 
 ## Global Constraints
 

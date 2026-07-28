@@ -1271,7 +1271,7 @@ OpenAPI server routes не содержат generated client/models, browser bui
 production frontend и не меняют статус `UX-005`.
 
 API следует действующему контракту
-`docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md`:
+`docs/superpowers/implemented/specs/2026-07-21-i18n-machine-api-contract.md`:
 `Accept-Language` не влияет на success/problem data, backend не возвращает
 translation keys, `title`, `detail`, finding summary или product prose.
 Frontend содержит полные EN/RU catalogs по stable IDs.

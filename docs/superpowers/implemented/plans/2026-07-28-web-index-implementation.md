@@ -316,7 +316,7 @@ git diff --check
 
 ```bash
 git add crates/kronika-analytics/src/overview/mod.rs \
-  crates/kronika-reader docs/superpowers/plans/2026-07-28-web-index-implementation.md
+  crates/kronika-reader docs/superpowers/implemented/plans/2026-07-28-web-index-implementation.md
 git commit -m "feat: реализовать формат web-индекса OVF"
 ```
 
