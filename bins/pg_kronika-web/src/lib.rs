@@ -832,6 +832,7 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .route("/v1/incidents", get(handlers::incidents::incidents))
         .route("/v1/sources", get(handlers::v1::sources))
         .route("/v1/ui/catalog", get(ui::handlers::catalog))
+        .route("/v1/views/summary", get(ui::handlers::summary))
         .route("/v1/sections", get(handlers::v1::sections))
         .route("/v1/segments", get(handlers::v1::segments))
         .route("/v1/section/{name}", get(handlers::v1::section_data))

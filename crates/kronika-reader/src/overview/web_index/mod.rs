@@ -1,8 +1,10 @@
 mod build;
+mod read;
 mod series;
 mod summary;
 
 pub(super) use build::{WebIndexBlocks, build_web_index};
+pub(crate) use read::{read_entity_series, read_ui_summary};
 pub use series::{
     EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, METRIC_FLAG_CANONICAL,
     MetricAggregation, MetricStatus,

@@ -1,10 +1,13 @@
 //! Compact identities derived from validated PGM end catalogs.
 
-use kronika_format::{Catalog, DecodeError, Entry, FORMAT_VERSION, MAGIC};
+use kronika_format::{
+    Catalog, DecodeError, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex,
+};
 use sha2::{Digest as _, Sha256};
 
 const LOGICAL_DIGEST_DOMAIN: &[u8] = b"pgk-overview-catalog-v1\0";
 const LAYOUT_DIGEST_DOMAIN: &[u8] = b"pgk-pgm-catalog-layout-v1\0";
+const SOURCE_DESCRIPTOR_DOMAIN: &[u8] = b"pgk-pgm-catalog-descriptor-v1";
 const TYPE_BLOOM_WORDS: usize = 8;
 const TYPE_BLOOM_HASHES: usize = 8;
 const TYPE_BLOOM_BITS: u64 = 512;
@@ -61,6 +64,57 @@ impl CatalogLayoutDigest {
     }
 }
 
+/// SHA-256 identity of the exact PGM length, tail index, and catalog bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PgmSourceDigest([u8; 32]);
+
+impl PgmSourceDigest {
+    /// Returns the digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Offset-independent fields of the first catalog entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstCatalogEntry {
+    /// Registry type and layout identifier.
+    pub type_id: u32,
+    /// Catalog flags.
+    pub flags: u32,
+    /// Section body length in bytes.
+    pub body_len: u64,
+    /// Row count declared by the section.
+    pub rows: u32,
+    /// CRC32C of the section body.
+    pub body_crc32c: u32,
+}
+
+impl FirstCatalogEntry {
+    const fn of(entry: Entry) -> Self {
+        Self {
+            type_id: entry.type_id,
+            flags: entry.flags,
+            body_len: entry.len,
+            rows: entry.rows,
+            body_crc32c: entry.crc32c,
+        }
+    }
+
+    /// Encodes the descriptor in its canonical 24-byte representation.
+    #[must_use]
+    pub fn canonical_bytes(self) -> [u8; 24] {
+        let mut output = [0_u8; 24];
+        output[0..4].copy_from_slice(&self.type_id.to_le_bytes());
+        output[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        output[8..16].copy_from_slice(&self.body_len.to_le_bytes());
+        output[16..20].copy_from_slice(&self.rows.to_le_bytes());
+        output[20..24].copy_from_slice(&self.body_crc32c.to_le_bytes());
+        output
+    }
+}
+
 /// Compact validated metadata retained for a finished PGM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogSummary {
@@ -82,6 +136,10 @@ pub struct CatalogSummary {
     pub logical_digest: CatalogDigest,
     /// Offset-sensitive identity used to pin the exact catalog layout.
     pub layout_digest: CatalogLayoutDigest,
+    /// Exact identity needed to validate an OVF without reopening the PGM.
+    pub source_digest: PgmSourceDigest,
+    /// First entry needed to derive the sealed lineage stored in the OVF.
+    pub first_entry: Option<FirstCatalogEntry>,
     nonempty_type_bloom: [u64; TYPE_BLOOM_WORDS],
 }
 
@@ -118,6 +176,12 @@ impl CatalogSummary {
             view.entry_count,
             entries.clone(),
         );
+        let source_file_len = body_end
+            .checked_add(u64::from(catalog_len))
+            .and_then(|length| length.checked_add(TAIL_INDEX_LEN as u64))
+            .ok_or(CatalogSummaryError::LengthOverflow)?;
+        let source_digest = source_digest(source_file_len, catalog_len, bytes);
+        let first_entry = entries.clone().next().map(FirstCatalogEntry::of);
         let nonempty_type_bloom = nonempty_type_bloom(entries);
         Ok(Self {
             min_ts: view.min_ts,
@@ -129,6 +193,8 @@ impl CatalogSummary {
             catalog_len,
             logical_digest,
             layout_digest,
+            source_digest,
+            first_entry,
             nonempty_type_bloom,
         })
     }
@@ -154,6 +220,19 @@ impl CatalogSummary {
             entry_count,
             catalog.entries.iter().copied(),
         );
+        let encoded = catalog.encode();
+        let raw_catalog = &encoded[..encoded.len() - TAIL_INDEX_LEN];
+        let body_end = catalog
+            .entries
+            .last()
+            .and_then(|entry| entry.offset.checked_add(entry.len))
+            .unwrap_or(MAGIC.len() as u64);
+        let source_file_len = body_end
+            .checked_add(u64::from(catalog_len))
+            .and_then(|length| length.checked_add(TAIL_INDEX_LEN as u64))
+            .expect("a validated catalog and u32 length fit one PGM");
+        let source_digest = source_digest(source_file_len, catalog_len, raw_catalog);
+        let first_entry = catalog.entries.first().copied().map(FirstCatalogEntry::of);
         let nonempty_type_bloom = nonempty_type_bloom(catalog.entries.iter().copied());
         Self {
             min_ts: catalog.min_ts,
@@ -165,6 +244,8 @@ impl CatalogSummary {
             catalog_len,
             logical_digest,
             layout_digest,
+            source_digest,
+            first_entry,
             nonempty_type_bloom,
         }
     }
@@ -180,6 +261,15 @@ impl CatalogSummary {
             .iter()
             .any(|&type_id| bloom_may_contain(&self.nonempty_type_bloom, type_id))
     }
+}
+
+fn source_digest(source_file_len: u64, catalog_len: u32, raw_catalog: &[u8]) -> PgmSourceDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_DESCRIPTOR_DOMAIN);
+    hasher.update(source_file_len.to_le_bytes());
+    hasher.update(TailIndex { catalog_len }.encode());
+    hasher.update(raw_catalog);
+    PgmSourceDigest(hasher.finalize().into())
 }
 
 /// Structural failure while deriving a compact catalog summary.
@@ -329,8 +419,6 @@ const fn mix64(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::TAIL_INDEX_LEN;
-
     use super::*;
 
     fn catalog() -> Catalog {

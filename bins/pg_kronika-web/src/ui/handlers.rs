@@ -10,13 +10,52 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
 
 use super::catalog::ProjectionCatalog;
+use super::data::view_summary;
 use crate::AppState;
-use crate::params::{QueryParams, parse_u64};
+use crate::params::{QueryParams, parse_i64, parse_u64};
 use crate::problem::{ApiProblem, QueryParameter};
 
 /// Maximum serialized projection catalog response.
 const MAX_CATALOG_RESPONSE_BYTES: usize = 512 * 1024;
 const CATALOG_PARAMS: &[QueryParameter] = &[QueryParameter::Source];
+const SUMMARY_PARAMS: &[QueryParameter] = &[QueryParameter::Source, QueryParameter::At];
+
+/// `GET /v1/views/summary?source=<id>&at=<us>` — exact OVF populations.
+pub(crate) async fn summary(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<axum::Json<super::data::ViewSummaryResponse>, ApiProblem> {
+    let params = QueryParams::parse(raw.as_deref(), SUMMARY_PARAMS)?;
+    let source = parse_u64(&params, QueryParameter::Source)?;
+    let at_us = parse_i64(&params, QueryParameter::At)?;
+    let snapshot = state.snapshot();
+    let response = tokio::task::spawn_blocking(move || view_summary(&snapshot, source, at_us))
+        .await
+        .map_err(|join| {
+            let problem = ApiProblem::internal_error();
+            tracing::error!(
+                event = "api_ui_summary_worker_failed",
+                request_id = problem.request_id(),
+                error = ?join,
+                "UI summary worker failed"
+            );
+            problem
+        })?
+        .map_err(|read| {
+            let problem = ApiProblem::store_read_failed();
+            tracing::error!(
+                event = "api_ui_summary_read_failed",
+                request_id = problem.request_id(),
+                error = %read,
+                source,
+                at_us,
+                "UI summary OVF read failed"
+            );
+            problem
+        })?
+        .ok_or_else(|| ApiProblem::unknown_source(source))?;
+    Ok(axum::Json(response))
+}
 
 /// `GET /v1/ui/catalog?source=<id>` — source-aware stable UI projections.
 pub(crate) async fn catalog(

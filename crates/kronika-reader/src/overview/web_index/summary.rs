@@ -334,6 +334,13 @@ impl UiSummaryBlock {
     /// Last observed population of `view_code` at or before `at_us`.
     #[must_use]
     pub fn population_at(&self, view_code: u16, at_us: i64) -> Option<u64> {
+        self.snapshot_at(view_code, at_us)
+            .map(|(_timestamp, population)| population)
+    }
+
+    /// Last exact snapshot timestamp and population at or before `at_us`.
+    #[must_use]
+    pub fn snapshot_at(&self, view_code: u16, at_us: i64) -> Option<(i64, u64)> {
         let view = self
             .views
             .binary_search_by_key(&view_code, ViewSummary::view_code)
@@ -342,9 +349,10 @@ impl UiSummaryBlock {
         let upper = self
             .snapshot_times
             .partition_point(|timestamp| *timestamp <= at_us);
-        (0..upper)
-            .rev()
-            .find_map(|index| view.population_at_index(index))
+        (0..upper).rev().find_map(|index| {
+            view.population_at_index(index)
+                .map(|population| (self.snapshot_times[index], population))
+        })
     }
 
     /// Shared bucket grid, or `None` for the canonical empty summary.
@@ -497,6 +505,7 @@ mod tests {
         assert_eq!(block.population_at(1, 10_000_000), Some(7));
         assert_eq!(block.population_at(1, 49_999_999), Some(7));
         assert_eq!(block.population_at(1, 50_000_000), Some(11));
+        assert_eq!(block.snapshot_at(1, 49_999_999), Some((10_000_000, 7)));
     }
 
     #[test]

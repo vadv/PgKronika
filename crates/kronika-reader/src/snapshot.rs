@@ -14,7 +14,7 @@ use kronika_format::{
     Catalog, DamageRegion, Entry, JOURNAL_HEADER_LEN, JournalHeader, JournalState, MAGIC,
     RESET_MARKER_LEN, ResetMarker, TAIL_INDEX_LEN,
 };
-use kronika_layout::SegmentId;
+use kronika_layout::{DataRoot as LayoutDataRoot, SegmentId};
 use kronika_registry::{
     Bytes, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
     MAX_SECTION_ROWS, Row, VerifiedSection, decode_any, encode_sealed_batches,
@@ -26,14 +26,16 @@ use kronika_store::{
 };
 use sha2::{Digest as _, Sha256};
 
+use crate::overview::{read_entity_series, read_ui_summary};
 use crate::refresh::{
     ByteRange, JournalDelta, JournalGenerationId, JournalIdentity, JournalPhase, PartDescriptor,
     PartTransition, RefreshDelta, SealedLocator, SegmentDescriptor,
     apply_committed_reset_transition, classify_transition, part_id_from_digest,
 };
 use crate::{
-    Bounds, BuildError, Dictionary, FactLoad, FactStore, PgmUnit, ReadError, SegmentContext,
-    Stored, decode_dictionary,
+    Bounds, BuildError, CacheReadError, Dictionary, EntitySeriesBlock, FactLoad, FactReadStats,
+    FactStore, HeaderIdentity, PgmUnit, ReadError, SegmentContext, Stored, UiSummaryBlock,
+    decode_dictionary,
 };
 
 const JOURNAL_PREFIX_DOMAIN: &[u8] = b"pgk-overview-journal-prefix-v1\0";
@@ -267,6 +269,37 @@ pub enum SealedFactError {
     },
     /// Source extraction or a hard fact bound failed.
     Build(BuildError),
+}
+
+/// Why a pinned selective web-index read could not be completed.
+#[derive(Debug)]
+pub enum WebIndexReadError {
+    /// The descriptor is absent or changed in the pinned snapshot.
+    Descriptor(SealedFactError),
+    /// An empty PGM cannot have a sealed fact lineage.
+    MissingLineage,
+    /// The OVF is missing, incompatible, corrupt, oversized, or unreadable.
+    Cache(CacheReadError),
+}
+
+impl std::fmt::Display for WebIndexReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Descriptor(error) => write!(f, "{error}"),
+            Self::MissingLineage => f.write_str("sealed descriptor has no fact lineage"),
+            Self::Cache(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for WebIndexReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Descriptor(error) => Some(error),
+            Self::Cache(error) => Some(error),
+            Self::MissingLineage => None,
+        }
+    }
 }
 
 impl std::fmt::Display for SealedFactError {
@@ -774,6 +807,83 @@ impl LocalDirSnapshot {
         self.scan.sealed.iter().map(descriptor_for_sealed)
     }
 
+    /// Reads only the OVF header, directory, and shared UI summary block.
+    ///
+    /// The pinned descriptor supplies the exact PGM identity, so this path
+    /// never reopens or decodes the sibling PGM.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebIndexReadError`] when the descriptor changed or the
+    /// selected OVF metadata/body fails admission.
+    pub fn read_ui_summary(
+        &self,
+        descriptor: &SegmentDescriptor,
+        bounds: &Bounds,
+    ) -> Result<(UiSummaryBlock, FactReadStats), WebIndexReadError> {
+        let (context, expected) = self.web_index_context(descriptor)?;
+        let file = self.open_web_index_sidecar(&context)?;
+        read_ui_summary(file, &expected, bounds).map_err(WebIndexReadError::Cache)
+    }
+
+    /// Reads one view-addressed entity-series block from the sibling OVF.
+    ///
+    /// An absent view returns `Ok((None, stats))` after metadata admission and
+    /// performs no body read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WebIndexReadError`] when the descriptor changed or the
+    /// selected OVF metadata/body fails admission.
+    pub fn read_entity_series(
+        &self,
+        descriptor: &SegmentDescriptor,
+        view_code: u16,
+        bounds: &Bounds,
+    ) -> Result<(Option<EntitySeriesBlock>, FactReadStats), WebIndexReadError> {
+        let (context, expected) = self.web_index_context(descriptor)?;
+        let file = self.open_web_index_sidecar(&context)?;
+        read_entity_series(file, &expected, view_code, bounds).map_err(WebIndexReadError::Cache)
+    }
+
+    fn web_index_context(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<(SegmentContext, HeaderIdentity), WebIndexReadError> {
+        let context = self
+            .sealed_context(descriptor)
+            .map_err(WebIndexReadError::Descriptor)?;
+        let lineage = descriptor
+            .segment_lineage_id
+            .ok_or(WebIndexReadError::MissingLineage)?;
+        let expected = HeaderIdentity::from_current_contract(
+            descriptor.source_format_version,
+            descriptor.source_id,
+            descriptor.min_ts,
+            descriptor.max_ts,
+            descriptor.file_identity.len,
+            descriptor.source_descriptor,
+            lineage,
+        );
+        Ok((context, expected))
+    }
+
+    fn open_web_index_sidecar(
+        &self,
+        context: &SegmentContext,
+    ) -> Result<std::fs::File, WebIndexReadError> {
+        let root = LayoutDataRoot::open(&self.root)
+            .map_err(|error| WebIndexReadError::Cache(layout_cache_error(error)))?;
+        root.open_ovf(context.address())
+            .map_err(|error| WebIndexReadError::Cache(layout_cache_error(error)))?
+            .ok_or_else(|| {
+                WebIndexReadError::Cache(CacheReadError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "overview sidecar is absent",
+                )))
+            })
+    }
+
     /// Loads persistent overview facts for one sealed unit.
     ///
     /// The file is reopened and its catalog is compared with the pinned scan
@@ -1184,6 +1294,10 @@ impl LocalDirSnapshot {
 
         sealed_iter.chain(active_iter)
     }
+}
+
+fn layout_cache_error(error: kronika_layout::LayoutError) -> CacheReadError {
+    CacheReadError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Proves that the rare same-id sealed/live pair contains exactly one logical

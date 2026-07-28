@@ -72,7 +72,7 @@ pub use refresh::{
     PartId, PartTransition, RefreshDelta, SealedLocator, SegmentDescriptor, catalog_digest,
     classify_transition, part_id,
 };
-pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta};
+pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta, WebIndexReadError};
 
 /// Returns the versioned registry-backed all-family parity qualification fixture.
 ///

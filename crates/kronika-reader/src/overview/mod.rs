@@ -78,6 +78,7 @@ pub use web_index::{
     EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, IndexStatus,
     METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, TimeGrid, UiSummaryBlock, ViewSummary,
 };
+pub(crate) use web_index::{read_entity_series, read_ui_summary};
 
 #[cfg(feature = "qualification")]
 pub(crate) fn qualification_all_family_pgm() -> Vec<u8> {

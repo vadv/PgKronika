@@ -108,6 +108,7 @@ closed_string_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum QueryParameter {
         Source => "source",
+        At => "at",
         From => "from",
         To => "to",
         Window => "window",
@@ -129,6 +130,7 @@ impl QueryParameter {
     pub(crate) const fn from_query_name(name: &str) -> Option<Self> {
         match name.as_bytes() {
             b"source" => Some(Self::Source),
+            b"at" => Some(Self::At),
             b"from" => Some(Self::From),
             b"to" => Some(Self::To),
             b"window" => Some(Self::Window),
