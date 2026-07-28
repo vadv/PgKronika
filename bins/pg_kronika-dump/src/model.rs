@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 pub(crate) enum Output {
     Tree(TreeOutput),
     Pgm(PgmOutput),
+    Ovf(OvfOutput),
     Journal(JournalOutput),
 }
 
@@ -70,6 +71,130 @@ pub(crate) struct PgmOutput {
     pub(crate) dictionary: DictionaryOutput,
     pub(crate) sections: Vec<SectionOutput>,
     pub(crate) totals: TotalsOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfHeaderOutput {
+    pub(crate) fact_schema_version: u32,
+    pub(crate) extractor_semantics_version: u32,
+    pub(crate) registry_contract_version: u32,
+    pub(crate) source_format_version: u32,
+    pub(crate) pgm_source_id: u64,
+    pub(crate) source_min_ts_us: i64,
+    pub(crate) source_max_ts_us: i64,
+    pub(crate) source_file_len: u64,
+    pub(crate) source_descriptor: String,
+    pub(crate) fact_key: String,
+    pub(crate) segment_lineage_id: String,
+    pub(crate) directory_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfBlockOutput {
+    pub(crate) kind: Option<&'static str>,
+    pub(crate) kind_code: u32,
+    pub(crate) logical_id: u32,
+    pub(crate) schema_version: u16,
+    pub(crate) required: bool,
+    pub(crate) sorted: bool,
+    pub(crate) has_time_range: bool,
+    pub(crate) codec: &'static str,
+    pub(crate) stored_bytes: u64,
+    pub(crate) decoded_bytes: u64,
+    pub(crate) items: u32,
+    pub(crate) min_ts_us: Option<i64>,
+    pub(crate) max_ts_us: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content: Option<OvfBlockContentOutput>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum OvfBlockContentOutput {
+    UiSummary(OvfUiSummaryOutput),
+    EntitySeries(OvfEntitySeriesOutput),
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct OvfGridOutput {
+    pub(crate) start_us: i64,
+    pub(crate) bucket_width_s: u32,
+    pub(crate) bucket_count: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfUiSummaryViewOutput {
+    pub(crate) view_code: u16,
+    pub(crate) view_revision: u16,
+    pub(crate) status: &'static str,
+    pub(crate) populations: Vec<Option<u64>>,
+    pub(crate) notable: Vec<Option<bool>>,
+    pub(crate) coverage: Vec<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfUiSummaryOutput {
+    pub(crate) grid: Option<OvfGridOutput>,
+    pub(crate) snapshot_times_us: Vec<i64>,
+    pub(crate) views: Vec<OvfUiSummaryViewOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfEntityDictionaryOutput {
+    pub(crate) entity_ref: u16,
+    pub(crate) key: String,
+    pub(crate) label: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfEntitySeriesItemOutput {
+    pub(crate) entity_ref: u16,
+    pub(crate) key: String,
+    pub(crate) label: String,
+    pub(crate) exact_score: f64,
+    pub(crate) max_bucket_value: f64,
+    pub(crate) values: Vec<Option<f64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfEntityMetricOutput {
+    pub(crate) metric_code: u16,
+    pub(crate) metric_revision: u16,
+    pub(crate) flags: u16,
+    pub(crate) unit_code: u16,
+    pub(crate) aggregation: &'static str,
+    pub(crate) status: &'static str,
+    pub(crate) cutoff_score: f64,
+    pub(crate) series: Vec<OvfEntitySeriesItemOutput>,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfObservedRangeOutput {
+    pub(crate) first_us: i64,
+    pub(crate) last_us: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfEntitySeriesOutput {
+    pub(crate) view_code: u16,
+    pub(crate) view_revision: u16,
+    pub(crate) identity_revision: u16,
+    pub(crate) status: &'static str,
+    pub(crate) observed_range: OvfObservedRangeOutput,
+    pub(crate) grid: OvfGridOutput,
+    pub(crate) coverage: Vec<bool>,
+    pub(crate) dictionary: Vec<OvfEntityDictionaryOutput>,
+    pub(crate) metrics: Vec<OvfEntityMetricOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct OvfOutput {
+    pub(crate) kind: &'static str,
+    pub(crate) path: String,
+    pub(crate) file_bytes: u64,
+    pub(crate) header: OvfHeaderOutput,
+    pub(crate) blocks: Vec<OvfBlockOutput>,
 }
 
 #[derive(Debug, Serialize)]

@@ -24,9 +24,9 @@ use super::limits::Bounds;
 
 /// A canonical block kind in the fact file.
 ///
-/// Every kind here is a required baseline block: it may be empty, but it may
-/// not be absent. Unknown kinds are handled by the container through the
-/// required-for-schema flag, not by this enum.
+/// Unknown kinds are handled by the container through the required-for-schema
+/// flag, not by this enum. [`BlockKind::BASELINE`] distinguishes mandatory
+/// singleton-or-partitioned blocks from known repeatable extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BlockKind {
     /// Catalog inventory, PGM layout, and source/range provenance.
@@ -47,11 +47,15 @@ pub enum BlockKind {
     EntityStates,
     /// Bounded canonical text retained by explicit reference.
     StringTable,
+    /// Shared web UI snapshot times, populations, and view status.
+    UiSummary,
+    /// Independently addressable top-K and heatmap series for one UI view.
+    EntitySeries,
 }
 
 impl BlockKind {
-    /// Every canonical kind in stable code order.
-    pub const ALL: [Self; 9] = [
+    /// Required kinds in stable code order.
+    pub const BASELINE: [Self; 10] = [
         Self::SourceManifest,
         Self::EventObservations,
         Self::EventFacts,
@@ -61,6 +65,22 @@ impl BlockKind {
         Self::ResetMarkers,
         Self::EntityStates,
         Self::StringTable,
+        Self::UiSummary,
+    ];
+
+    /// Every understood kind in stable code order.
+    pub const KNOWN: [Self; 11] = [
+        Self::SourceManifest,
+        Self::EventObservations,
+        Self::EventFacts,
+        Self::LossCoverage,
+        Self::GaugeSamples,
+        Self::CounterSamples,
+        Self::ResetMarkers,
+        Self::EntityStates,
+        Self::StringTable,
+        Self::UiSummary,
+        Self::EntitySeries,
     ];
 
     /// The stable on-disk block-kind code.
@@ -76,6 +96,8 @@ impl BlockKind {
             Self::ResetMarkers => 7,
             Self::EntityStates => 8,
             Self::StringTable => 9,
+            Self::UiSummary => 10,
+            Self::EntitySeries => 11,
         }
     }
 
@@ -92,6 +114,8 @@ impl BlockKind {
             7 => Some(Self::ResetMarkers),
             8 => Some(Self::EntityStates),
             9 => Some(Self::StringTable),
+            10 => Some(Self::UiSummary),
+            11 => Some(Self::EntitySeries),
             _ => None,
         }
     }
@@ -109,7 +133,7 @@ pub enum BlockCodec {
 /// A parsed set of block directory flags.
 ///
 /// Bit 0 marks a required block, bit 1 canonical order, bit 2 a time range,
-/// and bits 8..12 the codec. Other set bits are incompatible.
+/// and bits 8..11 the codec. Other set bits are incompatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockFlags {
     /// Whether a reader that cannot decode this block must reject the file.
@@ -1949,11 +1973,11 @@ mod tests {
 
     #[test]
     fn block_kind_codes_round_trip_and_reject_unknown() {
-        for kind in BlockKind::ALL {
+        for kind in BlockKind::KNOWN {
             assert_eq!(BlockKind::from_code(kind.code()), Some(kind));
         }
         assert_eq!(BlockKind::from_code(0), None);
-        assert_eq!(BlockKind::from_code(10), None);
+        assert_eq!(BlockKind::from_code(12), None);
     }
 
     #[test]

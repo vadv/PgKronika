@@ -109,8 +109,9 @@ bridge these no-data states and does not extrapolate across unsampled time.
 
 ## Overview fact files
 
-`SourceDescriptor`, `section_body_id`, and `dictionary_context_id` derive
-typed content identities from exact PGM metadata and retained values.
+`SourceDescriptor` is the validated canonical catalog-layout digest;
+`section_body_id` and `dictionary_context_id` derive typed content identities
+from exact retained values.
 `PgmUnit::read_overview_section` reads one catalog ordinal and verifies its
 CRC. `PgmUnit::resolve_overview_dictionary` reads only `dict.strings` and
 `dict.blobs`, retains requested IDs, and reports stored and decoded work.
@@ -136,7 +137,7 @@ sidecar are siblings in the UTC day derived from `SegmentId`:
 `FactStore` receives a verified `SegmentAddress` and resolves `N.ovf` through
 the owned calendar tree; request strings cannot select another path. The
 PGKOVF header stores the `FactKey`,
-`SegmentLineageId`, exact `SourceDescriptor`, source metadata, and the schema,
+`SegmentLineageId`, canonical `SourceDescriptor`, source metadata, and the schema,
 extractor, registry, and source-format versions. Every read validates those
 fields against the selected PGM. A missing, stale, incompatible, corrupt, or
 mismatched sidecar triggers bounded extraction from that PGM. The replacement

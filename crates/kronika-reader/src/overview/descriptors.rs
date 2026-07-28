@@ -10,7 +10,6 @@ use kronika_analytics::overview::{
 use kronika_format::{Catalog, Entry};
 use sha2::{Digest, Sha256};
 
-const CATALOG_DESCRIPTOR_TAG: &[u8] = b"pgk-pgm-catalog-descriptor-v1";
 const SECTION_BODY_TAG: &[u8] = b"pgk-overview-section-body-v1";
 const DICTIONARY_CONTEXT_TAG: &[u8] = b"pgk-overview-dictionary-context-v1";
 
@@ -87,7 +86,7 @@ impl ManifestEntryDescriptor {
     }
 }
 
-/// SHA-256 descriptor of the exact PGM tail index and catalog.
+/// SHA-256 descriptor of the validated canonical PGM catalog layout.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceDescriptor(pub [u8; 32]);
 
@@ -102,31 +101,10 @@ impl std::fmt::Debug for SourceDescriptor {
 }
 
 impl SourceDescriptor {
-    /// Derives a descriptor from the exact bytes read while opening a PGM.
+    /// Derives a descriptor from a validated decoded catalog.
     #[must_use]
-    pub fn derive(source_file_len: u64, tail_index_bytes: &[u8], raw_catalog_bytes: &[u8]) -> Self {
-        let mut builder = Self::builder(source_file_len, tail_index_bytes);
-        Self::update_catalog(&mut builder, raw_catalog_bytes);
-        Self::finish(builder)
-    }
-
-    /// Starts an incremental descriptor over one PGM catalog.
-    pub(crate) fn builder(source_file_len: u64, tail_index_bytes: &[u8]) -> Sha256 {
-        let mut hasher = Sha256::new();
-        hasher.update(CATALOG_DESCRIPTOR_TAG);
-        hasher.update(source_file_len.to_le_bytes());
-        hasher.update(tail_index_bytes);
-        hasher
-    }
-
-    /// Adds the next contiguous raw catalog block.
-    pub(crate) fn update_catalog(hasher: &mut Sha256, bytes: &[u8]) {
-        hasher.update(bytes);
-    }
-
-    /// Completes the descriptor after the final catalog block.
-    pub(crate) fn finish(hasher: Sha256) -> Self {
-        Self(hasher.finalize().into())
+    pub fn from_catalog(catalog: &Catalog) -> Self {
+        Self(*kronika_store::CatalogLayoutDigest::from_catalog(catalog).as_bytes())
     }
 }
 
@@ -199,23 +177,14 @@ pub fn dictionary_context_id(
     Some(DictionaryContextId(hasher.finalize().into()))
 }
 
-/// Derives a sealed segment lineage from its first catalog entry.
+/// Derives a sealed segment lineage from its validated catalog identity.
 #[must_use]
 pub fn lineage_from_catalog(
     catalog: &Catalog,
     source_descriptor: SourceDescriptor,
 ) -> Option<SegmentLineageId> {
-    let first = catalog.entries.first()?;
-    let descriptor = CatalogEntryDescriptor::of(first).canonical_bytes();
-    Some(
-        SegmentIdentity::sealed(
-            catalog.source_id,
-            source_descriptor.0,
-            first.type_id,
-            &descriptor,
-        )
-        .id(),
-    )
+    (!catalog.entries.is_empty())
+        .then(|| SegmentIdentity::sealed(catalog.source_id, source_descriptor.0).id())
 }
 
 const fn length_prefix(bytes: &[u8]) -> [u8; 8] {
@@ -258,29 +227,19 @@ mod tests {
     }
 
     #[test]
-    fn source_descriptor_binds_length_tail_and_catalog() {
-        let base = SourceDescriptor::derive(1_000, b"tail", b"catalog");
-        assert_ne!(base, SourceDescriptor::derive(1_001, b"tail", b"catalog"));
-        assert_ne!(base, SourceDescriptor::derive(1_000, b"TAIL", b"catalog"));
-        assert_ne!(base, SourceDescriptor::derive(1_000, b"tail", b"CATALOG"));
-    }
-
-    #[test]
-    fn incremental_source_descriptor_matches_derive_across_chunk_boundaries() {
-        let catalog: Vec<u8> = (0_u8..=255).cycle().take(128 * 1024 + 17).collect();
-        let expected = SourceDescriptor::derive(1_000, b"tail", &catalog);
-
-        for chunk_len in [1, 31, 32, 64 * 1024, 64 * 1024 + 1] {
-            let mut builder = SourceDescriptor::builder(1_000, b"tail");
-            for chunk in catalog.chunks(chunk_len) {
-                SourceDescriptor::update_catalog(&mut builder, chunk);
-            }
-            assert_eq!(
-                SourceDescriptor::finish(builder),
-                expected,
-                "chunk length {chunk_len}"
-            );
-        }
+    fn source_descriptor_is_the_catalog_layout_digest() {
+        let catalog = Catalog {
+            entries: vec![entry(7, 5, 3, 11)],
+            min_ts: 10,
+            max_ts: 20,
+            source_id: 1,
+            format_version: 1,
+            window_count: 2,
+        };
+        assert_eq!(
+            SourceDescriptor::from_catalog(&catalog).0,
+            *kronika_store::CatalogLayoutDigest::from_catalog(&catalog).as_bytes()
+        );
     }
 
     #[test]
@@ -328,14 +287,7 @@ mod tests {
         };
         let source_descriptor = SourceDescriptor([3; 32]);
         let derived = lineage_from_catalog(&catalog, source_descriptor).expect("entry");
-        let descriptor = CatalogEntryDescriptor::of(&catalog.entries[0]).canonical_bytes();
-        let expected = SegmentIdentity::sealed(
-            catalog.source_id,
-            source_descriptor.0,
-            1_022_001,
-            &descriptor,
-        )
-        .id();
+        let expected = SegmentIdentity::sealed(catalog.source_id, source_descriptor.0).id();
         assert_eq!(derived, expected);
     }
 }

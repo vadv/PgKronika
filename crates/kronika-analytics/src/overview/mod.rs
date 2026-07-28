@@ -88,13 +88,15 @@ pub const CONTAINER_VERSION: u16 = 2;
 
 /// Canonical fact schema version.
 ///
-/// Version 3 uses the numeric PGM source ID throughout canonical facts.
-pub const FACT_SCHEMA_VERSION: u32 = 3;
+/// The schema includes the mandatory web summary and view-addressed entity
+/// series blocks.
+pub const FACT_SCHEMA_VERSION: u32 = 4;
 
 /// Version for PGM-to-fact extraction and normalization.
 ///
-/// Version 5 derives sealed lineage from exact PGM metadata.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 5;
+/// Version 6 materializes the canonical web projection registry into indexed
+/// summary and entity-series blocks.
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 7;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///

@@ -1406,6 +1406,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "zstd",
 ]
 
 [[package]]
@@ -2035,6 +2036,7 @@ dependencies = [
 name = "pg_kronika-dump"
 version = "0.0.0"
 dependencies = [
+ "kronika-analytics",
  "kronika-format",
  "kronika-layout",
  "kronika-reader",

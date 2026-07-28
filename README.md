@@ -184,7 +184,13 @@ allow lists with `cargo run -p xtask -- check-deps`.
   failure can place the same immutable facts in that fallback.
 - **Derived fact sidecars.** `KRONIKA_WEB_DIR` is one PgKronika-owned data
   root. Every sealed `YYYY/MM/DD/N.pgm` has at most one same-day `N.ovf`
-  sibling. One independently constructed `FactStore` or process holds the
+  sibling. OVF uses directory addresses `(block_kind, logical_id)`: every file
+  has one `UiSummary`, while each present UI view has an independent
+  `EntitySeries(view_code)`. A reader can fetch one view without reading the
+  other views. Entity series use Zstd level 1 only when compression saves more
+  than 64 bytes; CRC32C covers stored bytes and decompression must produce the
+  exact bounded decoded length. Missing buckets remain distinct from observed
+  zeroes. One independently constructed `FactStore` or process holds the
   overview mutation lease; clones share it. Garbage collection scans the tree
   with fixed bounds, refuses to sweep after an unavailable, incomplete, or
   capped scan, and never deletes PGM source files or follows symlinks. Optional

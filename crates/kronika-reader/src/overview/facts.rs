@@ -46,6 +46,7 @@ use super::metric_extract::{
     MetricExtraction, cadence_covered_duration, extract_metrics, observed_cadence,
 };
 use super::observations::EventObservationsBlock;
+use super::web_index::{EntitySeriesBlock, UiSummaryBlock, WebIndexBlocks, build_web_index};
 
 /// Filesystem address of one sealed PGM and its sibling overview sidecar.
 #[derive(Debug, Clone)]
@@ -193,6 +194,8 @@ pub struct SegmentFacts {
     reset_markers: ResetMarkersBlock,
     entity_states: EntityStatesBlock,
     loss_coverage: LossCoverageBlock,
+    ui_summary: UiSummaryBlock,
+    entity_series: Vec<EntitySeriesBlock>,
     retained_text_bytes: u64,
     dictionary_fingerprints: Vec<DictionaryFingerprint>,
 }
@@ -225,11 +228,20 @@ impl SegmentFacts {
             segment_span(min_ts, max_ts)?,
             bounds,
         )?;
+        let web_index = build_web_index(unit, &extracted.observations, min_ts, max_ts, bounds)?;
         apply_descriptor_replacements(&mut extracted, &metrics)?;
-        let pgm_body_read_stats =
-            checked_add_read_stats(extracted.pgm_body_read_stats, metrics.pgm_body_read_stats)?;
+        let pgm_body_read_stats = checked_add_read_stats(
+            checked_add_read_stats(extracted.pgm_body_read_stats, metrics.pgm_body_read_stats)?,
+            web_index.pgm_body_read_stats,
+        )?;
         let facts = Self::assemble(
-            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+            identity,
+            lineage,
+            extracted,
+            metrics,
+            web_index,
+            (min_ts, max_ts),
+            bounds,
         )?;
         Ok((facts, pgm_body_read_stats))
     }
@@ -278,9 +290,16 @@ impl SegmentFacts {
             segment_span(min_ts, max_ts)?,
             bounds,
         )?;
+        let web_index = build_web_index(unit, &extracted.observations, min_ts, max_ts, bounds)?;
         apply_descriptor_replacements(&mut extracted, &metrics)?;
         Self::assemble(
-            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+            identity,
+            lineage,
+            extracted,
+            metrics,
+            web_index,
+            (min_ts, max_ts),
+            bounds,
         )
     }
 
@@ -339,8 +358,16 @@ impl SegmentFacts {
         else {
             return Ok(None);
         };
+        let web_index =
+            build_web_index(sealed_unit, &extracted.observations, min_ts, max_ts, bounds)?;
         Self::assemble(
-            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+            identity,
+            lineage,
+            extracted,
+            metrics,
+            web_index,
+            (min_ts, max_ts),
+            bounds,
         )
         .map(Some)
     }
@@ -351,8 +378,8 @@ impl SegmentFacts {
         lineage: SegmentIdentity,
         extracted: EventExtraction,
         metrics: MetricExtraction,
-        min_ts: i64,
-        max_ts: i64,
+        web_index: WebIndexBlocks,
+        observed_range: (i64, i64),
         bounds: &Bounds,
     ) -> Result<Self, BuildError> {
         let mut event_facts = extracted
@@ -362,7 +389,7 @@ impl SegmentFacts {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_error| BuildError::Internal)?;
         event_facts.extend(metrics.event_facts.iter().cloned());
-        let covered = segment_coverage(min_ts, max_ts)?;
+        let covered = segment_coverage(observed_range.0, observed_range.1)?;
         let counter_samples =
             CounterSamplesBlock::new_with_series(metrics.counter_series, metrics.counters, bounds)
                 .map_err(block_build_error)?;
@@ -411,6 +438,8 @@ impl SegmentFacts {
             reset_markers,
             entity_states,
             loss_coverage,
+            ui_summary: web_index.summary,
+            entity_series: web_index.series,
             retained_text_bytes: extracted.retained_text_bytes,
             dictionary_fingerprints: extracted.dictionary_fingerprints,
         })
@@ -429,16 +458,11 @@ impl SegmentFacts {
         unit: &PgmUnit<R>,
     ) -> Result<(HeaderIdentity, SegmentIdentity), BuildError> {
         let catalog = unit.catalog();
-        let first = catalog
+        catalog
             .entries
             .first()
             .ok_or(BuildError::Source(SourceError::UnsupportedLayout))?;
-        let lineage = SegmentIdentity::sealed(
-            catalog.source_id,
-            unit.source_descriptor().0,
-            first.type_id,
-            &CatalogEntryDescriptor::of(first).canonical_bytes(),
-        );
+        let lineage = SegmentIdentity::sealed(catalog.source_id, unit.source_descriptor().0);
         let identity = HeaderIdentity::from_current_contract(
             catalog.format_version,
             catalog.source_id,
@@ -511,6 +535,18 @@ impl SegmentFacts {
         &self.loss_coverage
     }
 
+    /// Exact per-view snapshot populations and collection states.
+    #[must_use]
+    pub const fn ui_summary(&self) -> &UiSummaryBlock {
+        &self.ui_summary
+    }
+
+    /// Canonical view-addressed local top-K blocks.
+    #[must_use]
+    pub fn entity_series(&self) -> &[EntitySeriesBlock] {
+        &self.entity_series
+    }
+
     /// Catalog manifest descriptors in catalog order.
     #[must_use]
     pub fn manifest_entries(&self) -> &[ManifestEntryDescriptor] {
@@ -552,6 +588,17 @@ impl SegmentFacts {
         let event_fact_heap = self.event_facts.iter().try_fold(0_usize, |total, fact| {
             total.checked_add(fact.resident_heap_bytes()?)
         })?;
+        let ui_summary = self.ui_summary.resident_heap_bytes()?;
+        let entity_series_slots = self
+            .entity_series
+            .capacity()
+            .checked_mul(size_of::<EntitySeriesBlock>())?;
+        let entity_series_heap = self
+            .entity_series
+            .iter()
+            .try_fold(0_usize, |total, block| {
+                total.checked_add(block.resident_heap_bytes()?)
+            })?;
         let dictionary = self
             .dictionary_fingerprints
             .capacity()
@@ -568,6 +615,9 @@ impl SegmentFacts {
             .checked_add(observation_heap)?
             .checked_add(event_fact_slots)?
             .checked_add(event_fact_heap)?
+            .checked_add(ui_summary)?
+            .checked_add(entity_series_slots)?
+            .checked_add(entity_series_heap)?
             .checked_add(self.loss_coverage.covered().resident_heap_bytes()?)?
             .checked_add(self.loss_coverage.known_gaps().resident_heap_bytes()?)?
             .checked_add(counter_samples)?
@@ -607,21 +657,25 @@ impl SegmentFacts {
         let observations = EventObservationsBlock::new(self.observations.clone(), bounds)?;
         let strings = observations.string_table().clone();
         let event_facts = EventFactsBlock::new(self.event_facts.clone(), &strings, bounds)?;
-        FactFile::build(
-            &self.identity,
-            vec![
-                BlockContent::SourceManifest(Box::new(manifest)),
-                BlockContent::StringTable(Box::new(strings)),
-                BlockContent::EventObservations(Box::new(observations)),
-                BlockContent::EventFacts(Box::new(event_facts)),
-                BlockContent::LossCoverage(Box::new(self.loss_coverage.clone())),
-                BlockContent::GaugeSamples(Box::new(self.gauge_samples.clone())),
-                BlockContent::CounterSamples(Box::new(self.counter_samples.clone())),
-                BlockContent::ResetMarkers(Box::new(self.reset_markers.clone())),
-                BlockContent::EntityStates(Box::new(self.entity_states.clone())),
-            ],
-            bounds,
-        )
+        let mut blocks = vec![
+            BlockContent::SourceManifest(Box::new(manifest)),
+            BlockContent::StringTable(Box::new(strings)),
+            BlockContent::EventObservations(Box::new(observations)),
+            BlockContent::EventFacts(Box::new(event_facts)),
+            BlockContent::LossCoverage(Box::new(self.loss_coverage.clone())),
+            BlockContent::GaugeSamples(Box::new(self.gauge_samples.clone())),
+            BlockContent::CounterSamples(Box::new(self.counter_samples.clone())),
+            BlockContent::ResetMarkers(Box::new(self.reset_markers.clone())),
+            BlockContent::EntityStates(Box::new(self.entity_states.clone())),
+            BlockContent::UiSummary(Box::new(self.ui_summary.clone())),
+        ];
+        blocks.extend(
+            self.entity_series
+                .iter()
+                .cloned()
+                .map(|series| BlockContent::EntitySeries(Box::new(series))),
+        );
+        FactFile::build(&self.identity, blocks, bounds)
     }
 
     /// Admits an in-memory fact-file buffer and reloads its facts.
@@ -668,6 +722,10 @@ impl SegmentFacts {
     ///
     /// Returns [`CacheReadError`] under the same conditions as
     /// [`Self::from_reader`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reload validates each canonical block before assembling one fact set"
+    )]
     pub fn from_reader_with_stats<R: ReadAt>(
         reader: R,
         expected: &HeaderIdentity,
@@ -757,6 +815,16 @@ impl SegmentFacts {
             expected.pgm_source_id,
         )?;
 
+        let (summary_entry, summary_body) = singleton_body(&mut fact_reader, BlockKind::UiSummary)?;
+        let ui_summary = UiSummaryBlock::decode(&summary_body, bounds)?;
+        validate_block_descriptor(&summary_entry, &ui_summary)?;
+        let mut entity_series = Vec::new();
+        for (entry, body) in fact_reader.read_blocks_with_entries(BlockKind::EntitySeries)? {
+            let series = EntitySeriesBlock::decode(&body, bounds)?;
+            validate_block_descriptor(&entry, &series)?;
+            entity_series.push(series);
+        }
+
         let coverage = merge_coverage_blocks(&mut fact_reader, bounds)?;
         let retained_text_bytes = bounds
             .decoded_block_len
@@ -775,6 +843,8 @@ impl SegmentFacts {
                 reset_markers,
                 entity_states,
                 loss_coverage: coverage,
+                ui_summary,
+                entity_series,
                 retained_text_bytes,
                 dictionary_fingerprints: Vec::new(),
             },
@@ -2061,6 +2131,7 @@ mod tests {
 
     use super::super::limits::LIMIT;
     use super::super::qualification_fixture::{ALL_FAMILY_SCHEMA_VERSION, all_family_fixture};
+    use super::super::web_index::EntitySeries;
     use super::*;
 
     const LIMITS: OracleLimits = OracleLimits {
@@ -3181,6 +3252,22 @@ mod tests {
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
         let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let encoded = raw.encode(&LIMIT).expect("encode fact file");
+        let admitted =
+            FactFile::admit(&encoded, raw.identity(), raw.lineage(), &LIMIT).expect("admit OVF");
+        let summary_entry = admitted
+            .directory()
+            .iter()
+            .find(|entry| entry.block_kind == BlockKind::UiSummary.code())
+            .expect("mandatory UI summary");
+        assert_eq!(summary_entry.logical_id, 0);
+        let summary = UiSummaryBlock::decode(
+            admitted
+                .block_body(BlockKind::UiSummary)
+                .expect("uncompressed UI summary body"),
+            &LIMIT,
+        )
+        .expect("decode UI summary");
+        assert_eq!(&summary, raw.ui_summary());
         let index = SegmentFacts::from_bytes(
             &encoded,
             raw.identity(),
@@ -3189,9 +3276,57 @@ mod tests {
             &LIMIT,
         )
         .expect("admit");
+        assert_eq!(index.ui_summary(), raw.ui_summary());
+        assert_eq!(index.entity_series(), raw.entity_series());
         let divergences =
             semantic_divergences(&index, &raw, full_range(), LIMITS).expect("bounded comparison");
         assert_eq!(divergences, Vec::<SemanticDivergence>::new());
+    }
+
+    #[test]
+    fn all_family_ovf_contains_populated_web_index() {
+        let bytes = all_family_fixture().sealed_bytes();
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("extract web index");
+        let encoded = raw.encode(&LIMIT).expect("encode OVF");
+        let admitted =
+            FactFile::admit(&encoded, raw.identity(), raw.lineage(), &LIMIT).expect("admit OVF");
+
+        let summary = UiSummaryBlock::decode(
+            admitted
+                .block_body(BlockKind::UiSummary)
+                .expect("mandatory UI summary"),
+            &LIMIT,
+        )
+        .expect("decode UI summary");
+        assert_eq!(summary.snapshot_times(), &[10, 20, 30, 40]);
+        assert_eq!(summary.population_at(9, 40), Some(1));
+
+        let series_entry = admitted
+            .directory()
+            .iter()
+            .find(|entry| {
+                entry.block_kind == BlockKind::EntitySeries.code() && entry.logical_id == 9
+            })
+            .expect("events entity series");
+        assert_eq!(series_entry.item_count, 1);
+        let series_body = admitted
+            .read_block(BlockKind::EntitySeries, 9)
+            .expect("read events entity series")
+            .expect("events entity series body");
+        let series =
+            EntitySeriesBlock::decode(&series_body, &LIMIT).expect("decode events entity series");
+        assert_eq!(series.view_code(), 9);
+        assert_eq!(series.metrics()[0].series().len(), 3);
+        assert_eq!(
+            series.metrics()[0]
+                .series()
+                .iter()
+                .map(EntitySeries::exact_score)
+                .collect::<Vec<_>>(),
+            vec![2.0, 1.0, 1.0],
+            "event rows are grouped by stable category before top-K ranking"
+        );
     }
 
     #[test]
@@ -3396,19 +3531,20 @@ mod tests {
                 .iter()
                 .map(|entry| entry.block_kind)
                 .collect::<Vec<_>>(),
-            BlockKind::ALL
+            BlockKind::BASELINE
                 .into_iter()
                 .map(BlockKind::code)
+                .chain(std::iter::once(BlockKind::EntitySeries.code()))
                 .collect::<Vec<_>>(),
-            "the qualification fixture must encode every canonical block exactly once"
+            "the fixture must encode every baseline block and its events series"
         );
 
         for entry in admitted.directory() {
             if entry.stored_len == 0 {
-                assert_eq!(
-                    entry.block_kind,
-                    BlockKind::StringTable.code(),
-                    "only the fixture's intentionally text-free string table is empty"
+                assert!(
+                    [BlockKind::StringTable.code(), BlockKind::UiSummary.code()]
+                        .contains(&entry.block_kind),
+                    "only the text-free string table and unbuilt web summary are empty"
                 );
                 continue;
             }
@@ -3441,7 +3577,7 @@ mod tests {
             .entries
             .clone();
         assert!(
-            catalog.len() > BlockKind::ALL.len(),
+            catalog.len() > BlockKind::BASELINE.len(),
             "the source fixture must exercise repeated section layouts"
         );
 

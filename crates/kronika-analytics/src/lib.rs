@@ -27,6 +27,7 @@
 pub mod anomaly;
 pub mod diff;
 pub mod overview;
+pub mod web_projection;
 
 pub use anomaly::{
     CategoryCount, CategoryShareChange, ChangeNotEvaluatedReason, Direction, DistributionEvidence,

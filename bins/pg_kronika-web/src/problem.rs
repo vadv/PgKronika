@@ -29,6 +29,7 @@ closed_string_enum! {
         UnknownQueryParameter => "unknown_query_parameter",
         DuplicateQueryParameter => "duplicate_query_parameter",
         InvalidQueryConstraint => "invalid_query_constraint",
+        UnknownSource => "unknown_source",
         UnknownSection => "unknown_section",
         InvalidCursor => "invalid_cursor",
         CursorQueryMismatch => "cursor_query_mismatch",
@@ -47,7 +48,9 @@ impl ProblemCode {
     pub(crate) const fn status(self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::RouteNotFound | Self::UnknownSection => StatusCode::NOT_FOUND,
+            Self::RouteNotFound | Self::UnknownSource | Self::UnknownSection => {
+                StatusCode::NOT_FOUND
+            }
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::MissingQueryParameter
             | Self::InvalidQueryParameter
@@ -79,6 +82,7 @@ impl ProblemCode {
             Self::InvalidQueryConstraint => {
                 "https://pgkronika.dev/problems/invalid-query-constraint"
             }
+            Self::UnknownSource => "https://pgkronika.dev/problems/unknown-source",
             Self::UnknownSection => "https://pgkronika.dev/problems/unknown-section",
             Self::InvalidCursor => "https://pgkronika.dev/problems/invalid-cursor",
             Self::CursorQueryMismatch => "https://pgkronika.dev/problems/cursor-query-mismatch",
@@ -104,8 +108,13 @@ closed_string_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum QueryParameter {
         Source => "source",
+        At => "at",
         From => "from",
         To => "to",
+        View => "view",
+        Metric => "metric",
+        Buckets => "buckets",
+        Top => "top",
         Window => "window",
         Step => "step",
         Threshold => "threshold",
@@ -125,8 +134,13 @@ impl QueryParameter {
     pub(crate) const fn from_query_name(name: &str) -> Option<Self> {
         match name.as_bytes() {
             b"source" => Some(Self::Source),
+            b"at" => Some(Self::At),
             b"from" => Some(Self::From),
             b"to" => Some(Self::To),
+            b"view" => Some(Self::View),
+            b"metric" => Some(Self::Metric),
+            b"buckets" => Some(Self::Buckets),
+            b"top" => Some(Self::Top),
             b"window" => Some(Self::Window),
             b"step" => Some(Self::Step),
             b"threshold" => Some(Self::Threshold),
@@ -187,6 +201,7 @@ closed_string_enum! {
         NonNegativeInteger => "non_negative_integer",
         SectionList => "section_list",
         Severity => "severity",
+        ProjectionCode => "projection_code",
     }
 }
 
@@ -264,6 +279,11 @@ struct SectionParams {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct SourceParams {
+    source: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct LimitParams {
     resource: LimitResource,
     limit: u64,
@@ -284,6 +304,7 @@ enum ProblemParams {
     InvalidParameter(InvalidParameterParams),
     UnknownParameter(UnknownParameterParams),
     Constraint(ConstraintParams),
+    Source(SourceParams),
     Section(SectionParams),
     Limit(LimitParams),
     Capacity(CapacityParams),
@@ -384,6 +405,13 @@ impl ApiProblem {
             ProblemParams::Section(SectionParams {
                 section: bounded_public_token(section),
             }),
+        )
+    }
+
+    pub(crate) fn unknown_source(source: u64) -> Self {
+        Self::new(
+            ProblemCode::UnknownSource,
+            ProblemParams::Source(SourceParams { source }),
         )
     }
 

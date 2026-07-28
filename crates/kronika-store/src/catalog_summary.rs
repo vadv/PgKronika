@@ -1,5 +1,7 @@
 //! Compact identities derived from validated PGM end catalogs.
 
+#[cfg(test)]
+use kronika_format::TAIL_INDEX_LEN;
 use kronika_format::{Catalog, DecodeError, Entry, FORMAT_VERSION, MAGIC};
 use sha2::{Digest as _, Sha256};
 
@@ -54,6 +56,28 @@ impl CatalogDigest {
 pub struct CatalogLayoutDigest([u8; 32]);
 
 impl CatalogLayoutDigest {
+    /// Derives the canonical layout identity of a validated catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an in-memory catalog contains more entries than the on-disk
+    /// `u32` entry-count field can represent.
+    #[must_use]
+    pub fn from_catalog(catalog: &Catalog) -> Self {
+        let entry_count = u32::try_from(catalog.entries.len())
+            .expect("a decoded PGM catalog entry count always fits u32");
+        catalog_digests(
+            catalog.source_id,
+            catalog.min_ts,
+            catalog.max_ts,
+            catalog.format_version,
+            catalog.window_count,
+            entry_count,
+            catalog.entries.iter().copied(),
+        )
+        .1
+    }
+
     /// Returns the digest bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -329,8 +353,6 @@ const fn mix64(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::TAIL_INDEX_LEN;
-
     use super::*;
 
     fn catalog() -> Catalog {

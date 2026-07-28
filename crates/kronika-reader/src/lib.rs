@@ -45,16 +45,18 @@ pub use overview::{
     BlockCodec, BlockContent, BlockDirectoryEntry, BlockError, BlockFlags, BlockKind, Bounds,
     BuildError, CacheReadError, CacheRebuildReason, CatalogEntryDescriptor, CounterSamplesBlock,
     DEFAULT_FALLBACK_BYTES, DEFAULT_FALLBACK_SEGMENT_HOURS, DictionaryContextEntry,
-    EntityStateRecord, EntityStatesBlock, EventFactsBlock, EventObservationsBlock, FactBuildKey,
-    FactFile, FactFileHeader, FactFileReader, FactKey, FactLoad, FactOrigin, FactReadStats,
-    FactStore, FallbackConfig, FallbackConfigError, FallbackStats, FileKind, FoldEffect,
-    GaugeSamplesBlock, GcCategoryUsage, GcConfig, GcConfigError, GcMark, GcOutcome, GcSkipReason,
-    GcUsage, HeaderIdentity, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState,
+    EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, EntityStateRecord,
+    EntityStatesBlock, EventFactsBlock, EventObservationsBlock, FactBuildKey, FactFile,
+    FactFileHeader, FactFileReader, FactKey, FactLoad, FactOrigin, FactReadStats, FactStore,
+    FallbackConfig, FallbackConfigError, FallbackStats, FileKind, FoldEffect, GaugeSamplesBlock,
+    GcCategoryUsage, GcConfig, GcConfigError, GcMark, GcOutcome, GcSkipReason, GcUsage,
+    HeaderIdentity, IndexStatus, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState,
     LiveView, LossCoverageBlock, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS,
-    ManifestEntryDescriptor, PersistError, PersistFailureClass, PersistMode, PersistModeSnapshot,
-    PersistenceProbeOutcome, ResetMarker, ResetMarkersBlock, ResolvedPattern, SealOutcome,
-    SegmentContext, SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock,
-    StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id,
+    METRIC_FLAG_CANONICAL, ManifestEntryDescriptor, MetricAggregation, MetricStatus, PersistError,
+    PersistFailureClass, PersistMode, PersistModeSnapshot, PersistenceProbeOutcome, ResetMarker,
+    ResetMarkersBlock, ResolvedPattern, SealOutcome, SegmentContext, SegmentFacts,
+    SourceDescriptor, SourceError, SourceManifestBlock, StringTableBlock, TargetedDictionaryRead,
+    TargetedDictionaryStats, TimeGrid, UiSummaryBlock, ViewSummary, dictionary_context_id,
     lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
 };
 pub use query::{
@@ -70,7 +72,7 @@ pub use refresh::{
     PartId, PartTransition, RefreshDelta, SealedLocator, SegmentDescriptor, catalog_digest,
     classify_transition, part_id,
 };
-pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta};
+pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta, WebIndexReadError};
 
 /// Returns the versioned registry-backed all-family parity qualification fixture.
 ///

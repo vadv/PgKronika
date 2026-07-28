@@ -171,6 +171,42 @@ fn sealed_snapshot_cache_hit_after_reopen_reads_no_pgm_bodies() {
 }
 
 #[test]
+fn selective_web_index_read_loads_only_the_addressed_ovf_body() {
+    let source = tempfile::tempdir().expect("source directory");
+    write_segment(source.path(), 1_500, &lifecycle_part(7));
+    let store = FactStore::new(source.path());
+    let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
+    let descriptor = snapshot
+        .sealed_descriptors()
+        .next()
+        .expect("sealed descriptor");
+    snapshot
+        .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+        .expect("publish populated facts");
+
+    let (summary, summary_stats) = snapshot
+        .read_ui_summary(&descriptor, &LIMIT)
+        .expect("selective summary");
+    assert_eq!(summary.population_at(9, 1_500), Some(1));
+    assert_eq!(summary_stats.read_calls, 3);
+    assert!(summary_stats.decoded_bytes > 0);
+
+    let (events, events_stats) = snapshot
+        .read_entity_series(&descriptor, 9, &LIMIT)
+        .expect("selective events");
+    assert!(events.is_some());
+    assert_eq!(events_stats.read_calls, 3);
+    assert!(events_stats.decoded_bytes > 0);
+
+    let (missing, missing_stats) = snapshot
+        .read_entity_series(&descriptor, 2, &LIMIT)
+        .expect("absent view");
+    assert!(missing.is_none());
+    assert_eq!(missing_stats.read_calls, 2);
+    assert_eq!(missing_stats.decoded_bytes, 0);
+}
+
+#[test]
 fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
     let source = tempfile::tempdir().expect("source directory");
     let bytes = lifecycle_part(7);

@@ -5,7 +5,9 @@
 //! known logical block. [`FactFileReader`] exposes the same metadata checks for
 //! positional sources and reads only requested block bodies.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Read};
 
 use kronika_analytics::overview::{
     CONTAINER_VERSION, EXTRACTOR_SEMANTICS_VERSION, FACT_SCHEMA_VERSION, REGISTRY_CONTRACT_VERSION,
@@ -24,6 +26,7 @@ use super::event_facts::EventFactsBlock;
 use super::factkey::{FactKey, FileKind};
 use super::limits::Bounds;
 use super::observations::EventObservationsBlock;
+use super::web_index::{EntitySeriesBlock, UiSummaryBlock};
 
 const MAGIC: [u8; 8] = *b"PGKOVF\0\0";
 const HEADER_LEN: usize = 192;
@@ -34,7 +37,11 @@ const DIRECTORY_ENTRY_LEN_U16: u16 = 64;
 const FILE_KIND_SEGMENT_FACTS: u16 = 1;
 const DESCRIPTOR_KIND_CATALOG: u16 = 1;
 const BLOCK_SCHEMA_VERSION: u16 = 3;
+const WEB_BLOCK_SCHEMA_VERSION: u16 = 1;
 const HEADER_CRC_OFFSET: usize = 188;
+const ZSTD_LEVEL: i32 = 1;
+const ZSTD_MIN_SAVING: usize = DIRECTORY_ENTRY_LEN;
+const ZSTD_WINDOW_LOG_MAX: u32 = 19;
 
 /// Source and compatibility identity serialized in a fact-file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +122,7 @@ pub struct BlockDirectoryEntry {
     pub block_schema_version: u16,
     /// Parsed flags.
     pub flags: BlockFlags,
-    /// Stable factor or source ID, or zero for segment-wide data.
+    /// Stable view, factor, or source ID; zero for segment-wide data.
     pub logical_id: u32,
     /// Absolute offset of stored bytes.
     pub offset: u64,
@@ -224,6 +231,10 @@ pub enum BlockContent {
     EntityStates(Box<EntityStatesBlock>),
     /// Retained text and byte values.
     StringTable(Box<StringTableBlock>),
+    /// Shared web UI times, populations, and view status.
+    UiSummary(Box<UiSummaryBlock>),
+    /// Top-K and heatmap series for one independently addressable view.
+    EntitySeries(Box<EntitySeriesBlock>),
 }
 
 impl BlockContent {
@@ -240,6 +251,26 @@ impl BlockContent {
             Self::ResetMarkers(block) => block.kind(),
             Self::EntityStates(block) => block.kind(),
             Self::StringTable(block) => block.kind(),
+            Self::UiSummary(block) => block.kind(),
+            Self::EntitySeries(block) => block.kind(),
+        }
+    }
+
+    /// Directory logical ID.
+    #[must_use]
+    pub fn logical_id(&self) -> u32 {
+        match self {
+            Self::EntitySeries(block) => u32::from(block.view_code()),
+            Self::SourceManifest(_)
+            | Self::EventObservations(_)
+            | Self::EventFacts(_)
+            | Self::LossCoverage(_)
+            | Self::GaugeSamples(_)
+            | Self::CounterSamples(_)
+            | Self::ResetMarkers(_)
+            | Self::EntityStates(_)
+            | Self::StringTable(_)
+            | Self::UiSummary(_) => 0,
         }
     }
 
@@ -254,6 +285,8 @@ impl BlockContent {
             Self::ResetMarkers(block) => encoded_block(block.as_ref()),
             Self::EntityStates(block) => encoded_block(block.as_ref()),
             Self::StringTable(block) => encoded_block(block.as_ref()),
+            Self::UiSummary(block) => encoded_block(block.as_ref()),
+            Self::EntitySeries(block) => encoded_block(block.as_ref()),
         }
     }
 }
@@ -305,12 +338,19 @@ impl FactFile {
         &self.directory
     }
 
-    /// First admitted body of `kind`.
+    /// Admitted singleton body of `kind`.
+    ///
+    /// Logically addressed `EntitySeries` and compressed bodies require
+    /// [`Self::read_block`] because this borrowed API cannot select an address
+    /// or return decompressed storage.
     #[must_use]
     pub fn block_body(&self, kind: BlockKind) -> Option<&[u8]> {
+        if kind == BlockKind::EntitySeries {
+            return None;
+        }
         self.directory
             .iter()
-            .find(|entry| entry.block_kind == kind.code())
+            .find(|entry| entry.block_kind == kind.code() && entry.flags.codec == BlockCodec::None)
             .and_then(|entry| {
                 let start = usize::try_from(entry.offset).ok()?;
                 let length = usize::try_from(entry.stored_len).ok()?;
@@ -319,7 +359,32 @@ impl FactFile {
             })
     }
 
-    /// Builds one canonical version-1 fact file.
+    /// Returns one decoded body addressed by `(kind, logical_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheReadError::Corrupt`] when a compressed body does not
+    /// satisfy its exact decoded length.
+    pub fn read_block(
+        &self,
+        kind: BlockKind,
+        logical_id: u32,
+    ) -> Result<Option<Vec<u8>>, CacheReadError> {
+        let Some(entry) = self
+            .directory
+            .iter()
+            .find(|entry| entry.block_kind == kind.code() && entry.logical_id == logical_id)
+        else {
+            return Ok(None);
+        };
+        let start = usize::try_from(entry.offset).map_err(|_error| CacheReadError::Corrupt)?;
+        let length = usize::try_from(entry.stored_len).map_err(|_error| CacheReadError::Corrupt)?;
+        let end = start.checked_add(length).ok_or(CacheReadError::Corrupt)?;
+        let stored = self.bytes.get(start..end).ok_or(CacheReadError::Corrupt)?;
+        Ok(Some(decoded_body(entry, stored)?.into_owned()))
+    }
+
+    /// Builds one canonical fact file.
     ///
     /// `SOURCE_MANIFEST` is mandatory because its metadata must match the
     /// header. Other missing baseline kinds are inserted as canonical empty
@@ -340,17 +405,31 @@ impl FactFile {
     ) -> Result<Vec<u8>, CacheReadError> {
         validate_api_inputs(identity, bounds)?;
 
-        let mut present = [false; BlockKind::ALL.len()];
-        let mut selected = Vec::with_capacity(BlockKind::ALL.len());
+        if blocks.len()
+            > usize::try_from(bounds.directory_entries)
+                .map_err(|_error| CacheReadError::Oversized)?
+        {
+            return Err(CacheReadError::Oversized);
+        }
+        let mut present = [false; BlockKind::BASELINE.len()];
+        let mut addresses = BTreeSet::new();
+        let mut selected = Vec::with_capacity(
+            blocks
+                .len()
+                .checked_add(BlockKind::BASELINE.len())
+                .ok_or(CacheReadError::Oversized)?,
+        );
         for block in blocks {
-            let index = baseline_index(block.kind());
-            if present[index] {
+            let address = (block.kind(), block.logical_id());
+            if !addresses.insert(address) {
                 return Err(CacheReadError::Corrupt);
             }
-            present[index] = true;
+            if let Some(index) = baseline_index(block.kind()) {
+                present[index] = true;
+            }
             selected.push(block);
         }
-        if !present[baseline_index(BlockKind::SourceManifest)] {
+        if !present[baseline_index(BlockKind::SourceManifest).ok_or(CacheReadError::Corrupt)?] {
             return Err(CacheReadError::Corrupt);
         }
         let observation_strings = selected.iter().find_map(|block| match block {
@@ -382,7 +461,7 @@ impl FactFile {
         }
         for (index, was_present) in present.into_iter().enumerate() {
             if !was_present {
-                let kind = BlockKind::ALL[index];
+                let kind = BlockKind::BASELINE[index];
                 if kind == BlockKind::StringTable {
                     selected.push(BlockContent::StringTable(Box::new(
                         observation_strings
@@ -394,7 +473,7 @@ impl FactFile {
                 }
             }
         }
-        selected.sort_by_key(|block| block.kind().code());
+        selected.sort_by_key(|block| (block.kind().code(), block.logical_id()));
 
         if let Some(BlockContent::SourceManifest(manifest)) = selected.first() {
             verify_manifest_identity(manifest, identity)?;
@@ -413,12 +492,17 @@ impl FactFile {
 
         for block in &selected {
             let encoded = block.encoded();
-            let stored_len = encoded.body.len() as u64;
-            if stored_len > bounds.stored_block_len || stored_len > bounds.decoded_block_len {
+            let decoded_len = encoded.body.len() as u64;
+            if decoded_len > decoded_len_bound(block.kind(), bounds) {
+                return Err(CacheReadError::Oversized);
+            }
+            let (codec, stored_body) = encode_stored_body(block.kind(), encoded.body)?;
+            let stored_len = stored_body.len() as u64;
+            if stored_len > stored_len_bound(block.kind(), bounds) {
                 return Err(CacheReadError::Oversized);
             }
             decoded_sum = decoded_sum
-                .checked_add(stored_len)
+                .checked_add(decoded_len)
                 .ok_or(CacheReadError::Oversized)?;
             if decoded_sum > bounds.decoded_file_bytes {
                 return Err(CacheReadError::Oversized);
@@ -428,7 +512,7 @@ impl FactFile {
             if u64::from(item_count) > item_count_bound(block.kind().code(), bounds) {
                 return Err(CacheReadError::Oversized);
             }
-            if (item_count == 0) != encoded.body.is_empty() {
+            if (item_count == 0) != (decoded_len == 0) {
                 return Err(CacheReadError::Corrupt);
             }
             let (min_ts_us, max_ts_us) = encoded.time_range.unwrap_or((0, 0));
@@ -443,23 +527,25 @@ impl FactFile {
                 required_for_schema: true,
                 canonically_sorted: encoded.sorted,
                 has_time_range: encoded.time_range.is_some(),
-                codec: BlockCodec::None,
+                codec,
             };
             write_directory_entry(
                 &mut directory,
                 block.kind().code(),
+                block.logical_id(),
                 flags,
                 offset,
                 stored_len,
+                decoded_len,
                 item_count,
-                crc32c(&encoded.body),
+                crc32c(&stored_body),
                 min_ts_us,
                 max_ts_us,
             );
             offset = offset
                 .checked_add(stored_len)
                 .ok_or(CacheReadError::Oversized)?;
-            bodies.push(encoded.body);
+            bodies.push(stored_body);
         }
         if offset > bounds.fact_file_len {
             return Err(CacheReadError::Oversized);
@@ -550,6 +636,26 @@ pub struct FactFileReader<R: ReadAt> {
 }
 
 impl<R: ReadAt> FactFileReader<R> {
+    /// Reads fixed metadata and validates the identity carried by the file.
+    ///
+    /// Unlike [`Self::open`], standalone inspection does not bind the fact file
+    /// to an externally supplied PGM identity. It still verifies the
+    /// content-derived fact key and sealed segment lineage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheReadError`] when metadata, embedded identity, or a safety
+    /// bound is invalid.
+    pub fn inspect(reader: R, bounds: &Bounds) -> Result<Self, CacheReadError> {
+        let file = Self::open_inner(reader, None, bounds)?;
+        let identity = &file.header.identity;
+        let lineage = SegmentIdentity::sealed(identity.pgm_source_id, identity.source_descriptor.0);
+        if lineage.id() != identity.segment_lineage_id {
+            return Err(CacheReadError::Corrupt);
+        }
+        Ok(file)
+    }
+
     /// Reads only the fixed header and bounded directory.
     ///
     /// # Errors
@@ -561,6 +667,17 @@ impl<R: ReadAt> FactFileReader<R> {
         bounds: &Bounds,
     ) -> Result<Self, CacheReadError> {
         validate_api_inputs(expected, bounds)?;
+        Self::open_inner(reader, Some(expected), bounds)
+    }
+
+    fn open_inner(
+        reader: R,
+        expected: Option<&HeaderIdentity>,
+        bounds: &Bounds,
+    ) -> Result<Self, CacheReadError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(CacheReadError::Oversized);
+        }
         let file_len = reader.byte_len()?;
         if file_len > bounds.fact_file_len {
             return Err(CacheReadError::Oversized);
@@ -572,7 +689,11 @@ impl<R: ReadAt> FactFileReader<R> {
         let mut header_bytes = [0_u8; HEADER_LEN];
         reader.read_exact_at(&mut header_bytes, 0)?;
         let (header, directory_crc) = decode_header(&header_bytes)?;
-        verify_identity(&header.identity, expected)?;
+        if let Some(expected) = expected {
+            verify_identity(&header.identity, expected)?;
+        } else {
+            validate_api_inputs(&header.identity, bounds)?;
+        }
         if header.file_len != file_len {
             return Err(CacheReadError::Corrupt);
         }
@@ -638,6 +759,28 @@ impl<R: ReadAt> FactFileReader<R> {
             .collect())
     }
 
+    /// Reads one decoded block addressed by `(kind, logical_id)`.
+    ///
+    /// No body read is issued when the address is absent. CRC is verified
+    /// before optional bounded decompression.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheReadError`] for an I/O error, CRC failure, malformed
+    /// compressed bytes, an exact-length mismatch, or counter overflow.
+    pub fn read_block(
+        &mut self,
+        kind: BlockKind,
+        logical_id: u32,
+    ) -> Result<Option<Vec<u8>>, CacheReadError> {
+        let entry = self
+            .directory
+            .iter()
+            .find(|entry| entry.block_kind == kind.code() && entry.logical_id == logical_id)
+            .copied();
+        entry.map(|entry| self.read_entry(entry)).transpose()
+    }
+
     /// Reads blocks of `kind` with the admitted directory entry for each body.
     ///
     /// The entry lets a selective logical decoder verify item count, canonical
@@ -695,33 +838,42 @@ impl<R: ReadAt> FactFileReader<R> {
             .collect();
         let mut bodies = Vec::with_capacity(selected.len());
         for entry in selected {
-            let length =
-                usize::try_from(entry.stored_len).map_err(|_error| CacheReadError::Oversized)?;
-            let mut body = vec![0_u8; length];
-            if !body.is_empty() {
-                self.reader.read_exact_at(&mut body, entry.offset)?;
-                self.stats.read_calls = self
-                    .stats
-                    .read_calls
-                    .checked_add(1)
-                    .ok_or(CacheReadError::Oversized)?;
-                self.stats.stored_bytes_read = self
-                    .stats
-                    .stored_bytes_read
-                    .checked_add(entry.stored_len)
-                    .ok_or(CacheReadError::Oversized)?;
-            }
-            if crc32c(&body) != entry.block_crc32c {
-                return Err(CacheReadError::Corrupt);
-            }
-            self.stats.decoded_bytes = self
-                .stats
-                .decoded_bytes
-                .checked_add(entry.decoded_len)
-                .ok_or(CacheReadError::Oversized)?;
+            let body = self.read_entry(entry)?;
             bodies.push((entry, body));
         }
         Ok(bodies)
+    }
+
+    fn read_entry(&mut self, entry: BlockDirectoryEntry) -> Result<Vec<u8>, CacheReadError> {
+        let length =
+            usize::try_from(entry.stored_len).map_err(|_error| CacheReadError::Oversized)?;
+        let mut stored = vec![0_u8; length];
+        if !stored.is_empty() {
+            self.reader.read_exact_at(&mut stored, entry.offset)?;
+            self.stats.read_calls = self
+                .stats
+                .read_calls
+                .checked_add(1)
+                .ok_or(CacheReadError::Oversized)?;
+            self.stats.stored_bytes_read = self
+                .stats
+                .stored_bytes_read
+                .checked_add(entry.stored_len)
+                .ok_or(CacheReadError::Oversized)?;
+        }
+        if crc32c(&stored) != entry.block_crc32c {
+            return Err(CacheReadError::Corrupt);
+        }
+        let decoded = match entry.flags.codec {
+            BlockCodec::None => stored,
+            BlockCodec::Zstd => decoded_body(&entry, &stored)?.into_owned(),
+        };
+        self.stats.decoded_bytes = self
+            .stats
+            .decoded_bytes
+            .checked_add(entry.decoded_len)
+            .ok_or(CacheReadError::Oversized)?;
+        Ok(decoded)
     }
 }
 
@@ -944,14 +1096,20 @@ fn decode_directory(
             return Err(CacheReadError::Corrupt);
         }
         let flags = BlockFlags::from_bits(raw_flags)?;
-        if flags.codec != BlockCodec::None {
-            return Err(CacheReadError::Incompatible);
-        }
-        if let Some(kind) = BlockKind::from_code(block_kind) {
-            if block_schema_version != BLOCK_SCHEMA_VERSION {
+        let known_kind = BlockKind::from_code(block_kind);
+        if let Some(kind) = known_kind {
+            if block_schema_version != expected_block_schema_version(kind) {
                 return Err(CacheReadError::Incompatible);
             }
             if !flags.required_for_schema || flags.canonically_sorted != expected_sorted(kind) {
+                return Err(CacheReadError::Corrupt);
+            }
+            if flags.codec == BlockCodec::Zstd && kind != BlockKind::EntitySeries {
+                return Err(CacheReadError::Incompatible);
+            }
+            if (kind == BlockKind::UiSummary && logical_id != 0)
+                || (kind == BlockKind::EntitySeries && logical_id == 0)
+            {
                 return Err(CacheReadError::Corrupt);
             }
         } else if flags.required_for_schema {
@@ -960,7 +1118,13 @@ fn decode_directory(
         if stored_len > bounds.stored_block_len || decoded_len > bounds.decoded_block_len {
             return Err(CacheReadError::Oversized);
         }
-        if stored_len != decoded_len {
+        if let Some(kind) = known_kind
+            && (stored_len > stored_len_bound(kind, bounds)
+                || decoded_len > decoded_len_bound(kind, bounds))
+        {
+            return Err(CacheReadError::Oversized);
+        }
+        if flags.codec == BlockCodec::None && stored_len != decoded_len {
             return Err(CacheReadError::Corrupt);
         }
         if u64::from(item_count) > item_count_bound(block_kind, bounds) {
@@ -1087,15 +1251,26 @@ fn validate_directory(
 }
 
 fn item_count_bound(block_kind: u32, bounds: &Bounds) -> u64 {
-    if block_kind == BlockKind::SourceManifest.code() {
-        u64::from(bounds.directory_entries) + 1
-    } else {
-        bounds.items_per_block
+    match BlockKind::from_code(block_kind) {
+        Some(BlockKind::SourceManifest) => u64::from(bounds.directory_entries) + 1,
+        Some(BlockKind::UiSummary) => bounds.web_summary_views,
+        Some(BlockKind::EntitySeries) => bounds.web_metrics_per_view,
+        Some(
+            BlockKind::EventObservations
+            | BlockKind::EventFacts
+            | BlockKind::LossCoverage
+            | BlockKind::GaugeSamples
+            | BlockKind::CounterSamples
+            | BlockKind::ResetMarkers
+            | BlockKind::EntityStates
+            | BlockKind::StringTable,
+        )
+        | None => bounds.items_per_block,
     }
 }
 
 fn verify_required_baseline(directory: &[BlockDirectoryEntry]) -> Result<(), CacheReadError> {
-    for kind in BlockKind::ALL {
+    for kind in BlockKind::BASELINE {
         let count = directory
             .iter()
             .filter(|entry| entry.block_kind == kind.code())
@@ -1105,9 +1280,21 @@ fn verify_required_baseline(directory: &[BlockDirectoryEntry]) -> Result<(), Cac
         }
         if matches!(
             kind,
-            BlockKind::SourceManifest | BlockKind::EventFacts | BlockKind::StringTable
+            BlockKind::SourceManifest
+                | BlockKind::EventFacts
+                | BlockKind::StringTable
+                | BlockKind::UiSummary
         ) && count != 1
         {
+            return Err(CacheReadError::Corrupt);
+        }
+    }
+    let mut series_by_view = BTreeSet::new();
+    for entry in directory
+        .iter()
+        .filter(|entry| entry.block_kind == BlockKind::EntitySeries.code())
+    {
+        if !series_by_view.insert(entry.logical_id) {
             return Err(CacheReadError::Corrupt);
         }
     }
@@ -1125,13 +1312,15 @@ fn validate_logical_blocks(
         .iter()
         .position(|entry| entry.block_kind == BlockKind::SourceManifest.code())
         .ok_or(CacheReadError::Corrupt)?;
-    let manifest = SourceManifestBlock::decode(bodies[manifest_index], bounds)?;
+    let manifest_body = decoded_body(&directory[manifest_index], bodies[manifest_index])?;
+    let manifest = SourceManifestBlock::decode(&manifest_body, bounds)?;
     verify_manifest_identity(&manifest, identity)?;
     let strings_index = directory
         .iter()
         .position(|entry| entry.block_kind == BlockKind::StringTable.code())
         .ok_or(CacheReadError::Corrupt)?;
-    let strings = StringTableBlock::decode(bodies[strings_index], bounds)?;
+    let strings_body = decoded_body(&directory[strings_index], bodies[strings_index])?;
+    let strings = StringTableBlock::decode(&strings_body, bounds)?;
     let mut referenced_strings = Vec::new();
     let mut remaining_observations = bounds.items_per_block;
     let mut observation_text_budget = bounds.decoded_block_len;
@@ -1142,11 +1331,12 @@ fn validate_logical_blocks(
         let Some(kind) = BlockKind::from_code(entry.block_kind) else {
             continue;
         };
+        let body = decoded_body(entry, body)?;
         let logical = match kind {
             BlockKind::SourceManifest => logical_descriptor(&manifest),
             BlockKind::EventObservations => {
                 let block = EventObservationsBlock::decode_with_budgets(
-                    body,
+                    &body,
                     lineage,
                     &strings,
                     bounds,
@@ -1158,7 +1348,7 @@ fn validate_logical_blocks(
                 logical_descriptor(&block)
             }
             BlockKind::EventFacts => {
-                let block = EventFactsBlock::decode(body, &strings, bounds)?;
+                let block = EventFactsBlock::decode(&body, &strings, bounds)?;
                 if block.string_table() != &strings {
                     return Err(CacheReadError::Corrupt);
                 }
@@ -1166,25 +1356,38 @@ fn validate_logical_blocks(
             }
             BlockKind::LossCoverage => {
                 logical_descriptor(&LossCoverageBlock::decode_with_span_budgets(
-                    body,
+                    &body,
                     bounds,
                     &mut covered_span_budget,
                     &mut gap_span_budget,
                 )?)
             }
             BlockKind::GaugeSamples => {
-                logical_descriptor(&GaugeSamplesBlock::decode(body, bounds)?)
+                logical_descriptor(&GaugeSamplesBlock::decode(&body, bounds)?)
             }
             BlockKind::CounterSamples => {
-                logical_descriptor(&CounterSamplesBlock::decode(body, bounds)?)
+                logical_descriptor(&CounterSamplesBlock::decode(&body, bounds)?)
             }
             BlockKind::ResetMarkers => {
-                logical_descriptor(&ResetMarkersBlock::decode(body, bounds)?)
+                logical_descriptor(&ResetMarkersBlock::decode(&body, bounds)?)
             }
             BlockKind::EntityStates => {
-                logical_descriptor(&EntityStatesBlock::decode(body, bounds)?)
+                logical_descriptor(&EntityStatesBlock::decode(&body, bounds)?)
             }
-            BlockKind::StringTable => logical_descriptor(&StringTableBlock::decode(body, bounds)?),
+            BlockKind::StringTable => logical_descriptor(&strings),
+            BlockKind::UiSummary => {
+                if entry.logical_id != 0 {
+                    return Err(CacheReadError::Corrupt);
+                }
+                logical_descriptor(&UiSummaryBlock::decode(&body, bounds)?)
+            }
+            BlockKind::EntitySeries => {
+                let block = EntitySeriesBlock::decode(&body, bounds)?;
+                if entry.logical_id != u32::from(block.view_code()) {
+                    return Err(CacheReadError::Corrupt);
+                }
+                logical_descriptor(&block)
+            }
         };
         validate_logical_descriptor(entry, &logical)?;
     }
@@ -1275,6 +1478,103 @@ fn expected_sorted(kind: BlockKind) -> bool {
     kind != BlockKind::SourceManifest
 }
 
+const fn expected_block_schema_version(kind: BlockKind) -> u16 {
+    match kind {
+        BlockKind::UiSummary | BlockKind::EntitySeries => WEB_BLOCK_SCHEMA_VERSION,
+        BlockKind::SourceManifest
+        | BlockKind::EventObservations
+        | BlockKind::EventFacts
+        | BlockKind::LossCoverage
+        | BlockKind::GaugeSamples
+        | BlockKind::CounterSamples
+        | BlockKind::ResetMarkers
+        | BlockKind::EntityStates
+        | BlockKind::StringTable => BLOCK_SCHEMA_VERSION,
+    }
+}
+
+const fn decoded_len_bound(kind: BlockKind, bounds: &Bounds) -> u64 {
+    match kind {
+        BlockKind::UiSummary => bounds.web_summary_decoded_bytes,
+        BlockKind::EntitySeries => bounds.web_series_decoded_bytes,
+        BlockKind::SourceManifest
+        | BlockKind::EventObservations
+        | BlockKind::EventFacts
+        | BlockKind::LossCoverage
+        | BlockKind::GaugeSamples
+        | BlockKind::CounterSamples
+        | BlockKind::ResetMarkers
+        | BlockKind::EntityStates
+        | BlockKind::StringTable => bounds.decoded_block_len,
+    }
+}
+
+const fn stored_len_bound(kind: BlockKind, bounds: &Bounds) -> u64 {
+    match kind {
+        BlockKind::EntitySeries => bounds.web_series_stored_bytes,
+        BlockKind::SourceManifest
+        | BlockKind::EventObservations
+        | BlockKind::EventFacts
+        | BlockKind::LossCoverage
+        | BlockKind::GaugeSamples
+        | BlockKind::CounterSamples
+        | BlockKind::ResetMarkers
+        | BlockKind::EntityStates
+        | BlockKind::StringTable
+        | BlockKind::UiSummary => bounds.stored_block_len,
+    }
+}
+
+fn encode_stored_body(
+    kind: BlockKind,
+    decoded: Vec<u8>,
+) -> Result<(BlockCodec, Vec<u8>), CacheReadError> {
+    if kind != BlockKind::EntitySeries || decoded.is_empty() {
+        return Ok((BlockCodec::None, decoded));
+    }
+    let compressed =
+        zstd::stream::encode_all(decoded.as_slice(), ZSTD_LEVEL).map_err(CacheReadError::Io)?;
+    if compressed
+        .len()
+        .checked_add(ZSTD_MIN_SAVING)
+        .is_some_and(|threshold| threshold < decoded.len())
+    {
+        Ok((BlockCodec::Zstd, compressed))
+    } else {
+        Ok((BlockCodec::None, decoded))
+    }
+}
+
+fn decoded_body<'a>(
+    entry: &BlockDirectoryEntry,
+    stored: &'a [u8],
+) -> Result<Cow<'a, [u8]>, CacheReadError> {
+    if entry.flags.codec == BlockCodec::None {
+        return Ok(Cow::Borrowed(stored));
+    }
+    let decoded_len =
+        usize::try_from(entry.decoded_len).map_err(|_error| CacheReadError::Oversized)?;
+    let cursor = Cursor::new(stored);
+    let mut zstd_reader = zstd::stream::read::Decoder::with_buffer(cursor)
+        .map_err(|_error| CacheReadError::Corrupt)?;
+    zstd_reader
+        .window_log_max(ZSTD_WINDOW_LOG_MAX)
+        .map_err(|_error| CacheReadError::Corrupt)?;
+    let mut output = vec![0_u8; decoded_len];
+    zstd_reader
+        .read_exact(&mut output)
+        .map_err(|_error| CacheReadError::Corrupt)?;
+    let mut extra = [0_u8; 1];
+    if zstd_reader
+        .read(&mut extra)
+        .map_err(|_error| CacheReadError::Corrupt)?
+        != 0
+    {
+        return Err(CacheReadError::Corrupt);
+    }
+    Ok(Cow::Owned(output))
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "arguments mirror the fixed directory entry"
@@ -1282,39 +1582,46 @@ fn expected_sorted(kind: BlockKind) -> bool {
 fn write_directory_entry(
     writer: &mut ByteWriter,
     block_kind: u32,
+    logical_id: u32,
     flags: BlockFlags,
     offset: u64,
     stored_len: u64,
+    decoded_len: u64,
     item_count: u32,
     block_crc32c: u32,
     min_ts_us: i64,
     max_ts_us: i64,
 ) {
     writer.u32_le(block_kind);
-    writer.u16_le(BLOCK_SCHEMA_VERSION);
+    writer.u16_le(
+        BlockKind::from_code(block_kind)
+            .map_or(BLOCK_SCHEMA_VERSION, expected_block_schema_version),
+    );
     writer.u16_le(flags.to_bits());
-    writer.u32_le(0);
+    writer.u32_le(logical_id);
     writer.u32_le(0);
     writer.u64_le(offset);
     writer.u64_le(stored_len);
-    writer.u64_le(stored_len);
+    writer.u64_le(decoded_len);
     writer.u32_le(item_count);
     writer.u32_le(block_crc32c);
     writer.i64_le(min_ts_us);
     writer.i64_le(max_ts_us);
 }
 
-const fn baseline_index(kind: BlockKind) -> usize {
+const fn baseline_index(kind: BlockKind) -> Option<usize> {
     match kind {
-        BlockKind::SourceManifest => 0,
-        BlockKind::EventObservations => 1,
-        BlockKind::EventFacts => 2,
-        BlockKind::LossCoverage => 3,
-        BlockKind::GaugeSamples => 4,
-        BlockKind::CounterSamples => 5,
-        BlockKind::ResetMarkers => 6,
-        BlockKind::EntityStates => 7,
-        BlockKind::StringTable => 8,
+        BlockKind::SourceManifest => Some(0),
+        BlockKind::EventObservations => Some(1),
+        BlockKind::EventFacts => Some(2),
+        BlockKind::LossCoverage => Some(3),
+        BlockKind::GaugeSamples => Some(4),
+        BlockKind::CounterSamples => Some(5),
+        BlockKind::ResetMarkers => Some(6),
+        BlockKind::EntityStates => Some(7),
+        BlockKind::StringTable => Some(8),
+        BlockKind::UiSummary => Some(9),
+        BlockKind::EntitySeries => None,
     }
 }
 
@@ -1325,7 +1632,7 @@ fn empty_block(kind: BlockKind, bounds: &Bounds) -> Result<BlockContent, CacheRe
     };
 
     match kind {
-        BlockKind::SourceManifest => Err(CacheReadError::Corrupt),
+        BlockKind::SourceManifest | BlockKind::EntitySeries => Err(CacheReadError::Corrupt),
         BlockKind::EventObservations => Ok(BlockContent::EventObservations(Box::new(
             EventObservationsBlock::new(Vec::new(), bounds)?,
         ))),
@@ -1363,6 +1670,7 @@ fn empty_block(kind: BlockKind, bounds: &Bounds) -> Result<BlockContent, CacheRe
             Vec::new(),
             bounds,
         )?))),
+        BlockKind::UiSummary => Ok(BlockContent::UiSummary(Box::new(UiSummaryBlock::empty()))),
     }
 }
 
@@ -1382,6 +1690,10 @@ mod tests {
     use super::super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor};
     use super::super::facts::SegmentFacts;
     use super::super::limits::LIMIT;
+    use super::super::web_index::{
+        EntityDictionaryEntry, EntityMetric, EntitySeries, IndexStatus, METRIC_FLAG_CANONICAL,
+        MetricAggregation, MetricStatus, TimeGrid,
+    };
     use super::*;
 
     fn identity() -> HeaderIdentity {
@@ -1398,7 +1710,7 @@ mod tests {
     }
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(7, [0x22; 32], 1_006_001, b"first")
+        SegmentIdentity::sealed(7, [0x22; 32])
     }
 
     fn event_lineage() -> SegmentIdentity {
@@ -1537,6 +1849,42 @@ mod tests {
 
     fn valid_file() -> Vec<u8> {
         FactFile::build(&identity(), sample_blocks(), &LIMIT).expect("build")
+    }
+
+    fn web_series_block(view_code: u16, key: u8) -> EntitySeriesBlock {
+        let grid = TimeGrid::for_range(1_000, 2_000).expect("grid");
+        let dictionary = EntityDictionaryEntry::new(
+            vec![key; 256],
+            String::from_utf8(vec![b'a' + key; 160]).expect("ASCII label"),
+            &LIMIT,
+        )
+        .expect("dictionary");
+        let series = EntitySeries::new(0, 1.0, 1.0, vec![1], vec![255], &LIMIT).expect("series");
+        let metric = EntityMetric::new(
+            1,
+            1,
+            METRIC_FLAG_CANONICAL,
+            1,
+            MetricAggregation::Sum,
+            MetricStatus::Complete,
+            0.0,
+            vec![series],
+            &LIMIT,
+        )
+        .expect("metric");
+        EntitySeriesBlock::new(
+            view_code,
+            1,
+            1,
+            IndexStatus::Complete,
+            (1_000, 2_000),
+            grid,
+            vec![1],
+            vec![dictionary],
+            vec![metric],
+            &LIMIT,
+        )
+        .expect("series block")
     }
 
     fn u32_at(bytes: &[u8], offset: usize) -> u32 {
@@ -1879,12 +2227,12 @@ mod tests {
         assert_eq!(
             encoded,
             concat!(
-                "50474b4f564600000200c0000100000003000000050000000100000001000000",
+                "50474b4f564600000200c0000100000004000000070000000100000001000000",
                 "0700000000000000e803000000000000d0070000000000000010000000000000",
                 "2222222222222222222222222222222222222222222222222222222222222222",
-                "0f5f858cedc70fc4b8310a3e6ec674a9968ba3f45c03fb1e642f8570ef6add17",
-                "e73b670ad7aa416e8cf61c89131021e400d089bc2488d5906d5422829205f1de",
-                "c0000000000000000900000040000100d204000000000000443322118451343e",
+                "3ed3efce95f3c5f75ba8a6dfc972daf7882558c57cc8e91118ae8869efd19254",
+                "39908d412362ac445b8020355de54029abd363f91229bf3cc53f977239aba912",
+                "c0000000000000000900000040000100d204000000000000443322117875810c",
             )
         );
     }
@@ -2225,7 +2573,7 @@ mod tests {
         append_empty_optional_block(&mut bytes);
         let admitted =
             FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT).expect("optional block");
-        assert_eq!(admitted.directory().len(), BlockKind::ALL.len() + 1);
+        assert_eq!(admitted.directory().len(), BlockKind::BASELINE.len() + 1);
         assert_eq!(
             admitted.directory().last().expect("entry").block_kind,
             9_999
@@ -2344,6 +2692,38 @@ mod tests {
     }
 
     #[test]
+    fn positional_inspection_admits_metadata_without_external_identity() {
+        let bytes = valid_file();
+        let reader = FactFileReader::inspect(bytes.as_slice(), &LIMIT).expect("inspect");
+        assert_eq!(reader.header().file_len, bytes.len() as u64);
+        assert_eq!(reader.directory().len(), BlockKind::BASELINE.len());
+        assert_eq!(reader.stats().read_calls, 2);
+    }
+
+    #[test]
+    fn positional_inspection_rejects_an_invalid_embedded_fact_key() {
+        let mut bytes = valid_file();
+        bytes[96] ^= 1;
+        reseal_header(&mut bytes);
+        assert!(matches!(
+            FactFileReader::inspect(bytes.as_slice(), &LIMIT),
+            Err(CacheReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn positional_reader_classifies_a_foreign_descriptor_before_internal_identity() {
+        let mut bytes = valid_file();
+        bytes[64] ^= 1;
+        reseal_header(&mut bytes);
+
+        assert!(matches!(
+            FactFileReader::open(bytes.as_slice(), &identity(), &LIMIT),
+            Err(CacheReadError::WrongSource)
+        ));
+    }
+
+    #[test]
     fn positional_reader_reads_only_metadata_and_selected_bodies() {
         let bytes = valid_file();
         let calls = Rc::new(Cell::new(0));
@@ -2354,7 +2734,7 @@ mod tests {
             read_bytes: Rc::clone(&read_bytes),
         };
         let mut file = FactFileReader::open(reader, &identity(), &LIMIT).expect("open");
-        let metadata_bytes = HEADER_LEN_U64 + BlockKind::ALL.len() as u64 * 64;
+        let metadata_bytes = HEADER_LEN_U64 + BlockKind::BASELINE.len() as u64 * 64;
         assert_eq!(file.stats().read_calls, 2);
         assert_eq!(file.stats().stored_bytes_read, metadata_bytes);
         assert_eq!(calls.get(), file.stats().read_calls);
@@ -2403,7 +2783,7 @@ mod tests {
             read_bytes: Rc::clone(&read_bytes),
         };
         let mut file = FactFileReader::open(reader, &identity(), &LIMIT).expect("metadata");
-        let metadata_bytes = HEADER_LEN_U64 + BlockKind::ALL.len() as u64 * 64;
+        let metadata_bytes = HEADER_LEN_U64 + BlockKind::BASELINE.len() as u64 * 64;
         assert_eq!(calls.get(), 2);
         assert_eq!(read_bytes.get(), metadata_bytes);
 
@@ -2418,6 +2798,221 @@ mod tests {
         assert_eq!(file.stats().stored_bytes_read, read_bytes.get());
         assert_eq!(file.stats().decoded_bytes, 0);
         assert!(file.stats().stored_bytes_read < bytes.len() as u64);
+    }
+
+    #[test]
+    fn builder_adds_ui_summary_and_addresses_series_by_view() {
+        let first = web_series_block(1, 1);
+        let second = web_series_block(2, 2);
+        let bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::EntitySeries(Box::new(second)),
+                BlockContent::EntitySeries(Box::new(first)),
+            ],
+            &LIMIT,
+        )
+        .expect("build web index");
+        let admitted =
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT).expect("admit web index");
+
+        let summaries: Vec<_> = admitted
+            .directory()
+            .iter()
+            .filter(|entry| entry.block_kind == BlockKind::UiSummary.code())
+            .collect();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].logical_id, 0);
+        assert_eq!(summaries[0].flags.codec, BlockCodec::None);
+        assert_eq!(summaries[0].item_count, 0);
+
+        let series: Vec<_> = admitted
+            .directory()
+            .iter()
+            .filter(|entry| entry.block_kind == BlockKind::EntitySeries.code())
+            .collect();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].logical_id, 1);
+        assert_eq!(series[1].logical_id, 2);
+        assert!(
+            series
+                .iter()
+                .all(|entry| entry.flags.codec == BlockCodec::Zstd)
+        );
+    }
+
+    #[test]
+    fn positional_inspection_reads_typed_web_index_blocks() {
+        let bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::EntitySeries(Box::new(web_series_block(1, 1))),
+            ],
+            &LIMIT,
+        )
+        .expect("build web index");
+        let mut reader = FactFileReader::inspect(bytes.as_slice(), &LIMIT).expect("inspect");
+
+        assert!(
+            reader
+                .read_ui_summary(&LIMIT)
+                .expect("summary")
+                .views()
+                .is_empty()
+        );
+        let series = reader
+            .read_entity_series(1, &LIMIT)
+            .expect("series read")
+            .expect("series block");
+        assert_eq!(series.view_code(), 1);
+        assert_eq!(
+            reader
+                .read_entity_series(2, &LIMIT)
+                .expect("missing series"),
+            None
+        );
+    }
+
+    #[test]
+    fn positional_reader_reads_and_decompresses_only_one_view() {
+        let expected = web_series_block(2, 2);
+        let bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::EntitySeries(Box::new(web_series_block(1, 1))),
+                BlockContent::EntitySeries(Box::new(expected.clone())),
+            ],
+            &LIMIT,
+        )
+        .expect("build web index");
+        let calls = Rc::new(Cell::new(0));
+        let read_bytes = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            bytes: &bytes,
+            calls: Rc::clone(&calls),
+            read_bytes: Rc::clone(&read_bytes),
+        };
+        let mut file = FactFileReader::open(reader, &identity(), &LIMIT).expect("metadata");
+        let before = file.stats();
+        let selected = file
+            .read_block(BlockKind::EntitySeries, 2)
+            .expect("read view")
+            .expect("view exists");
+        let decoded = EntitySeriesBlock::decode(&selected, &LIMIT).expect("decode view");
+
+        assert_eq!(decoded, expected);
+        assert_eq!(file.stats().read_calls, before.read_calls + 1);
+        let selected_entry = file
+            .directory()
+            .iter()
+            .find(|entry| {
+                entry.block_kind == BlockKind::EntitySeries.code() && entry.logical_id == 2
+            })
+            .expect("selected entry");
+        assert_eq!(
+            file.stats().stored_bytes_read,
+            before.stored_bytes_read + selected_entry.stored_len
+        );
+        assert_eq!(
+            file.stats().decoded_bytes,
+            before.decoded_bytes + selected_entry.decoded_len
+        );
+        assert_eq!(calls.get(), file.stats().read_calls);
+        assert_eq!(read_bytes.get(), file.stats().stored_bytes_read);
+    }
+
+    #[test]
+    fn duplicate_entity_series_logical_id_is_rejected() {
+        let result = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::EntitySeries(Box::new(web_series_block(1, 1))),
+                BlockContent::EntitySeries(Box::new(web_series_block(1, 2))),
+            ],
+            &LIMIT,
+        );
+
+        assert!(matches!(result, Err(CacheReadError::Corrupt)));
+    }
+
+    #[test]
+    fn borrowed_body_api_rejects_logically_addressed_block_kinds() {
+        let grid = TimeGrid::for_range(1_000, 2_000).expect("grid");
+        let dictionary =
+            EntityDictionaryEntry::new(vec![1], "x".to_owned(), &LIMIT).expect("dictionary");
+        let series = EntitySeries::new(0, 1.0, 1.0, vec![1], vec![255], &LIMIT).expect("series");
+        let metric = EntityMetric::new(
+            1,
+            1,
+            METRIC_FLAG_CANONICAL,
+            1,
+            MetricAggregation::Sum,
+            MetricStatus::Complete,
+            0.0,
+            vec![series],
+            &LIMIT,
+        )
+        .expect("metric");
+        let block = EntitySeriesBlock::new(
+            1,
+            1,
+            1,
+            IndexStatus::Complete,
+            (1_000, 2_000),
+            grid,
+            vec![1],
+            vec![dictionary],
+            vec![metric],
+            &LIMIT,
+        )
+        .expect("series block");
+        let bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::EntitySeries(Box::new(block)),
+            ],
+            &LIMIT,
+        )
+        .expect("build web index");
+        let admitted =
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT).expect("admit web index");
+        let entry = admitted
+            .directory()
+            .iter()
+            .find(|entry| entry.block_kind == BlockKind::EntitySeries.code())
+            .expect("entity series entry");
+        assert_eq!(entry.flags.codec, BlockCodec::None);
+
+        assert!(admitted.block_body(BlockKind::EntitySeries).is_none());
+    }
+
+    #[test]
+    fn zstd_decode_never_exceeds_declared_length() {
+        let mut bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::EntitySeries(Box::new(web_series_block(1, 1))),
+            ],
+            &LIMIT,
+        )
+        .expect("build web index");
+        let series = entry_index(&bytes, BlockKind::EntitySeries);
+        bytes[entry_field(series, 32)..entry_field(series, 32) + 8]
+            .copy_from_slice(&1_u64.to_le_bytes());
+        reseal_directory(&mut bytes);
+
+        let mut file =
+            FactFileReader::open(bytes.as_slice(), &identity(), &LIMIT).expect("metadata");
+        assert!(matches!(
+            file.read_block(BlockKind::EntitySeries, 1),
+            Err(CacheReadError::Corrupt)
+        ));
     }
 
     #[test]
