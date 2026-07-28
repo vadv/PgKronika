@@ -5,6 +5,11 @@ use super::{IndexStatus, TimeGrid, bit_is_set, mask_len, validate_mask};
 
 const SUMMARY_REVISION: u16 = 1;
 
+#[cfg(test)]
+std::thread_local! {
+    static ENCODE_BODY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Per-snapshot population and collection status of one UI view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewSummary {
@@ -174,8 +179,18 @@ impl UiSummaryBlock {
     pub fn new(
         grid: TimeGrid,
         snapshot_times: Vec<i64>,
+        views: Vec<ViewSummary>,
+        bounds: &Bounds,
+    ) -> Result<Self, BlockError> {
+        Self::from_parts(grid, snapshot_times, views, bounds, None)
+    }
+
+    fn from_parts(
+        grid: TimeGrid,
+        snapshot_times: Vec<i64>,
         mut views: Vec<ViewSummary>,
         bounds: &Bounds,
+        decoded_len: Option<usize>,
     ) -> Result<Self, BlockError> {
         let timestamp_count =
             u64::try_from(snapshot_times.len()).map_err(|_error| BlockError::AboveBound)?;
@@ -231,8 +246,8 @@ impl UiSummaryBlock {
             snapshot_times,
             views,
         };
-        let encoded_len =
-            u64::try_from(block.encode_body().len()).map_err(|_error| BlockError::AboveBound)?;
+        let encoded_len = decoded_len.unwrap_or_else(|| block.encode_body().len());
+        let encoded_len = u64::try_from(encoded_len).map_err(|_error| BlockError::AboveBound)?;
         if encoded_len > bounds.web_summary_decoded_bytes {
             return Err(BlockError::AboveBound);
         }
@@ -327,7 +342,7 @@ impl UiSummaryBlock {
         {
             return Err(BlockError::Unsorted);
         }
-        let block = Self::new(grid, snapshot_times, views, bounds)?;
+        let block = Self::from_parts(grid, snapshot_times, views, bounds, Some(body.len()))?;
         if block
             .views
             .iter()
@@ -423,6 +438,9 @@ impl UiSummaryBlock {
     }
 
     pub(super) fn encode_body(&self) -> Vec<u8> {
+        #[cfg(test)]
+        ENCODE_BODY_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         let Some(grid) = self.grid else {
             return Vec::new();
         };
@@ -481,7 +499,7 @@ fn nonnegative_i64(value: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::{IndexStatus, TimeGrid};
-    use super::{UiSummaryBlock, ViewSummary};
+    use super::{ENCODE_BODY_CALLS, UiSummaryBlock, ViewSummary};
     use crate::overview::block::BlockError;
     use crate::overview::limits::LIMIT;
 
@@ -521,6 +539,28 @@ mod tests {
         assert_eq!(decoded, block);
         assert_eq!(decoded.views()[0].view_code(), 1);
         assert_eq!(decoded.snapshot_times(), &[0, 60_000_000, 120_000_000]);
+    }
+
+    #[test]
+    fn ui_summary_decode_does_not_reencode_a_validated_body() {
+        let grid = TimeGrid::for_range(0, 0).expect("grid");
+        let view = ViewSummary::new(
+            1,
+            1,
+            IndexStatus::Complete,
+            vec![1],
+            vec![0],
+            vec![1],
+            &LIMIT,
+        )
+        .expect("view");
+        let block = UiSummaryBlock::new(grid, vec![0], vec![view], &LIMIT).expect("summary");
+        let body = block.encode_body();
+        ENCODE_BODY_CALLS.with(|calls| calls.set(0));
+
+        UiSummaryBlock::decode(&body, &LIMIT).expect("decode");
+
+        ENCODE_BODY_CALLS.with(|calls| assert_eq!(calls.get(), 0));
     }
 
     #[test]

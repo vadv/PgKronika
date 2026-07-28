@@ -21,7 +21,7 @@ bulk codec, proptest, встроенный test harness.
   musl-target на этой машине не линкует zstd/mimalloc; Linux musl проверяет CI.
 - `UiSummary`: не более 32 view, 4096 timestamps и 64 КиБ decoded bytes.
 - `EntitySeries`: не более 16 metrics, K=64, 256 buckets, 1024 dictionary
-  entries, 256 КиБ decoded и 128 КиБ stored bytes на view.
+  entries, 256 КиБ decoded и stored bytes на view.
 - Identity не длиннее 256 байтов, label не длиннее 160 байтов.
 - Декомпрессия резервирует и проверяет `decoded_len` до allocation.
 - Новые rustdoc/comments описывают contract и bounds, а не пересказывают код.

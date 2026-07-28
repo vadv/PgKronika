@@ -249,9 +249,12 @@ q = round(value / max_bucket_value * 255)  otherwise
 value' = q / 255 * max_bucket_value
 ```
 
-Значения конечны и неотрицательны. Ошибка одного восстановленного
-bucket не превышает `max_bucket_value / 255`. `exact_score` не
-квантуется и используется для отбора и оценки качества range top.
+Значения конечны и неотрицательны. При `max_bucket_value > 0`
+каноническая серия содержит хотя бы один `q = 255`; иначе заявленный
+максимум не заякорен наблюдаемым bucket и блок отвергается. Ошибка одного
+восстановленного bucket не превышает `max_bucket_value / 255`.
+`exact_score` не квантуется и используется для отбора и оценки качества
+range top.
 
 ## Identity сущности
 
@@ -427,12 +430,16 @@ API возвращает для неё `unavailable_revision`; фоновая п
 | dictionary entries на view | 1024 |
 | decoded `UiSummary` | 64 КиБ |
 | decoded `EntitySeries` view | 256 КиБ |
-| stored `EntitySeries` view | 128 КиБ |
+| stored `EntitySeries` view | 256 КиБ |
 | окно Zstd decompressor | 512 КиБ |
 | decoded source rows одного view | 64 МиБ |
 | дополнительная память builder `UiSummary` | 4 МиБ |
 | дополнительная память builder одного view | 32 МиБ |
 | одновременно строящихся view на writer | 1 |
+
+Stored-cap равен decoded-cap, поэтому валидный, но плохо сжимаемый view
+может быть записан без codec. Writer всё равно выбирает Zstd, когда он
+уменьшает тело хотя бы на минимальный установленный порог.
 
 Oversized directory entry отвергается до чтения тела. Декомпрессия,
 которая не укладывается в `decoded_len` или bound, прекращается

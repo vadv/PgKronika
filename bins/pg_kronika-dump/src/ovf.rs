@@ -196,15 +196,17 @@ fn entity_series_output(
                         .ok_or_else(|| {
                             DumpError::message("OVF entity_ref is outside dictionary")
                         })?;
+                    let mut values = vec![None; bucket_count];
+                    for (bucket, value) in series.observed_values() {
+                        values[bucket] = Some(value);
+                    }
                     Ok(OvfEntitySeriesItemOutput {
                         entity_ref: series.entity_ref(),
                         key: entity.key.clone(),
                         label: entity.label.clone(),
                         exact_score: series.exact_score(),
                         max_bucket_value: series.max_bucket_value(),
-                        values: (0..bucket_count)
-                            .map(|bucket| series.value_at(bucket))
-                            .collect(),
+                        values,
                     })
                 })
                 .collect::<Result<_, DumpError>>()?;

@@ -136,10 +136,14 @@ pub const LIMIT: Bounds = Bounds {
     web_dictionary_entries: 1_024,
     web_summary_decoded_bytes: 64 * KIB,
     web_series_decoded_bytes: 256 * KIB,
-    web_series_stored_bytes: 128 * KIB,
+    web_series_stored_bytes: 256 * KIB,
 };
 
 const KIB: u64 = 1_024;
+const _: () = assert!(
+    LIMIT.web_series_stored_bytes >= LIMIT.web_series_decoded_bytes,
+    "a decoded-valid block must remain storable when compression is ineffective"
+);
 const MIB: u64 = 1_024 * 1_024;
 const GIB: u64 = 1_024 * MIB;
 
@@ -171,6 +175,6 @@ mod tests {
         assert_eq!(LIMIT.web_dictionary_entries, 1_024);
         assert_eq!(LIMIT.web_summary_decoded_bytes, 65_536);
         assert_eq!(LIMIT.web_series_decoded_bytes, 262_144);
-        assert_eq!(LIMIT.web_series_stored_bytes, 131_072);
+        assert_eq!(LIMIT.web_series_stored_bytes, 262_144);
     }
 }

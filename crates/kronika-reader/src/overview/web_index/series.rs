@@ -6,6 +6,11 @@ use super::{IndexStatus, TimeGrid, bit_is_set, mask_len, validate_mask};
 const SERIES_BLOCK_REVISION: u16 = 1;
 const FORMAT_TOP_K: usize = 64;
 
+#[cfg(test)]
+std::thread_local! {
+    static ENCODE_BODY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Marks the metric used as the canonical sparkline for its view.
 pub const METRIC_FLAG_CANONICAL: u16 = 1 << 0;
 const KNOWN_METRIC_FLAGS: u16 = METRIC_FLAG_CANONICAL;
@@ -149,6 +154,9 @@ impl EntitySeries {
         if max_bucket_value == 0.0
             && (exact_score != 0.0 || quantized_values.iter().any(|value| *value != 0))
         {
+            return Err(BlockError::Malformed);
+        }
+        if max_bucket_value > 0.0 && !quantized_values.contains(&u8::MAX) {
             return Err(BlockError::Malformed);
         }
         Ok(Self {
@@ -383,6 +391,38 @@ impl EntitySeriesBlock {
         metrics: Vec<EntityMetric>,
         bounds: &Bounds,
     ) -> Result<Self, BlockError> {
+        Self::from_parts(
+            view_code,
+            view_revision,
+            identity_revision,
+            status,
+            observed_range,
+            grid,
+            coverage_mask,
+            dictionary,
+            metrics,
+            bounds,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "arguments mirror one independently addressable view block"
+    )]
+    fn from_parts(
+        view_code: u16,
+        view_revision: u16,
+        identity_revision: u16,
+        status: IndexStatus,
+        observed_range: (i64, i64),
+        grid: TimeGrid,
+        coverage_mask: Vec<u8>,
+        dictionary: Vec<EntityDictionaryEntry>,
+        metrics: Vec<EntityMetric>,
+        bounds: &Bounds,
+        decoded_len: Option<usize>,
+    ) -> Result<Self, BlockError> {
         if view_code == 0 || view_revision == 0 || identity_revision == 0 {
             return Err(BlockError::Malformed);
         }
@@ -415,7 +455,8 @@ impl EntitySeriesBlock {
             dictionary,
             metrics,
         };
-        if exceeds_len(block.encode_body().len(), bounds.web_series_decoded_bytes) {
+        let decoded_len = decoded_len.unwrap_or_else(|| block.encode_body().len());
+        if exceeds_len(decoded_len, bounds.web_series_decoded_bytes) {
             return Err(BlockError::AboveBound);
         }
         Ok(block)
@@ -511,7 +552,7 @@ impl EntitySeriesBlock {
             )?);
         }
         reader.finish()?;
-        Self::new(
+        Self::from_parts(
             view_code,
             view_revision,
             identity_revision,
@@ -522,6 +563,7 @@ impl EntitySeriesBlock {
             dictionary,
             metrics,
             bounds,
+            Some(body.len()),
         )
     }
 
@@ -615,6 +657,9 @@ impl EntitySeriesBlock {
     }
 
     pub(super) fn encode_body(&self) -> Vec<u8> {
+        #[cfg(test)]
+        ENCODE_BODY_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         let mut writer = ByteWriter::new();
         writer.u16_le(SERIES_BLOCK_REVISION);
         writer.u16_le(self.view_code);
@@ -817,7 +862,7 @@ fn validate_observed_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock,
+        ENCODE_BODY_CALLS, EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock,
         METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus,
     };
     use crate::overview::block::BlockError;
@@ -877,6 +922,31 @@ mod tests {
     }
 
     #[test]
+    fn entity_series_decode_does_not_reencode_a_validated_body() {
+        let grid = TimeGrid::for_range(0, 0).expect("grid");
+        let series = EntitySeries::new(0, 1.0, 1.0, vec![1], vec![255], &LIMIT).expect("series");
+        let block = EntitySeriesBlock::new(
+            1,
+            1,
+            1,
+            IndexStatus::Complete,
+            (0, 0),
+            grid,
+            vec![1],
+            vec![dictionary_entry(1)],
+            vec![complete_metric(vec![series])],
+            &LIMIT,
+        )
+        .expect("block");
+        let body = block.encode_body();
+        ENCODE_BODY_CALLS.with(|calls| calls.set(0));
+
+        EntitySeriesBlock::decode(&body, &LIMIT).expect("decode");
+
+        ENCODE_BODY_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
     fn entity_series_rejects_duplicate_dictionary_keys() {
         let grid = TimeGrid::for_range(0, 0).expect("grid");
         let result = EntitySeriesBlock::new(
@@ -932,6 +1002,14 @@ mod tests {
         );
         assert_eq!(
             EntitySeries::new(0, 1.0, -1.0, vec![1], vec![1], &LIMIT),
+            Err(BlockError::Malformed)
+        );
+    }
+
+    #[test]
+    fn entity_series_rejects_an_unanchored_positive_scale() {
+        assert_eq!(
+            EntitySeries::new(0, 1.0, 10.0, vec![1], vec![1], &LIMIT),
             Err(BlockError::Malformed)
         );
     }

@@ -338,12 +338,16 @@ impl FactFile {
         &self.directory
     }
 
-    /// First admitted body of `kind`.
+    /// Admitted singleton body of `kind`.
     ///
-    /// Compressed bodies require [`Self::read_block`] because they cannot be
-    /// returned as a slice of the stored file.
+    /// Logically addressed `EntitySeries` and compressed bodies require
+    /// [`Self::read_block`] because this borrowed API cannot select an address
+    /// or return decompressed storage.
     #[must_use]
     pub fn block_body(&self, kind: BlockKind) -> Option<&[u8]> {
+        if kind == BlockKind::EntitySeries {
+            return None;
+        }
         self.directory
             .iter()
             .find(|entry| entry.block_kind == kind.code() && entry.flags.codec == BlockCodec::None)
@@ -2933,6 +2937,58 @@ mod tests {
         );
 
         assert!(matches!(result, Err(CacheReadError::Corrupt)));
+    }
+
+    #[test]
+    fn borrowed_body_api_rejects_logically_addressed_block_kinds() {
+        let grid = TimeGrid::for_range(1_000, 2_000).expect("grid");
+        let dictionary =
+            EntityDictionaryEntry::new(vec![1], "x".to_owned(), &LIMIT).expect("dictionary");
+        let series = EntitySeries::new(0, 1.0, 1.0, vec![1], vec![255], &LIMIT).expect("series");
+        let metric = EntityMetric::new(
+            1,
+            1,
+            METRIC_FLAG_CANONICAL,
+            1,
+            MetricAggregation::Sum,
+            MetricStatus::Complete,
+            0.0,
+            vec![series],
+            &LIMIT,
+        )
+        .expect("metric");
+        let block = EntitySeriesBlock::new(
+            1,
+            1,
+            1,
+            IndexStatus::Complete,
+            (1_000, 2_000),
+            grid,
+            vec![1],
+            vec![dictionary],
+            vec![metric],
+            &LIMIT,
+        )
+        .expect("series block");
+        let bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::EntitySeries(Box::new(block)),
+            ],
+            &LIMIT,
+        )
+        .expect("build web index");
+        let admitted =
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT).expect("admit web index");
+        let entry = admitted
+            .directory()
+            .iter()
+            .find(|entry| entry.block_kind == BlockKind::EntitySeries.code())
+            .expect("entity series entry");
+        assert_eq!(entry.flags.codec, BlockCodec::None);
+
+        assert!(admitted.block_body(BlockKind::EntitySeries).is_none());
     }
 
     #[test]
