@@ -715,7 +715,7 @@ mod tests {
             &SeriesSet::for_test(0),
             typed,
             &lenses,
-            &IncidentConfig::for_test("node", 5, 10_000, ClockRelation::Unknown),
+            &IncidentConfig::for_test(5, 10_000, ClockRelation::Unknown),
         )
         .expect("bounded evaluation")
         .incidents[0]

@@ -33,25 +33,6 @@ async fn segments_missing_a_required_parameter_is_a_bad_request() {
     );
 }
 
-#[tokio::test]
-async fn segments_rejects_the_removed_source_parameter() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "1000.pgm", 1_000, 2_000);
-
-    let (status, body) = serve(dir.path(), "/v1/segments?source=abc&from=0&to=1000").await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "the removed source parameter is a client error"
-    );
-    assert_problem(
-        &body,
-        status,
-        "unknown_query_parameter",
-        serde_json::json!({ "parameter": "source" }),
-    );
-}
-
 /// Write a `pg_stat_archiver` segment holding `rows`.
 fn write_archiver_segment(
     dir: &std::path::Path,

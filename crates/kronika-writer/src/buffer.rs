@@ -277,7 +277,6 @@ mod tests {
         InstanceMetadata {
             ts: Ts(ts),
             hostname: StrId(1),
-            node_self_id: StrId(2),
             pg_version_num: 170_000,
             kernel_version: StrId(3),
             pg_system_identifier: Some(7),

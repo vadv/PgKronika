@@ -2,7 +2,7 @@
 //! (README.md, "Service Sections").
 //!
 //! Mandatory in every segment carrying `PostgreSQL` or OS snapshots. It records
-//! the source identity and version used to interpret other sections:
+//! the node identity and version used to interpret other sections:
 //! `pg_version_num` explains version-dependent columns (a PG17 layout drops
 //! `pg_stat_bgwriter` counters), and the OS fields (`clock_ticks_per_sec`,
 //! `page_size_bytes`, `boot_id`, `btime`) make OS sections self-contained.
@@ -24,9 +24,6 @@ pub struct InstanceMetadata {
     /// Collector hostname.
     #[column(l)]
     pub hostname: StrId,
-    /// Stable node id the collector assigns itself.
-    #[column(l)]
-    pub node_self_id: StrId,
     /// `server_version_num`, e.g. 170000 for PG17.
     #[column(l)]
     pub pg_version_num: i32,
@@ -61,7 +58,6 @@ mod tests {
         InstanceMetadata {
             ts: Ts(1_000_000),
             hostname: StrId(1),
-            node_self_id: StrId(2),
             pg_version_num: 170_000,
             kernel_version: StrId(3),
             pg_system_identifier: Some(7_300_000_000_000_000_000),
@@ -75,6 +71,29 @@ mod tests {
     #[test]
     fn contract_passes_the_linter() {
         assert_eq!(lint(&[InstanceMetadata::CONTRACT]), Ok(()));
+    }
+
+    #[test]
+    fn contract_contains_only_passive_factual_columns() {
+        let names: Vec<&str> = InstanceMetadata::CONTRACT
+            .columns
+            .iter()
+            .map(|column| column.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "ts",
+                "hostname",
+                "pg_version_num",
+                "kernel_version",
+                "pg_system_identifier",
+                "clock_ticks_per_sec",
+                "page_size_bytes",
+                "boot_id",
+                "btime",
+            ]
+        );
     }
 
     #[test]

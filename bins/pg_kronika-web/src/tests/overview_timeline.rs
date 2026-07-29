@@ -277,15 +277,6 @@ async fn overview_requires_the_range_bounds() {
 }
 
 #[tokio::test]
-async fn timeline_rejects_the_removed_source_parameter() {
-    let (_dir, status, body) =
-        fixture_response("/v1/timeline/overview?source=7&from=0&to=1000000000").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "unknown_query_parameter");
-    assert_eq!(body["params"]["parameter"], "source");
-}
-
-#[tokio::test]
 async fn timeline_aggregates_all_segments_in_the_root() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_panic_segment_for(dir.path(), "early.pgm", 0, 2);
@@ -299,8 +290,6 @@ async fn timeline_aggregates_all_segments_in_the_root() {
         overview["event_digest"]["retained_error_occurrence_count"],
         5
     );
-    assert!(overview["meta"].get("sources").is_none());
-
     let (event_status, events) = serve_state(state, "/v1/timeline/events?from=0&to=1000000").await;
     assert_eq!(event_status, StatusCode::OK);
     assert_eq!(events["events"].as_array().expect("events").len(), 5);
@@ -352,7 +341,6 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
     };
     assert_eq!(fact["event_kind"], "pg.database.deadlock_delta");
     assert_eq!(fact["notable_class"], "deadlock_observation");
-    assert!(fact.get("source_id").is_none());
     assert!(fact["section_type_id"].is_null());
     assert_eq!(fact["identity_quality"], "content_derived");
     assert_eq!(fact["sort_ts_us"], 20);
@@ -546,7 +534,6 @@ async fn all_supported_factor_families_reach_every_timeline_endpoint() {
         assert!(event["event_id"].is_string());
         assert!(event["event_instance_id"].is_string());
         assert!(event["event_kind"].is_string());
-        assert!(event.get("source_id").is_none());
         if let Some(factor_id) = event["payload"]["factor_id"].as_u64() {
             assert!(
                 expected_ids.contains(&factor_id),
@@ -645,7 +632,6 @@ async fn preview_and_events_share_typed_fact_ids_and_canonical_order() {
     let positions = facts
         .iter()
         .map(|fact| {
-            assert!(fact.get("source_id").is_none());
             assert!(fact["payload"].is_object());
             assert!(fact["supporting_evidence"].is_array());
             (

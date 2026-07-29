@@ -58,7 +58,6 @@ OVF, reader, writer и API реализуются как один текущий
 
 API оперирует следующими идентификаторами:
 
-- `source` — обязательный ID из `/v1/sources`;
 - `view` — стабильная UI-проекция, например `statements`;
 - `metric` — стабильный код метрики внутри view;
 - `entity` — непрозрачный base64url token из typed identity;
@@ -71,8 +70,8 @@ Raw registry section не является UI-контрактом. Один vie
 
 ## Projection catalog
 
-`GET /v1/ui/catalog?source=<id>` возвращает единственный нормативный
-каталог интерфейса. Клиент не зашивает source sections, формулы,
+`GET /v1/ui/catalog` возвращает единственный нормативный каталог интерфейса.
+Клиент не зашивает source sections, формулы,
 единицы или допустимость поля.
 
 Для каждого view каталог содержит:

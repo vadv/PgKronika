@@ -767,7 +767,7 @@ mod tests {
             &SeriesSet::for_test(0),
             typed,
             &[lens],
-            &IncidentConfig::for_test("node", 5, 10_000_000, ClockRelation::Unknown),
+            &IncidentConfig::for_test(5, 10_000_000, ClockRelation::Unknown),
         )
         .expect("analysis")
     }

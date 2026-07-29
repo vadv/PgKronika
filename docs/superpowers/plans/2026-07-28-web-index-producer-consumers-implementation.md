@@ -187,12 +187,12 @@ Expected: tests pass with bounded read counters.
 - Test: `bins/pg_kronika-web/src/tests/ui_data.rs`
 
 **Interfaces:**
-- Produces: `GET /v1/views/summary?source=<u64>&at=<i64>`.
+- Produces: `GET /v1/views/summary?at=<i64>`.
 - Response includes all nine view codes, latest snapshot at or before `at`, exact population or `null`, status, notable flag and quality.
 
 - [ ] **Step 1: Write failing endpoint tests**
 
-Assert the route returns exact per-snapshot population, distinguishes gated from empty, rejects unknown query parameters/source, and leaves PGM body-read counters unchanged.
+Assert the route returns exact per-snapshot population, distinguishes gated from empty, rejects unknown query parameters, and leaves PGM body-read counters unchanged.
 
 - [ ] **Step 2: Verify RED**
 
@@ -206,11 +206,11 @@ Expected: `404` because the route is absent.
 
 - [ ] **Step 3: Implement descriptor selection and merge**
 
-Select only descriptors for `source` whose range can contain a snapshot at or before `at`, scan newest first, and stop resolving each view after its latest snapshot is found.
+Select only descriptors whose range can contain a snapshot at or before `at`, scan newest first, and stop resolving each view after its latest snapshot is found.
 
 - [ ] **Step 4: Serialize bounded DTO and stable errors**
 
-Reject unknown parameters and source. Map corrupt sidecar to `corrupt_ovf`; map hard read/response bounds to `resource_limited` or `response_too_large`.
+Reject unknown parameters. Map corrupt sidecar to `corrupt_ovf`; map hard read/response bounds to `resource_limited` or `response_too_large`.
 
 - [ ] **Step 5: Verify GREEN**
 
@@ -232,7 +232,7 @@ Expected: endpoint tests pass and PGM body reads remain zero.
 - Test: `bins/pg_kronika-web/src/tests/ui_data.rs`
 
 **Interfaces:**
-- Produces: `GET /v1/timeline/heatmap?source=<u64>&view=<code>&metric=<code>&from=<i64>&to=<i64>&buckets=<1..=256>&top=<1..=64>`.
+- Produces: `GET /v1/timeline/heatmap?view=<code>&metric=<code>&from=<i64>&to=<i64>&buckets=<1..=256>&top=<1..=64>`.
 - Merge consumes `EntitySeriesBlock` only and returns bounded rows with base64url entity token, newest label, score bounds, values, ranking proof and quality.
 
 - [ ] **Step 1: Write failing merge and route tests**

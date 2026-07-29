@@ -101,7 +101,7 @@ PGM publication creates and synchronizes a temporary file inside the target
 day, adds the final `N.pgm` name without overwriting an existing segment,
 synchronizes the day, removes the temporary name, and synchronizes the day
 again. OVF publication synchronizes a same-day temporary and atomically
-replaces `N.ovf` only after rechecking the source PGM identity.
+replaces `N.ovf` only after rechecking the input PGM descriptor.
 
 The initial local-filesystem contract targets Linux with ext4 or XFS.
 Descriptor-bound PGM publication resolves the already-open temporary through

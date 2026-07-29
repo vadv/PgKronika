@@ -158,12 +158,6 @@ pub(crate) enum InputError {
         resource: MaterializationKind,
         limit: usize,
     },
-    /// No resolved node id covers the requested interval.
-    MissingNodeIdentity,
-    /// The interval spans more than one node id.
-    ConflictingNodeIdentity,
-    /// Node identity bytes exceeded the adapter ceiling.
-    IdentityByteLimit { observed: usize, limit: usize },
     /// Two adapter paths attempted to register the same series.
     DuplicateSeries {
         section: &'static str,
@@ -214,7 +208,6 @@ pub(crate) enum SkipReason {
 
 /// Owned engine input, coverage, and exclusion counters.
 pub(crate) struct PreparedInput {
-    pub node_self_id: String,
     pub episodes: Vec<EnrichedEpisode>,
     pub series: SeriesSet,
     pub typed: TypedInputs,
@@ -260,6 +253,9 @@ pub(crate) fn prepare_input(
             limit: limits.units,
         });
     }
+    if overlapping_units == 0 {
+        return Err(InputError::NoData);
+    }
     let mut input = read_input_pages(snap, scan, sections, limits)?;
     let log_events = build_log_events(
         &input.pages,
@@ -268,17 +264,11 @@ pub(crate) fn prepare_input(
         scan.from,
         scan.to,
     );
-    let mut remaining_identity_bytes = limits.identity_bytes;
-    let node_self_id = load_node_identity(
-        &input.metadata,
-        &mut remaining_identity_bytes,
-        limits.identity_bytes,
-    )?;
     let gates = Gates::from_pages(&input.logicals, &input.pages);
     let snapshot_provenance = SnapshotProvenance::from_page(input.pages.get(SNAPSHOT_COVERAGE));
     let mut state = BuildState::new(
         limits,
-        remaining_identity_bytes,
+        limits.identity_bytes,
         input.skipped,
         snapshot_provenance,
     );
@@ -299,7 +289,6 @@ pub(crate) fn prepare_input(
     }
 
     Ok(PreparedInput {
-        node_self_id,
         episodes: state.episodes,
         series: state.series,
         typed: state.typed,
@@ -523,7 +512,6 @@ fn read_str(row: &OutRow, name: &str) -> Option<String> {
 
 struct InputPages {
     logicals: Vec<LogicalSection>,
-    metadata: SectionPage,
     pages: BTreeMap<String, SectionPage>,
     skipped: Vec<SectionSkip>,
 }
@@ -552,7 +540,7 @@ fn read_input_pages(
     read_names.extend(logicals.iter().map(|logical| logical.name));
     read_names.extend(Gates::sections(&logicals));
     read_names.insert(SNAPSHOT_COVERAGE);
-    let observed_sections = read_names.len().saturating_add(1);
+    let observed_sections = read_names.len();
     if observed_sections > limits.sections {
         return Err(InputError::SectionLimit {
             observed: observed_sections,
@@ -560,29 +548,7 @@ fn read_input_pages(
         });
     }
 
-    let metadata_from = snap
-        .units()
-        .iter()
-        .filter(|unit| unit.max_ts >= scan.from && unit.min_ts <= scan.to)
-        .map(|unit| unit.min_ts)
-        .min()
-        .ok_or(InputError::NoData)?;
-    let mut remaining_cells = limits.materialized_cells;
-    let metadata_page = section_with_limits(
-        snap,
-        "instance_metadata",
-        metadata_from,
-        scan.to,
-        None,
-        QueryLimits::with_bytes(DIFF_MAX_ROWS, remaining_cells, limits.materialized_bytes),
-    )
-    .map_err(|err| map_query_error(err, limits.materialized_cells, limits.materialized_bytes))?;
-    charge_materialized_cells(
-        &metadata_page,
-        &mut remaining_cells,
-        limits.materialized_cells,
-    )?;
-
+    let remaining_cells = limits.materialized_cells;
     let read_names: Vec<&str> = read_names.into_iter().collect();
     let batch = sections_with_limits(
         snap,
@@ -613,7 +579,6 @@ fn read_input_pages(
 
     Ok(InputPages {
         logicals,
-        metadata: metadata_page,
         pages,
         skipped,
     })
@@ -1481,24 +1446,6 @@ pub(crate) fn scan_position_count(scan: &ScanParams) -> Option<usize> {
     usize::try_from(interior.checked_add(1)?).ok()
 }
 
-fn map_query_error(
-    error: QueryError,
-    materialized_cell_limit: usize,
-    materialized_byte_limit: usize,
-) -> InputError {
-    match error {
-        QueryError::ResultTooLarge { .. } => InputError::MaterializationLimit {
-            resource: MaterializationKind::Cells,
-            limit: materialized_cell_limit,
-        },
-        QueryError::MaterializedBytesTooLarge { .. } => InputError::MaterializationLimit {
-            resource: MaterializationKind::Bytes,
-            limit: materialized_byte_limit,
-        },
-        other => InputError::Read(other),
-    }
-}
-
 fn charge_materialized_cells(
     page: &SectionPage,
     remaining: &mut usize,
@@ -1519,36 +1466,6 @@ fn charge_materialized_cells(
             limit,
         })?;
     Ok(())
-}
-
-fn load_node_identity(
-    page: &SectionPage,
-    remaining_bytes: &mut usize,
-    byte_limit: usize,
-) -> Result<String, InputError> {
-    if page.next_cursor.is_some() {
-        return Err(InputError::MissingNodeIdentity);
-    }
-    let mut identities = BTreeSet::new();
-    for row in &page.rows {
-        let Some(Value::Str(value)) = row_value(row, "node_self_id") else {
-            continue;
-        };
-        if value.is_empty() {
-            continue;
-        }
-        charge_identity_bytes(value.len(), remaining_bytes, byte_limit)
-            .map_err(|(observed, limit)| InputError::IdentityByteLimit { observed, limit })?;
-        identities.insert(value.clone());
-    }
-    match identities.len() {
-        0 => Err(InputError::MissingNodeIdentity),
-        1 => identities
-            .into_iter()
-            .next()
-            .ok_or(InputError::MissingNodeIdentity),
-        _ => Err(InputError::ConflictingNodeIdentity),
-    }
 }
 
 fn row_value<'a>(row: &'a OutRow, name: &str) -> Option<&'a Value> {
@@ -2548,53 +2465,16 @@ mod tests {
         min_ts: i64,
         max_ts: i64,
     ) {
-        use kronika_format::{DictLimits, PartMeta, SectionInput};
-        use kronika_registry::instance_metadata::InstanceMetadata;
-        use kronika_registry::{Section, StrId, Ts};
+        use kronika_format::{PartMeta, SectionInput};
+        use kronika_registry::Section;
 
-        let mut interner = kronika_writer::Interner::new(
-            DictLimits::new(4096, 1 << 20).expect("dictionary limits"),
-        );
-        let mut intern = |value: &str| {
-            interner
-                .intern(value.as_bytes())
-                .map(|id| StrId(id.get()))
-                .expect("intern fixture identity")
-        };
-        let metadata = InstanceMetadata {
-            ts: Ts(min_ts),
-            hostname: intern("db-host-7"),
-            node_self_id: intern("node-7"),
-            pg_version_num: 170_000,
-            kernel_version: intern("test-kernel"),
-            pg_system_identifier: Some(7),
-            clock_ticks_per_sec: 100,
-            page_size_bytes: 4096,
-            boot_id: intern("test-boot"),
-            btime: Ts(0),
-        };
-        let dictionary =
-            kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
         let archiver = kronika_registry::pg_stat_archiver::PgStatArchiver::encode(rows)
             .expect("encode archiver");
-        let metadata = InstanceMetadata::encode(&[metadata]).expect("encode metadata");
-        let mut sections = vec![
-            SectionInput {
-                type_id: 1_008_001,
-                rows: u32::try_from(rows.len()).expect("fixture row count"),
-                body: &archiver,
-            },
-            SectionInput {
-                type_id: 1_021_001,
-                rows: 1,
-                body: &metadata,
-            },
-        ];
-        sections.extend(dictionary.iter().map(|section| SectionInput {
-            type_id: section.type_id,
-            rows: section.rows,
-            body: &section.body,
-        }));
+        let sections = [SectionInput {
+            type_id: 1_008_001,
+            rows: u32::try_from(rows.len()).expect("fixture row count"),
+            body: &archiver,
+        }];
         let bytes = kronika_format::build_part(&sections, PartMeta { min_ts, max_ts });
         let path = crate::test_layout::file_path(
             root,
@@ -2671,7 +2551,6 @@ mod tests {
             "the two segments read and scan cleanly: {:?}",
             prepared.skipped
         );
-        assert_eq!(prepared.node_self_id, "node-7");
         assert_eq!(prepared.quality.duplicate_timestamps, 1);
         let episode = prepared
             .episodes
@@ -2692,12 +2571,7 @@ mod tests {
         );
         let (start_us, end_us) = (episode.reference.start_us, episode.reference.end_us);
 
-        let config = IncidentConfig::for_test(
-            &prepared.node_self_id,
-            MINUTE,
-            3_600 * MINUTE,
-            ClockRelation::Unknown,
-        );
+        let config = IncidentConfig::for_test(MINUTE, 3_600 * MINUTE, ClockRelation::Unknown);
         let outcome = analyze(
             prepared.episodes,
             &prepared.series,
@@ -2777,13 +2651,7 @@ mod tests {
         )
         .expect("prepare input");
 
-        assert_eq!(prepared.node_self_id, "node-7");
-        let config = IncidentConfig::for_test(
-            &prepared.node_self_id,
-            MINUTE,
-            3_600 * MINUTE,
-            ClockRelation::Unknown,
-        );
+        let config = IncidentConfig::for_test(MINUTE, 3_600 * MINUTE, ClockRelation::Unknown);
         let outcome = analyze(
             prepared.episodes,
             &prepared.series,

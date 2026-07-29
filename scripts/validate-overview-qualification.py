@@ -249,7 +249,7 @@ EXPECTED_EVIDENCE = (
         rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/facts.rs",
-            "every_all_family_source_body_crc_failure_stays_a_source_error",
+            "every_consumed_source_body_crc_failure_stays_a_source_error",
         ),
     ),
     (

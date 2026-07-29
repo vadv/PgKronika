@@ -2334,7 +2334,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/facts.rs",
-                    "every_all_family_source_body_crc_failure_stays_a_source_error",
+                    "every_consumed_source_body_crc_failure_stays_a_source_error",
                 ),
             ],
             timeline_bdd: false,

@@ -140,7 +140,7 @@ git commit -m "feat(web): add UI projection catalog"
 
 **Interfaces:**
 - Consumes: `ProjectionCatalog::for_type_ids`.
-- Produces: `GET /v1/ui/catalog?source=<u64>`.
+- Produces: `GET /v1/ui/catalog`.
 - Produces: `unknown_source` RFC 9457 problem.
 - Produces: strong ETag over canonical serialized catalog bytes.
 
@@ -185,7 +185,7 @@ Expected: `404` because the route is not registered.
 In the blocking worker:
 
 1. clone the published snapshot;
-2. select units whose `source_id` matches;
+2. select units intersecting the requested time window;
 3. return `unknown_source` when none match;
 4. read catalog entries only, collecting non-empty known type IDs in a
    `BTreeSet<u32>`;

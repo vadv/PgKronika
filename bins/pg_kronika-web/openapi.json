@@ -1450,7 +1450,7 @@
       "PlanQuality": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["snapshot_rows", "snapshots_total", "full_snapshots", "truncated_snapshots", "restricted_or_failed_snapshots", "coverage_unknown_snapshots", "support_pages_incomplete", "support_gap_ranges", "plan_gap_ranges", "invalid_support_rows", "snapshot_coverage_conflicts", "collection_coverage_missing", "collection_coverage_conflicts", "reset_metadata_conflicts", "instance_metadata_conflicts", "invalid_rows", "membership_boundaries", "plan_set_additions", "plan_set_removals", "counter_epoch_boundaries", "reset_boundaries", "plan_gap_intervals", "support_gap_intervals", "metadata_unknown_intervals", "extension_version_boundaries", "instance_boundaries", "instance_identity_unavailable_intervals", "unsupported_version_intervals", "query_id_disabled_intervals", "invalid_counter_intervals"],
+        "required": ["snapshot_rows", "snapshots_total", "full_snapshots", "truncated_snapshots", "restricted_or_failed_snapshots", "coverage_unknown_snapshots", "support_pages_incomplete", "support_gap_ranges", "plan_gap_ranges", "invalid_support_rows", "snapshot_coverage_conflicts", "collection_coverage_missing", "collection_coverage_conflicts", "reset_metadata_conflicts", "invalid_rows", "membership_boundaries", "plan_set_additions", "plan_set_removals", "counter_epoch_boundaries", "reset_boundaries", "plan_gap_intervals", "support_gap_intervals", "metadata_unknown_intervals", "extension_version_boundaries", "unsupported_version_intervals", "query_id_disabled_intervals", "invalid_counter_intervals"],
         "properties": {
           "snapshot_rows": { "type": "integer", "minimum": 0 },
           "snapshots_total": { "type": "integer", "minimum": 0 },
@@ -1466,7 +1466,6 @@
           "collection_coverage_missing": { "type": "integer", "minimum": 0 },
           "collection_coverage_conflicts": { "type": "integer", "minimum": 0 },
           "reset_metadata_conflicts": { "type": "integer", "minimum": 0 },
-          "instance_metadata_conflicts": { "type": "integer", "minimum": 0 },
           "invalid_rows": { "type": "integer", "minimum": 0 },
           "membership_boundaries": { "type": "integer", "minimum": 0 },
           "plan_set_additions": { "type": "integer", "minimum": 0 },
@@ -1477,8 +1476,6 @@
           "support_gap_intervals": { "type": "integer", "minimum": 0 },
           "metadata_unknown_intervals": { "type": "integer", "minimum": 0 },
           "extension_version_boundaries": { "type": "integer", "minimum": 0 },
-          "instance_boundaries": { "type": "integer", "minimum": 0 },
-          "instance_identity_unavailable_intervals": { "type": "integer", "minimum": 0 },
           "unsupported_version_intervals": { "type": "integer", "minimum": 0 },
           "query_id_disabled_intervals": { "type": "integer", "minimum": 0 },
           "invalid_counter_intervals": { "type": "integer", "minimum": 0 }
@@ -1618,7 +1615,7 @@
           "to": { "type": "integer", "format": "int64" },
           "complete": { "type": "boolean" },
           "clustering_complete": { "type": "boolean" },
-          "analysis_status": { "type": "string", "enum": ["no_data", "partial", "insufficient_data", "calm", "incidents_detected", "missing_node_identity", "conflicting_node_identity"] },
+          "analysis_status": { "type": "string", "enum": ["no_data", "partial", "insufficient_data", "calm", "incidents_detected"] },
           "incidents": { "type": "array", "items": { "$ref": "#/components/schemas/NeutralObject" } },
           "coverage_by_section": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/NeutralObject" } },
           "data_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
@@ -2805,7 +2802,7 @@
         "properties": {
           "resource": {
             "type": "string",
-            "enum": ["query_bytes", "query_parameters", "query_span_us", "window_positions", "rows", "cells", "bytes", "units", "sections", "identity_bytes", "series_points", "episodes", "clusters", "incident_key_bytes", "total_incident_key_bytes", "selected_segments"]
+            "enum": ["query_bytes", "query_parameters", "query_span_us", "window_positions", "rows", "cells", "bytes", "units", "sections", "series_points", "episodes", "clusters", "incident_key_bytes", "total_incident_key_bytes", "selected_segments"]
           },
           "limit": { "type": "integer", "minimum": 0 },
           "observed": { "type": "integer", "minimum": 0 }
@@ -2906,13 +2903,13 @@
         "properties": {
           "kind": {
             "type": "string",
-            "enum": ["materialization_limit", "incomplete_page", "scoring_work_budget", "scan_budget", "conflicting_timestamp", "identity_byte_limit", "series_point_limit", "typed_gauge_point_limit", "snapshot_row_limit", "incomplete_snapshot", "retention_limit", "no_data", "missing_node_identity", "conflicting_node_identity", "producer_unavailable", "provenance_or_input_missing", "complete_provenance", "section_absent", "complete_coverage", "coverage_gap", "empty_incident_window", "insufficient_intervals_for_observed_period", "incident_window_shorter_than_observed_period"]
+            "enum": ["materialization_limit", "incomplete_page", "scoring_work_budget", "scan_budget", "conflicting_timestamp", "identity_byte_limit", "series_point_limit", "typed_gauge_point_limit", "snapshot_row_limit", "incomplete_snapshot", "retention_limit", "no_data", "producer_unavailable", "provenance_or_input_missing", "complete_provenance", "section_absent", "complete_coverage", "coverage_gap", "empty_incident_window", "insufficient_intervals_for_observed_period", "incident_window_shorter_than_observed_period"]
           },
           "params": { "type": "object" }
         },
         "allOf": [
           { "if": { "properties": { "kind": { "const": "materialization_limit" } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/MaterializationReasonParams" } } } },
-          { "if": { "properties": { "kind": { "enum": ["incomplete_page", "incomplete_snapshot", "no_data", "missing_node_identity", "conflicting_node_identity", "producer_unavailable", "provenance_or_input_missing", "section_absent", "empty_incident_window", "insufficient_intervals_for_observed_period", "incident_window_shorter_than_observed_period"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "kind": { "enum": ["incomplete_page", "incomplete_snapshot", "no_data", "producer_unavailable", "provenance_or_input_missing", "section_absent", "empty_incident_window", "insufficient_intervals_for_observed_period", "incident_window_shorter_than_observed_period"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "kind": { "enum": ["scoring_work_budget", "scan_budget"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/WorkReasonParams" } } } },
           { "if": { "properties": { "kind": { "const": "conflicting_timestamp" } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/TimestampReasonParams" } } } },
           { "if": { "properties": { "kind": { "enum": ["identity_byte_limit", "series_point_limit", "typed_gauge_point_limit", "snapshot_row_limit"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/ObservedLimitReasonParams" } } } },

@@ -149,7 +149,7 @@ statvfs used — на общем разделе чужое не приписыв
 следующем тике либо web-GC.
 
 Прямой unlink безопасен: читатели держат открытый fd (lifetime не
-зависит от unlink), replace OVF ревалидирует source identity, GC
+зависит от unlink), replace OVF ревалидирует входной файл, GC
 перепроверяет dev/inode. Двухшаговая схема Kafka (`.deleted` + delay)
 не нужна.
 

@@ -1569,7 +1569,6 @@ mod tests {
             PartMeta {
                 min_ts,
                 max_ts,
-                source_id: source,
             },
         );
         std::fs::write(dir.join(file), part).expect("write PGM");
@@ -1694,7 +1693,6 @@ enum LatestError {
 fn latest_once(
     snapshot: &LocalDirSnapshot,
     logical: &LogicalSection,
-    source: u64,
     skip_stale: bool,
 ) -> Result<Option<OutRow>, LatestError> {
     let units = snapshot.units();
@@ -1702,13 +1700,12 @@ fn latest_once(
         .iter()
         .copied()
         .enumerate()
-        .filter(|(index, unit)| {
-            unit.source_id == source
-                && snapshot.unit_catalog(*index).is_some_and(|catalog| {
-                    catalog.entries.iter().any(|entry| {
-                        entry.rows != 0 && logical.type_ids.contains(&entry.type_id)
-                    })
+        .filter(|(index, _unit)| {
+            snapshot.unit_catalog(*index).is_some_and(|catalog| {
+                catalog.entries.iter().any(|entry| {
+                    entry.rows != 0 && logical.type_ids.contains(&entry.type_id)
                 })
+            })
         })
         .collect();
     candidates.sort_by(|left, right| {
@@ -1886,7 +1883,6 @@ fn write_status_segment(
         PartMeta {
             min_ts: ts,
             max_ts: ts,
-            source_id: source,
         },
     );
     std::fs::write(dir.join(file), part).expect("write status segment");
@@ -2044,14 +2040,13 @@ map with a loop so each source can call:
 let status = latest_section_row(
     &mut snapshot,
     "pg_log_source_status",
-    source_id,
 )
 .map_err(|error| query_error_response_without_cursor(&error))?;
 let pg_log = pg_log_status_json(status.as_ref());
 ```
 
-Return the unchanged `source_id`, `min_ts`, `max_ts`, `segments` fields plus
-`pg_log`. Do not derive staleness from wall-clock time.
+Return the unchanged `min_ts`, `max_ts`, `segments` fields plus `pg_log`. Do not
+derive staleness from wall-clock time.
 
 - [x] **Step 5: Make the OpenAPI change additive**
 

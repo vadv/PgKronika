@@ -11,7 +11,6 @@ use anyhow::{Context, Result, ensure};
 use cucumber::{given, then};
 use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
 use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId};
-use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::pg_store_plans::PgStorePlansOsscV1;
 use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
@@ -145,27 +144,20 @@ fn assert_plan_evidence_response(body: &serde_json::Value) -> Result<()> {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the deterministic fixture keeps plan, coverage, reset, instance, and dictionary rows visibly co-located"
+    reason = "the deterministic fixture keeps plan, coverage, reset, and dictionary rows visibly co-located"
 )]
 fn plan_evidence_pgm() -> Result<Vec<u8>> {
     let mut interner = kronika_writer::Interner::new(
         DictLimits::new(64, 4096).context("plan fixture dictionary limits")?,
     );
-    let (extension_version, compute_query_id, hostname, node_self_id, kernel_version, boot_id) = {
+    let (extension_version, compute_query_id) = {
         let mut intern = |value: &str| -> Result<StrId> {
             interner
                 .intern(value.as_bytes())
                 .map(|id| StrId(id.get()))
                 .context("intern plan fixture string")
         };
-        (
-            intern("1.10")?,
-            intern("auto")?,
-            intern("plan-host")?,
-            intern("plan-node")?,
-            intern("test-kernel")?,
-            intern("test-boot")?,
-        )
+        (intern("1.10")?, intern("auto")?)
     };
 
     let mut calls = [100_i64, 0];
@@ -232,26 +224,11 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
             track_wal_io_timing: Some(false),
         })
         .collect::<Vec<_>>();
-    let instance = InstanceMetadata {
-        ts: Ts(0),
-        hostname,
-        node_self_id,
-        pg_version_num: 150_000,
-        kernel_version,
-        pg_system_identifier: Some(99),
-        clock_ticks_per_sec: 100,
-        page_size_bytes: 4096,
-        boot_id,
-        btime: Ts(0),
-    };
-
     let dictionary =
         kronika_writer::dict::encode(interner.window()).context("encode fixture dictionary")?;
     let plans_body = PgStorePlansOsscV1::encode(&plans).context("encode plan evidence")?;
     let coverage_body = SnapshotCoverageV1::encode(&coverage).context("encode plan coverage")?;
     let reset_body = ResetMetadata::encode(&resets).context("encode plan reset metadata")?;
-    let instance_body =
-        InstanceMetadata::encode(&[instance]).context("encode plan instance metadata")?;
     let mut sections = vec![
         SectionInput {
             type_id: 1_003_001,
@@ -262,11 +239,6 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
             type_id: 1_020_001,
             rows: u32::try_from(resets.len())?,
             body: &reset_body,
-        },
-        SectionInput {
-            type_id: 1_021_001,
-            rows: 1,
-            body: &instance_body,
         },
         SectionInput {
             type_id: 1_038_001,

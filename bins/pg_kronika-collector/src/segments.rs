@@ -1245,7 +1245,6 @@ mod admission_tests {
             pool_refresh_secs: 600,
             heavy_timeout_cap_ms: 60_000,
             max_lock_rows: 1_000,
-            node_self_id: None,
             tick_secs: 5,
             intervals: Intervals::default(),
             log: LogConfig::disabled(out_dir),

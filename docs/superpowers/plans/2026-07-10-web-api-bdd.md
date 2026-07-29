@@ -59,21 +59,21 @@ near-real-time refresh журнала (секундный поллинг без 
 ## Ручки /v1/* (путь · вызов ридера · JSON)
 
 - `GET /v1/version` → `{ "api": "v1", "format_version": 1 }` (статика).
-- `GET /v1/sources` → `units()` группировать по `source_id` → `{ "sources": [ {source_id, min_ts, max_ts, segments} ] }`.
+- `GET /v1/sources` → сводка единственного корня данных: `{ "sources": [ {min_ts, max_ts, segments} ] }`.
 - `GET /v1/sections` → каталог из реестра: на логическое имя `logical_section(name)` →
   `{ "sections": [ {name, semantics, sort_key:[...], columns:[{name,type,class}]} ] }`. Статично.
-- `GET /v1/segments?source&from&to` → `units()` ∩ окно `source` → на единицу `unit_catalog(idx)`
-  → `{ "segments": [ {segment_id, source_id, min_ts, max_ts, sections:[{name, rows}]} ] }`
+- `GET /v1/segments?from&to` → `units()` ∩ окно → на единицу `unit_catalog(idx)`
+  → `{ "segments": [ {segment_id, min_ts, max_ts, sections:[{name, rows}]} ] }`
   (`type_id`→имя через `section_name`; суммировать `rows` одинаковых имён).
-- `GET /v1/section/{name}?source&from&to&limit&cursor` → `section(...)` → `SectionPage`→JSON.
+- `GET /v1/section/{name}?from&to&limit&cursor` → `section(...)` → `SectionPage`→JSON.
   Имени нет в реестре → 404; битые `from/to/limit/cursor` → 400.
-- `GET /v1/sections/batch?source&from&to&names=a,b,c&limit` → `sections(...)` → `{имя: страница}`.
+- `GET /v1/sections/batch?from&to&names=a,b,c&limit` → `sections(...)` → `{имя: страница}`.
 
 **JSON-сериализация:**
 - `OutRow` → объект `{колонка: значение}` в порядке union-колонок секции.
 - `Value`: `I64/U64/F64/Ts` → число (Ts = i64 микросекунды); `Bool` → bool; `Str` → строка;
   `Blob` → `{text, truncated, full_len}`; `ListI32` → массив чисел; `Null` → null.
-- `SectionPage` → `{section, source_id, rows:[...], gaps:[{from,to}], next_cursor: строка|null}`.
+- `SectionPage` → `{section, rows:[...], gaps:[{from,to}], next_cursor: строка|null}`.
   `next_cursor` = `Cursor::encode()` (готовый opaque hex из PR-A).
 - Ошибки → `{error, detail}`; коды: 404 UnknownSection, 400 BadCursor/битые параметры, 500 init-io.
   Стейл ридер деградирует в gaps (не ошибка) → веб отдаёт 200 с gaps.

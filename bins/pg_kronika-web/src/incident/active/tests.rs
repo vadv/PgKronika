@@ -63,7 +63,7 @@ fn run(typed: &TypedInputs) -> Vec<(Role, Confidence)> {
 fn run_window(typed: &TypedInputs, start_us: i64, end_us: i64) -> Vec<(Role, Confidence)> {
     let lens = SharedBufferMissesLens;
     let lenses: [&dyn Lens; 1] = [&lens];
-    let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+    let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);
     let outcome = analyze(
         vec![episode_window(start_us, end_us)],
         &SeriesSet::for_test(0),
@@ -91,8 +91,7 @@ fn counter_pair_scan_is_admitted_before_reading_the_tracks() {
     let typed = typed(&[30.0, 30.0, 20.0], &[5.0, 5.0, 10.0]);
     let lens = SharedBufferMissesLens;
     let lenses: [&dyn Lens; 1] = [&lens];
-    let config =
-        IncidentConfig::for_test_with_work_limit("node", 5, 1_000, ClockRelation::Unknown, 2);
+    let config = IncidentConfig::for_test_with_work_limit(5, 1_000, ClockRelation::Unknown, 2);
     let outcome = analyze(
         vec![episode_window(0, 10)],
         &SeriesSet::for_test(0),
@@ -248,7 +247,7 @@ fn first_reading(
     typed: &TypedInputs,
 ) -> Option<CounterReading> {
     let lenses: [&dyn Lens; 1] = [lens];
-    let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+    let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);
     let outcome = analyze(
         vec![window_episode(section, column)],
         &SeriesSet::for_test(0),
@@ -291,7 +290,7 @@ fn run_lens(
 ) -> Vec<(Role, Confidence)> {
     let episode = window_episode(section, column);
     let lenses: [&dyn Lens; 1] = [lens];
-    let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+    let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);
     let outcome = analyze(
         vec![episode],
         &SeriesSet::for_test(0),
@@ -1232,8 +1231,7 @@ fn gauge_window_work_is_admitted_before_reduction() {
     episode.reference.column = "mem_available";
     let lens = MemoryReclaimLens;
     let lenses: [&dyn Lens; 1] = [&lens];
-    let config =
-        IncidentConfig::for_test_with_work_limit("node", 5, 1_000, ClockRelation::Unknown, 5);
+    let config = IncidentConfig::for_test_with_work_limit(5, 1_000, ClockRelation::Unknown, 5);
     let outcome = analyze(
         vec![episode],
         &SeriesSet::for_test(0),
@@ -1391,13 +1389,8 @@ fn insert_horizon_lock_snapshot(
 fn xmin_outcome(typed: &TypedInputs, work_limit: u64) -> EngineOutcome {
     let episode = window_episode(PG_STAT_ACTIVITY, "backend_xmin_age");
     let lenses: [&dyn Lens; 1] = [&XminHorizonHoldLens];
-    let config = IncidentConfig::for_test_with_work_limit(
-        "node",
-        5,
-        1_000,
-        ClockRelation::Unknown,
-        work_limit,
-    );
+    let config =
+        IncidentConfig::for_test_with_work_limit(5, 1_000, ClockRelation::Unknown, work_limit);
     analyze(
         vec![episode],
         &SeriesSet::for_test(0),
@@ -1721,13 +1714,8 @@ fn insert_lock_edges(typed: &mut TypedInputs, timestamps: &[i64], pids: &[i64], 
 fn internal_wait_outcome(typed: &TypedInputs, work_limit: u64) -> EngineOutcome {
     let lens = InternalWaitConcentrationLens;
     let lenses: [&dyn Lens; 1] = [&lens];
-    let config = IncidentConfig::for_test_with_work_limit(
-        "node",
-        5,
-        1_000,
-        ClockRelation::Unknown,
-        work_limit,
-    );
+    let config =
+        IncidentConfig::for_test_with_work_limit(5, 1_000, ClockRelation::Unknown, work_limit);
     analyze(
         vec![window_episode(PG_STAT_ACTIVITY, "wait_event_type")],
         &SeriesSet::for_test(0),

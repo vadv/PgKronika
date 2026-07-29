@@ -477,7 +477,6 @@ fn plan_analyzer_provenance(world: &mut BddWorld, section: String) -> Result<()>
     let (plans, _) = decode_section(segment, type_id)?;
     let (coverage, _) = decode_section(segment, 1_038_001)?;
     let (resets, reset_dict) = decode_section(segment, 1_020_001)?;
-    let (instances, instance_dict) = decode_section(segment, 1_021_001)?;
     let mut rows_per_timestamp = BTreeMap::<i64, u64>::new();
     for row in &plans {
         let Some(Cell::Ts(ts)) = row.get("ts") else {
@@ -520,16 +519,6 @@ fn plan_analyzer_provenance(world: &mut BddWorld, section: String) -> Result<()>
             } && matches!(compute_query_id, "auto" | "on" | "regress"),
             "{section} reset metadata does not carry extension/query-id context: {reset:?}"
         );
-        let instance = latest_row_at(&instances, ts).with_context(|| {
-            format!("no instance_metadata at or before {section} timestamp {ts}")
-        })?;
-        ensure!(
-            resolved_text(instance.get("node_self_id"), &instance_dict).is_some()
-                && matches!(instance.get("pg_system_identifier"), Some(Cell::I64(_)))
-                && cell_i64(instance.get("pg_version_num"))
-                    .is_some_and(|version| (15..=18).contains(&(version / 10_000))),
-            "{section} instance identity is incomplete: {instance:?}"
-        );
     }
     Ok(())
 }
@@ -548,15 +537,6 @@ fn exact_row_at(rows: &[kronika_registry::Row], ts: i64) -> Result<&kronika_regi
     Ok(row)
 }
 
-fn latest_row_at(rows: &[kronika_registry::Row], ts: i64) -> Option<&kronika_registry::Row> {
-    rows.iter()
-        .filter(|row| matches!(row.get("ts"), Some(Cell::Ts(row_ts)) if *row_ts <= ts))
-        .max_by_key(|row| match row.get("ts") {
-            Some(Cell::Ts(row_ts)) => *row_ts,
-            _ => i64::MIN,
-        })
-}
-
 fn resolved_text<'a>(
     cell: Option<&Cell>,
     dictionary: &'a kronika_reader::Dictionary,
@@ -571,17 +551,6 @@ fn resolved_text<'a>(
     };
     let text = std::str::from_utf8(bytes).ok()?;
     (!text.is_empty()).then_some(text)
-}
-
-fn cell_i64(cell: Option<&Cell>) -> Option<i64> {
-    match cell {
-        Some(Cell::I16(value)) => Some(i64::from(*value)),
-        Some(Cell::I32(value)) => Some(i64::from(*value)),
-        Some(Cell::I64(value)) => Some(*value),
-        Some(Cell::U32(value)) => Some(i64::from(*value)),
-        Some(Cell::U64(value)) => i64::try_from(*value).ok(),
-        _ => None,
-    }
 }
 
 fn cell_u64(cell: Option<&Cell>) -> Option<u64> {

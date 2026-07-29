@@ -422,7 +422,6 @@ pub(crate) fn push_instance_metadata(
     let row = InstanceMetadata {
         ts: Ts(facts.pg.ts),
         hostname: intern(facts.os.hostname.as_bytes())?,
-        node_self_id: intern(facts.node_self_id.as_bytes())?,
         pg_version_num: facts.pg.pg_version_num,
         kernel_version: intern(facts.os.kernel_version.as_bytes())?,
         pg_system_identifier: facts.system_identifier,

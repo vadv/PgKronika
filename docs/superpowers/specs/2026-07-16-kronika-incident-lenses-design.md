@@ -42,7 +42,7 @@ heavyweight lock в момент снимка. Даже такое ребро д
 
 ```text
 Incident {
-  interval, incident_key: IncidentKeyV1,
+  interval, incident_key: IncidentKeyV2,
   members: [AnomalyEpisodeRef],
   findings: [Finding],
   unclassified_members: [AnomalyEpisodeRef],
@@ -243,8 +243,8 @@ Findings сортируются по `(confidence desc, role_rank, lens_id, scop
 сравниваемых sources. При `clock_relation=Unknown` PostgreSQL/OS ordering не
 даёт directional role.
 
-Идентичность incident задаёт полный `IncidentKeyV1`:
-`(node_self_id, incident_start_us, incident_end_us, sorted EpisodeRefV1[])`.
+Идентичность incident задаёт полный `IncidentKeyV2`:
+`(incident_start_us, incident_end_us, sorted EpisodeRefV1[])`.
 `EpisodeRefV1` содержит `(logical_section, column, registry identity key,
 start_us, end_us)`; identity values кодируются в порядке registry key с типом и
 длиной. `type_id` отсутствует: union reader не сохраняет provenance layout. Это
@@ -264,11 +264,10 @@ series запрещены. Top-K findings поддерживается bounded h
 В каждый incident без причинной роли добавляются факты:
 
 - рестарт PostgreSQL: изменение `reset_metadata.postmaster_start_time`;
-- рестарт узла: изменение `instance_metadata.boot_id`/`btime`;
 - lifecycle events `crash`, `shutdown`, `ready`;
 - изменение значимых `pg_settings`, включая `pending_restart`;
 - log/collector gaps и coverage/top-N;
-- смена PostgreSQL major, extension version, hostname, node id или system id.
+- смена extension version.
 
 Деплой приложения сейчас не собирается. Его нельзя выводить из смены query mix;
 для точного deploy context нужен отдельный event source.
@@ -303,8 +302,8 @@ series запрещены. Top-K findings поддерживается bounded h
 
 Детерминизм ключа и слияния:
 
-4. **Резолвинг StrId.** `node_self_id` и Label-колонки identity идут в ключ
-   резолвнутой UTF-8 строкой. Текущий `SectionPage` объединяет настоящий NULL,
+4. **Резолвинг StrId.** Label-колонки identity идут в ключ резолвнутой UTF-8
+   строкой. Текущий `SectionPage` объединяет настоящий NULL,
    отсутствующую layout-колонку и нерезолвнутый `StrId` в `Value::Null`.
    Поэтому первый срез консервативно исключает любую записку с NULL в identity
    как `identity_null_or_unresolved`, а не заявляет точный `dropped_unresolved`.
@@ -737,8 +736,8 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 
 ## 5. Каталог Linux и cgroup
 
-OS finding связывается с PostgreSQL только при совпадении `node_self_id`,
-интервала и совместимого scope. Host-wide signal нельзя приписывать container
+OS finding связывается с PostgreSQL только по доказанной типизированной связи,
+интервалу и совместимому scope. Host-wide signal нельзя приписывать container
 без PID-to-cgroup или cgroup evidence.
 
 ### `OS-CPU-020` (`cpu_saturation`) — host CPU pressure и steal

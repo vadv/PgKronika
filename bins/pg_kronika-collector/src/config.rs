@@ -39,8 +39,6 @@ pub(crate) struct Config {
     pub(crate) heavy_timeout_cap_ms: u64,
     /// Maximum lock-wait waiters, edges, and nodes accepted for one section.
     pub(crate) max_lock_rows: i64,
-    /// Node id sealed into `instance_metadata`; `None` falls back to hostname.
-    pub(crate) node_self_id: Option<String>,
     /// Base tick of the internal timer, seconds; `0` disables the timer and
     /// leaves collection to signals only.
     pub(crate) tick_secs: u64,
@@ -234,10 +232,6 @@ impl Config {
         let heavy_timeout_cap_ms = env_u64("KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS", 60_000)?;
         let max_lock_rows = i64::try_from(env_u64("KRONIKA_PG_MAX_LOCK_ROWS", 1000)?)
             .context("KRONIKA_PG_MAX_LOCK_ROWS exceeds i64")?;
-        let node_self_id = std::env::var("KRONIKA_NODE_SELF_ID")
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty());
         let tick_secs = env_u64("KRONIKA_INTERVAL_S", 5)?;
         let segment_max_bytes = env_u64("KRONIKA_SEGMENT_MAX_BYTES", 64 * 1024 * 1024)?;
         let segment_max_age_secs = env_u64("KRONIKA_SEGMENT_MAX_AGE_S", 900)?;
@@ -296,7 +290,6 @@ impl Config {
             pool_refresh_secs,
             heavy_timeout_cap_ms,
             max_lock_rows,
-            node_self_id,
             tick_secs,
             intervals,
             log,

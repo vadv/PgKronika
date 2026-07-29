@@ -6,7 +6,7 @@
 | Каталог | Смысл | Specs | Plans |
 | --- | --- | ---: | ---: |
 | [`specs/`](specs/), [`plans/`](plans/) | Активные `PARTIAL`/`FUTURE`: есть точный незакрытый объём | 16 | 4 |
-| [`implemented/specs/`](implemented/specs/), [`implemented/plans/`](implemented/plans/) | Полностью реализованные контракты и планы | 4 | 12 |
+| [`implemented/specs/`](implemented/specs/), [`implemented/plans/`](implemented/plans/) | Полностью реализованные контракты и планы | 6 | 14 |
 | [`archive/specs/`](archive/specs/), [`archive/plans/`](archive/plans/) | Заменённые или отклонённые варианты | 1 | 1 |
 
 В количества входят только датированные документы, без этого README.
