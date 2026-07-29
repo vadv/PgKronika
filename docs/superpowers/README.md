@@ -5,7 +5,7 @@
 
 | Каталог | Смысл | Specs | Plans |
 | --- | --- | ---: | ---: |
-| [`specs/`](specs/), [`plans/`](plans/) | Активные `PARTIAL`/`FUTURE`: есть точный незакрытый объём | 16 | 4 |
+| [`specs/`](specs/), [`plans/`](plans/) | Активные `PARTIAL`/`FUTURE`: есть точный незакрытый объём | 17 | 4 |
 | [`implemented/specs/`](implemented/specs/), [`implemented/plans/`](implemented/plans/) | Полностью реализованные контракты и планы | 5 | 13 |
 | [`archive/specs/`](archive/specs/), [`archive/plans/`](archive/plans/) | Заменённые или отклонённые варианты | 1 | 1 |
 
@@ -31,6 +31,7 @@
 | [Diagnostics roadmap](specs/2026-07-28-diagnostics-roadmap-design.md) | `PARTIAL` | Десять dependency bands: score/services, coverage, frontend, core facts, catalogs, progress/inspector, product actions, Tier 3 и external access. |
 | [Health Score diagnostics](specs/2026-07-28-health-score-diagnostics-design.md) | `PARTIAL` | 0-100 scoring/honesty, Health services, universal coverage, catalog/progress/inspector/compare/settings/log/client work и qualification/RBAC/audit. |
 | [Full UI Web API](specs/2026-07-28-web-ui-api-design.md) | `PARTIAL` | Context/frame/entity/storage routes, predecessor-aware frames, filtering/detail/history, three bounded caches и N=96/1 440 qualification. |
+| [Passive instance metadata](specs/2026-07-29-passive-instance-metadata-design.md) | `FUTURE` | Полное удаление node label и всех аналитических зависимостей от `instance_metadata`; секция остаётся только справочной. |
 
 ## Активные планы
 
