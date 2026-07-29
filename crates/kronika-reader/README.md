@@ -58,7 +58,7 @@ timeline view. Ordinary logical-section requests continue to query
 `logical_section(name)` combines registered layout versions with that name.
 Section queries:
 
-1. select one `source_id` and overlapping time range;
+1. select the units that overlap the requested time range;
 2. decode only matching entries and dictionary sections;
 3. union version columns and resolve strings;
 4. order rows by the registry sort key;
@@ -70,8 +70,8 @@ an adapter spend a smaller request-wide cell budget. Exceeding it returns
 `QueryError::ResultTooLarge` before retaining another row.
 
 `QueryLimits::with_work_limits(QueryWorkLimits::new(...))` adds aggregate
-request ceilings. `max_units` counts units inspected after source/time
-filtering, `max_catalog_read_bytes` counts stored bytes admitted to open
+request ceilings. `max_units` counts units inspected after time filtering,
+`max_catalog_read_bytes` counts stored bytes admitted to open
 candidate catalogs, and `max_dictionary_read_bytes` counts stored
 dictionary-body bytes admitted after catalog confirmation. The defaults are
 500,000 units, 64 MiB of catalog reads, and 64 MiB of dictionary reads. Before
@@ -79,7 +79,7 @@ admitting work over a ceiling, the query returns
 `QueryError::WorkLimitExceeded { resource, limit, observed }`; a stale-open
 retry is charged again.
 
-The cursor pins the last returned key and source contract. A malformed or
+The cursor pins the last returned key and query contract. A malformed or
 cross-source cursor is rejected rather than treated as an offset.
 
 The compact summary's 512-bit Bloom filter can rule out a section type with

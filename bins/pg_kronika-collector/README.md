@@ -20,7 +20,6 @@ while valid storage and future collection continue.
 | --- | ---: | --- |
 | `KRONIKA_PG_DSN` | required | `tokio-postgres` URI or `key=value` connection string. |
 | `KRONIKA_OUT_DIR` | required | PgKronika-owned data root containing `active.parts`, owner locks, and the `YYYY/MM/DD` segment tree. |
-| `KRONIKA_SOURCE_ID` | `0` | `u64` source id stored in segment catalogs. Use a stable, distinct non-zero value for each collector/data root whose data may be compared. |
 | `KRONIKA_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, or `trace`; an invalid value falls back to `info`. |
 
 The output directory is created if absent. File modes follow the process umask.
@@ -187,8 +186,8 @@ The collector reports the outcome in `pg_log_source_status`:
 | `disabled` | The operator explicitly set `KRONIKA_PG_LOG_ENABLED=0`. |
 
 A status row is written on the first observation, when the state, reason,
-parser, or path changes, and after the unchanged heartbeat interval. The latest
-row is exposed as the `pg_log` object in `GET /v1/sources`.
+parser, or path changes, and after the unchanged heartbeat interval. The rows
+are available through `GET /v1/section/pg_log_source_status`.
 
 The collector does not change PostgreSQL settings or file permissions. When no
 committed tail position exists, the first read of a newly discovered file
@@ -235,7 +234,6 @@ BDD and parser fixtures. Production deployments normally leave them unset.
 KRONIKA_PG_DSN='host=127.0.0.1 dbname=postgres user=kronika password=change-me' \
 KRONIKA_OUT_DIR=/var/lib/pg_kronika \
 KRONIKA_LOG_STATE_PATH=/var/lib/pg_kronika-log.state \
-KRONIKA_SOURCE_ID=1 \
 pg_kronika-collector
 ```
 

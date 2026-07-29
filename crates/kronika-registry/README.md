@@ -133,9 +133,9 @@ only to make the number readable. The parts mean:
 - `SSS`: allocated type slot within the class;
 - `VVV`: version of the physical schema and its meaning.
 
-`SSS` is not the PGM `source_id` of a PostgreSQL instance. `VVV` is not a
-PostgreSQL version or a PGM container version. Source code maps a concrete
-source version to a layout version.
+`SSS` is a section-family discriminator. `VVV` is not a PostgreSQL version or
+a PGM container version. Source code maps a concrete source version to a layout
+version.
 
 | Class | Meaning | Current use |
 | ---: | --- | --- |
@@ -153,7 +153,6 @@ by itself imply that a source or codec exists.
 | Identifier | What it distinguishes |
 | --- | --- |
 | `type_id` | A section-body layout, such as one version of `pg_stat_activity`. |
-| PGM `source_id` | An opaque `u64` copied from `KRONIKA_SOURCE_ID` into segment metadata. The registry does not interpret it. |
 | `StrId` | A text or binary value held by PGM dictionary sections. |
 | `query_id`, `plan_id`, OID, PID | PostgreSQL or OS data inside a row; these values do not select the codec. |
 
@@ -349,7 +348,7 @@ sections:
 
 | Logical section | What it reports |
 | --- | --- |
-| `collection_coverage` (`1_023_001`) | For `source_type_id`: known lower bound `total`, its `unknown_total` inexactness flag, written rows `collected`, limit `max_n`, axis `order_by`, boundary `cutoff_value`, and reason `0` top-N, `1` timeout, `2` insufficient privileges, or `3` other. |
+| `collection_coverage` (`1_023_001`) | For `section_type_id`: known lower bound `total`, its `unknown_total` inexactness flag, written rows `collected`, limit `max_n`, axis `order_by`, boundary `cutoff_value`, and reason `0` top-N, `1` timeout, `2` insufficient privileges, or `3` other. |
 | `snapshot_coverage` (`1_038_001`) | For an attempted multi-row snapshot: read state, visibility, observed and durably written row counts, plus `collector_pid` and `collector_started_at`. |
 
 An older segment without `snapshot_coverage` has unknown coverage, not

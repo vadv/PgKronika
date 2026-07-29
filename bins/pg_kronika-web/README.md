@@ -149,9 +149,9 @@ without arming global backoff.
 
 ## Endpoints
 
-For an unfamiliar store, start with `/v1/sources`, `/v1/ui/catalog`,
-`/v1/views/summary`, `/v1/sections`, and `/v1/segments`. They show what data
-exists before you request rows or run an analysis.
+For an unfamiliar store, start with `/v1/ui/catalog`, `/v1/views/summary`,
+`/v1/sections`, and `/v1/segments`. They show what data exists before you
+request rows or run an analysis.
 
 | Endpoint | Parameters | What the operator gets |
 | --- | --- | --- |
@@ -159,35 +159,32 @@ exists before you request rows or run an analysis.
 | `GET /readyz` | none | Tells a health checker whether the directory snapshot was refreshed recently and reports its age. |
 | `GET /metrics` | none | Exposes Prometheus metrics for reader errors, data age, HTTP requests, RSS, and open file descriptors. |
 | `GET /v1/version` | none | Identifies the JSON API version and the PGM format version served by this build. |
-| `GET /v1/sources` | none | Lists the collector sources present in the store, with the earliest and latest timestamp and the segment count for each source. |
-| `GET /v1/ui/catalog` | `source`; optional `If-None-Match` header | Returns the nine stable UI views with source-aware inputs, joins, metric formulas, columns, presets, and availability. It reads PGM catalog metadata only, returns a strong ETag, and answers a matching validator with `304`. |
-| `GET /v1/views/summary` | `source`, `at` | Returns the latest exact population, status, and notable state at or before the cursor for all nine UI views. Sealed data reads only the shared `UiSummary` OVF block; a current active tail is merged from memory. |
-| `GET /v1/timeline/heatmap` | `source`, `view`, `metric`, `from`, `to`; optional `buckets`, `top` | Merges the selected view's local top-K series into a bounded heatmap with score bounds and an exact-ranking proof. The half-open range is limited to 24 hours, `buckets` to `1..=256`, `top` to `1..=64`, and the serialized response to 512 KiB. Sealed requests read only `EntitySeries(view)` and never a PGM body. |
+| `GET /v1/ui/catalog` | optional `If-None-Match` header | Returns the nine stable UI views with inputs, joins, metric formulas, columns, presets, and availability. It reads PGM catalog metadata only, returns a strong ETag, and answers a matching validator with `304`. |
+| `GET /v1/views/summary` | `at` | Returns the latest exact population, status, and notable state at or before the cursor for all nine UI views. Sealed data reads only the shared `UiSummary` OVF block; a current active tail is merged from memory. |
+| `GET /v1/timeline/heatmap` | `view`, `metric`, `from`, `to`; optional `buckets`, `top` | Merges the selected view's local top-K series into a bounded heatmap with score bounds and an exact-ranking proof. The half-open range is limited to 24 hours, `buckets` to `1..=256`, `top` to `1..=64`, and the serialized response to 512 KiB. Sealed requests read only `EntitySeries(view)` and never a PGM body. |
 | `GET /v1/sections` | none | Shows which logical datasets can be queried and gives each dataset's semantics, sort key, and union of registered columns. |
-| `GET /v1/segments` | `source`, `from`, `to` | Shows which segments overlap the requested period and how many rows each section contains. It reads catalog metadata, not section bodies. |
-| `GET /v1/section/{name}` | `source`, `from`, `to`; optional `limit`, `cursor` | Returns the selected dataset as time-ordered rows. The response also names unreadable or missing intervals in `gaps` and supplies `next_cursor` when more rows remain. |
-| `GET /v1/sections/batch` | `source`, `from`, `to`, comma-separated `names`; optional `limit` | Returns the same row pages for several datasets, keyed by section name, after one pass over the overlapping segments. |
-| `GET /v1/section/{name}/diff` | `source`, `from`, `to` | Turns cumulative counters into per-identity changes and per-second rates. Each point contains `delta`, `rate`, and `dt_micros`, or a `nodata` reason when no honest rate can be computed. |
-| `GET /v1/sections/batch/diff` | `source`, `from`, `to`, comma-separated `names` | Returns the same counter-change view for several datasets, keyed by section name, after one segment pass. |
-| `GET /v1/timeline/overview` | exactly one `source`, `from`, `to` | Returns a source-scoped event digest, bounded notable preview, health summary, coverage, freshness, completeness, exactness, count semantics, and known loss. |
-| `GET /v1/timeline/events` | one or more repeatable `source`, `from`, `to`; optional `limit`, `cursor`, `min_severity`, `kind` | Returns a stable page of typed notable event facts and an opaque cursor when more events remain. |
-| `GET /v1/timeline/health` | exactly one `source`, `from`, `to`; optional integer-microsecond `step` | Returns at most 2,000 policy-evaluated health points plus coverage and the effective step. |
-| `GET /v1/anomalies` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `limit`, `section` | Finds unusual rate or gauge intervals and, for stored plans, call-normalized plan-mixture changes and same-plan buffer-work increases. It returns ranked `episodes`, ranked `plan_signals`, per-section evaluation counts, plan applicability and quality, coverage, truncation, and skipped work. |
-| `GET /v1/incidents` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Groups anomaly episodes that are close in time into incident candidates. It returns findings and machine-readable evidence where the inputs support them, plus coverage, data quality, catalog state, and skipped work. |
+| `GET /v1/segments` | `from`, `to` | Shows which segments overlap the requested period and how many rows each section contains. It reads catalog metadata, not section bodies. |
+| `GET /v1/section/{name}` | `from`, `to`; optional `limit`, `cursor` | Returns the selected dataset as time-ordered rows. The response also names unreadable or missing intervals in `gaps` and supplies `next_cursor` when more rows remain. |
+| `GET /v1/sections/batch` | `from`, `to`, comma-separated `names`; optional `limit` | Returns the same row pages for several datasets, keyed by section name, after one pass over the overlapping segments. |
+| `GET /v1/section/{name}/diff` | `from`, `to` | Turns cumulative counters into per-identity changes and per-second rates. Each point contains `delta`, `rate`, and `dt_micros`, or a `nodata` reason when no honest rate can be computed. |
+| `GET /v1/sections/batch/diff` | `from`, `to`, comma-separated `names` | Returns the same counter-change view for several datasets, keyed by section name, after one segment pass. |
+| `GET /v1/timeline/overview` | `from`, `to` | Returns an event digest, bounded notable preview, health summary, coverage, freshness, completeness, exactness, count semantics, and known loss. |
+| `GET /v1/timeline/events` | `from`, `to`; optional `limit`, `cursor`, `min_severity`, `kind` | Returns a stable page of typed notable event facts and an opaque cursor when more events remain. |
+| `GET /v1/timeline/health` | `from`, `to`; optional integer-microsecond `step` | Returns at most 2,000 policy-evaluated health points plus coverage and the effective step. |
+| `GET /v1/anomalies` | `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `limit`, `section` | Finds unusual rate or gauge intervals and, for stored plans, call-normalized plan-mixture changes and same-plan buffer-work increases. It returns ranked `episodes`, ranked `plan_signals`, per-section evaluation counts, plan applicability and quality, coverage, truncation, and skipped work. |
+| `GET /v1/incidents` | `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Groups anomaly episodes that are close in time into incident candidates. It returns findings and machine-readable evidence where the inputs support them, plus coverage, data quality, catalog state, and skipped work. |
 | `GET /` | none | Opens the embedded browser UI over the same local snapshot. |
 
-`source` is the unsigned id returned by `/v1/sources`. `from` and `to` are
-signed Unix timestamps in microseconds. Duration parameters accept `250ms`,
-`90s`, `15m`, `2h`, or bare seconds. Row endpoints return 1,000 rows by default
-and clamp `limit` to 10,000. Treat a cursor as opaque and pass it back unchanged
-on the next request.
+`from` and `to` are signed Unix timestamps in microseconds. Duration parameters
+accept `250ms`, `90s`, `15m`, `2h`, or bare seconds. Row endpoints return 1,000
+rows by default and clamp `limit` to 10,000. Treat a cursor as opaque and pass
+it back unchanged on the next request.
 
 The UI catalog uses the closed availability set `available`, `gated`,
 `not_collected`, and `unsupported_type`. `processes.pss` remains
 `not_collected` until the collector writes bounded `smaps_rollup`; Activity
 CPU and I/O require both activity and process inputs. The serialized catalog
-has a 512 KiB hard ceiling. An absent source returns `404` with
-`code=unknown_source`.
+has a 512 KiB hard ceiling.
 
 Heatmap values preserve the distinction between an absent sample (`null`) and
 an observed zero (`0`). `ranking.exact` is true only when every returned lower
@@ -195,17 +192,14 @@ score bound beats all later and unseen upper bounds. Any incomplete block is
 reported in the response quality and makes the proof inexact. Current
 `active.parts` web-index blocks use the same merge path in memory.
 
-Timeline `from`/`to` ranges are half-open and limited to 31 days. Overview and
-health reject missing or repeated `source`; events canonicalizes a repeatable
-source set by sorting and deduplicating it. Timeline health `step` is an integer
-number of microseconds and is raised when necessary to keep the result within
-2,000 points. Before response-cache lookup, response-flight registration,
-analytic admission, or a new cursor pin, each first-page request plans the
-intersecting sealed descriptors from its canonical source set. More than the
-configured effective limit returns `400` with
-`code=query_limit_exceeded` and `params.resource=selected_segments`. Events
-applies one aggregate limit to the deduplicated source union. Live journal data
-is not charged as a sealed segment and remains subject to its separate bounds.
+Timeline `from`/`to` ranges are half-open and limited to 31 days. Timeline
+health `step` is an integer number of microseconds and is raised when necessary
+to keep the result within 2,000 points. Before response-cache lookup,
+response-flight registration, analytic admission, or a new cursor pin, each
+first-page request plans the intersecting sealed descriptors. More than the
+configured effective limit returns `400` with `code=query_limit_exceeded` and
+`params.resource=selected_segments`. Live journal data is not charged as a
+sealed segment and remains subject to its separate bounds.
 Events pages default to 100 facts and never exceed 1,000. An invalid or
 query-mismatched event cursor returns `400`. Expired and post-restart cursors
 return `410` with `code=cursor_expired`; an evicted or otherwise absent pinned
@@ -216,7 +210,7 @@ Example:
 
 ```sh
 curl -u operator:change-me \
-  'http://127.0.0.1:8688/v1/segments?source=1&from=0&to=9223372036854775807'
+  'http://127.0.0.1:8688/v1/segments?from=0&to=9223372036854775807'
 ```
 
 The success/data API is locale-neutral. `Accept-Language` does not change its
@@ -242,45 +236,39 @@ See the [OpenAPI contract](openapi.json) and the
   before decoding, combine registered layout versions under one logical section
   name, and sort by the registry key. Exact duplicates between sealed segments
   and `active.parts` appear only once.
-- `/v1/sources` computes spans and latest `pg_log_source_status` rows in one
-  pass over one snapshot generation. A request is limited to 65,536 units,
-  1,048,576 status rows, and 64 MiB of admitted body reads. A stale unit
-  restarts the whole result; after two failed refreshes the server returns an
-  explicit store-read error instead of an older status with `200`.
-- Timeline facts remain isolated by source. The overview preview and event
-  pages use the same typed `EventFact` projection: semantic `event_id`,
-  provenance-bound `event_instance_id`, source and time fields, notable and
-  evidence classes, quality flags, a typed payload, supporting evidence, and
-  attached loss. Pagination order is exactly `(sort_ts_us, event_id,
-  event_instance_id)`.
+- The overview preview and event pages use the same typed `EventFact`
+  projection: semantic `event_id`, provenance-bound `event_instance_id`, time
+  fields, notable and evidence classes, quality flags, a typed payload,
+  supporting evidence, and attached loss. Pagination order is exactly
+  `(sort_ts_us, event_id, event_instance_id)`.
 - Timeline refresh publishes catalog-derived sealed descriptors and one
   bounded live generation without decoding sealed section bodies. An admitted
-  request loads only the descriptors selected for its sources and interval.
+  request loads only the descriptors selected for its interval.
   Hits in decoded memory, a valid sibling `.ovf`, or the recoverable in-memory
-  fallback bypass source-build admission. Missing facts share work by the full
+  fallback bypass fact-build admission. Missing facts share work by the full
   `FactBuildKey`, survive request cancellation, and enter the configurable
   process-wide FIFO scheduler. Queue exhaustion, an overweight build, or FIFO
   timeout returns `503` with `code=cold_build_overloaded` and the configured
   `Retry-After`.
-- A selected sealed source that fails while the request is loading facts does
+- A selected sealed segment that fails while the request is loading facts does
   not become a successful empty segment and does not fail the whole request.
   The response is `200` with that interval in `known_gaps`, reduced
   completeness, and a fact-set identity distinct from the planned complete
   input. Such a partial response is not retained under the complete response
   cache key. The background streaming CRC scrub detects silent section-body
   damage, marks the segment unavailable, and prevents an older sidecar from
-  masking that source gap.
+  masking that segment gap.
 - Event counts use checked arithmetic. Severity and category totals,
   SQLSTATE top/other/missing buckets, and joint top/other buckets independently
   reconcile to retained error occurrences; retained groups and physical
-  observation rows are separate counts. Retained exactness, source
+  observation rows are separate counts. Retained exactness, data
   completeness, physical-count semantics, freshness, and known loss remain
   independent response fields.
 - A valid sibling sidecar is always consulted before the bounded process-local
   fallback. Only a recoverable publication failure may populate that fallback.
   Exact overview/health response caching is bounded by entry
   count and bytes. Event cursors pin an exact immutable view in a count-, byte-,
-  and TTL-bounded registry and bind the canonical source set, query, policy,
+  and TTL-bounded registry and bind the query, policy,
   and last sort position with a process-local OS-random authentication key.
 - Diff responses distinguish a measured zero from a missing result. A point
   without a valid rate carries one of the response codes `reset`, `gap`,
@@ -370,7 +358,7 @@ See the [OpenAPI contract](openapi.json) and the
   `{ "kind": "...", "params": { ... } }` reason schema. Lens ids, enum values,
   formulas, units, and evidence remain stable machine data; incident catalogs
   contain no localized title or question.
-- Only one `/v1/sources`, anomaly, incident, or uncached timeline response
+- Only one anomaly, incident, or uncached timeline response
   projection runs at a time. Equal timeline response misses share one response
   flight; cache hits do not consume the slot. Another distinct heavy request
   receives `503` with `code=analytic_capacity_unavailable` and

@@ -242,7 +242,7 @@ fn fact_load_problem(error: FactLoadFailure) -> ApiProblem {
     }
 }
 
-fn overview_key(fact_set_id: [u8; 32], request: OverviewRequest) -> ResponseKey {
+const fn overview_key(fact_set_id: [u8; 32], request: OverviewRequest) -> ResponseKey {
     ResponseKey {
         endpoint: Endpoint::Overview,
         response_schema_version: RESPONSE_SCHEMA_VERSION,
@@ -390,7 +390,7 @@ fn parse_optional_u64(
     })
 }
 
-fn health_key(fact_set_id: [u8; 32], request: HealthRequest) -> ResponseKey {
+const fn health_key(fact_set_id: [u8; 32], request: HealthRequest) -> ResponseKey {
     ResponseKey {
         endpoint: Endpoint::Health,
         response_schema_version: RESPONSE_SCHEMA_VERSION,

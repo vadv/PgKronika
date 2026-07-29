@@ -100,10 +100,9 @@ KRONIKA_WEB_ADDR=127.0.0.1:8688 \
 ./target/x86_64-unknown-linux-gnu/debug/pg_kronika-web
 ```
 
-Получите список источников и доступных секций:
+Получите список доступных секций:
 
 ```sh
-curl -sS http://127.0.0.1:8688/v1/sources
 curl -sS http://127.0.0.1:8688/v1/sections
 ```
 

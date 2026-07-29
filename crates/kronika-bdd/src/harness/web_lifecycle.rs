@@ -468,17 +468,6 @@ async fn timeline(client: WebClient, case: &WebCase) -> Result<TimelineResponses
     );
     let readyz = client.get("/readyz").await?;
     ensure!(readyz.status == 200, "/readyz returned {}", readyz.status);
-    let sources = client.get_json("/v1/sources").await?;
-    let source_rows = sources["sources"]
-        .as_array()
-        .context("/v1/sources has no sources array")?;
-    ensure!(
-        source_rows
-            .iter()
-            .any(|row| row["source_id"].as_u64() == Some(case.source_id())),
-        "/v1/sources omitted the fixture source {}",
-        case.source_id()
-    );
     assert_same_fact_set(&overview, &events, &health)?;
     Ok(TimelineResponses {
         overview,
@@ -493,8 +482,7 @@ async fn request_overview(client: WebClient, case: &WebCase) -> Result<Value> {
 
 fn overview_target(case: &WebCase) -> String {
     format!(
-        "/v1/timeline/overview?source={}&from={}&to={}",
-        case.source_id(),
+        "/v1/timeline/overview?from={}&to={}",
         case.range_start_us(),
         case.to_us()
     )
@@ -506,8 +494,7 @@ fn health_target(case: &WebCase) -> String {
         .checked_sub(case.range_start_us())
         .expect("lifecycle range is nonempty");
     format!(
-        "/v1/timeline/health?source={}&from={}&to={}&step={step}",
-        case.source_id(),
+        "/v1/timeline/health?from={}&to={}&step={step}",
         case.range_start_us(),
         case.to_us()
     )
@@ -515,8 +502,7 @@ fn health_target(case: &WebCase) -> String {
 
 fn events_target(case: &WebCase, limit: usize, cursor: Option<&str>) -> String {
     let mut target = format!(
-        "/v1/timeline/events?source={}&from={}&to={}&limit={limit}",
-        case.source_id(),
+        "/v1/timeline/events?from={}&to={}&limit={limit}",
         case.range_start_us(),
         case.to_us()
     );

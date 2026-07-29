@@ -71,7 +71,6 @@ README.
     "extractor_semantics_version": 7,
     "registry_contract_version": 1,
     "source_format_version": 1,
-    "pgm_source_id": 7,
     "source_min_ts_us": 1785200000000000,
     "source_max_ts_us": 1785203600000000,
     "source_file_len": 923410,

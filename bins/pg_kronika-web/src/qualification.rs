@@ -903,14 +903,12 @@ async fn concurrent_disjoint(root: &Path) -> WorkerOutcome {
     let (snapshot, view) = state.overview_request_view();
     let mut plans = Vec::with_capacity(CONCURRENT_WORKERS);
     for worker in 0..CONCURRENT_WORKERS {
-        let source = 100 + u64::try_from(worker).expect("worker source");
         let start =
             DENSE_FIRST_WINDOW_US + i64::try_from(worker).expect("worker range") * 1_000_000_000;
         plans.push(
             state
                 .select_overview(
                     Arc::clone(&view),
-                    &[source],
                     CoverageSpan::new(start, start + 32 * CADENCE_US).expect("disjoint range"),
                 )
                 .expect("disjoint plan"),
@@ -2286,11 +2284,6 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                     "rust_test",
                     "crates/kronika-reader/src/overview/publish.rs",
                     "oversized_candidate_is_rebuilt_and_atomically_replaced",
-                ),
-                (
-                    "rust_test",
-                    "crates/kronika-reader/src/overview/container.rs",
-                    "admission_distinguishes_wrong_source_from_incompatible_versions",
                 ),
                 (
                     "rust_test",

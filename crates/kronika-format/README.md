@@ -200,30 +200,22 @@ ascending `type_id`, followed by at most one `dict.strings` and at most one
 `dict.blobs`. Different chart entities and rows from different collection
 windows are coalesced inside the one body for their type.
 
-### Catalog metadata: 40 bytes
+### Catalog metadata: 32 bytes
 
 | Offset | Field | Type | Meaning |
 | ---: | --- | --- | --- |
 | 0 | `min_ts` | `i64` | Earliest section timestamp, Unix microseconds. |
 | 8 | `max_ts` | `i64` | Latest section timestamp, Unix microseconds. |
-| 16 | `source_id` | `u64` | Source identifier; zero means unspecified. |
-| 24 | `entry_count` | `u32` | Number of 32-byte entries before this block. |
-| 28 | `format_version` | `u32` | Container layout version; current writers store `1`. |
-| 32 | `crc32c` | `u32` | CRC32C of entries and metadata with this field zeroed. |
-| 36 | `window_count` | `u32` | Collection windows coalesced into this container. `build_part` stores `1`; `seal` stores the exact number of journal parts; zero means unknown. |
-
-The low-level `Catalog` and `PartMeta` APIs historically document `source_id`
-as the `StrId` of `{cluster_id}/{pg_system_identifier}`. The current collector
-instead copies an arbitrary `KRONIKA_SOURCE_ID` into the field and does not
-guarantee a matching `dict.strings` record. Readers of current collector output
-must therefore treat `source_id` as an opaque identifier, not a resolvable
-string reference.
+| 16 | `entry_count` | `u32` | Number of 32-byte entries before this block. |
+| 20 | `format_version` | `u32` | Container layout version; current writers store `2`. |
+| 24 | `crc32c` | `u32` | CRC32C of entries and metadata with this field zeroed. |
+| 28 | `window_count` | `u32` | Collection windows coalesced into this container. `build_part` stores `1`; `seal` stores the exact number of journal parts; zero means unknown. |
 
 ### Tail index: 8 bytes
 
 | Offset | Field | Type | Meaning |
 | ---: | --- | --- | --- |
-| 0 | `catalog_len` | `u32` | Entries plus the 40-byte metadata block; excludes the tail itself. |
+| 0 | `catalog_len` | `u32` | Entries plus the 32-byte metadata block; excludes the tail itself. |
 | 4 | `magic` | 4 bytes | `"PGM1"`. |
 
 A reader therefore starts at the end, not at the first section:

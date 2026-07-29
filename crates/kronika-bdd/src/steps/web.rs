@@ -30,8 +30,7 @@ async fn web_section_single_row(world: &mut BddWorld, section: String, step: &St
         .with_context(|| format!("section {} has no logical name", section.label))?;
     let segment = world.harness.segment()?.clone();
     let dir = segment.data_root();
-    let source = web::only_source(dir).await?;
-    let page = web::section_page(dir, name, source).await?;
+    let page = web::section_page(dir, name).await?;
     web::assert_one_row(&page, &expected)
 }
 
@@ -61,8 +60,7 @@ async fn web_section_row_by_key(
         .with_context(|| format!("section {} has no logical name", section.label))?;
     let segment = world.harness.segment()?.clone();
     let dir = segment.data_root();
-    let source = web::only_source(dir).await?;
-    let page = web::section_page(dir, name, source).await?;
+    let page = web::section_page(dir, name).await?;
     web::assert_row_where(&page, &keys, &expected)
 }
 
@@ -74,7 +72,7 @@ async fn web_locale_neutral_problem(world: &mut BddWorld) -> Result<()> {
     web::assert_locale_neutral_problem(dir).await
 }
 
-/// Assert `/v1/sources` reports successful default `PostgreSQL` log collection.
+/// Assert the collected status row reports successful default `PostgreSQL` log collection.
 #[then("the web API reports PostgreSQL log state collecting for the only source")]
 async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();

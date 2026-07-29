@@ -476,10 +476,10 @@ fn descriptor_freshness(sealed: &[DescriptorEntry], live: &LiveView) -> Descript
     let mut data_through_us = sealed.iter().map(|entry| entry.descriptor().max_ts).max();
     if matches!(live.state(), LiveState::Empty | LiveState::Current) {
         for facts in live.chunks() {
+            let source_max_ts_us = facts.identity().source_max_ts_us;
             data_through_us = Some(
-                data_through_us.map_or(facts.identity().source_max_ts_us, |current| {
-                    current.max(facts.identity().source_max_ts_us)
-                }),
+                data_through_us
+                    .map_or_else(|| source_max_ts_us, |current| current.max(source_max_ts_us)),
             );
         }
     }
@@ -497,12 +497,14 @@ pub(crate) struct SealedEntry {
 
 impl SealedEntry {
     /// Binds sealed facts, computing the content-addressed fact key.
-    pub(crate) fn new(_descriptor: SegmentDescriptor, facts: Arc<SegmentFacts>) -> Self {
+    pub(crate) fn new(descriptor: SegmentDescriptor, facts: Arc<SegmentFacts>) -> Self {
         let fact_key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
         let fact_build_key = FactBuildKey::new(fact_key, facts.lineage().id());
+        #[cfg(not(test))]
+        let _ = descriptor;
         Self {
             #[cfg(test)]
-            descriptor: _descriptor,
+            descriptor,
             facts,
             fact_build_key,
         }
@@ -623,7 +625,7 @@ impl IndexView {
         clippy::too_many_arguments,
         reason = "the constructor binds every immutable axis of one selected fact view"
     )]
-    fn new_with_id(
+    const fn new_with_id(
         view_generation: u64,
         sealed: Vec<SealedEntry>,
         live: Arc<LiveView>,

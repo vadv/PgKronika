@@ -23,7 +23,6 @@ use crate::harness::web_process::WebCase;
 
 const MINUTE_US: i64 = 60 * 1_000_000;
 const SNAPSHOTS: i64 = 60;
-const SOURCE_ID: u64 = 7;
 
 #[given("a deterministic OSSC plan-evidence segment")]
 fn deterministic_plan_segment(world: &mut BddWorld) -> Result<()> {
@@ -62,8 +61,7 @@ async fn real_web_reports_plan_evidence(world: &mut BddWorld) -> Result<()> {
     let case = WebCase::from_segment(&segment, "plan-evidence")?;
     let process = case.spawn(&[]).await?;
     let target = format!(
-        "/v1/anomalies?source={}&from={}&to={}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc",
-        case.source_id(),
+        "/v1/anomalies?from={}&to={}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc",
         case.range_start_us(),
         case.to_us() - 1,
     );
@@ -286,7 +284,6 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
         PartMeta {
             min_ts: 0,
             max_ts: (SNAPSHOTS - 1) * MINUTE_US,
-            source_id: SOURCE_ID,
         },
     ))
 }

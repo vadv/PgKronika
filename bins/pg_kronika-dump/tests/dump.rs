@@ -33,11 +33,11 @@ use serde_json::Value;
 
 const FIRST_SEGMENT: i64 = 1_753_500_000_000_001;
 const SECOND_SEGMENT: i64 = FIRST_SEGMENT + 86_400_000_000;
-const OVF_HEADER_LEN: usize = 192;
+const OVF_HEADER_LEN: usize = 184;
 const OVF_DIRECTORY_ENTRY_LEN: usize = 64;
-const OVF_DIRECTORY_COUNT_OFFSET: usize = 168;
-const OVF_DIRECTORY_CRC_OFFSET: usize = 184;
-const OVF_HEADER_CRC_OFFSET: usize = 188;
+const OVF_DIRECTORY_COUNT_OFFSET: usize = 160;
+const OVF_DIRECTORY_CRC_OFFSET: usize = 176;
+const OVF_HEADER_CRC_OFFSET: usize = 180;
 
 fn loadavg_body(rows: &[i64]) -> Vec<u8> {
     OsLoadavg::encode(
@@ -70,11 +70,7 @@ fn part_with_loadavg(min_ts: i64, max_ts: i64, rows: &[i64]) -> (Vec<u8>, Vec<u8
             rows: u32::try_from(rows.len()).expect("small fixture"),
             body: &body,
         }],
-        PartMeta {
-            min_ts,
-            max_ts,
-            source_id: 7,
-        },
+        PartMeta { min_ts, max_ts },
     );
     (part, body)
 }
@@ -83,10 +79,9 @@ fn ovf_fixture() -> Vec<u8> {
     const BUCKET_US: i64 = 60_000_000;
 
     let descriptor = SourceDescriptor([0x22; 32]);
-    let lineage = SegmentIdentity::sealed(7, descriptor.0);
+    let lineage = SegmentIdentity::sealed(descriptor.0);
     let identity = HeaderIdentity::from_current_contract(
         kronika_format::FORMAT_VERSION,
-        7,
         0,
         BUCKET_US,
         4_096,
@@ -94,7 +89,6 @@ fn ovf_fixture() -> Vec<u8> {
         lineage.id(),
     );
     let manifest = SourceManifestBlock::new(
-        7,
         kronika_format::FORMAT_VERSION,
         0,
         BUCKET_US,
@@ -256,7 +250,7 @@ fn ovf_name_selects_metadata_dump_without_reading_bodies() {
     assert!(stderr.is_empty());
     assert_eq!(output["kind"], "ovf");
     assert_eq!(output["file_bytes"], bytes.len());
-    assert_eq!(output["header"]["pgm_source_id"], 7);
+    assert!(output["header"].get("pgm_source_id").is_none());
     assert!(
         output["blocks"]
             .as_array()
@@ -505,7 +499,6 @@ fn unknown_type_keeps_metadata_and_skips_rows() {
         PartMeta {
             min_ts: 10,
             max_ts: 10,
-            source_id: 7,
         },
     );
     let path = directory.path().join(format!("{FIRST_SEGMENT}.pgm"));
@@ -554,7 +547,6 @@ fn rows_resolve_segment_dictionary_values() {
         PartMeta {
             min_ts: 1_000,
             max_ts: 1_000,
-            source_id: 7,
         },
     );
     let path = directory.path().join(format!("{FIRST_SEGMENT}.pgm"));

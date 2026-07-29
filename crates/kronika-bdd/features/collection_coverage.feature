@@ -20,7 +20,7 @@ Feature: Coverage rows (collection_coverage) describe truncated top-N sources
       END $$;
       """
     When the collector snapshots the segment
-    Then section collection_coverage has a row with source_type_id = 1013003:
+    Then section collection_coverage has a row with section_type_id = 1013003:
       | total        | 40   |
       | unknown_total | false |
       | max_n        | 5    |

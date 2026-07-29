@@ -1033,7 +1033,6 @@ fn prepare_window_admission(
 
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "one transaction keeps admission, journal append, early seal, and SegmentId state synchronized"
 )]
 pub(crate) fn append_window_and_maybe_seal(

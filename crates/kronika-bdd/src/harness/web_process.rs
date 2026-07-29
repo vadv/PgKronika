@@ -328,7 +328,6 @@ pub(crate) struct WebCase {
     root: TempDir,
     data_root: DataRoot,
     address: SegmentAddress,
-    source_id: u64,
     from_us: i64,
     to_us: i64,
     sources_before: SourceArtifacts,
@@ -395,7 +394,6 @@ impl WebCase {
                 .context("open copied PGM")?,
         )
         .context("open copied PGM catalog")?;
-        let source_id = unit.catalog().source_id;
         let from_us = unit.catalog().min_ts;
         let to_us = unit
             .catalog()
@@ -408,7 +406,6 @@ impl WebCase {
             root,
             data_root,
             address: segment.address(),
-            source_id,
             from_us,
             to_us,
             sources_before,
@@ -422,10 +419,6 @@ impl WebCase {
     pub(crate) fn sidecar(&self) -> PathBuf {
         self.data_root
             .diagnostic_file_path(self.address, FileKind::Ovf)
-    }
-
-    pub(crate) const fn source_id(&self) -> u64 {
-        self.source_id
     }
 
     pub(crate) const fn range_start_us(&self) -> i64 {

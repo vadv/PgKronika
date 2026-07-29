@@ -93,52 +93,18 @@ async fn request_with_router(
     })
 }
 
-/// The single source id the store holds, read through `/v1/sources`.
-///
-/// A BDD scenario collects one instance, so the store carries exactly one source.
-pub(crate) async fn only_source(dir: &Path) -> Result<u64> {
-    let response = request(dir, "/v1/sources", &[]).await?;
-    anyhow::ensure!(
-        response.status == 200,
-        "/v1/sources returned status {}",
-        response.status
-    );
-    let sources = response.body["sources"]
-        .as_array()
-        .context("`sources` is not an array")?;
-    match sources.as_slice() {
-        [source] => source["source_id"]
-            .as_u64()
-            .context("`source_id` is not a number"),
-        other => bail!("expected exactly one source, got {}", other.len()),
-    }
-}
-
-/// The `PostgreSQL` log status nested under the only `/v1/sources` row.
+/// The latest collected `PostgreSQL` log status row.
 pub(crate) async fn only_pg_log_status(dir: &Path) -> Result<Value> {
-    let response = request(dir, "/v1/sources", &[]).await?;
-    anyhow::ensure!(
-        response.status == 200,
-        "/v1/sources returned status {}: {}",
-        response.status,
-        response.body
-    );
-    let sources = response.body["sources"]
-        .as_array()
-        .context("`sources` is not an array")?;
-    let [source] = sources.as_slice() else {
-        bail!("expected exactly one source, got {}", sources.len());
-    };
-    source
-        .get("pg_log")
+    let page = section_page(dir, "pg_log_source_status").await?;
+    let rows = page["rows"].as_array().context("`rows` is not an array")?;
+    rows.last()
         .cloned()
-        .context("the source has no `pg_log` status")
+        .context("the store has no `pg_log_source_status` row")
 }
 
 /// Verify that two source-status rows expose two different non-null log paths.
 pub(crate) async fn assert_two_log_source_paths(dir: &Path) -> Result<()> {
-    let source = only_source(dir).await?;
-    let page = section_page(dir, "pg_log_source_status", source).await?;
+    let page = section_page(dir, "pg_log_source_status").await?;
     let rows = page["rows"].as_array().context("`rows` is not an array")?;
     let paths = rows
         .iter()
@@ -155,36 +121,27 @@ pub(crate) async fn assert_two_log_source_paths(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The single source's id and time span, read through `/v1/sources`.
-pub(crate) async fn source_span(dir: &Path) -> Result<(u64, i64, i64)> {
-    let response = request(dir, "/v1/sources", &[]).await?;
-    anyhow::ensure!(
-        response.status == 200,
-        "/v1/sources returned status {}",
-        response.status
-    );
-    let sources = response.body["sources"]
-        .as_array()
-        .context("`sources` is not an array")?;
-    let [source] = sources.as_slice() else {
-        bail!("expected exactly one source, got {}", sources.len());
-    };
-    Ok((
-        source["source_id"]
-            .as_u64()
-            .context("`source_id` is not a number")?,
-        source["min_ts"].as_i64().context("`min_ts` is not i64")?,
-        source["max_ts"].as_i64().context("`max_ts` is not i64")?,
-    ))
+/// The timestamp envelope of the single observation stream in `dir`.
+pub(crate) fn store_span(dir: &Path) -> Result<(i64, i64)> {
+    let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
+    let min_ts = snapshot
+        .units()
+        .iter()
+        .map(|unit| unit.min_ts)
+        .min()
+        .context("the store has no units")?;
+    let max_ts = snapshot
+        .units()
+        .iter()
+        .map(|unit| unit.max_ts)
+        .max()
+        .context("the store has no units")?;
+    Ok((min_ts, max_ts))
 }
 
 /// One section's diff over the whole period, for failure diagnostics.
-pub(crate) async fn section_diff(dir: &Path, name: &str, source: u64) -> Result<Value> {
-    let uri = format!(
-        "/v1/section/{name}/diff?source={source}&from={}&to={}",
-        i64::MIN,
-        i64::MAX,
-    );
+pub(crate) async fn section_diff(dir: &Path, name: &str) -> Result<Value> {
+    let uri = format!("/v1/section/{name}/diff?from={}&to={}", i64::MIN, i64::MAX);
     let response = request(dir, &uri, &[]).await?;
     anyhow::ensure!(
         response.status == 200,
@@ -209,11 +166,11 @@ pub(crate) async fn anomalies(dir: &Path, query: &str) -> Result<Value> {
 
 /// Prove the storage-to-HTTP incident observability contract for collected data.
 pub(crate) async fn assert_incident_observability(dir: &Path) -> Result<()> {
-    let (source, from_us, max_us) = source_span(dir).await?;
+    let (from_us, max_us) = store_span(dir)?;
     let to_us = max_us
         .checked_add(1)
-        .context("incident source range cannot form a half-open interval")?;
-    let response = incident_response(dir, source, from_us, to_us).await?;
+        .context("incident range cannot form a half-open interval")?;
+    let response = incident_response(dir, from_us, to_us).await?;
     anyhow::ensure!(
         response["analysis_status"] != "no_data",
         "collected source unexpectedly returned no_data: {response}"
@@ -223,26 +180,23 @@ pub(crate) async fn assert_incident_observability(dir: &Path) -> Result<()> {
 
 /// Prove that an early no-data return keeps the catalog but claims no diagnosis.
 pub(crate) async fn assert_incident_no_data_observability(dir: &Path) -> Result<()> {
-    let (source, from_us, max_us) = source_span(dir).await?;
-    let missing_source = source
+    let (_from_us, max_us) = store_span(dir)?;
+    let query_from_us = max_us
         .checked_add(1)
-        .context("source id cannot form a missing-source probe")?;
-    let to_us = max_us
-        .checked_add(1)
-        .context("incident source range cannot form a half-open interval")?;
-    let query_from_us = from_us
-        .checked_sub(5 * 60 * 1_000_000)
-        .context("incident no-data range underflowed")?;
-    let response = incident_response(dir, missing_source, query_from_us, to_us).await?;
+        .context("incident no-data range overflowed")?;
+    let query_to_us = query_from_us
+        .checked_add(5 * 60 * 1_000_000)
+        .context("incident no-data range overflowed")?;
+    let response = incident_response(dir, query_from_us, query_to_us).await?;
     anyhow::ensure!(
         response["analysis_status"] == "no_data",
-        "missing source did not return no_data: {response}"
+        "uncovered range did not return no_data: {response}"
     );
     assert_incident_catalog(&response, false, 0)
 }
 
-async fn incident_response(dir: &Path, source: u64, from_us: i64, to_us: i64) -> Result<Value> {
-    let uri = format!("/v1/incidents?source={source}&from={from_us}&to={to_us}&window=5m&step=1m");
+async fn incident_response(dir: &Path, from_us: i64, to_us: i64) -> Result<Value> {
+    let uri = format!("/v1/incidents?from={from_us}&to={to_us}&window=5m&step=1m");
     let response = request(dir, &uri, &[]).await?;
     anyhow::ensure!(
         response.status == 200,
@@ -382,10 +336,10 @@ fn assert_no_presentation_fields(value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Fetch one section's page for `source` over the widest possible window.
-pub(crate) async fn section_page(dir: &Path, name: &str, source: u64) -> Result<Value> {
+/// Fetch one section's page over the widest possible window.
+pub(crate) async fn section_page(dir: &Path, name: &str) -> Result<Value> {
     let uri = format!(
-        "/v1/section/{name}?source={source}&from={}&to={}&limit=10000",
+        "/v1/section/{name}?from={}&to={}&limit=10000",
         i64::MIN,
         i64::MAX,
     );
@@ -426,41 +380,24 @@ pub(crate) async fn assert_timeline_pg_log_contract(segment: &SealedSegment) -> 
     let state = AppState::new(snapshot).context("build the timeline web state")?;
     let router = app(state, None, bdd_metrics_handle());
 
-    let sources = request_with_router(&router, "/v1/sources", &[]).await?;
-    anyhow::ensure!(
-        sources.status == 200,
-        "/v1/sources returned status {}: {}",
-        sources.status,
-        sources.body
-    );
-    let source_rows = sources.body["sources"]
-        .as_array()
-        .context("`sources` is not an array")?;
-    let [source_row] = source_rows.as_slice() else {
-        bail!("expected exactly one source, got {}", source_rows.len());
-    };
-    let source = source_row["source_id"]
-        .as_u64()
-        .context("`source_id` is not a number")?;
-
-    assert_timeline_source_required(&router, from_us, to_us).await?;
+    assert_timeline_rejects_source(&router, from_us, to_us).await?;
 
     let overview = timeline_ok(
         &router,
-        &format!("/v1/timeline/overview?source={source}&from={from_us}&to={to_us}"),
+        &format!("/v1/timeline/overview?from={from_us}&to={to_us}"),
         "overview",
     )
     .await?;
     let events = timeline_ok(
         &router,
-        &format!("/v1/timeline/events?source={source}&from={from_us}&to={to_us}"),
+        &format!("/v1/timeline/events?from={from_us}&to={to_us}"),
         "events",
     )
     .await?;
     let health = timeline_ok(
         &router,
         &format!(
-            "/v1/timeline/health?source={source}&from={from_us}&to={to_us}&step={}",
+            "/v1/timeline/health?from={from_us}&to={to_us}&step={}",
             to_us
                 .checked_sub(from_us)
                 .context("timeline fixture range subtraction overflowed")?
@@ -474,11 +411,11 @@ pub(crate) async fn assert_timeline_pg_log_contract(segment: &SealedSegment) -> 
         ("events", &events),
         ("health", &health),
     ] {
-        assert_source_meta(name, body, source)?;
+        assert_root_meta(name, body)?;
     }
     assert_same_publication(&overview, &events, &health)?;
     assert_digest_reconciles(&overview)?;
-    assert_shared_event_facts(&overview, &events, source)?;
+    assert_shared_event_facts(&overview, &events)?;
     assert_metric_factor_coverage(&overview, &events, &health)?;
     assert_parsed_panic_and_child_termination_do_not_set_health_floor(&health)?;
     let sidecar = data_root.diagnostic_file_path(segment.address(), kronika_layout::FileKind::Ovf);
@@ -493,28 +430,28 @@ pub(crate) async fn assert_timeline_pg_log_contract(segment: &SealedSegment) -> 
     Ok(())
 }
 
-async fn assert_timeline_source_required(router: &Router, from_us: i64, to_us: i64) -> Result<()> {
+async fn assert_timeline_rejects_source(router: &Router, from_us: i64, to_us: i64) -> Result<()> {
     let uris = [
-        format!("/v1/timeline/overview?from={from_us}&to={to_us}"),
-        format!("/v1/timeline/events?from={from_us}&to={to_us}"),
-        format!("/v1/timeline/health?from={from_us}&to={to_us}"),
+        format!("/v1/timeline/overview?source=7&from={from_us}&to={to_us}"),
+        format!("/v1/timeline/events?source=7&from={from_us}&to={to_us}"),
+        format!("/v1/timeline/health?source=7&from={from_us}&to={to_us}"),
     ];
     for uri in uris {
         let response = request_with_router(router, &uri, &[]).await?;
         anyhow::ensure!(
             response.status == 400,
-            "{uri} without source returned status {}: {}",
+            "{uri} with removed source returned status {}: {}",
             response.status,
             response.body
         );
         anyhow::ensure!(
-            response.body["code"] == "missing_query_parameter",
-            "{uri} did not reject the missing source: {}",
+            response.body["code"] == "unknown_query_parameter",
+            "{uri} did not reject the removed source parameter: {}",
             response.body
         );
         anyhow::ensure!(
             response.body["params"]["parameter"] == "source",
-            "{uri} reported the wrong missing parameter: {}",
+            "{uri} reported the wrong unknown parameter: {}",
             response.body
         );
     }
@@ -532,7 +469,7 @@ async fn timeline_ok(router: &Router, uri: &str, label: &str) -> Result<Value> {
     Ok(response.body)
 }
 
-fn assert_source_meta(label: &str, body: &Value, source: u64) -> Result<()> {
+fn assert_root_meta(label: &str, body: &Value) -> Result<()> {
     let meta = body["meta"]
         .as_object()
         .with_context(|| format!("{label} `meta` is not an object"))?;
@@ -541,50 +478,28 @@ fn assert_source_meta(label: &str, body: &Value, source: u64) -> Result<()> {
         "{label} used the wrong response schema: {}",
         body["meta"]
     );
+    anyhow::ensure!(meta.get("sources").is_none());
+    anyhow::ensure!(meta.get("available_sources").is_none());
     anyhow::ensure!(
-        meta.get("sources") == Some(&serde_json::json!([source])),
-        "{label} did not retain the selected source: {}",
-        body["meta"]
-    );
-    anyhow::ensure!(
-        meta.get("available_sources") == Some(&serde_json::json!([source])),
-        "{label} did not report the selected source as available: {}",
-        body["meta"]
-    );
-    anyhow::ensure!(
-        meta.get("source_status")
+        meta.get("status")
             .and_then(Value::as_str)
             .is_some_and(|status| status != "unavailable"),
-        "{label} source status is unavailable: {}",
+        "{label} status is unavailable: {}",
         body["meta"]
     );
 
     let freshness = meta
-        .get("source_freshness")
-        .and_then(Value::as_array)
-        .with_context(|| format!("{label} `source_freshness` is not an array"))?;
-    let [freshness] = freshness.as_slice() else {
-        bail!(
-            "{label} expected one source freshness record, got {}",
-            freshness.len()
-        );
-    };
-    anyhow::ensure!(freshness["source_id"] == source);
-    anyhow::ensure!(freshness["source_completeness"] == "bounded_subset");
+        .get("freshness")
+        .and_then(Value::as_object)
+        .with_context(|| format!("{label} `freshness` is not an object"))?;
+    anyhow::ensure!(freshness["completeness"] == "bounded_subset");
     anyhow::ensure!(freshness["retained_exactness"] == "exact");
     anyhow::ensure!(freshness["physical_count_semantics"] == "lower_bound");
 
     let loss = meta
         .get("loss")
-        .and_then(Value::as_array)
-        .with_context(|| format!("{label} `loss` is not an array"))?;
-    let [loss] = loss.as_slice() else {
-        bail!(
-            "{label} expected one source loss record, got {}",
-            loss.len()
-        );
-    };
-    anyhow::ensure!(loss["source_id"] == source);
+        .and_then(Value::as_object)
+        .with_context(|| format!("{label} `loss` is not an object"))?;
     anyhow::ensure!(loss["known_gaps"].is_array());
     anyhow::ensure!(
         loss["dropped_count_lower_bound"].is_null() || loss["dropped_count_lower_bound"].is_u64()
@@ -694,7 +609,7 @@ fn json_u64(value: &Value, label: &str) -> Result<u64> {
         .with_context(|| format!("`{label}` is not an unsigned integer: {value}"))
 }
 
-fn assert_shared_event_facts(overview: &Value, events: &Value, source: u64) -> Result<()> {
+fn assert_shared_event_facts(overview: &Value, events: &Value) -> Result<()> {
     let preview = overview["notable_preview"]["observations"]
         .as_array()
         .context("overview notable observations is not an array")?;
@@ -715,13 +630,13 @@ fn assert_shared_event_facts(overview: &Value, events: &Value, source: u64) -> R
     anyhow::ensure!(events["omitted_by_response_filter"] == 0);
     anyhow::ensure!(events["notable_policy_version"] == 2);
     anyhow::ensure!(events["retained_exactness"] == "exact");
-    anyhow::ensure!(events["source_completeness"] == "bounded_subset");
+    anyhow::ensure!(events["completeness"] == "bounded_subset");
     anyhow::ensure!(events["physical_count_semantics"] == "lower_bound");
 
     let mut seen_event_ids = BTreeSet::new();
     let mut seen_instance_ids = BTreeSet::new();
     for fact in preview {
-        let (event_id, instance_id) = assert_event_fact(fact, source)?;
+        let (event_id, instance_id) = assert_event_fact(fact)?;
         anyhow::ensure!(!event_id.is_empty() && seen_event_ids.insert(event_id));
         anyhow::ensure!(!instance_id.is_empty() && seen_instance_ids.insert(instance_id));
     }
@@ -742,11 +657,10 @@ fn assert_shared_event_facts(overview: &Value, events: &Value, source: u64) -> R
     Ok(())
 }
 
-fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
+fn assert_event_fact(fact: &Value) -> Result<(&str, &str)> {
     let expected_fields = BTreeSet::from([
         "event_id",
         "event_instance_id",
-        "source_id",
         "section_type_id",
         "identity_quality",
         "sort_ts_us",
@@ -774,7 +688,6 @@ fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
     let instance_id = fact["event_instance_id"]
         .as_str()
         .context("EventFact.event_instance_id is not a string")?;
-    anyhow::ensure!(fact["source_id"] == source);
     anyhow::ensure!(fact["section_type_id"].is_u64());
     anyhow::ensure!(fact["identity_quality"] == "content_derived");
     anyhow::ensure!(fact["sort_ts_us"].is_i64());
@@ -963,7 +876,7 @@ fn assert_parsed_panic_and_child_termination_do_not_set_health_floor(health: &Va
 
 /// Verify that language preferences cannot change a Problem representation.
 pub(crate) async fn assert_locale_neutral_problem(dir: &Path) -> Result<()> {
-    const URI: &str = "/v1/segments?source=not-a-number&from=0&to=1";
+    const URI: &str = "/v1/segments?from=not-a-number&to=1";
     let english = request(dir, URI, &[("accept-language", "en")]).await?;
     let russian = request(dir, URI, &[("accept-language", "ru-RU, ru;q=0.9")]).await?;
 
