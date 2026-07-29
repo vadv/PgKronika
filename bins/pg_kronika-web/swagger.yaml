@@ -1,0 +1,567 @@
+openapi: 3.1.0
+info:
+  title: pg_kronika-web
+  description: Local PGM UI and JSON API with bounded diff, anomaly, and incident queries
+  license:
+    name: MIT
+    identifier: MIT
+  version: 0.0.0
+paths:
+  /v1/anomalies:
+    get:
+      summary: '`GET /v1/anomalies?from&to` returns ranked anomaly episodes.'
+      description: |-
+        Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `limit`,
+        and `section`. Oversized sections are reported in `skipped`.
+      operationId: anomalies
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: window
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: step
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: threshold
+        in: query
+        required: false
+        schema:
+          type: number
+          format: double
+      - name: eps_rel
+        in: query
+        required: false
+        schema:
+          type: number
+          format: double
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: section
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/incidents:
+    get:
+      summary: '`GET /v1/incidents?from&to` returns clustered incidents.'
+      description: |-
+        Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `epsilon`,
+        `max_cluster_span`, and `section`. All time inputs are unix microseconds.
+      operationId: incidents
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: window
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: step
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: threshold
+        in: query
+        required: false
+        schema:
+          type: number
+          format: double
+      - name: eps_rel
+        in: query
+        required: false
+        schema:
+          type: number
+          format: double
+      - name: epsilon
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: max_cluster_span
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: section
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/section/{name}:
+    get:
+      summary: |-
+        `GET /v1/section/{name}?from&to&limit` — one section's rows over the
+        window, decoded and serialized to JSON.
+      description: |-
+        The reader does the query (ts filter, sort, union columns, gaps); this
+        handler parses params and shapes the result. A stale snapshot degrades to
+        gaps inside the reader, so it stays a `200`.
+      operationId: section_data
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/section/{name}/diff:
+    get:
+      summary: |-
+        `GET /v1/section/{name}/diff?from&to` — per-entity deltas and rates
+        over a window.
+      description: |-
+        Resolves the section's identity and cumulative columns from the registry,
+        reads the window in one page, and folds each series through the diff core.
+      operationId: section_diff
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/sections:
+    get:
+      summary: '`GET /v1/sections` — static catalog of section types from the registry.'
+      description: |-
+        One entry per logical name: its semantics, sort key, and the union of its
+        versions' columns (first appearance across ascending `type_id`).
+      operationId: sections
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/sections/batch:
+    get:
+      summary: |-
+        `GET /v1/sections/batch?from&to&names=a,b,c&limit` — several sections
+        over one window, each as its own page keyed by name.
+      description: |-
+        One decode of each overlapping segment serves every requested section, so a
+        multi-metric view costs one pass, not one per section. An unknown name fails
+        the whole request.
+      operationId: sections_batch
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: names
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/sections/batch/diff:
+    get:
+      summary: |-
+        `GET /v1/sections/batch/diff?from&to&names=a,b,c` — diffs for several
+        sections over one window, each keyed by name.
+      description: |-
+        One decode of each overlapping segment serves every requested section, so a
+        multi-metric diff costs one segment pass, not one per section. An unknown name
+        fails the whole request.
+      operationId: sections_batch_diff
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: names
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/segments:
+    get:
+      summary: |-
+        `GET /v1/segments?from&to` — segments overlapping the
+        window, catalog metadata only (no section bodies decoded).
+      operationId: segments
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/timeline/events:
+    get:
+      summary: '`GET /v1/timeline/events?from=..&to=..&limit=..&cursor=..`.'
+      operationId: events
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: min_severity
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: kind
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/timeline/health:
+    get:
+      summary: '`GET /v1/timeline/health?from=..&to=..&step=..`.'
+      operationId: health
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: step
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/timeline/heatmap:
+    get:
+      summary: '`GET /v1/timeline/heatmap` — bounded web-index entity-series merge.'
+      operationId: heatmap
+      parameters:
+      - name: view
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: metric
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: buckets
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: top
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/timeline/overview:
+    get:
+      summary: '`GET /v1/timeline/overview?from_us=..&to_us=..`.'
+      operationId: overview
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/ui/catalog:
+    get:
+      summary: '`GET /v1/ui/catalog` — stable UI projections.'
+      operationId: catalog
+      parameters:
+      - name: If-None-Match
+        in: header
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/version:
+    get:
+      summary: '`GET /v1/version` — the API and container format versions this build serves.'
+      description: Static body, `application/json`.
+      operationId: version
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /v1/views/summary:
+    get:
+      summary: '`GET /v1/views/summary?at=<us>` — exact indexed populations.'
+      operationId: summary
+      parameters:
+      - name: at
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: OK
+        default:
+          description: API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+components:
+  schemas:
+    ApiError:
+      type: object
+      description: A small machine-readable API error.
+      required:
+      - code
+      - params
+      properties:
+        code:
+          type: string
+        params:
+          type: object

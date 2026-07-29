@@ -218,17 +218,20 @@ representations, and `/v1` sends neither `Content-Language` nor a language
 `Vary`. Raw PostgreSQL, OS, and user strings remain literal; product-owned
 labels and explanations belong to the UI.
 
-Every `/v1` application error is an RFC 9457 Problem Details response with
-media type `application/problem+json` and exactly `type`, `status`, `code`,
-typed `params`, and an opaque `instance`. It has no human-language `title` or
-`detail`. Problem responses use `Cache-Control: no-store` and expose the same
-server-generated correlation token in `instance` and `X-Request-ID`.
-`WWW-Authenticate`, `Allow`, and `Retry-After` remain present where HTTP
-semantics require them. Unknown sections return `404`, malformed parameters
-return `400`, and existing input or materialization ceilings return `413`.
-The selected sealed-segment request-shape limit is a `400`.
-See the [OpenAPI contract](openapi.json) and the
-[normative machine API specification](../../docs/superpowers/implemented/specs/2026-07-21-i18n-machine-api-contract.md).
+Every `/v1` application error is an `application/json` object with `code` and
+open `params`. `WWW-Authenticate`, `Allow`, and `Retry-After` remain present
+where HTTP semantics require them. Unknown sections return `404`, malformed
+parameters return `400`, and existing input or materialization ceilings return
+`413`. The selected sealed-segment request-shape limit is a `400`.
+See the generated [OpenAPI document](swagger.yaml) and the
+[simplification specification](../../docs/superpowers/specs/2026-07-29-openapi-swagger-migration.md).
+
+`src/api_docs.rs` is the single registry connecting documented handlers to
+Axum and OpenAPI. Refresh `swagger.yaml` without contract tests:
+
+```sh
+make swagger
+```
 
 ## Query and analysis contracts
 

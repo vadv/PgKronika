@@ -828,26 +828,9 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .route("/readyz", get(handlers::probes::readyz))
         .route("/metrics", get(handlers::metrics::metrics_handler));
 
-    let mut protected = Router::new()
-        .route("/v1/version", get(handlers::v1::version))
-        .route("/v1/timeline/overview", get(overview::handlers::overview))
-        .route("/v1/timeline/events", get(overview::handlers::events))
-        .route("/v1/timeline/health", get(overview::handlers::health))
-        .route("/v1/timeline/heatmap", get(ui::handlers::heatmap))
-        .route("/v1/anomalies", get(handlers::anomalies::anomalies))
-        .route("/v1/incidents", get(handlers::incidents::incidents))
-        .route("/v1/ui/catalog", get(ui::handlers::catalog))
-        .route("/v1/views/summary", get(ui::handlers::summary))
-        .route("/v1/sections", get(handlers::v1::sections))
-        .route("/v1/segments", get(handlers::v1::segments))
-        .route("/v1/section/{name}", get(handlers::v1::section_data))
-        .route("/v1/section/{name}/diff", get(handlers::v1::section_diff))
-        .route("/v1/sections/batch", get(handlers::v1::sections_batch))
-        .route(
-            "/v1/sections/batch/diff",
-            get(handlers::v1::sections_batch_diff),
-        )
-        .merge(SwaggerUi::new("/swagger-ui").url("/openapi.json", api_docs::document()))
+    let (api, document) = api_docs::router_and_document();
+    let mut protected = api
+        .merge(SwaggerUi::new("/swagger-ui").url("/openapi.json", document))
         .method_not_allowed_fallback(|| async {
             api_error::ApiError::method_not_allowed("GET, HEAD")
         })
@@ -863,6 +846,13 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .layer(Extension(metrics_handle))
         .layer(middleware::from_fn(track_metrics))
         .with_state(state)
+}
+
+/// Build the same OpenAPI document that the server exposes at `/openapi.json`.
+#[doc(hidden)]
+#[must_use]
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    api_docs::document()
 }
 
 #[cfg(test)]

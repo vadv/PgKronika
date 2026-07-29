@@ -4,13 +4,14 @@
 
 **Goal:** Replace the hand-written OpenAPI and RFC 9457 machinery with direct `utoipa` annotations, standard Swagger UI, and a minimal `{code, params}` error.
 
-**Architecture:** Keep the existing Axum router and add a small `api_docs` module that derives the document from annotated handlers. Keep runtime API behavior tests, delete every OpenAPI/schema synchronization test, and reduce the error responder to two serialized fields plus private response metadata.
+**Architecture:** Register each documented handler once in `api_docs` through `OpenApiRouter`, split that registry into the Axum router and generated document, and export the same document as tool-neutral YAML. Keep runtime API behavior tests, delete every OpenAPI/schema synchronization test, and reduce the error responder to two serialized fields plus private response metadata.
 
-**Tech Stack:** Rust 1.96, Axum 0.8, utoipa 5, utoipa-swagger-ui 9, serde/serde_json.
+**Tech Stack:** Rust 1.96, Axum 0.8, utoipa 5, utoipa-axum 0.2, utoipa-swagger-ui 9, serde/serde_json.
 
 ## Global Constraints
 
-- Do not add `utoipa-axum`, `OpenApiRouter`, generators, snapshots, or OpenAPI tests.
+- Keep one `OpenApiRouter` registry and one direct YAML exporter.
+- Do not add schema comparisons, snapshot tests, generated-file checks, or OpenAPI tests.
 - Do not type successful response DTOs as part of this change.
 - Keep `/healthz`, `/readyz`, and `/metrics` outside OpenAPI.
 - Keep Swagger UI assets vendored for the static musl build.
@@ -123,10 +124,12 @@ Expected: all retained web tests pass.
 
 Commit the renamed module, updated users, and deleted contract tests together.
 
-### Task 2: Add direct OpenAPI annotations and Swagger UI
+### Task 2: Add one documented router and Swagger UI
 
 **Files:**
 - Create: `bins/pg_kronika-web/src/api_docs.rs`
+- Create: `bins/pg_kronika-web/examples/export_openapi.rs`
+- Create: `bins/pg_kronika-web/swagger.yaml`
 - Modify: `bins/pg_kronika-web/Cargo.toml`
 - Modify: `Cargo.lock`
 - Modify: `bins/pg_kronika-web/src/lib.rs`
@@ -138,21 +141,23 @@ Commit the renamed module, updated users, and deleted contract tests together.
 - Delete: `bins/pg_kronika-web/openapi.json`
 
 **Interfaces:**
-- Produces: `api_docs::document() -> utoipa::openapi::OpenApi`
+- Produces: one `(Router, OpenApi)` from the documented route registry
 - Serves: `/swagger-ui/` and `/openapi.json`
+- Exports: `bins/pg_kronika-web/swagger.yaml`
 
-- [ ] **Step 1: Add the two dependencies**
+- [ ] **Step 1: Add the three dependencies**
 
 Use:
 
 ```toml
-utoipa = "5"
+utoipa = { version = "5", features = ["yaml"] }
+utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 ```
 
-- [ ] **Step 2: Define the direct document**
+- [ ] **Step 2: Define the documented router**
 
-Create an `ApiDoc` derive listing exactly these handlers:
+Create one `OpenApiRouter` registry listing exactly these handlers:
 
 ```text
 version, sections, segments, section_data, sections_batch,
@@ -160,7 +165,8 @@ section_diff, sections_batch_diff, overview, events, health,
 heatmap, catalog, summary, anomalies, incidents
 ```
 
-Expose `document()` and register `ApiError` as the only component schema.
+Split it into the production Axum router and generated document. Do not repeat
+these `/v1/*` registrations in `lib.rs`.
 
 - [ ] **Step 3: Annotate the handlers**
 
@@ -195,10 +201,11 @@ incidents: from, to; optional window, step, threshold, eps_rel, epsilon,
 
 - [ ] **Step 4: Mount standard Swagger UI**
 
-Merge:
+Split the documented router and merge:
 
 ```rust
-SwaggerUi::new("/swagger-ui").url("/openapi.json", api_docs::document())
+let (api, document) = api_docs::router_and_document();
+api.merge(SwaggerUi::new("/swagger-ui").url("/openapi.json", document))
 ```
 
 into the existing protected router before Basic Auth is layered. Do not change
@@ -214,14 +221,26 @@ cargo check -p pg_kronika-web --all-targets --target aarch64-apple-darwin
 
 Expected: compilation succeeds with no OpenAPI-specific test added.
 
-- [ ] **Step 6: Commit OpenAPI and Swagger UI**
+- [ ] **Step 6: Export neutral YAML**
 
-Commit dependencies, annotations, router integration, and deletion of
-`openapi.json` together.
+Add the direct exporter and run:
+
+```bash
+make swagger
+```
+
+Do not add a generated-file check or OpenAPI test.
+
+- [ ] **Step 7: Commit OpenAPI and Swagger UI**
+
+Commit dependencies, annotations, router integration, deletion of
+`openapi.json`, and generated `swagger.yaml` together.
 
 ### Task 3: Document and verify the operator path
 
 **Files:**
+- Modify: `README.md`
+- Modify: `README.ru.md`
 - Modify: `bins/pg_kronika-web/README.md`
 - Modify: `bins/pg_kronika-web/README.ru.md`
 

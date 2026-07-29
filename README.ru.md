@@ -114,6 +114,17 @@ JSON-объект с полями `code` и `params`. TLS в сервер не �
 открыты; `/healthz`, `/readyz` и `/metrics` публичны даже при включённой
 Basic Auth.
 
+Единый реестр в
+[`bins/pg_kronika-web/src/api_docs.rs`](bins/pg_kronika-web/src/api_docs.rs)
+подключает документированные обработчики одновременно к Axum и OpenAPI.
+Нейтральное представление результата находится в
+[`swagger.yaml`](bins/pg_kronika-web/swagger.yaml). Оно обновляется без
+schema-сверок и snapshot-тестов:
+
+```sh
+make swagger
+```
+
 ## Карта рабочего пространства
 
 Все пакеты внутренние, имеют общую версию и не публикуются на crates.io.

@@ -50,6 +50,7 @@ use tower_http as _;
 use tracing as _;
 use tracing_subscriber as _;
 use utoipa as _;
+use utoipa_axum as _;
 use utoipa_swagger_ui as _;
 
 #[global_allocator]

@@ -110,6 +110,16 @@ and `params`. The web server has no TLS. If `KRONIKA_WEB_BASIC_AUTH` is unset,
 the UI, Swagger UI, OpenAPI document, and `/v1/*` are open; `/healthz`,
 `/readyz`, and `/metrics` remain public even when Basic Auth is enabled.
 
+[`bins/pg_kronika-web/src/api_docs.rs`](bins/pg_kronika-web/src/api_docs.rs)
+is the single registry that connects documented handlers to both Axum and
+OpenAPI. The generated, tool-neutral view is
+[`swagger.yaml`](bins/pg_kronika-web/swagger.yaml). Refresh it without any
+schema checks or snapshot tests:
+
+```sh
+make swagger
+```
+
 ## Workspace map
 
 All packages are internal and share one version. Nothing is published to
