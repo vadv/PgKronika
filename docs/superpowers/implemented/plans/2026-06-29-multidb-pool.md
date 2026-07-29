@@ -33,7 +33,6 @@
 - **Соединения ко всем базам без лимита на их число** (решение спеки §8). Ограничение памяти вводится не на соединениях, а на данных: (1) top-N в SQL до материализации строк; (2) **database-local сбор интернирует строки инкрементально, по одной базе за раз, поэтому пик памяти равен одной базе, а не сумме по всем**. Это критично для будущего `user_tables` и фиксируется как обязательный инвариант.
 - **Контракт прав:** коллектору нужна роль `pg_monitor` и `CONNECT` на собираемые базы. Базы без `CONNECT` для роли коллектора пропускаются при enumerate, иначе серверный лог будет получать `FATAL` на каждый refresh.
 - **`max_connections`:** N баз = N backend-процессов в PG. Лимит не вводим: это зона ответственности оператора. Требование отдельно описать в README/операторской документации.
-- **`source_id`:** один коллектор = один `source_id`; два коллектора на один `out_dir` с одинаковым `source_id` смешают сегменты. Это ограничение для оператора.
 - Имя в `pg_stat_activity`: `pg_kronika-collector/<CARGO_PKG_VERSION>`.
 
 ---
@@ -527,7 +526,6 @@ impl ConnectionPool {
 struct Config {
     dsn: String,
     out_dir: PathBuf,
-    source_id: u64,
     session: kronika_source_pg::pool::SessionConfig,
     exclude_databases: std::collections::HashSet<String>,
     pool_refresh: std::time::Duration,
@@ -544,7 +542,6 @@ impl Config {
     fn from_env() -> Result<Self> {
         let dsn = std::env::var("KRONIKA_PG_DSN").context("KRONIKA_PG_DSN is not set")?;
         let out_dir = std::env::var("KRONIKA_OUT_DIR").context("KRONIKA_OUT_DIR is not set")?.into();
-        let source_id = env_u64("KRONIKA_SOURCE_ID", 0)?;
         let session = kronika_source_pg::pool::SessionConfig {
             statement_timeout_ms: env_u64("KRONIKA_PG_STATEMENT_TIMEOUT_MS", 15_000)?,
             lock_timeout_ms: env_u64("KRONIKA_PG_LOCK_TIMEOUT_MS", 1_000)?,
@@ -561,7 +558,7 @@ impl Config {
             eprintln!("pg_kronika: excluding databases: {exclude_databases:?}");
         }
         let pool_refresh = std::time::Duration::from_secs(env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?);
-        Ok(Self { dsn, out_dir, source_id, session, exclude_databases, pool_refresh })
+        Ok(Self { dsn, out_dir, session, exclude_databases, pool_refresh })
     }
 }
 ```
@@ -588,7 +585,7 @@ impl Config {
                     continue;
                 }
                 let major = pool.server_major();
-                match snapshot_and_seal(pool.main(), major, &mut journal, &config.out_dir, config.source_id).await {
+                match snapshot_and_seal(pool.main(), major, &mut journal, &config.out_dir).await {
 ```
 
 `pool` теперь `mut`. `major` берётся заново на каждый снимок, чтобы failover на
@@ -683,7 +680,7 @@ async fn every_cluster_pools_databases(world: &mut BddWorld) -> anyhow::Result<(
   покрыт. Добавить, когда появится дешёвый способ проверить это в матрице.
 - **Режим одной базы** (`PGDATABASE`/явный `dbname=` → пул из одной базы).
 - **README оператора**: роль `pg_monitor` + `CONNECT`; связь «N баз = N backend»
-  и `max_connections`; уникальность `source_id` на коллектор.
+  и `max_connections`.
 
 ## Самопроверка
 

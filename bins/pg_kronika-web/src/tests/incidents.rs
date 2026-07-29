@@ -1,18 +1,16 @@
 use super::*;
 
-fn write_archiver_with_node(
+fn write_archiver(
     dir: &std::path::Path,
     file: &str,
-    node_self_id: &str,
     rows: &[PgStatArchiver],
     min_ts: i64,
     max_ts: i64,
 ) {
     let archiver = PgStatArchiver::encode(rows).expect("encode archiver");
-    write_section_with_node(
+    write_section(
         dir,
         file,
-        node_self_id,
         1_008_001,
         u32::try_from(rows.len()).expect("fixture row count"),
         &archiver,
@@ -25,10 +23,9 @@ fn write_archiver_with_node(
     clippy::too_many_arguments,
     reason = "fixture helper mirrors SectionInput and PartMeta fields"
 )]
-fn write_section_with_node(
+fn write_section(
     dir: &std::path::Path,
     file: &str,
-    node_self_id: &str,
     type_id: u32,
     rows: u32,
     body: &[u8],
@@ -36,7 +33,6 @@ fn write_section_with_node(
     max_ts: i64,
 ) {
     use kronika_format::DictLimits;
-    use kronika_registry::instance_metadata::InstanceMetadata;
 
     let mut interner =
         kronika_writer::Interner::new(DictLimits::new(4096, 1 << 20).expect("dictionary limits"));
@@ -45,18 +41,6 @@ fn write_section_with_node(
             .intern(value.as_bytes())
             .map(|id| StrId(id.get()))
             .expect("intern fixture identity")
-    };
-    let metadata = InstanceMetadata {
-        ts: Ts(min_ts),
-        hostname: intern("db-host-7"),
-        node_self_id: intern(node_self_id),
-        pg_version_num: 170_000,
-        kernel_version: intern("test-kernel"),
-        pg_system_identifier: Some(7),
-        clock_ticks_per_sec: 100,
-        page_size_bytes: 4096,
-        boot_id: intern("test-boot"),
-        btime: Ts(0),
     };
     for value in [
         "fixture-1",
@@ -74,20 +58,11 @@ fn write_section_with_node(
         let _ = intern(value);
     }
     let dictionary = kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
-    let metadata = InstanceMetadata::encode(&[metadata]).expect("encode metadata");
-    let mut sections = vec![
-        SectionInput {
-            type_id,
-            rows,
-            body,
-        },
-        SectionInput {
-            type_id: 1_021_001,
-            rows: 1,
-            body: &metadata,
-        },
-    ];
-    sections.sort_unstable_by_key(|section| section.type_id);
+    let mut sections = vec![SectionInput {
+        type_id,
+        rows,
+        body,
+    }];
     sections.extend(dictionary.iter().map(|section| SectionInput {
         type_id: section.type_id,
         rows: section.rows,
@@ -107,13 +82,13 @@ fn fixture_str_id(value: &str) -> StrId {
         .expect("fixture string id")
 }
 
-fn write_archiver_with_identity(
+fn write_archiver_fixture(
     dir: &std::path::Path,
     rows: &[PgStatArchiver],
     min_ts: i64,
     max_ts: i64,
 ) {
-    write_archiver_with_node(dir, "0.pgm", "node-7", rows, min_ts, max_ts);
+    write_archiver(dir, "0.pgm", rows, min_ts, max_ts);
 }
 
 fn archiver_rows(spiking: bool) -> Vec<PgStatArchiver> {
@@ -209,10 +184,9 @@ async fn six_sqlstate_conditions_reach_the_http_log_projection() {
     let body = PgLogErrorV1::encode(&rows).expect("encode log errors");
     let dir = tempfile::tempdir().expect("tempdir");
     let to = 10 * MINUTE;
-    write_section_with_node(
+    write_section(
         dir.path(),
         "0.pgm",
-        "node-7",
         1_022_001,
         u32::try_from(rows.len()).expect("row count"),
         &body,
@@ -247,7 +221,7 @@ async fn six_sqlstate_conditions_reach_the_http_log_projection() {
 
 async fn assert_calm_incidents(uri: &str, to: i64) {
     let calm = tempfile::tempdir().expect("tempdir");
-    write_archiver_with_identity(calm.path(), &archiver_rows(false), 0, to);
+    write_archiver_fixture(calm.path(), &archiver_rows(false), 0, to);
     let (status, body) = serve(calm.path(), uri).await;
     assert_eq!(status, StatusCode::OK, "calm 200; got {status}: {body}");
     assert_eq!(
@@ -266,26 +240,12 @@ async fn assert_calm_incidents(uri: &str, to: i64) {
     }
 }
 
-async fn spiking_incident_for_node(node_self_id: &str) -> serde_json::Value {
+async fn spiking_incident() -> serde_json::Value {
     let to = 39 * 60 * 1_000_000;
     let rows = archiver_rows(true);
     let dir = tempfile::tempdir().expect("tempdir");
-    write_archiver_with_node(
-        dir.path(),
-        "0.pgm",
-        node_self_id,
-        &rows[..21],
-        0,
-        20 * 60 * 1_000_000,
-    );
-    write_archiver_with_node(
-        dir.path(),
-        "1.pgm",
-        node_self_id,
-        &rows[20..],
-        20 * 60 * 1_000_000,
-        to,
-    );
+    write_archiver(dir.path(), "0.pgm", &rows[..21], 0, 20 * 60 * 1_000_000);
+    write_archiver(dir.path(), "1.pgm", &rows[20..], 20 * 60 * 1_000_000, to);
     let uri = format!("/v1/incidents?from=0&to={to}&window=6m&step=2m");
     let (status, response) = serve(dir.path(), &uri).await;
     assert_eq!(status, StatusCode::OK, "{response}");
@@ -294,22 +254,17 @@ async fn spiking_incident_for_node(node_self_id: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn incidents_bind_identity_to_the_observed_node() {
-    let first = spiking_incident_for_node("node-a").await;
-    let other_node = spiking_incident_for_node("node-b").await;
-
-    for body in [&first, &other_node] {
-        assert_eq!(body["data_quality"]["node_identity"], "available");
-        assert!(body.get("source_id").is_none());
-    }
+async fn identical_payloads_produce_the_same_incident_key_without_metadata() {
+    let first = spiking_incident().await;
+    let second = spiking_incident().await;
 
     let first_key = first["incidents"][0]["incident_key"]
         .as_str()
         .expect("first storage-backed incident key");
-    let other_node_key = other_node["incidents"][0]["incident_key"]
+    let second_key = second["incidents"][0]["incident_key"]
         .as_str()
-        .expect("other-node storage-backed incident key");
-    assert_ne!(first_key, other_node_key);
+        .expect("second storage-backed incident key");
+    assert_eq!(first_key, second_key);
 }
 
 fn assert_active_incident_catalog(body: &serde_json::Value) {
@@ -367,18 +322,16 @@ async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
 
     let spiking = tempfile::tempdir().expect("tempdir");
     let spike_rows = archiver_rows(true);
-    write_archiver_with_node(
+    write_archiver(
         spiking.path(),
         "0.pgm",
-        "node-7",
         &spike_rows[..21],
         0,
         20 * 60 * 1_000_000,
     );
-    write_archiver_with_node(
+    write_archiver(
         spiking.path(),
         "1.pgm",
-        "node-7",
         &spike_rows[20..],
         20 * 60 * 1_000_000,
         to,
@@ -467,10 +420,9 @@ async fn incidents_publish_numeric_gauge_evidence_from_reader_input() {
     let body = OsMeminfo::encode(&rows).expect("encode os_meminfo");
     let dir = tempfile::tempdir().expect("tempdir");
     let to = 39 * MINUTE;
-    write_section_with_node(
+    write_section(
         dir.path(),
         "0.pgm",
-        "node-7",
         1_104_001,
         u32::try_from(rows.len()).expect("row count"),
         &body,
@@ -526,10 +478,9 @@ async fn assert_contract_lens(
     to: i64,
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_section_with_node(
+    write_section(
         dir.path(),
         "0.pgm",
-        "node-7",
         type_id,
         u32::try_from(rows).expect("row count"),
         body,
@@ -772,7 +723,6 @@ async fn incidents_reject_degenerate_parameters() {
         "/v1/incidents?from=-9223372036854775808&to=9223372036854775807",
         "/v1/incidents?from=0&to=3600000000&max_cluster_span=2h",
         "/v1/incidents?from=0&to=9000000000&unknown=1",
-        "/v1/incidents?source=8&from=0&to=9000000000",
     ] {
         let (status, _body) = serve(dir.path(), uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be rejected");
@@ -792,7 +742,7 @@ async fn incidents_reject_degenerate_parameters() {
 }
 
 #[tokio::test]
-async fn incidents_distinguish_no_data_and_identity_quality() {
+async fn incidents_distinguish_no_data_and_use_metadata_free_payload() {
     const MINUTE: i64 = 60 * 1_000_000;
     let no_data = tempfile::tempdir().expect("tempdir");
     write_bgwriter_segment(no_data.path(), "0.pgm", 0, MINUTE);
@@ -812,36 +762,13 @@ async fn incidents_distinguish_no_data_and_identity_quality() {
     let uri = format!("/v1/incidents?from=0&to={to}&window=6m&step=2m");
     let (status, body) = serve(missing.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["analysis_status"], "missing_node_identity");
-    assert_eq!(body["complete"], false);
-    assert_eq!(body["incidents"], serde_json::json!([]));
-    assert_eq!(body["catalog"]["diagnosis_available"], false);
-    assert_eq!(body["catalog"]["evaluated_lens_ids"], serde_json::json!([]));
-
-    let conflicting = tempfile::tempdir().expect("tempdir");
-    let rows = archiver_rows(true);
-    write_archiver_with_node(
-        conflicting.path(),
-        "0.pgm",
-        "node-a",
-        &rows[..21],
-        0,
-        20 * MINUTE,
+    assert_eq!(body["analysis_status"], "incidents_detected");
+    assert!(
+        body["incidents"]
+            .as_array()
+            .is_some_and(|incidents| !incidents.is_empty())
     );
-    write_archiver_with_node(
-        conflicting.path(),
-        "1.pgm",
-        "node-b",
-        &rows[20..],
-        20 * MINUTE,
-        39 * MINUTE,
-    );
-    let (status, body) = serve(conflicting.path(), &uri).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["analysis_status"], "conflicting_node_identity");
-    assert_eq!(body["complete"], false);
-    assert_eq!(body["catalog"]["diagnosis_available"], false);
-    assert_eq!(body["catalog"]["evaluated_lens_ids"], serde_json::json!([]));
+    assert_eq!(body["catalog"]["diagnosis_available"], true);
 }
 
 #[tokio::test]
@@ -886,7 +813,7 @@ async fn analytic_endpoints_share_fail_fast_admission() {
 async fn incident_read_failure_is_sanitized() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = 39 * 60 * 1_000_000;
-    write_archiver_with_identity(dir.path(), &archiver_rows(true), 0, to);
+    write_archiver_fixture(dir.path(), &archiver_rows(true), 0, to);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
     let state = AppState::new(snapshot).expect("state");
     std::fs::remove_file(crate::test_layout::named_pgm_path(dir.path(), "0.pgm"))

@@ -548,7 +548,7 @@ async fn snapshot_and_seal(
         cycle_start,
     )
     .await;
-    let instance = collect_due_instance(pool, config, due).await?;
+    let instance = collect_due_instance(pool, due).await?;
     let store_plans_rows = collect_store_plans_cached(
         pool,
         major,

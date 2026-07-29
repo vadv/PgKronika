@@ -20,9 +20,7 @@ use crate::incident::{
 use crate::incident_input::{
     InputError, InputLimits, MaterializationKind, prepare_input, scan_position_count,
 };
-use crate::incident_response::{
-    IdentityIssue, ResponseInput, build_response, identity_response, no_data_response,
-};
+use crate::incident_response::{ResponseInput, build_response, no_data_response};
 use crate::params::{QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64};
 use crate::problem::{ApiProblem, LimitResource, QueryConstraint, QueryParameter, count_u64};
 
@@ -113,25 +111,10 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiPr
         Err(InputError::NoData) => {
             return Ok(Json(no_data_response(&request.scan, data_age)));
         }
-        Err(InputError::MissingNodeIdentity) => {
-            return Ok(Json(identity_response(
-                &request.scan,
-                data_age,
-                IdentityIssue::Missing,
-            )));
-        }
-        Err(InputError::ConflictingNodeIdentity) => {
-            return Ok(Json(identity_response(
-                &request.scan,
-                data_age,
-                IdentityIssue::Conflicting,
-            )));
-        }
         Err(error) => return Err(input_error_response(error)),
     };
 
     let config = IncidentConfig::production(
-        &prepared.node_self_id,
         request.epsilon_us,
         request.max_cluster_span_us,
         // Product convention: timestamps are true observation times, but all
@@ -300,22 +283,10 @@ fn input_error_response(error: InputError) -> ApiProblem {
             count_u64(limit),
             None,
         ),
-        InputError::IdentityByteLimit { observed, limit } => ApiProblem::query_limit_exceeded(
-            LimitResource::IdentityBytes,
-            count_u64(limit),
-            Some(count_u64(observed)),
-        ),
         InputError::SeriesLimit { observed, limit } => ApiProblem::query_limit_exceeded(
             LimitResource::SeriesPoints,
             count_u64(limit),
             Some(count_u64(observed)),
-        ),
-        InputError::MissingNodeIdentity => {
-            logged_internal_problem("api_identity_mapping_invariant", &IdentityIssue::Missing)
-        }
-        InputError::ConflictingNodeIdentity => logged_internal_problem(
-            "api_identity_mapping_invariant",
-            &IdentityIssue::Conflicting,
         ),
         InputError::Read(error) => read_error_response(error),
         InputError::UnknownColumn { section, column } => {
@@ -367,9 +338,6 @@ fn read_error_response(error: QueryError) -> ApiProblem {
 /// registry inconsistency (duplicate lens id) is a `500`.
 fn analyze_error_response(error: AnalyzeError) -> ApiProblem {
     match error {
-        AnalyzeError::MissingNodeIdentity => {
-            logged_internal_problem("api_engine_identity_invariant", &"missing")
-        }
         AnalyzeError::EpisodeLimit { observed, limit } => ApiProblem::query_limit_exceeded(
             LimitResource::Episodes,
             count_u64(limit),

@@ -52,12 +52,11 @@
 Прямая связь сущностей допустима только при одновременном выполнении всех
 условий:
 
-1. Совпадают `source_id` и `node_self_id`.
-2. Совпадают `domain`, `name` и все компоненты идентификатора (`value`). Для
+1. Совпадают `domain`, `name` и все компоненты идентификатора (`value`). Для
    backend обязательна как минимум пара `(pid, backend_start)`. Для relation
    или database одного OID недостаточно: нужны идентификатор базы данных и
    границы жизни объекта.
-3. Связь доказана одним из трёх контрактов активации:
+2. Связь доказана одним из трёх контрактов активации:
    - `SharedSnapshot`: `shared_snapshot_producer`,
      `shared_snapshot_token`, `both_inputs_complete`;
    - `SnapshotRelation`: `typed_relation_producer`,
@@ -110,8 +109,8 @@ filesystem, device, cgroup и network endpoint сначала нужен пол�
   хранит `queryid`, `dbid` или backend identity и остаётся нетипизированным
   контекстом.
 - **Минимальный путь:** сохранить ограниченную типизированную relation из
-  строки statement, перенести её `source_id`, `node_self_id`, snapshot и
-  coverage во вход инцидента, затем подключить evidence базы данных и запроса.
+  строки statement, перенести её snapshot и coverage во вход инцидента, затем
+  подключить evidence базы данных и запроса.
   Для direct log enrichment нужен отдельный typed producer/schema.
 - **Приёмка:** сквозной тест с `dbid=42`, `dbid=43` и одинаковым `queryid`
   публикует temp evidence через доказанную связь только для точной identity;
@@ -139,8 +138,7 @@ filesystem, device, cgroup и network endpoint сначала нужен пол�
 - **Не хватает:** ReplicationSession/WalState identity в рабочем коде,
   проекции relation и coverage полного снимка.
 - **Минимальный путь:** выпустить ограниченную relation из одной строки с
-  `source_id`, `node_self_id`, snapshot и признаком полноты, затем подключить
-  её к replication evidence.
+  snapshot и признаком полноты, затем подключить её к replication evidence.
 - **Приёмка:** обогащение получает только точный экземпляр backend по
   `(pid, backend_start)`; строка с тем же PID и другим `backend_start` остаётся
   несвязанной.
@@ -153,8 +151,8 @@ filesystem, device, cgroup и network endpoint сначала нужен пол�
 - **Не хватает:** snapshot-scoped relation между семействами входных данных и
   их coverage.
 - **Минимальный путь:** создать ограниченный index из physical row и
-  сопоставлять только полную session identity в том же source/node и
-  доказанном snapshot.
+  сопоставлять только полную session identity для того же узла и доказанного
+  snapshot.
 - **Приёмка:** SyncRep finding получает replication evidence только при точном
   `backend_start`; сценарий повторного использования PID сохраняет базовый
   finding без evidence связи.

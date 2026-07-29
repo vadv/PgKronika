@@ -516,7 +516,7 @@ impl FactStore {
     ///
     /// # Errors
     /// Returns [`BuildError`] only when the catalog cannot establish the
-    /// expected source identity needed for fallback lookup.
+    /// expected input file identity needed for fallback lookup.
     pub fn load_cached<R: ReadAt>(
         &self,
         unit: &PgmUnit<R>,

@@ -2,17 +2,15 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use super::cluster::{ClusterError, ClusterOutcome, cluster_episodes};
 use super::dispatch::{
     LimitAxis, LimitHit, SectionColumn, WorkBudget, candidate_lenses, section_index,
 };
-use super::entity_join::EntityScope;
 use super::evidence::Finding;
 use super::evidence::sink::{FindingSink, OutputCounts, OutputLimits};
 use super::lens::Lens;
-use super::model::{EnrichedEpisode, EpisodeRefV1, IncidentKeyV1, KeyTooLarge};
+use super::model::{EnrichedEpisode, EpisodeRefV1, IncidentKeyV2, KeyTooLarge};
 use super::series::SeriesSet;
 use super::typed::TypedInputs;
 
@@ -25,7 +23,6 @@ pub(crate) enum ClockRelation {
 pub(crate) struct EvalContext {
     pub incident_start_us: i64,
     pub incident_end_us: i64,
-    node_self_id: Arc<str>,
     clock_relation: ClockRelation,
 }
 
@@ -36,23 +33,17 @@ impl EvalContext {
         self.clock_relation
     }
 
-    pub(crate) fn entity_scope(&self) -> Option<EntityScope<'_>> {
-        EntityScope::new(&self.node_self_id)
-    }
-
     #[cfg(test)]
-    pub(crate) fn for_test(clock_relation: ClockRelation) -> Self {
+    pub(crate) const fn for_test(clock_relation: ClockRelation) -> Self {
         Self {
             incident_start_us: 0,
             incident_end_us: 10,
-            node_self_id: Arc::from("node"),
             clock_relation,
         }
     }
 }
 
 pub(crate) struct IncidentConfig {
-    node_self_id: Arc<str>,
     epsilon_us: i64,
     max_cluster_span_us: i64,
     clock_relation: ClockRelation,
@@ -71,14 +62,12 @@ impl IncidentConfig {
     /// Fixed ceilings for collection sizes and work units.
     ///
     /// These values do not claim a resident-memory budget.
-    pub(crate) fn production(
-        node_self_id: &str,
+    pub(crate) const fn production(
         epsilon_us: i64,
         max_cluster_span_us: i64,
         clock_relation: ClockRelation,
     ) -> Self {
         Self {
-            node_self_id: Arc::from(node_self_id),
             epsilon_us,
             max_cluster_span_us,
             clock_relation,
@@ -99,13 +88,11 @@ impl IncidentConfig {
 impl IncidentConfig {
     /// Relaxed collection and work ceilings for focused engine tests.
     pub(crate) fn for_test(
-        node_self_id: &str,
         epsilon_us: i64,
         max_cluster_span_us: i64,
         clock_relation: ClockRelation,
     ) -> Self {
         Self {
-            node_self_id: Arc::from(node_self_id),
             epsilon_us,
             max_cluster_span_us,
             clock_relation,
@@ -122,25 +109,19 @@ impl IncidentConfig {
     }
 
     pub(crate) fn for_test_with_work_limit(
-        node_self_id: &str,
         epsilon_us: i64,
         max_cluster_span_us: i64,
         clock_relation: ClockRelation,
         work_limit: u64,
     ) -> Self {
-        let mut config = Self::for_test(
-            node_self_id,
-            epsilon_us,
-            max_cluster_span_us,
-            clock_relation,
-        );
+        let mut config = Self::for_test(epsilon_us, max_cluster_span_us, clock_relation);
         config.work_limit = work_limit;
         config
     }
 }
 
 pub(crate) struct Incident {
-    pub key: IncidentKeyV1,
+    pub key: IncidentKeyV2,
     pub start_us: i64,
     pub end_us: i64,
     pub members: Vec<EpisodeRefV1>,
@@ -164,7 +145,6 @@ pub(crate) struct EngineOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnalyzeError {
-    MissingNodeIdentity,
     EpisodeLimit { observed: usize, limit: usize },
     ClusterLimit { observed: usize, limit: usize },
     DuplicateLensId(&'static str),
@@ -186,9 +166,6 @@ fn prepare_clusters(
     episodes: Vec<EnrichedEpisode>,
     config: &IncidentConfig,
 ) -> Result<ClusterOutcome, AnalyzeError> {
-    if config.node_self_id.is_empty() {
-        return Err(AnalyzeError::MissingNodeIdentity);
-    }
     if episodes.len() > config.max_episodes {
         return Err(AnalyzeError::EpisodeLimit {
             observed: episodes.len(),
@@ -244,7 +221,7 @@ const fn admit_lens_evaluation(
 
 fn charge_key_bytes(
     spent: usize,
-    key: &IncidentKeyV1,
+    key: &IncidentKeyV2,
     limit: usize,
 ) -> Result<usize, AnalyzeError> {
     let observed =
@@ -296,7 +273,6 @@ pub(crate) fn analyze(
         let context = EvalContext {
             incident_start_us: cluster.start_us,
             incident_end_us: cluster.end_us,
-            node_self_id: Arc::clone(&config.node_self_id),
             clock_relation: config.clock_relation,
         };
         let present: BTreeSet<&'static str> = cluster
@@ -344,8 +320,7 @@ pub(crate) fn analyze(
         }
         findings.sort_by(finding_order);
 
-        let key = IncidentKeyV1::new(
-            &config.node_self_id,
+        let key = IncidentKeyV2::new(
             cluster.start_us,
             cluster.end_us,
             &cluster.members,
@@ -378,6 +353,8 @@ pub(crate) fn analyze(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::incident::cluster::Cluster;
     use crate::incident::evidence::{
@@ -565,7 +542,6 @@ mod tests {
 
     fn config(work_limit: u64) -> IncidentConfig {
         IncidentConfig {
-            node_self_id: Arc::from("node"),
             epsilon_us: 5,
             max_cluster_span_us: 1_000,
             clock_relation: ClockRelation::Unknown,
@@ -865,20 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_node_and_input_limits_are_typed_errors() {
-        let mut missing_node = config(100);
-        missing_node.node_self_id = Arc::from("");
-        assert!(matches!(
-            analyze(
-                vec![],
-                &SeriesSet::for_test(0),
-                &TypedInputs::new(),
-                &[],
-                &missing_node
-            ),
-            Err(AnalyzeError::MissingNodeIdentity)
-        ));
-
+    fn input_limits_are_typed_errors() {
         let mut episode_limited = config(100);
         episode_limited.max_episodes = 0;
         assert!(matches!(
@@ -922,7 +885,7 @@ mod tests {
                 &key_limited,
             ),
             Err(AnalyzeError::Key(KeyTooLarge {
-                observed: 88,
+                observed: 76,
                 limit: 1
             }))
         ));

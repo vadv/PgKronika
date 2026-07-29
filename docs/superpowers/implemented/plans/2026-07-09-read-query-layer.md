@@ -46,11 +46,11 @@ pub enum Resolved<'a> { String(&'a [u8]), Blob{bytes:&'a [u8], full_len:u64, tru
 impl LocalDirSnapshot { pub fn open(&Path)->io::Result<Self>; pub fn refresh(&mut self)->io::Result<()>;
     pub fn units(&self)->Vec<UnitMeta>; pub fn unit_catalog(&self, idx:usize)->Option<&Catalog>;
     pub fn decode_unit(&self, idx:usize, entry_idx:usize)->Result<DecodedSection,ReadError>; pub fn warnings(&self)->&[StoreWarning]; }
-pub struct UnitMeta { pub source_id:u64, pub min_ts:i64, pub max_ts:i64, pub live:bool }
+pub struct UnitMeta { pub min_ts:i64, pub max_ts:i64, pub live:bool }
 pub enum ReadError { /* ... */ StaleSnapshot{unit_idx:usize}, Codec(CodecError), Io(io::Error), /* ... */ }
 // kronika-format
 pub struct Entry { pub type_id:u32, pub offset:u64, pub len:u64, pub rows:u32, pub crc32c:u32, pub flags:u32 }
-pub struct Catalog { pub entries:Vec<Entry>, pub min_ts:i64, pub max_ts:i64, pub source_id:u64, pub format_version:u32 }
+pub struct Catalog { pub entries:Vec<Entry>, pub min_ts:i64, pub max_ts:i64, pub format_version:u32 }
 ```
 
 Секции формат сортирует по `sort_key` → строки одной `(unit, type_id-entry)` уже
@@ -133,17 +133,17 @@ impl LocalDirSnapshot { pub fn open_unit(&self, idx:usize) -> Result<OpenUnit, R
 // active: read_active_part байты один раз (стейл-проверка при open), дальше все секции из них.
 
 // query/section.rs
-pub struct SectionPage { pub section:String, pub source_id:u64, pub rows:Vec<OutRow>, pub gaps:Vec<Gap>, pub next_cursor:Option<Cursor> }
+pub struct SectionPage { pub section:String, pub rows:Vec<OutRow>, pub gaps:Vec<Gap>, pub next_cursor:Option<Cursor> }
 pub enum QueryError { UnknownSection(String), Read(ReadError) }
-pub fn sections(snap:&mut LocalDirSnapshot, source:u64, from:i64, to:i64, names:&[&str], limit:usize)
+pub fn sections(snap:&mut LocalDirSnapshot, from:i64, to:i64, names:&[&str], limit:usize)
     -> Result<BTreeMap<String, SectionPage>, QueryError>;   // &mut уже здесь: T6 навесит refresh-retry без ресигнатуры
-pub fn section(snap:&mut LocalDirSnapshot, name:&str, source:u64, from:i64, to:i64, limit:usize)
+pub fn section(snap:&mut LocalDirSnapshot, name:&str, from:i64, to:i64, limit:usize)
     -> Result<SectionPage, QueryError>;   // = sections(&[name])[name]
 ```
 (Курсор не вводить; `next_cursor: None`, `gaps: vec![]` — T5/T6.)
 
 Алгоритм §1.3a (ОДИН проход): `logical_section` каждого имени (нет → `UnknownSection`);
-отобрать единицы `snap.units()` `source_id==source` ∩ окно; **на единицу `open_unit` ОДИН
+отобрать единицы `snap.units()` по пересечению с окном; **на единицу `open_unit` ОДИН
 раз** (словарь из неё один раз) → для каждого имени: каждый `entry` матчащего `type_id`
 (повтор = мультиокно) `OpenUnit::decode_rows` → `cell_to_value` по union-колонкам
 (отсутствующие Null) → фильтр `row["ts"](Cell::Ts) ∈ [from,to]` → per-name аккумулятор;
@@ -166,11 +166,11 @@ pub struct Cursor(/* непрозрачный */);
 impl Cursor { pub fn encode(&self)->String; pub fn decode(s:&str)->Result<Self,QueryError>; }
 // SectionQuery получает pub cursor: Option<Cursor>
 ```
-Курсор = `(source_id, sort_key_values:[Cell], tie_break)`; `tie_break=(ts:i64, type_id:u32)`
+Курсор = `(sort_key_values:[Cell], tie_break)`; `tie_break=(ts:i64, type_id:u32)`
 + лексикографика остальных колонок при равенстве. Encode = base64 длина-префиксных
 типизированных ячеек. `section()` при `Some(cursor)`: слить окно и пропустить строки с
 `(sort_key, tie_break) <= cursor`; `next_cursor` от последней выданной, `None` если поток
-исчерпан. Валидировать `source_id` курсора против запроса.
+исчерпан. Валидировать версию и структуру курсора до применения к запросу.
 
 **TDD:** page1(limit=N)+page2(cursor) покрывают все строки без дублей/пропусков, включая
 границу между единицами; курсор стабилен при повторе; битый курсор → `QueryError`;

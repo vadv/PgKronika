@@ -291,7 +291,7 @@ impl SegmentFacts {
     /// Promotes matching live parts without rereading sealed event bodies.
     ///
     /// The parts must be the ordered constituents of the sealed segment. Their
-    /// catalogs, source identity, timestamp envelope, and referenced dictionary
+    /// catalogs, input descriptors, timestamp envelope, and referenced dictionary
     /// values must match the sealed PGM. Dictionary
     /// sections are read when rows contain references. A match re-keys retained
     /// observations to sealed provenance; a mismatch returns `Ok(None)`.
@@ -453,7 +453,7 @@ impl SegmentFacts {
         Ok((identity, lineage))
     }
 
-    /// Header identity carrying source provenance and contract versions.
+    /// Header metadata carrying input provenance and contract versions.
     #[must_use]
     pub const fn identity(&self) -> &HeaderIdentity {
         &self.identity
@@ -3391,8 +3391,8 @@ mod tests {
             MetricFactor::OsCgroupMemoryHighEvents
             | MetricFactor::OsCgroupMemoryMaxEvents
             | MetricFactor::OsCgroupOomEvents
-            | MetricFactor::OsCgroupOomKills => (MetricUnit::Count, Some(ResetFamily::CgroupBoot)),
-            MetricFactor::OsHostOomKills => (MetricUnit::Count, Some(ResetFamily::HostBoot)),
+            | MetricFactor::OsCgroupOomKills
+            | MetricFactor::OsHostOomKills => (MetricUnit::Count, None),
             MetricFactor::PgStatisticsResetAt
             | MetricFactor::PgPostmasterStartTime
             | MetricFactor::PgReplicationReplayLag => (MetricUnit::Microseconds, None),
@@ -3473,7 +3473,7 @@ mod tests {
     }
 
     #[test]
-    fn every_all_family_source_body_crc_failure_stays_a_source_error() {
+    fn every_consumed_source_body_crc_failure_stays_a_source_error() {
         let pristine = all_family_fixture().sealed_bytes();
         let catalog = PgmUnit::open(pristine.as_slice())
             .expect("open pristine all-family PGM")
@@ -3491,6 +3491,13 @@ mod tests {
             let offset = usize::try_from(entry.offset).expect("fixture source offset fits usize");
             damaged[offset] ^= 0x40;
             let unit = PgmUnit::open(damaged.as_slice()).expect("catalog remains readable");
+            if entry.type_id == 1_021_001 {
+                assert!(
+                    SegmentFacts::extract(&unit, &LIMIT).is_ok(),
+                    "passive metadata must not enter derived extraction"
+                );
+                continue;
+            }
             assert!(
                 matches!(
                     SegmentFacts::extract(&unit, &LIMIT),
@@ -3641,7 +3648,7 @@ mod tests {
     }
 
     #[test]
-    fn positional_reload_requires_no_pgm_source() {
+    fn positional_reload_reads_no_pgm_body() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
         let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");

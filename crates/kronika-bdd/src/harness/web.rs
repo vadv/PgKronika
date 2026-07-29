@@ -380,8 +380,6 @@ pub(crate) async fn assert_timeline_pg_log_contract(segment: &SealedSegment) -> 
     let state = AppState::new(snapshot).context("build the timeline web state")?;
     let router = app(state, None, bdd_metrics_handle());
 
-    assert_timeline_rejects_source(&router, from_us, to_us).await?;
-
     let overview = timeline_ok(
         &router,
         &format!("/v1/timeline/overview?from={from_us}&to={to_us}"),
@@ -427,34 +425,6 @@ pub(crate) async fn assert_timeline_pg_log_contract(segment: &SealedSegment) -> 
         "timeline did not publish the canonical sibling sidecar: {}",
         sidecar.display()
     );
-    Ok(())
-}
-
-async fn assert_timeline_rejects_source(router: &Router, from_us: i64, to_us: i64) -> Result<()> {
-    let uris = [
-        format!("/v1/timeline/overview?source=7&from={from_us}&to={to_us}"),
-        format!("/v1/timeline/events?source=7&from={from_us}&to={to_us}"),
-        format!("/v1/timeline/health?source=7&from={from_us}&to={to_us}"),
-    ];
-    for uri in uris {
-        let response = request_with_router(router, &uri, &[]).await?;
-        anyhow::ensure!(
-            response.status == 400,
-            "{uri} with removed source returned status {}: {}",
-            response.status,
-            response.body
-        );
-        anyhow::ensure!(
-            response.body["code"] == "unknown_query_parameter",
-            "{uri} did not reject the removed source parameter: {}",
-            response.body
-        );
-        anyhow::ensure!(
-            response.body["params"]["parameter"] == "source",
-            "{uri} reported the wrong unknown parameter: {}",
-            response.body
-        );
-    }
     Ok(())
 }
 

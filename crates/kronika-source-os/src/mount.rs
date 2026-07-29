@@ -215,7 +215,7 @@ pub fn mount_row(
     ts: i64,
     mount_point_id: StrId,
     fstype_id: StrId,
-    source_id: StrId,
+    source_str_id: StrId,
 ) -> OsMountinfo {
     OsMountinfo {
         ts: Ts(ts),
@@ -223,7 +223,7 @@ pub fn mount_row(
         minor: entry.minor,
         mount_point: mount_point_id,
         fstype: fstype_id,
-        source: source_id,
+        source: source_str_id,
         is_k8s_infra: entry.is_k8s_infra,
         total_bytes: space.map(|s| s.total_bytes),
         free_bytes: space.map(|s| s.free_bytes),

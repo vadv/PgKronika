@@ -304,10 +304,6 @@ impl MetricUnit {
 pub enum ResetFamily {
     /// Counter is reset with `pg_stat_database`/postmaster context.
     PgStatDatabase,
-    /// Counter is reset by a host boot.
-    HostBoot,
-    /// Counter is reset by a cgroup/host boot identity change.
-    CgroupBoot,
 }
 
 impl ResetFamily {
@@ -316,8 +312,6 @@ impl ResetFamily {
     pub const fn code(self) -> u8 {
         match self {
             Self::PgStatDatabase => 1,
-            Self::HostBoot => 2,
-            Self::CgroupBoot => 3,
         }
     }
 
@@ -326,8 +320,6 @@ impl ResetFamily {
     pub const fn from_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::PgStatDatabase),
-            2 => Some(Self::HostBoot),
-            3 => Some(Self::CgroupBoot),
             _ => None,
         }
     }
@@ -383,8 +375,12 @@ impl MetricSeriesDescriptor {
 
 /// Derives a content-qualified entity reference.
 #[must_use]
-pub fn derive_entity(kind: EntityKind, source_identity: &[u8]) -> EntityRef {
-    let digest = sha256::digest_parts(&[METRIC_ENTITY_DOMAIN_TAG, &[kind.code()], source_identity]);
+pub fn derive_entity(kind: EntityKind, entity_identity_bytes: &[u8]) -> EntityRef {
+    let digest = sha256::digest_parts(&[
+        METRIC_ENTITY_DOMAIN_TAG,
+        &[kind.code()],
+        entity_identity_bytes,
+    ]);
     let mut id = [0_u8; 16];
     id.copy_from_slice(&digest[..16]);
     EntityRef { kind, id }

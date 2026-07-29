@@ -6,7 +6,7 @@ use std::sync::Arc;
 use kronika_analytics::Episode;
 
 /// Bump when the canonical byte layout changes.
-const KEY_VERSION: u8 = 1;
+const KEY_VERSION: u8 = 2;
 
 /// A scalar accepted in a canonical series identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -119,7 +119,7 @@ impl PartialOrd for EpisodeRefV1 {
     }
 }
 
-pub(crate) struct IncidentKeyV1 {
+pub(crate) struct IncidentKeyV2 {
     bytes: Vec<u8>,
 }
 
@@ -129,9 +129,8 @@ pub(crate) struct KeyTooLarge {
     pub limit: usize,
 }
 
-impl IncidentKeyV1 {
+impl IncidentKeyV2 {
     pub(crate) fn new(
-        node_self_id: &str,
         start_us: i64,
         end_us: i64,
         members: &[EpisodeRefV1],
@@ -141,9 +140,7 @@ impl IncidentKeyV1 {
         ordered.sort_unstable();
 
         let mut encoded_len = 1_usize
-            .checked_add(8)
-            .and_then(|len| len.checked_add(node_self_id.len()))
-            .and_then(|len| len.checked_add(16))
+            .checked_add(16)
             .and_then(|len| len.checked_add(8))
             .unwrap_or(usize::MAX);
         for member in &ordered {
@@ -158,7 +155,6 @@ impl IncidentKeyV1 {
 
         let mut bytes = Vec::with_capacity(encoded_len);
         bytes.push(KEY_VERSION);
-        encode_bytes(&mut bytes, node_self_id.as_bytes());
         bytes.extend_from_slice(&start_us.to_be_bytes());
         bytes.extend_from_slice(&end_us.to_be_bytes());
         bytes.extend_from_slice(&(ordered.len() as u64).to_be_bytes());
@@ -200,8 +196,8 @@ mod tests {
     fn encoding_is_deterministic() {
         let a = iref("s", &[IdentityValue::I64(1)], 10, 20);
         let b = iref("s", &[IdentityValue::I64(1)], 10, 20);
-        let key_a = IncidentKeyV1::new("n", 0, 100, &[a], 1024).expect("within limit");
-        let key_b = IncidentKeyV1::new("n", 0, 100, &[b], 1024).expect("within limit");
+        let key_a = IncidentKeyV2::new(0, 100, &[a], 1024).expect("within limit");
+        let key_b = IncidentKeyV2::new(0, 100, &[b], 1024).expect("within limit");
         assert_eq!(key_a.canonical_bytes(), key_b.canonical_bytes());
     }
 
@@ -209,8 +205,8 @@ mod tests {
     fn length_prefix_prevents_text_boundary_collision() {
         let ab_c = iref("s", &[text("ab"), text("c")], 0, 1);
         let a_bc = iref("s", &[text("a"), text("bc")], 0, 1);
-        let ka = IncidentKeyV1::new("n", 0, 1, &[ab_c], 1024).expect("within limit");
-        let kb = IncidentKeyV1::new("n", 0, 1, &[a_bc], 1024).expect("within limit");
+        let ka = IncidentKeyV2::new(0, 1, &[ab_c], 1024).expect("within limit");
+        let kb = IncidentKeyV2::new(0, 1, &[a_bc], 1024).expect("within limit");
         assert_ne!(ka.canonical_bytes(), kb.canonical_bytes());
     }
 
@@ -218,7 +214,7 @@ mod tests {
     fn distinct_fields_produce_distinct_keys() {
         let base = || iref("s", &[IdentityValue::U64(1)], 10, 20);
         let bytes = |r: EpisodeRefV1| {
-            IncidentKeyV1::new("n", 0, 99, &[r], 1024)
+            IncidentKeyV2::new(0, 99, &[r], 1024)
                 .expect("within limit")
                 .canonical_bytes()
                 .to_vec()
@@ -237,29 +233,29 @@ mod tests {
         let x = iref("a", &[IdentityValue::I64(1)], 0, 5);
         let y = iref("b", &[IdentityValue::I64(2)], 3, 8);
         let forward =
-            IncidentKeyV1::new("n", 0, 10, &[x.clone(), y.clone()], 1024).expect("within limit");
-        let reversed = IncidentKeyV1::new("n", 0, 10, &[y, x], 1024).expect("within limit");
+            IncidentKeyV2::new(0, 10, &[x.clone(), y.clone()], 1024).expect("within limit");
+        let reversed = IncidentKeyV2::new(0, 10, &[y, x], 1024).expect("within limit");
         assert_eq!(forward.canonical_bytes(), reversed.canonical_bytes());
     }
 
     #[test]
-    fn node_id_participates_in_the_key() {
+    fn identical_incident_inputs_produce_one_key() {
         let r = iref("s", &[IdentityValue::I64(1)], 0, 1);
-        let one = IncidentKeyV1::new("node-a", 0, 1, std::slice::from_ref(&r), 1024)
+        let one = IncidentKeyV2::new(0, 1, std::slice::from_ref(&r), 1024)
             .expect("within limit")
             .canonical_bytes()
             .to_vec();
-        let two = IncidentKeyV1::new("node-b", 0, 1, &[r], 1024)
+        let two = IncidentKeyV2::new(0, 1, &[r], 1024)
             .expect("within limit")
             .canonical_bytes()
             .to_vec();
-        assert_ne!(one, two);
+        assert_eq!(one, two);
     }
 
     #[test]
     fn key_carries_the_version_byte() {
         let r = iref("s", &[IdentityValue::I64(1)], 0, 1);
-        let key = IncidentKeyV1::new("n", 0, 1, &[r], 1024).expect("within limit");
+        let key = IncidentKeyV2::new(0, 1, &[r], 1024).expect("within limit");
         assert_eq!(key.canonical_bytes().first(), Some(&KEY_VERSION));
     }
 
@@ -267,9 +263,9 @@ mod tests {
     fn key_size_is_checked_before_allocation() {
         let reference = iref("section", &[text("identity")], 0, 1);
         assert_eq!(
-            IncidentKeyV1::new("node", 0, 1, &[reference], 1).err(),
+            IncidentKeyV2::new(0, 1, &[reference], 1).err(),
             Some(KeyTooLarge {
-                observed: 102,
+                observed: 90,
                 limit: 1,
             })
         );

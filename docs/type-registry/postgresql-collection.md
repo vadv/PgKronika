@@ -496,8 +496,6 @@ SELECT system_identifier FROM pg_control_system();
 - `clock_ticks_per_sec` — `sysconf(_SC_CLK_TCK)`;
 - `page_size_bytes` — `sysconf(_SC_PAGESIZE)`.
 
-`node_self_id` берётся из `KRONIKA_NODE_SELF_ID`; без переменной — hostname.
-
 ## Сегмент
 
 Окна сборов накапливаются в журнале `active.parts`, который лежит в

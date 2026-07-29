@@ -29,54 +29,8 @@ pub(crate) fn no_data_response(scan: &ScanParams, data_age: Option<u64>) -> Valu
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
         "catalog": catalog_to_json(None, &[], &BTreeMap::new(), &[], &[]),
         "log": empty_log_json(),
-        "data_quality": quality_to_json(&quality, "unknown"),
+        "data_quality": quality_to_json(&quality),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some(ApiReason::no_data())),
-    })
-}
-
-/// Identity condition that prevents incident analysis from starting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IdentityIssue {
-    Missing,
-    Conflicting,
-}
-
-impl IdentityIssue {
-    const fn analysis_status(self) -> &'static str {
-        match self {
-            Self::Missing => "missing_node_identity",
-            Self::Conflicting => "conflicting_node_identity",
-        }
-    }
-
-    const fn reason(self) -> ApiReason {
-        match self {
-            Self::Missing => ApiReason::missing_node_identity(),
-            Self::Conflicting => ApiReason::conflicting_node_identity(),
-        }
-    }
-}
-
-pub(crate) fn identity_response(
-    scan: &ScanParams,
-    data_age: Option<u64>,
-    issue: IdentityIssue,
-) -> Value {
-    let quality = InputQuality::default();
-    let analysis_status = issue.analysis_status();
-    json!({
-        "from": scan.from,
-        "to": scan.to,
-        "complete": false,
-        "clustering_complete": false,
-        "analysis_status": analysis_status,
-        "incidents": Value::Array(Vec::new()),
-        "coverage_by_section": json!({}),
-        "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(None, &[], &BTreeMap::new(), &[], &[]),
-        "log": empty_log_json(),
-        "data_quality": quality_to_json(&quality, analysis_status),
-        "skipped": skipped_to_json(&[], &[], 0, &quality, Some(issue.reason())),
     })
 }
 
@@ -129,7 +83,7 @@ pub(crate) fn build_response(
             &log.evaluated_lens_ids,
         ),
         "log": log_to_json(log),
-        "data_quality": quality_to_json(quality, "available"),
+        "data_quality": quality_to_json(quality),
         "skipped": skipped_to_json(
             input_skipped,
             &outcome.skipped,
@@ -777,9 +731,8 @@ fn section_skip_reason(reason: SkipReason) -> ApiReason {
     }
 }
 
-fn quality_to_json(quality: &InputQuality, node_identity: &str) -> Value {
+fn quality_to_json(quality: &InputQuality) -> Value {
     json!({
-        "node_identity": node_identity,
         "non_canonical_identity": quality.non_canonical_identity,
         "non_finite_points": quality.non_finite_points,
         "first_points": quality.first_points,
@@ -1456,24 +1409,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_issue_drives_status_quality_and_reason_together() {
-        for (issue, expected) in [
-            (IdentityIssue::Missing, "missing_node_identity"),
-            (IdentityIssue::Conflicting, "conflicting_node_identity"),
-        ] {
-            let body = identity_response(&scan(), None, issue);
-            assert_eq!(body["analysis_status"], expected);
-            assert_eq!(body["data_quality"]["node_identity"], expected);
-            assert_eq!(body["catalog"]["diagnosis_available"], false);
-            assert_eq!(body["catalog"]["evaluated_lens_ids"], json!([]));
-            assert_eq!(
-                body["skipped"]["analysis"][0]["reason"],
-                json!({ "kind": expected, "params": {} })
-            );
-        }
-    }
-
-    #[test]
     fn global_catalog_readiness_is_not_a_request_skip() {
         let body = no_data_response(&scan(), None);
         assert!(
@@ -1674,7 +1609,7 @@ mod tests {
                 end_us: 10,
             },
         };
-        let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+        let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);
         let catalog = active_catalog();
         let lenses: Vec<&dyn Lens> = catalog.iter().map(AsRef::as_ref).collect();
         // A pg_locks episode with no sampled lock edges: the lock lens is active
@@ -1797,7 +1732,7 @@ mod tests {
                 end_us: 10,
             },
         };
-        let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+        let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);
         let catalog = active_catalog();
         let lenses: Vec<&dyn Lens> = catalog.iter().map(AsRef::as_ref).collect();
         let outcome = analyze(

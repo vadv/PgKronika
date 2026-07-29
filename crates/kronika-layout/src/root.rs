@@ -650,7 +650,7 @@ pub enum QuarantineFailureStage {
     QuarantineDirectoryEntrySync,
     /// The source object disappeared before the operation.
     SourceMissing,
-    /// The source identity changed before the operation.
+    /// The input entry changed before the operation.
     SourceChanged,
     /// All bounded collision slots already existed.
     CollisionSlotsExhausted,
@@ -2131,7 +2131,7 @@ impl WriterOwner {
 
     /// Atomically moves a discovered unsupported entry into opaque quarantine.
     ///
-    /// The raw path remains private, the source identity is revalidated without
+    /// The raw path remains private, the input entry is revalidated without
     /// following links, destination names are bounded and collision-safe, and
     /// no existing object is overwritten. Every local failure is returned as a
     /// degraded outcome so callers can continue processing other entries.
@@ -2258,7 +2258,7 @@ impl WriterOwner {
     /// Removes a sealed segment (its PGM and sibling OVF) and prunes the day.
     ///
     /// Direct unlink is safe: live readers keep their own descriptors, the
-    /// overview owner revalidates source identity before publishing an OVF, and
+    /// overview owner revalidates the input file before publishing an OVF, and
     /// its GC rechecks device/inode, so no delayed two-step deletion is needed.
     /// A part of the pair that already vanished frees zero bytes instead of
     /// failing. The writer owns the root, so empty calendar ancestors are
@@ -2476,7 +2476,7 @@ impl OverviewOwner {
         &self.root
     }
 
-    /// Creates an OVF temporary and captures the source PGM identity.
+    /// Creates an OVF temporary and captures the input PGM file identity.
     ///
     /// # Errors
     ///
@@ -2500,7 +2500,7 @@ impl OverviewOwner {
         kind: TemporaryKind,
     ) -> Result<OvfTemp<'_>, LayoutError> {
         let source = self.root.open_pgm(address)?;
-        let source_identity = FileIdentity::from_file(&source)?;
+        let input_file_identity = FileIdentity::from_file(&source)?;
         let day = self.root.open_day(address.day)?;
         let temp_name = temporary_name(address, kind);
         let file = create_regular_at(&day, &temp_name, OFlags::RDWR, DATA_FILE_MODE)?;
@@ -2513,7 +2513,7 @@ impl OverviewOwner {
             temp_name,
             final_name: address.ovf_name(),
             address,
-            source_identity,
+            input_file_identity,
             kind,
             completed: false,
         })
@@ -2664,7 +2664,7 @@ pub struct OvfTemp<'owner> {
     temp_name: String,
     final_name: String,
     address: SegmentAddress,
-    source_identity: FileIdentity,
+    input_file_identity: FileIdentity,
     kind: TemporaryKind,
     completed: bool,
 }
@@ -2725,7 +2725,7 @@ impl OvfTemp<'_> {
             &self.temp_name,
         )?;
         let current_source = self.root.open_pgm(self.address)?;
-        if FileIdentity::from_file(&current_source)? != self.source_identity {
+        if FileIdentity::from_file(&current_source)? != self.input_file_identity {
             return Err(LayoutError::SourceChanged {
                 id: self.address.id,
             });

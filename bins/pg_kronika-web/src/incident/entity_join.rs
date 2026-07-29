@@ -154,25 +154,6 @@ impl EntityJoinContract {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EntityScope<'a> {
-    node_self_id: &'a str,
-}
-
-impl<'a> EntityScope<'a> {
-    pub(crate) const fn new(node_self_id: &'a str) -> Option<Self> {
-        if node_self_id.is_empty() {
-            None
-        } else {
-            Some(Self { node_self_id })
-        }
-    }
-
-    fn matches(self, other: Self) -> bool {
-        self.node_self_id == other.node_self_id
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EntityValue {
     I64Pair(i64, i64),
@@ -238,17 +219,15 @@ pub(crate) enum EntityJoinInsert {
 }
 
 /// Exact-key index bounded by the number of already-admitted input relations.
-pub(crate) struct EntityJoinIndex<'scope> {
-    scope: EntityScope<'scope>,
+pub(crate) struct EntityJoinIndex {
     entries: BTreeMap<EntityJoinKey, BTreeSet<i64>>,
     relation_count: usize,
     relation_limit: usize,
 }
 
-impl<'scope> EntityJoinIndex<'scope> {
-    pub(crate) const fn new(scope: EntityScope<'scope>, relation_limit: usize) -> Self {
+impl EntityJoinIndex {
+    pub(crate) const fn new(relation_limit: usize) -> Self {
         Self {
-            scope,
             entries: BTreeMap::new(),
             relation_count: 0,
             relation_limit,
@@ -280,25 +259,14 @@ impl<'scope> EntityJoinIndex<'scope> {
         EntityJoinInsert::Inserted
     }
 
-    pub(crate) fn matches(
-        &self,
-        scope: EntityScope<'_>,
-        key: &EntityJoinKey,
-    ) -> Option<&BTreeSet<i64>> {
-        self.scope
-            .matches(scope)
-            .then(|| self.entries.get(key))
-            .flatten()
+    pub(crate) fn matches(&self, key: &EntityJoinKey) -> Option<&BTreeSet<i64>> {
+        self.entries.get(key)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn scope(node_self_id: &str) -> EntityScope<'_> {
-        EntityScope::new(node_self_id).expect("non-empty node identity")
-    }
 
     fn backend(snapshot: i64, pid: i64, backend_start: i64) -> EntityJoinKey {
         EntityJoinKey::shared_snapshot(
@@ -347,14 +315,13 @@ mod tests {
 
     #[test]
     fn exact_scoped_snapshot_session_join_is_observable_and_ordered() {
-        let request = scope("node-a");
         let key = backend(100, 42, 10);
-        let mut index = EntityJoinIndex::new(request, 2);
+        let mut index = EntityJoinIndex::new(2);
         assert_eq!(index.insert(key.clone(), 9), EntityJoinInsert::Inserted);
         assert_eq!(index.insert(key.clone(), 3), EntityJoinInsert::Inserted);
         assert_eq!(
             index
-                .matches(request, &key)
+                .matches(&key)
                 .expect("exact join")
                 .iter()
                 .copied()
@@ -365,9 +332,8 @@ mod tests {
 
     #[test]
     fn zero_relation_limit_rejects_without_creating_a_lookup_entry() {
-        let request = scope("node-a");
         let key = backend(100, 42, 10);
-        let mut index = EntityJoinIndex::new(request, 0);
+        let mut index = EntityJoinIndex::new(0);
         assert_eq!(
             index.insert(key.clone(), 9),
             EntityJoinInsert::LimitExceeded {
@@ -375,12 +341,11 @@ mod tests {
                 limit: 0,
             }
         );
-        assert!(index.matches(request, &key).is_none());
+        assert!(index.matches(&key).is_none());
     }
 
     #[test]
     fn equal_numbers_in_other_names_or_domains_do_not_join() {
-        let request = scope("node-a");
         let relation = EntityJoinKey::shared_snapshot(
             100,
             100,
@@ -396,33 +361,30 @@ mod tests {
             100,
             TypedEntityIdentity::scalar(EntityDomain::Linux, EntityName::Process, 42),
         );
-        let mut index = EntityJoinIndex::new(request, 1);
+        let mut index = EntityJoinIndex::new(1);
         assert_eq!(index.insert(relation, 1), EntityJoinInsert::Inserted);
-        assert!(index.matches(request, &database).is_none());
-        assert!(index.matches(request, &process).is_none());
+        assert!(index.matches(&database).is_none());
+        assert!(index.matches(&process).is_none());
     }
 
     #[test]
-    fn node_snapshot_time_and_lifetime_are_part_of_the_match() {
-        let request = scope("node-a");
+    fn snapshot_time_and_lifetime_are_part_of_the_match() {
         let key = backend(100, 42, 10);
-        let mut index = EntityJoinIndex::new(request, 1);
-        assert_eq!(index.insert(key.clone(), 1), EntityJoinInsert::Inserted);
-        assert!(index.matches(scope("node-b"), &key).is_none());
-        assert!(index.matches(request, &backend(101, 42, 10)).is_none());
-        assert!(index.matches(request, &backend(100, 42, 11)).is_none());
+        let mut index = EntityJoinIndex::new(1);
+        assert_eq!(index.insert(key, 1), EntityJoinInsert::Inserted);
+        assert!(index.matches(&backend(101, 42, 10)).is_none());
+        assert!(index.matches(&backend(100, 42, 11)).is_none());
 
         let same_token_other_time = EntityJoinKey::shared_snapshot(
             100,
             101,
             TypedEntityIdentity::postgres_backend_session(42, 10).expect("valid session"),
         );
-        assert!(index.matches(request, &same_token_other_time).is_none());
+        assert!(index.matches(&same_token_other_time).is_none());
     }
 
     #[test]
     fn oid_reuse_requires_a_new_snapshot_provenance() {
-        let request = scope("node-a");
         let relation = |snapshot| {
             EntityJoinKey::shared_snapshot(
                 snapshot,
@@ -430,9 +392,9 @@ mod tests {
                 TypedEntityIdentity::scalar(EntityDomain::Postgres, EntityName::Relation, 42),
             )
         };
-        let mut index = EntityJoinIndex::new(request, 1);
+        let mut index = EntityJoinIndex::new(1);
         assert_eq!(index.insert(relation(100), 1), EntityJoinInsert::Inserted);
-        assert!(index.matches(request, &relation(200)).is_none());
+        assert!(index.matches(&relation(200)).is_none());
     }
 
     #[test]
@@ -440,14 +402,12 @@ mod tests {
         assert!(TypedEntityIdentity::postgres_backend_session(0, 1).is_none());
         assert!(TypedEntityIdentity::postgres_backend_session(1, 0).is_none());
         assert!(TypedEntityIdentity::postgres_backend_session(-1, 1).is_none());
-        assert!(EntityScope::new("").is_none());
     }
 
     #[test]
     fn duplicate_relations_do_not_consume_the_bound() {
-        let request = scope("node-a");
         let key = backend(100, 42, 10);
-        let mut index = EntityJoinIndex::new(request, 1);
+        let mut index = EntityJoinIndex::new(1);
         assert_eq!(index.insert(key.clone(), 9), EntityJoinInsert::Inserted);
         assert_eq!(index.insert(key.clone(), 9), EntityJoinInsert::Duplicate);
         assert_eq!(
@@ -459,7 +419,7 @@ mod tests {
         );
         assert_eq!(
             index
-                .matches(request, &backend(100, 42, 10))
+                .matches(&backend(100, 42, 10))
                 .expect("first admitted relation")
                 .iter()
                 .copied()
@@ -470,8 +430,7 @@ mod tests {
 
     #[test]
     fn relation_count_overflow_is_rejected() {
-        let request = scope("node-a");
-        let mut index = EntityJoinIndex::new(request, usize::MAX);
+        let mut index = EntityJoinIndex::new(usize::MAX);
         index.relation_count = usize::MAX;
         let key = backend(100, 42, 10);
         assert_eq!(
@@ -481,6 +440,6 @@ mod tests {
                 limit: usize::MAX,
             }
         );
-        assert!(index.matches(request, &key).is_none());
+        assert!(index.matches(&key).is_none());
     }
 }

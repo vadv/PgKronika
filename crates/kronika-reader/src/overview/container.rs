@@ -43,7 +43,7 @@ const ZSTD_LEVEL: i32 = 1;
 const ZSTD_MIN_SAVING: usize = DIRECTORY_ENTRY_LEN;
 const ZSTD_WINDOW_LOG_MAX: u32 = 19;
 
-/// Source and compatibility identity serialized in a fact-file header.
+/// Input-file descriptor and compatibility metadata serialized in a fact-file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderIdentity {
     /// Logical fact-shape version.
@@ -62,7 +62,7 @@ pub struct HeaderIdentity {
     pub source_file_len: u64,
     /// Content-derived PGM descriptor.
     pub source_descriptor: SourceDescriptor,
-    /// Logical fact identity derived from the source and contract versions.
+    /// Logical fact identity derived from the input descriptor and contract versions.
     pub fact_key: FactKey,
     /// Rebuild-stable lineage of this sealed source occurrence.
     pub segment_lineage_id: SegmentLineageId,
@@ -99,7 +99,7 @@ impl HeaderIdentity {
 /// Decoded fixed header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FactFileHeader {
-    /// Source and compatibility identity.
+    /// Input-file descriptor and compatibility metadata.
     pub identity: HeaderIdentity,
     /// Directory offset, fixed at 184 in container version 3.
     pub directory_offset: u64,
@@ -118,7 +118,7 @@ pub struct BlockDirectoryEntry {
     pub block_schema_version: u16,
     /// Parsed flags.
     pub flags: BlockFlags,
-    /// Stable view, factor, or source ID; zero for segment-wide data.
+    /// Stable view, factor, or producer code; zero for segment-wide data.
     pub logical_id: u32,
     /// Absolute offset of stored bytes.
     pub offset: u64,
@@ -656,7 +656,7 @@ impl<R: ReadAt> FactFileReader<R> {
     ///
     /// # Errors
     ///
-    /// Returns [`CacheReadError`] when metadata or source identity is invalid.
+    /// Returns [`CacheReadError`] when metadata or input file identity is invalid.
     pub fn open(
         reader: R,
         expected: &HeaderIdentity,

@@ -157,8 +157,6 @@ Product-owned reason всегда имеет одну форму:
 | `incomplete_snapshot` | `{}` |
 | `retention_limit` | `dropped` |
 | `no_data` | `{}` |
-| `missing_node_identity` | `{}` |
-| `conflicting_node_identity` | `{}` |
 | `producer_unavailable` | `{}` |
 | `provenance_or_input_missing` | `{}` |
 | `complete_provenance` | `gap_count` |

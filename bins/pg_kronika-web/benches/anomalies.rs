@@ -19,7 +19,6 @@ use http_body_util::BodyExt;
 use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
 use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId};
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
-use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
 use kronika_registry::pg_stat_statements::PgStatStatementsV6;
 use kronika_registry::pg_store_plans::PgStorePlansOsscV1;
@@ -260,21 +259,14 @@ fn build_fixture(dir: &Path) {
         let mut interner = kronika_writer::Interner::new(
             DictLimits::new(64, 4096).expect("plan benchmark dictionary limits"),
         );
-        let (extension_version, compute_query_id, hostname, node_self_id, kernel_version, boot_id) = {
+        let (extension_version, compute_query_id) = {
             let mut intern = |value: &str| {
                 interner
                     .intern(value.as_bytes())
                     .map(|id| StrId(id.get()))
                     .expect("intern plan benchmark string")
             };
-            (
-                intern("1.10"),
-                intern("auto"),
-                intern("benchmark-host"),
-                intern("benchmark-node"),
-                intern("benchmark-kernel"),
-                intern("benchmark-boot"),
-            )
+            (intern("1.10"), intern("auto"))
         };
         let resets = (first_tick..first_tick + SNAPSHOTS_PER_SEGMENT)
             .map(|tick| ResetMetadata {
@@ -295,18 +287,6 @@ fn build_fixture(dir: &Path) {
                 track_wal_io_timing: Some(false),
             })
             .collect::<Vec<_>>();
-        let metadata = InstanceMetadata {
-            ts: Ts(first_tick * STEP),
-            hostname,
-            node_self_id,
-            pg_version_num: 150_000,
-            kernel_version,
-            pg_system_identifier: Some(99),
-            clock_ticks_per_sec: 100,
-            page_size_bytes: 4096,
-            boot_id,
-            btime: Ts(0),
-        };
         let dictionary =
             kronika_writer::dict::encode(interner.window()).expect("encode benchmark dictionary");
         let statements_body = PgStatStatementsV6::encode(&statements).expect("encode statements");
@@ -314,8 +294,6 @@ fn build_fixture(dir: &Path) {
         let plan_coverage_body =
             SnapshotCoverageV1::encode(&plan_coverage).expect("encode plan coverage");
         let reset_body = ResetMetadata::encode(&resets).expect("encode reset metadata");
-        let metadata_body =
-            InstanceMetadata::encode(&[metadata]).expect("encode instance metadata");
         let archiver_body = PgStatArchiver::encode(&archiver).expect("encode archiver");
         let bgwriter_body = BgwriterCheckpointer::encode(&bgwriter).expect("encode bgwriter");
         let min_ts = first_tick * STEP;
@@ -344,11 +322,6 @@ fn build_fixture(dir: &Path) {
                 type_id: 1_020_001,
                 rows: u32::try_from(resets.len()).expect("reset row count"),
                 body: &reset_body,
-            },
-            SectionInput {
-                type_id: 1_021_001,
-                rows: 1,
-                body: &metadata_body,
             },
             SectionInput {
                 type_id: 1_038_001,

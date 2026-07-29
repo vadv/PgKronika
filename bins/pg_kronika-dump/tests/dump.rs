@@ -250,7 +250,6 @@ fn ovf_name_selects_metadata_dump_without_reading_bodies() {
     assert!(stderr.is_empty());
     assert_eq!(output["kind"], "ovf");
     assert_eq!(output["file_bytes"], bytes.len());
-    assert!(output["header"].get("pgm_source_id").is_none());
     assert!(
         output["blocks"]
             .as_array()

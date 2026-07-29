@@ -496,7 +496,6 @@ def check_fixture_tail_and_ovf(summary: dict[str, Any]) -> None:
         fixture["candidate"]["data_type_id_count"] == fixture["registered_contracts"],
         "fixture type coverage",
     )
-    require(fixture["source_id"] != 0, "fixture must exercise non-zero source_id")
     require(fixture["min_ts_us"] < fixture["max_ts_us"], "fixture timestamp range")
     for field in FIXTURE_IDENTITY_FIELDS:
         require(fixture[field], f"fixture {field}")

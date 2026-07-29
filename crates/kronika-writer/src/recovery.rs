@@ -80,7 +80,7 @@ pub struct JournalRecoverySummary {
 #[derive(Debug)]
 pub struct JournalRecovery {
     source: File,
-    source_identity: FileIdentity,
+    input_file_identity: FileIdentity,
     parts: Vec<PartRef>,
     summary: JournalRecoverySummary,
 }
@@ -206,13 +206,13 @@ impl JournalRecovery {
     pub fn inspect(source: &File, config: JournalConfig) -> Result<Self, JournalRecoveryError> {
         validate_config(config).map_err(JournalRecoveryError::Config)?;
         let source = source.try_clone()?;
-        let source_identity = FileIdentity::from_file(&source)?;
-        let evidence_bytes = source_identity.len;
+        let input_file_identity = FileIdentity::from_file(&source)?;
+        let evidence_bytes = input_file_identity.len;
 
         if evidence_bytes == 0 {
             return Self::without_scan(
                 source,
-                source_identity,
+                input_file_identity,
                 JournalRecoveryReason::ZeroLength,
                 0,
             );
@@ -220,7 +220,7 @@ impl JournalRecovery {
         if evidence_bytes < JOURNAL_HEADER_LEN as u64 {
             return Self::without_scan(
                 source,
-                source_identity,
+                input_file_identity,
                 JournalRecoveryReason::TornHeader,
                 evidence_bytes,
             );
@@ -236,7 +236,7 @@ impl JournalRecovery {
             ) => {
                 return Self::without_scan(
                     source,
-                    source_identity,
+                    input_file_identity,
                     JournalRecoveryReason::UnsupportedHeader,
                     evidence_bytes,
                 );
@@ -244,7 +244,7 @@ impl JournalRecovery {
             Err(_) => {
                 return Self::without_scan(
                     source,
-                    source_identity,
+                    input_file_identity,
                     JournalRecoveryReason::InvalidHeader,
                     evidence_bytes,
                 );
@@ -263,7 +263,7 @@ impl JournalRecovery {
                 };
                 Self::with_header_without_scan(
                     source,
-                    source_identity,
+                    input_file_identity,
                     reason,
                     header.body_len,
                     physical_body_bytes,
@@ -273,7 +273,7 @@ impl JournalRecovery {
                 let Ok(segment_id) = SegmentId::new(segment_id) else {
                     return Self::with_header_without_scan(
                         source,
-                        source_identity,
+                        input_file_identity,
                         JournalRecoveryReason::InvalidSegmentId,
                         header.body_len,
                         physical_body_bytes,
@@ -285,7 +285,7 @@ impl JournalRecovery {
                     JOURNAL_HEADER_LEN as u64,
                     limits,
                 )?;
-                ensure_identity(&source, source_identity)?;
+                ensure_identity(&source, input_file_identity)?;
                 let body_length_mismatch = header.body_len != physical_body_bytes;
                 let reason = if scan.stop != RecoveryScanStop::EndOfSource {
                     JournalRecoveryReason::AdmissionLimit
@@ -315,7 +315,7 @@ impl JournalRecovery {
                 };
                 Ok(Self {
                     source,
-                    source_identity,
+                    input_file_identity,
                     parts: scan.parts,
                     summary,
                 })
@@ -352,18 +352,18 @@ impl JournalRecovery {
         let Some(segment_id) = self.summary.trusted_segment_id else {
             return Err(JournalRecoveryError::MissingTrustedSegmentId);
         };
-        ensure_identity(&self.source, self.source_identity)?;
+        ensure_identity(&self.source, self.input_file_identity)?;
 
         let mut recovered = JournalReplaySummary::default();
         for part in &self.parts {
-            ensure_identity(&self.source, self.source_identity)?;
+            ensure_identity(&self.source, self.input_file_identity)?;
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(part.len)
                 .map_err(JournalRecoveryError::Allocation)?;
             bytes.resize(part.len, 0);
             self.source.read_exact_at(&mut bytes, part.offset as u64)?;
-            ensure_identity(&self.source, self.source_identity)?;
+            ensure_identity(&self.source, self.input_file_identity)?;
             let catalog =
                 validate_part(&bytes).map_err(JournalRecoveryError::VerifiedPartChanged)?;
             let rows = catalog
@@ -397,25 +397,25 @@ impl JournalRecovery {
                     quantity: "part byte",
                 })?;
         }
-        ensure_identity(&self.source, self.source_identity)?;
+        ensure_identity(&self.source, self.input_file_identity)?;
         Ok(recovered)
     }
 
     fn without_scan(
         source: File,
-        source_identity: FileIdentity,
+        input_file_identity: FileIdentity,
         reason: JournalRecoveryReason,
         discarded_bytes: u64,
     ) -> Result<Self, JournalRecoveryError> {
-        ensure_identity(&source, source_identity)?;
+        ensure_identity(&source, input_file_identity)?;
         Ok(Self {
             source,
-            source_identity,
+            input_file_identity,
             parts: Vec::new(),
             summary: JournalRecoverySummary {
                 reason,
                 trusted_segment_id: None,
-                evidence_bytes: source_identity.len,
+                evidence_bytes: input_file_identity.len,
                 recorded_body_bytes: None,
                 physical_body_bytes: 0,
                 body_length_mismatch: false,
@@ -432,20 +432,20 @@ impl JournalRecovery {
 
     fn with_header_without_scan(
         source: File,
-        source_identity: FileIdentity,
+        input_file_identity: FileIdentity,
         reason: JournalRecoveryReason,
         recorded_body_bytes: u64,
         physical_body_bytes: u64,
     ) -> Result<Self, JournalRecoveryError> {
-        ensure_identity(&source, source_identity)?;
+        ensure_identity(&source, input_file_identity)?;
         Ok(Self {
             source,
-            source_identity,
+            input_file_identity,
             parts: Vec::new(),
             summary: JournalRecoverySummary {
                 reason,
                 trusted_segment_id: None,
-                evidence_bytes: source_identity.len,
+                evidence_bytes: input_file_identity.len,
                 recorded_body_bytes: Some(recorded_body_bytes),
                 physical_body_bytes,
                 body_length_mismatch: recorded_body_bytes != physical_body_bytes,
@@ -512,7 +512,6 @@ mod tests {
             .push(InstanceMetadata {
                 ts: Ts(ts),
                 hostname: StrId(1),
-                node_self_id: StrId(2),
                 pg_version_num: 180_000,
                 kernel_version: StrId(3),
                 pg_system_identifier: Some(7),

@@ -224,7 +224,6 @@ closed_string_enum! {
         Bytes => "bytes",
         Units => "units",
         Sections => "sections",
-        IdentityBytes => "identity_bytes",
         SeriesPoints => "series_points",
         Episodes => "episodes",
         Clusters => "clusters",

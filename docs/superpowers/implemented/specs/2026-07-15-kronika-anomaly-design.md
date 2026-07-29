@@ -67,7 +67,7 @@ total_variation  = 0.5 * sum(abs(share_current[k] - share_reference[k]))
 ## HTTP-контракт
 
 ```text
-GET /v1/anomalies?source=…&from=…&to=…
+GET /v1/anomalies?from=…&to=…
   [&window=1h][&step=15m][&threshold=3.5]
   [&eps_rel=0.05][&limit=50][&section=name]
 ```
