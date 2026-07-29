@@ -25,8 +25,9 @@ required pull-request check and must never run automatically for `push` or
   environment.
 - Keep the ordinary collector settings. In particular,
   `KRONIKA_SEGMENT_MAX_AGE_S` remains at its 900-second default.
-- Wait at most 1200 seconds for the first retained segment. Start the smoke as
-  soon as a segment appears rather than sleeping for a fixed 20 minutes.
+- Wait at most 1200 seconds for retained timestamps to span at least 900
+  seconds. Early segments closed by size or row limits do not make timeline
+  evidence ready.
 - Keep local `make demo-api-smoke` immediate by default. CI opts into waiting
   with `DEMO_API_WAIT_SECONDS=1200`.
 - Run at most one manual demo smoke at a time.
@@ -72,7 +73,7 @@ The steps are:
 7. Run `make demo-api-smoke` against `http://127.0.0.1:18081` with
    `DEMO_API_WAIT_SECONDS=1200`.
 8. Always stop the demo gracefully, collect logs and the generated report, and
-   upload `demo-data` as an artifact.
+   upload an explicit diagnostic-file allowlist as an artifact.
 
 The workflow requests `contents: read` and `packages: write`. Package write is
 needed only when an exact dependency builder is absent; the demo runtime image
@@ -86,7 +87,8 @@ variable, `DEMO_API_WAIT_SECONDS`, controls a bounded polling phase before the
 existing preflight:
 
 - absent or `0`: preserve the current immediate behavior;
-- positive: query `/v1/segments` until at least one retained segment exists;
+- positive: query `/v1/segments` until its earliest and latest timestamps span
+  at least 900 seconds;
 - invalid or negative: fail immediately with a configuration error;
 - deadline reached: fail with an error that reports the wait duration.
 
@@ -96,10 +98,10 @@ visible, the existing preflight revalidates health, readiness, Swagger UI,
 runtime OpenAPI operation count, usable time range, scorable section, and
 catalog projection before invoking Schemathesis.
 
-Only the absence of retained segments is retried. Broken health endpoints,
-invalid JSON, an incorrect OpenAPI operation count, and other contract
-failures remain immediate failures instead of being hidden behind a
-20-minute retry window.
+Only an absent or shorter-than-900-second retained range is retried. Broken
+health endpoints, invalid JSON, an incorrect OpenAPI operation count, and
+other contract failures remain immediate failures instead of being hidden
+behind a 20-minute retry window.
 
 ## Evidence and Failure Handling
 
@@ -108,13 +110,16 @@ The Schemathesis output is written to both the Actions log and
 stand, seals the tail, and writes:
 
 - `demo-data/stand.log`;
+- `demo-data/container-live.log`;
 - `demo-data/collector.log`;
 - `demo-data/web.log`;
 - `demo-data/report.json`, when shutdown reaches measurement.
 
 Cleanup and artifact upload use `if: always()` so diagnostics survive build,
-startup, wait, contract, or smoke failures. Missing optional files do not hide
-the original failure.
+startup, wait, contract, or smoke failures. The artifact action receives only
+these files and `api-smoke.log`; it never traverses root-owned `pgdata`,
+tablespaces, segments, or other stand state. Missing optional files do not
+hide the original failure.
 
 ## Testing
 

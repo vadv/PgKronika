@@ -101,6 +101,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: demo-api-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-          path: demo-data/
+          path: |
+            demo-data/api-smoke.log
+            demo-data/container-live.log
+            demo-data/stand.log
+            demo-data/collector.log
+            demo-data/web.log
+            demo-data/report.json
           if-no-files-found: warn
           retention-days: 14

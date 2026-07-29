@@ -33,6 +33,74 @@ async fn segments_missing_a_required_parameter_is_a_bad_request() {
     );
 }
 
+#[tokio::test]
+async fn segments_refreshes_when_the_active_journal_changed_since_snapshot() {
+    use kronika_layout::SegmentId;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first_body =
+        BgwriterCheckpointer::encode(&[bgwriter_row(1_000)]).expect("encode first section");
+    let first_part = build_part(
+        &[SectionInput {
+            type_id: 1_006_001,
+            rows: 1,
+            body: &first_body,
+        }],
+        PartMeta {
+            min_ts: 1_000,
+            max_ts: 2_000,
+        },
+    );
+    crate::test_layout::write_journal(
+        dir.path(),
+        SegmentId::new(1_000).expect("first segment id"),
+        &[&first_part],
+    );
+    let state = state_for_dir(dir.path());
+
+    let second_body =
+        BgwriterCheckpointer::encode(&[bgwriter_row(5_000)]).expect("encode second section");
+    let second_part = build_part(
+        &[SectionInput {
+            type_id: 1_006_001,
+            rows: 1,
+            body: &second_body,
+        }],
+        PartMeta {
+            min_ts: 5_000,
+            max_ts: 6_000,
+        },
+    );
+    crate::test_layout::write_journal(
+        dir.path(),
+        SegmentId::new(5_000).expect("second segment id"),
+        &[&second_part],
+    );
+
+    let (status, body) = serve_state(state, "/v1/segments?from=0&to=10000").await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a stale catalog snapshot is retried"
+    );
+    assert_eq!(
+        body,
+        serde_json::json!({ "segments": [
+            {
+                "segment_id": "5000",
+                "min_ts": 5_000,
+                "max_ts": 6_000,
+                "sections": [{
+                    "name": "pg_stat_bgwriter + pg_stat_checkpointer",
+                    "rows": 1
+                }]
+            }
+        ] }),
+        "the response comes from the refreshed journal generation"
+    );
+}
+
 /// Write a `pg_stat_archiver` segment holding `rows`.
 fn write_archiver_segment(
     dir: &std::path::Path,

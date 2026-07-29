@@ -4,8 +4,9 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, RawQuery, State};
 use kronika_reader::{
-    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_collection_gating,
-    diff_section, gate_readings, logical_section, section, sections as query_sections,
+    GateReading, LocalDirSnapshot, LogicalSection, QueryError, ReadError, SectionPage, SeriesDiff,
+    apply_collection_gating, diff_section, gate_readings, logical_section, section,
+    sections as query_sections,
 };
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
@@ -27,6 +28,8 @@ use crate::serialize::{column_class_name, column_type_name, semantics_name};
 /// Cap on rows read for one diff response; a wider window is rejected so a
 /// single request cannot pull an unbounded section into memory.
 pub(crate) const DIFF_MAX_ROWS: usize = 262_144;
+
+const MAX_SEGMENT_SNAPSHOT_REFRESHES: u32 = 2;
 
 const RANGE_PARAMS: &[QueryParameter] = &[QueryParameter::From, QueryParameter::To];
 const PAGE_PARAMS: &[QueryParameter] = &[
@@ -143,17 +146,41 @@ pub(crate) async fn segments(
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
 
-    let snapshot = state.snapshot();
+    let mut snapshot = state.snapshot().as_ref().clone();
+    let segments = segment_responses(&mut snapshot, from, to)
+        .map_err(|error| query_error_response_without_cursor(&QueryError::Read(error)))?;
+    Ok(Json(SegmentsResponse { segments }))
+}
+
+fn segment_responses(
+    snapshot: &mut LocalDirSnapshot,
+    from: i64,
+    to: i64,
+) -> Result<Vec<SegmentResponse>, ReadError> {
+    let mut refreshed = 0_u32;
+    loop {
+        match segment_responses_once(snapshot, from, to) {
+            Err(ReadError::StaleSnapshot { .. }) if refreshed < MAX_SEGMENT_SNAPSHOT_REFRESHES => {
+                snapshot.refresh().map_err(ReadError::Io)?;
+                refreshed += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn segment_responses_once(
+    snapshot: &LocalDirSnapshot,
+    from: i64,
+    to: i64,
+) -> Result<Vec<SegmentResponse>, ReadError> {
     let units = snapshot.units();
     let mut out = Vec::new();
     for (idx, unit) in units.iter().enumerate() {
         if unit.max_ts < from || unit.min_ts > to {
             continue;
         }
-        let Some(catalog) = snapshot
-            .unit_catalog(idx)
-            .map_err(|error| query_error_response_without_cursor(&QueryError::Read(error)))?
-        else {
+        let Some(catalog) = snapshot.unit_catalog(idx)? else {
             continue;
         };
         let mut rows_by_name: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -177,7 +204,7 @@ pub(crate) async fn segments(
             sections,
         });
     }
-    Ok(Json(SegmentsResponse { segments: out }))
+    Ok(out)
 }
 
 /// `GET /v1/section/{name}?from&to&limit` — one section's rows over the
