@@ -41,6 +41,7 @@ use tower::ServiceExt as _;
 
 use crate::overview::live::LiveFoldStats;
 use crate::overview::loader::{LoaderIoSnapshot, LoaderQualificationSnapshot};
+use crate::overview::view::DescriptorView;
 use crate::{AppState, OverviewConfig, app};
 
 const ARTIFACT_SCHEMA: &str = "pgkronika-overview-parity-v1-evidence-v2";
@@ -901,15 +902,43 @@ async fn concurrent_disjoint(root: &Path) -> WorkerOutcome {
     config.cold.file_descriptors = 16;
     let state = state(root, &config);
     let (snapshot, view) = state.overview_request_view();
-    let mut plans = Vec::with_capacity(CONCURRENT_WORKERS);
-    for worker in 0..CONCURRENT_WORKERS {
-        let start =
-            DENSE_FIRST_WINDOW_US + i64::try_from(worker).expect("worker range") * 1_000_000_000;
+    let last_start = DENSE_FIRST_WINDOW_US
+        + i64::try_from(CONCURRENT_WORKERS - 1).expect("worker range") * 1_000_000_000;
+    let all = state
+        .select_overview(
+            Arc::clone(&view),
+            CoverageSpan::new(DENSE_FIRST_WINDOW_US, last_start + 32 * CADENCE_US)
+                .expect("full disjoint fixture range"),
+        )
+        .expect("full disjoint fixture plan");
+    let entries = all.entries().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        CONCURRENT_WORKERS,
+        "disjoint fixture must contain one descriptor per worker"
+    );
+    let mut plans = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let descriptor = *entry.descriptor();
+        let worker_view = Arc::new(DescriptorView::new(
+            view.view_generation(),
+            vec![entry],
+            Vec::new(),
+            Arc::clone(view.live()),
+            None,
+        ));
         plans.push(
             state
                 .select_overview(
-                    Arc::clone(&view),
-                    CoverageSpan::new(start, start + 32 * CADENCE_US).expect("disjoint range"),
+                    worker_view,
+                    CoverageSpan::new(
+                        descriptor.min_ts,
+                        descriptor
+                            .max_ts
+                            .checked_add(1)
+                            .expect("descriptor range end"),
+                    )
+                    .expect("disjoint range"),
                 )
                 .expect("disjoint plan"),
         );
@@ -2661,6 +2690,19 @@ fn evidence_binary(kind: &str, path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disjoint_qualification_uses_one_fact_key_per_worker() {
+        let directory = tempfile::tempdir().expect("fixture parent");
+        let root = directory.path().join("disjoint");
+        prepare_mode("concurrent-disjoint", &root);
+
+        let outcome = concurrent_disjoint(&root).await;
+
+        assert_eq!(outcome.work.singleflight_builds, CONCURRENT_WORKERS as u64);
+        assert_eq!(outcome.work.source_builds, CONCURRENT_WORKERS as u64);
+    }
 
     #[test]
     fn fixture_journal_v1_preserves_identity_and_absolute_frame_offsets() {
