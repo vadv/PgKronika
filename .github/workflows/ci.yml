@@ -44,6 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p xtask -- check-deps
       - run: bash scripts/test-bdd-image.sh
+      - run: python3 -B -m unittest scripts/test_demo_api_smoke.py -v
 
   test:
     name: test

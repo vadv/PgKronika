@@ -109,5 +109,27 @@ class RetainedSegmentWaitTests(unittest.TestCase):
         sleep.assert_called_once_with(10)
 
 
+class ManualWorkflowContractTests(unittest.TestCase):
+    def test_workflow_is_manual_only_and_owns_the_demo_lifecycle(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parent.parent
+            / ".github/workflows/demo-api-smoke.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotRegex(workflow, r"(?m)^  (push|pull_request|schedule):")
+        self.assertIn("timeout-minutes: 60", workflow)
+        self.assertIn('DEMO_API_WAIT_SECONDS: "1200"', workflow)
+        for command in (
+            "make demo-build",
+            "make demo-up",
+            "make demo-api-smoke",
+            "make demo-down",
+        ):
+            self.assertIn(command, workflow)
+        self.assertGreaterEqual(workflow.count("if: always()"), 2)
+        self.assertIn("actions/upload-artifact@v4", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
