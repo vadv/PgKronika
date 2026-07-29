@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, header};
+use axum::http::Request;
 use http_body_util::BodyExt as _;
 use kronika_reader::{LocalDirSnapshot, PgmUnit};
 use kronika_registry::Cell;
@@ -39,19 +39,10 @@ fn bdd_metrics_handle() -> PrometheusHandle {
         .clone()
 }
 
-/// Captured in-process response, including the transport contract.
+/// Captured in-process JSON response.
 struct WebResponse {
     status: u16,
-    headers: HeaderMap,
     body: Value,
-}
-
-impl WebResponse {
-    fn media_type(&self) -> Option<&str> {
-        self.headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-    }
 }
 
 /// One in-process request against a fresh router over `dir`.
@@ -78,7 +69,6 @@ async fn request_with_router(
         .await
         .context("route the request")?;
     let status = response.status().as_u16();
-    let headers = response.headers().clone();
     let bytes = response
         .into_body()
         .collect()
@@ -86,11 +76,7 @@ async fn request_with_router(
         .context("read the response body")?
         .to_bytes();
     let body = serde_json::from_slice(&bytes).context("parse the JSON body")?;
-    Ok(WebResponse {
-        status,
-        headers,
-        body,
-    })
+    Ok(WebResponse { status, body })
 }
 
 /// The latest collected `PostgreSQL` log status row.
