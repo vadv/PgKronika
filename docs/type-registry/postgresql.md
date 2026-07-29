@@ -1116,7 +1116,6 @@ track_wal_io_timing            bool? L
 ```text
 ts                    ts    T
 hostname              str   L
-node_self_id          str   L
 pg_version_num        i32   L
 kernel_version        str   L
 pg_system_identifier  i64?  L
@@ -1127,8 +1126,7 @@ btime                 ts    L   // /proc/stat btime
 ```
 
 `pg_system_identifier` переживает рестарты и меняется при `initdb`; `NULL`,
-если роль коллектора не может выполнить `pg_control_system()`. `node_self_id`
-берётся из `KRONIKA_NODE_SELF_ID`, по умолчанию — hostname.
+если роль коллектора не может выполнить `pg_control_system()`.
 `clock_ticks_per_sec`, `page_size_bytes`, `boot_id` и `btime` делают OS-секции
 самодостаточными: код чтения не должен знать эти значения из внешней
 конфигурации.

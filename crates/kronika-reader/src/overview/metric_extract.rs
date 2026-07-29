@@ -31,7 +31,6 @@ use crate::{PgmBodyReadStats, PgmUnit};
 const PG_STAT_DATABASE_TYPES: [u32; 4] = [1_005_001, 1_005_002, 1_005_003, 1_005_004];
 const REPLICATION_INSTANCE: u32 = 1_015_001;
 const RESET_METADATA: u32 = 1_020_001;
-const INSTANCE_METADATA: u32 = 1_021_001;
 const COLLECTION_COVERAGE: u32 = 1_023_001;
 const PG_REPLICATION_PHYSICAL: u32 = 1_033_001;
 const PG_REPLICATION_SLOT_TYPES: [u32; 3] = [1_034_001, 1_034_002, 1_034_003];
@@ -111,8 +110,6 @@ fn decoded_rows_resident_bytes(rows: &[Row], row_capacity: usize) -> Result<u64,
 struct ResetContext {
     postmaster_start_us: Option<i64>,
     database_reset_us: Option<i64>,
-    boot_id: Option<u64>,
-    boot_time_us: Option<i64>,
 }
 
 impl ResetContext {
@@ -120,8 +117,6 @@ impl ResetContext {
         Self {
             postmaster_start_us: None,
             database_reset_us: None,
-            boot_id: None,
-            boot_time_us: None,
         }
     }
 
@@ -141,26 +136,14 @@ impl ResetContext {
         ])
     }
 
-    fn os_epoch(self, sample_ts_us: i64) -> u64 {
-        epoch(&[
-            self.boot_id.unwrap_or(0).to_le_bytes(),
-            self.boot_time_us.unwrap_or(sample_ts_us).to_le_bytes(),
-        ])
-    }
-
     const fn has_pg_context(self) -> bool {
         self.postmaster_start_us.is_some()
-    }
-
-    const fn has_os_context(self) -> bool {
-        self.boot_id.is_some() && self.boot_time_us.is_some()
     }
 }
 
 #[derive(Debug, Default)]
 struct ResetTimeline {
     pg: Vec<(i64, i64, Option<i64>)>,
-    os: Vec<(i64, u64, i64)>,
 }
 
 impl ResetTimeline {
@@ -173,22 +156,11 @@ impl ResetTimeline {
             context.postmaster_start_us = Some(*postmaster_start_us);
             context.database_reset_us = database_reset_us.filter(|reset| *reset <= ts_us);
         }
-        if let Some((_context_ts, boot_id, boot_time_us)) =
-            latest_at(&self.os, ts_us, |point| point.0)
-                .or_else(|| self.os.first().filter(|point| point.2 <= ts_us))
-        {
-            context.boot_id = Some(*boot_id);
-            context.boot_time_us = Some(*boot_time_us);
-        }
         context
     }
 
     const fn has_pg_context(&self) -> bool {
         !self.pg.is_empty()
-    }
-
-    const fn has_os_context(&self) -> bool {
-        !self.os.is_empty()
     }
 }
 
@@ -451,10 +423,10 @@ pub(super) fn extract_metrics<R: ReadAt>(
                 extract_pg_database(&mut metrics, section, &reset_timeline)?;
             }
             OS_CGROUP_MEMORY => {
-                extract_cgroup_memory(&mut metrics, section, &reset_timeline)?;
+                extract_cgroup_memory(&mut metrics, section)?;
             }
             OS_VMSTAT => {
-                extract_vmstat(&mut metrics, section, &reset_timeline)?;
+                extract_vmstat(&mut metrics, section)?;
             }
             REPLICATION_INSTANCE => {
                 extract_replication_instance(&mut metrics, section)?;
@@ -471,7 +443,7 @@ pub(super) fn extract_metrics<R: ReadAt>(
             PG_PROCESS_CGROUP_MEMORY => {
                 extract_process_cgroup_memory(&mut metrics, section)?;
             }
-            RESET_METADATA | INSTANCE_METADATA | COLLECTION_COVERAGE | SNAPSHOT_COVERAGE => {}
+            RESET_METADATA | COLLECTION_COVERAGE | SNAPSHOT_COVERAGE => {}
             _ => return Err(BuildError::Internal),
         }
     }
@@ -495,22 +467,6 @@ pub(super) fn extract_metrics<R: ReadAt>(
                 .insert(LossReason::MissingResetContext);
         }
     }
-    if !reset_timeline.has_os_context() {
-        for factor in [
-            MetricFactor::OsCgroupMemoryHighEvents,
-            MetricFactor::OsCgroupMemoryMaxEvents,
-            MetricFactor::OsCgroupOomEvents,
-            MetricFactor::OsCgroupOomKills,
-            MetricFactor::OsHostOomKills,
-        ] {
-            metrics
-                .factor_losses
-                .entry(factor.id())
-                .or_default()
-                .insert(LossReason::MissingResetContext);
-        }
-    }
-
     metrics.counters.sort_unstable_by_key(|sample| {
         (
             sample.series_id().0,
@@ -692,11 +648,9 @@ fn extract_pg_database(
 fn extract_cgroup_memory(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         let ts = required_ts(row, "ts")?;
-        let context = reset.context_at(ts);
         let path = required_str_id(row, "cgroup_path")?;
         let source_scope = required_u32(row, "scope")?;
         let identity = [
@@ -731,25 +685,15 @@ fn extract_cgroup_memory(
             (MetricFactor::OsCgroupOomKills, "oom_kill"),
         ] {
             let value = required_i64(row, field)?;
-            if !context.has_os_context() {
-                out.factor_losses
-                    .entry(factor.id())
-                    .or_default()
-                    .insert(LossReason::MissingResetContext);
-            }
-            out.counter(
-                series(
-                    factor,
-                    section.type_id,
-                    MetricUnit::Count,
-                    Some(entity),
-                    Some(ResetFamily::CgroupBoot),
-                    &identity,
-                ),
-                ts,
-                value,
-                context.os_epoch(ts),
-            )?;
+            let descriptor = series(
+                factor,
+                section.type_id,
+                MetricUnit::Count,
+                Some(entity),
+                None,
+                &identity,
+            );
+            out.counter(descriptor, ts, value, series_epoch(descriptor.series_id))?;
         }
     }
     Ok(())
@@ -758,36 +702,24 @@ fn extract_cgroup_memory(
 fn extract_vmstat(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         let Some(value) = optional_i64(row, "oom_kill")? else {
             continue;
         };
         let ts = required_ts(row, "ts")?;
-        let context = reset.context_at(ts);
-        if !context.has_os_context() {
-            out.factor_losses
-                .entry(MetricFactor::OsHostOomKills.id())
-                .or_default()
-                .insert(LossReason::MissingResetContext);
-        }
         let source_scope = required_u32(row, "scope")?;
         let identity = source_scope.to_le_bytes();
         let entity = derive_entity(EntityKind::Host, &identity);
-        out.counter(
-            series(
-                MetricFactor::OsHostOomKills,
-                section.type_id,
-                MetricUnit::Count,
-                Some(entity),
-                Some(ResetFamily::HostBoot),
-                &identity,
-            ),
-            ts,
-            value,
-            context.os_epoch(ts),
-        )?;
+        let descriptor = series(
+            MetricFactor::OsHostOomKills,
+            section.type_id,
+            MetricUnit::Count,
+            Some(entity),
+            None,
+            &identity,
+        );
+        out.counter(descriptor, ts, value, series_epoch(descriptor.series_id))?;
     }
     Ok(())
 }
@@ -1002,42 +934,24 @@ fn extract_process_cgroup_memory(
 
 fn reset_timeline(sections: &[DecodedMetricSection]) -> Result<ResetTimeline, BuildError> {
     let mut pg = BTreeMap::new();
-    let mut os = BTreeMap::new();
     for section in sections {
         for row in &section.rows {
-            match section.type_id {
-                RESET_METADATA => {
-                    let ts_us = required_ts(row, "ts")?;
-                    let postmaster_start_us = required_ts(row, "postmaster_start_time")?;
-                    let database_reset_us = optional_ts(row, "pg_stat_database_reset_max_at")?;
-                    if postmaster_start_us > ts_us
-                        || database_reset_us.is_some_and(|reset| reset > ts_us)
-                    {
-                        return Err(BuildError::Source(SourceError::Corrupt));
-                    }
-                    let point = (postmaster_start_us, database_reset_us);
-                    if pg
-                        .insert(ts_us, point)
-                        .is_some_and(|previous| previous != point)
-                    {
-                        return Err(BuildError::Source(SourceError::Corrupt));
-                    }
+            if section.type_id == RESET_METADATA {
+                let ts_us = required_ts(row, "ts")?;
+                let postmaster_start_us = required_ts(row, "postmaster_start_time")?;
+                let database_reset_us = optional_ts(row, "pg_stat_database_reset_max_at")?;
+                if postmaster_start_us > ts_us
+                    || database_reset_us.is_some_and(|reset| reset > ts_us)
+                {
+                    return Err(BuildError::Source(SourceError::Corrupt));
                 }
-                INSTANCE_METADATA => {
-                    let ts_us = required_ts(row, "ts")?;
-                    let boot_time_us = required_ts(row, "btime")?;
-                    if boot_time_us > ts_us {
-                        return Err(BuildError::Source(SourceError::Corrupt));
-                    }
-                    let point = (required_str_id(row, "boot_id")?, boot_time_us);
-                    if os
-                        .insert(ts_us, point)
-                        .is_some_and(|previous| previous != point)
-                    {
-                        return Err(BuildError::Source(SourceError::Corrupt));
-                    }
+                let point = (postmaster_start_us, database_reset_us);
+                if pg
+                    .insert(ts_us, point)
+                    .is_some_and(|previous| previous != point)
+                {
+                    return Err(BuildError::Source(SourceError::Corrupt));
                 }
-                _ => {}
             }
         }
     }
@@ -1047,10 +961,6 @@ fn reset_timeline(sections: &[DecodedMetricSection]) -> Result<ResetTimeline, Bu
             .map(|(ts_us, (postmaster_start_us, database_reset_us))| {
                 (ts_us, postmaster_start_us, database_reset_us)
             })
-            .collect(),
-        os: os
-            .into_iter()
-            .map(|(ts_us, (boot_id, boot_time_us))| (ts_us, boot_id, boot_time_us))
             .collect(),
     })
 }
@@ -1615,7 +1525,6 @@ fn supported_metric_source(type_id: u32) -> bool {
             type_id,
             REPLICATION_INSTANCE
                 | RESET_METADATA
-                | INSTANCE_METADATA
                 | COLLECTION_COVERAGE
                 | PG_REPLICATION_PHYSICAL
                 | PG_PROCESS_CGROUP_MEMORY
@@ -1633,6 +1542,10 @@ fn epoch<const N: usize>(parts: &[[u8; N]]) -> u64 {
     }
     let digest = hasher.finalize();
     u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 has eight bytes"))
+}
+
+fn series_epoch(series_id: MetricSeriesId) -> u64 {
+    epoch(&[series_id.0])
 }
 
 fn cell<'a>(row: &'a Row, field: &str) -> Result<&'a Cell, BuildError> {
@@ -1763,6 +1676,56 @@ const fn exact_u64_to_f64(value: u64) -> Result<f64, BuildError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn os_counters_do_not_depend_on_instance_metadata_for_reset_semantics() {
+        use kronika_analytics::overview::{CounterInterval, Coverage, PairQuality};
+
+        assert!(!supported_metric_source(1_021_001));
+        let descriptor = series(
+            MetricFactor::OsHostOomKills,
+            OS_VMSTAT,
+            MetricUnit::Count,
+            None,
+            None,
+            &0_u32.to_le_bytes(),
+        );
+        assert_eq!(descriptor.reset_family, None);
+        let reset_epoch = series_epoch(descriptor.series_id);
+        assert_eq!(reset_epoch, series_epoch(descriptor.series_id));
+
+        let previous = CounterSample::new(
+            descriptor.series_id,
+            AlignmentId([1; 16]),
+            10,
+            10,
+            reset_epoch,
+        );
+        let decreased = CounterSample::new(
+            descriptor.series_id,
+            AlignmentId([1; 16]),
+            20,
+            1,
+            reset_epoch,
+        );
+        assert_eq!(
+            CounterInterval::classify(Some(previous), decreased, &Coverage::empty()).quality(),
+            PairQuality::Reset
+        );
+
+        let increased = CounterSample::new(
+            descriptor.series_id,
+            AlignmentId([1; 16]),
+            20,
+            11,
+            reset_epoch,
+        );
+        let gap = Coverage::from_spans(vec![CoverageSpan::new(12, 13).expect("valid gap")]);
+        assert_eq!(
+            CounterInterval::classify(Some(previous), increased, &gap).quality(),
+            PairQuality::Gap
+        );
+    }
+
     fn coverage_for(
         factor: MetricFactor,
         sources: &[u32],
@@ -1892,24 +1855,19 @@ mod tests {
     }
 
     #[test]
-    fn context_falls_forward_only_when_the_epoch_predates_the_sample() {
+    fn pg_context_falls_forward_only_when_the_epoch_predates_the_sample() {
         let timeline = ResetTimeline {
             pg: vec![(200, 50, Some(150))],
-            os: vec![(200, 7, 40)],
         };
         let context = timeline.context_at(100);
         assert_eq!(context.postmaster_start_us, Some(50));
         assert_eq!(context.database_reset_us, None);
-        assert_eq!(context.boot_id, Some(7));
-        assert_eq!(context.boot_time_us, Some(40));
 
         let restarted = ResetTimeline {
             pg: vec![(200, 150, None)],
-            os: vec![(200, 8, 150)],
         }
         .context_at(100);
         assert!(!restarted.has_pg_context());
-        assert!(!restarted.has_os_context());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::config::{Config, validate_settings_row_count};
+use crate::config::validate_settings_row_count;
 use crate::logging::{
     LogLevel, duration_ms, field, layout_id, log_collection_failure, log_collection_finish,
     log_collection_start, log_event, section_name,
@@ -84,17 +84,13 @@ pub(crate) async fn collect_service_sections(
     })
 }
 
-/// Collect a due instance fingerprint before any plan snapshot.
-///
-/// A newly opened segment must establish its instance identity before a plan
-/// row can refer to that identity at a later timestamp.
+/// Collect due factual `PostgreSQL` and host metadata.
 pub(crate) async fn collect_due_instance(
     pool: &ConnectionPool,
-    config: &Config,
     due: &DueSet,
 ) -> Result<Option<InstanceFacts>> {
     if due.has(SourceKind::InstanceMetadata) {
-        return Ok(Some(collect_instance_facts(pool.main(), config).await?));
+        return Ok(Some(collect_instance_facts(pool.main()).await?));
     }
     Ok(None)
 }
@@ -106,11 +102,10 @@ pub(crate) struct InstanceFacts {
     /// `None` when `pg_control_system()` is not executable under this role.
     pub(crate) system_identifier: Option<i64>,
     pub(crate) os: OsInstanceFacts,
-    pub(crate) node_self_id: String,
 }
 
-/// Collect the instance fingerprint; only the system identifier may degrade.
-async fn collect_instance_facts(client: &Client, config: &Config) -> Result<InstanceFacts> {
+/// Collect passive metadata; only the system identifier may degrade.
+async fn collect_instance_facts(client: &Client) -> Result<InstanceFacts> {
     let type_id = 1_021_001;
     let started = Instant::now();
     log_collection_start(type_id, "main");
@@ -141,15 +136,10 @@ async fn collect_instance_facts(client: &Client, config: &Config) -> Result<Inst
         }
     };
     let os = collect_os_instance_facts().context("collect OS instance facts")?;
-    let node_self_id = config
-        .node_self_id
-        .clone()
-        .unwrap_or_else(|| os.hostname.clone());
     let facts = InstanceFacts {
         pg,
         system_identifier,
         os,
-        node_self_id,
     };
     log_collection_finish(type_id, "main", 1, started.elapsed());
     Ok(facts)

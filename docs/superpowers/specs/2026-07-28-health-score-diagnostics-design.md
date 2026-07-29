@@ -319,7 +319,6 @@ client и models.
   "evaluation_id": "7-d7IB3CFsDt9DWiJ98rKJjT9uof8W5dTQ1OwM9ZMnE",
   "scope": {
     "kind": "instance",
-    "node_self_id": "node-7",
     "database_episode_id": null
   },
   "source_window": {
@@ -578,7 +577,6 @@ versioning. Новый смысл или новая nullable-колонка по
 
 ```text
 sampled_at
-node_self_id
 server_version_num
 server_role
 database_oid?                 # для per-database catalogs
@@ -1595,9 +1593,9 @@ Health, compare и log APIs никогда не вызывают live PostgreSQL
 visibility и population semantics. Top-N row не даёт отрицательного вывода о
 tail.
 
-Cumulative inputs требуют predecessor в том же reset/boot/catalog episode и
-используют typed diff. `stats_reset`, postmaster restart, OS boot, GUC gate,
-extension version и collection cadence входят в continuity. Gauge не
+Cumulative inputs требуют predecessor в той же серии и используют typed diff.
+Уменьшение значения, `stats_reset`, postmaster restart, GUC gate, extension
+version и collection cadence задают применимые к источнику границы. Gauge не
 вычитается.
 
 ### 7.5. Catalog change identity
@@ -1605,7 +1603,6 @@ extension version и collection cadence входят в continuity. Gauge не
 Исторический object key:
 
 ```text
-node identity
 database episode
 object class
 catalog OID

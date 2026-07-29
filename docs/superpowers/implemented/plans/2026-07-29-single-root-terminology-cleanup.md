@@ -120,7 +120,7 @@ Expected: all focused suites pass with unchanged behavior.
 **Interfaces:**
 - Preserves: closed OpenAPI schemas and exact response shapes
 - Removes: tests and prose that retain the retired field name only to assert its absence
-- Replaces: old global-namespace language with one data root, file descriptors, `node_self_id`, typed entity identity, or contract revision as appropriate
+- Replaces: old global-namespace language with one data root, file descriptors, typed entity identity, or contract revision as appropriate
 
 - [x] **Step 1: Replace negative field-name assertions**
 

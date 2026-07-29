@@ -259,8 +259,7 @@ series.
 ### 5.3. Детерминированный ключ
 
 ```text
-IncidentKeyV1 = (
-  node_self_id,
+IncidentKeyV2 = (
   incident_start_us,
   incident_end_us,
   sorted EpisodeRefV1[]
@@ -279,9 +278,8 @@ EpisodeRefV1 = (
 выбор layout последней точки был бы описательным предположением.
 
 Canonical encoding содержит version byte, variant tag, length и bytes каждого
-поля. `DefaultHasher` и process-local hash запрещены. Если `node_self_id` не
-прочитан или не разрешён, ключ не строится: ответ помечает request как
-`missing_node_identity` и не выдаёт incident с подменным id.
+поля. `DefaultHasher` и process-local hash запрещены. Ключ строится только из
+интервала и канонических ссылок на эпизоды и не зависит от служебных метаданных.
 
 Episodes сортируются по `(start_us, end_us, logical_section, column, identity)`.
 Findings сортируются по `(confidence desc, role_rank, lens_id, scope_key)`, где
@@ -557,7 +555,7 @@ Readiness задаётся по ветке линзы, а не только по
 - Cluster: epsilon/span boundaries, вложенные episodes, `max(end)`, checked
   overflow, deterministic split accounting.
 - Key: отсутствие `type_id`, canonical tags/lengths, стабильный order,
-  `Null`/unresolved rejection, missing `node_self_id`.
+  `Null`/unresolved rejection и независимость от служебных метаданных.
 - Confidence: `min(cap, evidence_ceiling)`, private high path, high-cap без
   direction, co-leads с полным порядком.
 - Work budget: каждая ось, observed/limit, `complete=false`, deterministic

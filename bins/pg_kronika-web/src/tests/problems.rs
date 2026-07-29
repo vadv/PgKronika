@@ -371,8 +371,6 @@ fn reason_example(kind: ReasonKind) -> ApiReason {
         ReasonKind::IncompleteSnapshot => ApiReason::incomplete_snapshot(),
         ReasonKind::RetentionLimit => ApiReason::retention_limit(1),
         ReasonKind::NoData => ApiReason::no_data(),
-        ReasonKind::MissingNodeIdentity => ApiReason::missing_node_identity(),
-        ReasonKind::ConflictingNodeIdentity => ApiReason::conflicting_node_identity(),
         ReasonKind::ProducerUnavailable => ApiReason::producer_unavailable(),
         ReasonKind::ProvenanceOrInputMissing => ApiReason::provenance_or_input_missing(),
         ReasonKind::CompleteProvenance => ApiReason::complete_provenance(0),

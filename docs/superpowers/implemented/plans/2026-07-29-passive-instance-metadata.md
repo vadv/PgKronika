@@ -1,8 +1,8 @@
 # Passive Instance Metadata Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
-**Goal:** Make `instance_metadata` purely informational, remove the invented node label completely, and ensure no incident or analytic result depends on the section.
+**Goal:** Make `instance_metadata` purely informational, remove the invented service identity completely, and ensure no incident or analytic result depends on the section.
 
 **Architecture:** The collector keeps one exact `instance_metadata` schema with factual PostgreSQL and OS fields only. Incident preparation, entity joins, plan continuity, and overview reset extraction stop requesting the section. Existing typed identities, snapshot provenance, reset metadata, counter decreases, and gaps remain the only analytic boundaries.
 
@@ -10,9 +10,9 @@
 
 ## Global Constraints
 
-- The current tracked tree must contain neither token assembled as `"node_self_" + "id"` and `"KRONIKA_NODE_SELF_" + "ID"`.
+- The current tracked tree must contain neither removed identifier.
 - `instance_metadata` remains type `1_021_001` with `ts`, `hostname`, `pg_version_num`, `kernel_version`, nullable `pg_system_identifier`, `clock_ticks_per_sec`, `page_size_bytes`, `boot_id`, and `btime`.
-- No legacy decoder, alias, reserved column, compatibility layout, migration reader, or replacement node identifier is added.
+- No legacy decoder, alias, reserved column, compatibility layout, migration reader, or replacement identifier is added.
 - Every selected valid payload section remains eligible for incident analysis without `instance_metadata`.
 - `instance_metadata` does not affect incident admission, keys, joins, plan continuity, metric reset epochs, coverage, or quality.
 - Resource bounds, typed entity identities, snapshot provenance, reset metadata, negative-counter reset detection, and gap detection remain enforced.
@@ -21,7 +21,7 @@
 
 ---
 
-### Task 1: Remove The Node Label From The Stored Schema
+### Task 1: Remove The Service Identity From The Stored Schema
 
 **Files:**
 - Modify: `scripts/validate-single-root-terminology.py`
@@ -41,13 +41,13 @@
 - Removes: the dedicated collector configuration input and dictionary value
 - Extends: `forbidden_terms() -> tuple[str, ...]` with the two assembled tokens
 
-- [ ] **Step 1: Extend the guard regression**
+- [x] **Step 1: Extend the guard regression**
 
 Add both assembled tokens to the guard test constants and `RETIRED_TERMS`.
 Keep every spelling split across string fragments so the tests do not violate
 their own invariant.
 
-- [ ] **Step 2: Run the guard tests to verify RED**
+- [x] **Step 2: Run the guard tests to verify RED**
 
 Run:
 
@@ -58,26 +58,26 @@ python3 -B scripts/test_validate_single_root_terminology.py
 Expected: the guard-source test fails because the validator does not yet reject
 the new tokens.
 
-- [ ] **Step 3: Extend the validator**
+- [x] **Step 3: Extend the validator**
 
 Add the same two fragment-built strings to `forbidden_terms()`. Do not special
 case paths or introduce an allow-list.
 
-- [ ] **Step 4: Remove the schema and collector field**
+- [x] **Step 4: Remove the schema and collector field**
 
 Delete the field from `InstanceMetadata`, `Config`, `InstanceFacts`, buffering,
 recovery fixtures, qualification fixtures, and collector test defaults. Remove
 the environment read and hostname fallback. Keep all remaining field types,
 column classes, order, collection schedule, and error handling unchanged.
 
-- [ ] **Step 5: Update codec and collector tests**
+- [x] **Step 5: Update codec and collector tests**
 
 Make the codec contract-shape test assert the exact remaining column list.
 Remove BDD scenarios and steps that set or inspect the deleted override while
 retaining hostname, PostgreSQL, kernel, boot, clock-tick, and page-size
 assertions.
 
-- [ ] **Step 6: Run focused checks**
+- [x] **Step 6: Run focused checks**
 
 Run:
 
@@ -106,16 +106,16 @@ Expected: the guard tests and focused schema/collector suites pass.
 **Interfaces:**
 - Produces: `IncidentKeyV2::new(start_us, end_us, members, max_bytes)`
 - Produces: `EntityJoinIndex::new(relation_limit)` and `matches(&EntityJoinKey)`
-- Removes: node-label fields from `PreparedInput`, `IncidentConfig`, and `EvalContext`
-- Removes: missing/conflicting node-label input and response states
+- Removes: service-identity fields from `PreparedInput`, `IncidentConfig`, and `EvalContext`
+- Removes: missing/conflicting service-identity input and response states
 
-- [ ] **Step 1: Write the failing route regression**
+- [x] **Step 1: Write the failing route regression**
 
 Change the incident fixture writer so it emits no `instance_metadata`. Add a
 test that writes two valid payload segments, requests one range covering both,
 and asserts that the expected incident and findings use both segments.
 
-- [ ] **Step 2: Run the route test to verify RED**
+- [x] **Step 2: Run the route test to verify RED**
 
 Run:
 
@@ -126,32 +126,32 @@ cargo test -p pg_kronika-web --lib tests::incidents --target aarch64-apple-darwi
 Expected: the route returns the current missing-identity data-quality response
 instead of incidents.
 
-- [ ] **Step 3: Remove incident input admission**
+- [x] **Step 3: Remove incident input admission**
 
 Remove `instance_metadata` from the requested logical sections. Delete the
-node-label loader, byte charging performed only for that label, prepared-input
+service-identity loader, byte charging performed only for that value, prepared-input
 field, error variants, handler branches, and problem-registry entries.
 
-- [ ] **Step 4: Replace the incident key**
+- [x] **Step 4: Replace the incident key**
 
-Rename `IncidentKeyV1` to `IncidentKeyV2`, change the version byte, and encode
+Rename the incident key type, change the version byte, and encode
 only the incident bounds and sorted `EpisodeRefV1` members. Preserve checked
 length arithmetic and both per-key and aggregate key-byte limits.
 
-- [ ] **Step 5: Remove node scope from joins**
+- [x] **Step 5: Remove service scope from joins**
 
-Delete `EntityScope`. Construct `EntityJoinIndex` from only its relation limit;
+Delete the service-scope wrapper. Construct `EntityJoinIndex` from only its relation limit;
 match only the complete `EntityJoinKey`. Update activity/lock helpers and tests
 so exact typed identity and shared-snapshot mismatches still fail while an
-unrelated node label no longer exists in the interface.
+unrelated service identity no longer exists in the interface.
 
-- [ ] **Step 6: Simplify engine configuration**
+- [x] **Step 6: Simplify engine configuration**
 
 Remove the label from production/test constructors and `EvalContext`. Keep
 clock relation, clustering, work admission, output caps, ordering, and evidence
 limits unchanged.
 
-- [ ] **Step 7: Run focused incident checks**
+- [x] **Step 7: Run focused incident checks**
 
 Run:
 
@@ -181,13 +181,13 @@ problem/OpenAPI tests pass.
 - Removes: `InstanceContext`, instance lookup/conflict maps, instance-only
   `ContinuityFailure` variants, and their quality counters
 
-- [ ] **Step 1: Write the failing plan regression**
+- [x] **Step 1: Write the failing plan regression**
 
 Remove `instance_metadata` from the plan-anomaly fixture and assert that the
 same supported anomaly remains evaluated with complete population. Assert the
 exact quality object does not contain instance-specific counters.
 
-- [ ] **Step 2: Run the plan route test to verify RED**
+- [x] **Step 2: Run the plan route test to verify RED**
 
 Run:
 
@@ -198,19 +198,19 @@ cargo test -p pg_kronika-web --lib tests::anomalies --target aarch64-apple-darwi
 Expected: continuity is currently reported as metadata-unknown or the fixture
 fails the old exact quality shape.
 
-- [ ] **Step 3: Remove the context consumer**
+- [x] **Step 3: Remove the context consumer**
 
 Delete `instance_metadata` from `PLAN_CONTEXT_SECTIONS`; remove parsing,
 conflict/gap tracking, nearest-instance lookup, major-version checks, system
 identifier checks, and the corresponding failure variants.
 
-- [ ] **Step 4: Close the new quality shape**
+- [x] **Step 4: Close the new quality shape**
 
 Remove counters produced only by the deleted checks from `QualityCounts`,
 `to_json`, completeness, BDD assertions, fixtures, and benchmark setup. Do not
 leave always-zero compatibility properties.
 
-- [ ] **Step 5: Run focused plan checks**
+- [x] **Step 5: Run focused plan checks**
 
 Run:
 
@@ -239,7 +239,7 @@ quality object contains no retired counters.
 - Preserves: negative-value rejection, value-decrease resets, gaps, work
   limits, factor inventory, units, and typed entity identity
 
-- [ ] **Step 1: Write failing reset regressions**
+- [x] **Step 1: Write failing reset regressions**
 
 Add tests proving cgroup and host OS counters:
 
@@ -252,7 +252,7 @@ known gap between increasing values => Gap
 Construct the fixtures without `instance_metadata` and assert the descriptors
 have no boot reset family or missing-reset-context loss.
 
-- [ ] **Step 2: Run focused tests to verify RED**
+- [x] **Step 2: Run focused tests to verify RED**
 
 Run:
 
@@ -263,26 +263,26 @@ cargo test -p kronika-reader --lib overview::metric_extract --target aarch64-app
 Expected: current extraction reports missing reset context and gives every
 sample a timestamp-derived epoch.
 
-- [ ] **Step 3: Remove the metadata timeline**
+- [x] **Step 3: Remove the metadata timeline**
 
 Delete the type from the supported-source allow-list and decoded reset
 sections. Remove OS boot fields and methods from `ResetContext` and
 `ResetTimeline`.
 
-- [ ] **Step 4: Emit ordinary OS counter series**
+- [x] **Step 4: Emit ordinary OS counter series**
 
 Build cgroup/host OS descriptors with `reset_family = None`. Derive the
 required stored epoch deterministically from the completed `MetricSeriesId`,
 without hostname, path, timestamp, metadata, global mutable state, or a magic
 configuration value.
 
-- [ ] **Step 5: Remove obsolete losses and expectations**
+- [x] **Step 5: Remove obsolete losses and expectations**
 
 Delete `MissingResetContext` production for the affected OS factors and update
 descriptor inventories, facts tests, golden blocks, and qualification fixtures
 to the new series identities.
 
-- [ ] **Step 6: Run focused analytics checks**
+- [x] **Step 6: Run focused analytics checks**
 
 Run:
 
@@ -309,14 +309,14 @@ Expected: metric and reader suites pass with ordinary reset/gap semantics.
 - Removes: every exact field/env spelling and every behavioral claim that
   metadata gates analysis
 
-- [ ] **Step 1: Normalize documentation and fixtures**
+- [x] **Step 1: Normalize documentation and fixtures**
 
 Describe `instance_metadata` only as passive facts. Remove retired field/env
-prose, old incident key shapes, node-scope joins, instance continuity gates,
+prose, old incident key shapes, service-scoped joins, instance continuity gates,
 boot reset-family claims, and migration-only references from active and
 implemented documents.
 
-- [ ] **Step 2: Stage and run the repository guard**
+- [x] **Step 2: Stage and run the repository guard**
 
 Run:
 
@@ -328,7 +328,7 @@ python3 -B scripts/validate-single-root-terminology.py
 
 Expected: guard tests pass and the tracked tree has no matches.
 
-- [ ] **Step 3: Run qualification and repository gates**
+- [x] **Step 3: Run qualification and repository gates**
 
 Run:
 
@@ -346,13 +346,35 @@ On macOS, record and exclude only the already-proven Linux-only
 `rename_noreplace` quarantine/recovery tests if the unfiltered workspace run
 returns `Unsupported`.
 
-- [ ] **Step 4: Complete project records**
+Observed on macOS: the unfiltered tests reproduce `Unsupported` in exactly
+these eleven Linux-only quarantine/recovery cases:
+
+```text
+root::tests::remove_quarantine_entry_frees_bytes_once_and_rechecks_identity
+rotation::tests::plan_from_a_real_scan_orders_all_victim_kinds_and_skips_foreign_temporaries
+tests::runtime::corrupt_existing_pgm_does_not_block_active_journal_recovery
+tests::runtime::corrupt_existing_pgm_does_not_block_writer_ownership
+tests::runtime::failed_recovery_seal_preserves_evidence_and_continues_empty
+tests::runtime::startup_finishes_recovery_pending_evidence_after_activation
+tests::runtime::startup_quarantines_a_torn_header_and_accepts_future_windows
+tests::runtime::startup_quarantines_only_stale_writer_temporaries
+tests::runtime::startup_recovers_a_pending_alternate_generation
+tests::runtime::startup_recovers_complete_frames_despite_a_wrong_recorded_body_length
+tests::runtime::startup_validation_quarantines_body_and_catalog_corruption
+```
+
+The filtered workspace suite passes. The terminology guard and its six tests,
+both qualification validators, formatting, strict clippy, all four focused
+Rust suites, the 77 BDD tests, the 612 Web API tests, the 450 reader tests, and
+`xtask check-deps` also pass.
+
+- [x] **Step 4: Complete project records**
 
 Mark every plan checkbox complete, record the exact verification caveat, move
 the design and plan to `implemented`, and update active/implemented counts.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
-git commit -m "refactor: удалить node identity из аналитики"
+git commit -m "refactor: сделать instance metadata пассивной"
 ```

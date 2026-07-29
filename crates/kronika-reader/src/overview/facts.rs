@@ -3391,8 +3391,8 @@ mod tests {
             MetricFactor::OsCgroupMemoryHighEvents
             | MetricFactor::OsCgroupMemoryMaxEvents
             | MetricFactor::OsCgroupOomEvents
-            | MetricFactor::OsCgroupOomKills => (MetricUnit::Count, Some(ResetFamily::CgroupBoot)),
-            MetricFactor::OsHostOomKills => (MetricUnit::Count, Some(ResetFamily::HostBoot)),
+            | MetricFactor::OsCgroupOomKills
+            | MetricFactor::OsHostOomKills => (MetricUnit::Count, None),
             MetricFactor::PgStatisticsResetAt
             | MetricFactor::PgPostmasterStartTime
             | MetricFactor::PgReplicationReplayLag => (MetricUnit::Microseconds, None),
@@ -3473,7 +3473,7 @@ mod tests {
     }
 
     #[test]
-    fn every_all_family_source_body_crc_failure_stays_a_source_error() {
+    fn every_consumed_source_body_crc_failure_stays_a_source_error() {
         let pristine = all_family_fixture().sealed_bytes();
         let catalog = PgmUnit::open(pristine.as_slice())
             .expect("open pristine all-family PGM")
@@ -3491,6 +3491,13 @@ mod tests {
             let offset = usize::try_from(entry.offset).expect("fixture source offset fits usize");
             damaged[offset] ^= 0x40;
             let unit = PgmUnit::open(damaged.as_slice()).expect("catalog remains readable");
+            if entry.type_id == 1_021_001 {
+                assert!(
+                    SegmentFacts::extract(&unit, &LIMIT).is_ok(),
+                    "passive metadata must not enter derived extraction"
+                );
+                continue;
+            }
             assert!(
                 matches!(
                     SegmentFacts::extract(&unit, &LIMIT),

@@ -30,6 +30,8 @@ def forbidden_terms() -> tuple[str, ...]:
         "source_" + "identity",
         "source " + "identity",
         "source " + "ID",
+        "node_self_" + "id",
+        "KRONIKA_NODE_SELF_" + "ID",
     )
 
 

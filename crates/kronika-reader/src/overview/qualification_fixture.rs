@@ -305,7 +305,6 @@ const fn instance_row(ts_us: i64, snapshot: u8) -> InstanceMetadata {
     InstanceMetadata {
         ts: Ts(ts_us),
         hostname: StrId(1),
-        node_self_id: StrId(2),
         pg_version_num: 18_00_00,
         kernel_version: StrId(3),
         pg_system_identifier: Some(4),

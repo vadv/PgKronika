@@ -5,7 +5,7 @@ use super::super::cluster::Cluster;
 use super::super::dispatch::{LimitHit, SectionColumn};
 use super::super::engine::EvalContext;
 use super::super::entity_join::{
-    EntityJoinIndex, EntityJoinInsert, EntityJoinKey, EntityScope, TypedEntityIdentity,
+    EntityJoinIndex, EntityJoinInsert, EntityJoinKey, TypedEntityIdentity,
 };
 use super::super::evidence::sink::FindingSink;
 use super::super::evidence::{
@@ -292,7 +292,7 @@ impl Lens for SyncReplicationWaitLens {
 /// same-snapshot, same-session `blocked_by` edge.
 pub(crate) struct InternalWaitConcentrationLens;
 
-type LockEdgeIndex<'scope> = EntityJoinIndex<'scope>;
+type LockEdgeIndex = EntityJoinIndex;
 type LockEdgeWitnesses = BTreeSet<(i64, i64, i64)>;
 
 struct WaitConcentration {
@@ -322,14 +322,13 @@ impl InternalWaitConcentrationLens {
     const MIN_SNAPSHOTS: usize = 3;
     const WAIT_FRACTION: f64 = 0.5;
 
-    fn index_lock_edges<'scope>(
+    fn index_lock_edges(
         typed: &TypedInputs,
         start: i64,
         end: i64,
-        scope: EntityScope<'scope>,
         relation_limit: usize,
-    ) -> Option<LockEdgeIndex<'scope>> {
-        let mut indexed = EntityJoinIndex::new(scope, relation_limit);
+    ) -> Option<LockEdgeIndex> {
+        let mut indexed = EntityJoinIndex::new(relation_limit);
         for snapshot in typed.lock_window(start, end) {
             if snapshot.activity_snapshot_ts != Some(snapshot.ts) {
                 continue;
@@ -363,8 +362,7 @@ impl InternalWaitConcentrationLens {
     }
 
     fn record_lock_witnesses(
-        indexed: &LockEdgeIndex<'_>,
-        scope: EntityScope<'_>,
+        indexed: &LockEdgeIndex,
         snapshot_ts: i64,
         backend: &ActivityBackend,
         witnesses: &mut LockEdgeWitnesses,
@@ -375,7 +373,7 @@ impl InternalWaitConcentrationLens {
             return false;
         };
         let key = EntityJoinKey::shared_snapshot(snapshot_ts, snapshot_ts, identity);
-        let Some(matching) = indexed.matches(scope, &key) else {
+        let Some(matching) = indexed.matches(&key) else {
             return false;
         };
         for &blocker in matching {
@@ -391,8 +389,7 @@ impl InternalWaitConcentrationLens {
         typed: &TypedInputs,
         start: i64,
         end: i64,
-        indexed: &LockEdgeIndex<'_>,
-        scope: EntityScope<'_>,
+        indexed: &LockEdgeIndex,
     ) -> WaitConcentration {
         let mut measured = WaitConcentration {
             snapshots: 0,
@@ -428,7 +425,6 @@ impl InternalWaitConcentrationLens {
                     Some("Lock")
                         if Self::record_lock_witnesses(
                             indexed,
-                            scope,
                             snapshot.ts,
                             backend,
                             &mut measured.lock_edge_witnesses,
@@ -539,21 +535,17 @@ impl Lens for InternalWaitConcentrationLens {
             return Ok(());
         }
         let (start, end) = (context.incident_start_us, context.incident_end_us);
-        let Some(scope) = context.entity_scope() else {
-            return Ok(());
-        };
         let activity_points = activity_backends_examined(typed, start, end);
         sink.charge_points(activity_points)?;
         let lock_edges = lock_edges_examined(typed, start, end);
         sink.charge_points(lock_edges)?;
         // Every activity row is the conservative ceiling for one membership probe.
         sink.charge_points(activity_points)?;
-        let Some(lock_edges_by_waiter) =
-            Self::index_lock_edges(typed, start, end, scope, lock_edges)
+        let Some(lock_edges_by_waiter) = Self::index_lock_edges(typed, start, end, lock_edges)
         else {
             return Ok(());
         };
-        let measured = Self::measure(typed, start, end, &lock_edges_by_waiter, scope);
+        let measured = Self::measure(typed, start, end, &lock_edges_by_waiter);
         Self::emit(&measured, start, end, sink)
     }
 }

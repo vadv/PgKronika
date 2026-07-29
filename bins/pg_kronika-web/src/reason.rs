@@ -21,8 +21,6 @@ closed_string_enum! {
         IncompleteSnapshot => "incomplete_snapshot",
         RetentionLimit => "retention_limit",
         NoData => "no_data",
-        MissingNodeIdentity => "missing_node_identity",
-        ConflictingNodeIdentity => "conflicting_node_identity",
         ProducerUnavailable => "producer_unavailable",
         ProvenanceOrInputMissing => "provenance_or_input_missing",
         CompleteProvenance => "complete_provenance",
@@ -167,14 +165,6 @@ impl ApiReason {
 
     pub(crate) const fn no_data() -> Self {
         Self::empty(ReasonKind::NoData)
-    }
-
-    pub(crate) const fn missing_node_identity() -> Self {
-        Self::empty(ReasonKind::MissingNodeIdentity)
-    }
-
-    pub(crate) const fn conflicting_node_identity() -> Self {
-        Self::empty(ReasonKind::ConflictingNodeIdentity)
     }
 
     pub(crate) const fn producer_unavailable() -> Self {

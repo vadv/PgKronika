@@ -742,7 +742,6 @@ impl EventFact {
         if descriptor.series_id != previous.series_id()
             || descriptor.series_id != current.series_id()
             || descriptor.unit != MetricUnit::Count
-            || descriptor.reset_family.is_none()
         {
             return Ok(None);
         }

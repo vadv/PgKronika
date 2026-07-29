@@ -25,12 +25,8 @@ pub(crate) const PLAN_DISTRIBUTION_SIGNAL_ID: &str = "pg.query.plan_distribution
 pub(crate) const PLAN_BUFFER_SIGNAL_ID: &str = "pg.plan.buffer_work_per_call_increase.v1";
 
 /// Supporting storage sections decoded once when a plan section is requested.
-pub(crate) const PLAN_CONTEXT_SECTIONS: [&str; 4] = [
-    "snapshot_coverage",
-    "collection_coverage",
-    "reset_metadata",
-    "instance_metadata",
-];
+pub(crate) const PLAN_CONTEXT_SECTIONS: [&str; 3] =
+    ["snapshot_coverage", "collection_coverage", "reset_metadata"];
 
 const OSSC_TYPE_ID: u32 = 1_003_001;
 const VADV_TYPE_ID: u32 = 1_004_001;
@@ -171,14 +167,6 @@ struct ResetContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct InstanceContext {
-    ts: i64,
-    node_self_id: Option<String>,
-    pg_version_num: Option<i64>,
-    system_identifier: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct CollectionCoverageMarker {
     total: u64,
     unknown_total: bool,
@@ -216,19 +204,16 @@ pub(crate) struct PlanContext {
     conflicting_collection_coverage: BTreeSet<(u32, i64)>,
     reset: BTreeMap<i64, ResetContext>,
     conflicting_reset: BTreeSet<i64>,
-    instance: BTreeMap<i64, InstanceContext>,
-    conflicting_instance: BTreeSet<i64>,
     extension_families_seen: BTreeSet<PlanFamily>,
     coverage_gaps: Vec<(i64, i64)>,
     collection_gaps: Vec<(i64, i64)>,
     reset_gaps: Vec<(i64, i64)>,
-    instance_gaps: Vec<(i64, i64)>,
     support_pages_incomplete: u64,
     invalid_support_rows: u64,
 }
 
 impl PlanContext {
-    /// Parse the four support pages. Missing or paged support stays explicit.
+    /// Parse the three support pages. Missing or paged support stays explicit.
     #[must_use]
     pub(crate) fn from_pages(pages: &BTreeMap<String, SectionPage>) -> Self {
         let mut context = Self::default();
@@ -250,10 +235,6 @@ impl PlanContext {
                 "reset_metadata" => {
                     context.reset_gaps = gaps(page);
                     context.parse_reset(page);
-                }
-                "instance_metadata" => {
-                    context.instance_gaps = gaps(page);
-                    context.parse_instance(page);
                 }
                 _ => unreachable!("PLAN_CONTEXT_SECTIONS is closed"),
             }
@@ -368,30 +349,6 @@ impl PlanContext {
         }
     }
 
-    fn parse_instance(&mut self, page: &SectionPage) {
-        for row in &page.rows {
-            let Some(ts) = timestamp(row, "ts") else {
-                self.invalid_support_rows += 1;
-                continue;
-            };
-            let parsed = InstanceContext {
-                ts,
-                node_self_id: text(row, "node_self_id"),
-                pg_version_num: signed(row, "pg_version_num"),
-                system_identifier: signed(row, "pg_system_identifier"),
-            };
-            match self.instance.get(&ts) {
-                Some(previous) if previous != &parsed => {
-                    self.conflicting_instance.insert(ts);
-                }
-                Some(_) => {}
-                None => {
-                    self.instance.insert(ts, parsed);
-                }
-            }
-        }
-    }
-
     fn coverage_at(&self, family: PlanFamily, ts: i64) -> Option<SnapshotCoverage> {
         (!self.conflicting_coverage.contains(&(family.type_id(), ts)))
             .then(|| {
@@ -413,40 +370,25 @@ impl PlanContext {
     }
 
     fn support_spans_gap(&self, from: i64, to: i64) -> bool {
-        [
-            &self.coverage_gaps,
-            &self.collection_gaps,
-            &self.reset_gaps,
-            &self.instance_gaps,
-        ]
-        .into_iter()
-        .any(|gaps| spans_gap(from, to, gaps))
+        [&self.coverage_gaps, &self.collection_gaps, &self.reset_gaps]
+            .into_iter()
+            .any(|gaps| spans_gap(from, to, gaps))
     }
 
     fn support_gap_ranges(&self) -> u64 {
-        [
-            &self.coverage_gaps,
-            &self.collection_gaps,
-            &self.reset_gaps,
-            &self.instance_gaps,
-        ]
-        .into_iter()
-        .map(Vec::len)
-        .fold(0_u64, |total, count| {
-            total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX))
-        })
+        [&self.coverage_gaps, &self.collection_gaps, &self.reset_gaps]
+            .into_iter()
+            .map(Vec::len)
+            .fold(0_u64, |total, count| {
+                total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX))
+            })
     }
 
-    fn metadata_conflict_between(&self, from: i64, to: i64) -> bool {
+    fn reset_conflict_between(&self, from: i64, to: i64) -> bool {
         self.conflicting_reset
             .range((Excluded(from), Included(to)))
             .next()
             .is_some()
-            || self
-                .conflicting_instance
-                .range((Excluded(from), Included(to)))
-                .next()
-                .is_some()
     }
 
     fn extension_family_seen(&self, family: PlanFamily) -> bool {
@@ -492,17 +434,6 @@ impl PlanContext {
         (!self.conflicting_reset.contains(&ts))
             .then(|| self.reset.get(&ts))
             .flatten()
-    }
-
-    fn instance_at(&self, ts: i64) -> Option<&InstanceContext> {
-        self.instance
-            .range(..=ts)
-            .next_back()
-            .filter(|(row_ts, row)| {
-                !self.conflicting_instance.contains(row_ts)
-                    && !spans_gap(row.ts, ts, &self.instance_gaps)
-            })
-            .map(|(_, row)| row)
     }
 }
 
@@ -624,7 +555,6 @@ struct QualityCounts {
     collection_coverage_missing: u64,
     collection_coverage_conflicts: u64,
     reset_metadata_conflicts: u64,
-    instance_metadata_conflicts: u64,
     invalid_rows: u64,
     membership_boundaries: u64,
     plan_set_additions: u64,
@@ -635,8 +565,6 @@ struct QualityCounts {
     support_gap_intervals: u64,
     metadata_unknown_intervals: u64,
     extension_version_boundaries: u64,
-    instance_boundaries: u64,
-    instance_identity_unavailable_intervals: u64,
     unsupported_version_intervals: u64,
     query_id_disabled_intervals: u64,
     invalid_counter_intervals: u64,
@@ -659,7 +587,6 @@ impl QualityCounts {
             "collection_coverage_missing": self.collection_coverage_missing,
             "collection_coverage_conflicts": self.collection_coverage_conflicts,
             "reset_metadata_conflicts": self.reset_metadata_conflicts,
-            "instance_metadata_conflicts": self.instance_metadata_conflicts,
             "invalid_rows": self.invalid_rows,
             "membership_boundaries": self.membership_boundaries,
             "plan_set_additions": self.plan_set_additions,
@@ -670,8 +597,6 @@ impl QualityCounts {
             "support_gap_intervals": self.support_gap_intervals,
             "metadata_unknown_intervals": self.metadata_unknown_intervals,
             "extension_version_boundaries": self.extension_version_boundaries,
-            "instance_boundaries": self.instance_boundaries,
-            "instance_identity_unavailable_intervals": self.instance_identity_unavailable_intervals,
             "unsupported_version_intervals": self.unsupported_version_intervals,
             "query_id_disabled_intervals": self.query_id_disabled_intervals,
             "invalid_counter_intervals": self.invalid_counter_intervals,
@@ -691,7 +616,6 @@ impl QualityCounts {
             && self.snapshot_coverage_conflicts == 0
             && self.collection_coverage_conflicts == 0
             && self.reset_metadata_conflicts == 0
-            && self.instance_metadata_conflicts == 0
             && self.coverage_unknown_snapshots == 0
             && self.truncated_snapshots == 0
             && self.restricted_or_failed_snapshots == 0
@@ -699,7 +623,6 @@ impl QualityCounts {
             && self.plan_gap_intervals == 0
             && self.support_gap_intervals == 0
             && self.metadata_unknown_intervals == 0
-            && self.instance_identity_unavailable_intervals == 0
             && self.unsupported_version_intervals == 0
             && self.invalid_counter_intervals == 0
     }
@@ -710,8 +633,6 @@ enum ContinuityFailure {
     MetadataUnknown,
     UnsupportedVersion,
     ExtensionVersion,
-    Instance,
-    InstanceIdentityUnavailable,
     Reset,
     QueryIdDisabled,
 }
@@ -719,7 +640,6 @@ enum ContinuityFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Continuity {
     reset_marker: &'static str,
-    instance_identity: &'static str,
 }
 
 fn continuity(
@@ -729,7 +649,7 @@ fn continuity(
     current: i64,
     require_query_id: bool,
 ) -> Result<Continuity, ContinuityFailure> {
-    if context.metadata_conflict_between(previous, current) {
+    if context.reset_conflict_between(previous, current) {
         return Err(ContinuityFailure::MetadataUnknown);
     }
     let previous_reset = context
@@ -775,46 +695,7 @@ fn continuity(
         }
     };
 
-    let previous_instance = context
-        .instance_at(previous)
-        .ok_or(ContinuityFailure::MetadataUnknown)?;
-    let current_instance = context
-        .instance_at(current)
-        .ok_or(ContinuityFailure::MetadataUnknown)?;
-    let (Some(previous_node), Some(current_node)) = (
-        previous_instance.node_self_id.as_deref(),
-        current_instance.node_self_id.as_deref(),
-    ) else {
-        return Err(ContinuityFailure::MetadataUnknown);
-    };
-    let (Some(previous_version_num), Some(current_version_num)) = (
-        previous_instance.pg_version_num,
-        current_instance.pg_version_num,
-    ) else {
-        return Err(ContinuityFailure::MetadataUnknown);
-    };
-    let previous_major = previous_version_num / 10_000;
-    let current_major = current_version_num / 10_000;
-    if !(15..=18).contains(&previous_major) || !(15..=18).contains(&current_major) {
-        return Err(ContinuityFailure::UnsupportedVersion);
-    }
-    if previous_major != current_major || previous_node != current_node {
-        return Err(ContinuityFailure::Instance);
-    }
-    let instance_identity = match (
-        previous_instance.system_identifier,
-        current_instance.system_identifier,
-    ) {
-        (Some(previous), Some(current)) if previous == current => "pg_system_identifier",
-        (None, None) => return Err(ContinuityFailure::InstanceIdentityUnavailable),
-        (Some(_) | None, Some(_)) | (Some(_), None) => {
-            return Err(ContinuityFailure::Instance);
-        }
-    };
-    Ok(Continuity {
-        reset_marker,
-        instance_identity,
-    })
+    Ok(Continuity { reset_marker })
 }
 
 const fn query_id_enabled(value: &str) -> bool {
@@ -828,10 +709,6 @@ const fn tally_continuity_failure(quality: &mut QualityCounts, failure: Continui
         ContinuityFailure::MetadataUnknown => quality.metadata_unknown_intervals += 1,
         ContinuityFailure::UnsupportedVersion => quality.unsupported_version_intervals += 1,
         ContinuityFailure::ExtensionVersion => quality.extension_version_boundaries += 1,
-        ContinuityFailure::Instance => quality.instance_boundaries += 1,
-        ContinuityFailure::InstanceIdentityUnavailable => {
-            quality.instance_identity_unavailable_intervals += 1;
-        }
         ContinuityFailure::Reset => quality.reset_boundaries += 1,
         ContinuityFailure::QueryIdDisabled => quality.query_id_disabled_intervals += 1,
     }
@@ -974,7 +851,6 @@ pub(crate) struct BufferHit {
     severity: f64,
     evidence: PerUnitEvidence,
     reset_marker: &'static str,
-    instance_identity: &'static str,
 }
 
 /// One retained specialized plan signal.
@@ -1158,7 +1034,6 @@ fn buffer_to_json(hit: &BufferHit, scan: &ScanParams) -> JsonValue {
             "complete_for_evidence": true,
             "retained_plan_continuity": "every_observed_plan_snapshot",
             "reset_marker": hit.reset_marker,
-            "instance_identity": hit.instance_identity,
             "parallelism": "extension_execution_aggregate_not_worker_normalized",
         },
         "evidence": {
@@ -1341,7 +1216,6 @@ struct PlanInterval {
     calls: CounterDelta,
     buffers: [CounterDelta; BUFFER_DIMENSIONS.len()],
     reset_marker: &'static str,
-    instance_identity: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -1537,8 +1411,6 @@ fn initial_quality(
         .unwrap_or(u64::MAX),
         reset_metadata_conflicts: u64::try_from(context.conflicting_reset.len())
             .unwrap_or(u64::MAX),
-        instance_metadata_conflicts: u64::try_from(context.conflicting_instance.len())
-            .unwrap_or(u64::MAX),
         ..QualityCounts::default()
     }
 }
@@ -1718,14 +1590,12 @@ fn build_plan_timelines(
             }
             let continuity = continuity.unwrap_or(Continuity {
                 reset_marker: "unknown",
-                instance_identity: "unknown",
             });
             intervals.push(PlanInterval {
                 ts: current_ts,
                 calls,
                 buffers,
                 reset_marker: continuity.reset_marker,
-                instance_identity: continuity.instance_identity,
             });
         }
         timelines.push(PlanTimeline {
@@ -2205,7 +2075,6 @@ struct WorkPoint {
     calls: u64,
     work: u64,
     reset_marker: &'static str,
-    instance_identity: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2216,7 +2085,6 @@ struct OpenBuffer {
     severity: f64,
     evidence: PerUnitEvidence,
     reset_marker: &'static str,
-    instance_identity: &'static str,
 }
 
 fn scan_buffers(
@@ -2245,7 +2113,6 @@ fn scan_buffers(
                             calls,
                             work,
                             reset_marker: interval.reset_marker,
-                            instance_identity: interval.instance_identity,
                         });
                     }
                     (CounterDelta::Value(_), CounterDelta::Value(_) | CounterDelta::Invalid)
@@ -2308,8 +2175,7 @@ fn scan_buffer_dimension(
             Some(PerUnitOutcome::Increase(evidence)) => {
                 result.buffers.evaluated += 1;
                 result.buffers.changed += 1;
-                let (reset_marker, instance_identity) =
-                    evidence_provenance(points, breaks, position);
+                let reset_marker = evidence_provenance(points, breaks, position);
                 let severity = per_unit_severity(&evidence, params);
                 match open.as_mut() {
                     Some(hit) => {
@@ -2319,7 +2185,6 @@ fn scan_buffer_dimension(
                             hit.severity = severity;
                             hit.evidence = evidence;
                             hit.reset_marker = reset_marker;
-                            hit.instance_identity = instance_identity;
                         }
                     }
                     None => {
@@ -2330,7 +2195,6 @@ fn scan_buffer_dimension(
                             severity,
                             evidence,
                             reset_marker,
-                            instance_identity,
                         });
                     }
                 }
@@ -2375,18 +2239,12 @@ fn aggregate_work_windows(
     Some((reference, current))
 }
 
-fn evidence_provenance(
-    points: &[WorkPoint],
-    breaks: &[i64],
-    position: i64,
-) -> (&'static str, &'static str) {
+fn evidence_provenance(points: &[WorkPoint], breaks: &[i64], position: i64) -> &'static str {
     let (segment_start, segment_end) = segment_bounds(breaks, position);
     points
         .iter()
         .find(|point| point.ts > segment_start && point.ts < segment_end)
-        .map_or(("unknown", "unknown"), |point| {
-            (point.reset_marker, point.instance_identity)
-        })
+        .map_or("unknown", |point| point.reset_marker)
 }
 
 fn per_unit_severity(evidence: &PerUnitEvidence, params: &PerUnitParams) -> f64 {
@@ -2419,7 +2277,6 @@ fn close_buffer(
             severity: open.severity,
             evidence: open.evidence,
             reset_marker: open.reset_marker,
-            instance_identity: open.instance_identity,
         }),
         signal_limit,
         result,
@@ -2510,15 +2367,6 @@ mod tests {
             );
         }
         context.extension_families_seen.insert(PlanFamily::Ossc);
-        context.instance.insert(
-            0,
-            InstanceContext {
-                ts: 0,
-                node_self_id: Some("node-a".to_owned()),
-                pg_version_num: Some(150_000),
-                system_identifier: Some(99),
-            },
-        );
         context
     }
 
@@ -2786,7 +2634,7 @@ mod tests {
     }
 
     #[test]
-    fn query_id_and_instance_applicability_fail_closed() {
+    fn query_id_applicability_fails_closed() {
         let mut context = complete_context();
         for reset in context.reset.values_mut() {
             reset.compute_query_id = Some("off".to_owned());
@@ -2807,16 +2655,6 @@ mod tests {
         assert_eq!(
             context.distribution_applicability(PlanFamily::Ossc),
             DistributionApplicability::MixedComputeQueryId
-        );
-
-        context
-            .instance
-            .get_mut(&0)
-            .expect("instance fixture")
-            .system_identifier = None;
-        assert_eq!(
-            continuity(&context, PlanFamily::Ossc, 0, 10, false),
-            Err(ContinuityFailure::InstanceIdentityUnavailable)
         );
     }
 
