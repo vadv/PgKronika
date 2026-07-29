@@ -251,7 +251,14 @@ make demo-api-smoke
 The command discovers a retained range, section, and available heatmap metric,
 then uses Schemathesis to validate one response per operation and require
 endpoint-specific evidence of data. Set `DEMO_API_URL` or
-`PG_KRONIKA_SMOKE_AUTH=user:password` when needed. This smoke is not run in CI.
+`PG_KRONIKA_SMOKE_AUTH=user:password` when needed. By default missing retained
+data fails immediately; `DEMO_API_WAIT_SECONDS` enables bounded polling.
+
+The GitHub Actions `Demo API smoke` workflow runs the same check manually for
+the revision selected at dispatch time. It builds and starts an isolated demo
+with the ordinary 15-minute collector rollover, waits up to 20 minutes for
+retained data, and always uploads the stand diagnostics. It has no automatic
+`push` or pull-request trigger.
 
 ## Query and analysis contracts
 
