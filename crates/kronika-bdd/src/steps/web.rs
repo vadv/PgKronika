@@ -91,7 +91,7 @@ async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {
         "expected PostgreSQL log parser `stderr`, got {status}"
     );
     anyhow::ensure!(
-        status["observed_at"].as_i64().is_some(),
+        status["ts"].as_i64().is_some(),
         "expected PostgreSQL log observation timestamp, got {status}"
     );
     anyhow::ensure!(
