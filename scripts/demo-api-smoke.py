@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +20,8 @@ from typing import Any
 DEFAULT_BASE_URL = "http://127.0.0.1:8688"
 DEFAULT_SCHEMATHESIS_VERSION = "4.24.3"
 MAX_SMOKE_RANGE_US = 6 * 60 * 60 * 1_000_000
+RETAINED_SEGMENT_POLL_SECONDS = 10
+SEGMENTS_QUERY = {"from": -(2**63), "to": 2**63 - 1}
 SECTION_PRIORITY = (
     "pg_stat_database",
     "pg_stat_io",
@@ -30,6 +33,22 @@ SECTION_PRIORITY = (
 
 class PreflightError(RuntimeError):
     """The running demo cannot provide a meaningful smoke-test fixture."""
+
+
+def parse_wait_seconds(raw: str | None) -> int:
+    if raw is None:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise PreflightError(
+            "DEMO_API_WAIT_SECONDS must be a non-negative integer"
+        ) from error
+    if value < 0:
+        raise PreflightError(
+            "DEMO_API_WAIT_SECONDS must be a non-negative integer"
+        )
+    return value
 
 
 def authorization_header(credentials: str | None) -> str | None:
@@ -83,6 +102,35 @@ def request_json(
         raise PreflightError(f"{path} did not return JSON: {error}") from error
 
 
+def wait_for_retained_segments(
+    base_url: str,
+    authorization: str | None,
+    wait_seconds: int,
+) -> None:
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        body = request_json(
+            base_url,
+            "/v1/segments",
+            query=SEGMENTS_QUERY,
+            authorization=authorization,
+        )
+        if body.get("segments", []):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PreflightError(
+                f"demo has no retained segments after waiting {wait_seconds} seconds"
+            )
+        delay = min(RETAINED_SEGMENT_POLL_SECONDS, remaining)
+        print(
+            f"demo has no retained segments; waiting {delay:g}s "
+            f"({remaining:g}s remaining)",
+            flush=True,
+        )
+        time.sleep(delay)
+
+
 def prepare_context(base_url: str, authorization: str | None) -> dict[str, Any]:
     health_status, _ = request(base_url, "/healthz")
     ready_status, _ = request(base_url, "/readyz")
@@ -116,7 +164,7 @@ def prepare_context(base_url: str, authorization: str | None) -> dict[str, Any]:
     segments_body = request_json(
         base_url,
         "/v1/segments",
-        query={"from": -(2**63), "to": 2**63 - 1},
+        query=SEGMENTS_QUERY,
         authorization=authorization,
     )
     segments = segments_body.get("segments", [])
@@ -192,10 +240,14 @@ def run() -> int:
     base_url = os.environ.get("DEMO_API_URL", DEFAULT_BASE_URL).rstrip("/")
     credentials = os.environ.get("PG_KRONIKA_SMOKE_AUTH")
     version = os.environ.get("SCHEMATHESIS_VERSION", DEFAULT_SCHEMATHESIS_VERSION)
+    wait_seconds = parse_wait_seconds(os.environ.get("DEMO_API_WAIT_SECONDS"))
     if shutil.which("uvx") is None:
         raise PreflightError("uvx is required; install uv before running the smoke test")
 
-    context = prepare_context(base_url, authorization_header(credentials))
+    authorization = authorization_header(credentials)
+    if wait_seconds > 0:
+        wait_for_retained_segments(base_url, authorization, wait_seconds)
+    context = prepare_context(base_url, authorization)
     print(
         "demo API smoke fixture: "
         f"range=[{context['from']}, {context['to']}), "

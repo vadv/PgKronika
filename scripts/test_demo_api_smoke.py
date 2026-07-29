@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Regression tests for the demo API smoke runner and manual workflow."""
+
+from __future__ import annotations
+
+import importlib.util
+import unittest
+from pathlib import Path
+from types import ModuleType
+from unittest import mock
+
+
+def load_script(filename: str, module_name: str) -> ModuleType:
+    path = Path(__file__).with_name(filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+SMOKE = load_script("demo-api-smoke.py", "demo_api_smoke")
+
+
+class WaitConfigurationTests(unittest.TestCase):
+    def test_absent_wait_is_zero(self) -> None:
+        self.assertEqual(SMOKE.parse_wait_seconds(None), 0)
+
+    def test_positive_wait_is_accepted(self) -> None:
+        self.assertEqual(SMOKE.parse_wait_seconds("1200"), 1200)
+
+    def test_invalid_wait_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            SMOKE.PreflightError,
+            "DEMO_API_WAIT_SECONDS must be a non-negative integer",
+        ):
+            SMOKE.parse_wait_seconds("twenty")
+
+    def test_negative_wait_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            SMOKE.PreflightError,
+            "DEMO_API_WAIT_SECONDS must be a non-negative integer",
+        ):
+            SMOKE.parse_wait_seconds("-1")
+
+
+class RetainedSegmentWaitTests(unittest.TestCase):
+    @mock.patch("time.sleep")
+    @mock.patch("time.monotonic", return_value=0.0)
+    @mock.patch.object(
+        SMOKE,
+        "request_json",
+        return_value={"segments": [{"min_ts": 1, "max_ts": 2}]},
+    )
+    def test_existing_segment_returns_without_sleep(
+        self,
+        request_json: mock.Mock,
+        _monotonic: mock.Mock,
+        sleep: mock.Mock,
+    ) -> None:
+        SMOKE.wait_for_retained_segments("http://demo", "Basic token", 1200)
+
+        sleep.assert_not_called()
+        request_json.assert_called_once_with(
+            "http://demo",
+            "/v1/segments",
+            query={"from": -(2**63), "to": 2**63 - 1},
+            authorization="Basic token",
+        )
+
+    @mock.patch("time.sleep")
+    @mock.patch("time.monotonic", side_effect=[0.0, 0.0])
+    @mock.patch.object(
+        SMOKE,
+        "request_json",
+        side_effect=[
+            {"segments": []},
+            {"segments": [{"min_ts": 1, "max_ts": 2}]},
+        ],
+    )
+    def test_empty_result_is_polled_until_a_segment_appears(
+        self,
+        request_json: mock.Mock,
+        _monotonic: mock.Mock,
+        sleep: mock.Mock,
+    ) -> None:
+        SMOKE.wait_for_retained_segments("http://demo", None, 1200)
+
+        self.assertEqual(request_json.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+    @mock.patch("time.sleep")
+    @mock.patch("time.monotonic", side_effect=[0.0, 0.0, 1200.0])
+    @mock.patch.object(SMOKE, "request_json", return_value={"segments": []})
+    def test_empty_result_fails_at_the_deadline(
+        self,
+        request_json: mock.Mock,
+        _monotonic: mock.Mock,
+        sleep: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(
+            SMOKE.PreflightError,
+            "no retained segments after waiting 1200 seconds",
+        ):
+            SMOKE.wait_for_retained_segments("http://demo", None, 1200)
+
+        self.assertEqual(request_json.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+
+if __name__ == "__main__":
+    unittest.main()
