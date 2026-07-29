@@ -427,14 +427,25 @@ git add bins/pg_kronika-web/README.md bins/pg_kronika-web/README.ru.md \
 git commit -m "docs: describe manual demo API smoke"
 ```
 
-- [ ] **Step 6: Push and dispatch hosted verification**
+- [x] **Step 6: Push the implementation branch**
 
 Run:
 
 ```bash
 git push origin feat/typed-multifile-openapi
-gh workflow run demo-api-smoke.yml --ref feat/typed-multifile-openapi
-gh run list --workflow demo-api-smoke.yml --branch feat/typed-multifile-openapi --limit 1
+```
+
+Expected: the existing pull request is updated with all implementation
+commits.
+
+- [ ] **Step 7: Dispatch hosted verification after merge**
+
+GitHub accepts `workflow_dispatch` only after the workflow file exists on the
+default branch. After this pull request is merged, run:
+
+```bash
+gh workflow run demo-api-smoke.yml --ref main
+gh run list --workflow demo-api-smoke.yml --branch main --limit 1
 ```
 
 Record the run URL. The hosted run is expected to take at least one ordinary

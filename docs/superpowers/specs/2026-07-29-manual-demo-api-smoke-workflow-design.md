@@ -133,7 +133,9 @@ upload.
 
 The existing live `make demo-api-smoke` remains the end-to-end contract test.
 The new GitHub workflow is itself the final hosted-runner validation and must
-be invoked manually after it is pushed.
+be invoked manually after the workflow file reaches the default branch.
+GitHub does not dispatch a new `workflow_dispatch` workflow while its file
+exists only on a feature branch.
 
 ## Documentation
 
