@@ -451,19 +451,16 @@ mod tests {
 
     fn key(durable_byte: u8, lineage_byte: u8) -> FallbackFactKey {
         FallbackFactKey::new(
-            FactKey::for_current_segment(
-                u64::from(durable_byte),
-                SourceDescriptor([durable_byte; 32]),
-            ),
+            FactKey::for_current_segment(SourceDescriptor([durable_byte; 32])),
             SegmentLineageId([lineage_byte; 32]),
         )
     }
 
-    fn facts(source_id: u64, min_ts_us: i64, max_ts_us: i64) -> Arc<SegmentFacts> {
+    fn facts(variant: u64, min_ts_us: i64, max_ts_us: i64) -> Arc<SegmentFacts> {
         let row = PgLogLifecycleV1 {
             ts: Ts(min_ts_us),
             kind: 2,
-            pid: None,
+            pid: Some(i32::try_from(variant).expect("test variant fits i32")),
             signal: None,
             shutdown_mode: None,
             message: None,
@@ -480,7 +477,6 @@ mod tests {
             PartMeta {
                 min_ts: min_ts_us,
                 max_ts: max_ts_us,
-                source_id,
             },
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
@@ -540,22 +536,9 @@ mod tests {
     fn complete_key_distinguishes_durable_content_and_lineage() {
         assert_ne!(key(1, 1), key(2, 1));
         assert_ne!(key(1, 1), key(1, 2));
-        let current = FactKey::derive(
-            1,
-            SourceDescriptor([1; 32]),
-            FileKind::SegmentFacts,
-            1,
-            1,
-            1,
-        );
-        let next_extractor = FactKey::derive(
-            1,
-            SourceDescriptor([1; 32]),
-            FileKind::SegmentFacts,
-            1,
-            2,
-            1,
-        );
+        let current = FactKey::derive(SourceDescriptor([1; 32]), FileKind::SegmentFacts, 1, 1, 1);
+        let next_extractor =
+            FactKey::derive(SourceDescriptor([1; 32]), FileKind::SegmentFacts, 1, 2, 1);
         assert_ne!(
             FallbackFactKey::new(current, SegmentLineageId([1; 32])),
             FallbackFactKey::new(next_extractor, SegmentLineageId([1; 32]))

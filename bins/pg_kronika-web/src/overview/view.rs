@@ -41,7 +41,7 @@ const FACT_SET_ID_DOMAIN: &[u8] = b"pgk-overview-fact-set-id-v1";
 /// The status reports the completeness of the selected retained contract, not
 /// of the physical `PostgreSQL` log, which the collector cannot prove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SourceStatus {
+pub(crate) enum TimelineStatus {
     /// The live generation is folded through its watermark; sealed set intact.
     CompleteForContract,
     /// The live state is incomplete under a hard bound; sealed set still served.
@@ -52,7 +52,7 @@ pub(crate) enum SourceStatus {
     Gap,
 }
 
-impl SourceStatus {
+impl TimelineStatus {
     /// The stable wire code of this status.
     pub(crate) const fn wire_code(self) -> &'static str {
         match self {
@@ -74,10 +74,9 @@ impl SourceStatus {
     }
 }
 
-/// Selected-source metadata retained independently from event presence.
+/// Timeline metadata retained independently from event presence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceMetadata {
-    pub(crate) source_id: u64,
+pub(crate) struct TimelineMetadata {
     pub(crate) data_through_us: Option<i64>,
     pub(crate) covered: Coverage,
     pub(crate) known_gaps: Coverage,
@@ -97,7 +96,7 @@ pub(crate) enum MetadataError {
 }
 
 #[derive(Debug)]
-struct SourceAccumulator {
+struct MetadataAccumulator {
     data_through_us: Option<i64>,
     covered: Vec<CoverageSpan>,
     known_gaps: Vec<CoverageSpan>,
@@ -142,27 +141,21 @@ impl DescriptorEntry {
     }
 }
 
-/// Descriptor-derived source identity and freshness without a fact body.
+/// Descriptor-derived freshness without loading a fact body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DescriptorSource {
-    source_id: u64,
+pub(crate) struct DescriptorFreshness {
     data_through_us: Option<i64>,
 }
 
-/// One explicit source interval omitted from a selected fact view.
+/// One explicit interval omitted from a selected fact view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct SourceGap {
-    source_id: u64,
+pub(crate) struct OmittedRange {
     span: CoverageSpan,
 }
 
-impl SourceGap {
-    pub(crate) const fn new(source_id: u64, span: CoverageSpan) -> Self {
-        Self { source_id, span }
-    }
-
-    pub(crate) const fn source_id(self) -> u64 {
-        self.source_id
+impl OmittedRange {
+    pub(crate) const fn new(span: CoverageSpan) -> Self {
+        Self { span }
     }
 
     pub(crate) const fn span(self) -> CoverageSpan {
@@ -170,18 +163,7 @@ impl SourceGap {
     }
 }
 
-impl DescriptorSource {
-    const fn unknown(source_id: u64) -> Self {
-        Self {
-            source_id,
-            data_through_us: None,
-        }
-    }
-
-    pub(crate) const fn source_id(self) -> u64 {
-        self.source_id
-    }
-
+impl DescriptorFreshness {
     pub(crate) const fn data_through_us(self) -> Option<i64> {
         self.data_through_us
     }
@@ -330,10 +312,10 @@ fn visit_intersections<T>(
 pub(crate) struct DescriptorView {
     view_generation: u64,
     sealed: Vec<DescriptorEntry>,
-    source_indices: BTreeMap<u64, IntervalIndex>,
+    sealed_index: IntervalIndex,
     unavailable: Vec<SegmentDescriptor>,
-    unavailable_source_indices: BTreeMap<u64, IntervalIndex>,
-    sources: BTreeMap<u64, DescriptorSource>,
+    unavailable_index: IntervalIndex,
+    freshness: DescriptorFreshness,
     store_data_through_us: Option<i64>,
     live: Arc<LiveView>,
     promotion: Option<PromotionCandidate>,
@@ -349,36 +331,26 @@ impl DescriptorView {
     ) -> Self {
         sealed.sort_by_key(|entry| {
             let descriptor = entry.descriptor();
-            (descriptor.source_id, descriptor.min_ts, descriptor.locator)
+            (descriptor.min_ts, descriptor.locator)
         });
-        unavailable.sort_by_key(|descriptor| {
-            (descriptor.source_id, descriptor.min_ts, descriptor.locator)
+        unavailable.sort_by_key(|descriptor| (descriptor.min_ts, descriptor.locator));
+        let sealed_index = IntervalIndex::build(&sealed, 0..sealed.len(), |entry| {
+            let descriptor = entry.descriptor();
+            (descriptor.min_ts, descriptor.max_ts)
         });
-        let sealed_source_indices = source_indices(
-            &sealed,
-            |entry| entry.descriptor().source_id,
-            |entry| {
-                let descriptor = entry.descriptor();
+        let unavailable_index =
+            IntervalIndex::build(&unavailable, 0..unavailable.len(), |descriptor| {
                 (descriptor.min_ts, descriptor.max_ts)
-            },
-        );
-        let unavailable_source_indices = source_indices(
-            &unavailable,
-            |descriptor| descriptor.source_id,
-            |descriptor| (descriptor.min_ts, descriptor.max_ts),
-        );
-        let sources = descriptor_sources(&sealed, &live);
-        let store_data_through_us = sources
-            .values()
-            .filter_map(|source| source.data_through_us)
-            .max();
+            });
+        let freshness = descriptor_freshness(&sealed, &live);
+        let store_data_through_us = freshness.data_through_us;
         Self {
             view_generation,
             sealed,
-            source_indices: sealed_source_indices,
+            sealed_index,
             unavailable,
-            unavailable_source_indices,
-            sources,
+            unavailable_index,
+            freshness,
             store_data_through_us,
             live,
             promotion,
@@ -391,29 +363,31 @@ impl DescriptorView {
 
     pub(crate) fn extend_selected_with_halo(
         &self,
-        source: u64,
         range: CoverageSpan,
         stop_after: usize,
         selected: &mut Vec<usize>,
     ) -> bool {
-        let Some(index) = self.source_indices.get(&source) else {
-            return false;
-        };
-        if index.extend_intersections(&self.sealed, range, stop_after, selected, |entry| {
-            let descriptor = entry.descriptor();
-            (descriptor.min_ts, descriptor.max_ts)
-        }) {
+        if self.sealed_index.extend_intersections(
+            &self.sealed,
+            range,
+            stop_after,
+            selected,
+            |entry| {
+                let descriptor = entry.descriptor();
+                (descriptor.min_ts, descriptor.max_ts)
+            },
+        ) {
             return true;
         }
-        let source_entries = &self.sealed[index.range.clone()];
-        let left_halo = source_entries
+        let entries = &self.sealed[self.sealed_index.range.clone()];
+        let left_halo = entries
             .iter()
             .rposition(|entry| entry.descriptor().max_ts < range.start_us())
-            .map(|offset| index.range.start + offset);
-        let right_halo = source_entries
+            .map(|offset| self.sealed_index.range.start + offset);
+        let right_halo = entries
             .iter()
             .position(|entry| entry.descriptor().min_ts >= range.end_us())
-            .map(|offset| index.range.start + offset);
+            .map(|offset| self.sealed_index.range.start + offset);
         for halo in [left_halo, right_halo].into_iter().flatten() {
             if !selected.contains(&halo) {
                 selected.push(halo);
@@ -431,28 +405,25 @@ impl DescriptorView {
         dead_code,
         reason = "retained as a constant-space probe for callers that do not need explicit gaps"
     )]
-    pub(crate) fn unavailable_intersects(&self, source: u64, range: CoverageSpan) -> bool {
-        let Some(index) = self.unavailable_source_indices.get(&source) else {
-            return false;
-        };
+    pub(crate) fn unavailable_intersects(&self, range: CoverageSpan) -> bool {
         let mut one = Vec::with_capacity(1);
-        index.extend_intersections(&self.unavailable, range, 1, &mut one, |descriptor| {
-            (descriptor.min_ts, descriptor.max_ts)
-        })
+        self.unavailable_index.extend_intersections(
+            &self.unavailable,
+            range,
+            1,
+            &mut one,
+            |descriptor| (descriptor.min_ts, descriptor.max_ts),
+        )
     }
 
     pub(crate) fn extend_unavailable_gaps(
         &self,
-        source: u64,
         range: CoverageSpan,
         stop_after: usize,
-        output: &mut Vec<SourceGap>,
+        output: &mut Vec<OmittedRange>,
     ) -> bool {
-        let Some(index) = self.unavailable_source_indices.get(&source) else {
-            return false;
-        };
         let mut intersections = Vec::new();
-        let stopped = index.extend_intersections(
+        let stopped = self.unavailable_index.extend_intersections(
             &self.unavailable,
             range,
             stop_after,
@@ -460,7 +431,7 @@ impl DescriptorView {
             |descriptor| (descriptor.min_ts, descriptor.max_ts),
         );
         output.extend(intersections.into_iter().filter_map(|index| {
-            descriptor_gap(self.unavailable[index], range).map(|span| SourceGap::new(source, span))
+            descriptor_gap(self.unavailable[index], range).map(OmittedRange::new)
         }));
         output.sort_unstable();
         output.dedup();
@@ -476,16 +447,8 @@ impl DescriptorView {
         &self.sealed
     }
 
-    pub(crate) fn sources_for(&self, requested: &[u64]) -> Vec<DescriptorSource> {
-        requested
-            .iter()
-            .map(|source| {
-                self.sources
-                    .get(source)
-                    .copied()
-                    .unwrap_or_else(|| DescriptorSource::unknown(*source))
-            })
-            .collect()
+    pub(crate) const fn freshness(&self) -> DescriptorFreshness {
+        self.freshness
     }
 
     pub(crate) const fn live(&self) -> &Arc<LiveView> {
@@ -509,68 +472,24 @@ fn descriptor_gap(descriptor: SegmentDescriptor, range: CoverageSpan) -> Option<
     CoverageSpan::new(start, end)
 }
 
-fn source_indices<T>(
-    values: &[T],
-    source_id: impl Fn(&T) -> u64,
-    span: impl Fn(&T) -> (i64, i64) + Copy,
-) -> BTreeMap<u64, IntervalIndex> {
-    let mut indices = BTreeMap::new();
-    let mut start = 0;
-    while start < values.len() {
-        let source = source_id(&values[start]);
-        let mut end = start + 1;
-        while end < values.len() && source_id(&values[end]) == source {
-            end += 1;
-        }
-        indices.insert(source, IntervalIndex::build(values, start..end, span));
-        start = end;
-    }
-    indices
-}
-
-fn descriptor_sources(
-    sealed: &[DescriptorEntry],
-    live: &LiveView,
-) -> BTreeMap<u64, DescriptorSource> {
-    let mut sources = BTreeMap::new();
-    for entry in sealed {
-        merge_descriptor_source(
-            &mut sources,
-            entry.descriptor().source_id,
-            entry.descriptor().max_ts,
-        );
-    }
+fn descriptor_freshness(sealed: &[DescriptorEntry], live: &LiveView) -> DescriptorFreshness {
+    let mut data_through_us = sealed.iter().map(|entry| entry.descriptor().max_ts).max();
     if matches!(live.state(), LiveState::Empty | LiveState::Current) {
         for facts in live.chunks() {
-            let identity = facts.identity();
-            merge_descriptor_source(
-                &mut sources,
-                identity.pgm_source_id,
-                identity.source_max_ts_us,
+            let source_max_ts_us = facts.identity().source_max_ts_us;
+            data_through_us = Some(
+                data_through_us
+                    .map_or_else(|| source_max_ts_us, |current| current.max(source_max_ts_us)),
             );
         }
     }
-    sources
-}
-
-fn merge_descriptor_source(
-    sources: &mut BTreeMap<u64, DescriptorSource>,
-    source_id: u64,
-    data_through_us: i64,
-) {
-    let source = sources
-        .entry(source_id)
-        .or_insert_with(|| DescriptorSource::unknown(source_id));
-    source.data_through_us = Some(
-        source
-            .data_through_us
-            .map_or(data_through_us, |current| current.max(data_through_us)),
-    );
+    DescriptorFreshness { data_through_us }
 }
 
 /// One sealed segment bound into an index view.
 #[derive(Debug, Clone)]
 pub(crate) struct SealedEntry {
+    #[cfg(test)]
     descriptor: SegmentDescriptor,
     facts: Arc<SegmentFacts>,
     fact_build_key: FactBuildKey,
@@ -581,7 +500,10 @@ impl SealedEntry {
     pub(crate) fn new(descriptor: SegmentDescriptor, facts: Arc<SegmentFacts>) -> Self {
         let fact_key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
         let fact_build_key = FactBuildKey::new(fact_key, facts.lineage().id());
+        #[cfg(not(test))]
+        let _ = descriptor;
         Self {
+            #[cfg(test)]
             descriptor,
             facts,
             fact_build_key,
@@ -622,10 +544,9 @@ pub(crate) struct IndexView {
     live_queryable: bool,
     coverage_envelope: Coverage,
     fact_set_id: [u8; 32],
-    source_status: SourceStatus,
-    source_descriptors: Vec<DescriptorSource>,
-    source_gaps: Vec<SourceGap>,
-    source_ids: Vec<u64>,
+    status: TimelineStatus,
+    freshness: DescriptorFreshness,
+    omitted_ranges: Vec<OmittedRange>,
     store_data_through_us: Option<i64>,
 }
 
@@ -635,7 +556,7 @@ impl IndexView {
     /// The sealed entries are expected in canonical `(min_ts, locator)` order.
     /// The live generation is included in queries only when its state is
     /// authoritative (`Empty` or `Current`); otherwise the view serves the
-    /// sealed set alone and reports the live state through [`SourceStatus`].
+    /// sealed set alone and reports the live state through [`TimelineStatus`].
     ///
     /// `sealed_gap` marks that a sealed segment could not be loaded, so the
     /// status is a source gap rather than the live state alone.
@@ -648,17 +569,14 @@ impl IndexView {
     ) -> Self {
         let live_queryable = matches!(live.state(), LiveState::Empty | LiveState::Current);
         let coverage_envelope = Self::build_envelope(&sealed, &live, live_queryable);
-        let source_status = if sealed_gap {
-            SourceStatus::Gap
+        let status = if sealed_gap {
+            TimelineStatus::Gap
         } else {
-            SourceStatus::from_live_state(live.state())
+            TimelineStatus::from_live_state(live.state())
         };
         let fact_set_id = Self::derive_fact_set_id(view_generation, &sealed, &live);
-        let source_descriptors = loaded_source_descriptors(&sealed, &live, live_queryable);
-        let store_data_through_us = source_descriptors
-            .iter()
-            .filter_map(|source| source.data_through_us())
-            .max();
+        let freshness = loaded_freshness(&sealed, &live, live_queryable);
+        let store_data_through_us = freshness.data_through_us();
         Self::new_with_id(
             view_generation,
             sealed,
@@ -666,8 +584,8 @@ impl IndexView {
             live_queryable,
             coverage_envelope,
             fact_set_id,
-            source_status,
-            source_descriptors,
+            status,
+            freshness,
             Vec::new(),
             store_data_through_us,
         )
@@ -676,18 +594,18 @@ impl IndexView {
     pub(crate) fn from_selected(
         view: &DescriptorView,
         sealed: Vec<SealedEntry>,
-        source_gaps: Vec<SourceGap>,
+        omitted_ranges: Vec<OmittedRange>,
         fact_set_id: [u8; 32],
-        source_descriptors: Vec<DescriptorSource>,
+        freshness: DescriptorFreshness,
         store_data_through_us: Option<i64>,
     ) -> Self {
         let live = Arc::clone(view.live());
         let live_queryable = matches!(live.state(), LiveState::Empty | LiveState::Current);
         let coverage_envelope = Self::build_envelope(&sealed, &live, live_queryable);
-        let source_status = if source_gaps.is_empty() {
-            SourceStatus::from_live_state(live.state())
+        let status = if omitted_ranges.is_empty() {
+            TimelineStatus::from_live_state(live.state())
         } else {
-            SourceStatus::Gap
+            TimelineStatus::Gap
         };
         Self::new_with_id(
             view.view_generation(),
@@ -696,9 +614,9 @@ impl IndexView {
             live_queryable,
             coverage_envelope,
             fact_set_id,
-            source_status,
-            source_descriptors,
-            source_gaps,
+            status,
+            freshness,
+            omitted_ranges,
             store_data_through_us,
         )
     }
@@ -707,22 +625,18 @@ impl IndexView {
         clippy::too_many_arguments,
         reason = "the constructor binds every immutable axis of one selected fact view"
     )]
-    fn new_with_id(
+    const fn new_with_id(
         view_generation: u64,
         sealed: Vec<SealedEntry>,
         live: Arc<LiveView>,
         live_queryable: bool,
         coverage_envelope: Coverage,
         fact_set_id: [u8; 32],
-        source_status: SourceStatus,
-        source_descriptors: Vec<DescriptorSource>,
-        source_gaps: Vec<SourceGap>,
+        status: TimelineStatus,
+        freshness: DescriptorFreshness,
+        omitted_ranges: Vec<OmittedRange>,
         store_data_through_us: Option<i64>,
     ) -> Self {
-        let source_ids = source_descriptors
-            .iter()
-            .map(|source| source.source_id())
-            .collect();
         Self {
             view_generation,
             sealed,
@@ -730,10 +644,9 @@ impl IndexView {
             live_queryable,
             coverage_envelope,
             fact_set_id,
-            source_status,
-            source_descriptors,
-            source_gaps,
-            source_ids,
+            status,
+            freshness,
+            omitted_ranges,
             store_data_through_us,
         }
     }
@@ -748,17 +661,12 @@ impl IndexView {
         self.fact_set_id
     }
 
-    /// The source-completeness status for the wire contract.
-    pub(crate) const fn source_status(&self) -> SourceStatus {
-        self.source_status
+    /// The completeness status for the wire contract.
+    pub(crate) const fn status(&self) -> TimelineStatus {
+        self.status
     }
 
-    /// Canonical numeric PGM source IDs represented by this view.
-    pub(crate) fn source_ids(&self) -> &[u64] {
-        &self.source_ids
-    }
-
-    /// The precomputed union coverage of the queried sources.
+    /// The precomputed union coverage of the queried root.
     pub(crate) const fn coverage_envelope(&self) -> &Coverage {
         &self.coverage_envelope
     }
@@ -768,69 +676,33 @@ impl IndexView {
         self.store_data_through_us
     }
 
-    /// Latest selected sealed/live timestamp.
-    pub(crate) fn data_through_us_for(&self, sources: &[u64]) -> Option<i64> {
-        self.source_descriptors
-            .iter()
-            .filter(|source| source_selected(sources, source.source_id()))
-            .filter_map(|source| source.data_through_us())
-            .max()
+    /// Incomplete active-journal byte range.
+    pub(crate) fn live_tail_pending(&self) -> Option<kronika_reader::ByteRange> {
+        self.live.tail_pending()
     }
 
-    /// Incomplete active-journal byte range for the selected live source.
-    pub(crate) fn live_tail_pending_for(
-        &self,
-        sources: &[u64],
-    ) -> Option<kronika_reader::ByteRange> {
-        self.live
-            .source_id()
-            .filter(|source| sources.binary_search(source).is_ok())
-            .and_then(|_| self.live.tail_pending())
-    }
-
-    /// Returns sorted, range-clipped metadata for every requested source.
-    ///
-    /// An unknown source remains explicit with unknown quality instead of
-    /// becoming an exact empty result.
+    /// Returns bounded, range-clipped metadata for the configured root.
     #[allow(
         clippy::too_many_lines,
         reason = "all independent quality axes must be folded in the same bounded fact pass"
     )]
-    pub(crate) fn selected_source_metadata(
+    pub(crate) fn metadata(
         &self,
-        sources: &[u64],
         range: CoverageSpan,
         max_spans: usize,
-    ) -> Result<Vec<SourceMetadata>, MetadataError> {
-        let mut selected = sources
-            .iter()
-            .map(|source_id| {
-                let source = self
-                    .source_descriptors
-                    .iter()
-                    .find(|source| source.source_id() == *source_id)
-                    .copied()
-                    .unwrap_or_else(|| DescriptorSource::unknown(*source_id));
-                (
-                    *source_id,
-                    SourceAccumulator {
-                        data_through_us: source.data_through_us(),
-                        covered: Vec::new(),
-                        known_gaps: Vec::new(),
-                        source_completeness: None,
-                        retained_exactness: None,
-                        physical_count: None,
-                        dropped_lower_bound: None,
-                        dropped_count_unavailable: false,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+    ) -> Result<TimelineMetadata, MetadataError> {
+        let mut accumulator = MetadataAccumulator {
+            data_through_us: self.freshness.data_through_us(),
+            covered: Vec::new(),
+            known_gaps: Vec::new(),
+            source_completeness: None,
+            retained_exactness: None,
+            physical_count: None,
+            dropped_lower_bound: None,
+            dropped_count_unavailable: false,
+        };
         let mut remaining_spans = max_spans;
-        for gap in &self.source_gaps {
-            let Some(accumulator) = selected.get_mut(&gap.source_id()) else {
-                continue;
-            };
+        for gap in &self.omitted_ranges {
             if remaining_spans == 0 {
                 return Err(MetadataError::SpanLimitExceeded);
             }
@@ -840,9 +712,6 @@ impl IndexView {
         }
         for facts in self.queryable_facts() {
             let identity = facts.identity();
-            let Some(accumulator) = selected.get_mut(&identity.pgm_source_id) else {
-                continue;
-            };
             accumulator.data_through_us = Some(
                 accumulator
                     .data_through_us
@@ -895,31 +764,26 @@ impl IndexView {
                 );
             }
         }
-        Ok(selected
-            .into_iter()
-            .map(|(source_id, accumulator)| SourceMetadata {
-                source_id,
-                data_through_us: accumulator.data_through_us,
-                covered: Coverage::from_spans(accumulator.covered),
-                known_gaps: Coverage::from_spans(accumulator.known_gaps),
-                source_completeness: accumulator
-                    .source_completeness
-                    .unwrap_or(SourceCompleteness::Unknown),
-                retained_exactness: accumulator
-                    .retained_exactness
-                    .unwrap_or(RetainedExactness::Unknown),
-                physical_count: accumulator
-                    .physical_count
-                    .unwrap_or(PhysicalCountSemantics::NotApplicable),
-                dropped_lower_bound: accumulator.dropped_lower_bound,
-            })
-            .collect())
+        Ok(TimelineMetadata {
+            data_through_us: accumulator.data_through_us,
+            covered: Coverage::from_spans(accumulator.covered),
+            known_gaps: Coverage::from_spans(accumulator.known_gaps),
+            source_completeness: accumulator
+                .source_completeness
+                .unwrap_or(SourceCompleteness::Unknown),
+            retained_exactness: accumulator
+                .retained_exactness
+                .unwrap_or(RetainedExactness::Unknown),
+            physical_count: accumulator
+                .physical_count
+                .unwrap_or(PhysicalCountSemantics::NotApplicable),
+            dropped_lower_bound: accumulator.dropped_lower_bound,
+        })
     }
 
-    /// Queries only the canonical selected source set.
-    pub(crate) fn query_sources(
+    /// Queries the canonical configured root.
+    pub(crate) fn query_range(
         &self,
-        sources: &[u64],
         range: CoverageSpan,
         limits: OracleLimits,
         max_materialized_bytes: usize,
@@ -927,25 +791,21 @@ impl IndexView {
         let sealed_observations = self
             .sealed
             .iter()
-            .filter(|entry| source_selected(sources, entry.descriptor.source_id))
             .flat_map(|entry| entry.facts().observations());
         let sealed_spans = self
             .sealed
             .iter()
-            .filter(|entry| source_selected(sources, entry.descriptor.source_id))
             .flat_map(|entry| entry.facts().coverage().spans().iter().copied());
         if self.live_queryable {
             let live_observations = self
                 .live
                 .chunks()
                 .iter()
-                .filter(|facts| source_selected(sources, facts.identity().pgm_source_id))
                 .flat_map(|facts| facts.observations());
             let live_spans = self
                 .live
                 .chunks()
                 .iter()
-                .filter(|facts| source_selected(sources, facts.identity().pgm_source_id))
                 .flat_map(|facts| facts.coverage().spans().iter().copied());
             query_bounded_materialized(
                 sealed_observations.chain(live_observations),
@@ -976,7 +836,6 @@ impl IndexView {
     )]
     pub(crate) fn query_canonical_facts(
         &self,
-        sources: &[u64],
         range: CoverageSpan,
         max_facts: usize,
         max_samples: usize,
@@ -988,32 +847,18 @@ impl IndexView {
             BTreeMap::<MetricSeriesId, (MetricSeriesDescriptor, Vec<EntityStateRecord>)>::new();
         let mut gauge_series =
             BTreeMap::<MetricSeriesId, (MetricSeriesDescriptor, Vec<GaugeSample>)>::new();
-        let mut gaps = BTreeMap::<u64, Coverage>::new();
+        let mut gaps =
+            Coverage::from_spans(self.omitted_ranges.iter().map(|gap| gap.span()).collect());
         let mut materialized_samples = 0_usize;
 
-        for gap in &self.source_gaps {
-            gaps.entry(gap.source_id())
-                .and_modify(|coverage| {
-                    *coverage = coverage.union(&Coverage::from_spans(vec![gap.span()]));
-                })
-                .or_insert_with(|| Coverage::from_spans(vec![gap.span()]));
-        }
-
-        for segment in self
-            .queryable_facts()
-            .filter(|facts| source_selected(sources, facts.identity().pgm_source_id))
-        {
+        for segment in self.queryable_facts() {
             for fact in segment.event_facts().iter().filter(|fact| {
                 fact.interval().start_us() < range.end_us()
                     && fact.interval().end_us() > range.start_us()
             }) {
                 insert_canonical_fact(&mut facts, fact.clone(), max_facts)?;
             }
-            gaps.entry(segment.identity().pgm_source_id)
-                .and_modify(|coverage| {
-                    *coverage = coverage.union(segment.loss_coverage().known_gaps());
-                })
-                .or_insert_with(|| segment.loss_coverage().known_gaps().clone());
+            gaps = gaps.union(segment.loss_coverage().known_gaps());
             for descriptor in segment.counter_samples().series() {
                 let entry = counter_series
                     .entry(descriptor.series_id)
@@ -1108,16 +953,13 @@ impl IndexView {
             {
                 return Err(CanonicalFactQueryError::ContradictoryFacts);
             }
-            let known_gaps = gaps
-                .get(&descriptor.source_id)
-                .cloned()
-                .unwrap_or_else(Coverage::empty);
+            let known_gaps = &gaps;
             for pair in samples.windows(2) {
                 if pair[1].ts_us() < range.start_us() || pair[1].ts_us() >= range.end_us() {
                     continue;
                 }
                 if let Some(fact) =
-                    CanonicalEventFact::from_counter_pair(descriptor, pair[0], pair[1], &known_gaps)
+                    CanonicalEventFact::from_counter_pair(descriptor, pair[0], pair[1], known_gaps)
                         .map_err(|_error| CanonicalFactQueryError::ContradictoryFacts)?
                 {
                     insert_canonical_fact(&mut facts, fact, max_facts)?;
@@ -1140,10 +982,7 @@ impl IndexView {
             {
                 return Err(CanonicalFactQueryError::ContradictoryFacts);
             }
-            let known_gaps = gaps
-                .get(&descriptor.source_id)
-                .cloned()
-                .unwrap_or_else(Coverage::empty);
+            let known_gaps = &gaps;
             for pair in samples.windows(2) {
                 if pair[1].ts_us() < range.start_us()
                     || pair[1].ts_us() >= range.end_us()
@@ -1175,10 +1014,7 @@ impl IndexView {
             {
                 return Err(CanonicalFactQueryError::ContradictoryFacts);
             }
-            let known_gaps = gaps
-                .get(&descriptor.source_id)
-                .cloned()
-                .unwrap_or_else(Coverage::empty);
+            let known_gaps = &gaps;
             for pair in records.windows(2) {
                 if pair[1].ts_us < range.start_us() || pair[1].ts_us >= range.end_us() {
                     continue;
@@ -1247,17 +1083,14 @@ impl IndexView {
                 && current_available.ts_us() >= range.start_us()
                 && current_available.ts_us() < range.end_us()
             {
-                let known_gaps = gaps
-                    .get(&available_descriptor.source_id)
-                    .cloned()
-                    .unwrap_or_else(Coverage::empty);
+                let known_gaps = &gaps;
                 if let Some(fact) = CanonicalEventFact::from_capacity_zero_transition(
                     *total_descriptor,
                     *total,
                     available_descriptor,
                     previous_available,
                     current_available,
-                    &known_gaps,
+                    known_gaps,
                 )
                 .map_err(|_error| CanonicalFactQueryError::ContradictoryFacts)?
                 {
@@ -1274,15 +1107,11 @@ impl IndexView {
     /// Returns bounded factor coverage records intersecting a query interval.
     pub(crate) fn query_factor_coverage(
         &self,
-        sources: &[u64],
         range: CoverageSpan,
         max_records: usize,
     ) -> Result<Vec<FactorCoverage>, CanonicalFactQueryError> {
         let mut coverage = Vec::new();
-        for segment in self
-            .queryable_facts()
-            .filter(|facts| source_selected(sources, facts.identity().pgm_source_id))
-        {
+        for segment in self.queryable_facts() {
             for record in segment
                 .loss_coverage()
                 .factor_coverage()
@@ -1311,7 +1140,7 @@ impl IndexView {
     /// Checked logical resident charge retained while a cursor pins this view.
     ///
     /// The charge includes reserved container slots, `Arc` counters, sealed and
-    /// live fact allocations, coverage, and source IDs. It returns `None`
+    /// live fact allocations, coverage, freshness, and omitted ranges. It returns `None`
     /// instead of saturating if a platform-sized total cannot be represented.
     pub(crate) fn resident_bytes(&self) -> Option<usize> {
         const ARC_COUNTER_BYTES: usize = 2 * size_of::<usize>();
@@ -1326,15 +1155,10 @@ impl IndexView {
                 .checked_add(entry.facts().resident_bytes()?)
         })?;
         let coverage = self.coverage_envelope().resident_heap_bytes()?;
-        let sources = self.source_ids.capacity().checked_mul(size_of::<u64>())?;
-        let source_descriptors = self
-            .source_descriptors
+        let omitted_ranges = self
+            .omitted_ranges
             .capacity()
-            .checked_mul(size_of::<DescriptorSource>())?;
-        let source_gaps = self
-            .source_gaps
-            .capacity()
-            .checked_mul(size_of::<SourceGap>())?;
+            .checked_mul(size_of::<OmittedRange>())?;
 
         size_of::<Self>()
             .checked_add(ARC_COUNTER_BYTES)?
@@ -1343,9 +1167,7 @@ impl IndexView {
             .checked_add(ARC_COUNTER_BYTES)?
             .checked_add(self.live.resident_bytes()?)?
             .checked_add(coverage)?
-            .checked_add(sources)?
-            .checked_add(source_descriptors)?
-            .checked_add(source_gaps)
+            .checked_add(omitted_ranges)
     }
 
     fn build_envelope(sealed: &[SealedEntry], live: &LiveView, live_queryable: bool) -> Coverage {
@@ -1372,7 +1194,6 @@ impl IndexView {
         hasher.update(sealed_count.to_le_bytes());
         for entry in sealed {
             hasher.update(entry.descriptor.locator.as_bytes());
-            hasher.update(entry.descriptor.source_id.to_le_bytes());
             hasher.update(entry.fact_build_key.fact_key().as_bytes());
         }
         hasher.update(live.generation().0.to_le_bytes());
@@ -1394,31 +1215,31 @@ impl IndexView {
 }
 
 #[cfg(test)]
-fn loaded_source_descriptors(
+fn loaded_freshness(
     sealed: &[SealedEntry],
     live: &LiveView,
     live_queryable: bool,
-) -> Vec<DescriptorSource> {
-    let mut sources = BTreeMap::new();
+) -> DescriptorFreshness {
+    let mut data_through_us = None;
     for entry in sealed {
         let identity = entry.facts().identity();
-        merge_descriptor_source(
-            &mut sources,
-            identity.pgm_source_id,
-            identity.source_max_ts_us,
+        data_through_us = Some(
+            data_through_us.map_or(identity.source_max_ts_us, |current: i64| {
+                current.max(identity.source_max_ts_us)
+            }),
         );
     }
     if live_queryable {
         for facts in live.chunks() {
             let identity = facts.identity();
-            merge_descriptor_source(
-                &mut sources,
-                identity.pgm_source_id,
-                identity.source_max_ts_us,
+            data_through_us = Some(
+                data_through_us.map_or(identity.source_max_ts_us, |current| {
+                    current.max(identity.source_max_ts_us)
+                }),
             );
         }
     }
-    sources.into_values().collect()
+    DescriptorFreshness { data_through_us }
 }
 
 impl RawOracle for IndexView {
@@ -1452,19 +1273,18 @@ impl RawOracle for IndexView {
 
 fn derive_sender_disappearances(
     states: &BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, Vec<EntityStateRecord>)>,
-    gaps: &BTreeMap<u64, Coverage>,
+    gaps: &Coverage,
     range: CoverageSpan,
     max_facts: usize,
     facts: &mut BTreeMap<FactId, CanonicalEventFact>,
 ) -> Result<(), CanonicalFactQueryError> {
-    let mut boundaries =
-        BTreeMap::<(u64, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
+    let mut boundaries = BTreeMap::<u32, Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
     let mut snapshots = SenderSnapshots::new();
     for (descriptor, records) in states.values() {
         for record in records {
             match MetricFactor::from_id(descriptor.factor_id) {
                 Some(MetricFactor::PgReplicationSenderSnapshotPopulation) => boundaries
-                    .entry((descriptor.source_id, descriptor.source_type_id))
+                    .entry(descriptor.section_type_id)
                     .or_default()
                     .push((*descriptor, *record)),
                 Some(MetricFactor::PgReplicationSenderState) => {
@@ -1474,7 +1294,7 @@ fn derive_sender_disappearances(
             }
         }
     }
-    for ((source_id, source_type), source_boundaries) in &mut boundaries {
+    for (section_type_id, source_boundaries) in &mut boundaries {
         source_boundaries.sort_unstable_by_key(|(_descriptor, record)| record.ts_us);
         if source_boundaries
             .windows(2)
@@ -1489,21 +1309,18 @@ fn derive_sender_disappearances(
                 || current.ts_us >= range.end_us()
                 || previous_descriptor.series_id != current_descriptor.series_id
                 || gaps
-                    .get(&current_descriptor.source_id)
-                    .is_some_and(|known| {
-                        known.spans().iter().any(|gap| {
-                            gap.start_us() < current.ts_us && gap.end_us() > previous.ts_us
-                        })
-                    })
+                    .spans()
+                    .iter()
+                    .any(|gap| gap.start_us() < current.ts_us && gap.end_us() > previous.ts_us)
             {
                 continue;
             }
             let empty = BTreeMap::new();
             let previous_entities = snapshots
-                .get(&(*source_id, *source_type, previous.ts_us))
+                .get(&(*section_type_id, previous.ts_us))
                 .unwrap_or(&empty);
             let current_entities = snapshots
-                .get(&(*source_id, *source_type, current.ts_us))
+                .get(&(*section_type_id, current.ts_us))
                 .unwrap_or(&empty);
             let current_sample = GaugeSample::new(
                 current_descriptor.series_id,
@@ -1533,10 +1350,8 @@ fn derive_sender_disappearances(
     Ok(())
 }
 
-type SenderSnapshots = BTreeMap<
-    (u64, u32, i64),
-    BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
->;
+type SenderSnapshots =
+    BTreeMap<(u32, i64), BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>>;
 
 fn insert_sender_snapshot(
     snapshots: &mut SenderSnapshots,
@@ -1544,11 +1359,7 @@ fn insert_sender_snapshot(
     record: EntityStateRecord,
 ) -> Result<(), CanonicalFactQueryError> {
     if snapshots
-        .entry((
-            descriptor.source_id,
-            descriptor.source_type_id,
-            record.ts_us,
-        ))
+        .entry((descriptor.section_type_id, record.ts_us))
         .or_default()
         .insert(descriptor.series_id, (descriptor, record))
         .is_some()
@@ -1576,10 +1387,6 @@ fn insert_canonical_fact(
         std::collections::btree_map::Entry::Occupied(_) => {}
     }
     Ok(())
-}
-
-fn source_selected(sources: &[u64], source: u64) -> bool {
-    sources.binary_search(&source).is_ok()
 }
 
 const fn merge_source_completeness(
@@ -1698,10 +1505,6 @@ mod tests {
     }
 
     fn sealed_bytes(min_ts: i64, max_ts: i64) -> Vec<u8> {
-        sealed_bytes_for_source(min_ts, max_ts, 7)
-    }
-
-    fn sealed_bytes_for_source(min_ts: i64, max_ts: i64, source_id: u64) -> Vec<u8> {
         let body = BgwriterCheckpointer::encode(&[bgwriter_row(min_ts)]).expect("encode section");
         build_part(
             &[SectionInput {
@@ -1709,26 +1512,12 @@ mod tests {
                 rows: 1,
                 body: &body,
             }],
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id,
-            },
+            PartMeta { min_ts, max_ts },
         )
     }
 
     fn sealed_entry(file: &str, min_ts: i64, max_ts: i64) -> SealedEntry {
         let bytes = sealed_bytes(min_ts, max_ts);
-        sealed_entry_from_bytes(file, &bytes)
-    }
-
-    fn sealed_entry_for_source(
-        file: &str,
-        min_ts: i64,
-        max_ts: i64,
-        source_id: u64,
-    ) -> SealedEntry {
-        let bytes = sealed_bytes_for_source(min_ts, max_ts, source_id);
         sealed_entry_from_bytes(file, &bytes)
     }
 
@@ -1793,7 +1582,7 @@ mod tests {
         let view = IndexView::new(1, Vec::new(), live, false);
         let result = view.query(full_span(), LIMITS).expect("query empty view");
         assert!(result.observations().is_empty());
-        assert_eq!(view.source_status(), SourceStatus::CompleteForContract);
+        assert_eq!(view.status(), TimelineStatus::CompleteForContract);
         let again = IndexView::new(1, Vec::new(), empty_live(), false);
         assert_eq!(
             view.fact_set_id(),
@@ -1834,7 +1623,6 @@ mod tests {
         assert_eq!(
             crate::overview::selection::SelectedSealedPlan::build(
                 Arc::clone(&view),
-                &[7],
                 CoverageSpan::new(0, 10_000).expect("span"),
                 4,
             )
@@ -1846,7 +1634,6 @@ mod tests {
         assert_eq!(
             crate::overview::selection::SelectedSealedPlan::build(
                 Arc::clone(&view),
-                &[7],
                 CoverageSpan::new(0, 2_500).expect("span"),
                 4,
             )
@@ -1858,7 +1645,6 @@ mod tests {
         assert_eq!(
             crate::overview::selection::SelectedSealedPlan::build(
                 view,
-                &[7],
                 CoverageSpan::new(3_000, 4_000).expect("span"),
                 4,
             )
@@ -1897,7 +1683,7 @@ mod tests {
     #[test]
     fn a_warming_live_view_is_excluded_and_reported() {
         let view = IndexView::new(1, Vec::new(), warming_live(), false);
-        assert_eq!(view.source_status(), SourceStatus::Warming);
+        assert_eq!(view.status(), TimelineStatus::Warming);
         assert_eq!(view.data_through_us(), None);
         // A warming live view is unqueryable on its own; the merged view still
         // answers (over the empty sealed set) rather than propagating the error.
@@ -1914,68 +1700,54 @@ mod tests {
     }
 
     #[test]
-    fn selected_metadata_is_source_and_range_scoped() {
+    fn metadata_is_range_scoped() {
         let view = IndexView::new(
             3,
             vec![
-                sealed_entry_for_source("source-7.pgm", 1_000, 2_000, 7),
-                sealed_entry_for_source("source-8.pgm", 3_000, 4_000, 8),
+                sealed_entry("early.pgm", 1_000, 2_000),
+                sealed_entry("late.pgm", 3_000, 4_000),
             ],
             empty_live(),
             false,
         );
         let range = CoverageSpan::new(900, 2_100).expect("range");
-        let selected = view
-            .selected_source_metadata(&[7], range, 16)
-            .expect("selected metadata");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].source_id, 7);
-        assert_eq!(selected[0].data_through_us, Some(2_000));
-        assert!(!selected[0].covered.is_empty());
+        let selected = view.metadata(range, 16).expect("metadata");
+        assert_eq!(selected.data_through_us, Some(4_000));
+        assert!(!selected.covered.is_empty());
         assert_eq!(
-            selected[0].source_completeness,
+            selected.source_completeness,
             SourceCompleteness::BoundedSubset
         );
-        assert_eq!(selected[0].retained_exactness, RetainedExactness::Exact);
-        assert_eq!(
-            selected[0].physical_count,
-            PhysicalCountSemantics::LowerBound
-        );
+        assert_eq!(selected.retained_exactness, RetainedExactness::Exact);
+        assert_eq!(selected.physical_count, PhysicalCountSemantics::LowerBound);
     }
 
     #[test]
-    fn unknown_and_disjoint_sources_do_not_invent_exact_zero_loss() {
+    fn a_disjoint_range_does_not_invent_exact_zero_loss() {
         let view = IndexView::new(
             3,
-            vec![sealed_entry("source-7.pgm", 1_000, 2_000)],
+            vec![sealed_entry("segment.pgm", 1_000, 2_000)],
             empty_live(),
             false,
         );
-        let unknown = view
-            .selected_source_metadata(&[999], CoverageSpan::new(0, 10_000).expect("range"), 16)
-            .expect("unknown metadata");
-        assert_eq!(unknown[0].data_through_us, None);
-        assert_eq!(unknown[0].source_completeness, SourceCompleteness::Unknown);
-        assert_eq!(unknown[0].dropped_lower_bound, None);
-
         let disjoint = view
-            .selected_source_metadata(&[7], CoverageSpan::new(10_000, 20_000).expect("range"), 16)
+            .metadata(CoverageSpan::new(10_000, 20_000).expect("range"), 16)
             .expect("disjoint metadata");
-        assert_eq!(disjoint[0].data_through_us, Some(2_000));
-        assert_eq!(disjoint[0].retained_exactness, RetainedExactness::Unknown);
-        assert_eq!(disjoint[0].dropped_lower_bound, None);
+        assert_eq!(disjoint.data_through_us, Some(2_000));
+        assert_eq!(disjoint.retained_exactness, RetainedExactness::Unknown);
+        assert_eq!(disjoint.dropped_lower_bound, None);
     }
 
     #[test]
     fn selected_metadata_enforces_its_span_budget_before_retaining() {
         let view = IndexView::new(
             3,
-            vec![sealed_entry("source-7.pgm", 1_000, 2_000)],
+            vec![sealed_entry("segment.pgm", 1_000, 2_000)],
             empty_live(),
             false,
         );
         assert_eq!(
-            view.selected_source_metadata(&[7], CoverageSpan::new(0, 10_000).expect("range"), 0,),
+            view.metadata(CoverageSpan::new(0, 10_000).expect("range"), 0),
             Err(MetadataError::SpanLimitExceeded)
         );
     }

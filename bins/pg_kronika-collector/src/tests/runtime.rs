@@ -208,7 +208,7 @@ fn activity_window_at(ts: i64) -> Vec<u8> {
     .expect("push interns and buffers");
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part")
 }
@@ -238,15 +238,9 @@ fn first_window_identity_owns_the_segment_across_utc_year_and_late_data() {
         segment.on_window_appended(first_id, std::time::Instant::now());
     }
 
-    let dest = seal_open_segment_with_reset(
-        &mut journal,
-        &owner,
-        0,
-        &mut segment,
-        "test",
-        Journal::reset,
-    )
-    .expect("seal cross-year segment");
+    let dest =
+        seal_open_segment_with_reset(&mut journal, &owner, &mut segment, "test", Journal::reset)
+            .expect("seal cross-year segment");
     let first_address = SegmentAddress::new(first_id).unwrap();
     assert_eq!(
         dest,
@@ -517,7 +511,6 @@ fn failed_recovery_seal_preserves_evidence_and_continues_empty() {
         PartMeta {
             min_ts: 123,
             max_ts: 123,
-            source_id: 7,
         },
     );
     {
@@ -594,7 +587,7 @@ fn published_pgm_with_failed_reset_requires_restart_before_another_append() {
     segment.on_window_appended(segment_id, std::time::Instant::now());
 
     let error =
-        seal_open_segment_with_reset(&mut journal, &owner, 0, &mut segment, "test", |_journal| {
+        seal_open_segment_with_reset(&mut journal, &owner, &mut segment, "test", |_journal| {
             Err(JournalError::Io(std::io::Error::other(
                 "injected reset failure",
             )))

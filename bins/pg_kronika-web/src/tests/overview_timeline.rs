@@ -20,16 +20,10 @@ use crate::{AppState, TimelineFlightRole};
 /// Each panic is a distinct notable observation, so the segment exercises
 /// paginated notable retrieval.
 fn write_panic_segment(dir: &std::path::Path, count: i64) {
-    write_panic_segment_for(dir, "0.pgm", 7, 0, count);
+    write_panic_segment_for(dir, "0.pgm", 0, count);
 }
 
-fn write_panic_segment_for(
-    dir: &std::path::Path,
-    file: &str,
-    source: u64,
-    offset_us: i64,
-    count: i64,
-) {
+fn write_panic_segment_for(dir: &std::path::Path, file: &str, offset_us: i64, count: i64) {
     let rows: Vec<_> = (1..=count)
         .map(|index| PgLogErrorV1 {
             ts: Ts(offset_us + index * 1_000),
@@ -58,7 +52,6 @@ fn write_panic_segment_for(
         PartMeta {
             min_ts: offset_us + 1_000,
             max_ts: offset_us + count * 1_000,
-            source_id: source,
         },
     );
     crate::test_layout::write_named_pgm(dir, file, &bytes);
@@ -117,7 +110,7 @@ fn metric_reset_row(ts_us: i64) -> ResetMetadata {
 fn database_coverage_row(ts_us: i64) -> SnapshotCoverageV1 {
     SnapshotCoverageV1 {
         ts: Ts(ts_us),
-        source_type_id: 1_005_001,
+        section_type_id: 1_005_001,
         collector_pid: 42,
         collector_started_at: Ts(1),
         read_state: 0,
@@ -157,7 +150,6 @@ fn write_database_metric_segment(dir: &std::path::Path) {
         PartMeta {
             min_ts: 10,
             max_ts: 20,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir, "database-metrics.pgm", &bytes);
@@ -184,15 +176,13 @@ fn lifecycle_part(ts_us: i64) -> Vec<u8> {
         PartMeta {
             min_ts: ts_us,
             max_ts: ts_us,
-            source_id: 7,
         },
     )
 }
 
 #[tokio::test]
 async fn overview_returns_a_digest_over_a_valid_range() {
-    let (_dir, status, body) =
-        fixture_response("/v1/timeline/overview?source=7&from=0&to=1000000000").await;
+    let (_dir, status, body) = fixture_response("/v1/timeline/overview?from=0&to=1000000000").await;
     assert_eq!(status, StatusCode::OK, "a valid range is served: {body}");
 
     let object = body.as_object().expect("overview body is an object");
@@ -211,7 +201,7 @@ async fn overview_returns_a_digest_over_a_valid_range() {
         meta["requested_range"],
         json!({ "from_us": 0, "to_us": 1_000_000_000 })
     );
-    assert_eq!(meta["source_status"], "complete_for_contract");
+    assert_eq!(meta["status"], "complete_for_contract");
     assert!(
         meta["fact_set_id"].is_string(),
         "fact set id is a base64url string"
@@ -260,7 +250,7 @@ async fn timeline_meta_has_no_pending_tail_for_a_complete_active_journal() {
     );
 
     let state = state_for_dir(dir.path());
-    let (status, body) = serve_state(state, "/v1/timeline/events?source=7&from=0&to=100").await;
+    let (status, body) = serve_state(state, "/v1/timeline/events?from=0&to=100").await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["meta"]["tail_pending"], json!(null));
@@ -269,8 +259,7 @@ async fn timeline_meta_has_no_pending_tail_for_a_complete_active_journal() {
 
 #[tokio::test]
 async fn overview_rejects_an_inverted_range() {
-    let (_dir, status, body) =
-        fixture_response("/v1/timeline/overview?source=7&from=1000&to=1000").await;
+    let (_dir, status, body) = fixture_response("/v1/timeline/overview?from=1000&to=1000").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_problem(
         &body,
@@ -282,71 +271,44 @@ async fn overview_rejects_an_inverted_range() {
 
 #[tokio::test]
 async fn overview_requires_the_range_bounds() {
-    let (_dir, status, body) = fixture_response("/v1/timeline/overview?source=7&from=0").await;
+    let (_dir, status, body) = fixture_response("/v1/timeline/overview?from=0").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "missing_query_parameter");
 }
 
 #[tokio::test]
-async fn timeline_requires_an_explicit_source_selection() {
-    let (_dir, status, body) = fixture_response("/v1/timeline/overview?from=0&to=1000000000").await;
+async fn timeline_rejects_the_removed_source_parameter() {
+    let (_dir, status, body) =
+        fixture_response("/v1/timeline/overview?source=7&from=0&to=1000000000").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "missing_query_parameter");
+    assert_eq!(body["code"], "unknown_query_parameter");
     assert_eq!(body["params"]["parameter"], "source");
 }
 
 #[tokio::test]
-async fn source_selection_isolated_and_repeated_event_sources_are_canonical() {
+async fn timeline_aggregates_all_segments_in_the_root() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_panic_segment_for(dir.path(), "source-7.pgm", 7, 0, 2);
-    write_panic_segment_for(dir.path(), "source-8.pgm", 8, 10_000, 3);
+    write_panic_segment_for(dir.path(), "early.pgm", 0, 2);
+    write_panic_segment_for(dir.path(), "late.pgm", 10_000, 3);
     let state = state_for_dir(dir.path());
 
-    let (status, source_seven) = serve_state(
-        state.clone(),
-        "/v1/timeline/overview?source=7&from=0&to=1000000",
-    )
-    .await;
+    let (status, overview) =
+        serve_state(state.clone(), "/v1/timeline/overview?from=0&to=1000000").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        source_seven["event_digest"]["retained_error_occurrence_count"],
-        2
+        overview["event_digest"]["retained_error_occurrence_count"],
+        5
     );
-    assert_eq!(source_seven["meta"]["sources"], json!([7]));
+    assert!(overview["meta"].get("sources").is_none());
 
-    let (status, source_eight) = serve_state(
-        state.clone(),
-        "/v1/timeline/overview?source=8&from=0&to=1000000",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        source_eight["event_digest"]["retained_error_occurrence_count"],
-        3
-    );
-    assert_eq!(source_eight["meta"]["sources"], json!([8]));
-
-    let (left_status, left) = serve_state(
-        state.clone(),
-        "/v1/timeline/events?source=8&source=7&from=0&to=1000000",
-    )
-    .await;
-    let (right_status, right) = serve_state(
-        state,
-        "/v1/timeline/events?source=7&source=8&from=0&to=1000000",
-    )
-    .await;
-    assert_eq!(left_status, StatusCode::OK);
-    assert_eq!(right_status, StatusCode::OK);
-    assert_eq!(left, right, "source order canonicalizes before projection");
-    assert_eq!(left["meta"]["sources"], json!([7, 8]));
-    assert_eq!(left["events"].as_array().expect("events").len(), 5);
+    let (event_status, events) = serve_state(state, "/v1/timeline/events?from=0&to=1000000").await;
+    assert_eq!(event_status, StatusCode::OK);
+    assert_eq!(events["events"].as_array().expect("events").len(), 5);
 }
 
 #[tokio::test]
 async fn events_returns_a_machine_neutral_page() {
-    let (_dir, status, body) =
-        fixture_response("/v1/timeline/events?source=7&from=0&to=1000000000").await;
+    let (_dir, status, body) = fixture_response("/v1/timeline/events?from=0&to=1000000000").await;
     assert_eq!(status, StatusCode::OK, "a valid range is served: {body}");
     // The bgwriter fixture retains no notable events; the page is empty and
     // final, and its exactness and policy version are still reported.
@@ -370,7 +332,7 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_database_metric_segment(dir.path());
     let state = state_for_dir(dir.path());
-    let query = "source=7&from=10&to=21";
+    let query = "from=10&to=21";
 
     let (events_status, events) =
         serve_state(state.clone(), &format!("/v1/timeline/events?{query}")).await;
@@ -390,8 +352,8 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
     };
     assert_eq!(fact["event_kind"], "pg.database.deadlock_delta");
     assert_eq!(fact["notable_class"], "deadlock_observation");
-    assert_eq!(fact["source_id"], 7);
-    assert!(fact["source_type_id"].is_null());
+    assert!(fact.get("source_id").is_none());
+    assert!(fact["section_type_id"].is_null());
     assert_eq!(fact["identity_quality"], "content_derived");
     assert_eq!(fact["sort_ts_us"], 20);
     assert_eq!(fact["occurred_at_us"], 20);
@@ -505,7 +467,7 @@ async fn all_supported_factor_families_reach_every_timeline_endpoint() {
         &kronika_reader::qualification_all_family_pgm(),
     );
     let state = state_for_dir(dir.path());
-    let query = "source=7&from=10&to=41";
+    let query = "from=10&to=41";
 
     let (overview_status, overview) =
         serve_state(state.clone(), &format!("/v1/timeline/overview?{query}")).await;
@@ -521,8 +483,8 @@ async fn all_supported_factor_families_reach_every_timeline_endpoint() {
     assert_eq!(health_status, StatusCode::OK, "{health}");
 
     for body in [&overview, &events, &health] {
-        assert_eq!(body["meta"]["sources"], json!([7]));
-        assert_eq!(body["meta"]["available_sources"], json!([7]));
+        assert!(body["meta"].get("sources").is_none());
+        assert!(body["meta"].get("available_sources").is_none());
         assert_eq!(body["meta"]["tail_pending"], serde_json::Value::Null);
         assert_eq!(
             body["meta"]["fact_set_id"], overview["meta"]["fact_set_id"],
@@ -584,7 +546,7 @@ async fn all_supported_factor_families_reach_every_timeline_endpoint() {
         assert!(event["event_id"].is_string());
         assert!(event["event_instance_id"].is_string());
         assert!(event["event_kind"].is_string());
-        assert_eq!(event["source_id"], 7);
+        assert!(event.get("source_id").is_none());
         if let Some(factor_id) = event["payload"]["factor_id"].as_u64() {
             assert!(
                 expected_ids.contains(&factor_id),
@@ -592,7 +554,7 @@ async fn all_supported_factor_families_reach_every_timeline_endpoint() {
             );
             assert!(
                 event["entity"].is_object(),
-                "factor event lost its source-qualified entity: {event}"
+                "factor event lost its entity: {event}"
             );
         }
     }
@@ -610,8 +572,7 @@ async fn all_supported_factor_families_reach_every_timeline_endpoint() {
 #[tokio::test]
 async fn events_rejects_a_forged_cursor() {
     let (_dir, status, body) =
-        fixture_response("/v1/timeline/events?source=7&from=0&to=1000&cursor=not_a_real_cursor")
-            .await;
+        fixture_response("/v1/timeline/events?from=0&to=1000&cursor=not_a_real_cursor").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_cursor");
 }
@@ -623,7 +584,7 @@ async fn events_rejects_zero_and_over_maximum_page_limits() {
         (1_001, "query_limit_exceeded", StatusCode::PAYLOAD_TOO_LARGE),
     ] {
         let (_dir, status, body) = fixture_response(&format!(
-            "/v1/timeline/events?source=7&from=0&to=1000000000&limit={limit}"
+            "/v1/timeline/events?from=0&to=1000000000&limit={limit}"
         ))
         .await;
         assert_eq!(status, expected_status, "{body}");
@@ -641,10 +602,8 @@ async fn a_cursor_walks_the_retained_set_exactly_once() {
     let mut cursor: Option<String> = None;
     for _ in 0..8 {
         let uri = cursor.as_ref().map_or_else(
-            || "/v1/timeline/events?source=7&from=0&to=1000000&limit=2".to_owned(),
-            |token| {
-                format!("/v1/timeline/events?source=7&from=0&to=1000000&limit=2&cursor={token}")
-            },
+            || "/v1/timeline/events?from=0&to=1000000&limit=2".to_owned(),
+            |token| format!("/v1/timeline/events?from=0&to=1000000&limit=2&cursor={token}"),
         );
         let (status, body) = serve_state(state.clone(), &uri).await;
         assert_eq!(status, StatusCode::OK, "page served: {body}");
@@ -673,13 +632,9 @@ async fn preview_and_events_share_typed_fact_ids_and_canonical_order() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_panic_segment(dir.path(), 5);
     let state = state_for_dir(dir.path());
-    let (overview_status, overview) = serve_state(
-        state.clone(),
-        "/v1/timeline/overview?source=7&from=0&to=1000000",
-    )
-    .await;
-    let (events_status, events) =
-        serve_state(state, "/v1/timeline/events?source=7&from=0&to=1000000").await;
+    let (overview_status, overview) =
+        serve_state(state.clone(), "/v1/timeline/overview?from=0&to=1000000").await;
+    let (events_status, events) = serve_state(state, "/v1/timeline/events?from=0&to=1000000").await;
     assert_eq!(overview_status, StatusCode::OK);
     assert_eq!(events_status, StatusCode::OK);
     assert_eq!(
@@ -690,7 +645,7 @@ async fn preview_and_events_share_typed_fact_ids_and_canonical_order() {
     let positions = facts
         .iter()
         .map(|fact| {
-            assert_eq!(fact["source_id"], 7);
+            assert!(fact.get("source_id").is_none());
             assert!(fact["payload"].is_object());
             assert!(fact["supporting_evidence"].is_array());
             (
@@ -714,16 +669,10 @@ async fn a_capped_preview_is_the_exact_first_events_page() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_panic_segment(dir.path(), 105);
     let state = state_for_dir(dir.path());
-    let (overview_status, overview) = serve_state(
-        state.clone(),
-        "/v1/timeline/overview?source=7&from=0&to=1000000",
-    )
-    .await;
-    let (events_status, events) = serve_state(
-        state,
-        "/v1/timeline/events?source=7&from=0&to=1000000&limit=100",
-    )
-    .await;
+    let (overview_status, overview) =
+        serve_state(state.clone(), "/v1/timeline/overview?from=0&to=1000000").await;
+    let (events_status, events) =
+        serve_state(state, "/v1/timeline/events?from=0&to=1000000&limit=100").await;
     assert_eq!(overview_status, StatusCode::OK, "{overview}");
     assert_eq!(events_status, StatusCode::OK, "{events}");
     assert_eq!(overview["notable_preview"]["omitted_count"], 5);
@@ -737,9 +686,9 @@ async fn a_capped_preview_is_the_exact_first_events_page() {
 #[tokio::test]
 async fn duplicate_segment_contents_do_not_invent_path_based_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_panic_segment_for(dir.path(), "first.pgm", 7, 0, 1);
-    write_panic_segment_for(dir.path(), "second.pgm", 7, 0, 1);
-    let (status, body) = serve(dir.path(), "/v1/timeline/events?source=7&from=0&to=1000000").await;
+    write_panic_segment_for(dir.path(), "first.pgm", 0, 1);
+    write_panic_segment_for(dir.path(), "second.pgm", 0, 1);
+    let (status, body) = serve(dir.path(), "/v1/timeline/events?from=0&to=1000000").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let events = body["events"].as_array().expect("events");
     assert_eq!(
@@ -750,14 +699,10 @@ async fn duplicate_segment_contents_do_not_invent_path_based_identity() {
 }
 
 #[tokio::test]
-async fn digest_equations_and_source_quality_reconcile_independently() {
+async fn digest_equations_and_quality_reconcile_independently() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_panic_segment(dir.path(), 5);
-    let (status, body) = serve(
-        dir.path(),
-        "/v1/timeline/overview?source=7&from=0&to=1000000",
-    )
-    .await;
+    let (status, body) = serve(dir.path(), "/v1/timeline/overview?from=0&to=1000000").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let digest = &body["event_digest"];
     let total = digest["retained_error_occurrence_count"]
@@ -793,35 +738,22 @@ async fn digest_equations_and_source_quality_reconcile_independently() {
     assert_eq!(digest["retained_error_group_count"], 5);
     assert_eq!(digest["retained_observation_row_count"], 5);
 
-    let freshness = &body["meta"]["source_freshness"][0];
-    assert_eq!(freshness["source_completeness"], "bounded_subset");
+    let freshness = &body["meta"]["freshness"];
+    assert_eq!(freshness["completeness"], "bounded_subset");
     assert_eq!(freshness["retained_exactness"], "exact");
     assert_eq!(freshness["physical_count_semantics"], "lower_bound");
-    assert_eq!(body["meta"]["loss"][0]["known_gaps"], json!([]));
-    assert_eq!(body["meta"]["loss"][0]["dropped_count_lower_bound"], 0);
-}
-
-#[tokio::test]
-async fn an_unknown_source_is_unavailable_not_an_exact_empty_population() {
-    let (_dir, status, body) =
-        fixture_response("/v1/timeline/events?source=999&from=0&to=1000000000").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["events"], json!([]));
-    assert_eq!(body["meta"]["source_status"], "unavailable");
-    assert_eq!(body["retained_exactness"], "unknown");
-    assert_eq!(body["source_completeness"], "unknown");
-    assert_eq!(body["physical_count_semantics"], "not_applicable");
-    assert!(body["meta"]["loss"][0]["dropped_count_lower_bound"].is_null());
+    assert_eq!(body["meta"]["loss"]["known_gaps"], json!([]));
+    assert_eq!(body["meta"]["loss"]["dropped_count_lower_bound"], 0);
 }
 
 #[tokio::test]
 async fn a_cursor_resolves_its_pinned_view_after_a_new_publication() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_panic_segment_for(dir.path(), "first.pgm", 7, 0, 5);
+    write_panic_segment_for(dir.path(), "first.pgm", 0, 5);
     let state = state_for_dir(dir.path());
     let (first_status, first) = serve_state(
         state.clone(),
-        "/v1/timeline/events?source=7&from=0&to=1000000&limit=2",
+        "/v1/timeline/events?from=0&to=1000000&limit=2",
     )
     .await;
     assert_eq!(first_status, StatusCode::OK, "{first}");
@@ -830,7 +762,7 @@ async fn a_cursor_resolves_its_pinned_view_after_a_new_publication() {
         .expect("continuation")
         .to_owned();
 
-    write_panic_segment_for(dir.path(), "second.pgm", 7, 10_000, 2);
+    write_panic_segment_for(dir.path(), "second.pgm", 10_000, 2);
     let mut snapshot: LocalDirSnapshot = (*state.snapshot()).clone();
     let delta = snapshot.refresh_incremental_delta().expect("refresh delta");
     state
@@ -839,7 +771,7 @@ async fn a_cursor_resolves_its_pinned_view_after_a_new_publication() {
 
     let (continued_status, continued) = serve_state(
         state.clone(),
-        &format!("/v1/timeline/events?source=7&from=0&to=1000000&limit=2&cursor={cursor}"),
+        &format!("/v1/timeline/events?from=0&to=1000000&limit=2&cursor={cursor}"),
     )
     .await;
     assert_eq!(continued_status, StatusCode::OK, "{continued}");
@@ -848,11 +780,8 @@ async fn a_cursor_resolves_its_pinned_view_after_a_new_publication() {
         "continuation resolves the immutable pinned generation"
     );
 
-    let (fresh_status, fresh) = serve_state(
-        state,
-        "/v1/timeline/events?source=7&from=0&to=1000000&limit=100",
-    )
-    .await;
+    let (fresh_status, fresh) =
+        serve_state(state, "/v1/timeline/events?from=0&to=1000000&limit=100").await;
     assert_eq!(fresh_status, StatusCode::OK, "{fresh}");
     assert_ne!(fresh["meta"]["fact_set_id"], first["meta"]["fact_set_id"]);
     assert_eq!(fresh["events"].as_array().expect("fresh events").len(), 7);
@@ -864,7 +793,7 @@ async fn parsed_panic_does_not_assert_a_trusted_health_floor() {
     write_panic_segment(dir.path(), 1);
     let (status, body) = serve(
         dir.path(),
-        "/v1/timeline/health?source=7&from=0&to=1000000&step=1000000",
+        "/v1/timeline/health?from=0&to=1000000&step=1000000",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "health served: {body}");
@@ -894,7 +823,7 @@ async fn parsed_panic_does_not_assert_a_trusted_health_floor() {
 #[tokio::test]
 async fn health_of_an_empty_range_is_unknown_not_green() {
     let (_dir, status, body) =
-        fixture_response("/v1/timeline/health?source=7&from=0&to=1000&step=1000").await;
+        fixture_response("/v1/timeline/health?from=0&to=1000&step=1000").await;
     assert_eq!(status, StatusCode::OK, "health served: {body}");
     let points = body["points"].as_array().expect("points array");
     assert!(!points.is_empty(), "the range is partitioned into points");
@@ -919,21 +848,15 @@ async fn a_cursor_presented_to_a_changed_query_is_a_mismatch() {
     let state = state_for_dir(dir.path());
     let (status, first) = serve_state(
         state.clone(),
-        "/v1/timeline/events?source=7&from=0&to=1000000&limit=1",
+        "/v1/timeline/events?from=0&to=1000000&limit=1",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let cursor = first["next_cursor"].as_str().expect("a first-page cursor");
     // A cursor is bound to the query that issued it; a changed range is a 400
     // mismatch, distinct from a 410 response for an unavailable pinned view.
-    let changed = format!("/v1/timeline/events?source=7&from=0&to=2000000&limit=1&cursor={cursor}");
+    let changed = format!("/v1/timeline/events?from=0&to=2000000&limit=1&cursor={cursor}");
     let (status, body) = serve_state(state.clone(), &changed).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "cursor_query_mismatch");
-
-    let changed_source =
-        format!("/v1/timeline/events?source=8&from=0&to=1000000&limit=1&cursor={cursor}");
-    let (status, body) = serve_state(state, &changed_source).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "cursor_query_mismatch");
 }

@@ -267,7 +267,7 @@ pub enum HotMark {
     None,
     /// Soft hot request (event labels).
     Soft,
-    /// Strict hot (chart headers, catalog `source_id`).
+    /// Strict hot (chart headers and other required small values).
     Hard,
 }
 
@@ -318,7 +318,7 @@ struct Requirements {
     /// size, e.g. query plans.
     blob: bool,
     /// The strict part of the hot contract: the value must be readable
-    /// from `dict.hot_strings` (chart headers, catalog `source_id`).
+    /// from `dict.hot_strings` (chart headers and other required small values).
     hot_hard: bool,
     /// Soft hot request: duplicate into `dict.hot_strings` when placement
     /// permits it; otherwise leave it out without failing.
@@ -426,7 +426,7 @@ impl SegmentDicts {
 
     /// Intern a value that must be available in `dict.hot_strings`.
     ///
-    /// Use this only for short values such as chart headers and `source_id`.
+    /// Use this only for short values such as chart headers.
     ///
     /// # Errors
     ///

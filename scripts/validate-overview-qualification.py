@@ -235,11 +235,6 @@ EXPECTED_EVIDENCE = (
         ),
         rust_evidence(
             "kronika-reader",
-            "crates/kronika-reader/src/overview/container.rs",
-            "admission_distinguishes_wrong_source_from_incompatible_versions",
-        ),
-        rust_evidence(
-            "kronika-reader",
             "crates/kronika-reader/src/overview/publish.rs",
             "publication_failure_returns_fresh_facts_then_serves_the_fallback",
         ),

@@ -11,7 +11,7 @@ use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_mai
 use kronika_analytics::overview::{
     AlignmentId, CounterSample, GaugeSample, MetricSeriesId, SegmentIdentity,
 };
-use kronika_format::{PartMeta, ReadAt, SectionInput, build_part};
+use kronika_format::{FORMAT_VERSION, PartMeta, ReadAt, SectionInput, build_part};
 use kronika_layout as _;
 use kronika_reader::{
     BlockContent, BlockKind, CounterSamplesBlock, FactFile, FactFileReader, GaugeSamplesBlock,
@@ -35,10 +35,9 @@ use zstd as _;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn fixture() -> (Vec<u8>, HeaderIdentity, SegmentIdentity) {
-    let lineage = SegmentIdentity::sealed(7, [0x22; 32]);
+    let lineage = SegmentIdentity::sealed([0x22; 32]);
     let identity = HeaderIdentity::from_current_contract(
-        1,
-        7,
+        FORMAT_VERSION,
         0,
         9_999,
         1_048_576,
@@ -46,7 +45,8 @@ fn fixture() -> (Vec<u8>, HeaderIdentity, SegmentIdentity) {
         lineage.id(),
     );
     let manifest =
-        SourceManifestBlock::new(7, 1, 0, 9_999, 1_048_576, Vec::new(), &LIMIT).expect("manifest");
+        SourceManifestBlock::new(FORMAT_VERSION, 0, 9_999, 1_048_576, Vec::new(), &LIMIT)
+            .expect("manifest");
     let gauges = (0_i64..10_000)
         .map(|timestamp| {
             GaugeSample::new(MetricSeriesId([1; 16]), timestamp, 1.0).expect("finite gauge")
@@ -101,7 +101,6 @@ fn pgm_fixture() -> Vec<u8> {
         PartMeta {
             min_ts: 1_000_000,
             max_ts: 1_002_047,
-            source_id: 7,
         },
     )
 }

@@ -171,7 +171,6 @@ fn write_fact(writer: &mut ByteWriter, fact: &EventFact, strings: &StringTableBl
     writer.u64_le(fact.count());
     write_entity(writer, fact.entity());
     writer.u8(evidence_code(fact.evidence_quality()));
-    writer.u64_le(fact.coverage().source_id);
     writer.u8(exactness_code(fact.coverage().retained_exactness));
     write_loss(writer, fact.coverage().loss.as_ref());
     writer.uvarint(fact.supporting_observation_ids().len() as u64);
@@ -196,7 +195,6 @@ fn read_fact(
     let count = reader.u64_le()?;
     let entity = read_entity(reader)?;
     let evidence_quality = evidence_from(reader.u8()?)?;
-    let source_id = reader.u64_le()?;
     let retained_exactness = exactness_from(reader.u8()?)?;
     let loss = read_loss(reader, bounds)?;
     let supporting_count = reader.uvarint(*evidence_budget)?;
@@ -219,7 +217,6 @@ fn read_fact(
         supporting,
         evidence_quality,
         CoverageRef {
-            source_id,
             retained_exactness,
             loss,
         },
@@ -800,7 +797,6 @@ mod tests {
             vec![ObservationId([id; 32])],
             EvidenceQuality::Parsed,
             CoverageRef {
-                source_id: 7,
                 retained_exactness: RetainedExactness::Exact,
                 loss: None,
             },

@@ -43,7 +43,6 @@ fn build_part(sections: &[Vec<u8>]) -> Vec<u8> {
         entries,
         min_ts: 1,
         max_ts: 2,
-        source_id: 0,
         format_version: FORMAT_VERSION,
         window_count: 1,
     };

@@ -125,7 +125,7 @@ pub struct Interner {
     ///
     /// Bounded by contract, not by data: callers may strict-hot only
     /// registry-defined header strings (chart headers, the catalog
-    /// `source_id`), each shorter than `blob_threshold`. A data-driven
+    /// required catalog labels), each shorter than `blob_threshold`. A data-driven
     /// strict-hot call is a caller bug.
     hot_pinned: BTreeMap<StrId, Vec<u8>>,
 }
@@ -638,7 +638,7 @@ mod tests {
         flush_ok(&mut interner);
 
         // The fresh window already carries the pinned value, so the next part
-        // resolves its own catalog source_id.
+        // resolves its own catalog labels.
         assert!(interner.window().resolve(source).is_some());
         assert_eq!(interner.window().hot_strings().count(), 1);
         assert_eq!(flush_ok(&mut interner), 1, "the pin is flushed again");

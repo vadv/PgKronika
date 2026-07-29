@@ -51,8 +51,7 @@ const INPUT_SECTIONS: usize = WINDOWS * (DATA_SECTIONS_PER_PART + DICTIONARY_SEC
 const EXPECTED_DATA_ROWS: usize = WINDOWS * ROWS_PER_WINDOW * EXPECTED_REGISTRY_TYPES;
 const EXPECTED_DICTIONARY_ENTRIES: usize = 33;
 const MAX_OUTPUT_SECTIONS: usize = INPUT_SECTIONS;
-const SOURCE_VALUE: &[u8] = b"measurement/source";
-const SOURCE_ID_PLACEHOLDER: u64 = 1;
+const SHARED_DICTIONARY_VALUE: &[u8] = b"measurement/shared";
 const FIRST_TS_US: i64 = 1_700_000_000_000_000;
 
 type AnyError = Box<dyn Error>;
@@ -268,7 +267,6 @@ struct OutputInspection {
     catalog_rows: u64,
     catalog_data_rows: u64,
     catalog_dictionary_rows: u64,
-    source_id: u64,
 }
 
 fn main() -> Result<()> {
@@ -306,15 +304,8 @@ fn prepare(output_dir: &Path) -> Result<()> {
 
     let started = Instant::now();
     let mut expected = LogicalData::default();
-    let mut source_id = None;
     for window in 0..WINDOWS {
-        let (part, part_source_id) = build_window(window, &mut expected)?;
-        if source_id
-            .replace(part_source_id)
-            .is_some_and(|id| id != part_source_id)
-        {
-            return Err(invalid("measurement source id changed between windows"));
-        }
+        let part = build_window(window, &mut expected)?;
         journal.append(segment_id, &part)?;
     }
     if journal.parts().len() != WINDOWS {
@@ -322,7 +313,6 @@ fn prepare(output_dir: &Path) -> Result<()> {
             "journal does not contain exactly four completed parts",
         ));
     }
-    let source_id = source_id.unwrap_or(SOURCE_ID_PLACEHOLDER);
     let expected = expected.digest()?;
     if expected.data_rows != EXPECTED_DATA_ROWS {
         return Err(invalid("input logical data row total is wrong"));
@@ -341,7 +331,6 @@ fn prepare(output_dir: &Path) -> Result<()> {
     println!("journal_bytes={journal_bytes}");
     println!("journal_sha256={}", hex(journal_sha256));
     println!("journal_parts={}", journal.parts().len());
-    println!("source_id={source_id}");
     println!("logical_data_rows={}", expected.data_rows);
     println!("logical_dictionary_entries={}", expected.dictionary_entries);
     println!("logical_bytes={}", expected.logical_bytes);
@@ -402,14 +391,13 @@ fn seal_measurement(journal_path: &Path, output_dir: &Path, mode: Mode) -> Resul
 }
 
 fn read_measurement(pgm_path: &Path, mode: Mode) -> Result<()> {
-    let expected_source_id = measurement_source_id()?;
     let pgm_bytes = fs::metadata(pgm_path)?.len();
     let pgm_sha256 = sha256_file(pgm_path)?;
 
     let logical_started = Instant::now();
-    let output = inspect_output(pgm_path, mode, expected_source_id)?;
+    let output = inspect_output(pgm_path, mode)?;
     let logical_read_wall_ns = logical_started.elapsed().as_nanos();
-    let production = inspect_with_production_reader(pgm_path, output.source_id)?;
+    let production = inspect_with_production_reader(pgm_path)?;
     if production.data_rows != output.logical.data_rows {
         return Err(invalid(
             "production reader row count differs from the canonical digest reader",
@@ -445,7 +433,6 @@ fn read_measurement(pgm_path: &Path, mode: Mode) -> Result<()> {
     println!("catalog_rows={}", output.catalog_rows);
     println!("catalog_data_rows={}", output.catalog_data_rows);
     println!("catalog_dictionary_rows={}", output.catalog_dictionary_rows);
-    println!("source_id={}", output.source_id);
     println!("logical_data_rows={}", output.logical.data_rows);
     println!(
         "logical_dictionary_entries={}",
@@ -474,7 +461,7 @@ fn read_measurement(pgm_path: &Path, mode: Mode) -> Result<()> {
 }
 
 fn query_measurement(pgm_path: &Path) -> Result<()> {
-    let production = inspect_production_query(pgm_path, measurement_source_id()?)?;
+    let production = inspect_production_query(pgm_path)?;
     validate_production_query(&production)?;
 
     println!("phase=query");
@@ -508,7 +495,7 @@ struct ProductionRead {
     query_has_next_cursor: bool,
 }
 
-fn inspect_with_production_reader(path: &Path, source_id: u64) -> Result<ProductionRead> {
+fn inspect_with_production_reader(path: &Path) -> Result<ProductionRead> {
     let open_started = Instant::now();
     let segment = Segment::open(path)?;
     let open_wall_ns = open_started.elapsed().as_nanos();
@@ -529,7 +516,7 @@ fn inspect_with_production_reader(path: &Path, source_id: u64) -> Result<Product
     let _dictionary = segment.dictionary()?;
     let decode_wall_ns = decode_started.elapsed().as_nanos();
 
-    let query = inspect_production_query(path, source_id)?;
+    let query = inspect_production_query(path)?;
 
     Ok(ProductionRead {
         open_wall_ns,
@@ -558,7 +545,7 @@ struct ProductionQuery {
     query_has_next_cursor: bool,
 }
 
-fn inspect_production_query(path: &Path, source_id: u64) -> Result<ProductionQuery> {
+fn inspect_production_query(path: &Path) -> Result<ProductionQuery> {
     let store_dir = segment_root(path)?;
     let restart_started = Instant::now();
     let mut snapshot = LocalDirSnapshot::open(store_dir)?;
@@ -571,7 +558,6 @@ fn inspect_production_query(path: &Path, source_id: u64) -> Result<ProductionQue
     let page = section(
         &mut snapshot,
         "pg_stat_activity",
-        source_id,
         i64::MIN,
         i64::MAX,
         EXPECTED_DATA_ROWS,
@@ -650,12 +636,6 @@ fn expected_query_rows() -> Result<usize> {
         .ok_or_else(|| invalid("production query row expectation overflowed"))
 }
 
-fn measurement_source_id() -> Result<u64> {
-    let limits = DictLimits::new(32, 256)?;
-    let mut dictionaries = SegmentDicts::new(limits);
-    Ok(dictionaries.intern(SOURCE_VALUE)?.get())
-}
-
 fn arguments() -> Result<Command> {
     let mut args = std::env::args_os();
     let _program = args.next();
@@ -703,10 +683,10 @@ fn usage() -> AnyError {
     )
 }
 
-fn build_window(window: usize, logical: &mut LogicalData) -> Result<(Vec<u8>, u64)> {
+fn build_window(window: usize, logical: &mut LogicalData) -> Result<Vec<u8>> {
     let limits = DictLimits::new(32, 256)?;
     let mut dictionaries = SegmentDicts::new(limits);
-    let source_id = dictionaries.intern(SOURCE_VALUE)?.get();
+    let _shared_value_id = dictionaries.intern(SHARED_DICTIONARY_VALUE)?;
     let mut value_ids = Vec::with_capacity(ROWS_PER_WINDOW);
     for value in 0..ROWS_PER_WINDOW / 2 {
         let short = format!("window-{window}-string-{value}");
@@ -761,16 +741,12 @@ fn build_window(window: usize, logical: &mut LogicalData) -> Result<(Vec<u8>, u6
     let last_ts = first_ts
         .checked_add(i64::try_from(ROWS_PER_WINDOW - 1)?)
         .ok_or_else(|| invalid("measurement timestamp overflowed"))?;
-    Ok((
-        build_part(
-            &inputs,
-            PartMeta {
-                min_ts: first_ts,
-                max_ts: last_ts,
-                source_id,
-            },
-        ),
-        source_id,
+    Ok(build_part(
+        &inputs,
+        PartMeta {
+            min_ts: first_ts,
+            max_ts: last_ts,
+        },
     ))
 }
 
@@ -940,15 +916,12 @@ fn encode_window_body(batch: &RecordBatch) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn inspect_output(path: &Path, mode: Mode, expected_source_id: u64) -> Result<OutputInspection> {
+fn inspect_output(path: &Path, mode: Mode) -> Result<OutputInspection> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let (catalog, catalog_at) = read_catalog(&file, file_len)?;
     if catalog.entries.len() != mode.expected_sections() {
         return Err(invalid("output catalog has the wrong section count"));
-    }
-    if catalog.source_id != expected_source_id {
-        return Err(invalid("output catalog source id changed"));
     }
     validate_catalog_inventory(&catalog, mode)?;
 
@@ -1021,7 +994,6 @@ fn inspect_output(path: &Path, mode: Mode, expected_source_id: u64) -> Result<Ou
         catalog_rows,
         catalog_data_rows,
         catalog_dictionary_rows,
-        source_id: catalog.source_id,
     })
 }
 

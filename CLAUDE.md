@@ -109,7 +109,7 @@ a reference type instead of rediscovering the wiring.
    `|b| interner.intern(b).map(|id| StrId(id.get()))`
    (`kronika_format::StrId` is `NonZeroU64` → `.get()`; `kronika_registry::StrId`
    is plain `u64`). Then `dict::encode(interner.window())` →
-   `buffers.flush(&dict_sections, source_id)`. `DictLimits::new(4096, 64*1024)`
+   `buffers.flush(&dict_sections)`. `DictLimits::new(4096, 64*1024)`
    `.and_then(|l| l.with_max_total_bytes(16<<20))` — caps collector memory.
 5. `kronika-bdd/` — `features/<name>.feature` scenario + a `then` step. Verify
    via `Segment::open`, `catalog().entries.find(type_id)`,

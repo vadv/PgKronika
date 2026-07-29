@@ -47,7 +47,6 @@ fn header_output(header: &FactFileHeader) -> OvfHeaderOutput {
         extractor_semantics_version: identity.extractor_semantics_version,
         registry_contract_version: identity.registry_contract_version,
         source_format_version: identity.source_format_version,
-        pgm_source_id: identity.pgm_source_id,
         source_min_ts_us: identity.source_min_ts_us,
         source_max_ts_us: identity.source_max_ts_us,
         source_file_len: identity.source_file_len,

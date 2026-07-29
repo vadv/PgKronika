@@ -20,7 +20,6 @@ PostgreSQL, Linux, cgroup и журнал stderr PostgreSQL, добавляет 
 | --- | ---: | --- |
 | `KRONIKA_PG_DSN` | обязательна | URI или строка `key=value` для `tokio-postgres`. |
 | `KRONIKA_OUT_DIR` | обязательна | Корень данных PgKronika с `active.parts`, блокировками владельцев и деревом сегментов `YYYY/MM/DD`. |
-| `KRONIKA_SOURCE_ID` | `0` | `u64` в каталоге сегмента. Задайте стабильное уникальное ненулевое значение каждому коллектору и корню, данные которых могут сопоставляться. |
 | `KRONIKA_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` или `trace`; неверное значение заменяется на `info`. |
 
 Отсутствующий выходной каталог создаётся. Права файлов зависят от umask
@@ -189,7 +188,7 @@ lag достигает `KRONIKA_PG_REPL_LAG_TRIGGER_S` (`10`) или задер�
 
 Строка состояния записывается при первом наблюдении, при изменении состояния,
 причины, парсера или пути, а также по истечении интервала без изменений.
-Последняя строка доступна в объекте `pg_log` ответа `GET /v1/sources`.
+Строки доступны через `GET /v1/section/pg_log_source_status`.
 
 Коллектор не меняет настройки PostgreSQL и права доступа к файлам. Если
 сохранённой позиции чтения ещё нет, первое чтение нового файла начинается с
@@ -239,7 +238,6 @@ BDD и тестов парсера. В production их обычно не зад�
 KRONIKA_PG_DSN='host=127.0.0.1 dbname=postgres user=kronika password=change-me' \
 KRONIKA_OUT_DIR=/var/lib/pg_kronika \
 KRONIKA_LOG_STATE_PATH=/var/lib/pg_kronika-log.state \
-KRONIKA_SOURCE_ID=1 \
 pg_kronika-collector
 ```
 

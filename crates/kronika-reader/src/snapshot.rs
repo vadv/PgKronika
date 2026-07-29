@@ -160,8 +160,6 @@ impl OpenUnit {
 /// Metadata describing one unit (sealed or live) in the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnitMeta {
-    /// Source identifier from the unit's catalog.
-    pub source_id: u64,
     /// Earliest timestamp in the unit.
     pub min_ts: i64,
     /// Latest timestamp in the unit.
@@ -850,14 +848,10 @@ impl LocalDirSnapshot {
             .sealed_context(descriptor)
             .map_err(WebIndexReadError::Descriptor)?;
         let source_descriptor = SourceDescriptor(*descriptor.catalog_layout_digest.as_bytes());
-        let lineage = kronika_analytics::overview::SegmentIdentity::sealed(
-            descriptor.source_id,
-            source_descriptor.0,
-        )
-        .id();
+        let lineage =
+            kronika_analytics::overview::SegmentIdentity::sealed(source_descriptor.0).id();
         let expected = HeaderIdentity::from_current_contract(
             descriptor.source_format_version,
-            descriptor.source_id,
             descriptor.min_ts,
             descriptor.max_ts,
             descriptor.file_identity.len,
@@ -1044,7 +1038,6 @@ impl LocalDirSnapshot {
                         body_len,
                         active.catalog_digest,
                     ),
-                    source_id: active.catalog.source_id,
                     min_ts: active.catalog.min_ts,
                     max_ts: active.catalog.max_ts,
                 } == *descriptor
@@ -1260,7 +1253,6 @@ impl LocalDirSnapshot {
             UnitHandle::Sealed(i) => {
                 let summary = self.scan.sealed[i].summary.as_ref();
                 UnitMeta {
-                    source_id: summary.source_id,
                     min_ts: summary.min_ts,
                     max_ts: summary.max_ts,
                     live: false,
@@ -1269,7 +1261,6 @@ impl LocalDirSnapshot {
             UnitHandle::Active(i) => {
                 let catalog = &self.scan.active[i].catalog;
                 UnitMeta {
-                    source_id: catalog.source_id,
                     min_ts: catalog.min_ts,
                     max_ts: catalog.max_ts,
                     live: true,
@@ -1401,7 +1392,6 @@ fn prove_sealed_generation_matches_active(
 fn aggregate_envelope_matches(sealed: &CatalogSummary, active: &[ActivePart]) -> bool {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    let mut source_id = 0_u64;
     let Some(format_version) = active.first().map(|part| part.catalog.format_version) else {
         return false;
     };
@@ -1412,23 +1402,12 @@ fn aggregate_envelope_matches(sealed: &CatalogSummary, active: &[ActivePart]) ->
         }
         min_ts = min_ts.min(catalog.min_ts);
         max_ts = max_ts.max(catalog.max_ts);
-        if catalog.source_id != 0 {
-            if source_id != 0 && source_id != catalog.source_id {
-                return false;
-            }
-            source_id = catalog.source_id;
-        }
     }
     if min_ts > max_ts {
         min_ts = 0;
         max_ts = 0;
     }
-    (
-        sealed.min_ts,
-        sealed.max_ts,
-        sealed.source_id,
-        sealed.format_version,
-    ) == (min_ts, max_ts, source_id, format_version)
+    (sealed.min_ts, sealed.max_ts, sealed.format_version) == (min_ts, max_ts, format_version)
 }
 
 fn canonical_data_body_matches(
@@ -1676,7 +1655,6 @@ fn part_descriptors(
                     body_len,
                     active.catalog_digest,
                 ),
-                source_id: active.catalog.source_id,
                 min_ts: active.catalog.min_ts,
                 max_ts: active.catalog.max_ts,
             })

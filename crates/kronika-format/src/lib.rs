@@ -66,4 +66,4 @@ pub const MAGIC: [u8; 4] = *b"PGM1";
 ///
 /// This number changes only when the container framing changes. Section
 /// schemas evolve through new `type_id` values.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;

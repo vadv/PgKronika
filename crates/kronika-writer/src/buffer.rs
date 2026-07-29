@@ -155,10 +155,9 @@ impl SectionBuffers {
     pub fn flush(
         &mut self,
         dict_sections: &[crate::dict::DictSection],
-        source_id: u64,
     ) -> Result<Option<Vec<u8>>, CodecError> {
         Ok(self
-            .flush_with_summary(dict_sections, source_id)?
+            .flush_with_summary(dict_sections)?
             .map(|flushed| flushed.body))
     }
 
@@ -170,7 +169,6 @@ impl SectionBuffers {
     pub fn flush_with_summary(
         &mut self,
         dict_sections: &[crate::dict::DictSection],
-        source_id: u64,
     ) -> Result<Option<FlushedPart>, CodecError> {
         let encoded: Vec<(u32, EncodedRows)> = self
             .by_type
@@ -210,14 +208,7 @@ impl SectionBuffers {
             rows: dict.rows,
             body: &dict.body,
         }));
-        let part = build_part(
-            &sections,
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id,
-            },
-        );
+        let part = build_part(&sections, PartMeta { min_ts, max_ts });
         let mut summary_sections = Vec::with_capacity(sections.len());
         for (type_id, section) in &encoded {
             summary_sections.push(SectionFlushSummary {
@@ -349,14 +340,13 @@ mod tests {
         assert!(!buffers.is_empty());
 
         let part = buffers
-            .flush(&[], 7)
+            .flush(&[])
             .expect("flush encodes the buffered rows")
             .expect("buffered rows produce a part");
         assert!(buffers.is_empty(), "flush clears the window");
 
         let catalog = validate_part(&part).expect("the part is a valid container");
         assert_eq!(catalog.entries.len(), 2, "one section per buffered type");
-        assert_eq!(catalog.source_id, 7);
         assert_eq!(
             (catalog.min_ts, catalog.max_ts),
             (1_000, 2_000),
@@ -389,7 +379,7 @@ mod tests {
         buffers.push(instance(1_500)).expect("buffer not full");
 
         let flushed = buffers
-            .flush_with_summary(&[], 7)
+            .flush_with_summary(&[])
             .expect("flush encodes the buffered rows")
             .expect("buffered rows produce a part");
         assert_eq!(flushed.summary.part_bytes, flushed.body.len());
@@ -426,7 +416,7 @@ mod tests {
             .expect("buffer not full");
 
         let flushed = buffers
-            .flush_with_summary(&[], 7)
+            .flush_with_summary(&[])
             .expect("flush encodes rows")
             .expect("rows produce a part");
         assert_eq!(flushed.summary.sections.len(), 1);
@@ -437,7 +427,7 @@ mod tests {
     #[test]
     fn flushing_an_empty_window_yields_no_part() {
         let mut buffers = SectionBuffers::new();
-        assert!(buffers.flush(&[], 0).expect("flush ok").is_none());
+        assert!(buffers.flush(&[]).expect("flush ok").is_none());
     }
 
     #[test]
@@ -450,7 +440,7 @@ mod tests {
         }];
 
         let flushed = buffers
-            .flush_with_summary(&dict_sections, 0)
+            .flush_with_summary(&dict_sections)
             .expect("flush ok")
             .expect("dictionary-only part is still written");
         assert_eq!(flushed.summary.sections.len(), 1);

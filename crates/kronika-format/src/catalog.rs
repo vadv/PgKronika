@@ -9,14 +9,13 @@
 //! offsets from the start of the segment.
 //!
 //! ```text
-//! catalog entry: 32 B       metadata: 40 B            tail index: 8 B
+//! catalog entry: 32 B       metadata: 32 B            tail index: 8 B
 //!   type_id        u32        min_ts          i64       catalog_len u32
 //!   flags          u32        max_ts          i64       magic       "PGM1"
-//!   offset         u64        source_id       u64
-//!   len            u64        entry_count     u32
-//!   rows           u32        format_version  u32
-//!   crc32c         u32        crc32c          u32
-//!                             window_count    u32
+//!   offset         u64        entry_count     u32
+//!   len            u64        format_version  u32
+//!   rows           u32        crc32c          u32
+//!   crc32c         u32        window_count    u32
 //! ```
 
 use std::error::Error;
@@ -28,12 +27,12 @@ use crate::{MAGIC, crc::Crc32c};
 /// Size of one catalog entry on disk, bytes.
 pub const ENTRY_LEN: usize = 32;
 /// Size of the catalog meta block on disk, bytes.
-pub const META_LEN: usize = 40;
+pub const META_LEN: usize = 32;
 /// Size of the tail index on disk, bytes. Always the last bytes of a file.
 pub const TAIL_INDEX_LEN: usize = 8;
 
 /// Offset of the `crc32c` field inside the meta block.
-const META_CRC_OFFSET: usize = 32;
+const META_CRC_OFFSET: usize = 24;
 
 /// One row in the end catalog.
 ///
@@ -68,8 +67,6 @@ pub struct Catalog {
     pub min_ts: i64,
     /// Maximal timestamp of the segment, unix microseconds.
     pub max_ts: i64,
-    /// `str_id` of `{cluster_id}/{pg_system_identifier}`; 0 = not set.
-    pub source_id: u64,
     /// Container format version, [`crate::FORMAT_VERSION`] for new files.
     pub format_version: u32,
     /// Collection windows coalesced into this container; 0 = unknown.
@@ -88,8 +85,6 @@ pub struct CatalogView<'a> {
     pub min_ts: i64,
     /// Maximal timestamp of the segment, unix microseconds.
     pub max_ts: i64,
-    /// `str_id` of `{cluster_id}/{pg_system_identifier}`; 0 = not set.
-    pub source_id: u64,
     /// Number of catalog entries.
     pub entry_count: u32,
     /// Container format version.
@@ -391,16 +386,15 @@ impl Catalog {
         let mut meta = [0_u8; META_LEN];
         meta[0..8].copy_from_slice(&self.min_ts.to_le_bytes());
         meta[8..16].copy_from_slice(&self.max_ts.to_le_bytes());
-        meta[16..24].copy_from_slice(&self.source_id.to_le_bytes());
         let entry_count = u32::try_from(self.entries.len()).map_err(|_overflow| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "catalog entry count does not fit the PGM metadata",
             )
         })?;
-        meta[24..28].copy_from_slice(&entry_count.to_le_bytes());
-        meta[28..32].copy_from_slice(&self.format_version.to_le_bytes());
-        meta[36..40].copy_from_slice(&self.window_count.to_le_bytes());
+        meta[16..20].copy_from_slice(&entry_count.to_le_bytes());
+        meta[20..24].copy_from_slice(&self.format_version.to_le_bytes());
+        meta[28..32].copy_from_slice(&self.window_count.to_le_bytes());
         // The CRC field is already zeroed.
         checksum.update(&meta);
         meta[META_CRC_OFFSET..META_CRC_OFFSET + 4]
@@ -411,7 +405,7 @@ impl Catalog {
 
     /// Decode a catalog block.
     ///
-    /// `bytes` must contain catalog entries followed by the 40-byte metadata
+    /// `bytes` must contain catalog entries followed by the 32-byte metadata
     /// block. Do not include the tail index.
     ///
     /// # Errors
@@ -425,7 +419,6 @@ impl Catalog {
             entries: view.entries().collect(),
             min_ts: view.min_ts,
             max_ts: view.max_ts,
-            source_id: view.source_id,
             format_version: view.format_version,
             window_count: view.window_count,
         })
@@ -433,7 +426,7 @@ impl Catalog {
 
     /// Validate an encoded catalog and borrow its fixed-size entries.
     ///
-    /// `bytes` must contain catalog entries followed by the 40-byte metadata
+    /// `bytes` must contain catalog entries followed by the 32-byte metadata
     /// block. The returned view decodes entries on iteration and allocates
     /// nothing.
     ///
@@ -455,7 +448,7 @@ impl Catalog {
         })?;
 
         let meta = &bytes[bytes.len() - META_LEN..];
-        let stored_count = u32_at(meta, 24);
+        let stored_count = u32_at(meta, 16);
         if stored_count != derived {
             return Err(DecodeError::EntryCountMismatch {
                 stored: stored_count,
@@ -481,10 +474,9 @@ impl Catalog {
             entries: &bytes[..bytes.len() - META_LEN],
             min_ts: i64_at(meta, 0),
             max_ts: i64_at(meta, 8),
-            source_id: u64_at(meta, 16),
             entry_count: stored_count,
-            format_version: u32_at(meta, 28),
-            window_count: u32_at(meta, 36),
+            format_version: u32_at(meta, 20),
+            window_count: u32_at(meta, 28),
         })
     }
 }
@@ -528,10 +520,22 @@ mod tests {
             }],
             min_ts: 1_000_000,
             max_ts: 2_000_000,
-            source_id: 0,
             format_version: 1,
             window_count: 7,
         }
+    }
+
+    #[test]
+    fn catalog_metadata_is_32_bytes() {
+        assert_eq!(META_LEN, 32);
+    }
+
+    #[test]
+    fn old_40_byte_metadata_is_rejected() {
+        assert!(matches!(
+            Catalog::decode(&[0_u8; 40]),
+            Err(DecodeError::BadCatalogLen { actual: 40 })
+        ));
     }
 
     #[test]
@@ -578,7 +582,6 @@ mod tests {
 
         assert_eq!(view.min_ts, catalog.min_ts);
         assert_eq!(view.max_ts, catalog.max_ts);
-        assert_eq!(view.source_id, catalog.source_id);
         assert_eq!(view.entry_count, 1);
         assert_eq!(view.format_version, catalog.format_version);
         assert_eq!(view.window_count, catalog.window_count);
@@ -591,7 +594,6 @@ mod tests {
             entries: vec![],
             min_ts: 0,
             max_ts: 0,
-            source_id: 0,
             format_version: 1,
             window_count: 0,
         };
@@ -616,8 +618,8 @@ mod tests {
     fn decode_rejects_entry_count_mismatch() {
         let encoded = sample().encode();
         let mut body = encoded[..encoded.len() - TAIL_INDEX_LEN].to_vec();
-        // Patch entry_count from 1 to 2; offset 24 within meta.
-        let at = body.len() - META_LEN + 24;
+        // Patch entry_count from 1 to 2; offset 16 within meta.
+        let at = body.len() - META_LEN + 16;
         body[at..at + 4].copy_from_slice(&2_u32.to_le_bytes());
         assert_eq!(
             Catalog::decode(&body),
@@ -644,7 +646,6 @@ mod tests {
             entries,
             min_ts: 0,
             max_ts: 0,
-            source_id: 0,
             format_version: crate::FORMAT_VERSION,
             window_count: 1,
         }

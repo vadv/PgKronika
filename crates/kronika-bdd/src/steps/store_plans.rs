@@ -494,7 +494,7 @@ fn plan_analyzer_provenance(world: &mut BddWorld, section: String) -> Result<()>
             .iter()
             .find(|row| {
                 row.get("ts") == Some(&Cell::Ts(ts))
-                    && cell_u64(row.get("source_type_id")) == Some(u64::from(type_id))
+                    && cell_u64(row.get("section_type_id")) == Some(u64::from(type_id))
             })
             .with_context(|| format!("no snapshot_coverage marker for {section} at {ts}"))?;
         ensure!(

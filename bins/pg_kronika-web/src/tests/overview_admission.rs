@@ -39,7 +39,6 @@ fn one_weight() -> ColdWorkWeight {
 
 fn synthetic_entries(
     count: usize,
-    source_id: u64,
     min_ts: i64,
     max_ts: i64,
     ordinal_base: usize,
@@ -51,18 +50,14 @@ fn synthetic_entries(
             rows: 1,
             body: &body,
         }],
-        PartMeta {
-            min_ts,
-            max_ts,
-            source_id,
-        },
+        PartMeta { min_ts, max_ts },
     );
     let unit = PgmUnit::open(bytes.as_slice()).expect("open synthetic catalog");
-    let fact_key = FactKey::for_current_segment(source_id, unit.source_descriptor());
+    let fact_key = FactKey::for_current_segment(unit.source_descriptor());
     (0..count)
         .map(|offset| {
             let ordinal = ordinal_base.checked_add(offset).expect("synthetic ordinal");
-            let file_name = format!("synthetic-{source_id}-{ordinal}.pgm");
+            let file_name = format!("synthetic-{ordinal}.pgm");
             let locator =
                 SealedLocator::from_segment_id(crate::test_layout::named_address(&file_name).id);
             let summary = CatalogSummary::from_catalog(
@@ -181,27 +176,22 @@ fn install_oversized_real_entry(state: &AppState) {
 #[test]
 fn canonical_plan_enforces_zero_one_limit_and_limit_plus_one() {
     let range = CoverageSpan::new(0, 2).expect("range");
-    let empty = SelectedSealedPlan::build(synthetic_view(Vec::new(), Vec::new()), &[7], range, 1)
+    let empty = SelectedSealedPlan::build(synthetic_view(Vec::new(), Vec::new()), range, 1)
         .expect("empty plan");
     assert_eq!(empty.selected_count(), 0);
 
     let one = SelectedSealedPlan::build(
-        synthetic_view(synthetic_entries(1, 7, 0, 1, 0), Vec::new()),
-        &[7],
+        synthetic_view(synthetic_entries(1, 0, 1, 0), Vec::new()),
         range,
         1,
     )
     .expect("one segment is admitted");
     assert_eq!(one.selected_count(), 1);
 
-    let entries = synthetic_entries(ABSOLUTE_MAX_SELECTED_SEGMENTS + 1, 7, 0, 1, 0);
+    let entries = synthetic_entries(ABSOLUTE_MAX_SELECTED_SEGMENTS + 1, 0, 1, 0);
     let view = synthetic_view(entries, Vec::new());
-    let admitted = SelectedSealedPlan::build(
-        Arc::clone(&view),
-        &[7],
-        range,
-        ABSOLUTE_MAX_SELECTED_SEGMENTS,
-    );
+    let admitted =
+        SelectedSealedPlan::build(Arc::clone(&view), range, ABSOLUTE_MAX_SELECTED_SEGMENTS);
     assert!(matches!(
         admitted,
         Err(SelectionError::LimitExceeded {
@@ -210,11 +200,11 @@ fn canonical_plan_enforces_zero_one_limit_and_limit_plus_one() {
     ));
 
     let exact = synthetic_view(
-        synthetic_entries(ABSOLUTE_MAX_SELECTED_SEGMENTS, 7, 0, 1, 10_000),
+        synthetic_entries(ABSOLUTE_MAX_SELECTED_SEGMENTS, 0, 1, 10_000),
         Vec::new(),
     );
     assert_eq!(
-        SelectedSealedPlan::build(exact, &[7], range, ABSOLUTE_MAX_SELECTED_SEGMENTS,)
+        SelectedSealedPlan::build(exact, range, ABSOLUTE_MAX_SELECTED_SEGMENTS,)
             .expect("absolute boundary is inclusive")
             .selected_count(),
         ABSOLUTE_MAX_SELECTED_SEGMENTS
@@ -222,52 +212,16 @@ fn canonical_plan_enforces_zero_one_limit_and_limit_plus_one() {
 }
 
 #[test]
-fn selection_is_source_scoped_aggregate_and_requires_canonical_sources() {
-    let mut entries = synthetic_entries(1, 7, 0, 1, 0);
-    entries.extend(synthetic_entries(
-        ABSOLUTE_MAX_SELECTED_SEGMENTS,
-        8,
-        0,
-        1,
-        10_000,
-    ));
-    let view = synthetic_view(entries, Vec::new());
-    let range = CoverageSpan::new(0, 2).expect("range");
-    assert_eq!(
-        SelectedSealedPlan::build(Arc::clone(&view), &[7], range, 1)
-            .expect("foreign source is excluded")
-            .selected_count(),
-        1
-    );
-    assert!(matches!(
-        SelectedSealedPlan::build(
-            Arc::clone(&view),
-            &[7, 8],
-            range,
-            ABSOLUTE_MAX_SELECTED_SEGMENTS,
-        ),
-        Err(SelectionError::LimitExceeded {
-            limit: ABSOLUTE_MAX_SELECTED_SEGMENTS,
-        })
-    ));
-    assert!(matches!(
-        SelectedSealedPlan::build(view, &[7, 7], range, ABSOLUTE_MAX_SELECTED_SEGMENTS),
-        Err(SelectionError::SourcesNotCanonical)
-    ));
-}
-
-#[test]
 fn selection_keeps_half_open_intersection_with_boundary_halos() {
-    let mut entries = synthetic_entries(1, 7, -10, 0, 0);
-    entries.extend(synthetic_entries(1, 7, 10, 20, 1));
-    entries.extend(synthetic_entries(1, 7, i64::MIN, i64::MIN, 2));
-    entries.extend(synthetic_entries(1, 7, i64::MAX, i64::MAX, 3));
+    let mut entries = synthetic_entries(1, -10, 0, 0);
+    entries.extend(synthetic_entries(1, 10, 20, 1));
+    entries.extend(synthetic_entries(1, i64::MIN, i64::MIN, 2));
+    entries.extend(synthetic_entries(1, i64::MAX, i64::MAX, 3));
     let view = synthetic_view(entries, Vec::new());
 
     assert_eq!(
         SelectedSealedPlan::build(
             Arc::clone(&view),
-            &[7],
             CoverageSpan::new(0, 10).expect("range"),
             4,
         )
@@ -281,7 +235,6 @@ fn selection_keeps_half_open_intersection_with_boundary_halos() {
     assert_eq!(
         SelectedSealedPlan::build(
             Arc::clone(&view),
-            &[7],
             CoverageSpan::new(i64::MIN, i64::MIN + 1).expect("pre-epoch range"),
             4,
         )
@@ -294,7 +247,6 @@ fn selection_keeps_half_open_intersection_with_boundary_halos() {
     assert_eq!(
         SelectedSealedPlan::build(
             view,
-            &[7],
             CoverageSpan::new(i64::MAX - 1, i64::MAX).expect("maximum range"),
             4,
         )
@@ -309,13 +261,12 @@ fn selection_keeps_half_open_intersection_with_boundary_halos() {
 
 #[test]
 fn unavailable_descriptors_mark_a_gap_without_consuming_the_limit() {
-    let unavailable = synthetic_entries(1, 7, 0, 1, 0)
+    let unavailable = synthetic_entries(1, 0, 1, 0)
         .into_iter()
         .map(|entry| *entry.descriptor())
         .collect();
     let plan = SelectedSealedPlan::build(
         synthetic_view(Vec::new(), unavailable),
-        &[7],
         CoverageSpan::new(0, 2).expect("range"),
         1,
     )
@@ -337,7 +288,6 @@ fn live_parts_are_not_counted_as_sealed_segments() {
         PartMeta {
             min_ts: 0,
             max_ts: 1,
-            source_id: 7,
         },
     );
     crate::test_layout::write_journal(
@@ -350,7 +300,6 @@ fn live_parts_are_not_counted_as_sealed_segments() {
     let plan = state
         .select_overview(
             state.overview_view(),
-            &[7],
             CoverageSpan::new(0, 2).expect("range"),
         )
         .expect("live-only plan");
@@ -364,7 +313,7 @@ async fn all_timeline_routes_reject_before_cache_flight_capacity_or_cursor_work(
     install_view(
         &state,
         synthetic_view(
-            synthetic_entries(ABSOLUTE_MAX_SELECTED_SEGMENTS + 1, 7, 0, 1, 0),
+            synthetic_entries(ABSOLUTE_MAX_SELECTED_SEGMENTS + 1, 0, 1, 0),
             Vec::new(),
         ),
     );
@@ -373,9 +322,9 @@ async fn all_timeline_routes_reject_before_cache_flight_capacity_or_cursor_work(
         .expect("occupy analytic capacity");
 
     for uri in [
-        "/v1/timeline/overview?source=7&from=0&to=2",
-        "/v1/timeline/health?source=7&from=0&to=2",
-        "/v1/timeline/events?source=7&from=0&to=2",
+        "/v1/timeline/overview?from=0&to=2",
+        "/v1/timeline/health?from=0&to=2",
+        "/v1/timeline/events?from=0&to=2",
     ] {
         let response = app(state.clone(), None, test_metrics_handle())
             .oneshot(
@@ -410,38 +359,9 @@ async fn all_timeline_routes_reject_before_cache_flight_capacity_or_cursor_work(
 }
 
 #[tokio::test]
-async fn events_counts_the_deduplicated_source_union_against_one_effective_limit() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_with_limit(dir.path(), 4);
-    let mut entries = synthetic_entries(2, 7, 0, 1, 0);
-    entries.extend(synthetic_entries(3, 8, 0, 1, 10));
-    install_view(&state, synthetic_view(entries, Vec::new()));
-
-    let response = app(state, None, test_metrics_handle())
-        .oneshot(
-            Request::builder()
-                .uri("/v1/timeline/events?source=8&source=7&source=7&from=0&to=2")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("route");
-    let response = capture_json(response).await;
-    assert_problem(
-        &response.body,
-        StatusCode::BAD_REQUEST,
-        "query_limit_exceeded",
-        serde_json::json!({
-            "resource": "selected_segments",
-            "limit": 4,
-        }),
-    );
-}
-
-#[tokio::test]
 async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_bgwriter_segment(dir.path(), "one.pgm", 0, 1);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
     let mut config = OverviewConfig::new();
     config.max_selected_segments = 1;
@@ -454,7 +374,7 @@ async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
     let response = app(state.clone(), None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .uri("/v1/timeline/overview?from=0&to=2")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -487,13 +407,13 @@ async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
 #[tokio::test]
 async fn an_exact_decoded_hit_bypasses_cold_admission() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_bgwriter_segment(dir.path(), "one.pgm", 0, 1);
     let state = state_with_limit(dir.path(), 1);
 
     let cold = app(state.clone(), None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .uri("/v1/timeline/overview?from=0&to=2")
                 .body(Body::empty())
                 .expect("cold request"),
         )
@@ -505,7 +425,7 @@ async fn an_exact_decoded_hit_bypasses_cold_admission() {
     let decoded = app(state, None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/events?source=7&from=0&to=2")
+                .uri("/v1/timeline/events?from=0&to=2")
                 .body(Body::empty())
                 .expect("decoded request"),
         )
@@ -521,7 +441,7 @@ async fn an_exact_decoded_hit_bypasses_cold_admission() {
 #[tokio::test]
 async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_bgwriter_segment(dir.path(), "one.pgm", 0, 1);
 
     let first_snapshot =
         kronika_reader::LocalDirSnapshot::open(dir.path()).expect("first snapshot");
@@ -535,7 +455,7 @@ async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
     let cold = app(first_state.clone(), None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .uri("/v1/timeline/overview?from=0&to=2")
                 .body(Body::empty())
                 .expect("cold request"),
         )
@@ -557,7 +477,7 @@ async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
     let durable = app(restarted, None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/timeline/events?source=7&from=0&to=2")
+                .uri("/v1/timeline/events?from=0&to=2")
                 .body(Body::empty())
                 .expect("durable request"),
         )
@@ -568,43 +488,4 @@ async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
         StatusCode::OK,
         "an exact durable fact must be returned before the oversized cold charge is considered"
     );
-}
-
-#[tokio::test]
-async fn unselected_synthetic_descriptors_do_not_block_or_load_a_real_source() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "real-source-7.pgm", 7, 0, 1);
-    let state = state_with_limit(dir.path(), 1);
-    let (snapshot, original) = state.overview_request_view();
-    let mut entries = original.entries().to_vec();
-    assert_eq!(entries.len(), 1);
-    entries.extend(synthetic_entries(
-        ABSOLUTE_MAX_SELECTED_SEGMENTS,
-        8,
-        0,
-        1,
-        10_000,
-    ));
-    state.published.store(Arc::new(PublishedStoreView {
-        snapshot: Arc::clone(&snapshot),
-        timeline_snapshot: snapshot,
-        timeline: Arc::new(DescriptorView::new(
-            original.view_generation(),
-            entries,
-            Vec::new(),
-            Arc::clone(original.live()),
-            None,
-        )),
-    }));
-
-    let response = app(state, None, test_metrics_handle())
-        .oneshot(
-            Request::builder()
-                .uri("/v1/timeline/overview?source=7&from=0&to=2")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("route");
-    assert_eq!(response.status(), StatusCode::OK);
 }

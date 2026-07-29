@@ -49,7 +49,6 @@ pub(crate) fn page_to_json(page: &SectionPage) -> Value {
         .map_or(Value::Null, |cursor| Value::String(cursor.encode()));
     json!({
         "section": page.section,
-        "source_id": page.source_id,
         "rows": rows,
         "gaps": gaps,
         "next_cursor": next_cursor,

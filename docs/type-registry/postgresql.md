@@ -1458,8 +1458,8 @@ dict_dropped_fields  u8    G   // путь не попал в словарь с�
 
 `pg_log_source_status` добавлен без изменения PGM v1. Все прежние коды
 `pg_log_gap` остаются читаемыми и не переопределяются новым контрактом.
-Для старого PGM без `1_039_001` состояние неизвестно; `GET /v1/sources`
-возвращает `state=unknown` и `reason=no_status`.
+Для PGM без `1_039_001` состояние сбора неизвестно. Актуальное состояние
+доступно через `GET /v1/section/pg_log_source_status`.
 Состояние источника служит для диагностики полноты данных и не участвует в
 поиске аномалий или расчёте оценки здоровья.
 
@@ -1470,7 +1470,7 @@ dict_dropped_fields  u8    G   // путь не попал в словарь с�
 
 ```text
 ts              ts    T
-source_type_id  u32   L
+section_type_id u32   L
 total           u32   G   // известная нижняя граница строк в источнике
 unknown_total   bool  L   // true, если count(*) не удался
 collected       u32   G   // строк записано
@@ -1528,7 +1528,7 @@ cgroup до и после чтения контроллера. `mapping_state = 
 
 ```text
 ts                    ts   T
-source_type_id        u32  L
+section_type_id       u32  L
 collector_pid         u32  L
 collector_started_at  ts   L
 read_state            u8   L   // 0=complete, 1=source_limit,

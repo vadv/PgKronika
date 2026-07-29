@@ -1205,7 +1205,7 @@ mod tests {
         .count()
     }
 
-    fn lifecycle_pgm(source_id: u64) -> Vec<u8> {
+    fn lifecycle_pgm(variant: u64) -> Vec<u8> {
         let rows = [
             PgLogLifecycleV1 {
                 ts: Ts(1_500),
@@ -1220,7 +1220,7 @@ mod tests {
             PgLogLifecycleV1 {
                 ts: Ts(1_700),
                 kind: 0,
-                pid: Some(11),
+                pid: Some(i32::try_from(variant).expect("test variant fits i32")),
                 signal: Some(6),
                 shutdown_mode: None,
                 message: None,
@@ -1238,7 +1238,6 @@ mod tests {
             PartMeta {
                 min_ts: 1_500,
                 max_ts: 1_700,
-                source_id,
             },
         )
     }
@@ -1429,7 +1428,6 @@ mod tests {
             loaded.rebuild_reason(),
             Some(CacheRebuildReason::WrongSource)
         );
-        assert_eq!(loaded.facts().identity().pgm_source_id, 8);
         store
             .read(&unit(&bytes_b), &context_b, &LIMIT)
             .expect("source B replacement");

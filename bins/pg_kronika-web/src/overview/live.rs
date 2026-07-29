@@ -576,7 +576,7 @@ mod tests {
     use kronika_registry::{Section, Ts};
 
     use crate::overview::selection::SelectedSealedPlan;
-    use crate::overview::view::{IndexView, SourceStatus};
+    use crate::overview::view::{IndexView, TimelineStatus};
     use crate::tests::bgwriter_row;
 
     const QUERY_LIMITS: OracleLimits = OracleLimits {
@@ -603,11 +603,7 @@ mod tests {
                 rows: 1,
                 body: &body,
             }],
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: 7,
-            },
+            PartMeta { min_ts, max_ts },
         );
         std::fs::write(fixture_pgm_path(root, segment_id), &bytes).expect("write segment");
     }
@@ -630,11 +626,7 @@ mod tests {
                 rows: u32::try_from(rows.len()).expect("row count"),
                 body: &body,
             }],
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: 7,
-            },
+            PartMeta { min_ts, max_ts },
         )
     }
 
@@ -655,16 +647,11 @@ mod tests {
         writer: &OverviewIndex,
         snapshot: &LocalDirSnapshot,
         descriptors: DescriptorView,
-        sources: &[u64],
         range: CoverageSpan,
     ) -> Arc<IndexView> {
-        let plan = SelectedSealedPlan::build(
-            Arc::new(descriptors),
-            sources,
-            range,
-            ABSOLUTE_MAX_SELECTED_SEGMENTS,
-        )
-        .expect("selected plan");
+        let plan =
+            SelectedSealedPlan::build(Arc::new(descriptors), range, ABSOLUTE_MAX_SELECTED_SEGMENTS)
+                .expect("selected plan");
         writer
             .fact_loader(OverviewColdConfig::default(), 16 * 1024 * 1024, 16)
             .expect("fact loader")
@@ -687,12 +674,11 @@ mod tests {
             &index,
             &snapshot,
             descriptors,
-            &[7],
             CoverageSpan::new(0, 1).expect("range"),
         )
         .await;
         assert!(view.coverage_envelope().is_empty());
-        assert_eq!(view.source_status(), SourceStatus::CompleteForContract);
+        assert_eq!(view.status(), TimelineStatus::CompleteForContract);
     }
 
     #[test]
@@ -734,7 +720,6 @@ mod tests {
             &index,
             &snapshot,
             descriptors,
-            &[7],
             CoverageSpan::new(0, 10_000).expect("range"),
         )
         .await;
@@ -785,7 +770,6 @@ mod tests {
                 &index,
                 &snapshot,
                 descriptors,
-                &[7],
                 CoverageSpan::new(0, 10_000).expect("range"),
             )
             .await,
@@ -840,7 +824,6 @@ mod tests {
                 &index,
                 &snapshot,
                 next_view,
-                &[7],
                 CoverageSpan::new(0, 10_000).expect("range"),
             )
             .await,
@@ -888,15 +871,11 @@ mod tests {
             .expect("second view");
         let range = CoverageSpan::new(0, 10_000).expect("range");
         let first =
-            SelectedSealedPlan::build(Arc::new(first), &[7], range, ABSOLUTE_MAX_SELECTED_SEGMENTS)
+            SelectedSealedPlan::build(Arc::new(first), range, ABSOLUTE_MAX_SELECTED_SEGMENTS)
                 .expect("first plan");
-        let second = SelectedSealedPlan::build(
-            Arc::new(second),
-            &[7],
-            range,
-            ABSOLUTE_MAX_SELECTED_SEGMENTS,
-        )
-        .expect("second plan");
+        let second =
+            SelectedSealedPlan::build(Arc::new(second), range, ABSOLUTE_MAX_SELECTED_SEGMENTS)
+                .expect("second plan");
         assert_eq!(first.fact_set_id(), second.fact_set_id());
     }
 
@@ -931,7 +910,7 @@ mod tests {
             .assemble(&snapshot, &bootstrap)
             .expect("first live view");
         let range = CoverageSpan::new(0, 10_000).expect("range");
-        let first_view = load_selected(&writer, &snapshot, first_descriptors, &[7], range).await;
+        let first_view = load_selected(&writer, &snapshot, first_descriptors, range).await;
         let first_result = first_view.query(range, QUERY_LIMITS).expect("first query");
         assert_eq!(first_result.observations().len(), 1);
         let first_public_ids = first_result
@@ -951,7 +930,7 @@ mod tests {
         let second_descriptors = writer
             .assemble_with_live(&snapshot, &appended)
             .expect("appended live view");
-        let second_view = load_selected(&writer, &snapshot, second_descriptors, &[7], range).await;
+        let second_view = load_selected(&writer, &snapshot, second_descriptors, range).await;
         let second_result = second_view
             .query(range, QUERY_LIMITS)
             .expect("second query");
@@ -982,7 +961,6 @@ mod tests {
             PartMeta {
                 min_ts: first.ts.0,
                 max_ts: second.ts.0,
-                source_id: 7,
             },
         );
         std::fs::write(
@@ -1002,7 +980,7 @@ mod tests {
                 .is_some(),
             "the seal publication retains one bounded prior-live candidate"
         );
-        let sealed_view = load_selected(&writer, &snapshot, sealed_descriptors, &[7], range).await;
+        let sealed_view = load_selected(&writer, &snapshot, sealed_descriptors, range).await;
         let sealed_result = sealed_view
             .query(range, QUERY_LIMITS)
             .expect("sealed query");

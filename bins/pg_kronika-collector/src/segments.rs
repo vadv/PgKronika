@@ -468,15 +468,14 @@ pub(crate) const fn seal_reason(
 pub(crate) fn encode_window(
     mut buffers: SectionBuffers,
     interner: &Interner,
-    config: &Config,
 ) -> Result<FlushedPart> {
     let started = Instant::now();
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let flushed = buffers
-        .flush_with_summary(&dict_sections, config.source_id)
+        .flush_with_summary(&dict_sections)
         .context("encode the collection window")?
         .context("a buffered row must yield a part")?;
-    log_flush_summary(&flushed.summary, config.source_id, started.elapsed());
+    log_flush_summary(&flushed.summary, started.elapsed());
     Ok(flushed)
 }
 
@@ -485,24 +484,15 @@ pub(crate) fn encode_window(
 pub(crate) fn seal_open_segment(
     journal: &mut Journal,
     owner: &WriterOwner,
-    config: &Config,
     segment: &mut SegmentState,
     reason: &'static str,
 ) -> Result<PathBuf> {
-    seal_open_segment_with_reset(
-        journal,
-        owner,
-        config.source_id,
-        segment,
-        reason,
-        Journal::reset,
-    )
+    seal_open_segment_with_reset(journal, owner, segment, reason, Journal::reset)
 }
 
 pub(crate) fn seal_open_segment_with_reset<F>(
     journal: &mut Journal,
     owner: &WriterOwner,
-    source_id: u64,
     segment: &mut SegmentState,
     reason: &'static str,
     reset: F,
@@ -525,7 +515,6 @@ where
         &[
             field("segment_path", dest.display()),
             field("segment_id", segment_id.get()),
-            field("source_id", source_id),
             field("reason", reason),
             field("sections", summary.sections),
             field("segment_bytes", summary.bytes),
@@ -622,7 +611,6 @@ fn validate_existing_segment(file: &File) -> Result<()> {
         entries: catalog.entries().collect(),
         min_ts: catalog.min_ts,
         max_ts: catalog.max_ts,
-        source_id: catalog.source_id,
         format_version: catalog.format_version,
         window_count: catalog.window_count,
     };
@@ -1010,7 +998,6 @@ fn seal_recovered_journal(journal: &mut Journal, owner: &WriterOwner) -> Result<
 fn prepare_window_admission(
     journal: &mut Journal,
     owner: &WriterOwner,
-    config: &Config,
     segment: &mut SegmentState,
     flushed: &FlushedPart,
     interner: &Interner,
@@ -1035,7 +1022,7 @@ fn prepare_window_admission(
                 ],
             );
             sealed.push((
-                seal_open_segment(journal, owner, config, segment, "format-limit")?,
+                seal_open_segment(journal, owner, segment, "format-limit")?,
                 "format-limit",
             ));
             Ok(fresh)
@@ -1046,7 +1033,6 @@ fn prepare_window_admission(
 
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "one transaction keeps admission, journal append, early seal, and SegmentId state synchronized"
 )]
 pub(crate) fn append_window_and_maybe_seal(
@@ -1061,15 +1047,8 @@ pub(crate) fn append_window_and_maybe_seal(
 ) -> Result<Vec<(PathBuf, &'static str)>> {
     segment.ensure_append_allowed()?;
     let mut sealed = Vec::new();
-    let mut admission = prepare_window_admission(
-        journal,
-        owner,
-        config,
-        segment,
-        flushed,
-        interner,
-        &mut sealed,
-    )?;
+    let mut admission =
+        prepare_window_admission(journal, owner, segment, flushed, interner, &mut sealed)?;
     let segment_id = match segment.first_id {
         Some(segment_id) => segment_id,
         None => SegmentId::new(ts).context("collection timestamp is outside the layout range")?,
@@ -1102,7 +1081,7 @@ pub(crate) fn append_window_and_maybe_seal(
                 ],
             );
             sealed.push((
-                seal_open_segment(journal, owner, config, segment, "journal-full")?,
+                seal_open_segment(journal, owner, segment, "journal-full")?,
                 "journal-full",
             ));
             admission = fresh;
@@ -1154,10 +1133,7 @@ pub(crate) fn append_window_and_maybe_seal(
         config.segment_max_bytes,
         segment.age_expired(now, age),
     ) {
-        sealed.push((
-            seal_open_segment(journal, owner, config, segment, reason)?,
-            reason,
-        ));
+        sealed.push((seal_open_segment(journal, owner, segment, reason)?, reason));
     }
     Ok(sealed)
 }
@@ -1244,7 +1220,7 @@ mod admission_tests {
         let mut buffers = SectionBuffers::new();
         buffers.push(bgwriter(ts)).expect("one row fits");
         buffers
-            .flush_with_summary(&[], 7)
+            .flush_with_summary(&[])
             .expect("window encodes")
             .expect("one row yields one part")
     }
@@ -1253,7 +1229,6 @@ mod admission_tests {
         Config {
             dsn: String::new(),
             out_dir: out_dir.to_path_buf(),
-            source_id: 7,
             session: SessionConfig {
                 statement_timeout_ms: 15_000,
                 lock_timeout_ms: 1_000,
@@ -1655,7 +1630,6 @@ mod admission_tests {
             PartMeta {
                 min_ts: i64::MAX,
                 max_ts: i64::MIN,
-                source_id: 7,
             },
         );
         journal

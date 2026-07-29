@@ -240,7 +240,6 @@ mod tests {
             PartMeta {
                 min_ts: i64::from(seed),
                 max_ts: i64::from(seed) + 1,
-                source_id: u64::from(seed),
             },
         );
         let unit = PgmUnit::open(bytes).expect("open fixture");

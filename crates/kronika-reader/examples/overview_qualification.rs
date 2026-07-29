@@ -554,7 +554,7 @@ fn dense_hour_pgm() -> Vec<u8> {
         .iter()
         .map(|row| SnapshotCoverageV1 {
             ts: row.ts,
-            source_type_id: 1_005_001,
+            section_type_id: 1_005_001,
             collector_pid: 99,
             collector_started_at: Ts(1),
             read_state: 0,
@@ -605,7 +605,6 @@ fn dense_hour_pgm() -> Vec<u8> {
         PartMeta {
             min_ts: FIRST_WINDOW_US,
             max_ts: dense_end() - CADENCE_US,
-            source_id: 7,
         },
     )
 }

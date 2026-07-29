@@ -12,7 +12,7 @@ use crate::{Section, Ts};
     id = 1_038_001,
     name = "snapshot_coverage",
     semantics = snapshot_full,
-    sort_key("source_type_id", "ts")
+    sort_key("section_type_id", "ts")
 )]
 pub struct SnapshotCoverageV1 {
     /// Source snapshot timestamp, unix microseconds.
@@ -20,7 +20,7 @@ pub struct SnapshotCoverageV1 {
     pub ts: Ts,
     /// The attempted snapshot layout.
     #[column(l)]
-    pub source_type_id: u32,
+    pub section_type_id: u32,
     /// Collector process identity within `collector_started_at`.
     #[column(l)]
     pub collector_pid: u32,
@@ -50,7 +50,7 @@ mod tests {
     fn row(read_state: u8, visibility: u8) -> SnapshotCoverageV1 {
         SnapshotCoverageV1 {
             ts: Ts(10),
-            source_type_id: 1_001_003,
+            section_type_id: 1_001_003,
             collector_pid: 42,
             collector_started_at: Ts(1),
             read_state,

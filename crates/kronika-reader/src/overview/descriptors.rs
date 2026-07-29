@@ -183,8 +183,7 @@ pub fn lineage_from_catalog(
     catalog: &Catalog,
     source_descriptor: SourceDescriptor,
 ) -> Option<SegmentLineageId> {
-    (!catalog.entries.is_empty())
-        .then(|| SegmentIdentity::sealed(catalog.source_id, source_descriptor.0).id())
+    (!catalog.entries.is_empty()).then(|| SegmentIdentity::sealed(source_descriptor.0).id())
 }
 
 const fn length_prefix(bytes: &[u8]) -> [u8; 8] {
@@ -232,7 +231,6 @@ mod tests {
             entries: vec![entry(7, 5, 3, 11)],
             min_ts: 10,
             max_ts: 20,
-            source_id: 1,
             format_version: 1,
             window_count: 2,
         };
@@ -281,13 +279,12 @@ mod tests {
             ],
             min_ts: 1_000,
             max_ts: 2_000,
-            source_id: 7,
             format_version: 1,
             window_count: 2,
         };
         let source_descriptor = SourceDescriptor([3; 32]);
         let derived = lineage_from_catalog(&catalog, source_descriptor).expect("entry");
-        let expected = SegmentIdentity::sealed(catalog.source_id, source_descriptor.0).id();
+        let expected = SegmentIdentity::sealed(source_descriptor.0).id();
         assert_eq!(derived, expected);
     }
 }

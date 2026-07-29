@@ -77,7 +77,6 @@ mod composition_tests {
             PartMeta {
                 min_ts: 1_000,
                 max_ts: 2_000,
-                source_id: 7,
             },
         );
 
@@ -92,6 +91,5 @@ mod composition_tests {
         let catalog = validate_part(&read_back).expect("the persisted part validates");
         assert_eq!(catalog.entries.len(), 2);
         assert_eq!(catalog.entries[0].type_id, 1_006_001);
-        assert_eq!(catalog.source_id, 7);
     }
 }

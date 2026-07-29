@@ -16,7 +16,7 @@ use crate::AppState;
 use crate::anomaly::{EpisodeHit, MAX_SCORE_WORK, ScanCounts, ScanParams, rank, scan_section};
 use crate::params::{
     QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64, parse_limit_default,
-    parse_u64, query_error_response_without_cursor,
+    query_error_response_without_cursor,
 };
 use crate::plan_anomaly::{
     PLAN_CONTEXT_SECTIONS, PlanContext, PlanScan, PlanSignal, is_plan_section, rank_plan_signals,
@@ -42,7 +42,6 @@ const LIMIT_DEFAULT: usize = 50;
 const MAX_POSITIONS: i64 = 10_000;
 
 const ANOMALY_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
     QueryParameter::From,
     QueryParameter::To,
     QueryParameter::Window,
@@ -173,7 +172,7 @@ fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorR
     ))
 }
 
-/// `GET /v1/anomalies?source&from&to` returns ranked anomaly episodes.
+/// `GET /v1/anomalies?from&to` returns ranked anomaly episodes.
 ///
 /// Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `limit`,
 /// and `section`. Oversized sections are reported in `skipped`.
@@ -212,14 +211,12 @@ pub(crate) async fn anomalies(State(state): State<AppState>, RawQuery(raw): RawQ
 }
 
 struct AnomalyRequest {
-    source: u64,
     scan: ScanParams,
     limit: usize,
     names: Vec<&'static str>,
 }
 
 fn validate_request(params: &QueryParams) -> Result<AnomalyRequest, ErrorResponse> {
-    let source = parse_u64(params, QueryParameter::Source)?;
     let (scan, limit) = parse_scan_params(params)?;
     let names = match params.get(QueryParameter::Section) {
         Some(name) => {
@@ -228,12 +225,7 @@ fn validate_request(params: &QueryParams) -> Result<AnomalyRequest, ErrorRespons
         }
         None => scannable_sections(),
     };
-    Ok(AnomalyRequest {
-        source,
-        scan,
-        limit,
-        names,
-    })
+    Ok(AnomalyRequest { scan, limit, names })
 }
 
 #[allow(
@@ -241,12 +233,7 @@ fn validate_request(params: &QueryParams) -> Result<AnomalyRequest, ErrorRespons
     reason = "the request-global bounded ranking and completeness fold must update episodes and plan signals together"
 )]
 fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorResponse> {
-    let AnomalyRequest {
-        source,
-        scan,
-        limit,
-        names,
-    } = request;
+    let AnomalyRequest { scan, limit, names } = request;
     let (from, to) = (scan.from, scan.to);
     let (window, step) = (scan.window, scan.step);
 
@@ -256,7 +243,7 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
         .filter_map(|&name| logical_section(name))
         .collect();
     let plan_requested = names.iter().any(|name| is_plan_section(name));
-    let supporting = load_supporting_pages(&mut snap, &logicals, plan_requested, source, from, to)?;
+    let supporting = load_supporting_pages(&mut snap, &logicals, plan_requested, from, to)?;
     let gates = Gates::from_pages(&logicals, &supporting);
     let plan_context = plan_requested.then(|| PlanContext::from_pages(&supporting));
     let mut hits: Vec<(&'static str, EpisodeHit)> = Vec::new();
@@ -281,7 +268,6 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
         match scan_one_section(
             &mut snap,
             name,
-            source,
             &scan,
             remaining_work,
             limit,
@@ -359,7 +345,6 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
 
     Ok(Json(json!({
         "schema_version": 1,
-        "source_id": source,
         "from": from,
         "to": to,
         "window_us": window,
@@ -396,7 +381,6 @@ fn load_supporting_pages(
     snap: &mut LocalDirSnapshot,
     logicals: &[LogicalSection],
     include_plan_context: bool,
-    source: u64,
     from: i64,
     to: i64,
 ) -> Result<BTreeMap<String, SectionPage>, ErrorResponse> {
@@ -406,7 +390,7 @@ fn load_supporting_pages(
         names.extend(PLAN_CONTEXT_SECTIONS);
     }
     for name in names {
-        let page = query_section(snap, name, source, from, to, DIFF_MAX_ROWS, None)
+        let page = query_section(snap, name, from, to, DIFF_MAX_ROWS, None)
             .map_err(|err| query_error_response_without_cursor(&err))?;
         pages.insert(name.to_owned(), page);
     }
@@ -420,7 +404,6 @@ fn load_supporting_pages(
 fn scan_one_section(
     snap: &mut LocalDirSnapshot,
     name: &'static str,
-    source: u64,
     scan: &ScanParams,
     remaining_work: usize,
     hit_limit: usize,
@@ -432,23 +415,22 @@ fn scan_one_section(
     let page = if let Some(page) = supporting.get(name) {
         page
     } else {
-        owned_page =
-            match query_section(snap, name, source, scan.from, scan.to, DIFF_MAX_ROWS, None) {
-                Ok(page) => page,
-                Err(QueryError::ResultTooLarge { max_cells }) => {
-                    return Ok(Err(ApiReason::materialization_limit(
-                        MaterializationResource::Cells,
-                        max_cells,
-                    )));
-                }
-                Err(QueryError::MaterializedBytesTooLarge { max_bytes }) => {
-                    return Ok(Err(ApiReason::materialization_limit(
-                        MaterializationResource::Bytes,
-                        max_bytes,
-                    )));
-                }
-                Err(err) => return Err(query_error_response_without_cursor(&err)),
-            };
+        owned_page = match query_section(snap, name, scan.from, scan.to, DIFF_MAX_ROWS, None) {
+            Ok(page) => page,
+            Err(QueryError::ResultTooLarge { max_cells }) => {
+                return Ok(Err(ApiReason::materialization_limit(
+                    MaterializationResource::Cells,
+                    max_cells,
+                )));
+            }
+            Err(QueryError::MaterializedBytesTooLarge { max_bytes }) => {
+                return Ok(Err(ApiReason::materialization_limit(
+                    MaterializationResource::Bytes,
+                    max_bytes,
+                )));
+            }
+            Err(err) => return Err(query_error_response_without_cursor(&err)),
+        };
         &owned_page
     };
     if page.next_cursor.is_some() {

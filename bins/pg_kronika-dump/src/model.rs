@@ -79,7 +79,6 @@ pub(crate) struct OvfHeaderOutput {
     pub(crate) extractor_semantics_version: u32,
     pub(crate) registry_contract_version: u32,
     pub(crate) source_format_version: u32,
-    pub(crate) pgm_source_id: u64,
     pub(crate) source_min_ts_us: i64,
     pub(crate) source_max_ts_us: i64,
     pub(crate) source_file_len: u64,

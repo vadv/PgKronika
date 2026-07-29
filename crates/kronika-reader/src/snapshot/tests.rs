@@ -13,16 +13,11 @@ use super::*;
 use crate::{FactOrigin, LIMIT};
 
 /// Build one minimal valid part with a real section.
-fn make_part(min_ts: i64, max_ts: i64, source_id: u64) -> Vec<u8> {
-    make_part_with_timed(min_ts, max_ts, source_id, 0)
+fn make_part(min_ts: i64, max_ts: i64, variant: i64) -> Vec<u8> {
+    make_part_with_timed(min_ts, max_ts, variant)
 }
 
-fn make_part_with_timed(
-    min_ts: i64,
-    max_ts: i64,
-    source_id: u64,
-    checkpoints_timed: i64,
-) -> Vec<u8> {
+fn make_part_with_timed(min_ts: i64, max_ts: i64, checkpoints_timed: i64) -> Vec<u8> {
     let row = BgwriterCheckpointer {
         ts: Ts(min_ts),
         checkpoints_timed,
@@ -48,11 +43,7 @@ fn make_part_with_timed(
             rows: 1,
             body: &body,
         }],
-        PartMeta {
-            min_ts,
-            max_ts,
-            source_id,
-        },
+        PartMeta { min_ts, max_ts },
     )
 }
 
@@ -122,11 +113,11 @@ fn seal_parts_without_reset(root: &Path, raw_id: i64, parts: &[&[u8]]) {
     seal(&journal, &owner, address).expect("seal test segment");
 }
 
-fn lifecycle_part(source_id: u64) -> Vec<u8> {
+fn lifecycle_part(variant: i32) -> Vec<u8> {
     let rows = [PgLogLifecycleV1 {
         ts: Ts(1_500),
         kind: 0,
-        pid: Some(42),
+        pid: Some(variant),
         signal: Some(9),
         shutdown_mode: None,
         message: None,
@@ -143,7 +134,6 @@ fn lifecycle_part(source_id: u64) -> Vec<u8> {
         PartMeta {
             min_ts: 1_500,
             max_ts: 1_500,
-            source_id,
         },
     )
 }
@@ -255,12 +245,10 @@ fn exact_active_part_open_is_independent_of_query_unit_deduplication() {
     let active = snapshot
         .open_active_part(descriptor)
         .expect("open exact active part");
-    assert_eq!(active.catalog().source_id, 7);
     let sealed = snapshot
         .unit_catalog(0)
         .expect("read sealed catalog")
         .expect("sealed catalog");
-    assert_eq!(sealed.source_id, active.catalog().source_id);
     assert_eq!(
         (sealed.min_ts, sealed.max_ts),
         (active.catalog().min_ts, active.catalog().max_ts)
@@ -325,12 +313,11 @@ fn same_name_replacement_invalidates_pinned_snapshot() {
     let replacement = refreshed
         .load_sealed_facts(0, &store, &LIMIT)
         .expect("replacement facts");
-    assert_eq!(replacement.facts().identity().pgm_source_id, 8);
     assert_eq!(replacement.origin(), FactOrigin::Rebuilt);
 }
 
 #[test]
-fn removed_source_is_not_resurrected_by_an_orphan_fact_file() {
+fn removed_segment_is_not_resurrected_by_an_orphan_fact_file() {
     let source = tempfile::tempdir().expect("source directory");
     let path = write_segment(source.path(), 1_500, &lifecycle_part(7));
     let store = FactStore::new(source.path());
@@ -397,7 +384,6 @@ fn live_part_is_visible_before_seal() {
     let units = snap.units();
     assert_eq!(units.len(), 1, "one live part expected");
     assert!(units[0].live, "part must be marked live");
-    assert_eq!(units[0].source_id, 1);
     assert_eq!(units[0].min_ts, 1000);
     assert_eq!(units[0].max_ts, 2000);
 }
@@ -607,7 +593,6 @@ fn exact_sealed_active_catalog_is_deduped_no_double() {
     let units = snap.units();
     assert_eq!(units.len(), 1, "exact active duplicate must be deduped");
     assert!(!units[0].live, "surviving unit must be the sealed one");
-    assert_eq!(units[0].source_id, 42);
 }
 
 #[test]
@@ -635,7 +620,7 @@ fn same_catalog_envelope_with_changed_value_does_not_hide_active_parts() {
     let second = make_part(3000, 4000, 42);
     seal_parts_without_reset(dir.path(), 1_000, &[&first, &second]);
 
-    let changed_second = make_part_with_timed(3000, 4000, 42, 1);
+    let changed_second = make_part_with_timed(3000, 4000, 1);
     let segment_id = SegmentId::new(1_000).expect("test segment id");
     fs::write(
         dir.path().join("active.parts"),
@@ -674,7 +659,6 @@ fn dictionary_only_aggregate_uses_the_sealers_zero_interval() {
         PartMeta {
             min_ts: i64::MAX,
             max_ts: i64::MIN,
-            source_id: 0,
         },
     );
     seal_parts_without_reset(dir.path(), 1_000, &[&dictionary_only]);
@@ -1096,7 +1080,7 @@ use kronika_writer::dict;
 /// Build a part with one `pg_stat_archiver` row (carrying a `StrId`) and
 /// the corresponding `dict.strings` section. Returns the part bytes and the
 /// interned `str_id` for the WAL file name.
-fn make_archiver_part_with_dict(min_ts: i64, max_ts: i64, source_id: u64) -> (Vec<u8>, u64) {
+fn make_archiver_part_with_dict(min_ts: i64, max_ts: i64, variant: i64) -> (Vec<u8>, u64) {
     let mut interner = Interner::new(DictLimits::new(256, 1 << 20).expect("limits"));
     let wal_id = interner
         .intern(b"000000010000000000000001")
@@ -1107,7 +1091,7 @@ fn make_archiver_part_with_dict(min_ts: i64, max_ts: i64, source_id: u64) -> (Ve
         archived_count: 5,
         last_archived_wal: Some(StrId(wal_id.get())),
         last_archived_time: Some(Ts(min_ts - 1000)),
-        failed_count: 0,
+        failed_count: variant,
         last_failed_wal: None,
         last_failed_time: None,
         stats_reset: None,
@@ -1134,14 +1118,7 @@ fn make_archiver_part_with_dict(min_ts: i64, max_ts: i64, source_id: u64) -> (Ve
         });
     }
 
-    let bytes = build_part(
-        &all,
-        PartMeta {
-            min_ts,
-            max_ts,
-            source_id,
-        },
-    );
+    let bytes = build_part(&all, PartMeta { min_ts, max_ts });
     (bytes, wal_id.get())
 }
 
@@ -1348,7 +1325,6 @@ fn open_unit_sealed_decodes_rows_and_catalog() {
     let snap = LocalDirSnapshot::open(dir.path()).unwrap();
     let unit = snap.open_unit(0).expect("open sealed unit");
     assert!(matches!(unit, OpenUnit::Sealed(_)));
-    assert_eq!(unit.catalog().source_id, 9);
 
     let archiver = unit
         .catalog()
@@ -1377,7 +1353,6 @@ fn open_unit_active_decodes_rows_and_catalog() {
     assert!(snap.units()[0].live);
     let unit = snap.open_unit(0).expect("open active unit");
     assert!(matches!(unit, OpenUnit::Active(_)));
-    assert_eq!(unit.catalog().source_id, 9);
 
     let archiver = unit
         .catalog()

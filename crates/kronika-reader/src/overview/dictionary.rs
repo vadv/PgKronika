@@ -563,7 +563,6 @@ mod tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 7,
             },
         );
         let reads = Rc::new(RefCell::new(Vec::new()));
@@ -632,7 +631,6 @@ mod tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 7,
             },
         );
         let reads = Rc::new(RefCell::new(Vec::new()));
@@ -670,7 +668,6 @@ mod tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 7,
             },
         );
         let reads = Rc::new(RefCell::new(Vec::new()));

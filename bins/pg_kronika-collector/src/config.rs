@@ -17,7 +17,6 @@ use crate::source_contracts::activity_dict_limits;
 pub(crate) struct Config {
     pub(crate) dsn: String,
     pub(crate) out_dir: PathBuf,
-    pub(crate) source_id: u64,
     pub(crate) session: SessionConfig,
     pub(crate) exclude_databases: HashSet<String>,
     /// Per-axis top-N row count for the `pg_stat_user_tables` candidate selection.
@@ -199,7 +198,6 @@ impl Config {
         let out_dir: PathBuf = std::env::var("KRONIKA_OUT_DIR")
             .context("KRONIKA_OUT_DIR is not set")?
             .into();
-        let source_id = env_u64("KRONIKA_SOURCE_ID", 0)?;
         let session = SessionConfig {
             statement_timeout_ms: env_u64("KRONIKA_PG_STATEMENT_TIMEOUT_MS", 15_000)?,
             lock_timeout_ms: env_u64("KRONIKA_PG_LOCK_TIMEOUT_MS", 1_000)?,
@@ -286,7 +284,6 @@ impl Config {
         Ok(Self {
             dsn,
             out_dir,
-            source_id,
             session,
             exclude_databases,
             max_tables,

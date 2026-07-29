@@ -452,8 +452,7 @@ pub fn notable_event_id(observation: &EventObservation) -> Option<[u8; 32]> {
     let time = observation.time();
     let mut hasher = Sha256::new();
     hasher.update(b"pgk-overview-event-fact-v1");
-    hasher.update(observation.source_id().to_le_bytes());
-    hasher.update(observation.source_type_id().to_le_bytes());
+    hasher.update(observation.section_type_id().to_le_bytes());
     hasher.update(time.sort_ts_us.to_le_bytes());
     match time.occurred_at_us {
         Some(occurred_at_us) => {
@@ -554,7 +553,7 @@ mod tests {
     };
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(1, [2; 32])
+        SegmentIdentity::sealed([2; 32])
     }
 
     fn provenance(row_ordinal: u32) -> ObservationProvenance {
@@ -612,8 +611,8 @@ mod tests {
     fn public_event_identity_ignores_lineage_but_retains_content() {
         let first = error_group(0, 1_000, Severity::Panic, ErrorCategory::System, None);
         let same_content = EventObservation::new(
-            SegmentIdentity::sealed(1, [9; 32]),
-            first.source_type_id(),
+            SegmentIdentity::sealed([9; 32]),
+            first.section_type_id(),
             ObservationProvenance {
                 section_body_id: SectionBodyId([0xCC; 32]),
                 catalog_entry_ordinal: 4,

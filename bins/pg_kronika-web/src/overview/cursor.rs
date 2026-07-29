@@ -1,9 +1,9 @@
 //! Opaque, authenticated pagination cursor for `/v1/timeline/events`.
 //!
 //! A cursor is a server-authenticated continuation token. It binds a canonical
-//! source set, query and three-part event position to one count/logical-byte/TTL
-//! bounded pinned [`IndexView`]. A continuation resolves that exact immutable
-//! view even when refresh has published a newer one.
+//! query and three-part event position to one count/logical-byte/TTL bounded
+//! pinned [`IndexView`]. A continuation resolves that exact immutable view even
+//! when refresh has published a newer one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -17,10 +17,10 @@ use subtle::ConstantTimeEq;
 use super::view::IndexView;
 
 /// The cursor encoding version.
-const CURSOR_VERSION: u16 = 2;
+const CURSOR_VERSION: u16 = 3;
 
 /// Length of the authenticated payload, in bytes.
-const PAYLOAD_LEN: usize = 2 + 16 + 8 + 8 + 32 + 32 + 32 + 8 + 32 + 32;
+const PAYLOAD_LEN: usize = 2 + 16 + 8 + 8 + 32 + 32 + 8 + 32 + 32;
 
 /// Length of the appended message authentication code, in bytes.
 const MAC_LEN: usize = 32;
@@ -72,7 +72,6 @@ struct RegistryInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct RegistryKey {
     fact_set_id: [u8; 32],
-    source_set_hash: [u8; 32],
 }
 
 /// Application-owned cursor key and bounded pinned-view registry.
@@ -115,7 +114,6 @@ impl CursorRegistry {
     pub(crate) fn pin(
         &self,
         view: Arc<IndexView>,
-        source_set_hash: [u8; 32],
         now_secs: u64,
     ) -> Result<CursorLease, CursorError> {
         if self.config.max_views == 0 || self.config.ttl_secs == 0 {
@@ -132,10 +130,7 @@ impl CursorRegistry {
             .checked_add(self.config.ttl_secs)
             .ok_or_else(capacity_unavailable)?;
         let fact_set_id = view.fact_set_id();
-        let registry_key = RegistryKey {
-            fact_set_id,
-            source_set_hash,
-        };
+        let registry_key = RegistryKey { fact_set_id };
         let mut inner = self
             .inner
             .lock()
@@ -197,13 +192,9 @@ impl CursorRegistry {
     pub(crate) fn resolve(
         &self,
         fact_set_id: [u8; 32],
-        source_set_hash: [u8; 32],
         now_secs: u64,
     ) -> Result<Arc<IndexView>, CursorError> {
-        let registry_key = RegistryKey {
-            fact_set_id,
-            source_set_hash,
-        };
+        let registry_key = RegistryKey { fact_set_id };
         let mut inner = self
             .inner
             .lock()
@@ -306,8 +297,6 @@ pub(crate) struct CursorLease {
 pub(crate) struct EventsCursor {
     /// The pinned view lease.
     pub(crate) lease: CursorLease,
-    /// Canonical selected-source-set hash.
-    pub(crate) source_set_hash: [u8; 32],
     /// The hash binding range, filters, order, and policy versions.
     pub(crate) query_hash: [u8; 32],
     /// The sort timestamp of the last item served.
@@ -342,7 +331,6 @@ impl EventsCursor {
         payload.extend_from_slice(&self.lease.issued_at.to_le_bytes());
         payload.extend_from_slice(&self.lease.expires_at.to_le_bytes());
         payload.extend_from_slice(&self.lease.fact_set_id);
-        payload.extend_from_slice(&self.source_set_hash);
         payload.extend_from_slice(&self.query_hash);
         payload.extend_from_slice(&self.last_ts_us.to_le_bytes());
         payload.extend_from_slice(&self.last_event_id);
@@ -358,14 +346,12 @@ impl EventsCursor {
     /// # Errors
     ///
     /// Returns [`CursorError::Invalid`] on a decode or authentication failure,
-    /// [`CursorError::QueryMismatch`] when the bound query or source set
-    /// differs, and [`CursorError::Expired`] when the lease is no longer
-    /// usable.
+    /// [`CursorError::QueryMismatch`] when the bound query differs, and
+    /// [`CursorError::Expired`] when the lease is no longer usable.
     pub(crate) fn decode(
         token: &str,
         registry: &CursorRegistry,
         expected_query_hash: [u8; 32],
-        expected_source_set_hash: [u8; 32],
         now_secs: u64,
     ) -> Result<Self, CursorError> {
         let bytes = URL_SAFE_NO_PAD
@@ -402,27 +388,22 @@ impl EventsCursor {
         let fact_set_id: [u8; 32] = payload[34..66]
             .try_into()
             .map_err(|_error| CursorError::Invalid)?;
-        let source_set_hash: [u8; 32] = payload[66..98]
-            .try_into()
-            .map_err(|_error| CursorError::Invalid)?;
-        let query_hash: [u8; 32] = payload[98..130]
+        let query_hash: [u8; 32] = payload[66..98]
             .try_into()
             .map_err(|_error| CursorError::Invalid)?;
         let last_ts_us = i64::from_le_bytes(
-            payload[130..138]
+            payload[98..106]
                 .try_into()
                 .map_err(|_error| CursorError::Invalid)?,
         );
-        let last_event_id: [u8; 32] = payload[138..170]
+        let last_event_id: [u8; 32] = payload[106..138]
             .try_into()
             .map_err(|_error| CursorError::Invalid)?;
-        let last_event_instance_id: [u8; 32] = payload[170..202]
+        let last_event_instance_id: [u8; 32] = payload[138..170]
             .try_into()
             .map_err(|_error| CursorError::Invalid)?;
 
-        if query_hash.ct_eq(&expected_query_hash).unwrap_u8() != 1
-            || source_set_hash.ct_eq(&expected_source_set_hash).unwrap_u8() != 1
-        {
+        if query_hash.ct_eq(&expected_query_hash).unwrap_u8() != 1 {
             return Err(CursorError::QueryMismatch);
         }
         if issued_at > expires_at || expires_at <= now_secs {
@@ -434,7 +415,6 @@ impl EventsCursor {
                 issued_at,
                 expires_at,
             },
-            source_set_hash,
             query_hash,
             last_ts_us,
             last_event_id,
@@ -511,7 +491,6 @@ mod tests {
                 issued_at: now_secs,
                 expires_at: now_secs + 300,
             },
-            source_set_hash: [2; 32],
             query_hash: [3; 32],
             last_ts_us: 1_234,
             last_event_id: [9; 32],
@@ -523,8 +502,7 @@ mod tests {
     fn a_round_trip_recovers_the_position() {
         let registry = registry();
         let token = cursor(100).encode(&registry);
-        let decoded =
-            EventsCursor::decode(&token, &registry, [3; 32], [2; 32], 101).expect("valid cursor");
+        let decoded = EventsCursor::decode(&token, &registry, [3; 32], 101).expect("valid cursor");
         assert_eq!(decoded, cursor(100));
     }
 
@@ -536,7 +514,7 @@ mod tests {
         token[last] ^= 0x01;
         let tampered = String::from_utf8(token).expect("ascii token");
         assert_eq!(
-            EventsCursor::decode(&tampered, &registry, [3; 32], [2; 32], 101),
+            EventsCursor::decode(&tampered, &registry, [3; 32], 101),
             Err(CursorError::Invalid)
         );
     }
@@ -546,7 +524,7 @@ mod tests {
         let registry = registry();
         let token = cursor(100).encode(&registry);
         assert_eq!(
-            EventsCursor::decode(&token, &registry, [4; 32], [2; 32], 101),
+            EventsCursor::decode(&token, &registry, [4; 32], 101),
             Err(CursorError::QueryMismatch)
         );
     }
@@ -556,7 +534,7 @@ mod tests {
         let registry = registry();
         let token = cursor(100).encode(&registry);
         assert_eq!(
-            EventsCursor::decode(&token, &registry, [3; 32], [2; 32], 401),
+            EventsCursor::decode(&token, &registry, [3; 32], 401),
             Err(CursorError::Expired)
         );
     }
@@ -567,35 +545,26 @@ mod tests {
         let second = registry();
         let token = cursor(100).encode(&first);
         assert_eq!(
-            EventsCursor::decode(&token, &second, [3; 32], [2; 32], 101),
+            EventsCursor::decode(&token, &second, [3; 32], 101),
             Err(CursorError::Expired)
         );
     }
 
     #[test]
-    fn a_registry_key_includes_the_canonical_source_set() {
+    fn a_registry_key_is_the_fact_set() {
         let registry = registry();
         let view = empty_view(1);
-        let lease = registry
-            .pin(Arc::clone(&view), [1; 32], 100)
-            .expect("pin view");
-        assert!(registry.resolve(lease.fact_set_id, [1; 32], 101).is_ok());
-        assert!(matches!(
-            registry.resolve(lease.fact_set_id, [2; 32], 101),
-            Err(CursorError::ViewGone)
-        ));
+        let lease = registry.pin(Arc::clone(&view), 100).expect("pin view");
+        assert!(registry.resolve(lease.fact_set_id, 101).is_ok());
     }
 
     #[test]
     fn a_future_generation_is_gone() {
         let registry = registry();
-        let source_set_hash = [1; 32];
-        registry
-            .pin(empty_view(6), source_set_hash, 100)
-            .expect("pin current view");
+        registry.pin(empty_view(6), 100).expect("pin current view");
         let future_fact_set_id = empty_view(7).fact_set_id();
         assert!(matches!(
-            registry.resolve(future_fact_set_id, source_set_hash, 101),
+            registry.resolve(future_fact_set_id, 101),
             Err(CursorError::ViewGone)
         ));
     }
@@ -608,17 +577,13 @@ mod tests {
             ttl_secs: 30,
         })
         .expect("registry");
-        let first = registry
-            .pin(empty_view(1), [1; 32], 100)
-            .expect("first pin");
-        let second = registry
-            .pin(empty_view(2), [1; 32], 101)
-            .expect("second pin");
+        let first = registry.pin(empty_view(1), 100).expect("first pin");
+        let second = registry.pin(empty_view(2), 101).expect("second pin");
         assert!(matches!(
-            registry.resolve(first.fact_set_id, [1; 32], 102),
+            registry.resolve(first.fact_set_id, 102),
             Err(CursorError::ViewGone)
         ));
-        assert!(registry.resolve(second.fact_set_id, [1; 32], 102).is_ok());
+        assert!(registry.resolve(second.fact_set_id, 102).is_ok());
     }
 
     #[test]
@@ -629,11 +594,11 @@ mod tests {
             ttl_secs: 10,
         })
         .expect("registry");
-        let lease = registry.pin(empty_view(1), [1; 32], 100).expect("pin");
-        assert!(registry.resolve(lease.fact_set_id, [1; 32], 109).is_ok());
+        let lease = registry.pin(empty_view(1), 100).expect("pin");
+        assert!(registry.resolve(lease.fact_set_id, 109).is_ok());
         registry.prune(110);
         assert!(matches!(
-            registry.resolve(lease.fact_set_id, [1; 32], 110),
+            registry.resolve(lease.fact_set_id, 110),
             Err(CursorError::ViewGone)
         ));
     }
@@ -651,7 +616,7 @@ mod tests {
         })
         .expect("registry");
         assert!(matches!(
-            below.pin(Arc::clone(&view), [1; 32], 100),
+            below.pin(Arc::clone(&view), 100),
             Err(CursorError::CapacityUnavailable)
         ));
 
@@ -661,8 +626,8 @@ mod tests {
             ttl_secs: 10,
         })
         .expect("registry");
-        let lease = exact.pin(view, [1; 32], 100).expect("exact charge fits");
-        assert!(exact.resolve(lease.fact_set_id, [1; 32], 101).is_ok());
+        let lease = exact.pin(view, 100).expect("exact charge fits");
+        assert!(exact.resolve(lease.fact_set_id, 101).is_ok());
     }
 
     #[test]

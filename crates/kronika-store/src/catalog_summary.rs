@@ -5,8 +5,8 @@ use kronika_format::TAIL_INDEX_LEN;
 use kronika_format::{Catalog, DecodeError, Entry, FORMAT_VERSION, MAGIC};
 use sha2::{Digest as _, Sha256};
 
-const LOGICAL_DIGEST_DOMAIN: &[u8] = b"pgk-overview-catalog-v1\0";
-const LAYOUT_DIGEST_DOMAIN: &[u8] = b"pgk-pgm-catalog-layout-v1\0";
+const LOGICAL_DIGEST_DOMAIN: &[u8] = b"pgk-overview-catalog-v2\0";
+const LAYOUT_DIGEST_DOMAIN: &[u8] = b"pgk-pgm-catalog-layout-v2\0";
 const TYPE_BLOOM_WORDS: usize = 8;
 const TYPE_BLOOM_HASHES: usize = 8;
 const TYPE_BLOOM_BITS: u64 = 512;
@@ -30,7 +30,6 @@ impl CatalogDigest {
         let entry_count = u32::try_from(catalog.entries.len())
             .expect("a decoded PGM catalog entry count always fits u32");
         catalog_digests(
-            catalog.source_id,
             catalog.min_ts,
             catalog.max_ts,
             catalog.format_version,
@@ -67,7 +66,6 @@ impl CatalogLayoutDigest {
         let entry_count = u32::try_from(catalog.entries.len())
             .expect("a decoded PGM catalog entry count always fits u32");
         catalog_digests(
-            catalog.source_id,
             catalog.min_ts,
             catalog.max_ts,
             catalog.format_version,
@@ -92,8 +90,6 @@ pub struct CatalogSummary {
     pub min_ts: i64,
     /// Maximal timestamp of the segment, unix microseconds.
     pub max_ts: i64,
-    /// `str_id` of `{cluster_id}/{pg_system_identifier}`; 0 = not set.
-    pub source_id: u64,
     /// Number of ordered catalog entries.
     pub entry_count: u32,
     /// Container format version.
@@ -134,7 +130,6 @@ impl CatalogSummary {
             validate_entry_bounds(entry, body_end)?;
         }
         let (logical_digest, layout_digest) = catalog_digests(
-            view.source_id,
             view.min_ts,
             view.max_ts,
             view.format_version,
@@ -146,7 +141,6 @@ impl CatalogSummary {
         Ok(Self {
             min_ts: view.min_ts,
             max_ts: view.max_ts,
-            source_id: view.source_id,
             entry_count: view.entry_count,
             format_version: view.format_version,
             window_count: view.window_count,
@@ -170,7 +164,6 @@ impl CatalogSummary {
         let entry_count = u32::try_from(catalog.entries.len())
             .expect("a decoded PGM catalog entry count always fits u32");
         let (logical_digest, layout_digest) = catalog_digests(
-            catalog.source_id,
             catalog.min_ts,
             catalog.max_ts,
             catalog.format_version,
@@ -182,7 +175,6 @@ impl CatalogSummary {
         Self {
             min_ts: catalog.min_ts,
             max_ts: catalog.max_ts,
-            source_id: catalog.source_id,
             entry_count,
             format_version: catalog.format_version,
             window_count: catalog.window_count,
@@ -257,7 +249,6 @@ impl std::error::Error for CatalogSummaryError {
 /// Derives the logical and offset-sensitive identities of ordered entries.
 #[must_use]
 pub fn catalog_digests(
-    source_id: u64,
     min_ts: i64,
     max_ts: i64,
     format_version: u32,
@@ -267,7 +258,6 @@ pub fn catalog_digests(
 ) -> (CatalogDigest, CatalogLayoutDigest) {
     let mut logical = Sha256::new();
     logical.update(LOGICAL_DIGEST_DOMAIN);
-    logical.update(source_id.to_le_bytes());
     logical.update(min_ts.to_le_bytes());
     logical.update(max_ts.to_le_bytes());
     logical.update(format_version.to_le_bytes());
@@ -276,7 +266,6 @@ pub fn catalog_digests(
 
     let mut layout = Sha256::new();
     layout.update(LAYOUT_DIGEST_DOMAIN);
-    layout.update(source_id.to_le_bytes());
     layout.update(min_ts.to_le_bytes());
     layout.update(max_ts.to_le_bytes());
     layout.update(format_version.to_le_bytes());
@@ -385,7 +374,6 @@ mod tests {
             ],
             min_ts: 100,
             max_ts: 200,
-            source_id: 7,
             format_version: FORMAT_VERSION,
             window_count: 3,
         }

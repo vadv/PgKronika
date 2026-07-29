@@ -50,7 +50,7 @@ pub(crate) async fn run_log_only_cycle(
         commit_log_collection(log_collector, Some(&collection), config);
         return Ok(Vec::new());
     }
-    let flushed = encode_window(buffers, &interner, config)?;
+    let flushed = encode_window(buffers, &interner)?;
     let sealed = append_window_and_maybe_seal(
         journal,
         writer_owner,

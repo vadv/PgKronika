@@ -663,10 +663,9 @@ impl AppState {
     pub(crate) fn select_overview(
         &self,
         view: Arc<overview::view::DescriptorView>,
-        sources: &[u64],
         range: kronika_analytics::overview::CoverageSpan,
     ) -> Result<SelectedSealedPlan, overview::selection::SelectionError> {
-        SelectedSealedPlan::build(view, sources, range, self.max_selected_segments)
+        SelectedSealedPlan::build(view, range, self.max_selected_segments)
     }
 
     pub(crate) async fn load_overview_selection(
@@ -831,7 +830,6 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .route("/v1/timeline/heatmap", get(ui::handlers::heatmap))
         .route("/v1/anomalies", get(handlers::anomalies::anomalies))
         .route("/v1/incidents", get(handlers::incidents::incidents))
-        .route("/v1/sources", get(handlers::v1::sources))
         .route("/v1/ui/catalog", get(ui::handlers::catalog))
         .route("/v1/views/summary", get(ui::handlers::summary))
         .route("/v1/sections", get(handlers::v1::sections))

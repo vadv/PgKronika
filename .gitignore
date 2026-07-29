@@ -1,5 +1,6 @@
 /target
 __pycache__/
+.DS_Store
 
 # SDD scratch (progress ledger, task briefs)
 .superpowers/

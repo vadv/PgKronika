@@ -44,7 +44,6 @@ use sha2 as _;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const SOURCE: u64 = 7;
 const SECOND: i64 = 1_000_000;
 const FIRST_WINDOW_US: i64 = 0;
 /// Snapshot cadence of the synthetic fixtures: one row per series each 10 s.
@@ -158,7 +157,6 @@ fn build_two_section_fixture(dir: &Path) {
         PartMeta {
             min_ts: FIRST_WINDOW_US,
             max_ts: i64::try_from(snapshots).expect("fits") * STEP,
-            source_id: SOURCE,
         },
     );
     let root = DataRoot::open(dir).expect("open fixture root");
@@ -191,7 +189,6 @@ fn bench_batch_vs_single(c: &mut Criterion) {
             let cursors = BTreeMap::new();
             let pages = sections(
                 &mut snap,
-                SOURCE,
                 i64::MIN,
                 i64::MAX,
                 &TWO_SECTIONS,
@@ -206,7 +203,7 @@ fn bench_batch_vs_single(c: &mut Criterion) {
         b.iter(|| {
             for name in TWO_SECTIONS {
                 let mut snap = snap.clone();
-                let page = section(&mut snap, name, SOURCE, i64::MIN, i64::MAX, 1_000_000, None)
+                let page = section(&mut snap, name, i64::MIN, i64::MAX, 1_000_000, None)
                     .expect("single query");
                 black_box(page);
             }

@@ -166,11 +166,11 @@ fn process_pss_is_not_collected_even_when_process_input_exists() {
 }
 
 #[tokio::test]
-async fn ui_catalog_returns_nine_views_for_a_known_source() {
+async fn ui_catalog_returns_nine_views_for_the_root() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "known.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "known.pgm", 1_000, 2_000);
 
-    let response = serve_captured(dir.path(), "/v1/ui/catalog?source=7", &[]).await;
+    let response = serve_captured(dir.path(), "/v1/ui/catalog", &[]).await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.body["revision"], 1);
     assert_eq!(
@@ -187,9 +187,9 @@ async fn ui_catalog_returns_nine_views_for_a_known_source() {
 #[tokio::test]
 async fn ui_catalog_keeps_pss_not_collected() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "known.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "known.pgm", 1_000, 2_000);
 
-    let (status, body) = serve(dir.path(), "/v1/ui/catalog?source=7").await;
+    let (status, body) = serve(dir.path(), "/v1/ui/catalog").await;
     assert_eq!(status, StatusCode::OK);
     let pss = body["views"]
         .as_array()
@@ -203,26 +203,26 @@ async fn ui_catalog_keeps_pss_not_collected() {
 }
 
 #[tokio::test]
-async fn ui_catalog_unknown_source_is_not_found() {
+async fn ui_catalog_rejects_the_removed_source_parameter() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "known.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "known.pgm", 1_000, 2_000);
 
     let (status, body) = serve(dir.path(), "/v1/ui/catalog?source=8").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_problem(
         &body,
         status,
-        "unknown_source",
-        serde_json::json!({ "source": 8 }),
+        "unknown_query_parameter",
+        serde_json::json!({ "parameter": "source" }),
     );
 }
 
 #[tokio::test]
 async fn ui_catalog_rejects_unknown_parameters() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "known.pgm", 7, 1_000, 2_000);
+    write_bgwriter_segment(dir.path(), "known.pgm", 1_000, 2_000);
 
-    let (status, body) = serve(dir.path(), "/v1/ui/catalog?source=7&extra=1").await;
+    let (status, body) = serve(dir.path(), "/v1/ui/catalog?extra=1").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_problem(
         &body,
@@ -235,8 +235,8 @@ async fn ui_catalog_rejects_unknown_parameters() {
 #[tokio::test]
 async fn ui_catalog_honors_if_none_match() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "known.pgm", 7, 1_000, 2_000);
-    let first = serve_captured(dir.path(), "/v1/ui/catalog?source=7", &[]).await;
+    write_bgwriter_segment(dir.path(), "known.pgm", 1_000, 2_000);
+    let first = serve_captured(dir.path(), "/v1/ui/catalog", &[]).await;
     let etag = first
         .headers
         .get(header::ETAG)
@@ -248,7 +248,7 @@ async fn ui_catalog_honors_if_none_match() {
     let response = app(state, None, test_metrics_handle())
         .oneshot(
             Request::builder()
-                .uri("/v1/ui/catalog?source=7")
+                .uri("/v1/ui/catalog")
                 .header(header::IF_NONE_MATCH, etag)
                 .body(Body::empty())
                 .expect("request"),

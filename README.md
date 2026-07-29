@@ -97,10 +97,9 @@ KRONIKA_WEB_ADDR=127.0.0.1:8688 \
 ./target/x86_64-unknown-linux-gnu/debug/pg_kronika-web
 ```
 
-List the recorded sources and available sections:
+List the available sections:
 
 ```sh
-curl -sS http://127.0.0.1:8688/v1/sources
 curl -sS http://127.0.0.1:8688/v1/sections
 ```
 

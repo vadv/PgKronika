@@ -1,7 +1,7 @@
 //! Opaque keyset-pagination cursor.
 //!
-//! A [`Cursor`] pins the last row a page returned: its `source_id` plus that
-//! row's values on the logical section's union columns. Resuming a query drops
+//! A [`Cursor`] pins the last row a page returned through that row's values on
+//! the logical section's union columns. Resuming a query drops
 //! every row at or before this position under the section's total order, so
 //! pages tile the stream with no gap or repeat even across unit boundaries.
 //!
@@ -15,8 +15,6 @@ use crate::query::value::Value;
 /// A resume point for keyset pagination over one logical section.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cursor {
-    /// Source the paged rows belong to; a resume against another source fails.
-    pub(crate) source_id: u64,
     /// Last returned row's values, in union-column order.
     pub(crate) values: Vec<Value>,
 }
@@ -38,7 +36,6 @@ impl Cursor {
     #[must_use]
     pub fn encode(&self) -> String {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.source_id.to_le_bytes());
         bytes.extend_from_slice(&(self.values.len() as u64).to_le_bytes());
         for value in &self.values {
             encode_value(value, &mut bytes);
@@ -55,7 +52,6 @@ impl Cursor {
     pub fn decode(s: &str) -> Result<Self, QueryError> {
         let bytes = hex_decode(s)?;
         let mut reader = ByteReader::new(&bytes);
-        let source_id = reader.take_u64()?;
         // The count is untrusted, so grow the vec as values arrive rather than
         // pre-sizing to a length a malformed cursor could inflate.
         let count = reader.take_u64()?;
@@ -66,7 +62,7 @@ impl Cursor {
         if !reader.is_empty() {
             return Err(QueryError::BadCursor("trailing bytes after cursor".into()));
         }
-        Ok(Self { source_id, values })
+        Ok(Self { values })
     }
 }
 
@@ -287,7 +283,6 @@ mod tests {
     #[test]
     fn round_trip_preserves_every_value_variant() {
         let cursor = Cursor {
-            source_id: 42,
             values: all_variants(),
         };
         let decoded = Cursor::decode(&cursor.encode()).expect("decode");
@@ -296,10 +291,7 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_empty_values() {
-        let cursor = Cursor {
-            source_id: 0,
-            values: Vec::new(),
-        };
+        let cursor = Cursor { values: Vec::new() };
         let decoded = Cursor::decode(&cursor.encode()).expect("decode");
         assert_eq!(decoded, cursor);
     }
@@ -307,7 +299,6 @@ mod tests {
     #[test]
     fn encode_is_stable_for_the_same_position() {
         let cursor = Cursor {
-            source_id: 7,
             values: all_variants(),
         };
         assert_eq!(cursor.encode(), cursor.encode());
@@ -316,7 +307,6 @@ mod tests {
     #[test]
     fn encode_is_url_safe() {
         let cursor = Cursor {
-            source_id: u64::MAX,
             values: all_variants(),
         };
         let encoded = cursor.encode();
@@ -340,14 +330,14 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_body() {
-        // Two hex digits: one byte, far short of the source_id header.
+        // Two hex digits: one byte, far short of the item-count header.
         let err = Cursor::decode("ff").unwrap_err();
         assert!(matches!(err, QueryError::BadCursor(_)), "got {err:?}");
     }
 
     #[test]
     fn decode_rejects_unknown_tag() {
-        // source_id (8 bytes) + count 1 (8 bytes) + tag 0xFF (no such variant).
+        // Count 1 (8 bytes) + tag 0xFF (no such variant).
         let mut bytes = vec![0_u8; 8];
         bytes.extend_from_slice(&1_u64.to_le_bytes());
         bytes.push(0xff);
@@ -358,7 +348,6 @@ mod tests {
     #[test]
     fn decode_rejects_trailing_bytes() {
         let cursor = Cursor {
-            source_id: 1,
             values: vec![Value::I64(1)],
         };
         let mut encoded = cursor.encode();

@@ -31,8 +31,7 @@ async fn diff_column_points(
 ) -> Result<Vec<serde_json::Value>> {
     let segment = world.harness.segment()?.clone();
     let dir = segment.data_root();
-    let source = web::only_source(dir).await?;
-    let diff = web::section_diff(dir, section, source).await?;
+    let diff = web::section_diff(dir, section).await?;
     let series = diff["series"]
         .as_array()
         .context("`series` is not an array")?;
@@ -200,7 +199,7 @@ async fn web_reports_anomaly_episode(
 ) -> Result<()> {
     let segment = world.harness.segment()?.clone();
     let dir = segment.data_root();
-    let (source, min_ts, max_ts) = web::source_span(dir).await?;
+    let (min_ts, max_ts) = web::store_span(dir)?;
     let period = max_ts - min_ts;
     // A sixth of the period: four-five points per window over a ~30-snapshot
     // run, so the burst points own the window median while the reference
@@ -208,7 +207,7 @@ async fn web_reports_anomaly_episode(
     // whole BDD period is a few seconds long.
     let window_ms = (period / 6 / 1_000).max(1);
 
-    let query = format!("source={source}&from={min_ts}&to={max_ts}&window={window_ms}ms&limit=200");
+    let query = format!("from={min_ts}&to={max_ts}&window={window_ms}ms&limit=200");
     let body = web::anomalies(dir, &query).await?;
     let episodes = body["episodes"]
         .as_array()
@@ -219,7 +218,7 @@ async fn web_reports_anomaly_episode(
     });
     let Some(episode) = found else {
         // The series itself explains a miss better than the episode list.
-        let diff = web::section_diff(dir, &section, source).await?;
+        let diff = web::section_diff(dir, &section).await?;
         anyhow::bail!("no episode for {section}.{column}; diff: {diff}; body: {body}");
     };
     ensure!(

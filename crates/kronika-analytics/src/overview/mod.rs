@@ -82,9 +82,8 @@ pub use reduce::{
 
 /// Fact-container framing version.
 ///
-/// Version 2 stores the fact key and segment lineage in each sibling sidecar
-/// header.
-pub const CONTAINER_VERSION: u16 = 2;
+/// Version 3 stores single-root provenance without a numeric source namespace.
+pub const CONTAINER_VERSION: u16 = 3;
 
 /// Canonical fact schema version.
 ///

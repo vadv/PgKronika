@@ -104,7 +104,6 @@ async fn fixture_request_captured(
         PartMeta {
             min_ts: 1_000,
             max_ts: 2_000,
-            source_id: 7,
         },
     );
     let dir = tempfile::tempdir().expect("tempdir");
@@ -263,13 +262,7 @@ pub(crate) fn bgwriter_row(ts: i64) -> BgwriterCheckpointer {
 }
 
 /// Write a one-row `pg_stat_bgwriter + pg_stat_checkpointer` segment.
-fn write_bgwriter_segment(
-    dir: &std::path::Path,
-    file: &str,
-    source: u64,
-    min_ts: i64,
-    max_ts: i64,
-) {
+fn write_bgwriter_segment(dir: &std::path::Path, file: &str, min_ts: i64, max_ts: i64) {
     let body = BgwriterCheckpointer::encode(&[bgwriter_row(min_ts)]).expect("encode section");
     let bytes = build_part(
         &[SectionInput {
@@ -277,11 +270,7 @@ fn write_bgwriter_segment(
             rows: 1,
             body: &body,
         }],
-        PartMeta {
-            min_ts,
-            max_ts,
-            source_id: source,
-        },
+        PartMeta { min_ts, max_ts },
     );
     crate::test_layout::write_named_pgm(dir, file, &bytes);
 }
@@ -322,7 +311,6 @@ fn write_archiver_spike_segment(dir: &std::path::Path) -> i64 {
         PartMeta {
             min_ts: 0,
             max_ts: to,
-            source_id: 7,
         },
     );
     crate::test_layout::write_named_pgm(dir, "0.pgm", &bytes);

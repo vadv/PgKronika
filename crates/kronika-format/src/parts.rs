@@ -584,8 +584,6 @@ pub struct PartMeta {
     pub min_ts: i64,
     /// Maximal timestamp across the part's rows, unix microseconds.
     pub max_ts: i64,
-    /// `str_id` of `{cluster_id}/{pg_system_identifier}`; 0 = not set.
-    pub source_id: u64,
 }
 
 /// Assemble section bodies into a self-contained PGM part.
@@ -625,7 +623,6 @@ pub fn build_part(sections: &[SectionInput<'_>], meta: PartMeta) -> Vec<u8> {
         entries,
         min_ts: meta.min_ts,
         max_ts: meta.max_ts,
-        source_id: meta.source_id,
         format_version: crate::FORMAT_VERSION,
         window_count: 1,
     };
@@ -1814,7 +1811,6 @@ mod streaming_tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 7,
             },
         )
     }
@@ -2281,7 +2277,6 @@ mod tests {
             }],
             min_ts: 1,
             max_ts: 2,
-            source_id: 0,
             format_version: crate::FORMAT_VERSION,
             window_count: 1,
         };
@@ -2392,7 +2387,6 @@ mod tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 0,
             },
         );
 
@@ -2425,7 +2419,6 @@ mod tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 0,
             },
         );
 
@@ -2452,16 +2445,12 @@ mod tests {
             PartMeta {
                 min_ts: 100,
                 max_ts: 900,
-                source_id: 42,
             },
         );
 
         let catalog = validate_part(&part).expect("built part is valid");
         assert_eq!(catalog.entries.len(), 2);
-        assert_eq!(
-            (catalog.min_ts, catalog.max_ts, catalog.source_id),
-            (100, 900, 42)
-        );
+        assert_eq!((catalog.min_ts, catalog.max_ts), (100, 900));
         assert_eq!(catalog.entries[0].type_id, 1_006_001);
         assert_eq!(catalog.entries[0].rows, 3);
         assert_eq!(catalog.entries[0].offset, MAGIC.len() as u64);
@@ -2481,7 +2470,6 @@ mod tests {
             PartMeta {
                 min_ts: 0,
                 max_ts: 0,
-                source_id: 0,
             },
         );
         let catalog = validate_part(&part).expect("empty part is valid");
@@ -2499,7 +2487,6 @@ mod tests {
             PartMeta {
                 min_ts: 1,
                 max_ts: 2,
-                source_id: 0,
             },
         );
         let report = scan_journal(&frame(&part), small_limits());
@@ -2620,7 +2607,6 @@ mod tests {
             }],
             min_ts: 1,
             max_ts: 2,
-            source_id: 0,
             format_version: crate::FORMAT_VERSION,
             window_count: 1,
         };

@@ -20,7 +20,7 @@ use crate::{Section, StrId, Ts};
     id = 1_023_001,
     name = "collection_coverage",
     semantics = snapshot_full,
-    sort_key("source_type_id", "ts")
+    sort_key("section_type_id", "ts")
 )]
 pub struct CollectionCoverageV1 {
     /// Collection time, unix microseconds.
@@ -28,7 +28,7 @@ pub struct CollectionCoverageV1 {
     pub ts: Ts,
     /// `type_id` of the truncated section.
     #[column(l)]
-    pub source_type_id: u32,
+    pub section_type_id: u32,
     /// Known lower bound for rows in the source at collection time.
     #[column(g)]
     pub total: u32,
@@ -61,7 +61,7 @@ mod tests {
     fn row(source: u32) -> CollectionCoverageV1 {
         CollectionCoverageV1 {
             ts: Ts(1_000_000),
-            source_type_id: source,
+            section_type_id: source,
             total: 4_000,
             unknown_total: false,
             collected: 500,
@@ -82,7 +82,7 @@ mod tests {
         let c = CollectionCoverageV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_023_001);
         assert_eq!(c.columns.len(), 9);
-        assert_eq!(c.sort_key, ["source_type_id", "ts"]);
+        assert_eq!(c.sort_key, ["section_type_id", "ts"]);
         assert_eq!(
             c.column("unknown_total").map(|col| col.nullable),
             Some(false)
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn roundtrip_preserves_values_and_nulls() {
         let union_axes = CollectionCoverageV1 {
-            source_type_id: 1_013_003,
+            section_type_id: 1_013_003,
             cutoff_value: None,
             reason: 1,
             ..row(1_013_003)

@@ -51,7 +51,7 @@ fn push_log_collection_buffers_source_status() {
     .expect("buffer status");
     let dictionaries = dict::encode(interner.window()).expect("encode dictionary");
     let part = buffers
-        .flush(&dictionaries, 7)
+        .flush(&dictionaries)
         .expect("flush status")
         .expect("status creates a part");
     let catalog = kronika_format::validate_part(&part).expect("valid PGM");
@@ -87,7 +87,7 @@ fn source_status_survives_a_full_dictionary_without_its_path() {
     assert_eq!(dropped, 1);
     let dictionaries = dict::encode(interner.window()).expect("encode dictionary");
     let part = buffers
-        .flush(&dictionaries, 7)
+        .flush(&dictionaries)
         .expect("flush status")
         .expect("status row remains");
     let catalog = kronika_format::validate_part(&part).expect("valid PGM");
@@ -158,7 +158,7 @@ fn push_activity_buffers_rows_and_interns_their_strings() {
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     assert!(!dict_sections.is_empty(), "strings reached the dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -233,7 +233,7 @@ fn push_database_buffers_rows_and_interns_datname() {
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     assert!(!dict_sections.is_empty(), "datname was interned");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -321,7 +321,7 @@ fn push_user_tables_buffers_rows_and_interns_strings() {
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     assert!(!dict_sections.is_empty(), "strings reached the dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -383,7 +383,7 @@ fn push_user_indexes_buffers_rows_and_interns_strings() {
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     assert!(!dict_sections.is_empty(), "strings reached the dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -473,7 +473,7 @@ fn push_statements_buffers_rows_and_interns_strings() {
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     assert!(!dict_sections.is_empty(), "strings reached the dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -596,7 +596,7 @@ fn push_progress_vacuum_buffers_rows_and_interns_labels() {
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     assert!(!dict_sections.is_empty(), "labels reached the dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -620,7 +620,7 @@ fn push_prepared_xacts_buffers_rows_and_interns_datname() {
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     assert!(!dict_sections.is_empty(), "datname reached the dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -646,7 +646,7 @@ fn push_archiver_buffers_row_and_interns_wal_names() {
         "wal names reached the dictionary"
     );
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -675,7 +675,7 @@ fn push_io_buffers_rows_and_interns_labels() {
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     assert!(!dict_sections.is_empty(), "labels reached the dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -702,7 +702,7 @@ fn push_replication_instance_buffers_row_and_interns_labels() {
         "replication labels reached the dictionary"
     );
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -771,7 +771,7 @@ fn push_locks_buffers_v2_row_into_1_011_002_section() {
 
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");
@@ -799,7 +799,7 @@ fn push_locks_buffers_v1_row_into_1_011_001_section() {
 
     let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
     let part = buffers
-        .flush(&dict_sections, 0)
+        .flush(&dict_sections)
         .expect("flush encodes the window")
         .expect("buffered rows produce a part");
     let catalog = kronika_format::validate_part(&part).expect("a valid container");

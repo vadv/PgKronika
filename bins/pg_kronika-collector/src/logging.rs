@@ -566,12 +566,11 @@ pub(crate) fn summary_rows(summary: &FlushSummary) -> u64 {
     rows
 }
 
-pub(crate) fn log_flush_summary(summary: &FlushSummary, source_id: u64, elapsed: Duration) {
+pub(crate) fn log_flush_summary(summary: &FlushSummary, elapsed: Duration) {
     log_event(
         LogLevel::Debug,
         "window_encoded",
         &[
-            field("source_id", source_id),
             field("sections", summary.sections.len()),
             field("section_rows", summary_rows(summary)),
             field("part_bytes", summary.part_bytes),

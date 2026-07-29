@@ -57,7 +57,6 @@ pub(crate) fn metric_labels(method: &str, matched_path: Option<&str>) -> (String
         Some("/v1/timeline/health") => "/v1/timeline/health",
         Some("/v1/anomalies") => "/v1/anomalies",
         Some("/v1/incidents") => "/v1/incidents",
-        Some("/v1/sources") => "/v1/sources",
         Some("/v1/sections") => "/v1/sections",
         Some("/v1/segments") => "/v1/segments",
         Some("/v1/section/{name}") => "/v1/section/{name}",

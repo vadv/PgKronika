@@ -4,9 +4,8 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, RawQuery, State};
 use kronika_reader::{
-    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, SourceSummaryError,
-    SourceSummaryLimits, SourceSummaryResource, apply_collection_gating, diff_section,
-    gate_readings, logical_section, section, sections as query_sections, source_summaries,
+    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_collection_gating,
+    diff_section, gate_readings, logical_section, section, sections as query_sections,
 };
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
@@ -15,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::params::{
-    QueryParams, parse_cursor, parse_i64, parse_limit, parse_u64, query_error_response,
+    QueryParams, parse_cursor, parse_i64, parse_limit, query_error_response,
     query_error_response_without_cursor,
 };
 use crate::problem::{ApiProblem, ExpectedValue, LimitResource, QueryParameter, count_u64};
@@ -27,27 +26,20 @@ use crate::serialize::{
 /// single request cannot pull an unbounded section into memory.
 pub(crate) const DIFF_MAX_ROWS: usize = 262_144;
 
-const RANGE_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
-    QueryParameter::From,
-    QueryParameter::To,
-];
+const RANGE_PARAMS: &[QueryParameter] = &[QueryParameter::From, QueryParameter::To];
 const PAGE_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
     QueryParameter::From,
     QueryParameter::To,
     QueryParameter::Limit,
     QueryParameter::Cursor,
 ];
 const BATCH_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
     QueryParameter::From,
     QueryParameter::To,
     QueryParameter::Names,
     QueryParameter::Limit,
 ];
 const BATCH_DIFF_PARAMS: &[QueryParameter] = &[
-    QueryParameter::Source,
     QueryParameter::From,
     QueryParameter::To,
     QueryParameter::Names,
@@ -61,163 +53,6 @@ pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiP
     Ok(Json(
         json!({ "api": "v1", "format_version": crate::FORMAT_VERSION }),
     ))
-}
-
-/// `GET /v1/sources` — every source in the store and its overall time span.
-pub(crate) async fn sources(
-    State(state): State<AppState>,
-    RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiProblem> {
-    QueryParams::parse(raw.as_deref(), &[])?;
-    let permit = state
-        .try_acquire_analytic()
-        .map_err(|_capacity| ApiProblem::analytic_capacity_unavailable())?;
-    let published = state.snapshot();
-    let summaries = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let mut snapshot = published.as_ref().clone();
-        source_summaries(&mut snapshot, SourceSummaryLimits::default())
-    })
-    .await
-    .map_err(|join| {
-        let problem = ApiProblem::internal_error();
-        tracing::error!(
-            event = "api_source_summary_worker_failed",
-            request_id = problem.request_id(),
-            error = ?join,
-            "source summary worker failed"
-        );
-        problem
-    })?
-    .map_err(|error| source_summary_error_response(&error))?;
-
-    let mut sources = Vec::with_capacity(summaries.len());
-    for summary in summaries {
-        let pg_log = pg_log_status_json(summary.latest_status.as_ref());
-        sources.push(json!({
-            "source_id": summary.source_id,
-            "min_ts": summary.min_ts,
-            "max_ts": summary.max_ts,
-            "segments": summary.segments,
-            "pg_log": pg_log,
-        }));
-    }
-    Ok(Json(json!({ "sources": sources })))
-}
-
-fn source_summary_error_response(error: &SourceSummaryError) -> ApiProblem {
-    match error {
-        SourceSummaryError::LimitExceeded {
-            resource,
-            limit,
-            observed,
-        } => {
-            let resource = match resource {
-                SourceSummaryResource::Units => LimitResource::Units,
-                SourceSummaryResource::Rows => LimitResource::Rows,
-                SourceSummaryResource::Bytes => LimitResource::Bytes,
-            };
-            ApiProblem::query_limit_exceeded(resource, *limit, Some(*observed))
-        }
-        SourceSummaryError::IncompleteSnapshot {
-            unit_idx,
-            refreshes,
-        } => {
-            let problem = ApiProblem::store_read_failed();
-            tracing::warn!(
-                event = "api_source_summary_incomplete_snapshot",
-                request_id = problem.request_id(),
-                unit_idx,
-                refreshes,
-                "source summary remained stale after bounded retries"
-            );
-            problem
-        }
-        SourceSummaryError::Read(read) => {
-            let problem = ApiProblem::store_read_failed();
-            tracing::error!(
-                event = "api_store_read_failed",
-                request_id = problem.request_id(),
-                error = %read,
-                "source summary failed"
-            );
-            problem
-        }
-    }
-}
-
-fn unknown_pg_log_status() -> Value {
-    json!({
-        "state": "unknown",
-        "reason": "no_status",
-        "observed_at": null,
-        "parser": null,
-        "source_path": null,
-    })
-}
-
-fn reader_field<'a>(
-    row: &'a kronika_reader::OutRow,
-    name: &str,
-) -> Option<&'a kronika_reader::Value> {
-    row.iter()
-        .find(|(column, _)| column == name)
-        .map(|(_, value)| value)
-}
-
-fn pg_log_status_json(row: Option<&kronika_reader::OutRow>) -> Value {
-    let Some(row) = row else {
-        return unknown_pg_log_status();
-    };
-    let Some(kronika_reader::Value::Ts(observed_at)) = reader_field(row, "ts") else {
-        return unknown_pg_log_status();
-    };
-    let Some(kronika_reader::Value::U64(state)) = reader_field(row, "state") else {
-        return unknown_pg_log_status();
-    };
-    let Some(kronika_reader::Value::U64(reason)) = reader_field(row, "reason") else {
-        return unknown_pg_log_status();
-    };
-    let Some(kronika_reader::Value::U64(parser)) = reader_field(row, "parser_kind") else {
-        return unknown_pg_log_status();
-    };
-    let state = match *state {
-        0 => "collecting",
-        1 => "collecting_degraded",
-        2 => "unavailable",
-        3 => "disabled",
-        _ => return unknown_pg_log_status(),
-    };
-    let reason = match *reason {
-        0 => "none",
-        1 => "postgres_unavailable",
-        2 => "no_current_logfile",
-        3 => "unsupported_format",
-        4 => "discovery_query_failed",
-        5 => "missing_file",
-        6 => "permission_denied",
-        7 => "read_error",
-        _ => return unknown_pg_log_status(),
-    };
-    let parser = match *parser {
-        0 => "stderr",
-        1 => "csvlog",
-        2 => "unknown",
-        _ => return unknown_pg_log_status(),
-    };
-    let source_path = match reader_field(row, "source_path") {
-        Some(kronika_reader::Value::Str(path)) => Value::String(path.clone()),
-        Some(kronika_reader::Value::Blob { text, .. }) => Value::String(text.clone()),
-        Some(kronika_reader::Value::Null) | None => Value::Null,
-        _ => return unknown_pg_log_status(),
-    };
-    json!({
-        "state": state,
-        "reason": reason,
-        "observed_at": observed_at,
-        "parser": parser,
-        "source_path": source_path,
-    })
 }
 
 /// `GET /v1/sections` — static catalog of section types from the registry.
@@ -259,14 +94,13 @@ pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, Api
     Ok(Json(json!({ "sections": sections })))
 }
 
-/// `GET /v1/segments?source&from&to` — segments of `source` overlapping the
+/// `GET /v1/segments?from&to` — segments overlapping the
 /// window, catalog metadata only (no section bodies decoded).
 pub(crate) async fn segments(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiProblem> {
     let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
-    let source = parse_u64(&params, QueryParameter::Source)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
 
@@ -274,7 +108,7 @@ pub(crate) async fn segments(
     let units = snapshot.units();
     let mut out = Vec::new();
     for (idx, unit) in units.iter().enumerate() {
-        if unit.source_id != source || unit.max_ts < from || unit.min_ts > to {
+        if unit.max_ts < from || unit.min_ts > to {
             continue;
         }
         let Some(catalog) = snapshot
@@ -299,7 +133,6 @@ pub(crate) async fn segments(
             .collect();
         out.push(json!({
             "segment_id": unit.min_ts.to_string(),
-            "source_id": unit.source_id,
             "min_ts": unit.min_ts,
             "max_ts": unit.max_ts,
             "sections": sections,
@@ -308,7 +141,7 @@ pub(crate) async fn segments(
     Ok(Json(json!({ "segments": out })))
 }
 
-/// `GET /v1/section/{name}?source&from&to&limit` — one section's rows over the
+/// `GET /v1/section/{name}?from&to&limit` — one section's rows over the
 /// window, decoded and serialized to JSON.
 ///
 /// The reader does the query (ts filter, sort, union columns, gaps); this
@@ -321,7 +154,6 @@ pub(crate) async fn section_data(
 ) -> Result<Json<Value>, ApiProblem> {
     let Path(name) = path.map_err(|_rejection| ApiProblem::unknown_section("invalid"))?;
     let params = QueryParams::parse(raw.as_deref(), PAGE_PARAMS)?;
-    let source = parse_u64(&params, QueryParameter::Source)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
     let limit = parse_limit(&params)?;
@@ -330,14 +162,14 @@ pub(crate) async fn section_data(
     // section() takes `&mut`; clone the shared snapshot (catalog metadata, not
     // section bodies) and query the private copy.
     let mut snap = state.snapshot().as_ref().clone();
-    match section(&mut snap, &name, source, from, to, limit, cursor) {
+    match section(&mut snap, &name, from, to, limit, cursor) {
         Ok(page) => Ok(Json(page_to_json(&page))),
         Err(err) => Err(query_error_response(&err)),
     }
 }
 
-/// `GET /v1/sections/batch?source&from&to&names=a,b,c&limit` — several sections
-/// for one source over one window, each as its own page keyed by name.
+/// `GET /v1/sections/batch?from&to&names=a,b,c&limit` — several sections
+/// over one window, each as its own page keyed by name.
 ///
 /// One decode of each overlapping segment serves every requested section, so a
 /// multi-metric view costs one pass, not one per section. An unknown name fails
@@ -347,7 +179,6 @@ pub(crate) async fn sections_batch(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiProblem> {
     let params = QueryParams::parse(raw.as_deref(), BATCH_PARAMS)?;
-    let source = parse_u64(&params, QueryParameter::Source)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
     let limit = parse_limit(&params)?;
@@ -364,7 +195,7 @@ pub(crate) async fn sections_batch(
 
     let mut snap = state.snapshot().as_ref().clone();
     let cursors = BTreeMap::new();
-    match query_sections(&mut snap, source, from, to, &names, limit, &cursors) {
+    match query_sections(&mut snap, from, to, &names, limit, &cursors) {
         Ok(pages) => {
             let object = pages
                 .iter()
@@ -487,7 +318,7 @@ fn section_diff_object(
     Ok(object)
 }
 
-/// `GET /v1/section/{name}/diff?source&from&to` — per-entity deltas and rates
+/// `GET /v1/section/{name}/diff?from&to` — per-entity deltas and rates
 /// over a window.
 ///
 /// Resolves the section's identity and cumulative columns from the registry,
@@ -499,7 +330,6 @@ pub(crate) async fn section_diff(
 ) -> Result<Json<Value>, ErrorResponse> {
     let Path(name) = path.map_err(|_rejection| ApiProblem::unknown_section("invalid"))?;
     let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
-    let source = parse_u64(&params, QueryParameter::Source)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
 
@@ -507,30 +337,22 @@ pub(crate) async fn section_diff(
         query_error_response_without_cursor(&QueryError::UnknownSection(name.clone()))
     })?;
     let mut snap = state.snapshot().as_ref().clone();
-    let page = section(&mut snap, &name, source, from, to, DIFF_MAX_ROWS, None)
+    let page = section(&mut snap, &name, from, to, DIFF_MAX_ROWS, None)
         .map_err(|err| query_error_response_without_cursor(&err))?;
     let mut gate_pages = BTreeMap::new();
     for gate_section in Gates::sections(std::slice::from_ref(&logical)) {
-        let gate_page = section(
-            &mut snap,
-            gate_section,
-            source,
-            from,
-            to,
-            DIFF_MAX_ROWS,
-            None,
-        )
-        .map_err(|err| query_error_response_without_cursor(&err))?;
+        let gate_page = section(&mut snap, gate_section, from, to, DIFF_MAX_ROWS, None)
+            .map_err(|err| query_error_response_without_cursor(&err))?;
         gate_pages.insert(gate_section.to_owned(), gate_page);
     }
     let gates = Gates::from_pages(std::slice::from_ref(&logical), &gate_pages);
 
-    let mut object = section_diff_object(&logical, &page, &gates)?;
-    object.insert("source_id".to_owned(), json!(source));
-    Ok(Json(Value::Object(object)))
+    Ok(Json(Value::Object(section_diff_object(
+        &logical, &page, &gates,
+    )?)))
 }
 
-/// `GET /v1/sections/batch/diff?source&from&to&names=a,b,c` — diffs for several
+/// `GET /v1/sections/batch/diff?from&to&names=a,b,c` — diffs for several
 /// sections over one window, each keyed by name.
 ///
 /// One decode of each overlapping segment serves every requested section, so a
@@ -541,7 +363,6 @@ pub(crate) async fn sections_batch_diff(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ErrorResponse> {
     let params = QueryParams::parse(raw.as_deref(), BATCH_DIFF_PARAMS)?;
-    let source = parse_u64(&params, QueryParameter::Source)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
     let raw = params
@@ -573,16 +394,8 @@ pub(crate) async fn sections_batch_diff(
             fetch_names.push(gate_section);
         }
     }
-    let pages = query_sections(
-        &mut snap,
-        source,
-        from,
-        to,
-        &fetch_names,
-        DIFF_MAX_ROWS,
-        &cursors,
-    )
-    .map_err(|err| query_error_response_without_cursor(&err))?;
+    let pages = query_sections(&mut snap, from, to, &fetch_names, DIFF_MAX_ROWS, &cursors)
+        .map_err(|err| query_error_response_without_cursor(&err))?;
     let gates = Gates::from_pages(&logicals, &pages);
 
     let mut out = serde_json::Map::new();
@@ -602,26 +415,11 @@ pub(crate) async fn sections_batch_diff(
 mod tests {
     use std::collections::BTreeMap;
 
-    use kronika_reader::{
-        ColumnDiff, DiffAt, DiffPoint, Reason, Scalar, SeriesDiff, SourceSummaryLimits, Value,
-    };
+    use kronika_reader::{ColumnDiff, DiffAt, DiffPoint, Reason, Scalar, SeriesDiff, Value};
 
     use super::Gates;
 
     const SEC: i64 = 1_000_000;
-
-    #[test]
-    fn sources_default_admits_the_layout_segment_ceiling() {
-        const FIVE_YEARS_OF_FIFTEEN_MINUTE_SEGMENTS: usize = 5 * 365 * 24 * 4;
-
-        let limits = SourceSummaryLimits::default();
-
-        assert_eq!(
-            limits.max_units(),
-            kronika_layout::LayoutLimits::default().max_segments
-        );
-        assert!(limits.max_units() >= FIVE_YEARS_OF_FIFTEEN_MINUTE_SEGMENTS);
-    }
 
     fn series(object: &str, column: &str) -> SeriesDiff {
         SeriesDiff {

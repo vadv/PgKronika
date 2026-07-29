@@ -29,16 +29,16 @@ use super::observations::EventObservationsBlock;
 use super::web_index::{EntitySeriesBlock, UiSummaryBlock};
 
 const MAGIC: [u8; 8] = *b"PGKOVF\0\0";
-const HEADER_LEN: usize = 192;
-const HEADER_LEN_U16: u16 = 192;
-const HEADER_LEN_U64: u64 = 192;
+const HEADER_LEN: usize = 184;
+const HEADER_LEN_U16: u16 = 184;
+const HEADER_LEN_U64: u64 = 184;
 const DIRECTORY_ENTRY_LEN: usize = 64;
 const DIRECTORY_ENTRY_LEN_U16: u16 = 64;
 const FILE_KIND_SEGMENT_FACTS: u16 = 1;
 const DESCRIPTOR_KIND_CATALOG: u16 = 1;
-const BLOCK_SCHEMA_VERSION: u16 = 3;
+const BLOCK_SCHEMA_VERSION: u16 = 4;
 const WEB_BLOCK_SCHEMA_VERSION: u16 = 1;
-const HEADER_CRC_OFFSET: usize = 188;
+const HEADER_CRC_OFFSET: usize = 180;
 const ZSTD_LEVEL: i32 = 1;
 const ZSTD_MIN_SAVING: usize = DIRECTORY_ENTRY_LEN;
 const ZSTD_WINDOW_LOG_MAX: u32 = 19;
@@ -54,8 +54,6 @@ pub struct HeaderIdentity {
     pub registry_contract_version: u32,
     /// PGM container version.
     pub source_format_version: u32,
-    /// PGM source ID provenance.
-    pub pgm_source_id: u64,
     /// Inclusive minimum PGM timestamp.
     pub source_min_ts_us: i64,
     /// Inclusive maximum PGM timestamp.
@@ -75,7 +73,6 @@ impl HeaderIdentity {
     #[must_use]
     pub fn from_current_contract(
         source_format_version: u32,
-        pgm_source_id: u64,
         source_min_ts_us: i64,
         source_max_ts_us: i64,
         source_file_len: u64,
@@ -87,12 +84,11 @@ impl HeaderIdentity {
             extractor_semantics_version: EXTRACTOR_SEMANTICS_VERSION,
             registry_contract_version: REGISTRY_CONTRACT_VERSION,
             source_format_version,
-            pgm_source_id,
             source_min_ts_us,
             source_max_ts_us,
             source_file_len,
             source_descriptor,
-            fact_key: FactKey::for_current_segment(pgm_source_id, source_descriptor),
+            fact_key: FactKey::for_current_segment(source_descriptor),
             segment_lineage_id,
         };
         identity.fact_key = FactKey::for_identity(&identity, FileKind::SegmentFacts);
@@ -105,7 +101,7 @@ impl HeaderIdentity {
 pub struct FactFileHeader {
     /// Source and compatibility identity.
     pub identity: HeaderIdentity,
-    /// Directory offset, fixed at 192 in container version 2.
+    /// Directory offset, fixed at 184 in container version 3.
     pub directory_offset: u64,
     /// Directory entry count.
     pub directory_count: u32,
@@ -649,7 +645,7 @@ impl<R: ReadAt> FactFileReader<R> {
     pub fn inspect(reader: R, bounds: &Bounds) -> Result<Self, CacheReadError> {
         let file = Self::open_inner(reader, None, bounds)?;
         let identity = &file.header.identity;
-        let lineage = SegmentIdentity::sealed(identity.pgm_source_id, identity.source_descriptor.0);
+        let lineage = SegmentIdentity::sealed(identity.source_descriptor.0);
         if lineage.id() != identity.segment_lineage_id {
             return Err(CacheReadError::Corrupt);
         }
@@ -913,7 +909,6 @@ fn encode_header(
     writer.u32_le(identity.extractor_semantics_version);
     writer.u32_le(identity.registry_contract_version);
     writer.u32_le(identity.source_format_version);
-    writer.u64_le(identity.pgm_source_id);
     writer.i64_le(identity.source_min_ts_us);
     writer.i64_le(identity.source_max_ts_us);
     writer.u64_le(identity.source_file_len);
@@ -973,7 +968,6 @@ fn decode_header(bytes: &[u8]) -> Result<(FactFileHeader, u32), CacheReadError> 
         extractor_semantics_version: reader.u32_le().map_err(corrupt)?,
         registry_contract_version: reader.u32_le().map_err(corrupt)?,
         source_format_version: reader.u32_le().map_err(corrupt)?,
-        pgm_source_id: reader.u64_le().map_err(corrupt)?,
         source_min_ts_us: reader.i64_le().map_err(corrupt)?,
         source_max_ts_us: reader.i64_le().map_err(corrupt)?,
         source_file_len: reader.u64_le().map_err(corrupt)?,
@@ -1025,7 +1019,6 @@ fn verify_identity(
         return Err(CacheReadError::Incompatible);
     }
     if actual.source_descriptor != expected.source_descriptor
-        || actual.pgm_source_id != expected.pgm_source_id
         || actual.source_min_ts_us != expected.source_min_ts_us
         || actual.source_max_ts_us != expected.source_max_ts_us
         || actual.source_format_version != expected.source_format_version
@@ -1442,8 +1435,7 @@ pub(super) fn verify_manifest_identity(
     manifest: &SourceManifestBlock,
     identity: &HeaderIdentity,
 ) -> Result<(), CacheReadError> {
-    if manifest.source_id() != identity.pgm_source_id
-        || manifest.source_format_version() != identity.source_format_version
+    if manifest.source_format_version() != identity.source_format_version
         || manifest.source_time_range() != (identity.source_min_ts_us, identity.source_max_ts_us)
         || manifest.source_file_len() != identity.source_file_len
     {
@@ -1464,7 +1456,7 @@ pub(super) fn validate_observation_provenance(
             .entries()
             .get(ordinal)
             .ok_or(CacheReadError::Corrupt)?;
-        if observation.source_type_id() != entry.catalog.type_id
+        if observation.section_type_id() != entry.catalog.type_id
             || Some(provenance.section_body_id) != entry.section_body_id
             || provenance.row_ordinal >= entry.catalog.rows
         {
@@ -1696,11 +1688,14 @@ mod tests {
     };
     use super::*;
 
+    const DIRECTORY_COUNT_OFFSET: usize = 160;
+    const FILE_LEN_OFFSET: usize = 168;
+    const DIRECTORY_CRC_OFFSET: usize = 176;
+
     fn identity() -> HeaderIdentity {
         let lineage = lineage();
         HeaderIdentity::from_current_contract(
-            1,
-            7,
+            kronika_format::FORMAT_VERSION,
             1_000,
             2_000,
             4_096,
@@ -1710,7 +1705,7 @@ mod tests {
     }
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(7, [0x22; 32])
+        SegmentIdentity::sealed([0x22; 32])
     }
 
     fn event_lineage() -> SegmentIdentity {
@@ -1719,8 +1714,7 @@ mod tests {
 
     fn manifest() -> SourceManifestBlock {
         SourceManifestBlock::new(
-            7,
-            1,
+            kronika_format::FORMAT_VERSION,
             1_000,
             2_000,
             4_096,
@@ -1813,8 +1807,7 @@ mod tests {
 
     fn event_manifest_with_rows(rows: u32) -> SourceManifestBlock {
         SourceManifestBlock::new(
-            7,
-            1,
+            kronika_format::FORMAT_VERSION,
             1_000,
             2_000,
             4_096,
@@ -1902,10 +1895,10 @@ mod tests {
     }
 
     fn reseal_directory(bytes: &mut [u8]) {
-        let count = u32_at(bytes, 168) as usize;
+        let count = u32_at(bytes, DIRECTORY_COUNT_OFFSET) as usize;
         let end = HEADER_LEN + count * DIRECTORY_ENTRY_LEN;
         let checksum = crc32c(&bytes[HEADER_LEN..end]);
-        bytes[184..188].copy_from_slice(&checksum.to_le_bytes());
+        bytes[DIRECTORY_CRC_OFFSET..HEADER_CRC_OFFSET].copy_from_slice(&checksum.to_le_bytes());
         reseal_header(bytes);
     }
 
@@ -1914,7 +1907,7 @@ mod tests {
     }
 
     fn entry_index(bytes: &[u8], kind: BlockKind) -> usize {
-        let count = u32_at(bytes, 168) as usize;
+        let count = u32_at(bytes, DIRECTORY_COUNT_OFFSET) as usize;
         (0..count)
             .find(|&index| u32_at(bytes, entry_field(index, 0)) == kind.code())
             .expect("block kind is present")
@@ -1937,8 +1930,8 @@ mod tests {
     }
 
     fn insert_logical_block<B: EncodableBlock>(bytes: &mut Vec<u8>, logical_id: u32, block: &B) {
-        let old_count = u32_at(bytes, 168) as usize;
-        let old_file_len = u64_at(bytes, 176);
+        let old_count = u32_at(bytes, DIRECTORY_COUNT_OFFSET) as usize;
+        let old_file_len = u64_at(bytes, FILE_LEN_OFFSET);
         let source = entry_index(bytes, block.kind());
         let insert = source + 1;
         let source_offset = u64_at(bytes, entry_field(source, 16));
@@ -1990,12 +1983,13 @@ mod tests {
         bytes[entry + 56..entry + 64].copy_from_slice(&maximum.to_le_bytes());
 
         let new_count = u32::try_from(old_count + 1).expect("directory count fits u32");
-        bytes[168..172].copy_from_slice(&new_count.to_le_bytes());
+        bytes[DIRECTORY_COUNT_OFFSET..DIRECTORY_COUNT_OFFSET + 4]
+            .copy_from_slice(&new_count.to_le_bytes());
         let new_file_len = old_file_len
             .checked_add(DIRECTORY_ENTRY_LEN as u64)
             .and_then(|length| length.checked_add(body_len))
             .expect("fact file length");
-        bytes[176..184].copy_from_slice(&new_file_len.to_le_bytes());
+        bytes[FILE_LEN_OFFSET..DIRECTORY_CRC_OFFSET].copy_from_slice(&new_file_len.to_le_bytes());
         assert_eq!(bytes.len() as u64, new_file_len);
         reseal_directory(bytes);
     }
@@ -2119,9 +2113,9 @@ mod tests {
     }
 
     fn append_empty_optional_block(bytes: &mut Vec<u8>) {
-        let old_count = u32_at(bytes, 168) as usize;
+        let old_count = u32_at(bytes, DIRECTORY_COUNT_OFFSET) as usize;
         let old_directory_end = HEADER_LEN + old_count * DIRECTORY_ENTRY_LEN;
-        let old_file_len = u64::from_le_bytes(bytes[176..184].try_into().expect("file length"));
+        let old_file_len = u64_at(bytes, FILE_LEN_OFFSET);
         bytes.splice(
             old_directory_end..old_directory_end,
             [0_u8; DIRECTORY_ENTRY_LEN],
@@ -2139,8 +2133,10 @@ mod tests {
             .copy_from_slice(&(old_file_len + DIRECTORY_ENTRY_LEN as u64).to_le_bytes());
         bytes[optional + 44..optional + 48].copy_from_slice(&crc32c(&[]).to_le_bytes());
         let new_count = u32::try_from(old_count + 1).expect("directory count fits u32");
-        bytes[168..172].copy_from_slice(&new_count.to_le_bytes());
-        bytes[176..184].copy_from_slice(&(old_file_len + DIRECTORY_ENTRY_LEN as u64).to_le_bytes());
+        bytes[DIRECTORY_COUNT_OFFSET..DIRECTORY_COUNT_OFFSET + 4]
+            .copy_from_slice(&new_count.to_le_bytes());
+        bytes[FILE_LEN_OFFSET..DIRECTORY_CRC_OFFSET]
+            .copy_from_slice(&(old_file_len + DIRECTORY_ENTRY_LEN as u64).to_le_bytes());
         reseal_directory(bytes);
     }
 
@@ -2192,21 +2188,16 @@ mod tests {
     }
 
     #[test]
-    fn admission_distinguishes_wrong_source_from_incompatible_versions() {
+    fn admission_distinguishes_wrong_descriptor_from_incompatible_versions() {
         let bytes = valid_file();
-        let mut wrong_source = identity();
-        wrong_source.pgm_source_id ^= 1;
-        wrong_source.fact_key = FactKey::for_identity(&wrong_source, FileKind::SegmentFacts);
         let mut wrong_descriptor = identity();
         wrong_descriptor.source_descriptor.0[0] ^= 1;
         wrong_descriptor.fact_key =
             FactKey::for_identity(&wrong_descriptor, FileKind::SegmentFacts);
-        for expected in [&wrong_source, &wrong_descriptor] {
-            assert!(matches!(
-                FactFile::admit(&bytes, expected, &lineage(), &LIMIT),
-                Err(CacheReadError::WrongSource)
-            ));
-        }
+        assert!(matches!(
+            FactFile::admit(&bytes, &wrong_descriptor, &lineage(), &LIMIT),
+            Err(CacheReadError::WrongSource)
+        ));
 
         let mut incompatible = identity();
         incompatible.fact_schema_version += 1;
@@ -2219,7 +2210,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::format_collect,
-        reason = "a compact hex string keeps the 192-byte golden header reviewable"
+        reason = "a compact hex string keeps the 184-byte golden header reviewable"
     )]
     fn canonical_header_matches_the_golden_vector() {
         let header = encode_header(&identity(), 9, 1_234, 0x1122_3344);
@@ -2227,12 +2218,12 @@ mod tests {
         assert_eq!(
             encoded,
             concat!(
-                "50474b4f564600000200c0000100000004000000070000000100000001000000",
-                "0700000000000000e803000000000000d0070000000000000010000000000000",
-                "2222222222222222222222222222222222222222222222222222222222222222",
-                "3ed3efce95f3c5f75ba8a6dfc972daf7882558c57cc8e91118ae8869efd19254",
-                "39908d412362ac445b8020355de54029abd363f91229bf3cc53f977239aba912",
-                "c0000000000000000900000040000100d204000000000000443322117875810c",
+                "50474b4f564600000300b8000100000004000000070000000100000002000000",
+                "e803000000000000d00700000000000000100000000000002222222222222222",
+                "222222222222222222222222222222222222222222222222980fe92accc06f33",
+                "6363700a75ae26d3ef5445ea072d7837ba7fd8ea81a8a435b8a8e881bbc44c38",
+                "7ebcefd71a4aeb5a16b3e2715eea4c356987202c0e5b16cfb800000000000000",
+                "0900000040000100d204000000000000443322113ccc0b15",
             )
         );
     }
@@ -2350,8 +2341,8 @@ mod tests {
 
     #[test]
     fn source_manifest_must_match_the_header() {
-        let wrong = SourceManifestBlock::new(8, 1, 1_000, 2_000, 4_096, Vec::new(), &LIMIT)
-            .expect("manifest");
+        let wrong =
+            SourceManifestBlock::new(8, 1_000, 2_000, 4_096, Vec::new(), &LIMIT).expect("manifest");
         assert!(matches!(
             FactFile::build(
                 &identity(),
@@ -2473,7 +2464,7 @@ mod tests {
         let shutdown_mode = "a".repeat(1_024);
         let message = "z".repeat(1_024);
         let (bytes, expected_catalog) = partitioned_observation_file(&shutdown_mode, &message);
-        let directory_count = u32_at(&bytes, 168) as usize;
+        let directory_count = u32_at(&bytes, DIRECTORY_COUNT_OFFSET) as usize;
         let largest_body = (0..directory_count)
             .map(|index| u64_at(&bytes, entry_field(index, 32)))
             .max()

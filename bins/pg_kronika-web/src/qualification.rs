@@ -41,6 +41,7 @@ use tower::ServiceExt as _;
 
 use crate::overview::live::LiveFoldStats;
 use crate::overview::loader::{LoaderIoSnapshot, LoaderQualificationSnapshot};
+use crate::overview::view::DescriptorView;
 use crate::{AppState, OverviewConfig, app};
 
 const ARTIFACT_SCHEMA: &str = "pgkronika-overview-parity-v1-evidence-v2";
@@ -49,7 +50,6 @@ const SAMPLES: usize = 720;
 const CADENCE_US: i64 = 5_000_000;
 const ITERATIONS: usize = 20;
 const CONCURRENT_WORKERS: usize = 16;
-const SOURCE_ID: u64 = 7;
 const DENSE_FIRST_WINDOW_US: i64 = 1_000_000;
 const DENSE_END_US: i64 = 3_601_000_000;
 const LIVE_FIRST_WINDOW_US: i64 = DENSE_END_US + 10;
@@ -387,7 +387,7 @@ fn run_coordinator(output: &Path) {
     }
 
     let dense_address = dense_address();
-    let dense = dense_hour_pgm(SOURCE_ID, DENSE_FIRST_WINDOW_US, SAMPLES);
+    let dense = dense_hour_pgm(DENSE_FIRST_WINDOW_US, SAMPLES);
     let unit = PgmUnit::open(dense.as_slice()).expect("open dense fixture");
     let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract dense fixture");
     let encoded = facts.encode(&LIMIT).expect("encode dense facts");
@@ -465,11 +465,10 @@ fn prepare_mode(mode: &str, root: &Path) {
         "concurrent-disjoint" => {
             let owner = fixture_writer(root);
             for worker in 0..CONCURRENT_WORKERS {
-                let source = 100 + u64::try_from(worker).expect("worker source");
                 let start = DENSE_FIRST_WINDOW_US
                     + i64::try_from(worker).expect("worker range") * 1_000_000_000;
                 let address = segment_address(start);
-                let bytes = dense_hour_pgm(source, start, 32);
+                let bytes = dense_hour_pgm(start, 32);
                 publish_pgm(&owner, address, &bytes);
             }
         }
@@ -478,7 +477,7 @@ fn prepare_mode(mode: &str, root: &Path) {
             publish_pgm(
                 &owner,
                 dense_address(),
-                &dense_hour_pgm(SOURCE_ID, DENSE_FIRST_WINDOW_US, SAMPLES),
+                &dense_hour_pgm(DENSE_FIRST_WINDOW_US, SAMPLES),
             );
             let first = lifecycle_part(LIVE_FIRST_WINDOW_US, 41);
             initialize_fixture_journal(&owner);
@@ -486,7 +485,7 @@ fn prepare_mode(mode: &str, root: &Path) {
         }
         _ => {
             let address = dense_address();
-            let bytes = dense_hour_pgm(SOURCE_ID, DENSE_FIRST_WINDOW_US, SAMPLES);
+            let bytes = dense_hour_pgm(DENSE_FIRST_WINDOW_US, SAMPLES);
             publish_fixture_pgm(root, address, &bytes);
             if matches!(mode, "restart-warm" | "oracle-profile") {
                 let facts = SegmentFacts::extract(
@@ -732,10 +731,7 @@ async fn http_cold(root: &Path, restart: bool) -> WorkerOutcome {
     let measurement = Measurement::start();
     let body = request_json(
         &service,
-        &format!(
-            "/v1/timeline/overview?source={SOURCE_ID}&from=1000000&to={}",
-            dense_end()
-        ),
+        &format!("/v1/timeline/overview?from=1000000&to={}", dense_end()),
     )
     .await;
     let after = state.overview_loader.qualification_snapshot();
@@ -765,10 +761,7 @@ async fn http_cold(root: &Path, restart: bool) -> WorkerOutcome {
 async fn process_hot(root: &Path) -> WorkerOutcome {
     let state = state(root, &OverviewConfig::new());
     let service = qualification_service(state.clone());
-    let uri = format!(
-        "/v1/timeline/overview?source={SOURCE_ID}&from=1000000&to={}",
-        dense_end()
-    );
+    let uri = format!("/v1/timeline/overview?from=1000000&to={}", dense_end());
     drop(request_json(&service, &uri).await);
     let before = state.overview_loader.qualification_snapshot();
     let measurement = Measurement::start();
@@ -791,10 +784,7 @@ async fn range_cold(root: &Path) -> WorkerOutcome {
     drop(
         request_json(
             &service,
-            &format!(
-                "/v1/timeline/overview?source={SOURCE_ID}&from=1000000&to={}",
-                dense_end()
-            ),
+            &format!("/v1/timeline/overview?from=1000000&to={}", dense_end()),
         )
         .await,
     );
@@ -812,7 +802,7 @@ async fn range_cold(root: &Path) -> WorkerOutcome {
     let measurement = Measurement::start();
     let body = request_json(
         &service,
-        "/v1/timeline/health?source=7&from=61000000&to=361000000&step=30000000",
+        "/v1/timeline/health?from=61000000&to=361000000&step=30000000",
     )
     .await;
     let after = state.overview_loader.qualification_snapshot();
@@ -858,7 +848,6 @@ async fn concurrent_identical(root: &Path) -> WorkerOutcome {
     let plan = state
         .select_overview(
             view,
-            &[SOURCE_ID],
             CoverageSpan::new(DENSE_FIRST_WINDOW_US, dense_end()).expect("identical range"),
         )
         .expect("identical plan");
@@ -913,17 +902,43 @@ async fn concurrent_disjoint(root: &Path) -> WorkerOutcome {
     config.cold.file_descriptors = 16;
     let state = state(root, &config);
     let (snapshot, view) = state.overview_request_view();
-    let mut plans = Vec::with_capacity(CONCURRENT_WORKERS);
-    for worker in 0..CONCURRENT_WORKERS {
-        let source = 100 + u64::try_from(worker).expect("worker source");
-        let start =
-            DENSE_FIRST_WINDOW_US + i64::try_from(worker).expect("worker range") * 1_000_000_000;
+    let last_start = DENSE_FIRST_WINDOW_US
+        + i64::try_from(CONCURRENT_WORKERS - 1).expect("worker range") * 1_000_000_000;
+    let all = state
+        .select_overview(
+            Arc::clone(&view),
+            CoverageSpan::new(DENSE_FIRST_WINDOW_US, last_start + 32 * CADENCE_US)
+                .expect("full disjoint fixture range"),
+        )
+        .expect("full disjoint fixture plan");
+    let entries = all.entries().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        CONCURRENT_WORKERS,
+        "disjoint fixture must contain one descriptor per worker"
+    );
+    let mut plans = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let descriptor = *entry.descriptor();
+        let worker_view = Arc::new(DescriptorView::new(
+            view.view_generation(),
+            vec![entry],
+            Vec::new(),
+            Arc::clone(view.live()),
+            None,
+        ));
         plans.push(
             state
                 .select_overview(
-                    Arc::clone(&view),
-                    &[source],
-                    CoverageSpan::new(start, start + 32 * CADENCE_US).expect("disjoint range"),
+                    worker_view,
+                    CoverageSpan::new(
+                        descriptor.min_ts,
+                        descriptor
+                            .max_ts
+                            .checked_add(1)
+                            .expect("descriptor range end"),
+                    )
+                    .expect("disjoint range"),
                 )
                 .expect("disjoint plan"),
         );
@@ -1011,7 +1026,7 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
     let body = request_json(
         &service,
         &format!(
-            "/v1/timeline/events?source={SOURCE_ID}&from=1000000&to={}&limit=100",
+            "/v1/timeline/events?from=1000000&to={}&limit=100",
             dense_end() + 100
         ),
     )
@@ -1844,7 +1859,7 @@ fn percentile(sorted: &[u128], percentile: usize) -> u128 {
     sorted[rank.min(sorted.len() - 1)]
 }
 
-fn dense_hour_pgm(source_id: u64, start_us: i64, samples: usize) -> Vec<u8> {
+fn dense_hour_pgm(start_us: i64, samples: usize) -> Vec<u8> {
     let database = (0..samples)
         .map(|index| {
             let index = i64::try_from(index).expect("sample index");
@@ -1883,7 +1898,7 @@ fn dense_hour_pgm(source_id: u64, start_us: i64, samples: usize) -> Vec<u8> {
         .iter()
         .map(|row| SnapshotCoverageV1 {
             ts: row.ts,
-            source_type_id: 1_005_001,
+            section_type_id: 1_005_001,
             collector_pid: 99,
             collector_started_at: Ts(1),
             read_state: 0,
@@ -1934,7 +1949,6 @@ fn dense_hour_pgm(source_id: u64, start_us: i64, samples: usize) -> Vec<u8> {
             min_ts: start_us,
             max_ts: start_us
                 + i64::try_from(samples.saturating_sub(1)).expect("sample count") * CADENCE_US,
-            source_id,
         },
     )
 }
@@ -1960,7 +1974,6 @@ fn lifecycle_part(ts_us: i64, pid: i32) -> Vec<u8> {
         PartMeta {
             min_ts: ts_us,
             max_ts: ts_us,
-            source_id: SOURCE_ID,
         },
     )
 }
@@ -2300,11 +2313,6 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                     "rust_test",
                     "crates/kronika-reader/src/overview/publish.rs",
                     "oversized_candidate_is_rebuilt_and_atomically_replaced",
-                ),
-                (
-                    "rust_test",
-                    "crates/kronika-reader/src/overview/container.rs",
-                    "admission_distinguishes_wrong_source_from_incompatible_versions",
                 ),
                 (
                     "rust_test",
@@ -2682,6 +2690,19 @@ fn evidence_binary(kind: &str, path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disjoint_qualification_uses_one_fact_key_per_worker() {
+        let directory = tempfile::tempdir().expect("fixture parent");
+        let root = directory.path().join("disjoint");
+        prepare_mode("concurrent-disjoint", &root);
+
+        let outcome = concurrent_disjoint(&root).await;
+
+        assert_eq!(outcome.work.singleflight_builds, CONCURRENT_WORKERS as u64);
+        assert_eq!(outcome.work.source_builds, CONCURRENT_WORKERS as u64);
+    }
 
     #[test]
     fn fixture_journal_v1_preserves_identity_and_absolute_frame_offsets() {

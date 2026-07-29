@@ -186,7 +186,6 @@ mod tests {
 
     fn key(seed: u8) -> FactBuildKey {
         let fact = FactKey::derive(
-            u64::from(seed),
             kronika_reader::SourceDescriptor([seed.wrapping_add(1); 32]),
             FileKind::SegmentFacts,
             1,

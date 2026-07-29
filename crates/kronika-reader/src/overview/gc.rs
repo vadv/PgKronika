@@ -22,7 +22,7 @@ use super::descriptors::SourceDescriptor;
 use super::factkey::{FactBuildKey, FactKey};
 use super::limits::LIMIT;
 
-const HEADER_LEN: usize = 192;
+const HEADER_LEN: usize = 184;
 const MAX_GC_ENTRIES: usize = 1_000_000;
 
 /// Invalid sidecar-retention configuration.
@@ -844,13 +844,12 @@ fn identity_from_header(header: &[u8; HEADER_LEN]) -> Option<HeaderIdentity> {
         extractor_semantics_version: u32_at(header, 20)?,
         registry_contract_version: u32_at(header, 24)?,
         source_format_version: u32_at(header, 28)?,
-        pgm_source_id: u64_at(header, 32)?,
-        source_min_ts_us: i64_at(header, 40)?,
-        source_max_ts_us: i64_at(header, 48)?,
-        source_file_len: u64_at(header, 56)?,
-        source_descriptor: SourceDescriptor(header.get(64..96)?.try_into().ok()?),
-        fact_key: FactKey::from_bytes(header.get(96..128)?.try_into().ok()?),
-        segment_lineage_id: SegmentLineageId(header.get(128..160)?.try_into().ok()?),
+        source_min_ts_us: i64_at(header, 32)?,
+        source_max_ts_us: i64_at(header, 40)?,
+        source_file_len: u64_at(header, 48)?,
+        source_descriptor: SourceDescriptor(header.get(56..88)?.try_into().ok()?),
+        fact_key: FactKey::from_bytes(header.get(88..120)?.try_into().ok()?),
+        segment_lineage_id: SegmentLineageId(header.get(120..152)?.try_into().ok()?),
     })
 }
 

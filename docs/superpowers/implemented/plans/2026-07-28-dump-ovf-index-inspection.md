@@ -93,7 +93,6 @@ lineage with:
 
 ```rust
 let lineage = SegmentIdentity::sealed(
-    header.identity.pgm_source_id,
     header.identity.source_descriptor.0,
 );
 if lineage.id() != header.identity.segment_lineage_id {
@@ -174,7 +173,6 @@ fn ovf_name_selects_metadata_dump_without_reading_bodies() {
 
     assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
     assert_eq!(json["kind"], "ovf");
-    assert_eq!(json["header"]["pgm_source_id"], 7);
     assert!(json["blocks"].as_array().is_some_and(|blocks| !blocks.is_empty()));
     assert!(json["blocks"]
         .as_array()

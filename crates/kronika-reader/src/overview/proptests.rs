@@ -22,8 +22,7 @@ use super::web_index::{EntitySeriesBlock, UiSummaryBlock};
 fn identity() -> HeaderIdentity {
     let lineage = lineage();
     HeaderIdentity::from_current_contract(
-        1,
-        7,
+        kronika_format::FORMAT_VERSION,
         i64::MIN,
         i64::MAX,
         4_096,
@@ -33,14 +32,13 @@ fn identity() -> HeaderIdentity {
 }
 
 fn lineage() -> SegmentIdentity {
-    SegmentIdentity::sealed(7, [0x22; 32])
+    SegmentIdentity::sealed([0x22; 32])
 }
 
 fn manifest() -> BlockContent {
     BlockContent::SourceManifest(Box::new(
         SourceManifestBlock::new(
-            7,
-            1,
+            kronika_format::FORMAT_VERSION,
             i64::MIN,
             i64::MAX,
             4_096,

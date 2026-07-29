@@ -137,7 +137,6 @@ mod tests {
             PartMeta {
                 min_ts: 0,
                 max_ts: 0,
-                source_id: 0,
             },
         );
         let dir = tempfile::tempdir().expect("tempdir");

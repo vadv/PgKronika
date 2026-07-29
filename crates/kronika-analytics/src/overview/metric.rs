@@ -2,7 +2,7 @@
 //!
 //! The PGM registry describes physical columns. This module gives the subset
 //! admitted to overview facts explicit factor IDs, units, reset families and
-//! source-qualified series/entity identities. Unsupported columns remain
+//! content-qualified series/entity identities. Unsupported columns remain
 //! explicit coverage gaps instead of being guessed from their names.
 
 use super::fact::{EntityKind, EntityRef};
@@ -340,10 +340,8 @@ pub struct MetricSeriesDescriptor {
     pub series_id: MetricSeriesId,
     /// Stable factor identity.
     pub factor_id: FactorId,
-    /// Numeric PGM source.
-    pub source_id: u64,
-    /// PGM source type.
-    pub source_type_id: u32,
+    /// Physical PGM section type.
+    pub section_type_id: u32,
     /// Proven unit.
     pub unit: MetricUnit,
     /// Stable entity, when one is proven.
@@ -353,12 +351,11 @@ pub struct MetricSeriesDescriptor {
 }
 
 impl MetricSeriesDescriptor {
-    /// Builds a descriptor and derives its source-qualified series identity.
+    /// Builds a descriptor and derives its content-qualified series identity.
     #[must_use]
     pub fn new(
         factor: MetricFactor,
-        source_id: u64,
-        source_type_id: u32,
+        section_type_id: u32,
         unit: MetricUnit,
         entity: Option<EntityRef>,
         reset_family: Option<ResetFamily>,
@@ -367,8 +364,7 @@ impl MetricSeriesDescriptor {
         let factor_id = factor.id();
         let digest = sha256::digest_parts(&[
             METRIC_SERIES_DOMAIN_TAG,
-            &source_id.to_le_bytes(),
-            &source_type_id.to_le_bytes(),
+            &section_type_id.to_le_bytes(),
             &factor_id.0.to_le_bytes(),
             series_discriminator,
         ]);
@@ -377,8 +373,7 @@ impl MetricSeriesDescriptor {
         Self {
             series_id: MetricSeriesId(series_id),
             factor_id,
-            source_id,
-            source_type_id,
+            section_type_id,
             unit,
             entity,
             reset_family,
@@ -386,31 +381,21 @@ impl MetricSeriesDescriptor {
     }
 }
 
-/// Derives a source-qualified entity reference.
+/// Derives a content-qualified entity reference.
 #[must_use]
-pub fn derive_entity(source_id: u64, kind: EntityKind, source_identity: &[u8]) -> EntityRef {
-    let digest = sha256::digest_parts(&[
-        METRIC_ENTITY_DOMAIN_TAG,
-        &source_id.to_le_bytes(),
-        &[kind.code()],
-        source_identity,
-    ]);
+pub fn derive_entity(kind: EntityKind, source_identity: &[u8]) -> EntityRef {
+    let digest = sha256::digest_parts(&[METRIC_ENTITY_DOMAIN_TAG, &[kind.code()], source_identity]);
     let mut id = [0_u8; 16];
     id.copy_from_slice(&digest[..16]);
     EntityRef { kind, id }
 }
 
-/// Derives alignment shared by compatible samples of one source entity.
+/// Derives alignment shared by compatible samples of one entity.
 #[must_use]
-pub fn derive_alignment(source_id: u64, entity: Option<EntityRef>) -> AlignmentId {
+pub fn derive_alignment(entity: Option<EntityRef>) -> AlignmentId {
     let entity_kind = entity.map_or(0, |value| value.kind.code());
     let entity_id = entity.map_or([0_u8; 16], |value| value.id);
-    let digest = sha256::digest_parts(&[
-        METRIC_ALIGNMENT_DOMAIN_TAG,
-        &source_id.to_le_bytes(),
-        &[entity_kind],
-        &entity_id,
-    ]);
+    let digest = sha256::digest_parts(&[METRIC_ALIGNMENT_DOMAIN_TAG, &[entity_kind], &entity_id]);
     let mut id = [0_u8; 16];
     id.copy_from_slice(&digest[..16]);
     AlignmentId(id)
@@ -438,33 +423,29 @@ mod tests {
     }
 
     #[test]
-    fn series_and_entity_identity_are_source_qualified() {
-        let entity_a = derive_entity(1, EntityKind::Database, &42_u32.to_le_bytes());
-        let entity_b = derive_entity(2, EntityKind::Database, &42_u32.to_le_bytes());
-        assert_ne!(entity_a, entity_b);
+    fn series_and_entity_identity_use_proven_dimensions() {
+        let entity = derive_entity(EntityKind::Database, &42_u32.to_le_bytes());
 
         let series_a = MetricSeriesDescriptor::new(
             MetricFactor::PgDatabaseDeadlocks,
-            1,
             1_005_004,
             MetricUnit::Count,
-            Some(entity_a),
+            Some(entity),
             Some(ResetFamily::PgStatDatabase),
             &42_u32.to_le_bytes(),
         );
         let series_b = MetricSeriesDescriptor::new(
             MetricFactor::PgDatabaseDeadlocks,
-            2,
-            1_005_004,
+            1_005_005,
             MetricUnit::Count,
-            Some(entity_b),
+            Some(entity),
             Some(ResetFamily::PgStatDatabase),
             &42_u32.to_le_bytes(),
         );
         assert_ne!(series_a.series_id, series_b.series_id);
         assert_eq!(
-            derive_alignment(1, Some(entity_a)),
-            derive_alignment(1, Some(entity_a))
+            derive_alignment(Some(entity)),
+            derive_alignment(Some(entity))
         );
     }
 }

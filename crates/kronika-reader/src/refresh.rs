@@ -101,8 +101,6 @@ pub struct PartId {
 pub struct PartDescriptor {
     /// Stable idempotency key.
     pub part_id: PartId,
-    /// Source identifier from the part catalog.
-    pub source_id: u64,
     /// Earliest timestamp in the part.
     pub min_ts: i64,
     /// Latest timestamp in the part.
@@ -117,8 +115,6 @@ pub struct PartDescriptor {
 pub struct SegmentDescriptor {
     /// Stable identity derived from the verified segment id.
     pub locator: SealedLocator,
-    /// Source identifier from the segment catalog.
-    pub source_id: u64,
     /// Earliest timestamp in the segment.
     pub min_ts: i64,
     /// Latest timestamp in the segment.
@@ -143,7 +139,6 @@ impl SegmentDescriptor {
     ) -> Self {
         Self {
             locator,
-            source_id: summary.source_id,
             min_ts: summary.min_ts,
             max_ts: summary.max_ts,
             catalog_digest: summary.logical_digest,
@@ -372,7 +367,7 @@ mod tests {
         }
     }
 
-    fn part_catalog(min_ts: i64, max_ts: i64, source_id: u64) -> Catalog {
+    fn part_catalog(min_ts: i64, max_ts: i64, variant: u64) -> Catalog {
         let row = BgwriterCheckpointer {
             ts: kronika_registry::Ts(min_ts),
             checkpoints_timed: 0,
@@ -383,7 +378,7 @@ mod tests {
             restartpoints_timed: None,
             restartpoints_req: None,
             restartpoints_done: None,
-            buffers_clean: 0,
+            buffers_clean: i64::try_from(variant).expect("test variant fits i64"),
             maxwritten_clean: 0,
             buffers_backend: Some(0),
             buffers_backend_fsync: Some(0),
@@ -398,11 +393,7 @@ mod tests {
                 rows: 1,
                 body: &body,
             }],
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id,
-            },
+            PartMeta { min_ts, max_ts },
         );
         let unit = crate::PgmUnit::open(bytes.as_slice()).expect("open part");
         unit.catalog().clone()
