@@ -103,8 +103,11 @@ List the available sections:
 curl -sS http://127.0.0.1:8688/v1/sections
 ```
 
-The embedded UI is at `http://127.0.0.1:8688/`. The web server has no TLS. If
-`KRONIKA_WEB_BASIC_AUTH` is unset, the UI and `/v1/*` are open; `/healthz`,
+The embedded UI is at `http://127.0.0.1:8688/`, interactive Swagger UI at
+`http://127.0.0.1:8688/swagger-ui/`, and the generated OpenAPI document at
+`http://127.0.0.1:8688/openapi.json`. API errors are JSON objects with `code`
+and `params`. The web server has no TLS. If `KRONIKA_WEB_BASIC_AUTH` is unset,
+the UI, Swagger UI, OpenAPI document, and `/v1/*` are open; `/healthz`,
 `/readyz`, and `/metrics` remain public even when Basic Auth is enabled.
 
 ## Workspace map

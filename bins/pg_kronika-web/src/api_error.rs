@@ -207,7 +207,7 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
-    fn new(code: ErrorCode, params: serde_json::Value) -> Self {
+    const fn new(code: ErrorCode, params: serde_json::Value) -> Self {
         Self {
             code,
             params,

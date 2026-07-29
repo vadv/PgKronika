@@ -106,10 +106,13 @@ KRONIKA_WEB_ADDR=127.0.0.1:8688 \
 curl -sS http://127.0.0.1:8688/v1/sections
 ```
 
-Встроенный интерфейс доступен на `http://127.0.0.1:8688/`. TLS в сервер не
-встроен. Без `KRONIKA_WEB_BASIC_AUTH` интерфейс и `/v1/*` открыты;
-`/healthz`, `/readyz` и `/metrics` публичны даже при включённой Basic
-Auth.
+Встроенный интерфейс доступен на `http://127.0.0.1:8688/`, интерактивный
+Swagger UI — на `http://127.0.0.1:8688/swagger-ui/`, а генерируемый документ
+OpenAPI — на `http://127.0.0.1:8688/openapi.json`. Ошибка API — обычный
+JSON-объект с полями `code` и `params`. TLS в сервер не встроен. Без
+`KRONIKA_WEB_BASIC_AUTH` интерфейс, Swagger UI, документ OpenAPI и `/v1/*`
+открыты; `/healthz`, `/readyz` и `/metrics` публичны даже при включённой
+Basic Auth.
 
 ## Карта рабочего пространства
 
