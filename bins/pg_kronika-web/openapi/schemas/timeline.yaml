@@ -1,0 +1,838 @@
+CapacityPayload:
+  description: Published filesystem capacity evidence.
+  properties:
+    available_bytes:
+      format: int64
+      minimum: 0
+      type: integer
+    kind:
+      type: string
+    total_bytes:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - kind
+  - total_bytes
+  - available_bytes
+  type: object
+CounterDeltaPayload:
+  description: Published exact counter-pair fields.
+  properties:
+    delta:
+      format: int64
+      minimum: 0
+      type: integer
+    duration_us:
+      format: int64
+      minimum: 0
+      type: integer
+    factor_id:
+      format: int32
+      minimum: 0
+      type: integer
+    kind:
+      type: string
+    reset_epoch:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - kind
+  - factor_id
+  - delta
+  - duration_us
+  - reset_epoch
+  type: object
+CoverageSpanDto:
+  description: One half-open wire interval.
+  properties:
+    from_us:
+      format: int64
+      type: integer
+    to_us:
+      format: int64
+      type: integer
+  required:
+  - from_us
+  - to_us
+  type: object
+EntityDto:
+  description: Entity identity.
+  properties:
+    id:
+      type: string
+    kind:
+      type: string
+  required:
+  - kind
+  - id
+  type: object
+ErrorPayload:
+  description: Published grouped-error fields.
+  properties:
+    category:
+      type: string
+    dropped_field_count:
+      format: int32
+      minimum: 0
+      type: integer
+    kind:
+      type: string
+    severity:
+      type: string
+    sqlstate:
+      type:
+      - string
+      - 'null'
+  required:
+  - kind
+  - severity
+  - category
+  - sqlstate
+  - dropped_field_count
+  type: object
+EventDigestDto:
+  description: Checked event-count projection.
+  properties:
+    by_category:
+      items:
+        format: int64
+        minimum: 0
+        type: integer
+      type: array
+    by_severity:
+      items:
+        format: int64
+        minimum: 0
+        type: integer
+      type: array
+    by_sqlstate:
+      items:
+        $ref: '#/SqlstateCountDto'
+      type: array
+    exactness:
+      type: string
+    joint_other_count:
+      format: int64
+      minimum: 0
+      type: integer
+    joint_top:
+      items:
+        $ref: '#/JointCountDto'
+      type: array
+    lifecycle:
+      $ref: '#/LifecycleDigestDto'
+    retained_error_group_count:
+      format: int64
+      minimum: 0
+      type: integer
+    retained_error_occurrence_count:
+      format: int64
+      minimum: 0
+      type: integer
+    retained_observation_row_count:
+      format: int64
+      minimum: 0
+      type: integer
+    sqlstate_missing_count:
+      format: int64
+      minimum: 0
+      type: integer
+    sqlstate_other_count:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - retained_error_occurrence_count
+  - retained_error_group_count
+  - retained_observation_row_count
+  - by_severity
+  - by_category
+  - by_sqlstate
+  - sqlstate_missing_count
+  - sqlstate_other_count
+  - joint_top
+  - joint_other_count
+  - lifecycle
+  - exactness
+  type: object
+EventFact:
+  description: One stable, typed notable fact on the public wire.
+  properties:
+    entity:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/EntityDto'
+    event_id:
+      type: string
+    event_instance_id:
+      type: string
+    event_kind:
+      type: string
+    evidence_quality:
+      type: string
+    identity_quality:
+      type: string
+    loss:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/EventLoss'
+    notable_class:
+      type: string
+    observed_interval:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/CoverageSpanDto'
+    occurred_at_us:
+      format: int64
+      type:
+      - integer
+      - 'null'
+    occurrence_count:
+      format: int64
+      minimum: 0
+      type: integer
+    payload:
+      $ref: '#/EventPayload'
+    quality_flags:
+      format: int32
+      minimum: 0
+      type: integer
+    section_type_id:
+      format: int32
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    sort_ts_us:
+      format: int64
+      type: integer
+    supporting_evidence:
+      items:
+        $ref: '#/SupportingEvidence'
+      type: array
+  required:
+  - event_id
+  - event_instance_id
+  - section_type_id
+  - identity_quality
+  - sort_ts_us
+  - occurred_at_us
+  - observed_interval
+  - occurrence_count
+  - event_kind
+  - notable_class
+  - evidence_quality
+  - quality_flags
+  - entity
+  - payload
+  - supporting_evidence
+  - loss
+  type: object
+EventLoss:
+  description: Proven upstream loss attached to one retained fact.
+  properties:
+    lost_count_lower_bound:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    reasons:
+      items:
+        type: string
+      type: array
+  required:
+  - reasons
+  - lost_count_lower_bound
+  type: object
+EventPayload:
+  anyOf:
+  - $ref: '#/ErrorPayload'
+  - $ref: '#/LifecyclePayload'
+  - $ref: '#/CounterDeltaPayload'
+  - $ref: '#/StateTransitionPayload'
+  - $ref: '#/CapacityPayload'
+  - $ref: '#/MarkerPayload'
+  description: Redacted typed payload of a notable fact.
+EventsResponseDto:
+  description: Typed `/events` response.
+  properties:
+    completeness:
+      type: string
+    coverage:
+      items:
+        $ref: '#/HealthFactorCoverageResponse'
+      type: array
+    events:
+      items:
+        $ref: '#/EventFact'
+      type: array
+    meta:
+      $ref: '#/TimelineMetaDto'
+    next_cursor:
+      type:
+      - string
+      - 'null'
+    notable_policy_version:
+      format: int32
+      minimum: 0
+      type: integer
+    omitted_by_response_filter:
+      format: int64
+      minimum: 0
+      type: integer
+    physical_count_semantics:
+      type: string
+    retained_exactness:
+      type: string
+  required:
+  - meta
+  - notable_policy_version
+  - events
+  - next_cursor
+  - omitted_by_response_filter
+  - retained_exactness
+  - completeness
+  - physical_count_semantics
+  - coverage
+  type: object
+FreshnessDto:
+  description: Publication freshness and independent quality axes.
+  properties:
+    completeness:
+      type: string
+    data_through_us:
+      format: int64
+      type:
+      - integer
+      - 'null'
+    physical_count_semantics:
+      type: string
+    retained_exactness:
+      type: string
+    status:
+      type: string
+  required:
+  - data_through_us
+  - status
+  - completeness
+  - retained_exactness
+  - physical_count_semantics
+  type: object
+HealthDomainResponse:
+  description: Contribution of one health domain to a timeline point.
+  properties:
+    domain:
+      type: string
+    driving_factor_ids:
+      items:
+        format: int32
+        minimum: 0
+        type: integer
+      type: array
+    penalty:
+      format: double
+      type: number
+  required:
+  - domain
+  - penalty
+  - driving_factor_ids
+  type: object
+HealthFactorCoverageResponse:
+  description: Coverage and quality evidence for one health factor.
+  properties:
+    applicability:
+      type: string
+    boundary_quality:
+      type: string
+    cadence_epoch_id:
+      type:
+      - string
+      - 'null'
+    covered_duration_us:
+      format: int64
+      minimum: 0
+      type: integer
+    crosses_cadence_boundary:
+      type: boolean
+    expected_period_us:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    factor_id:
+      format: int32
+      minimum: 0
+      type: integer
+    interval:
+      $ref: '#/CoverageSpanDto'
+    loss_reasons:
+      items:
+        type: string
+      type: array
+    lost_count_lower_bound:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    period_quality:
+      type: string
+    physical_count_semantics:
+      type: string
+    present_samples:
+      format: int64
+      minimum: 0
+      type: integer
+    retained_exactness:
+      type: string
+    source_completeness:
+      type: string
+    source_population:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/HealthSourcePopulationResponse'
+    state:
+      type: string
+  required:
+  - factor_id
+  - applicability
+  - state
+  - interval
+  - expected_period_us
+  - period_quality
+  - cadence_epoch_id
+  - crosses_cadence_boundary
+  - present_samples
+  - covered_duration_us
+  - source_population
+  - loss_reasons
+  - lost_count_lower_bound
+  - retained_exactness
+  - source_completeness
+  - physical_count_semantics
+  - boundary_quality
+  type: object
+HealthFloorEvidenceResponse:
+  description: A fact that imposes a hard health-state floor.
+  properties:
+    class:
+      type: string
+    supporting_fact_id:
+      type: string
+  required:
+  - class
+  - supporting_fact_id
+  type: object
+HealthPointResponse:
+  description: One downsampled point of the timeline health line.
+  properties:
+    continuous_score:
+      format: double
+      type:
+      - number
+      - 'null'
+    coverage:
+      items:
+        $ref: '#/HealthFactorCoverageResponse'
+      type: array
+    domains:
+      items:
+        $ref: '#/HealthDomainResponse'
+      type: array
+    factor_set_id:
+      type: string
+    floor_evidence:
+      items:
+        $ref: '#/HealthFloorEvidenceResponse'
+      type: array
+    health_policy_version:
+      format: int32
+      minimum: 0
+      type: integer
+    interval:
+      $ref: '#/CoverageSpanDto'
+    overall_score:
+      format: double
+      type:
+      - number
+      - 'null'
+    overall_state:
+      type: string
+  required:
+  - interval
+  - continuous_score
+  - overall_score
+  - overall_state
+  - health_policy_version
+  - factor_set_id
+  - domains
+  - floor_evidence
+  - coverage
+  type: object
+HealthResponse:
+  description: Timeline health response with its calculation and evidence metadata.
+  properties:
+    coverage:
+      items:
+        $ref: '#/HealthFactorCoverageResponse'
+      type: array
+    factor_set_ids:
+      items:
+        type: string
+      type: array
+    health_policy_version:
+      format: int32
+      minimum: 0
+      type: integer
+    meta:
+      $ref: '#/TimelineMetaDto'
+    points:
+      items:
+        $ref: '#/HealthPointResponse'
+      type: array
+  required:
+  - meta
+  - health_policy_version
+  - factor_set_ids
+  - points
+  - coverage
+  type: object
+HealthSourcePopulationResponse:
+  description: Population evidence attached to one factor coverage record.
+  properties:
+    collected:
+      format: int64
+      minimum: 0
+      type: integer
+    total:
+      format: int64
+      minimum: 0
+      type: integer
+    total_quality:
+      type: string
+  required:
+  - collected
+  - total
+  - total_quality
+  type: object
+HealthSummaryResponse:
+  description: Worst and latest health points calculated for an overview window.
+  properties:
+    latest_point:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/HealthPointResponse'
+    worst_point:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/HealthPointResponse'
+  required:
+  - worst_point
+  - latest_point
+  type: object
+JointCountDto:
+  description: One joint error-dimension digest entry.
+  properties:
+    category:
+      type: string
+    count:
+      format: int64
+      minimum: 0
+      type: integer
+    severity:
+      type: string
+    sqlstate:
+      type:
+      - string
+      - 'null'
+  required:
+  - severity
+  - category
+  - sqlstate
+  - count
+  type: object
+LifecycleDigestDto:
+  description: Typed lifecycle digest.
+  properties:
+    crashes:
+      format: int64
+      minimum: 0
+      type: integer
+    ready:
+      format: int64
+      minimum: 0
+      type: integer
+    shutdowns:
+      format: int64
+      minimum: 0
+      type: integer
+    signals:
+      items:
+        $ref: '#/SignalCountDto'
+      type: array
+  required:
+  - crashes
+  - shutdowns
+  - ready
+  - signals
+  type: object
+LifecyclePayload:
+  description: Published lifecycle fields.
+  properties:
+    dropped_field_count:
+      format: int32
+      minimum: 0
+      type: integer
+    kind:
+      type: string
+    pid:
+      format: int32
+      type:
+      - integer
+      - 'null'
+    signal:
+      format: int32
+      type:
+      - integer
+      - 'null'
+  required:
+  - kind
+  - pid
+  - signal
+  - dropped_field_count
+  type: object
+LossDto:
+  description: Proven loss for the request range.
+  properties:
+    dropped_count_lower_bound:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    known_gaps:
+      items:
+        $ref: '#/CoverageSpanDto'
+      type: array
+  required:
+  - known_gaps
+  - dropped_count_lower_bound
+  type: object
+MarkerPayload:
+  description: Event kind with no extra dimensions.
+  properties:
+    kind:
+      type: string
+  required:
+  - kind
+  type: object
+NotablePreviewDto:
+  description: Bounded overview preview.
+  properties:
+    events_query_hash:
+      type: string
+    observations:
+      items:
+        $ref: '#/EventFact'
+      type: array
+    omitted_count:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - observations
+  - omitted_count
+  - events_query_hash
+  type: object
+OverviewResponseDto:
+  description: |-
+    Typed overview response; health policy output stays owned by its policy
+    serializer while the event and count contracts are compile-time types.
+  properties:
+    coverage:
+      items:
+        $ref: '#/HealthFactorCoverageResponse'
+      type: array
+    event_digest:
+      $ref: '#/EventDigestDto'
+    health_summary:
+      $ref: '#/HealthSummaryResponse'
+    meta:
+      $ref: '#/TimelineMetaDto'
+    notable_preview:
+      $ref: '#/NotablePreviewDto'
+    retained_coverage_duration_us:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - meta
+  - event_digest
+  - notable_preview
+  - health_summary
+  - coverage
+  - retained_coverage_duration_us
+  type: object
+SignalCountDto:
+  description: One child-signal count.
+  properties:
+    count:
+      format: int64
+      minimum: 0
+      type: integer
+    signal:
+      format: int32
+      type: integer
+  required:
+  - signal
+  - count
+  type: object
+SqlstateCountDto:
+  description: One SQLSTATE digest entry.
+  properties:
+    code:
+      type: string
+    count:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - code
+  - count
+  type: object
+StateTransitionPayload:
+  description: Published complete-snapshot state transition.
+  properties:
+    current_state:
+      format: int32
+      minimum: 0
+      type: integer
+    factor_id:
+      format: int32
+      minimum: 0
+      type: integer
+    kind:
+      type: string
+    population_total:
+      format: int64
+      minimum: 0
+      type: integer
+    previous_state:
+      format: int32
+      minimum: 0
+      type: integer
+  required:
+  - kind
+  - factor_id
+  - previous_state
+  - current_state
+  - population_total
+  type: object
+SupportingEvidence:
+  description: One physical observation supporting an event fact.
+  properties:
+    catalog_entry_ordinal:
+      format: int32
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    dictionary_context_id:
+      type:
+      - string
+      - 'null'
+    observation_id:
+      type: string
+    row_ordinal:
+      format: int32
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    section_body_id:
+      type:
+      - string
+      - 'null'
+  required:
+  - observation_id
+  - section_body_id
+  - catalog_entry_ordinal
+  - row_ordinal
+  - dictionary_context_id
+  type: object
+TailPendingDto:
+  description: One incomplete active-journal byte range.
+  properties:
+    from_offset_bytes:
+      format: int64
+      minimum: 0
+      type: integer
+    to_offset_bytes:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - from_offset_bytes
+  - to_offset_bytes
+  type: object
+TimelineMetaDto:
+  description: Shared metadata of all three timeline responses.
+  properties:
+    data_through_us:
+      format: int64
+      type:
+      - integer
+      - 'null'
+    effective_range:
+      $ref: '#/CoverageSpanDto'
+    effective_step_us:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    fact_set_id:
+      type: string
+    freshness:
+      $ref: '#/FreshnessDto'
+    loss:
+      $ref: '#/LossDto'
+    requested_range:
+      $ref: '#/CoverageSpanDto'
+    response_schema_version:
+      format: int32
+      minimum: 0
+      type: integer
+    status:
+      type: string
+    store_data_through_us:
+      format: int64
+      type:
+      - integer
+      - 'null'
+    tail_pending:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/TailPendingDto'
+    view_generation:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - response_schema_version
+  - view_generation
+  - fact_set_id
+  - requested_range
+  - effective_range
+  - effective_step_us
+  - data_through_us
+  - store_data_through_us
+  - tail_pending
+  - status
+  - freshness
+  - loss
+  type: object

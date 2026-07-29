@@ -7,24 +7,27 @@ use kronika_reader::{
     IndexStatus, LIMIT, LiveState, LiveView, LocalDirSnapshot, UiSummaryBlock, WebIndexReadError,
 };
 use serde::Serialize;
+use utoipa::ToSchema;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ViewSummaryResponse {
     at_us: String,
     views: Vec<ViewSummaryItem>,
     quality: SummaryQuality,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ViewSummaryItem {
     view: &'static str,
+    #[schema(required = true)]
     snapshot_ts_us: Option<String>,
+    #[schema(required = true)]
     population: Option<u64>,
     status: &'static str,
     notable: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct SummaryQuality {
     status: &'static str,
     snapshots: usize,

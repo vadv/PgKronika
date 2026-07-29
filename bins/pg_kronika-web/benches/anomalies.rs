@@ -44,6 +44,7 @@ use rust_embed as _;
 use rustix as _;
 use serde as _;
 use serde_json as _;
+use serde_norway as _;
 use sha2 as _;
 use subtle as _;
 use tower_http as _;

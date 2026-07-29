@@ -5,12 +5,13 @@ use std::collections::BTreeSet;
 use kronika_analytics::web_projection::{WebView, web_view_by_name};
 use kronika_registry::registry;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// Catalog schema revision.
 const CATALOG_REVISION: u16 = 1;
 
 /// Availability of one input, metric, or column for a source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Availability {
     /// Every required input has a supported observed type.
@@ -28,7 +29,7 @@ pub(crate) enum Availability {
 }
 
 /// UI ownership scope of one view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Scope {
     /// Rows belong to one database.
@@ -40,7 +41,7 @@ pub(crate) enum Scope {
 }
 
 /// Public scalar shape of one projected column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ValueType {
     /// Signed integer.
@@ -58,7 +59,7 @@ pub(crate) enum ValueType {
 }
 
 /// One alternative group of physical inputs for a view.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct InputSpec {
     /// Stable input code referenced by metrics and columns.
     pub code: &'static str,
@@ -71,7 +72,7 @@ pub(crate) struct InputSpec {
 }
 
 /// A proven or conditional relationship between two inputs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct JoinSpec {
     /// Left input code.
     pub left: &'static str,
@@ -86,7 +87,7 @@ pub(crate) struct JoinSpec {
 }
 
 /// One heatmap or spark metric.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct MetricSpec {
     /// Stable metric code inside its view.
     pub code: &'static str,
@@ -105,7 +106,7 @@ pub(crate) struct MetricSpec {
 }
 
 /// One table or detail projection column.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct ColumnSpec {
     /// Stable column code.
     pub code: &'static str,
@@ -127,7 +128,7 @@ pub(crate) struct ColumnSpec {
 }
 
 /// Default ordering of one preset.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct SortSpec {
     /// Column code.
     pub column: &'static str,
@@ -136,7 +137,7 @@ pub(crate) struct SortSpec {
 }
 
 /// Named ordered subset of view columns.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct PresetSpec {
     /// Stable preset code.
     pub code: &'static str,
@@ -147,7 +148,7 @@ pub(crate) struct PresetSpec {
 }
 
 /// One stable UI projection.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct ViewSpec {
     /// Numeric OVF logical ID.
     pub view_code: u16,
@@ -176,7 +177,7 @@ pub(crate) struct ViewSpec {
 }
 
 /// Complete source-aware catalog response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct ProjectionCatalog {
     /// Catalog schema revision.
     pub revision: u16,

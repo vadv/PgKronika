@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::api_error::{ApiError, QueryParameter};
+use crate::api_response::HealthResponse;
 use crate::overview::cache::{CacheKey, Endpoint, ResponseKey};
 use crate::overview::cursor::{CursorError, EventsCursor};
 use crate::overview::dto::{
@@ -77,13 +78,18 @@ struct OverviewRequest {
 #[utoipa::path(
     get,
     path = "/v1/timeline/overview",
+    tag = "timeline",
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Timeline overview", body = OverviewResponseDto),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Timeline query limit exceeded", body = ApiError),
+        (status = 503, description = "Cold-build capacity unavailable", body = ApiError),
+        (status = 500, description = "Timeline read or render failed", body = ApiError),
     )
 )]
 pub(crate) async fn overview(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
@@ -344,14 +350,19 @@ struct HealthRequest {
 #[utoipa::path(
     get,
     path = "/v1/timeline/health",
+    tag = "timeline",
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
         ("step" = Option<u64>, Query),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Timeline health line", body = HealthResponse),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Timeline query limit exceeded", body = ApiError),
+        (status = 503, description = "Cold-build capacity unavailable", body = ApiError),
+        (status = 500, description = "Timeline read or render failed", body = ApiError),
     )
 )]
 pub(crate) async fn health(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
@@ -509,17 +520,23 @@ impl EventsRequest {
 #[utoipa::path(
     get,
     path = "/v1/timeline/events",
+    tag = "timeline",
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
         ("limit" = Option<usize>, Query),
         ("cursor" = Option<String>, Query),
-        ("min_severity" = Option<String>, Query),
-        ("kind" = Option<String>, Query),
+        ("min_severity" = Option<String>, Query, example = "warning"),
+        ("kind" = Option<String>, Query, example = "pg.database.deadlock_delta"),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Paginated notable timeline events", body = EventsResponseDto),
+        (status = 400, description = "Invalid query or cursor", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 410, description = "Cursor expired or retained view is gone", body = ApiError),
+        (status = 413, description = "Timeline query limit exceeded", body = ApiError),
+        (status = 503, description = "Cursor or cold-build capacity unavailable", body = ApiError),
+        (status = 500, description = "Timeline read or render failed", body = ApiError),
     )
 )]
 pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {

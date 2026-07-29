@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::AppState;
 use crate::anomaly::ScanParams;
 use crate::api_error::{ApiError, LimitResource, QueryConstraint, QueryParameter, count_u64};
+use crate::api_response::IncidentsResponse;
 use crate::handlers::anomalies::scannable_sections;
 use crate::handlers::metrics::data_age_seconds;
 use crate::incident::{
@@ -61,6 +62,7 @@ struct ValidatedRequest {
 #[utoipa::path(
     get,
     path = "/v1/incidents",
+    tag = "analytics",
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
@@ -70,11 +72,16 @@ struct ValidatedRequest {
         ("eps_rel" = Option<f64>, Query),
         ("epsilon" = Option<String>, Query),
         ("max_cluster_span" = Option<String>, Query),
-        ("section" = Option<String>, Query),
+        ("section" = Option<String>, Query, example = "pg_stat_database"),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Clustered incidents and diagnostic findings", body = IncidentsResponse),
+        (status = 400, description = "Invalid or oversized query shape", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 404, description = "Unknown section", body = ApiError),
+        (status = 413, description = "Store or analysis limit exceeded", body = ApiError),
+        (status = 503, description = "Analytic capacity unavailable", body = ApiError),
+        (status = 500, description = "Store read or analysis failed", body = ApiError),
     )
 )]
 pub(crate) async fn incidents(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {

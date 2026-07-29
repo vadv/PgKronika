@@ -1,0 +1,13 @@
+VersionResponse:
+  description: API and on-disk format versions served by this process.
+  properties:
+    api:
+      type: string
+    format_version:
+      format: int32
+      minimum: 0
+      type: integer
+  required:
+  - api
+  - format_version
+  type: object

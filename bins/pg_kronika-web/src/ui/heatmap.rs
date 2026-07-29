@@ -10,6 +10,7 @@ use kronika_reader::{
     SegmentDescriptor, SegmentFacts, WebIndexReadError,
 };
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
 
@@ -49,7 +50,7 @@ impl From<WebIndexReadError> for HeatmapError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct HeatmapResponse {
     grid: HeatmapGrid,
     ranking: Ranking,
@@ -57,20 +58,20 @@ pub(crate) struct HeatmapResponse {
     quality: HeatmapQuality,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct HeatmapGrid {
     from_us: String,
     to_us: String,
     bucket_count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct Ranking {
     exact: bool,
     unseen_upper: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct HeatmapRow {
     entity: String,
     label: String,
@@ -79,13 +80,13 @@ struct HeatmapRow {
     values: Vec<Option<f64>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ScoreBounds {
     lower: f64,
     upper: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct HeatmapQuality {
     status: &'static str,
     snapshots: usize,
@@ -97,7 +98,7 @@ struct HeatmapQuality {
     active_tail: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct RangeGap {
     from_us: String,
     to_us: String,

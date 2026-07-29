@@ -17,6 +17,9 @@ use kronika_analytics::overview::{
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use utoipa::{PartialSchema, ToSchema};
+
+use crate::api_response::{HealthFactorCoverageResponse, HealthSummaryResponse};
 
 /// Canonical three-part `/events` order and cursor position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -27,23 +30,28 @@ pub(crate) struct EventFactPosition {
 }
 
 /// One stable, typed notable fact on the public wire.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct EventFact {
     pub(crate) event_id: String,
     pub(crate) event_instance_id: String,
+    #[schema(required = true)]
     pub(crate) section_type_id: Option<u32>,
     pub(crate) identity_quality: &'static str,
     pub(crate) sort_ts_us: i64,
+    #[schema(required = true)]
     pub(crate) occurred_at_us: Option<i64>,
+    #[schema(required = true)]
     pub(crate) observed_interval: Option<CoverageSpanDto>,
     pub(crate) occurrence_count: u64,
     pub(crate) event_kind: &'static str,
     pub(crate) notable_class: &'static str,
     pub(crate) evidence_quality: &'static str,
     pub(crate) quality_flags: u32,
+    #[schema(required = true)]
     pub(crate) entity: Option<EntityDto>,
     pub(crate) payload: EventPayload,
     pub(crate) supporting_evidence: Vec<SupportingEvidence>,
+    #[schema(required = true)]
     pub(crate) loss: Option<EventLoss>,
 }
 
@@ -59,27 +67,73 @@ pub(crate) enum EventPayload {
     Marker(MarkerPayload),
 }
 
+impl PartialSchema for EventPayload {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::Ref;
+        use utoipa::openapi::schema::AnyOfBuilder;
+
+        AnyOfBuilder::new()
+            .item(Ref::from_schema_name(ErrorPayload::name()))
+            .item(Ref::from_schema_name(LifecyclePayload::name()))
+            .item(Ref::from_schema_name(CounterDeltaPayload::name()))
+            .item(Ref::from_schema_name(StateTransitionPayload::name()))
+            .item(Ref::from_schema_name(CapacityPayload::name()))
+            .item(Ref::from_schema_name(MarkerPayload::name()))
+            .description(Some("Redacted typed payload of a notable fact."))
+            .into()
+    }
+}
+
+impl ToSchema for EventPayload {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        register_schema::<ErrorPayload>(schemas);
+        register_schema::<LifecyclePayload>(schemas);
+        register_schema::<CounterDeltaPayload>(schemas);
+        register_schema::<StateTransitionPayload>(schemas);
+        register_schema::<CapacityPayload>(schemas);
+        register_schema::<MarkerPayload>(schemas);
+    }
+}
+
+fn register_schema<T: ToSchema>(
+    schemas: &mut Vec<(
+        String,
+        utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+    )>,
+) {
+    schemas.push((T::name().into_owned(), T::schema()));
+    T::schemas(schemas);
+}
+
 /// Published grouped-error fields.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ErrorPayload {
     pub(crate) kind: &'static str,
     pub(crate) severity: &'static str,
     pub(crate) category: &'static str,
+    #[schema(required = true)]
     pub(crate) sqlstate: Option<String>,
     pub(crate) dropped_field_count: u32,
 }
 
 /// Published lifecycle fields.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct LifecyclePayload {
     pub(crate) kind: &'static str,
+    #[schema(required = true)]
     pub(crate) pid: Option<i32>,
+    #[schema(required = true)]
     pub(crate) signal: Option<i32>,
     pub(crate) dropped_field_count: u32,
 }
 
 /// Published exact counter-pair fields.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CounterDeltaPayload {
     pub(crate) kind: &'static str,
     pub(crate) factor_id: u32,
@@ -89,7 +143,7 @@ pub(crate) struct CounterDeltaPayload {
 }
 
 /// Published complete-snapshot state transition.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct StateTransitionPayload {
     pub(crate) kind: &'static str,
     pub(crate) factor_id: u32,
@@ -99,7 +153,7 @@ pub(crate) struct StateTransitionPayload {
 }
 
 /// Published filesystem capacity evidence.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CapacityPayload {
     pub(crate) kind: &'static str,
     pub(crate) total_bytes: u64,
@@ -107,52 +161,58 @@ pub(crate) struct CapacityPayload {
 }
 
 /// Event kind with no extra dimensions.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct MarkerPayload {
     pub(crate) kind: &'static str,
 }
 
 /// Entity identity.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct EntityDto {
     pub(crate) kind: &'static str,
     pub(crate) id: String,
 }
 
 /// One physical observation supporting an event fact.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct SupportingEvidence {
     pub(crate) observation_id: String,
+    #[schema(required = true)]
     pub(crate) section_body_id: Option<String>,
+    #[schema(required = true)]
     pub(crate) catalog_entry_ordinal: Option<u32>,
+    #[schema(required = true)]
     pub(crate) row_ordinal: Option<u32>,
+    #[schema(required = true)]
     pub(crate) dictionary_context_id: Option<String>,
 }
 
 /// Proven upstream loss attached to one retained fact.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct EventLoss {
     pub(crate) reasons: Vec<&'static str>,
+    #[schema(required = true)]
     pub(crate) lost_count_lower_bound: Option<u64>,
 }
 
 /// One half-open wire interval.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 pub(crate) struct CoverageSpanDto {
     pub(crate) from_us: i64,
     pub(crate) to_us: i64,
 }
 
 /// One incomplete active-journal byte range.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 pub(crate) struct TailPendingDto {
     pub(crate) from_offset_bytes: u64,
     pub(crate) to_offset_bytes: u64,
 }
 
 /// Publication freshness and independent quality axes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct FreshnessDto {
+    #[schema(required = true)]
     pub(crate) data_through_us: Option<i64>,
     pub(crate) status: &'static str,
     pub(crate) completeness: &'static str,
@@ -161,23 +221,28 @@ pub(crate) struct FreshnessDto {
 }
 
 /// Proven loss for the request range.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct LossDto {
     pub(crate) known_gaps: Vec<CoverageSpanDto>,
+    #[schema(required = true)]
     pub(crate) dropped_count_lower_bound: Option<u64>,
 }
 
 /// Shared metadata of all three timeline responses.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct TimelineMetaDto {
     pub(crate) response_schema_version: u32,
     pub(crate) view_generation: u64,
     pub(crate) fact_set_id: String,
     pub(crate) requested_range: CoverageSpanDto,
     pub(crate) effective_range: CoverageSpanDto,
+    #[schema(required = true)]
     pub(crate) effective_step_us: Option<u64>,
+    #[schema(required = true)]
     pub(crate) data_through_us: Option<i64>,
+    #[schema(required = true)]
     pub(crate) store_data_through_us: Option<i64>,
+    #[schema(required = true)]
     pub(crate) tail_pending: Option<TailPendingDto>,
     pub(crate) status: &'static str,
     pub(crate) freshness: FreshnessDto,
@@ -185,30 +250,31 @@ pub(crate) struct TimelineMetaDto {
 }
 
 /// One SQLSTATE digest entry.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, ToSchema, PartialEq, Eq)]
 pub(crate) struct SqlstateCountDto {
     pub(crate) code: String,
     pub(crate) count: u64,
 }
 
 /// One joint error-dimension digest entry.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, ToSchema, PartialEq, Eq)]
 pub(crate) struct JointCountDto {
     pub(crate) severity: &'static str,
     pub(crate) category: &'static str,
+    #[schema(required = true)]
     pub(crate) sqlstate: Option<String>,
     pub(crate) count: u64,
 }
 
 /// One child-signal count.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct SignalCountDto {
     pub(crate) signal: i32,
     pub(crate) count: u64,
 }
 
 /// Typed lifecycle digest.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct LifecycleDigestDto {
     pub(crate) crashes: u64,
     pub(crate) shutdowns: u64,
@@ -217,7 +283,7 @@ pub(crate) struct LifecycleDigestDto {
 }
 
 /// Checked event-count projection.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct EventDigestDto {
     pub(crate) retained_error_occurrence_count: u64,
     pub(crate) retained_error_group_count: u64,
@@ -234,7 +300,7 @@ pub(crate) struct EventDigestDto {
 }
 
 /// Bounded overview preview.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct NotablePreviewDto {
     pub(crate) observations: Vec<EventFact>,
     pub(crate) omitted_count: u64,
@@ -243,27 +309,31 @@ pub(crate) struct NotablePreviewDto {
 
 /// Typed overview response; health policy output stays owned by its policy
 /// serializer while the event and count contracts are compile-time types.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct OverviewResponseDto {
     pub(crate) meta: TimelineMetaDto,
     pub(crate) event_digest: EventDigestDto,
     pub(crate) notable_preview: NotablePreviewDto,
+    #[schema(value_type = HealthSummaryResponse)]
     pub(crate) health_summary: Value,
+    #[schema(value_type = Vec<HealthFactorCoverageResponse>)]
     pub(crate) coverage: Value,
     pub(crate) retained_coverage_duration_us: u64,
 }
 
 /// Typed `/events` response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct EventsResponseDto {
     pub(crate) meta: TimelineMetaDto,
     pub(crate) notable_policy_version: u32,
     pub(crate) events: Vec<EventFact>,
+    #[schema(required = true)]
     pub(crate) next_cursor: Option<String>,
     pub(crate) omitted_by_response_filter: u64,
     pub(crate) retained_exactness: &'static str,
     pub(crate) completeness: &'static str,
     pub(crate) physical_count_semantics: &'static str,
+    #[schema(value_type = Vec<HealthFactorCoverageResponse>)]
     pub(crate) coverage: Vec<Value>,
 }
 

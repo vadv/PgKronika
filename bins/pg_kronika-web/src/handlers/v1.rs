@@ -10,17 +10,19 @@ use kronika_reader::{
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
 };
-use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::api_error::{ApiError, ExpectedValue, LimitResource, QueryParameter, count_u64};
+use crate::api_response::{
+    DiffSeriesResponse, SectionCatalogEntry, SectionColumnResponse, SectionDiffResponse,
+    SectionPageResponse, SectionsBatchDiffResponse, SectionsBatchResponse, SectionsResponse,
+    SegmentResponse, SegmentSectionResponse, SegmentsResponse, VersionResponse,
+};
 use crate::params::{
     QueryParams, parse_cursor, parse_i64, parse_limit, query_error_response,
     query_error_response_without_cursor,
 };
-use crate::serialize::{
-    column_class_name, column_type_name, page_to_json, semantics_name, series_diff_to_json,
-};
+use crate::serialize::{column_class_name, column_type_name, semantics_name};
 
 /// Cap on rows read for one diff response; a wider window is rejected so a
 /// single request cannot pull an unbounded section into memory.
@@ -51,16 +53,19 @@ const BATCH_DIFF_PARAMS: &[QueryParameter] = &[
 #[utoipa::path(
     get,
     path = "/v1/version",
+    tag = "core",
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "API and container format versions", body = VersionResponse),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
     )
 )]
-pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<VersionResponse>, ApiError> {
     QueryParams::parse(raw.as_deref(), &[])?;
-    Ok(Json(
-        json!({ "api": "v1", "format_version": crate::FORMAT_VERSION }),
-    ))
+    Ok(Json(VersionResponse {
+        api: "v1",
+        format_version: crate::FORMAT_VERSION,
+    }))
 }
 
 /// `GET /v1/sections` — static catalog of section types from the registry.
@@ -70,19 +75,21 @@ pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiE
 #[utoipa::path(
     get,
     path = "/v1/sections",
+    tag = "sections",
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Logical section catalog", body = SectionsResponse),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
     )
 )]
-pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
+pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<SectionsResponse>, ApiError> {
     QueryParams::parse(raw.as_deref(), &[])?;
     let mut by_name: BTreeMap<&'static str, Vec<&'static kronika_registry::TypeContract>> =
         BTreeMap::new();
     for contract in registry() {
         by_name.entry(contract.name).or_default().push(contract);
     }
-    let sections: Vec<Value> = by_name
+    let sections = by_name
         .into_iter()
         .map(|(name, mut contracts)| {
             contracts.sort_by_key(|contract| contract.type_id.get());
@@ -91,23 +98,23 @@ pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, Api
             for contract in &contracts {
                 for column in contract.columns {
                     if seen.insert(column.name) {
-                        columns.push(json!({
-                            "name": column.name,
-                            "type": column_type_name(column.ty),
-                            "class": column_class_name(column.class),
-                        }));
+                        columns.push(SectionColumnResponse {
+                            name: column.name,
+                            value_type: column_type_name(column.ty),
+                            class: column_class_name(column.class),
+                        });
                     }
                 }
             }
-            json!({
-                "name": name,
-                "semantics": semantics_name(contracts[0].semantics),
-                "sort_key": contracts[0].sort_key,
-                "columns": columns,
-            })
+            SectionCatalogEntry {
+                name,
+                semantics: semantics_name(contracts[0].semantics),
+                sort_key: contracts[0].sort_key,
+                columns,
+            }
         })
         .collect();
-    Ok(Json(json!({ "sections": sections })))
+    Ok(Json(SectionsResponse { sections }))
 }
 
 /// `GET /v1/segments?from&to` — segments overlapping the
@@ -115,19 +122,23 @@ pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, Api
 #[utoipa::path(
     get,
     path = "/v1/segments",
+    tag = "sections",
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Segments overlapping the requested range", body = SegmentsResponse),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Store query limit exceeded", body = ApiError),
+        (status = 500, description = "Store read failed", body = ApiError),
     )
 )]
 pub(crate) async fn segments(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SegmentsResponse>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -155,18 +166,18 @@ pub(crate) async fn segments(
             };
             *rows_by_name.entry(name).or_insert(0) += u64::from(entry.rows);
         }
-        let sections: Vec<Value> = rows_by_name
+        let sections = rows_by_name
             .into_iter()
-            .map(|(name, rows)| json!({ "name": name, "rows": rows }))
+            .map(|(name, rows)| SegmentSectionResponse { name, rows })
             .collect();
-        out.push(json!({
-            "segment_id": unit.min_ts.to_string(),
-            "min_ts": unit.min_ts,
-            "max_ts": unit.max_ts,
-            "sections": sections,
-        }));
+        out.push(SegmentResponse {
+            segment_id: unit.min_ts.to_string(),
+            min_ts: unit.min_ts,
+            max_ts: unit.max_ts,
+            sections,
+        });
     }
-    Ok(Json(json!({ "segments": out })))
+    Ok(Json(SegmentsResponse { segments: out }))
 }
 
 /// `GET /v1/section/{name}?from&to&limit` — one section's rows over the
@@ -178,23 +189,28 @@ pub(crate) async fn segments(
 #[utoipa::path(
     get,
     path = "/v1/section/{name}",
+    tag = "sections",
     params(
-        ("name" = String, Path),
+        ("name" = String, Path, example = "pg_stat_database"),
         ("from" = i64, Query),
         ("to" = i64, Query),
         ("limit" = Option<usize>, Query),
         ("cursor" = Option<String>, Query),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Bounded page of decoded section rows", body = SectionPageResponse),
+        (status = 400, description = "Invalid query or cursor", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 404, description = "Unknown section", body = ApiError),
+        (status = 413, description = "Store query limit exceeded", body = ApiError),
+        (status = 500, description = "Store read failed", body = ApiError),
     )
 )]
 pub(crate) async fn section_data(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SectionPageResponse>, ApiError> {
     let Path(name) = path.map_err(|_rejection| ApiError::unknown_section("invalid"))?;
     let params = QueryParams::parse(raw.as_deref(), PAGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
@@ -206,7 +222,7 @@ pub(crate) async fn section_data(
     // section bodies) and query the private copy.
     let mut snap = state.snapshot().as_ref().clone();
     match section(&mut snap, &name, from, to, limit, cursor) {
-        Ok(page) => Ok(Json(page_to_json(&page))),
+        Ok(page) => Ok(Json(SectionPageResponse::from(&page))),
         Err(err) => Err(query_error_response(&err)),
     }
 }
@@ -220,21 +236,26 @@ pub(crate) async fn section_data(
 #[utoipa::path(
     get,
     path = "/v1/sections/batch",
+    tag = "sections",
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
-        ("names" = String, Query),
+        ("names" = String, Query, example = "pg_stat_database,pg_stat_wal"),
         ("limit" = Option<usize>, Query),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Section pages keyed by logical name", body = SectionsBatchResponse),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 404, description = "Unknown section", body = ApiError),
+        (status = 413, description = "Store query limit exceeded", body = ApiError),
+        (status = 500, description = "Store read failed", body = ApiError),
     )
 )]
 pub(crate) async fn sections_batch(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SectionsBatchResponse>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), BATCH_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -256,9 +277,9 @@ pub(crate) async fn sections_batch(
         Ok(pages) => {
             let object = pages
                 .iter()
-                .map(|(name, page)| (name.clone(), page_to_json(page)))
+                .map(|(name, page)| (name.clone(), SectionPageResponse::from(page)))
                 .collect();
-            Ok(Json(Value::Object(object)))
+            Ok(Json(SectionsBatchResponse(object)))
         }
         Err(err) => Err(query_error_response_without_cursor(&err)),
     }
@@ -266,9 +287,6 @@ pub(crate) async fn sections_batch(
 
 /// The error half of a handler result: one closed API error response.
 type ErrorResponse = ApiError;
-
-/// One section's diff as a JSON object (`section`, `identity`, `series`).
-type DiffObject = serde_json::Map<String, Value>;
 
 /// Gate timelines for the request's gated columns, keyed by the gate's
 /// section and column names.
@@ -351,7 +369,7 @@ fn section_diff_object(
     logical: &LogicalSection,
     page: &SectionPage,
     gates: &Gates,
-) -> Result<DiffObject, ErrorResponse> {
+) -> Result<SectionDiffResponse, ErrorResponse> {
     if page.next_cursor.is_some() {
         return Err(ApiError::query_limit_exceeded(
             LimitResource::Rows,
@@ -368,11 +386,11 @@ fn section_diff_object(
         .collect();
     let mut series = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
     gates.apply(logical, &mut series);
-    let mut object = serde_json::Map::new();
-    object.insert("section".to_owned(), json!(logical.name));
-    object.insert("identity".to_owned(), json!(identity));
-    object.insert("series".to_owned(), series_diff_to_json(&identity, &series));
-    Ok(object)
+    Ok(SectionDiffResponse {
+        section: logical.name.to_owned(),
+        identity: identity.iter().map(|name| (*name).to_owned()).collect(),
+        series: DiffSeriesResponse::collect(&identity, &series),
+    })
 }
 
 /// `GET /v1/section/{name}/diff?from&to` — per-entity deltas and rates
@@ -383,21 +401,26 @@ fn section_diff_object(
 #[utoipa::path(
     get,
     path = "/v1/section/{name}/diff",
+    tag = "sections",
     params(
-        ("name" = String, Path),
+        ("name" = String, Path, example = "pg_stat_database"),
         ("from" = i64, Query),
         ("to" = i64, Query),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Per-entity deltas and rates", body = SectionDiffResponse),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 404, description = "Unknown section", body = ApiError),
+        (status = 413, description = "Store query limit exceeded", body = ApiError),
+        (status = 500, description = "Store read failed", body = ApiError),
     )
 )]
 pub(crate) async fn section_diff(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ErrorResponse> {
+) -> Result<Json<SectionDiffResponse>, ErrorResponse> {
     let Path(name) = path.map_err(|_rejection| ApiError::unknown_section("invalid"))?;
     let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
@@ -417,9 +440,7 @@ pub(crate) async fn section_diff(
     }
     let gates = Gates::from_pages(std::slice::from_ref(&logical), &gate_pages);
 
-    Ok(Json(Value::Object(section_diff_object(
-        &logical, &page, &gates,
-    )?)))
+    Ok(Json(section_diff_object(&logical, &page, &gates)?))
 }
 
 /// `GET /v1/sections/batch/diff?from&to&names=a,b,c` — diffs for several
@@ -431,20 +452,25 @@ pub(crate) async fn section_diff(
 #[utoipa::path(
     get,
     path = "/v1/sections/batch/diff",
+    tag = "sections",
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
-        ("names" = String, Query),
+        ("names" = String, Query, example = "pg_stat_database,pg_stat_wal"),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Section diffs keyed by logical name", body = SectionsBatchDiffResponse),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 404, description = "Unknown section", body = ApiError),
+        (status = 413, description = "Store query limit exceeded", body = ApiError),
+        (status = 500, description = "Store read failed", body = ApiError),
     )
 )]
 pub(crate) async fn sections_batch_diff(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ErrorResponse> {
+) -> Result<Json<SectionsBatchDiffResponse>, ErrorResponse> {
     let params = QueryParams::parse(raw.as_deref(), BATCH_DIFF_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -481,17 +507,14 @@ pub(crate) async fn sections_batch_diff(
         .map_err(|err| query_error_response_without_cursor(&err))?;
     let gates = Gates::from_pages(&logicals, &pages);
 
-    let mut out = serde_json::Map::new();
+    let mut out = BTreeMap::new();
     for (logical, &name) in logicals.iter().zip(&names) {
         let page = pages.get(name).ok_or_else(|| {
             query_error_response_without_cursor(&QueryError::UnknownSection(name.to_owned()))
         })?;
-        out.insert(
-            name.to_owned(),
-            Value::Object(section_diff_object(logical, page, &gates)?),
-        );
+        out.insert(name.to_owned(), section_diff_object(logical, page, &gates)?);
     }
-    Ok(Json(Value::Object(out)))
+    Ok(Json(SectionsBatchDiffResponse(out)))
 }
 
 #[cfg(test)]
