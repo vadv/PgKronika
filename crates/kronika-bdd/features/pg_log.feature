@@ -14,7 +14,7 @@ Feature: PostgreSQL stderr collection
       | parser_kind         | 0 |
       | dict_dropped_fields | 0 |
     And section pg_log_errors is absent from the segment
-    And the web API reports PostgreSQL log state collecting for the only source
+    And the web API reports PostgreSQL log state collecting
 
   @pg16 @serial
   Scenario: collection follows a PostgreSQL stderr log rotation

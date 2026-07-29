@@ -73,21 +73,21 @@ async fn web_locale_neutral_problem(world: &mut BddWorld) -> Result<()> {
 }
 
 /// Assert the collected status row reports successful default `PostgreSQL` log collection.
-#[then("the web API reports PostgreSQL log state collecting for the only source")]
+#[then("the web API reports PostgreSQL log state collecting")]
 async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
     let dir = segment.data_root();
     let status = web::only_pg_log_status(dir).await?;
     anyhow::ensure!(
-        status["state"] == "collecting",
+        status["state"] == 0,
         "expected PostgreSQL log state `collecting`, got {status}"
     );
     anyhow::ensure!(
-        status["reason"] == "none",
+        status["reason"] == 0,
         "expected PostgreSQL log reason `none`, got {status}"
     );
     anyhow::ensure!(
-        status["parser"] == "stderr",
+        status["parser_kind"] == 0,
         "expected PostgreSQL log parser `stderr`, got {status}"
     );
     anyhow::ensure!(

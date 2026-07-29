@@ -916,7 +916,7 @@ pub(crate) async fn assert_locale_neutral_problem(dir: &Path) -> Result<()> {
         anyhow::ensure!(response.body["code"] == "invalid_query_parameter");
         anyhow::ensure!(
             response.body["params"]
-                == serde_json::json!({ "parameter": "source", "expected": "uint64" })
+                == serde_json::json!({ "parameter": "from", "expected": "int64" })
         );
         let instance = response.body["instance"]
             .as_str()

@@ -45,8 +45,8 @@ use tokio::time::timeout;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CAPTURED_STDERR_BYTES: usize = 1_048_576;
-const OVF_HEADER_LEN: usize = 192;
-const OVF_HEADER_CRC_OFFSET: usize = 188;
+const OVF_HEADER_LEN: usize = 184;
+const OVF_HEADER_CRC_OFFSET: usize = 180;
 
 type ChildLines = Lines<BufReader<ChildStdout>>;
 
@@ -751,8 +751,8 @@ pub(crate) fn mismatched_sidecar(canonical: &[u8], mismatch: SidecarMismatch) ->
         SidecarMismatch::FactSchema => increment_u32(&mut bytes, 16),
         SidecarMismatch::Extractor => increment_u32(&mut bytes, 20),
         SidecarMismatch::Registry => increment_u32(&mut bytes, 24),
-        SidecarMismatch::Descriptor => bytes[64] ^= 0x80,
-        SidecarMismatch::Lineage => bytes[128] ^= 0x80,
+        SidecarMismatch::Descriptor => bytes[56] ^= 0x80,
+        SidecarMismatch::Lineage => bytes[120] ^= 0x80,
     }
     reseal_header(&mut bytes);
     Ok(bytes)
@@ -828,6 +828,25 @@ fn escape_prometheus_label(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_mismatches_reseal_the_current_header() {
+        let mut canonical = vec![0_u8; OVF_HEADER_LEN];
+        reseal_header(&mut canonical);
+
+        for mismatch in SidecarMismatch::ALL {
+            let candidate =
+                mismatched_sidecar(&canonical, mismatch).expect("build mismatched sidecar");
+            let stored = u32::from_le_bytes(
+                candidate[OVF_HEADER_CRC_OFFSET..OVF_HEADER_LEN]
+                    .try_into()
+                    .expect("header checksum"),
+            );
+            let mut checksum_input = candidate[..OVF_HEADER_LEN].to_vec();
+            checksum_input[OVF_HEADER_CRC_OFFSET..].fill(0);
+            assert_eq!(stored, crc32c(&checksum_input), "{}", mismatch.label());
+        }
+    }
 
     #[test]
     fn child_stderr_capture_has_a_hard_byte_bound() {
