@@ -5,7 +5,7 @@
 
 | Каталог | Смысл | Specs | Plans |
 | --- | --- | ---: | ---: |
-| [`specs/`](specs/), [`plans/`](plans/) | Активные `PARTIAL`/`FUTURE`: есть точный незакрытый объём | 17 | 4 |
+| [`specs/`](specs/), [`plans/`](plans/) | Активные `PARTIAL`/`FUTURE`: есть точный незакрытый объём | 17 | 5 |
 | [`implemented/specs/`](implemented/specs/), [`implemented/plans/`](implemented/plans/) | Полностью реализованные контракты и планы | 5 | 13 |
 | [`archive/specs/`](archive/specs/), [`archive/plans/`](archive/plans/) | Заменённые или отклонённые варианты | 1 | 1 |
 
@@ -41,3 +41,4 @@
 | [Machine API routes](plans/2026-07-21-machine-api-route-contract.md) | `FUTURE` | Единый `/v1` method/path/query manifest, двусторонний Router/OpenAPI contract и resource-specific `Allow`. |
 | [Analysis contracts](plans/2026-07-22-analysis-remaining-contracts.md) | `PARTIAL` | Typed identity/relations/coverage; 6 adapter-first, 1 shared-snapshot, 8 partial-input и 9 producer/narrowing требований; diff completeness и browser contract. |
 | [Web-index producer and consumers](plans/2026-07-28-web-index-producer-consumers-implementation.md) | `PARTIAL` | Bounded degradation, stable error/OpenAPI contract, real statements producer proof, multi-segment top-K correctness и structural/BDD qualification. |
+| [Passive instance metadata](plans/2026-07-29-passive-instance-metadata.md) | `FUTURE` | Удаление node label, аналитических зависимостей от `instance_metadata` и связанных API/quality контрактов. |
