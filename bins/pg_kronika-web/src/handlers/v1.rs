@@ -48,6 +48,14 @@ const BATCH_DIFF_PARAMS: &[QueryParameter] = &[
 /// `GET /v1/version` — the API and container format versions this build serves.
 ///
 /// Static body, `application/json`.
+#[utoipa::path(
+    get,
+    path = "/v1/version",
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
     QueryParams::parse(raw.as_deref(), &[])?;
     Ok(Json(
@@ -59,6 +67,14 @@ pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiE
 ///
 /// One entry per logical name: its semantics, sort key, and the union of its
 /// versions' columns (first appearance across ascending `type_id`).
+#[utoipa::path(
+    get,
+    path = "/v1/sections",
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
     QueryParams::parse(raw.as_deref(), &[])?;
     let mut by_name: BTreeMap<&'static str, Vec<&'static kronika_registry::TypeContract>> =
@@ -96,6 +112,18 @@ pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, Api
 
 /// `GET /v1/segments?from&to` — segments overlapping the
 /// window, catalog metadata only (no section bodies decoded).
+#[utoipa::path(
+    get,
+    path = "/v1/segments",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn segments(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
@@ -147,6 +175,21 @@ pub(crate) async fn segments(
 /// The reader does the query (ts filter, sort, union columns, gaps); this
 /// handler parses params and shapes the result. A stale snapshot degrades to
 /// gaps inside the reader, so it stays a `200`.
+#[utoipa::path(
+    get,
+    path = "/v1/section/{name}",
+    params(
+        ("name" = String, Path),
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("limit" = Option<usize>, Query),
+        ("cursor" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn section_data(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
@@ -174,6 +217,20 @@ pub(crate) async fn section_data(
 /// One decode of each overlapping segment serves every requested section, so a
 /// multi-metric view costs one pass, not one per section. An unknown name fails
 /// the whole request.
+#[utoipa::path(
+    get,
+    path = "/v1/sections/batch",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("names" = String, Query),
+        ("limit" = Option<usize>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn sections_batch(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
@@ -323,6 +380,19 @@ fn section_diff_object(
 ///
 /// Resolves the section's identity and cumulative columns from the registry,
 /// reads the window in one page, and folds each series through the diff core.
+#[utoipa::path(
+    get,
+    path = "/v1/section/{name}/diff",
+    params(
+        ("name" = String, Path),
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn section_diff(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
@@ -358,6 +428,19 @@ pub(crate) async fn section_diff(
 /// One decode of each overlapping segment serves every requested section, so a
 /// multi-metric diff costs one segment pass, not one per section. An unknown name
 /// fails the whole request.
+#[utoipa::path(
+    get,
+    path = "/v1/sections/batch/diff",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("names" = String, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn sections_batch_diff(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,

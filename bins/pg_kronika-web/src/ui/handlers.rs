@@ -39,6 +39,17 @@ const HEATMAP_PARAMS: &[QueryParameter] = &[
 ];
 
 /// `GET /v1/views/summary?at=<us>` — exact indexed populations.
+#[utoipa::path(
+    get,
+    path = "/v1/views/summary",
+    params(
+        ("at" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn summary(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
@@ -72,6 +83,22 @@ pub(crate) async fn summary(
 }
 
 /// `GET /v1/timeline/heatmap` — bounded web-index entity-series merge.
+#[utoipa::path(
+    get,
+    path = "/v1/timeline/heatmap",
+    params(
+        ("view" = String, Query),
+        ("metric" = String, Query),
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("buckets" = Option<usize>, Query),
+        ("top" = Option<usize>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn heatmap(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
@@ -215,6 +242,17 @@ fn heatmap_error(error: &HeatmapError) -> ApiError {
 }
 
 /// `GET /v1/ui/catalog` — stable UI projections.
+#[utoipa::path(
+    get,
+    path = "/v1/ui/catalog",
+    params(
+        ("If-None-Match" = Option<String>, Header),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn catalog(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,

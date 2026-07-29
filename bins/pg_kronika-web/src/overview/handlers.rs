@@ -74,6 +74,18 @@ struct OverviewRequest {
 }
 
 /// `GET /v1/timeline/overview?from_us=..&to_us=..`.
+#[utoipa::path(
+    get,
+    path = "/v1/timeline/overview",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn overview(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), OVERVIEW_PARAMS) {
         Ok(params) => params,
@@ -329,6 +341,19 @@ struct HealthRequest {
 }
 
 /// `GET /v1/timeline/health?from=..&to=..&step=..`.
+#[utoipa::path(
+    get,
+    path = "/v1/timeline/health",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("step" = Option<u64>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn health(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), HEALTH_PARAMS) {
         Ok(params) => params,
@@ -481,6 +506,22 @@ impl EventsRequest {
 }
 
 /// `GET /v1/timeline/events?from=..&to=..&limit=..&cursor=..`.
+#[utoipa::path(
+    get,
+    path = "/v1/timeline/events",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("limit" = Option<usize>, Query),
+        ("cursor" = Option<String>, Query),
+        ("min_severity" = Option<String>, Query),
+        ("kind" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), EVENTS_PARAMS) {
         Ok(params) => params,

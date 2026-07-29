@@ -91,6 +91,7 @@ use tokio as _;
 use tower_http as _;
 use tracing as _;
 use tracing_subscriber as _;
+use utoipa_swagger_ui::SwaggerUi;
 
 // criterion is used only by the `anomalies` bench; anchored for the
 // `unused_crate_dependencies` lint, which checks each target separately.
@@ -98,6 +99,7 @@ use tracing_subscriber as _;
 use criterion as _;
 
 mod anomaly;
+mod api_docs;
 mod api_error;
 mod auth;
 pub(crate) mod handlers;
@@ -845,6 +847,7 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
             "/v1/sections/batch/diff",
             get(handlers::v1::sections_batch_diff),
         )
+        .merge(SwaggerUi::new("/swagger-ui").url("/openapi.json", api_docs::document()))
         .method_not_allowed_fallback(|| async {
             api_error::ApiError::method_not_allowed("GET, HEAD")
         })

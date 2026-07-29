@@ -42,6 +42,8 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower-http = { version = "0.6", features = ["trace"] }
+utoipa = "5"
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 mimalloc = { version = "0.1", features = ["override"] }
 sha2 = "0.10"
 http-body-util = { version = "0.1", optional = true }

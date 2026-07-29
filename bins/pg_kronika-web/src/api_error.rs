@@ -192,9 +192,11 @@ closed_string_enum! {
 }
 
 /// A small machine-readable API error.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub(crate) struct ApiError {
+    #[schema(value_type = String)]
     code: ErrorCode,
+    #[schema(value_type = Object)]
     params: serde_json::Value,
     #[serde(skip)]
     status: StatusCode,

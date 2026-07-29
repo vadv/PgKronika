@@ -176,6 +176,24 @@ fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorR
 ///
 /// Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `limit`,
 /// and `section`. Oversized sections are reported in `skipped`.
+#[utoipa::path(
+    get,
+    path = "/v1/anomalies",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("window" = Option<String>, Query),
+        ("step" = Option<String>, Query),
+        ("threshold" = Option<f64>, Query),
+        ("eps_rel" = Option<f64>, Query),
+        ("limit" = Option<usize>, Query),
+        ("section" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn anomalies(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), ANOMALY_PARAMS) {
         Ok(params) => params,

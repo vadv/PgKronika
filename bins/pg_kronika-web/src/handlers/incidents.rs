@@ -58,6 +58,25 @@ struct ValidatedRequest {
 ///
 /// Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `epsilon`,
 /// `max_cluster_span`, and `section`. All time inputs are unix microseconds.
+#[utoipa::path(
+    get,
+    path = "/v1/incidents",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("window" = Option<String>, Query),
+        ("step" = Option<String>, Query),
+        ("threshold" = Option<f64>, Query),
+        ("eps_rel" = Option<f64>, Query),
+        ("epsilon" = Option<String>, Query),
+        ("max_cluster_span" = Option<String>, Query),
+        ("section" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn incidents(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), INCIDENT_PARAMS) {
         Ok(params) => params,
