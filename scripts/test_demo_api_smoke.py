@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -43,6 +44,23 @@ class WaitConfigurationTests(unittest.TestCase):
             "DEMO_API_WAIT_SECONDS must be a non-negative integer",
         ):
             SMOKE.parse_wait_seconds("-1")
+
+
+class DemoStandDefaultsTests(unittest.TestCase):
+    def test_default_api_url_uses_demo_stand_web_port(self) -> None:
+        stand_script = (
+            Path(__file__).resolve().parent / "demo-stand.sh"
+        ).read_text(encoding="utf-8")
+        match = re.search(
+            r"(?m)^WEB_PORT=\$\{DEMO_WEB_PORT:-(\d+)\}$",
+            stand_script,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(
+            SMOKE.DEFAULT_BASE_URL,
+            f"http://127.0.0.1:{match.group(1)}",
+        )
 
 
 class RetainedSegmentWaitTests(unittest.TestCase):
