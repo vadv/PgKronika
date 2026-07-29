@@ -11,7 +11,8 @@
 ## Global Constraints
 
 - Keep one `OpenApiRouter` registry and one direct YAML exporter.
-- Do not add schema comparisons, snapshot tests, generated-file checks, or OpenAPI tests.
+- Keep one mechanical CI freshness check for the generated YAML.
+- Do not add schema comparisons, snapshot tests, or OpenAPI tests.
 - Do not type successful response DTOs as part of this change.
 - Keep `/healthz`, `/readyz`, and `/metrics` outside OpenAPI.
 - Keep Swagger UI assets vendored for the static musl build.
@@ -138,6 +139,7 @@ Commit the renamed module, updated users, and deleted contract tests together.
 - Modify: `bins/pg_kronika-web/src/handlers/incidents.rs`
 - Modify: `bins/pg_kronika-web/src/overview/handlers.rs`
 - Modify: `bins/pg_kronika-web/src/ui/handlers.rs`
+- Modify: `.github/workflows/ci.yml`
 - Delete: `bins/pg_kronika-web/openapi.json`
 
 **Interfaces:**
@@ -229,7 +231,9 @@ Add the direct exporter and run:
 make swagger
 ```
 
-Do not add a generated-file check or OpenAPI test.
+Add one CI step that runs the same command and fails if
+`bins/pg_kronika-web/swagger.yaml` is untracked or has a Git diff. Do not add
+schema comparisons or an OpenAPI test.
 
 - [ ] **Step 7: Commit OpenAPI and Swagger UI**
 

@@ -118,12 +118,14 @@ Basic Auth.
 [`bins/pg_kronika-web/src/api_docs.rs`](bins/pg_kronika-web/src/api_docs.rs)
 подключает документированные обработчики одновременно к Axum и OpenAPI.
 Нейтральное представление результата находится в
-[`swagger.yaml`](bins/pg_kronika-web/swagger.yaml). Оно обновляется без
-schema-сверок и snapshot-тестов:
+[`swagger.yaml`](bins/pg_kronika-web/swagger.yaml). Для обновления:
 
 ```sh
 make swagger
 ```
+
+CI выполняет ту же команду и отклоняет изменение `swagger.yaml`. Schema-сверок,
+контрактных тестов и OpenAPI snapshot-тестов при этом нет.
 
 ## Карта рабочего пространства
 

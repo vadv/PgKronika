@@ -113,12 +113,14 @@ the UI, Swagger UI, OpenAPI document, and `/v1/*` are open; `/healthz`,
 [`bins/pg_kronika-web/src/api_docs.rs`](bins/pg_kronika-web/src/api_docs.rs)
 is the single registry that connects documented handlers to both Axum and
 OpenAPI. The generated, tool-neutral view is
-[`swagger.yaml`](bins/pg_kronika-web/swagger.yaml). Refresh it without any
-schema checks or snapshot tests:
+[`swagger.yaml`](bins/pg_kronika-web/swagger.yaml). Refresh it with:
 
 ```sh
 make swagger
 ```
+
+CI runs the same command and rejects a diff in `swagger.yaml`. It does not run
+schema comparisons, contract tests, or OpenAPI snapshots.
 
 ## Workspace map
 

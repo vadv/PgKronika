@@ -227,11 +227,14 @@ See the generated [OpenAPI document](swagger.yaml) and the
 [simplification specification](../../docs/superpowers/specs/2026-07-29-openapi-swagger-migration.md).
 
 `src/api_docs.rs` is the single registry connecting documented handlers to
-Axum and OpenAPI. Refresh `swagger.yaml` without contract tests:
+Axum and OpenAPI. Refresh `swagger.yaml` with:
 
 ```sh
 make swagger
 ```
+
+CI runs the same command and rejects a diff in the generated file. It does not
+compare schemas or run OpenAPI contract or snapshot tests.
 
 ## Query and analysis contracts
 
