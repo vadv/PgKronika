@@ -19,6 +19,9 @@ from typing import Any
 
 DEFAULT_BASE_URL = "http://127.0.0.1:18081"
 DEFAULT_SCHEMATHESIS_VERSION = "4.24.3"
+ANALYTIC_CAPACITY_CODE = "analytic_capacity_unavailable"
+ANALYTIC_CAPACITY_MAX_ATTEMPTS = 3
+ANALYTIC_CAPACITY_RETRY_SECONDS = 1
 MAX_SMOKE_RANGE_US = 6 * 60 * 60 * 1_000_000
 RETAINED_SEGMENT_POLL_SECONDS = 10
 SEGMENTS_QUERY = {"from": -(2**63), "to": 2**63 - 1}
@@ -235,6 +238,40 @@ def prepare_context(base_url: str, authorization: str | None) -> dict[str, Any]:
     }
 
 
+def run_schemathesis(
+    command: list[str],
+    root: Path,
+    environment: dict[str, str],
+) -> int:
+    for attempt in range(1, ANALYTIC_CAPACITY_MAX_ATTEMPTS + 1):
+        result = subprocess.run(
+            command,
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        sys.stdout.write(stdout)
+        sys.stderr.write(stderr)
+        if result.returncode == 0:
+            return 0
+        if (
+            ANALYTIC_CAPACITY_CODE not in stdout + stderr
+            or attempt == ANALYTIC_CAPACITY_MAX_ATTEMPTS
+        ):
+            return result.returncode
+        print(
+            "retrying Schemathesis after analytic capacity rejection "
+            f"(attempt {attempt + 1}/{ANALYTIC_CAPACITY_MAX_ATTEMPTS})",
+            flush=True,
+        )
+        time.sleep(ANALYTIC_CAPACITY_RETRY_SECONDS)
+    raise AssertionError("bounded Schemathesis retry loop did not return")
+
+
 def run() -> int:
     root = Path(__file__).resolve().parent.parent
     base_url = os.environ.get("DEMO_API_URL", DEFAULT_BASE_URL).rstrip("/")
@@ -287,7 +324,7 @@ def run() -> int:
     ]
     if credentials is not None:
         command.extend(["--auth", credentials])
-    return subprocess.run(command, cwd=root, env=environment, check=False).returncode
+    return run_schemathesis(command, root, environment)
 
 
 if __name__ == "__main__":

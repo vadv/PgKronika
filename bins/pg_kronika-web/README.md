@@ -253,6 +253,8 @@ then uses Schemathesis to validate one response per operation and require
 endpoint-specific evidence of data. Set `DEMO_API_URL` or
 `PG_KRONIKA_SMOKE_AUTH=user:password` when needed. By default missing retained
 data fails immediately; `DEMO_API_WAIT_SECONDS` enables bounded polling.
+Documented `analytic_capacity_unavailable` rejections are retried twice with a
+one-second delay; other failures are not retried.
 
 The GitHub Actions `Demo API smoke` workflow runs the same check manually for
 the revision selected at dispatch time. It builds and starts an isolated demo

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import re
 import unittest
 from pathlib import Path
@@ -125,6 +127,92 @@ class RetainedSegmentWaitTests(unittest.TestCase):
 
         self.assertEqual(request_json.call_count, 2)
         sleep.assert_called_once_with(10)
+
+
+class SchemathesisRetryTests(unittest.TestCase):
+    @staticmethod
+    def result(returncode: int, output: str) -> object:
+        return SMOKE.subprocess.CompletedProcess(
+            args=["schemathesis"],
+            returncode=returncode,
+            stdout=output,
+            stderr="",
+        )
+
+    @mock.patch.object(SMOKE.time, "sleep")
+    @mock.patch.object(SMOKE.subprocess, "run")
+    def test_success_is_not_retried(
+        self,
+        run: mock.Mock,
+        sleep: mock.Mock,
+    ) -> None:
+        run.return_value = self.result(0, "all passed\n")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = SMOKE.run_schemathesis(["schemathesis"], Path("."), {})
+
+        self.assertEqual(status, 0)
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    @mock.patch.object(SMOKE.time, "sleep")
+    @mock.patch.object(SMOKE.subprocess, "run")
+    def test_analytic_capacity_failure_is_retried(
+        self,
+        run: mock.Mock,
+        sleep: mock.Mock,
+    ) -> None:
+        run.side_effect = [
+            self.result(1, '{"code":"analytic_capacity_unavailable"}\n'),
+            self.result(0, "all passed\n"),
+        ]
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            status = SMOKE.run_schemathesis(["schemathesis"], Path("."), {})
+
+        self.assertEqual(status, 0)
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1)
+        self.assertIn(
+            "retrying Schemathesis after analytic capacity rejection",
+            output.getvalue(),
+        )
+
+    @mock.patch.object(SMOKE.time, "sleep")
+    @mock.patch.object(SMOKE.subprocess, "run")
+    def test_unrelated_failure_is_not_retried(
+        self,
+        run: mock.Mock,
+        sleep: mock.Mock,
+    ) -> None:
+        run.return_value = self.result(1, "response schema mismatch\n")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = SMOKE.run_schemathesis(["schemathesis"], Path("."), {})
+
+        self.assertEqual(status, 1)
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    @mock.patch.object(SMOKE.time, "sleep")
+    @mock.patch.object(SMOKE.subprocess, "run")
+    def test_analytic_capacity_retries_are_bounded(
+        self,
+        run: mock.Mock,
+        sleep: mock.Mock,
+    ) -> None:
+        run.return_value = self.result(
+            1,
+            '{"code":"analytic_capacity_unavailable"}\n',
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = SMOKE.run_schemathesis(["schemathesis"], Path("."), {})
+
+        self.assertEqual(status, 1)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(1), mock.call(1)])
 
 
 class ManualWorkflowContractTests(unittest.TestCase):
