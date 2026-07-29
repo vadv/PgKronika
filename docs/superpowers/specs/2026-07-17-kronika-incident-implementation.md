@@ -451,7 +451,7 @@ xmin относится к той же relation. Horizon и dead tuples пока
 ### 7.1. Request
 
 ```text
-GET /v1/incidents?source=<u64>&from=<i64>&to=<i64>
+GET /v1/incidents?from=<i64>&to=<i64>
                   [&window=<duration>][&step=<duration>]
                   [&threshold=<f64>][&eps_rel=<f64>]
                   [&epsilon=<duration>][&max_cluster_span=<duration>]
@@ -470,7 +470,6 @@ Hard ceilings не являются client parameters. До snapshot/read про
 
 ```text
 IncidentsResponse {
-  source_id,
   from, to,
   complete,
   incidents: [Incident],

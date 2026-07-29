@@ -2,7 +2,7 @@
 //! (README.md, "Service Sections").
 //!
 //! Mandatory in every segment carrying `PostgreSQL` or OS snapshots. It records
-//! the source identity and version used to interpret other sections:
+//! the node identity and version used to interpret other sections:
 //! `pg_version_num` explains version-dependent columns (a PG17 layout drops
 //! `pg_stat_bgwriter` counters), and the OS fields (`clock_ticks_per_sec`,
 //! `page_size_bytes`, `boot_id`, `btime`) make OS sections self-contained.

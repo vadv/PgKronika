@@ -171,7 +171,7 @@ pg_kronika-dump \
 ```
 
 Without `--rows`, the command reads only the fixed OVF header and bounded block
-directory. `header` reports the source and contract identity. `blocks` preserves
+directory. `header` reports the input file descriptor and contract versions. `blocks` preserves
 directory order and reports kind/code, logical id, schema, flags, codec, stored
 and decoded bytes, item count, and optional time range. Unknown optional kinds
 remain visible with `kind: null`.

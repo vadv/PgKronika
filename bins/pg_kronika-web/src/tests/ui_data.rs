@@ -84,19 +84,10 @@ async fn ui_summary_returns_exact_event_population_and_all_views() {
 }
 
 #[tokio::test]
-async fn ui_summary_rejects_removed_and_unknown_parameters() {
+async fn ui_summary_rejects_unknown_parameters() {
     let directory = tempfile::tempdir().expect("tempdir");
     write_event_segment(directory.path());
     publish_web_index(directory.path());
-
-    let (status, body) = serve(directory.path(), "/v1/views/summary?source=8&at=1500").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_problem(
-        &body,
-        status,
-        "unknown_query_parameter",
-        serde_json::json!({ "parameter": "source" }),
-    );
 
     let (status, body) = serve(directory.path(), "/v1/views/summary?at=1500&extra=1").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

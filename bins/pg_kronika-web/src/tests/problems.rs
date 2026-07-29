@@ -166,7 +166,7 @@ async fn accept_language_does_not_change_success_or_problem_semantics() {
         assert!(response.headers.get(header::VARY).is_none());
     }
 
-    let uri = "/v1/segments?source=not-a-number&from=0&to=1";
+    let uri = "/v1/segments?unexpected=value&from=0&to=1";
     let (_dir, english) = fixture_captured(uri, &[("accept-language", "en")]).await;
     let (_dir, russian) = fixture_captured(uri, &[("accept-language", "ru")]).await;
     for response in [&english, &russian] {
@@ -174,7 +174,7 @@ async fn accept_language_does_not_change_success_or_problem_semantics() {
             &response.body,
             StatusCode::BAD_REQUEST,
             "unknown_query_parameter",
-            serde_json::json!({ "parameter": "source" }),
+            serde_json::json!({ "parameter": "unexpected" }),
         );
         assert!(response.headers.get(header::CONTENT_LANGUAGE).is_none());
         assert!(response.headers.get(header::VARY).is_none());
@@ -225,12 +225,12 @@ async fn routing_method_and_query_shape_use_the_closed_registry() {
         serde_json::json!({ "parameter": "locale" }),
     );
 
-    let (_dir, duplicate) = fixture_captured("/v1/segments?source=8&from=0&to=1", &[]).await;
+    let (_dir, duplicate) = fixture_captured("/v1/segments?unexpected=8&from=0&to=1", &[]).await;
     assert_problem(
         &duplicate.body,
         StatusCode::BAD_REQUEST,
         "unknown_query_parameter",
-        serde_json::json!({ "parameter": "source" }),
+        serde_json::json!({ "parameter": "unexpected" }),
     );
 
     let (_dir, malformed_path) = fixture_captured("/v1/section/%FF?from=0&to=1", &[]).await;
@@ -338,7 +338,7 @@ async fn generated_request_ids_are_unique_and_match_the_instance_header_invarian
 async fn correlation_is_server_generated_and_does_not_reflect_request_data() {
     let secret = "client-secret-request-id";
     let (_dir, response) = fixture_captured(
-        "/v1/segments?source=%2Fprivate%2Fstore&from=0&to=1",
+        "/v1/segments?unexpected=%2Fprivate%2Fstore&from=0&to=1",
         &[("x-request-id", secret)],
     )
     .await;
@@ -870,11 +870,6 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
         .expect("event instance ID description");
     assert!(event_instance_description.contains("retained occurrences"));
     assert!(event_instance_description.contains("provenance"));
-    assert!(
-        schemas["EventFact"]["properties"]
-            .get("source_id")
-            .is_none()
-    );
     assert_eq!(
         schemas["EventFact"]["properties"]["section_type_id"]["type"],
         serde_json::json!(["integer", "null"])

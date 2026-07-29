@@ -319,7 +319,7 @@ client и models.
   "evaluation_id": "7-d7IB3CFsDt9DWiJ98rKJjT9uof8W5dTQ1OwM9ZMnE",
   "scope": {
     "kind": "instance",
-    "source_id": "7",
+    "node_self_id": "node-7",
     "database_episode_id": null
   },
   "source_window": {
@@ -578,7 +578,7 @@ versioning. Новый смысл или новая nullable-колонка по
 
 ```text
 sampled_at
-source_id
+node_self_id
 server_version_num
 server_role
 database_oid?                 # для per-database catalogs
@@ -1380,8 +1380,8 @@ Registry IDs (`rule_id`, `input_id`, `policy_id`) ограничены 96 ASCII
 `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`; revision хранится отдельным полем и
 не кодируется в display text.
 
-В новых моделях `response_schema_version=3` `source_id` и любые сырые 64-bit
-counters, bounds и byte offsets передаются десятичными строками.
+В новых моделях `response_schema_version=3` сырые 64-bit counters, bounds и byte
+offsets передаются десятичными строками.
 `U64Decimal` имеет pattern `^(0|[1-9][0-9]{0,19})$` и проверку значения
 `<= 18446744073709551615`; `I64Decimal` — pattern
 `^(0|-?[1-9][0-9]{0,18})$` и проверку диапазона signed 64-bit. Производные
@@ -1455,7 +1455,7 @@ closed `parameter` registry. `expected` дополняется
 | `insufficient_samples` | `input_id`, `required`, `observed` |
 | `zero_denominator` | `input_id` |
 | `bounded_subset` | `input_id`, `returned`, optional `source_total` |
-| `cycle_budget_deferred` | `source_id` |
+| `cycle_budget_deferred` | `source_type_id` |
 | `pool_limit` | `limit` |
 | `connect_failed` | `database_episode_id`, `failure_class` |
 | `query_timeout` | `source_type_id`, `timeout_ms` |
@@ -1605,7 +1605,7 @@ extension version и collection cadence входят в continuity. Gauge не
 Исторический object key:
 
 ```text
-source identity
+node identity
 database episode
 object class
 catalog OID

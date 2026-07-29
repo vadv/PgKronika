@@ -22,6 +22,8 @@ jobs:
         with:
           ref: ${{ env.EXACT_SOURCE_HEAD }}
       - uses: Swatinem/rust-cache@v2
+      - name: Validate single-root terminology
+        run: python3 -B scripts/validate-single-root-terminology.py
       - run: cargo fmt --all --check
       - name: Validate frozen PGM research evidence
         run: python3 -B scripts/validate-pgm-size-reduction.py

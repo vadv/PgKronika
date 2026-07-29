@@ -82,7 +82,7 @@ pub use reduce::{
 
 /// Fact-container framing version.
 ///
-/// Version 3 stores single-root provenance without a numeric source namespace.
+/// Version 3 stores descriptor-based single-root provenance.
 pub const CONTAINER_VERSION: u16 = 3;
 
 /// Canonical fact schema version.

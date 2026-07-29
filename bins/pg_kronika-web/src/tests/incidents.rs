@@ -300,7 +300,6 @@ async fn incidents_bind_identity_to_the_observed_node() {
 
     for body in [&first, &other_node] {
         assert_eq!(body["data_quality"]["node_identity"], "available");
-        assert!(body.get("source_id").is_none());
     }
 
     let first_key = first["incidents"][0]["incident_key"]
@@ -772,7 +771,6 @@ async fn incidents_reject_degenerate_parameters() {
         "/v1/incidents?from=-9223372036854775808&to=9223372036854775807",
         "/v1/incidents?from=0&to=3600000000&max_cluster_span=2h",
         "/v1/incidents?from=0&to=9000000000&unknown=1",
-        "/v1/incidents?source=8&from=0&to=9000000000",
     ] {
         let (status, _body) = serve(dir.path(), uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be rejected");

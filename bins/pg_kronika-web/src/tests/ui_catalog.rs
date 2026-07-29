@@ -203,21 +203,6 @@ async fn ui_catalog_keeps_pss_not_collected() {
 }
 
 #[tokio::test]
-async fn ui_catalog_rejects_the_removed_source_parameter() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write_bgwriter_segment(dir.path(), "known.pgm", 1_000, 2_000);
-
-    let (status, body) = serve(dir.path(), "/v1/ui/catalog?source=8").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_problem(
-        &body,
-        status,
-        "unknown_query_parameter",
-        serde_json::json!({ "parameter": "source" }),
-    );
-}
-
-#[tokio::test]
 async fn ui_catalog_rejects_unknown_parameters() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_bgwriter_segment(dir.path(), "known.pgm", 1_000, 2_000);

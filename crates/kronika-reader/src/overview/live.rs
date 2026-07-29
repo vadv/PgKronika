@@ -1930,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn source_zero_dictionary_part_rebuilds_with_timestamped_parts() {
+    fn dictionary_only_part_rebuilds_with_timestamped_parts() {
         let (dictionary_bytes, mut sealed_sections) = dictionary_only_part();
         let lifecycle_rows = [row(1_000, 2, None, None)];
         let lifecycle_body = PgLogLifecycleV1::encode(&lifecycle_rows).expect("encode lifecycle");

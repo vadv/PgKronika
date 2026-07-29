@@ -132,7 +132,7 @@ enum SnapshotAttempt {
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "a verified plan read coordinates the pool, server version, source identity, reset context, and fork"
+    reason = "a verified plan read coordinates the pool, server version, node identity, reset context, and fork"
 )]
 async fn collect_verified_plans(
     pool: &ConnectionPool,

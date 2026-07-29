@@ -122,7 +122,7 @@ impl Default for FallbackConfig {
 
 /// Full in-memory identity of one admitted sealed-segment fact set.
 ///
-/// The durable key binds the numeric source, exact PGM descriptor, fact kind,
+/// The durable key binds the exact PGM descriptor, fact kind,
 /// schema, extractor, and registry versions. The lineage additionally binds
 /// the retained source provenance carried by admitted observations. No
 /// filesystem path participates in this in-memory key.

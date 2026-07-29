@@ -119,7 +119,6 @@ share one decode path.
 
 ```rust
 pub struct UnitMeta {
-    pub source_id: u64,
     pub min_ts: i64,
     pub max_ts: i64,
     pub live: bool,

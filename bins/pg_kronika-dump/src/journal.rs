@@ -20,7 +20,7 @@ pub(crate) fn inspect_file(
     path: &Path,
     options: Options,
 ) -> Result<JournalOutput, DumpError> {
-    let source_identity =
+    let input_file_identity =
         FileIdentity::from_file(file).map_err(|error| DumpError::input("stat journal", error))?;
     let physical_bytes = file
         .byte_len()
@@ -102,7 +102,7 @@ pub(crate) fn inspect_file(
             last_us,
         },
     };
-    verify_identity(file, source_identity)?;
+    verify_identity(file, input_file_identity)?;
     Ok(output)
 }
 

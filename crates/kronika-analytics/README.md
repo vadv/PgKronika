@@ -24,8 +24,8 @@ network I/O, PostgreSQL access, HTTP handling, redaction, or diagnosis.
 
 Observation identities do not depend on a filesystem path:
 
-- a sealed PGM produces rebuild-stable content-derived lineage from its
-  numeric source ID, exact source descriptor, and first catalog descriptor;
+- a sealed PGM produces rebuild-stable content-derived lineage from its exact
+  content descriptor and first catalog descriptor;
 - a live view uses its journal generation and first-part descriptor and reports
   `IdentityQuality::Approximate` until a sealed handoff is proven.
 

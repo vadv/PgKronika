@@ -75,7 +75,7 @@
       "transport": "Unix socket"
     },
     "identity_proof": [
-      "equal source_id, min_ts and max_ts",
+      "equal min_ts and max_ts",
       "equal non-dictionary type_id sets",
       "exact canonical Arrow RecordBatch equality for every non-dictionary type_id",
       "equal normalized dictionary map",
@@ -97,7 +97,6 @@
       "name": "1785059977507800.pgm",
       "min_ts_us": 1785059977507800,
       "max_ts_us": 1785060877652022,
-      "source_id": 0,
       "source": {
         "sha256": "749e67d88f3c7f36b62e94f449853e23970d4b9bced8f2a4bfa66df7f31cc1a8",
         "bytes": 19430424,
@@ -155,7 +154,6 @@
       "name": "1785060877737577.pgm",
       "min_ts_us": 1785060873475000,
       "max_ts_us": 1785061777673439,
-      "source_id": 0,
       "source": {
         "sha256": "eebb80c43f18311d7366ec1e121acb84f505b6d28b0841594a7e37be0a82fa34",
         "bytes": 19472521,
@@ -213,7 +211,6 @@
       "name": "1785061777869918.pgm",
       "min_ts_us": 1785061775406000,
       "max_ts_us": 1785062677839412,
-      "source_id": 0,
       "source": {
         "sha256": "ed85d14e14438ceb0fca200aaa40ff780b741b6db04ca3249b627ad0b301761a",
         "bytes": 19329891,
@@ -315,7 +312,6 @@
     "min_ts_us": 1785062675482000,
     "max_ts_us": 1785062738002630,
     "duration_seconds": 62.52063,
-    "source_id": 0,
     "source": {
       "sha256": "4f39c4fcfc94c0c829d587a7bd11b537829b301f9bebb285372fddcbd96b9aac",
       "bytes": 1349538,
@@ -459,7 +455,6 @@
     ],
     "min_ts_us": 1780000000000000,
     "max_ts_us": 1780000155000000,
-    "source_id": 8099562711456768513,
     "catalog_identity_equal": true,
     "data_type_sets_equal": true,
     "canonical_arrow_equal": true,

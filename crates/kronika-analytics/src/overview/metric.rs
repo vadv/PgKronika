@@ -383,8 +383,12 @@ impl MetricSeriesDescriptor {
 
 /// Derives a content-qualified entity reference.
 #[must_use]
-pub fn derive_entity(kind: EntityKind, source_identity: &[u8]) -> EntityRef {
-    let digest = sha256::digest_parts(&[METRIC_ENTITY_DOMAIN_TAG, &[kind.code()], source_identity]);
+pub fn derive_entity(kind: EntityKind, entity_identity_bytes: &[u8]) -> EntityRef {
+    let digest = sha256::digest_parts(&[
+        METRIC_ENTITY_DOMAIN_TAG,
+        &[kind.code()],
+        entity_identity_bytes,
+    ]);
     let mut id = [0_u8; 16];
     id.copy_from_slice(&digest[..16]);
     EntityRef { kind, id }
