@@ -23,6 +23,7 @@ ANALYTIC_CAPACITY_CODE = "analytic_capacity_unavailable"
 ANALYTIC_CAPACITY_MAX_ATTEMPTS = 3
 ANALYTIC_CAPACITY_RETRY_SECONDS = 1
 MAX_SMOKE_RANGE_US = 6 * 60 * 60 * 1_000_000
+MIN_WAIT_RETAINED_RANGE_US = 15 * 60 * 1_000_000
 RETAINED_SEGMENT_POLL_SECONDS = 10
 SEGMENTS_QUERY = {"from": -(2**63), "to": 2**63 - 1}
 SECTION_PRIORITY = (
@@ -118,17 +119,34 @@ def wait_for_retained_segments(
             query=SEGMENTS_QUERY,
             authorization=authorization,
         )
-        if body.get("segments", []):
+        segments = body.get("segments", [])
+        retained_range_us = 0
+        if segments:
+            retained_range_us = max(
+                int(segment["max_ts"]) for segment in segments
+            ) - min(int(segment["min_ts"]) for segment in segments)
+        if retained_range_us >= MIN_WAIT_RETAINED_RANGE_US:
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if segments:
+                raise PreflightError(
+                    "demo retained range is only "
+                    f"{retained_range_us / 1_000_000:g} seconds after waiting "
+                    f"{wait_seconds} seconds; smoke requires at least "
+                    f"{MIN_WAIT_RETAINED_RANGE_US / 1_000_000:g} seconds"
+                )
             raise PreflightError(
                 f"demo has no retained segments after waiting {wait_seconds} seconds"
             )
         delay = min(RETAINED_SEGMENT_POLL_SECONDS, remaining)
+        state = (
+            f"retained range is {retained_range_us / 1_000_000:g}s"
+            if segments
+            else "no retained segments"
+        )
         print(
-            f"demo has no retained segments; waiting {delay:g}s "
-            f"({remaining:g}s remaining)",
+            f"demo {state}; waiting {delay:g}s ({remaining:g}s remaining)",
             flush=True,
         )
         time.sleep(delay)

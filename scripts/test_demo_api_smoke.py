@@ -71,7 +71,9 @@ class RetainedSegmentWaitTests(unittest.TestCase):
     @mock.patch.object(
         SMOKE,
         "request_json",
-        return_value={"segments": [{"min_ts": 1, "max_ts": 2}]},
+        return_value={
+            "segments": [{"min_ts": 0, "max_ts": 15 * 60 * 1_000_000}]
+        },
     )
     def test_existing_segment_returns_without_sleep(
         self,
@@ -96,10 +98,39 @@ class RetainedSegmentWaitTests(unittest.TestCase):
         "request_json",
         side_effect=[
             {"segments": []},
-            {"segments": [{"min_ts": 1, "max_ts": 2}]},
+            {
+                "segments": [
+                    {"min_ts": 0, "max_ts": 15 * 60 * 1_000_000}
+                ]
+            },
         ],
     )
     def test_empty_result_is_polled_until_a_segment_appears(
+        self,
+        request_json: mock.Mock,
+        _monotonic: mock.Mock,
+        sleep: mock.Mock,
+    ) -> None:
+        SMOKE.wait_for_retained_segments("http://demo", None, 1200)
+
+        self.assertEqual(request_json.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+    @mock.patch("time.sleep")
+    @mock.patch("time.monotonic", side_effect=[0.0, 0.0])
+    @mock.patch.object(
+        SMOKE,
+        "request_json",
+        side_effect=[
+            {"segments": [{"min_ts": 0, "max_ts": 6 * 1_000_000}]},
+            {
+                "segments": [
+                    {"min_ts": 0, "max_ts": 15 * 60 * 1_000_000}
+                ]
+            },
+        ],
+    )
+    def test_short_retained_range_is_polled_until_it_is_long_enough(
         self,
         request_json: mock.Mock,
         _monotonic: mock.Mock,
@@ -235,6 +266,16 @@ class ManualWorkflowContractTests(unittest.TestCase):
             self.assertIn(command, workflow)
         self.assertGreaterEqual(workflow.count("if: always()"), 2)
         self.assertIn("actions/upload-artifact@v4", workflow)
+        self.assertNotIn("path: demo-data/", workflow)
+        for artifact in (
+            "demo-data/api-smoke.log",
+            "demo-data/container-live.log",
+            "demo-data/stand.log",
+            "demo-data/collector.log",
+            "demo-data/web.log",
+            "demo-data/report.json",
+        ):
+            self.assertIn(artifact, workflow)
 
 
 if __name__ == "__main__":
