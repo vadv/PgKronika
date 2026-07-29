@@ -25,7 +25,7 @@ async fn segments_missing_a_required_parameter_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a missing range bound is a client error"
     );
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "missing_query_parameter",
@@ -132,7 +132,7 @@ async fn section_unknown_name_is_not_found() {
 
     let (status, body) = serve(dir.path(), "/v1/section/does_not_exist?from=0&to=3000").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is 404");
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "unknown_section",
@@ -157,7 +157,7 @@ async fn section_bad_parameter_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a non-numeric range bound is 400"
     );
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "invalid_query_parameter",
@@ -237,7 +237,7 @@ async fn section_malformed_cursor_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a malformed cursor is a client error"
     );
-    assert_problem(&body, status, "invalid_cursor", serde_json::json!({}));
+    assert_api_error(&body, status, "invalid_cursor", serde_json::json!({}));
 }
 
 #[tokio::test]
@@ -297,7 +297,7 @@ async fn sections_batch_without_names_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "batch without names is a client error"
     );
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "missing_query_parameter",
@@ -322,7 +322,7 @@ async fn sections_batch_with_only_separators_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a names list of only separators names no section"
     );
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "invalid_query_parameter",

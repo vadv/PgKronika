@@ -13,11 +13,11 @@ use kronika_registry::{
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::api_error::{ApiError, ExpectedValue, LimitResource, QueryParameter, count_u64};
 use crate::params::{
     QueryParams, parse_cursor, parse_i64, parse_limit, query_error_response,
     query_error_response_without_cursor,
 };
-use crate::problem::{ApiProblem, ExpectedValue, LimitResource, QueryParameter, count_u64};
 use crate::serialize::{
     column_class_name, column_type_name, page_to_json, semantics_name, series_diff_to_json,
 };
@@ -48,7 +48,15 @@ const BATCH_DIFF_PARAMS: &[QueryParameter] = &[
 /// `GET /v1/version` — the API and container format versions this build serves.
 ///
 /// Static body, `application/json`.
-pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiProblem> {
+#[utoipa::path(
+    get,
+    path = "/v1/version",
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
+pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
     QueryParams::parse(raw.as_deref(), &[])?;
     Ok(Json(
         json!({ "api": "v1", "format_version": crate::FORMAT_VERSION }),
@@ -59,7 +67,15 @@ pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiP
 ///
 /// One entry per logical name: its semantics, sort key, and the union of its
 /// versions' columns (first appearance across ascending `type_id`).
-pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiProblem> {
+#[utoipa::path(
+    get,
+    path = "/v1/sections",
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
+pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
     QueryParams::parse(raw.as_deref(), &[])?;
     let mut by_name: BTreeMap<&'static str, Vec<&'static kronika_registry::TypeContract>> =
         BTreeMap::new();
@@ -96,10 +112,22 @@ pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, Api
 
 /// `GET /v1/segments?from&to` — segments overlapping the
 /// window, catalog metadata only (no section bodies decoded).
+#[utoipa::path(
+    get,
+    path = "/v1/segments",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn segments(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiProblem> {
+) -> Result<Json<Value>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -147,12 +175,27 @@ pub(crate) async fn segments(
 /// The reader does the query (ts filter, sort, union columns, gaps); this
 /// handler parses params and shapes the result. A stale snapshot degrades to
 /// gaps inside the reader, so it stays a `200`.
+#[utoipa::path(
+    get,
+    path = "/v1/section/{name}",
+    params(
+        ("name" = String, Path),
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("limit" = Option<usize>, Query),
+        ("cursor" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn section_data(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiProblem> {
-    let Path(name) = path.map_err(|_rejection| ApiProblem::unknown_section("invalid"))?;
+) -> Result<Json<Value>, ApiError> {
+    let Path(name) = path.map_err(|_rejection| ApiError::unknown_section("invalid"))?;
     let params = QueryParams::parse(raw.as_deref(), PAGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -174,20 +217,34 @@ pub(crate) async fn section_data(
 /// One decode of each overlapping segment serves every requested section, so a
 /// multi-metric view costs one pass, not one per section. An unknown name fails
 /// the whole request.
+#[utoipa::path(
+    get,
+    path = "/v1/sections/batch",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("names" = String, Query),
+        ("limit" = Option<usize>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn sections_batch(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiProblem> {
+) -> Result<Json<Value>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), BATCH_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
     let limit = parse_limit(&params)?;
     let raw = params
         .get(QueryParameter::Names)
-        .ok_or_else(|| ApiProblem::missing_query_parameter(QueryParameter::Names))?;
+        .ok_or_else(|| ApiError::missing_query_parameter(QueryParameter::Names))?;
     let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
     if names.is_empty() {
-        return Err(ApiProblem::invalid_query_parameter(
+        return Err(ApiError::invalid_query_parameter(
             QueryParameter::Names,
             ExpectedValue::SectionList,
         ));
@@ -207,8 +264,8 @@ pub(crate) async fn sections_batch(
     }
 }
 
-/// The error half of a handler result: one closed Problem Details response.
-type ErrorResponse = ApiProblem;
+/// The error half of a handler result: one closed API error response.
+type ErrorResponse = ApiError;
 
 /// One section's diff as a JSON object (`section`, `identity`, `series`).
 type DiffObject = serde_json::Map<String, Value>;
@@ -296,7 +353,7 @@ fn section_diff_object(
     gates: &Gates,
 ) -> Result<DiffObject, ErrorResponse> {
     if page.next_cursor.is_some() {
-        return Err(ApiProblem::query_limit_exceeded(
+        return Err(ApiError::query_limit_exceeded(
             LimitResource::Rows,
             count_u64(DIFF_MAX_ROWS),
             None,
@@ -323,12 +380,25 @@ fn section_diff_object(
 ///
 /// Resolves the section's identity and cumulative columns from the registry,
 /// reads the window in one page, and folds each series through the diff core.
+#[utoipa::path(
+    get,
+    path = "/v1/section/{name}/diff",
+    params(
+        ("name" = String, Path),
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn section_diff(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ErrorResponse> {
-    let Path(name) = path.map_err(|_rejection| ApiProblem::unknown_section("invalid"))?;
+    let Path(name) = path.map_err(|_rejection| ApiError::unknown_section("invalid"))?;
     let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -358,6 +428,19 @@ pub(crate) async fn section_diff(
 /// One decode of each overlapping segment serves every requested section, so a
 /// multi-metric diff costs one segment pass, not one per section. An unknown name
 /// fails the whole request.
+#[utoipa::path(
+    get,
+    path = "/v1/sections/batch/diff",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("names" = String, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn sections_batch_diff(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
@@ -367,10 +450,10 @@ pub(crate) async fn sections_batch_diff(
     let to = parse_i64(&params, QueryParameter::To)?;
     let raw = params
         .get(QueryParameter::Names)
-        .ok_or_else(|| ApiProblem::missing_query_parameter(QueryParameter::Names))?;
+        .ok_or_else(|| ApiError::missing_query_parameter(QueryParameter::Names))?;
     let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
     if names.is_empty() {
-        return Err(ApiProblem::invalid_query_parameter(
+        return Err(ApiError::invalid_query_parameter(
             QueryParameter::Names,
             ExpectedValue::SectionList,
         ));

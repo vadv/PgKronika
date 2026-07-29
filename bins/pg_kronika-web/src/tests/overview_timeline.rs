@@ -11,7 +11,7 @@ use kronika_registry::{Section, Ts};
 use serde_json::json;
 use std::sync::Arc;
 
-use super::{assert_problem, fixture_response, serve, serve_state, state_for_dir};
+use super::{assert_api_error, fixture_response, serve, serve_state, state_for_dir};
 use crate::overview::cache::{Endpoint, ResponseKey};
 use crate::{AppState, TimelineFlightRole};
 
@@ -261,7 +261,7 @@ async fn timeline_meta_has_no_pending_tail_for_a_complete_active_journal() {
 async fn overview_rejects_an_inverted_range() {
     let (_dir, status, body) = fixture_response("/v1/timeline/overview?from=1000&to=1000").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_problem(
+    assert_api_error(
         &body,
         StatusCode::BAD_REQUEST,
         "invalid_query_constraint",

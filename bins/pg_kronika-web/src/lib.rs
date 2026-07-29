@@ -41,6 +41,10 @@ macro_rules! closed_string_enum {
             $visibility const COUNT: usize = [$(stringify!($variant)),+].len();
 
             #[cfg(test)]
+            #[allow(
+                dead_code,
+                reason = "some closed enums are runtime-only after OpenAPI contract tests were removed"
+            )]
             $visibility const ALL: [Self; Self::COUNT] = [
                 $(Self::$variant),+
             ];
@@ -87,6 +91,7 @@ use tokio as _;
 use tower_http as _;
 use tracing as _;
 use tracing_subscriber as _;
+use utoipa_swagger_ui::SwaggerUi;
 
 // criterion is used only by the `anomalies` bench; anchored for the
 // `unused_crate_dependencies` lint, which checks each target separately.
@@ -94,6 +99,8 @@ use tracing_subscriber as _;
 use criterion as _;
 
 mod anomaly;
+mod api_docs;
+mod api_error;
 mod auth;
 pub(crate) mod handlers;
 #[allow(
@@ -107,7 +114,6 @@ mod incident_response;
 pub(crate) mod overview;
 mod params;
 mod plan_anomaly;
-mod problem;
 #[cfg(feature = "qualification")]
 #[doc(hidden)]
 pub mod qualification;
@@ -142,7 +148,7 @@ pub(crate) struct PublishedStoreView {
     timeline: Arc<overview::view::DescriptorView>,
 }
 
-type TimelineFlightResult = Result<Arc<[u8]>, problem::ApiProblem>;
+type TimelineFlightResult = Result<Arc<[u8]>, api_error::ApiError>;
 
 #[derive(Debug)]
 pub(crate) struct TimelineFlight {
@@ -822,27 +828,11 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .route("/readyz", get(handlers::probes::readyz))
         .route("/metrics", get(handlers::metrics::metrics_handler));
 
-    let mut protected = Router::new()
-        .route("/v1/version", get(handlers::v1::version))
-        .route("/v1/timeline/overview", get(overview::handlers::overview))
-        .route("/v1/timeline/events", get(overview::handlers::events))
-        .route("/v1/timeline/health", get(overview::handlers::health))
-        .route("/v1/timeline/heatmap", get(ui::handlers::heatmap))
-        .route("/v1/anomalies", get(handlers::anomalies::anomalies))
-        .route("/v1/incidents", get(handlers::incidents::incidents))
-        .route("/v1/ui/catalog", get(ui::handlers::catalog))
-        .route("/v1/views/summary", get(ui::handlers::summary))
-        .route("/v1/sections", get(handlers::v1::sections))
-        .route("/v1/segments", get(handlers::v1::segments))
-        .route("/v1/section/{name}", get(handlers::v1::section_data))
-        .route("/v1/section/{name}/diff", get(handlers::v1::section_diff))
-        .route("/v1/sections/batch", get(handlers::v1::sections_batch))
-        .route(
-            "/v1/sections/batch/diff",
-            get(handlers::v1::sections_batch_diff),
-        )
+    let (api, document) = api_docs::router_and_document();
+    let mut protected = api
+        .merge(SwaggerUi::new("/swagger-ui").url("/openapi.json", document))
         .method_not_allowed_fallback(|| async {
-            problem::ApiProblem::method_not_allowed("GET, HEAD")
+            api_error::ApiError::method_not_allowed("GET, HEAD")
         })
         .fallback(handlers::static_::static_handler);
     if let Some(cfg) = auth {
@@ -856,6 +846,13 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .layer(Extension(metrics_handle))
         .layer(middleware::from_fn(track_metrics))
         .with_state(state)
+}
+
+/// Build the same OpenAPI document that the server exposes at `/openapi.json`.
+#[doc(hidden)]
+#[must_use]
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    api_docs::document()
 }
 
 #[cfg(test)]

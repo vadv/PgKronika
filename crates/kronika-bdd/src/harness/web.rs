@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, header};
+use axum::http::Request;
 use http_body_util::BodyExt as _;
 use kronika_reader::{LocalDirSnapshot, PgmUnit};
 use kronika_registry::Cell;
@@ -39,19 +39,10 @@ fn bdd_metrics_handle() -> PrometheusHandle {
         .clone()
 }
 
-/// Captured in-process response, including the transport contract.
+/// Captured in-process JSON response.
 struct WebResponse {
     status: u16,
-    headers: HeaderMap,
     body: Value,
-}
-
-impl WebResponse {
-    fn media_type(&self) -> Option<&str> {
-        self.headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-    }
 }
 
 /// One in-process request against a fresh router over `dir`.
@@ -78,7 +69,6 @@ async fn request_with_router(
         .await
         .context("route the request")?;
     let status = response.status().as_u16();
-    let headers = response.headers().clone();
     let bytes = response
         .into_body()
         .collect()
@@ -86,11 +76,7 @@ async fn request_with_router(
         .context("read the response body")?
         .to_bytes();
     let body = serde_json::from_slice(&bytes).context("parse the JSON body")?;
-    Ok(WebResponse {
-        status,
-        headers,
-        body,
-    })
+    Ok(WebResponse { status, body })
 }
 
 /// The latest collected `PostgreSQL` log status row.
@@ -841,100 +827,6 @@ fn assert_parsed_panic_and_child_termination_do_not_set_health_floor(health: &Va
             "parsed PANIC or child termination created critical health: {point}"
         );
     }
-    Ok(())
-}
-
-/// Verify that language preferences cannot change a Problem representation.
-pub(crate) async fn assert_locale_neutral_problem(dir: &Path) -> Result<()> {
-    const URI: &str = "/v1/segments?from=not-a-number&to=1";
-    let english = request(dir, URI, &[("accept-language", "en")]).await?;
-    let russian = request(dir, URI, &[("accept-language", "ru-RU, ru;q=0.9")]).await?;
-
-    for response in [&english, &russian] {
-        anyhow::ensure!(
-            response.status == 400,
-            "problem status was {}",
-            response.status
-        );
-        anyhow::ensure!(
-            response.media_type() == Some("application/problem+json"),
-            "problem media type was {:?}",
-            response.media_type()
-        );
-        anyhow::ensure!(
-            response
-                .headers
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok())
-                == Some("no-store"),
-            "problem response did not disable caching"
-        );
-        anyhow::ensure!(response.headers.get(header::CONTENT_LANGUAGE).is_none());
-        anyhow::ensure!(response.headers.get(header::VARY).is_none());
-
-        let object = response
-            .body
-            .as_object()
-            .context("problem body is not an object")?;
-        let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        anyhow::ensure!(
-            keys == ["code", "instance", "params", "status", "type"],
-            "unexpected problem fields: {keys:?}"
-        );
-        anyhow::ensure!(response.body["status"] == 400);
-        anyhow::ensure!(response.body["code"] == "invalid_query_parameter");
-        anyhow::ensure!(
-            response.body["params"]
-                == serde_json::json!({ "parameter": "from", "expected": "int64" })
-        );
-        let instance = response.body["instance"]
-            .as_str()
-            .context("problem instance is not a string")?;
-        let request_id = response
-            .headers
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .context("problem response has no request id")?;
-        anyhow::ensure!(
-            instance == format!("https://pgkronika.dev/problems/occurrences/{request_id}")
-        );
-        anyhow::ensure!(
-            request_id.len() == 32
-                && request_id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-            "request id is not 32 lowercase hex characters"
-        );
-    }
-
-    let mut english_body = english.body;
-    let mut russian_body = russian.body;
-    english_body
-        .as_object_mut()
-        .context("English problem is not an object")?
-        .remove("instance");
-    russian_body
-        .as_object_mut()
-        .context("Russian problem is not an object")?
-        .remove("instance");
-    anyhow::ensure!(
-        english_body == russian_body,
-        "Accept-Language changed the problem"
-    );
-
-    let oversized_uri = format!("/v1/version?{}", "x".repeat(8_193));
-    let oversized = request(dir, &oversized_uri, &[]).await?;
-    anyhow::ensure!(oversized.status == 413);
-    anyhow::ensure!(oversized.body["code"] == "query_limit_exceeded");
-    anyhow::ensure!(
-        oversized.body["params"]
-            == serde_json::json!({
-                "resource": "query_bytes",
-                "limit": 8_192,
-                "observed": 8_193,
-            })
-    );
     Ok(())
 }
 

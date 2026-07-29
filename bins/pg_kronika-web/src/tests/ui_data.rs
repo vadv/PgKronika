@@ -5,7 +5,7 @@ use kronika_reader::{FactStore, LIMIT, LocalDirSnapshot};
 use kronika_registry::pg_log::PgLogLifecycleV1;
 use kronika_registry::{Section, Ts};
 
-use super::{AppState, assert_problem, serve, serve_state};
+use super::{AppState, assert_api_error, serve, serve_state};
 
 fn event_segment_bytes() -> Vec<u8> {
     let body = PgLogLifecycleV1::encode(&[
@@ -91,7 +91,7 @@ async fn ui_summary_rejects_unknown_parameters() {
 
     let (status, body) = serve(directory.path(), "/v1/views/summary?at=1500&extra=1").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "unknown_query_parameter",
@@ -137,7 +137,7 @@ async fn ui_heatmap_enforces_range_and_projection_contracts() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "invalid_query_parameter",
@@ -150,7 +150,7 @@ async fn ui_heatmap_enforces_range_and_projection_contracts() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "query_limit_exceeded",

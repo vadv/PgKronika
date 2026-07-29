@@ -89,8 +89,7 @@ impl HttpResponse {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         ensure!(
-            media_type.starts_with("application/json")
-                || media_type.starts_with("application/problem+json"),
+            media_type.starts_with("application/json"),
             "status {expected} used unexpected content type {media_type:?}"
         );
         self.json()

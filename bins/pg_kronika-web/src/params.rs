@@ -1,9 +1,9 @@
-//! Bounded query decoding and mapping of reader failures to API problems.
+//! Bounded query decoding and mapping of reader failures to API errors.
 
 use kronika_reader::{Cursor, QueryError, QueryWorkResource};
 
-use crate::problem::{
-    ApiProblem, ExpectedValue, InvalidParameterLocation, LimitResource, QueryParameter, count_u64,
+use crate::api_error::{
+    ApiError, ExpectedValue, InvalidParameterLocation, LimitResource, QueryParameter, count_u64,
 };
 
 /// Rows returned when a request omits `limit`.
@@ -30,7 +30,7 @@ pub(crate) struct QueryParams {
 
 impl QueryParams {
     /// Decode and validate one raw query against the route allowlist.
-    pub(crate) fn parse(raw: Option<&str>, allowed: &[QueryParameter]) -> Result<Self, ApiProblem> {
+    pub(crate) fn parse(raw: Option<&str>, allowed: &[QueryParameter]) -> Result<Self, ApiError> {
         Self::parse_with_repeatable(raw, allowed, &[])
     }
 
@@ -39,10 +39,10 @@ impl QueryParams {
         raw: Option<&str>,
         allowed: &[QueryParameter],
         repeatable: &[QueryParameter],
-    ) -> Result<Self, ApiProblem> {
+    ) -> Result<Self, ApiError> {
         let raw = raw.unwrap_or_default();
         if raw.len() > MAX_QUERY_BYTES {
-            return Err(ApiProblem::query_limit_exceeded(
+            return Err(ApiError::query_limit_exceeded(
                 LimitResource::QueryBytes,
                 count_u64(MAX_QUERY_BYTES),
                 Some(count_u64(raw.len())),
@@ -53,7 +53,7 @@ impl QueryParams {
             .filter(|component| !component.is_empty())
             .count();
         if pair_count > MAX_QUERY_PARAMETERS {
-            return Err(ApiProblem::query_limit_exceeded(
+            return Err(ApiError::query_limit_exceeded(
                 LimitResource::QueryParameters,
                 count_u64(MAX_QUERY_PARAMETERS),
                 Some(count_u64(pair_count)),
@@ -64,14 +64,14 @@ impl QueryParams {
         let mut values: [Vec<String>; QueryParameter::COUNT] = std::array::from_fn(|_| Vec::new());
         for (name, value) in form_urlencoded::parse(raw.as_bytes()) {
             let Some(parameter) = QueryParameter::from_query_name(&name) else {
-                return Err(ApiProblem::unknown_query_parameter(&name));
+                return Err(ApiError::unknown_query_parameter(&name));
             };
             if !allowed.contains(&parameter) {
-                return Err(ApiProblem::unknown_query_parameter(&name));
+                return Err(ApiError::unknown_query_parameter(&name));
             }
             let slot = &mut values[parameter.index()];
             if !slot.is_empty() && !repeatable.contains(&parameter) {
-                return Err(ApiProblem::duplicate_query_parameter(parameter));
+                return Err(ApiError::duplicate_query_parameter(parameter));
             }
             slot.push(value.into_owned());
         }
@@ -83,9 +83,9 @@ impl QueryParams {
     }
 }
 
-fn validate_query_encoding(raw: &str) -> Result<(), ApiProblem> {
+fn validate_query_encoding(raw: &str) -> Result<(), ApiError> {
     let invalid = || {
-        ApiProblem::invalid_query_parameter(
+        ApiError::invalid_query_parameter(
             InvalidParameterLocation::Query,
             ExpectedValue::UrlEncodedQuery,
         )
@@ -130,20 +130,17 @@ const fn hex_value(byte: u8) -> Option<u8> {
 }
 
 /// Parse a required signed query parameter.
-pub(crate) fn parse_i64(
-    params: &QueryParams,
-    parameter: QueryParameter,
-) -> Result<i64, ApiProblem> {
+pub(crate) fn parse_i64(params: &QueryParams, parameter: QueryParameter) -> Result<i64, ApiError> {
     params
         .get(parameter)
-        .ok_or_else(|| ApiProblem::missing_query_parameter(parameter))?
+        .ok_or_else(|| ApiError::missing_query_parameter(parameter))?
         .parse()
-        .map_err(|_error| ApiProblem::invalid_query_parameter(parameter, ExpectedValue::Int64))
+        .map_err(|_error| ApiError::invalid_query_parameter(parameter, ExpectedValue::Int64))
 }
 
 /// Parse the optional `limit`: absent → [`DEFAULT_LIMIT`], present → clamped to
 /// [`MAX_LIMIT`], unparseable → `400`.
-pub(crate) fn parse_limit(params: &QueryParams) -> Result<usize, ApiProblem> {
+pub(crate) fn parse_limit(params: &QueryParams) -> Result<usize, ApiError> {
     parse_limit_default(params, DEFAULT_LIMIT)
 }
 
@@ -152,10 +149,10 @@ pub(crate) fn parse_duration_us(
     params: &QueryParams,
     parameter: QueryParameter,
     default_us: i64,
-) -> Result<i64, ApiProblem> {
+) -> Result<i64, ApiError> {
     params.get(parameter).map_or(Ok(default_us), |raw| {
         duration_us(raw).ok_or_else(|| {
-            ApiProblem::invalid_query_parameter(parameter, ExpectedValue::PositiveDuration)
+            ApiError::invalid_query_parameter(parameter, ExpectedValue::PositiveDuration)
         })
     })
 }
@@ -181,12 +178,12 @@ pub(crate) fn parse_f64_non_negative(
     params: &QueryParams,
     parameter: QueryParameter,
     default: f64,
-) -> Result<f64, ApiProblem> {
+) -> Result<f64, ApiError> {
     params
         .get(parameter)
         .map_or(Ok(default), |raw| match raw.parse::<f64>() {
             Ok(value) if value.is_finite() && value >= 0.0 => Ok(value),
-            _ => Err(ApiProblem::invalid_query_parameter(
+            _ => Err(ApiError::invalid_query_parameter(
                 parameter,
                 ExpectedValue::NonNegativeFiniteNumber,
             )),
@@ -194,17 +191,14 @@ pub(crate) fn parse_f64_non_negative(
 }
 
 /// Parse the optional `limit` with a caller-chosen default and hard ceiling.
-pub(crate) fn parse_limit_default(
-    params: &QueryParams,
-    default: usize,
-) -> Result<usize, ApiProblem> {
+pub(crate) fn parse_limit_default(params: &QueryParams, default: usize) -> Result<usize, ApiError> {
     params
         .get(QueryParameter::Limit)
         .map_or(Ok(default), |raw| {
             raw.parse::<usize>()
                 .map(|limit| limit.min(MAX_LIMIT))
                 .map_err(|_error| {
-                    ApiProblem::invalid_query_parameter(
+                    ApiError::invalid_query_parameter(
                         QueryParameter::Limit,
                         ExpectedValue::NonNegativeInteger,
                     )
@@ -213,34 +207,33 @@ pub(crate) fn parse_limit_default(
 }
 
 /// Parse an optional opaque resume cursor.
-pub(crate) fn parse_cursor(params: &QueryParams) -> Result<Option<Cursor>, ApiProblem> {
+pub(crate) fn parse_cursor(params: &QueryParams) -> Result<Option<Cursor>, ApiError> {
     params.get(QueryParameter::Cursor).map_or(Ok(None), |raw| {
         Cursor::decode(raw)
             .map(Some)
-            .map_err(|_error| ApiProblem::invalid_cursor())
+            .map_err(|_error| ApiError::invalid_cursor())
     })
 }
 
 /// Map a reader failure without exposing paths, values, or error chains.
-pub(crate) fn query_error_response(error: &QueryError) -> ApiProblem {
+pub(crate) fn query_error_response(error: &QueryError) -> ApiError {
     match error {
-        QueryError::UnknownSection(name) => ApiProblem::unknown_section(name),
-        QueryError::BadCursor(_) => ApiProblem::invalid_cursor(),
+        QueryError::UnknownSection(name) => ApiError::unknown_section(name),
+        QueryError::BadCursor(_) => ApiError::invalid_cursor(),
         QueryError::Read(read) => {
-            let problem = ApiProblem::store_read_failed();
+            let error = ApiError::store_read_failed();
             tracing::error!(
                 event = "api_store_read_failed",
-                request_id = problem.request_id(),
                 error = %read,
                 "store query failed"
             );
-            problem
+            error
         }
         QueryError::ResultTooLarge { max_cells } => {
-            ApiProblem::query_limit_exceeded(LimitResource::Cells, count_u64(*max_cells), None)
+            ApiError::query_limit_exceeded(LimitResource::Cells, count_u64(*max_cells), None)
         }
         QueryError::MaterializedBytesTooLarge { max_bytes } => {
-            ApiProblem::query_limit_exceeded(LimitResource::Bytes, count_u64(*max_bytes), None)
+            ApiError::query_limit_exceeded(LimitResource::Bytes, count_u64(*max_bytes), None)
         }
         QueryError::WorkLimitExceeded {
             resource,
@@ -253,21 +246,20 @@ pub(crate) fn query_error_response(error: &QueryError) -> ApiProblem {
                     LimitResource::Bytes
                 }
             };
-            ApiProblem::query_limit_exceeded(resource, *limit, Some(*observed))
+            ApiError::query_limit_exceeded(resource, *limit, Some(*observed))
         }
     }
 }
 
 /// Map a reader failure for a request that has no cursor parameter.
-pub(crate) fn query_error_response_without_cursor(error: &QueryError) -> ApiProblem {
+pub(crate) fn query_error_response_without_cursor(error: &QueryError) -> ApiError {
     if matches!(error, QueryError::BadCursor(_)) {
-        let problem = ApiProblem::internal_error();
+        let error = ApiError::internal_error();
         tracing::error!(
             event = "api_reader_cursor_invariant",
-            request_id = problem.request_id(),
             "reader returned a cursor error for a cursor-free request"
         );
-        return problem;
+        return error;
     }
     query_error_response(error)
 }
@@ -279,7 +271,7 @@ mod tests {
         parse_f64_non_negative, parse_limit, query_error_response,
         query_error_response_without_cursor,
     };
-    use crate::problem::{ProblemCode, QueryParameter};
+    use crate::api_error::{ErrorCode, QueryParameter};
     use kronika_reader::QueryError;
 
     fn params(raw: &str, allowed: &[QueryParameter]) -> QueryParams {
@@ -366,21 +358,21 @@ mod tests {
     fn raw_query_bounds_are_enforced_before_decoding() {
         let oversized = "x".repeat(MAX_QUERY_BYTES + 1);
         let byte_error = QueryParams::parse(Some(&oversized), &[]).expect_err("byte ceiling");
-        assert_eq!(byte_error.code(), ProblemCode::QueryLimitExceeded);
+        assert_eq!(byte_error.code(), ErrorCode::QueryLimitExceeded);
 
         let too_many = std::iter::repeat_n("from=1", MAX_QUERY_PARAMETERS + 1)
             .collect::<Vec<_>>()
             .join("&");
         let pair_error =
             QueryParams::parse(Some(&too_many), &[QueryParameter::From]).expect_err("pair ceiling");
-        assert_eq!(pair_error.code(), ProblemCode::QueryLimitExceeded);
+        assert_eq!(pair_error.code(), ErrorCode::QueryLimitExceeded);
 
         let malformed_over_limit = std::iter::repeat_n("%FF", MAX_QUERY_PARAMETERS + 1)
             .collect::<Vec<_>>()
             .join("&");
         let priority = QueryParams::parse(Some(&malformed_over_limit), &[])
             .expect_err("pair admission precedes decoding");
-        assert_eq!(priority.code(), ProblemCode::QueryLimitExceeded);
+        assert_eq!(priority.code(), ErrorCode::QueryLimitExceeded);
     }
 
     #[test]
@@ -388,7 +380,7 @@ mod tests {
         for malformed in ["%", "%0", "%GG", "%FF", "from=%C3", "from=%C3%28"] {
             let error = QueryParams::parse(Some(malformed), &[QueryParameter::From])
                 .expect_err("malformed encoding");
-            assert_eq!(error.code(), ProblemCode::InvalidQueryParameter);
+            assert_eq!(error.code(), ErrorCode::InvalidQueryParameter);
         }
 
         let decoded = params("section=%D1%82", &[QueryParameter::Section]);
@@ -402,11 +394,11 @@ mod tests {
         let error = QueryError::BadCursor("synthetic invariant probe".to_owned());
         assert_eq!(
             query_error_response(&error).code(),
-            ProblemCode::InvalidCursor
+            ErrorCode::InvalidCursor
         );
         assert_eq!(
             query_error_response_without_cursor(&error).code(),
-            ProblemCode::InternalError
+            ErrorCode::InternalError
         );
     }
 }

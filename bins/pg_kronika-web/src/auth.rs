@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use subtle::ConstantTimeEq as _;
 
-use crate::problem::ApiProblem;
+use crate::api_error::ApiError;
 
 /// The exact `Authorization` header value an authenticated request must send.
 #[derive(Clone)]
@@ -64,7 +64,7 @@ pub(crate) async fn require_basic_auth(
     if check_basic_auth(header, &cfg) {
         next.run(req).await
     } else {
-        ApiProblem::unauthorized().into_response()
+        ApiError::unauthorized().into_response()
     }
 }
 

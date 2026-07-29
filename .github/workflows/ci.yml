@@ -27,6 +27,11 @@ jobs:
       - run: cargo fmt --all --check
       - name: Validate frozen PGM research evidence
         run: python3 -B scripts/validate-pgm-size-reduction.py
+      - name: Verify generated Swagger document is current
+        run: |
+          git ls-files --error-unmatch bins/pg_kronika-web/swagger.yaml >/dev/null
+          make swagger
+          git diff --exit-code -- bins/pg_kronika-web/swagger.yaml
       - run: cargo clippy --workspace --all-targets
 
   deps:

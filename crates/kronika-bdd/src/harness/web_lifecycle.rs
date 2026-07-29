@@ -292,7 +292,7 @@ pub(crate) async fn assert_publication_failure_recovery(
 }
 
 /// A cursor is process-local and becomes the public 410 `cursor_expired`
-/// problem after restart, while all ordinary timeline payloads stay equal.
+/// error after restart, while all ordinary timeline payloads stay equal.
 pub(crate) async fn assert_cursor_restart_contract(
     segment: &SealedSegment,
     baseline: &TimelineBaseline,
@@ -320,14 +320,14 @@ pub(crate) async fn assert_cursor_restart_contract(
         .client()
         .get(&events_target(&case, 1, Some(&cursor)))
         .await?;
-    let problem = response.json_status(410)?;
+    let error = response.json_status(410)?;
     ensure!(
-        problem["code"] == "cursor_expired",
-        "prior-process cursor returned the wrong problem: {problem}"
-    );
-    ensure!(
-        problem["type"] == "https://pgkronika.dev/problems/cursor-expired",
-        "prior-process cursor returned the wrong problem type: {problem}"
+        error
+            == serde_json::json!({
+                "code": "cursor_expired",
+                "params": {},
+            }),
+        "prior-process cursor returned the wrong API error: {error}"
     );
     assert_durable_zero_pgm(&restarted.client().metrics().await?)?;
     ensure!(

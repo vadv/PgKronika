@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::api_error::{ApiError, QueryParameter};
 use crate::overview::cache::{CacheKey, Endpoint, ResponseKey};
 use crate::overview::cursor::{CursorError, EventsCursor};
 use crate::overview::dto::{
@@ -34,7 +35,6 @@ use crate::overview::loader::FactLoadFailure;
 use crate::overview::selection::{SelectedSealedPlan, SelectionError};
 use crate::overview::view::{CanonicalFactQueryError, IndexView, TimelineMetadata, TimelineStatus};
 use crate::params::QueryParams;
-use crate::problem::{ApiProblem, QueryParameter};
 use crate::{AppState, TimelineFlightRole};
 
 /// Absolute query span for the overview endpoint: 31 days.
@@ -74,19 +74,31 @@ struct OverviewRequest {
 }
 
 /// `GET /v1/timeline/overview?from_us=..&to_us=..`.
+#[utoipa::path(
+    get,
+    path = "/v1/timeline/overview",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn overview(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), OVERVIEW_PARAMS) {
         Ok(params) => params,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let request = match validate(&params) {
         Ok(request) => request,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let (snapshot, view) = state.overview_request_view();
     let plan = match select_plan(&state, view, request.range) {
         Ok(plan) => plan,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let key = overview_key(plan.fact_set_id(), request);
     serve(
@@ -113,7 +125,7 @@ async fn serve<R, T>(
     render: R,
 ) -> Response
 where
-    R: FnOnce(&Arc<IndexView>) -> Result<T, ApiProblem> + Send + 'static,
+    R: FnOnce(&Arc<IndexView>) -> Result<T, ApiError> + Send + 'static,
     T: Serialize + Send + 'static,
 {
     let cache_key = CacheKey::new(key.clone());
@@ -140,16 +152,16 @@ where
                         TimelineViewSource::Selected { snapshot, plan } => worker_state
                             .load_overview_selection(snapshot, &plan)
                             .await
-                            .map_err(fact_load_problem),
+                            .map_err(fact_load_error),
                         TimelineViewSource::Loaded(view) => Ok(view),
                     };
                     let loaded = match loaded {
                         Ok(loaded) => loaded,
-                        Err(problem) => {
+                        Err(error) => {
                             worker_state.finish_timeline_flight(
                                 &worker_key,
                                 &worker_flight,
-                                Err(problem),
+                                Err(error),
                             );
                             return;
                         }
@@ -161,18 +173,18 @@ where
                         worker_state.finish_timeline_flight(
                             &worker_key,
                             &worker_flight,
-                            Err(ApiProblem::analytic_capacity_unavailable()),
+                            Err(ApiError::analytic_capacity_unavailable()),
                         );
                         return;
                     };
                     let cache = worker_state.response_cache.clone();
                     let render_cache_key = cacheable.then_some(cache_key).flatten();
                     let rendered =
-                        tokio::task::spawn_blocking(move || -> Result<Arc<[u8]>, ApiProblem> {
+                        tokio::task::spawn_blocking(move || -> Result<Arc<[u8]>, ApiError> {
                             let _permit = permit;
                             let value = render(&loaded)?;
                             let bytes: Arc<[u8]> = serde_json::to_vec(&value)
-                                .map_err(|_error| ApiProblem::internal_error())?
+                                .map_err(|_error| ApiError::internal_error())?
                                 .into();
                             if let Some(render_cache_key) = render_cache_key {
                                 cache.insert(render_cache_key, Arc::clone(&bytes));
@@ -180,7 +192,7 @@ where
                             Ok(bytes)
                         })
                         .await
-                        .unwrap_or_else(|_join| Err(ApiProblem::internal_error()));
+                        .unwrap_or_else(|_join| Err(ApiError::internal_error()));
                     worker_state.finish_timeline_flight(&worker_key, &worker_flight, rendered);
                 });
             }
@@ -189,7 +201,7 @@ where
     };
     match flight.wait().await {
         Ok(bytes) => json_bytes_response(bytes),
-        Err(problem) => problem.into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -202,7 +214,7 @@ fn select_plan(
     state: &AppState,
     view: Arc<crate::overview::view::DescriptorView>,
     range: CoverageSpan,
-) -> Result<SelectedSealedPlan, ApiProblem> {
+) -> Result<SelectedSealedPlan, ApiError> {
     state
         .select_overview(view, range)
         .map_err(|error| match error {
@@ -212,17 +224,17 @@ fn select_plan(
                     "resource" => "selected_segments"
                 )
                 .increment(1);
-                ApiProblem::query_shape_limit_exceeded(
-                    crate::problem::LimitResource::SelectedSegments,
-                    crate::problem::count_u64(limit),
+                ApiError::query_shape_limit_exceeded(
+                    crate::api_error::LimitResource::SelectedSegments,
+                    crate::api_error::count_u64(limit),
                     None,
                 )
             }
-            SelectionError::InvalidLimit => ApiProblem::internal_error(),
+            SelectionError::InvalidLimit => ApiError::internal_error(),
         })
 }
 
-fn fact_load_problem(error: FactLoadFailure) -> ApiProblem {
+fn fact_load_error(error: FactLoadFailure) -> ApiError {
     match error {
         FactLoadFailure::ColdBuildOverloaded {
             retry_after_seconds,
@@ -233,11 +245,11 @@ fn fact_load_problem(error: FactLoadFailure) -> ApiProblem {
                 "reason" => reason
             )
             .increment(1);
-            ApiProblem::cold_build_overloaded(retry_after_seconds)
+            ApiError::cold_build_overloaded(retry_after_seconds)
         }
-        FactLoadFailure::Source(_error) => ApiProblem::store_read_failed(),
+        FactLoadFailure::Source(_error) => ApiError::store_read_failed(),
         FactLoadFailure::WorkerFailed | FactLoadFailure::IdentityMismatch => {
-            ApiProblem::internal_error()
+            ApiError::internal_error()
         }
     }
 }
@@ -257,17 +269,17 @@ const fn overview_key(fact_set_id: [u8; 32], request: OverviewRequest) -> Respon
     }
 }
 
-fn validate(params: &QueryParams) -> Result<OverviewRequest, ApiProblem> {
+fn validate(params: &QueryParams) -> Result<OverviewRequest, ApiError> {
     let from_us = crate::params::parse_i64(params, QueryParameter::From)?;
     let to_us = crate::params::parse_i64(params, QueryParameter::To)?;
     let Some(range) = CoverageSpan::new(from_us, to_us) else {
-        return Err(ApiProblem::invalid_query_constraint(
-            crate::problem::QueryConstraint::FromBeforeTo,
+        return Err(ApiError::invalid_query_constraint(
+            crate::api_error::QueryConstraint::FromBeforeTo,
         ));
     };
     if to_us.saturating_sub(from_us) > MAX_OVERVIEW_SPAN_US {
-        return Err(ApiProblem::query_limit_exceeded(
-            crate::problem::LimitResource::QuerySpanUs,
+        return Err(ApiError::query_limit_exceeded(
+            crate::api_error::LimitResource::QuerySpanUs,
             u64::try_from(MAX_OVERVIEW_SPAN_US).unwrap_or(u64::MAX),
             None,
         ));
@@ -282,10 +294,10 @@ fn validate(params: &QueryParams) -> Result<OverviewRequest, ApiProblem> {
 fn render_overview(
     view: &IndexView,
     request: OverviewRequest,
-) -> Result<OverviewResponseDto, ApiProblem> {
+) -> Result<OverviewResponseDto, ApiError> {
     let result = view
         .query_range(request.range, QUERY_LIMITS, QUERY_MATERIALIZED_BYTES)
-        .map_err(oracle_problem)?;
+        .map_err(oracle_error)?;
 
     let policy = NotablePolicy::v1();
     let observations = result.observations();
@@ -297,7 +309,7 @@ fn render_overview(
         crate::overview::health::overview_health_summary(observations, request.range);
     let coverage = Value::Array(
         view.query_factor_coverage(request.range, MAX_FACTOR_COVERAGE_RECORDS)
-            .map_err(canonical_fact_problem)?
+            .map_err(canonical_fact_error)?
             .iter()
             .map(crate::overview::health::factor_coverage_json)
             .collect(),
@@ -329,19 +341,32 @@ struct HealthRequest {
 }
 
 /// `GET /v1/timeline/health?from=..&to=..&step=..`.
+#[utoipa::path(
+    get,
+    path = "/v1/timeline/health",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("step" = Option<u64>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn health(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), HEALTH_PARAMS) {
         Ok(params) => params,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let request = match validate_health(&params) {
         Ok(request) => request,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let (snapshot, view) = state.overview_request_view();
     let plan = match select_plan(&state, view, request.range) {
         Ok(plan) => plan,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let key = health_key(plan.fact_set_id(), request);
     serve(
@@ -353,17 +378,17 @@ pub(crate) async fn health(State(state): State<AppState>, RawQuery(raw): RawQuer
     .await
 }
 
-fn validate_health(params: &QueryParams) -> Result<HealthRequest, ApiProblem> {
+fn validate_health(params: &QueryParams) -> Result<HealthRequest, ApiError> {
     let from_us = crate::params::parse_i64(params, QueryParameter::From)?;
     let to_us = crate::params::parse_i64(params, QueryParameter::To)?;
     let Some(range) = CoverageSpan::new(from_us, to_us) else {
-        return Err(ApiProblem::invalid_query_constraint(
-            crate::problem::QueryConstraint::FromBeforeTo,
+        return Err(ApiError::invalid_query_constraint(
+            crate::api_error::QueryConstraint::FromBeforeTo,
         ));
     };
     if to_us.saturating_sub(from_us) > MAX_OVERVIEW_SPAN_US {
-        return Err(ApiProblem::query_limit_exceeded(
-            crate::problem::LimitResource::QuerySpanUs,
+        return Err(ApiError::query_limit_exceeded(
+            crate::api_error::LimitResource::QuerySpanUs,
             u64::try_from(MAX_OVERVIEW_SPAN_US).unwrap_or(u64::MAX),
             None,
         ));
@@ -382,10 +407,10 @@ fn validate_health(params: &QueryParams) -> Result<HealthRequest, ApiProblem> {
 fn parse_optional_u64(
     params: &QueryParams,
     parameter: QueryParameter,
-) -> Result<Option<u64>, ApiProblem> {
+) -> Result<Option<u64>, ApiError> {
     params.get(parameter).map_or(Ok(None), |value| {
         value.parse::<u64>().map(Some).map_err(|_error| {
-            ApiProblem::invalid_query_parameter(parameter, crate::problem::ExpectedValue::Uint64)
+            ApiError::invalid_query_parameter(parameter, crate::api_error::ExpectedValue::Uint64)
         })
     })
 }
@@ -405,19 +430,19 @@ const fn health_key(fact_set_id: [u8; 32], request: HealthRequest) -> ResponseKe
     }
 }
 
-fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiProblem> {
+fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiError> {
     let result = view
         .query_range(request.range, QUERY_LIMITS, QUERY_MATERIALIZED_BYTES)
-        .map_err(oracle_problem)?;
+        .map_err(oracle_error)?;
     let line = crate::overview::health::compute_health(
         result.observations(),
         request.range,
         request.effective_step_us,
     )
-    .ok_or_else(ApiProblem::internal_error)?;
+    .ok_or_else(ApiError::internal_error)?;
     let coverage = view
         .query_factor_coverage(request.range, MAX_FACTOR_COVERAGE_RECORDS)
-        .map_err(canonical_fact_problem)?
+        .map_err(canonical_fact_error)?
         .iter()
         .map(crate::overview::health::factor_coverage_json)
         .collect::<Vec<_>>();
@@ -481,14 +506,30 @@ impl EventsRequest {
 }
 
 /// `GET /v1/timeline/events?from=..&to=..&limit=..&cursor=..`.
+#[utoipa::path(
+    get,
+    path = "/v1/timeline/events",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("limit" = Option<usize>, Query),
+        ("cursor" = Option<String>, Query),
+        ("min_severity" = Option<String>, Query),
+        ("kind" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "OK"),
+        (status = "default", description = "API error", body = ApiError),
+    )
+)]
 pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), EVENTS_PARAMS) {
         Ok(params) => params,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let request = match validate_events(&params) {
         Ok(request) => request,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let policy = NotablePolicy::v1();
     let filters = request.filters();
@@ -499,14 +540,14 @@ pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuer
         let cursor =
             match EventsCursor::decode(token, state.cursor_registry(), query_hash, now_secs) {
                 Ok(cursor) => cursor,
-                Err(error) => return cursor_problem(error).into_response(),
+                Err(error) => return cursor_error(error).into_response(),
             };
         let view = match state
             .cursor_registry()
             .resolve(cursor.lease.fact_set_id, now_secs)
         {
             Ok(view) => view,
-            Err(error) => return cursor_problem(error).into_response(),
+            Err(error) => return cursor_error(error).into_response(),
         };
         let fact_set_id = view.fact_set_id();
         (TimelineViewSource::Loaded(view), Some(cursor), fact_set_id)
@@ -514,7 +555,7 @@ pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuer
         let (snapshot, view) = state.overview_request_view();
         let plan = match select_plan(&state, view, request.range) {
             Ok(plan) => plan,
-            Err(problem) => return problem.into_response(),
+            Err(error) => return error.into_response(),
         };
         let fact_set_id = plan.fact_set_id();
         (
@@ -546,17 +587,17 @@ fn events_key(fact_set_id: [u8; 32], request: &EventsRequest) -> ResponseKey {
     }
 }
 
-fn validate_events(params: &QueryParams) -> Result<EventsRequest, ApiProblem> {
+fn validate_events(params: &QueryParams) -> Result<EventsRequest, ApiError> {
     let from_us = crate::params::parse_i64(params, QueryParameter::From)?;
     let to_us = crate::params::parse_i64(params, QueryParameter::To)?;
     let Some(range) = CoverageSpan::new(from_us, to_us) else {
-        return Err(ApiProblem::invalid_query_constraint(
-            crate::problem::QueryConstraint::FromBeforeTo,
+        return Err(ApiError::invalid_query_constraint(
+            crate::api_error::QueryConstraint::FromBeforeTo,
         ));
     };
     if to_us.saturating_sub(from_us) > MAX_OVERVIEW_SPAN_US {
-        return Err(ApiProblem::query_limit_exceeded(
-            crate::problem::LimitResource::QuerySpanUs,
+        return Err(ApiError::query_limit_exceeded(
+            crate::api_error::LimitResource::QuerySpanUs,
             u64::try_from(MAX_OVERVIEW_SPAN_US).unwrap_or(u64::MAX),
             None,
         ));
@@ -565,21 +606,21 @@ fn validate_events(params: &QueryParams) -> Result<EventsRequest, ApiProblem> {
         .get(QueryParameter::Limit)
         .map_or(Ok(EVENTS_DEFAULT_LIMIT), |raw| {
             raw.parse::<usize>().map_err(|_error| {
-                ApiProblem::invalid_query_parameter(
+                ApiError::invalid_query_parameter(
                     QueryParameter::Limit,
-                    crate::problem::ExpectedValue::PositiveInteger,
+                    crate::api_error::ExpectedValue::PositiveInteger,
                 )
             })
         })?;
     if limit == 0 {
-        return Err(ApiProblem::invalid_query_parameter(
+        return Err(ApiError::invalid_query_parameter(
             QueryParameter::Limit,
-            crate::problem::ExpectedValue::PositiveInteger,
+            crate::api_error::ExpectedValue::PositiveInteger,
         ));
     }
     if limit > EVENTS_MAX_LIMIT {
-        return Err(ApiProblem::query_limit_exceeded(
-            crate::problem::LimitResource::Rows,
+        return Err(ApiError::query_limit_exceeded(
+            crate::api_error::LimitResource::Rows,
             u64::try_from(EVENTS_MAX_LIMIT).unwrap_or(u64::MAX),
             Some(u64::try_from(limit).unwrap_or(u64::MAX)),
         ));
@@ -598,7 +639,7 @@ fn validate_events(params: &QueryParams) -> Result<EventsRequest, ApiProblem> {
     })
 }
 
-fn parse_min_severity(params: &QueryParams) -> Result<Option<Severity>, ApiProblem> {
+fn parse_min_severity(params: &QueryParams) -> Result<Option<Severity>, ApiError> {
     let Some(value) = params.get(QueryParameter::MinSeverity) else {
         return Ok(None);
     };
@@ -609,9 +650,9 @@ fn parse_min_severity(params: &QueryParams) -> Result<Option<Severity>, ApiProbl
         "warning" => Severity::Warning,
         "log" => Severity::Log,
         _ => {
-            return Err(ApiProblem::invalid_query_parameter(
+            return Err(ApiError::invalid_query_parameter(
                 QueryParameter::MinSeverity,
-                crate::problem::ExpectedValue::Severity,
+                crate::api_error::ExpectedValue::Severity,
             ));
         }
     };
@@ -628,16 +669,16 @@ fn render_events(
     start_after: Option<EventsCursor>,
     query_hash: [u8; 32],
     state: &AppState,
-) -> Result<EventsResponseDto, ApiProblem> {
+) -> Result<EventsResponseDto, ApiError> {
     let result = view
         .query_range(request.range, QUERY_LIMITS, QUERY_MATERIALIZED_BYTES)
-        .map_err(oracle_problem)?;
+        .map_err(oracle_error)?;
 
     let policy = NotablePolicy::v1();
 
     let metadata = view
         .metadata(request.range, QUERY_LIMITS.max_coverage_spans)
-        .map_err(|_error| ApiProblem::store_read_failed())?;
+        .map_err(|_error| ApiError::store_read_failed())?;
     let observations = result.observations();
     let canonical_facts = view
         .query_canonical_facts(
@@ -645,7 +686,7 @@ fn render_events(
             QUERY_LIMITS.max_observations,
             QUERY_LIMITS.max_observations,
         )
-        .map_err(canonical_fact_problem)?;
+        .map_err(canonical_fact_error)?;
     let mut notable = BinaryHeap::with_capacity(request.limit.saturating_add(1));
     let mut omitted_by_response_filter = 0_u64;
     for observation in observations {
@@ -655,11 +696,11 @@ fn render_events(
         if !passes_response_filter(observation, request) {
             omitted_by_response_filter = omitted_by_response_filter
                 .checked_add(1)
-                .ok_or_else(ApiProblem::store_read_failed)?;
+                .ok_or_else(ApiError::store_read_failed)?;
             continue;
         }
         let fact_position = EventFactProjection::position(observation, class)
-            .ok_or_else(ApiProblem::store_read_failed)?;
+            .ok_or_else(ApiError::store_read_failed)?;
         if let Some(cursor) = start_after
             && fact_position
                 <= (EventFactPosition {
@@ -701,7 +742,7 @@ fn render_events(
         if !passes_canonical_response_filter(fact, request) {
             omitted_by_response_filter = omitted_by_response_filter
                 .checked_add(1)
-                .ok_or_else(ApiProblem::store_read_failed)?;
+                .ok_or_else(ApiError::store_read_failed)?;
             continue;
         }
         let position = EventFactProjection::canonical_position(fact);
@@ -747,7 +788,7 @@ fn render_events(
                     EventFactProjection::project_canonical(fact, candidate.class)
                 }
             }
-            .ok_or_else(ApiProblem::store_read_failed)
+            .ok_or_else(ApiError::store_read_failed)
         })
         .collect::<Result<_, _>>()?;
     let next_cursor = has_more
@@ -772,14 +813,14 @@ fn render_events(
             .encode(state.cursor_registry()))
         })
         .transpose()
-        .map_err(cursor_problem)?;
+        .map_err(cursor_error)?;
 
     let exactness = metadata.retained_exactness;
     let completeness = metadata.source_completeness;
     let physical_count = metadata.physical_count;
     let coverage = view
         .query_factor_coverage(request.range, MAX_FACTOR_COVERAGE_RECORDS)
-        .map_err(canonical_fact_problem)?
+        .map_err(canonical_fact_error)?
         .iter()
         .map(crate::overview::health::factor_coverage_json)
         .collect();
@@ -856,61 +897,61 @@ fn passes_canonical_response_filter(fact: &CanonicalEventFact, request: &EventsR
         .is_none_or(|kind| fact.kind().wire_code() == kind)
 }
 
-fn cursor_problem(error: CursorError) -> ApiProblem {
+fn cursor_error(error: CursorError) -> ApiError {
     match error {
         // A decode/authentication failure or a changed query is the caller's
         // error (400); a pinned generation that is gone is a 410.
-        CursorError::Invalid => ApiProblem::invalid_cursor(),
-        CursorError::QueryMismatch => ApiProblem::cursor_query_mismatch(),
-        CursorError::ViewGone => ApiProblem::view_gone(),
-        CursorError::Expired => ApiProblem::cursor_expired(),
-        CursorError::CapacityUnavailable => ApiProblem::cursor_capacity_unavailable(),
+        CursorError::Invalid => ApiError::invalid_cursor(),
+        CursorError::QueryMismatch => ApiError::cursor_query_mismatch(),
+        CursorError::ViewGone => ApiError::view_gone(),
+        CursorError::Expired => ApiError::cursor_expired(),
+        CursorError::CapacityUnavailable => ApiError::cursor_capacity_unavailable(),
     }
 }
 
-fn oracle_problem(error: OracleError) -> ApiProblem {
+fn oracle_error(error: OracleError) -> ApiError {
     let limit = match error {
         OracleError::LimitExceeded(OracleResource::MaterializedBytes) => Some((
-            crate::problem::LimitResource::Bytes,
+            crate::api_error::LimitResource::Bytes,
             QUERY_MATERIALIZED_BYTES,
         )),
         OracleError::LimitExceeded(OracleResource::Observations) => Some((
-            crate::problem::LimitResource::Rows,
+            crate::api_error::LimitResource::Rows,
             QUERY_LIMITS.max_observations,
         )),
         OracleError::LimitExceeded(OracleResource::CoverageSpans) => Some((
-            crate::problem::LimitResource::Rows,
+            crate::api_error::LimitResource::Rows,
             QUERY_LIMITS.max_coverage_spans,
         )),
         OracleError::Counts(CountError::LimitExceeded(CountResource::InputEntries)) => Some((
-            crate::problem::LimitResource::Rows,
+            crate::api_error::LimitResource::Rows,
             QUERY_LIMITS.count_limits.max_input_entries,
         )),
         OracleError::Counts(CountError::LimitExceeded(CountResource::JointKeys)) => Some((
-            crate::problem::LimitResource::Rows,
+            crate::api_error::LimitResource::Rows,
             QUERY_LIMITS.count_limits.max_joint_keys,
         )),
         OracleError::Counts(CountError::LimitExceeded(CountResource::SignalKeys)) => Some((
-            crate::problem::LimitResource::Rows,
+            crate::api_error::LimitResource::Rows,
             QUERY_LIMITS.count_limits.max_signal_keys,
         )),
         OracleError::Counts(CountError::Overflow)
         | OracleError::Source(_)
         | OracleError::ObservationIdCollision => None,
     };
-    limit.map_or_else(ApiProblem::store_read_failed, |(resource, limit)| {
-        ApiProblem::query_limit_exceeded(resource, crate::problem::count_u64(limit), None)
+    limit.map_or_else(ApiError::store_read_failed, |(resource, limit)| {
+        ApiError::query_limit_exceeded(resource, crate::api_error::count_u64(limit), None)
     })
 }
 
-fn canonical_fact_problem(error: CanonicalFactQueryError) -> ApiProblem {
+fn canonical_fact_error(error: CanonicalFactQueryError) -> ApiError {
     match error {
-        CanonicalFactQueryError::LimitExceeded => ApiProblem::query_limit_exceeded(
-            crate::problem::LimitResource::Rows,
-            crate::problem::count_u64(MAX_FACTOR_COVERAGE_RECORDS),
+        CanonicalFactQueryError::LimitExceeded => ApiError::query_limit_exceeded(
+            crate::api_error::LimitResource::Rows,
+            crate::api_error::count_u64(MAX_FACTOR_COVERAGE_RECORDS),
             None,
         ),
-        CanonicalFactQueryError::ContradictoryFacts => ApiProblem::store_read_failed(),
+        CanonicalFactQueryError::ContradictoryFacts => ApiError::store_read_failed(),
     }
 }
 
@@ -918,10 +959,10 @@ fn timeline_meta(
     view: &IndexView,
     request: OverviewRequest,
     effective_step_us: Option<u64>,
-) -> Result<TimelineMetaDto, ApiProblem> {
+) -> Result<TimelineMetaDto, ApiError> {
     let metadata = view
         .metadata(request.range, QUERY_LIMITS.max_coverage_spans)
-        .map_err(|_error| ApiProblem::store_read_failed())?;
+        .map_err(|_error| ApiError::store_read_failed())?;
     Ok(timeline_meta_with_metadata(
         view,
         request,
@@ -1022,8 +1063,8 @@ const fn physical_count_name(semantics: PhysicalCountSemantics) -> &'static str 
 fn event_digest(
     counts: &EventCounts,
     observations: &[EventObservation],
-) -> Result<EventDigestDto, ApiProblem> {
-    let projection_error = |_error| ApiProblem::store_read_failed();
+) -> Result<EventDigestDto, ApiError> {
+    let projection_error = |_error| ApiError::store_read_failed();
     let by_severity = counts.by_severity().map_err(projection_error)?;
     let by_category = counts.by_category().map_err(projection_error)?;
     let retained_error_occurrence_count = counts.total_occurrences().map_err(projection_error)?;
@@ -1038,9 +1079,9 @@ fn event_digest(
             })
             .count(),
     )
-    .map_err(|_error| ApiProblem::store_read_failed())?;
+    .map_err(|_error| ApiError::store_read_failed())?;
     let retained_observation_row_count =
-        u64::try_from(observations.len()).map_err(|_error| ApiProblem::store_read_failed())?;
+        u64::try_from(observations.len()).map_err(|_error| ApiError::store_read_failed())?;
     let (by_sqlstate, sqlstate_missing_count, sqlstate_other_count) = sqlstate_top_n(counts)?;
     let (joint_top, joint_other_count) = joint_top_n(counts)?;
     validate_digest_reconciliation(
@@ -1082,7 +1123,7 @@ fn event_digest(
     })
 }
 
-fn sqlstate_top_n(counts: &EventCounts) -> Result<(Vec<SqlstateCountDto>, u64, u64), ApiProblem> {
+fn sqlstate_top_n(counts: &EventCounts) -> Result<(Vec<SqlstateCountDto>, u64, u64), ApiError> {
     let mut aggregate: BTreeMap<[u8; 5], u64> = BTreeMap::new();
     let mut missing = 0_u64;
     for (key, count) in counts.joint() {
@@ -1090,11 +1131,11 @@ fn sqlstate_top_n(counts: &EventCounts) -> Result<(Vec<SqlstateCountDto>, u64, u
             let slot = aggregate.entry(sqlstate.0).or_insert(0);
             *slot = slot
                 .checked_add(*count)
-                .ok_or_else(ApiProblem::store_read_failed)?;
+                .ok_or_else(ApiError::store_read_failed)?;
         } else {
             missing = missing
                 .checked_add(*count)
-                .ok_or_else(ApiProblem::store_read_failed)?;
+                .ok_or_else(ApiError::store_read_failed)?;
         }
     }
     let mut total = 0_u64;
@@ -1102,16 +1143,16 @@ fn sqlstate_top_n(counts: &EventCounts) -> Result<(Vec<SqlstateCountDto>, u64, u
     for (code, count) in aggregate {
         total = total
             .checked_add(count)
-            .ok_or_else(ApiProblem::store_read_failed)?;
+            .ok_or_else(ApiError::store_read_failed)?;
         retain_top(&mut top, code, count);
     }
     let top_total = top.iter().try_fold(0_u64, |sum, (_, count)| {
         sum.checked_add(*count)
-            .ok_or_else(ApiProblem::store_read_failed)
+            .ok_or_else(ApiError::store_read_failed)
     })?;
     let other = total
         .checked_sub(top_total)
-        .ok_or_else(ApiProblem::store_read_failed)?;
+        .ok_or_else(ApiError::store_read_failed)?;
     Ok((
         top.into_iter()
             .map(|(code, count)| SqlstateCountDto {
@@ -1124,22 +1165,22 @@ fn sqlstate_top_n(counts: &EventCounts) -> Result<(Vec<SqlstateCountDto>, u64, u
     ))
 }
 
-fn joint_top_n(counts: &EventCounts) -> Result<(Vec<JointCountDto>, u64), ApiProblem> {
+fn joint_top_n(counts: &EventCounts) -> Result<(Vec<JointCountDto>, u64), ApiError> {
     let mut total = 0_u64;
     let mut top = Vec::with_capacity(DIGEST_TOP_N);
     for (key, count) in counts.joint() {
         total = total
             .checked_add(*count)
-            .ok_or_else(ApiProblem::store_read_failed)?;
+            .ok_or_else(ApiError::store_read_failed)?;
         retain_top(&mut top, *key, *count);
     }
     let top_total = top.iter().try_fold(0_u64, |sum, (_, count)| {
         sum.checked_add(*count)
-            .ok_or_else(ApiProblem::store_read_failed)
+            .ok_or_else(ApiError::store_read_failed)
     })?;
     let other = total
         .checked_sub(top_total)
-        .ok_or_else(ApiProblem::store_read_failed)?;
+        .ok_or_else(ApiError::store_read_failed)?;
     let top = top
         .into_iter()
         .map(|(key, count)| JointCountDto {
@@ -1175,33 +1216,33 @@ fn validate_digest_reconciliation(
     sqlstate_top: &[SqlstateCountDto],
     joint_other: u64,
     joint_top: &[JointCountDto],
-) -> Result<(), ApiProblem> {
+) -> Result<(), ApiError> {
     let sum = |values: &[u64]| {
         values.iter().try_fold(0_u64, |acc, value| {
             acc.checked_add(*value)
-                .ok_or_else(ApiProblem::store_read_failed)
+                .ok_or_else(ApiError::store_read_failed)
         })
     };
     let sqlstate_top_total = sqlstate_top.iter().try_fold(0_u64, |acc, value| {
         acc.checked_add(value.count)
-            .ok_or_else(ApiProblem::store_read_failed)
+            .ok_or_else(ApiError::store_read_failed)
     })?;
     let sqlstate_total = sqlstate_missing
         .checked_add(sqlstate_other)
         .and_then(|partial| partial.checked_add(sqlstate_top_total))
-        .ok_or_else(ApiProblem::store_read_failed)?;
+        .ok_or_else(ApiError::store_read_failed)?;
     let joint_total = joint_other
         .checked_add(joint_top.iter().try_fold(0_u64, |acc, value| {
             acc.checked_add(value.count)
-                .ok_or_else(ApiProblem::store_read_failed)
+                .ok_or_else(ApiError::store_read_failed)
         })?)
-        .ok_or_else(ApiProblem::store_read_failed)?;
+        .ok_or_else(ApiError::store_read_failed)?;
     if sum(by_severity)? != total
         || sum(by_category)? != total
         || sqlstate_total != total
         || joint_total != total
     {
-        return Err(ApiProblem::store_read_failed());
+        return Err(ApiError::store_read_failed());
     }
     Ok(())
 }
@@ -1210,7 +1251,7 @@ fn notable_preview_dto(
     policy: &NotablePolicy,
     observations: &[EventObservation],
     request: OverviewRequest,
-) -> Result<NotablePreviewDto, ApiProblem> {
+) -> Result<NotablePreviewDto, ApiError> {
     let mut total = 0_u64;
     let mut selected = BinaryHeap::with_capacity(policy.response_cap());
     for observation in observations {
@@ -1219,10 +1260,10 @@ fn notable_preview_dto(
         };
         total = total
             .checked_add(1)
-            .ok_or_else(ApiProblem::store_read_failed)?;
+            .ok_or_else(ApiError::store_read_failed)?;
         let candidate = PageCandidate {
             position: EventFactProjection::position(observation, class)
-                .ok_or_else(ApiProblem::store_read_failed)?,
+                .ok_or_else(ApiError::store_read_failed)?,
             source: PageCandidateSource::Observation(observation),
             class,
         };
@@ -1237,23 +1278,22 @@ fn notable_preview_dto(
         }
     }
     let selected = selected.into_sorted_vec();
-    let retained =
-        u64::try_from(selected.len()).map_err(|_error| ApiProblem::store_read_failed())?;
+    let retained = u64::try_from(selected.len()).map_err(|_error| ApiError::store_read_failed())?;
     let observations = selected
         .into_iter()
         .map(|candidate| {
             let PageCandidateSource::Observation(observation) = candidate.source else {
-                return Err(ApiProblem::store_read_failed());
+                return Err(ApiError::store_read_failed());
             };
             EventFactProjection::project(observation, candidate.class)
-                .ok_or_else(ApiProblem::store_read_failed)
+                .ok_or_else(ApiError::store_read_failed)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(NotablePreviewDto {
         observations,
         omitted_count: total
             .checked_sub(retained)
-            .ok_or_else(ApiProblem::store_read_failed)?,
+            .ok_or_else(ApiError::store_read_failed)?,
         events_query_hash: events_query_hash(policy, request),
     })
 }
@@ -1302,9 +1342,9 @@ fn events_query_hash(policy: &NotablePolicy, request: OverviewRequest) -> String
 mod tests {
     use super::{
         DIGEST_TOP_N, EVENTS_DEFAULT_LIMIT, EventsRequest, QUERY_MATERIALIZED_BYTES,
-        default_events_filters, joint_top_n, oracle_problem, sqlstate_top_n,
+        default_events_filters, joint_top_n, oracle_error, sqlstate_top_n,
     };
-    use crate::problem::ProblemCode;
+    use crate::api_error::ErrorCode;
     use kronika_analytics::overview::{
         CountLimits, CoverageSpan, ErrorCategory, EventCounts, JointErrorKey, LifecycleCounts,
         OracleError, OracleResource, Severity, SqlState,
@@ -1352,13 +1392,13 @@ mod tests {
     }
 
     #[test]
-    fn materialized_byte_overflow_maps_to_a_typed_413_problem() {
-        let problem = oracle_problem(OracleError::LimitExceeded(
+    fn materialized_byte_overflow_maps_to_a_413_error() {
+        let error = oracle_error(OracleError::LimitExceeded(
             OracleResource::MaterializedBytes,
         ));
-        assert_eq!(problem.code(), ProblemCode::QueryLimitExceeded);
-        let value = serde_json::to_value(problem).expect("serialize problem");
-        assert_eq!(value["status"], 413);
+        assert_eq!(error.code(), ErrorCode::QueryLimitExceeded);
+        let value = serde_json::to_value(error).expect("serialize API error");
+        assert_eq!(value["code"], "query_limit_exceeded");
         assert_eq!(value["params"]["resource"], "bytes");
         assert_eq!(
             value["params"]["limit"],
