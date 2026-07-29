@@ -1,0 +1,202 @@
+/v1/anomalies:
+  get:
+    description: |-
+      Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `limit`,
+      and `section`. Oversized sections are reported in `skipped`.
+    operationId: anomalies
+    parameters:
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: window
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: step
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: threshold
+      required: false
+      schema:
+        format: double
+        type: number
+    - in: query
+      name: eps_rel
+      required: false
+      schema:
+        format: double
+        type: number
+    - in: query
+      name: limit
+      required: false
+      schema:
+        minimum: 0
+        type: integer
+    - example: pg_stat_database
+      in: query
+      name: section
+      required: false
+      schema:
+        type: string
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/analytics.yaml#/AnomaliesResponse
+        description: Ranked anomaly episodes and scan accounting
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid or oversized query shape
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '404':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Unknown section
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store read or analysis failed
+      '503':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Analytic capacity unavailable
+    summary: '`GET /v1/anomalies?from&to` returns ranked anomaly episodes.'
+    tags:
+    - analytics
+/v1/incidents:
+  get:
+    description: |-
+      Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `epsilon`,
+      `max_cluster_span`, and `section`. All time inputs are unix microseconds.
+    operationId: incidents
+    parameters:
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: window
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: step
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: threshold
+      required: false
+      schema:
+        format: double
+        type: number
+    - in: query
+      name: eps_rel
+      required: false
+      schema:
+        format: double
+        type: number
+    - in: query
+      name: epsilon
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: max_cluster_span
+      required: false
+      schema:
+        type: string
+    - example: pg_stat_database
+      in: query
+      name: section
+      required: false
+      schema:
+        type: string
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/analytics.yaml#/IncidentsResponse
+        description: Clustered incidents and diagnostic findings
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid or oversized query shape
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '404':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Unknown section
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store or analysis limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store read or analysis failed
+      '503':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Analytic capacity unavailable
+    summary: '`GET /v1/incidents?from&to` returns clustered incidents.'
+    tags:
+    - analytics

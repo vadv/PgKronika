@@ -1,5 +1,6 @@
 /target
 __pycache__/
+.schemathesis/
 .DS_Store
 
 # SDD scratch (progress ledger, task briefs)

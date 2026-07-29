@@ -223,18 +223,44 @@ open `params`. `WWW-Authenticate`, `Allow`, and `Retry-After` remain present
 where HTTP semantics require them. Unknown sections return `404`, malformed
 parameters return `400`, and existing input or materialization ceilings return
 `413`. The selected sealed-segment request-shape limit is a `400`.
-See the generated [OpenAPI document](swagger.yaml) and the
-[simplification specification](../../docs/superpowers/specs/2026-07-29-openapi-swagger-migration.md).
+See the generated multi-file
+[OpenAPI document](openapi/openapi.yaml) and the
+[typed OpenAPI design](../../docs/superpowers/specs/2026-07-29-typed-multifile-openapi-design.md).
 
 `src/api_docs.rs` is the single registry connecting documented handlers to
-Axum and OpenAPI. Refresh `swagger.yaml` with:
+Axum and OpenAPI. Rust response DTOs define the wire schemas. The exporter
+groups paths and schemas by domain, writes standard relative `$ref` values, and
+reconstructs the generated tree to prove it equals `/openapi.json`. Refresh it
+with:
 
 ```sh
-make swagger
+make openapi
 ```
 
-CI runs the same command and rejects a diff in the generated file. It does not
-compare schemas or run OpenAPI contract or snapshot tests.
+CI rejects a diff in the committed tree. The library contract tests require
+named JSON success schemas, explicit statuses, and domain tags for all 15
+operations. `make openapi-bundle` creates an uncommitted single-file bundle
+under `target/` on demand.
+
+To check an already running demo locally:
+
+```sh
+make demo-api-smoke
+```
+
+The command discovers a retained range, section, and available heatmap metric,
+then uses Schemathesis to validate one response per operation and require
+endpoint-specific evidence of data. Set `DEMO_API_URL` or
+`PG_KRONIKA_SMOKE_AUTH=user:password` when needed. By default missing retained
+data fails immediately; `DEMO_API_WAIT_SECONDS` enables bounded polling.
+Documented `analytic_capacity_unavailable` rejections are retried twice with a
+one-second delay; other failures are not retried.
+
+The GitHub Actions `Demo API smoke` workflow runs the same check manually for
+the revision selected at dispatch time. It builds and starts an isolated demo
+with the ordinary 15-minute collector rollover, waits up to 20 minutes for
+retained data, and always uploads the stand diagnostics. It has no automatic
+`push` or pull-request trigger.
 
 ## Query and analysis contracts
 

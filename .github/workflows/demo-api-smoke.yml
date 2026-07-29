@@ -1,0 +1,106 @@
+name: Demo API smoke
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: demo-api-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: ordinary rollover + all API operations
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BDD_PLATFORM: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute exact dependency builder
+        id: meta
+        run: |
+          deps_hash=$(./scripts/bdd-image.sh deps-key)
+          platform_slug=$(./scripts/bdd-image.sh platform-slug)
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          builder="ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-${deps_hash:0:16}"
+          {
+            echo "deps_hash=${deps_hash}"
+            echo "builder=${builder}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '## Demo API smoke'
+            echo
+            echo "- exact revision: \`${GITHUB_SHA}\`"
+            echo "- dependency key: \`${deps_hash}\`"
+            echo "- exact builder: \`${builder}\`"
+            echo '- retained-data deadline: 1200 seconds'
+            echo '- collector rollover: ordinary defaults'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve exact dependency builder
+        id: builder
+        run: |
+          if docker manifest inspect "${{ steps.meta.outputs.builder }}" >/dev/null 2>&1; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+            docker pull "${{ steps.meta.outputs.builder }}"
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR for missing builder
+        if: steps.builder.outputs.exists != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx for missing builder
+        if: steps.builder.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build missing dependency builder
+        if: steps.builder.outputs.exists != 'true'
+        env:
+          BDD_BUILDER_IMAGE: ${{ steps.meta.outputs.builder }}
+          BDD_BUILDER_PUSH: "1"
+        run: ./scripts/bdd-image.sh build-builder
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build demo image
+        env:
+          BDD_BUILDER_IMAGE: ${{ steps.meta.outputs.builder }}
+        run: make demo-build
+
+      - name: Start demo
+        run: make demo-up
+
+      - name: Run API smoke
+        env:
+          DEMO_API_URL: http://127.0.0.1:18081
+          DEMO_API_WAIT_SECONDS: "1200"
+        run: |
+          set -o pipefail
+          make demo-api-smoke 2>&1 | tee demo-data/api-smoke.log
+
+      - name: Stop demo and collect diagnostics
+        if: always()
+        run: |
+          mkdir -p demo-data
+          docker logs pgkronika-demo-stand > demo-data/container-live.log 2>&1 || true
+          make demo-down || true
+
+      - name: Upload demo diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-api-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: demo-data/
+          if-no-files-found: warn
+          retention-days: 14

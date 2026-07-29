@@ -101,6 +101,7 @@ use criterion as _;
 mod anomaly;
 mod api_docs;
 mod api_error;
+mod api_response;
 mod auth;
 pub(crate) mod handlers;
 #[allow(
@@ -111,6 +112,8 @@ pub(crate) mod handlers;
 mod incident;
 mod incident_input;
 mod incident_response;
+#[doc(hidden)]
+pub mod openapi_export;
 pub(crate) mod overview;
 mod params;
 mod plan_anomaly;

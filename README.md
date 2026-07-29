@@ -112,15 +112,32 @@ the UI, Swagger UI, OpenAPI document, and `/v1/*` are open; `/healthz`,
 
 [`bins/pg_kronika-web/src/api_docs.rs`](bins/pg_kronika-web/src/api_docs.rs)
 is the single registry that connects documented handlers to both Axum and
-OpenAPI. The generated, tool-neutral view is
-[`swagger.yaml`](bins/pg_kronika-web/swagger.yaml). Refresh it with:
+OpenAPI. Rust response DTOs define the success schemas and every operation
+lists its reachable HTTP statuses. The generated, tool-neutral view starts at
+[`openapi/openapi.yaml`](bins/pg_kronika-web/openapi/openapi.yaml); paths and
+schemas are split into `core`, `sections`, `analytics`, `timeline`, and `ui`
+YAML files with standard relative `$ref` values. Refresh and structurally
+round-trip-check the tree with:
 
 ```sh
-make swagger
+make openapi
 ```
 
-CI runs the same command and rejects a diff in `swagger.yaml`. It does not run
-schema comparisons, contract tests, or OpenAPI snapshots.
+CI runs the same command and rejects a diff in the committed tree. Rust
+contract tests also require one named success schema and one domain tag for
+all 15 operations. `make openapi-bundle` writes an uncommitted single-file
+bundle to `target/pg-kronika-openapi.yaml` when a downstream tool needs one.
+
+With the demo already running, execute one deterministic, schema-validated
+request per operation and require lightweight evidence of retained data:
+
+```sh
+make demo-api-smoke
+```
+
+The local-only smoke uses pinned Schemathesis through `uvx`; it is deliberately
+not a CI job. Override the target with `DEMO_API_URL` and, when Basic Auth is
+enabled, set `PG_KRONIKA_SMOKE_AUTH=user:password`.
 
 ## Workspace map
 

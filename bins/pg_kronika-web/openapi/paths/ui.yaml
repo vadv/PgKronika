@@ -1,0 +1,153 @@
+/v1/timeline/heatmap:
+  get:
+    operationId: heatmap
+    parameters:
+    - example: activity
+      in: query
+      name: view
+      required: true
+      schema:
+        type: string
+    - example: wait
+      in: query
+      name: metric
+      required: true
+      schema:
+        type: string
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: buckets
+      required: false
+      schema:
+        minimum: 0
+        type: integer
+    - in: query
+      name: top
+      required: false
+      schema:
+        minimum: 0
+        type: integer
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/ui.yaml#/HeatmapResponse
+        description: Bounded entity heatmap
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid or oversized query shape
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Serialized response limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: UI index read or render failed
+    summary: '`GET /v1/timeline/heatmap` — bounded web-index entity-series merge.'
+    tags:
+    - ui
+/v1/ui/catalog:
+  get:
+    operationId: catalog
+    parameters:
+    - in: header
+      name: If-None-Match
+      required: false
+      schema:
+        type:
+        - string
+        - 'null'
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/ui.yaml#/ProjectionCatalog
+        description: Source-aware UI projection catalog
+      '304':
+        description: Catalog ETag matches If-None-Match
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Catalog read or render failed
+    summary: '`GET /v1/ui/catalog` — stable UI projections.'
+    tags:
+    - ui
+/v1/views/summary:
+  get:
+    operationId: summary
+    parameters:
+    - in: query
+      name: at
+      required: true
+      schema:
+        format: int64
+        type: integer
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/ui.yaml#/ViewSummaryResponse
+        description: Indexed view populations
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: UI index read failed
+    summary: '`GET /v1/views/summary?at=<us>` — exact indexed populations.'
+    tags:
+    - ui

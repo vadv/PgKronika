@@ -1,0 +1,472 @@
+Availability:
+  description: Availability of one input, metric, or column for a source.
+  enum:
+  - available
+  - gated
+  - not_collected
+  - unsupported_type
+  type: string
+ColumnSpec:
+  description: One table or detail projection column.
+  properties:
+    availability:
+      $ref: '#/Availability'
+      description: Source-specific availability.
+    code:
+      description: Stable column code.
+      type: string
+    formula:
+      description: Formula when this is a derived projection.
+      type:
+      - string
+      - 'null'
+    lazy:
+      description: Whether frame omits the value and detail loads it.
+      type: boolean
+    requires:
+      description: Input groups required by this column.
+      items:
+        type: string
+      type: array
+    source:
+      description: Raw source field when this is a direct projection.
+      type:
+      - string
+      - 'null'
+    type:
+      $ref: '#/ValueType'
+      description: Public value shape.
+  required:
+  - code
+  - type
+  - lazy
+  - requires
+  - availability
+  type: object
+HeatmapGrid:
+  properties:
+    bucket_count:
+      minimum: 0
+      type: integer
+    from_us:
+      type: string
+    to_us:
+      type: string
+  required:
+  - from_us
+  - to_us
+  - bucket_count
+  type: object
+HeatmapQuality:
+  properties:
+    active_tail:
+      type: boolean
+    gaps:
+      items:
+        $ref: '#/RangeGap'
+      type: array
+    gated:
+      items:
+        type: string
+      type: array
+    resource_limited:
+      items:
+        type: string
+      type: array
+    snapshots:
+      minimum: 0
+      type: integer
+    status:
+      type: string
+    unavailable_revision:
+      items:
+        type: string
+      type: array
+    unbounded_segments:
+      items:
+        type: string
+      type: array
+  required:
+  - status
+  - snapshots
+  - gaps
+  - gated
+  - unavailable_revision
+  - resource_limited
+  - unbounded_segments
+  - active_tail
+  type: object
+HeatmapResponse:
+  properties:
+    grid:
+      $ref: '#/HeatmapGrid'
+    quality:
+      $ref: '#/HeatmapQuality'
+    ranking:
+      $ref: '#/Ranking'
+    rows:
+      items:
+        $ref: '#/HeatmapRow'
+      type: array
+  required:
+  - grid
+  - ranking
+  - rows
+  - quality
+  type: object
+HeatmapRow:
+  properties:
+    entity:
+      type: string
+    label:
+      type: string
+    score:
+      $ref: '#/ScoreBounds'
+    unit:
+      type: string
+    values:
+      items:
+        format: double
+        type:
+        - number
+        - 'null'
+      type: array
+  required:
+  - entity
+  - label
+  - unit
+  - score
+  - values
+  type: object
+InputSpec:
+  description: One alternative group of physical inputs for a view.
+  properties:
+    availability:
+      $ref: '#/Availability'
+      description: Source-specific availability.
+    code:
+      description: Stable input code referenced by metrics and columns.
+      type: string
+    logical_sections:
+      description: Logical registry sections accepted by this input.
+      items:
+        type: string
+      type: array
+    type_ids:
+      description: Supported physical type IDs for the logical sections.
+      items:
+        format: int32
+        minimum: 0
+        type: integer
+      type: array
+  required:
+  - code
+  - logical_sections
+  - type_ids
+  - availability
+  type: object
+JoinSpec:
+  description: A proven or conditional relationship between two inputs.
+  properties:
+    cardinality:
+      description: Declared join cardinality.
+      type: string
+    fields:
+      description: Equality fields, in comparison order.
+      items:
+        type: string
+      type: array
+    left:
+      description: Left input code.
+      type: string
+    provenance:
+      description: Evidence required before the join is accepted.
+      type: string
+    right:
+      description: Right input code.
+      type: string
+  required:
+  - left
+  - right
+  - fields
+  - cardinality
+  - provenance
+  type: object
+MetricSpec:
+  description: One heatmap or spark metric.
+  properties:
+    aggregation:
+      description: Bucket aggregation across segments.
+      type: string
+    availability:
+      $ref: '#/Availability'
+      description: Source-specific availability.
+    code:
+      description: Stable metric code inside its view.
+      type: string
+    formula:
+      description: Normative formula over projected inputs.
+      type: string
+    requires:
+      description: Input groups required by the formula.
+      items:
+        type: string
+      type: array
+    revision:
+      description: Independently changeable projection revision.
+      format: int32
+      minimum: 0
+      type: integer
+    unit:
+      description: Public unit code.
+      type: string
+  required:
+  - code
+  - revision
+  - unit
+  - aggregation
+  - formula
+  - requires
+  - availability
+  type: object
+PresetSpec:
+  description: Named ordered subset of view columns.
+  properties:
+    code:
+      description: Stable preset code.
+      type: string
+    columns:
+      description: Columns returned by the preset, in display order.
+      items:
+        type: string
+      type: array
+    sort:
+      $ref: '#/SortSpec'
+      description: Default sort.
+  required:
+  - code
+  - columns
+  - sort
+  type: object
+ProjectionCatalog:
+  description: Complete source-aware catalog response.
+  properties:
+    revision:
+      description: Catalog schema revision.
+      format: int32
+      minimum: 0
+      type: integer
+    views:
+      items:
+        $ref: '#/ViewSpec'
+      type: array
+  required:
+  - revision
+  - views
+  type: object
+RangeGap:
+  properties:
+    from_us:
+      type: string
+    to_us:
+      type: string
+  required:
+  - from_us
+  - to_us
+  type: object
+Ranking:
+  properties:
+    exact:
+      type: boolean
+    unseen_upper:
+      format: double
+      type: number
+  required:
+  - exact
+  - unseen_upper
+  type: object
+Scope:
+  description: UI ownership scope of one view.
+  enum:
+  - database
+  - host
+  - instance
+  type: string
+ScoreBounds:
+  properties:
+    lower:
+      format: double
+      type: number
+    upper:
+      format: double
+      type: number
+  required:
+  - lower
+  - upper
+  type: object
+SortSpec:
+  description: Default ordering of one preset.
+  properties:
+    column:
+      description: Column code.
+      type: string
+    order:
+      description: '`asc` or `desc`.'
+      type: string
+  required:
+  - column
+  - order
+  type: object
+SummaryQuality:
+  properties:
+    active_tail:
+      type: boolean
+    gaps:
+      items:
+        type: string
+      type: array
+    gated:
+      items:
+        type: string
+      type: array
+    resource_limited:
+      items:
+        type: string
+      type: array
+    snapshots:
+      minimum: 0
+      type: integer
+    status:
+      type: string
+    unavailable_revision:
+      items:
+        type: string
+      type: array
+  required:
+  - status
+  - snapshots
+  - gaps
+  - gated
+  - unavailable_revision
+  - resource_limited
+  - active_tail
+  type: object
+ValueType:
+  description: Public scalar shape of one projected column.
+  enum:
+  - i64
+  - u64
+  - f64
+  - bool
+  - text
+  - timestamp
+  type: string
+ViewSpec:
+  description: One stable UI projection.
+  properties:
+    availability:
+      $ref: '#/Availability'
+      description: Source-specific view availability.
+    canonical_metric:
+      description: Metric used by the canonical row spark.
+      type: string
+    code:
+      description: Public URL and JSON code.
+      type: string
+    columns:
+      description: Frame and detail columns.
+      items:
+        $ref: '#/ColumnSpec'
+      type: array
+    identity_revision:
+      description: Typed identity encoding revision.
+      format: int32
+      minimum: 0
+      type: integer
+    inputs:
+      description: Physical input families.
+      items:
+        $ref: '#/InputSpec'
+      type: array
+    joins:
+      description: Proven joins between inputs.
+      items:
+        $ref: '#/JoinSpec'
+      type: array
+    metrics:
+      description: Heatmap and spark metrics.
+      items:
+        $ref: '#/MetricSpec'
+      type: array
+    presets:
+      description: Named frame presets.
+      items:
+        $ref: '#/PresetSpec'
+      type: array
+    scope:
+      $ref: '#/Scope'
+      description: Row ownership scope.
+    view_code:
+      description: Numeric OVF logical ID.
+      format: int32
+      minimum: 0
+      type: integer
+    view_revision:
+      description: Independently changeable view revision.
+      format: int32
+      minimum: 0
+      type: integer
+  required:
+  - view_code
+  - code
+  - view_revision
+  - scope
+  - identity_revision
+  - availability
+  - inputs
+  - joins
+  - metrics
+  - columns
+  - presets
+  - canonical_metric
+  type: object
+ViewSummaryItem:
+  properties:
+    notable:
+      type: boolean
+    population:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    snapshot_ts_us:
+      type:
+      - string
+      - 'null'
+    status:
+      type: string
+    view:
+      type: string
+  required:
+  - view
+  - snapshot_ts_us
+  - population
+  - status
+  - notable
+  type: object
+ViewSummaryResponse:
+  properties:
+    at_us:
+      type: string
+    quality:
+      $ref: '#/SummaryQuality'
+    views:
+      items:
+        $ref: '#/ViewSummaryItem'
+      type: array
+  required:
+  - at_us
+  - views
+  - quality
+  type: object

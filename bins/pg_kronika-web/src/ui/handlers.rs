@@ -11,8 +11,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
 
 use super::catalog::ProjectionCatalog;
-use super::data::view_summary;
-use super::heatmap::{HeatmapError, HeatmapRequest, heatmap as build_heatmap};
+use super::data::{ViewSummaryResponse, view_summary};
+use super::heatmap::{HeatmapError, HeatmapRequest, HeatmapResponse, heatmap as build_heatmap};
 use crate::AppState;
 use crate::api_error::{
     ApiError, ExpectedValue, LimitResource, QueryConstraint, QueryParameter, count_u64,
@@ -42,18 +42,21 @@ const HEATMAP_PARAMS: &[QueryParameter] = &[
 #[utoipa::path(
     get,
     path = "/v1/views/summary",
+    tag = "ui",
     params(
         ("at" = i64, Query),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Indexed view populations", body = ViewSummaryResponse),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 500, description = "UI index read failed", body = ApiError),
     )
 )]
 pub(crate) async fn summary(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<axum::Json<super::data::ViewSummaryResponse>, ApiError> {
+) -> Result<axum::Json<ViewSummaryResponse>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), SUMMARY_PARAMS)?;
     let at_us = parse_i64(&params, QueryParameter::At)?;
     let (snapshot, descriptor_view) = state.overview_request_view();
@@ -86,17 +89,21 @@ pub(crate) async fn summary(
 #[utoipa::path(
     get,
     path = "/v1/timeline/heatmap",
+    tag = "ui",
     params(
-        ("view" = String, Query),
-        ("metric" = String, Query),
+        ("view" = String, Query, example = "activity"),
+        ("metric" = String, Query, example = "wait"),
         ("from" = i64, Query),
         ("to" = i64, Query),
         ("buckets" = Option<usize>, Query),
         ("top" = Option<usize>, Query),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Bounded entity heatmap", body = HeatmapResponse),
+        (status = 400, description = "Invalid or oversized query shape", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Serialized response limit exceeded", body = ApiError),
+        (status = 500, description = "UI index read or render failed", body = ApiError),
     )
 )]
 pub(crate) async fn heatmap(
@@ -245,12 +252,16 @@ fn heatmap_error(error: &HeatmapError) -> ApiError {
 #[utoipa::path(
     get,
     path = "/v1/ui/catalog",
+    tag = "ui",
     params(
         ("If-None-Match" = Option<String>, Header),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Source-aware UI projection catalog", body = ProjectionCatalog),
+        (status = 304, description = "Catalog ETag matches If-None-Match"),
+        (status = 400, description = "Invalid query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 500, description = "Catalog read or render failed", body = ApiError),
     )
 )]
 pub(crate) async fn catalog(

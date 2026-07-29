@@ -27,11 +27,11 @@ jobs:
       - run: cargo fmt --all --check
       - name: Validate frozen PGM research evidence
         run: python3 -B scripts/validate-pgm-size-reduction.py
-      - name: Verify generated Swagger document is current
+      - name: Verify generated OpenAPI tree is current
         run: |
-          git ls-files --error-unmatch bins/pg_kronika-web/swagger.yaml >/dev/null
-          make swagger
-          git diff --exit-code -- bins/pg_kronika-web/swagger.yaml
+          git ls-files --error-unmatch bins/pg_kronika-web/openapi/openapi.yaml >/dev/null
+          make openapi
+          git diff --exit-code -- bins/pg_kronika-web/openapi
       - run: cargo clippy --workspace --all-targets
 
   deps:
@@ -44,6 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p xtask -- check-deps
       - run: bash scripts/test-bdd-image.sh
+      - run: python3 -B -m unittest scripts/test_demo_api_smoke.py -v
 
   test:
     name: test

@@ -1,0 +1,45 @@
+ApiError:
+  description: A small machine-readable API error.
+  properties:
+    code:
+      type: string
+    params:
+      type: object
+  required:
+  - code
+  - params
+  type: object
+ApiValue:
+  anyOf:
+  - type: 'null'
+  - format: int64
+    type: integer
+  - format: int64
+    minimum: 0
+    type: integer
+  - format: double
+    type: number
+  - type: boolean
+  - type: string
+  - $ref: '#/BlobValue'
+  - items:
+      format: int32
+      type: integer
+    type: array
+  description: Every scalar shape a registry column can expose on the JSON wire.
+BlobValue:
+  description: Truncated blob representation used by section rows and identity keys.
+  properties:
+    full_len:
+      format: int64
+      minimum: 0
+      type: integer
+    text:
+      type: string
+    truncated:
+      type: boolean
+  required:
+  - text
+  - full_len
+  - truncated
+  type: object

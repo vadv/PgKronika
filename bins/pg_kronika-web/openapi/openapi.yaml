@@ -1,0 +1,234 @@
+components:
+  schemas:
+    AnomaliesResponse:
+      $ref: schemas/analytics.yaml#/AnomaliesResponse
+    AnomalyCoverageResponse:
+      $ref: schemas/analytics.yaml#/AnomalyCoverageResponse
+    AnomalyEpisodeParametersResponse:
+      $ref: schemas/analytics.yaml#/AnomalyEpisodeParametersResponse
+    AnomalyEpisodeResponse:
+      $ref: schemas/analytics.yaml#/AnomalyEpisodeResponse
+    AnomalyNotEvaluatedResponse:
+      $ref: schemas/analytics.yaml#/AnomalyNotEvaluatedResponse
+    AnomalyPeakResponse:
+      $ref: schemas/analytics.yaml#/AnomalyPeakResponse
+    AnomalySectionResponse:
+      $ref: schemas/analytics.yaml#/AnomalySectionResponse
+    AnomalySkippedSectionResponse:
+      $ref: schemas/analytics.yaml#/AnomalySkippedSectionResponse
+    AnomalyTruncationResponse:
+      $ref: schemas/analytics.yaml#/AnomalyTruncationResponse
+    ApiError:
+      $ref: schemas/common.yaml#/ApiError
+    ApiRow:
+      $ref: schemas/sections.yaml#/ApiRow
+    ApiValue:
+      $ref: schemas/common.yaml#/ApiValue
+    Availability:
+      $ref: schemas/ui.yaml#/Availability
+    BlobValue:
+      $ref: schemas/common.yaml#/BlobValue
+    CapacityPayload:
+      $ref: schemas/timeline.yaml#/CapacityPayload
+    ColumnSpec:
+      $ref: schemas/ui.yaml#/ColumnSpec
+    CounterDeltaPayload:
+      $ref: schemas/timeline.yaml#/CounterDeltaPayload
+    CoverageSpanDto:
+      $ref: schemas/timeline.yaml#/CoverageSpanDto
+    DiffNoDataPoint:
+      $ref: schemas/sections.yaml#/DiffNoDataPoint
+    DiffPointResponse:
+      $ref: schemas/sections.yaml#/DiffPointResponse
+    DiffScalar:
+      $ref: schemas/sections.yaml#/DiffScalar
+    DiffSeriesResponse:
+      $ref: schemas/sections.yaml#/DiffSeriesResponse
+    DiffValuePoint:
+      $ref: schemas/sections.yaml#/DiffValuePoint
+    EntityDto:
+      $ref: schemas/timeline.yaml#/EntityDto
+    ErrorPayload:
+      $ref: schemas/timeline.yaml#/ErrorPayload
+    EventDigestDto:
+      $ref: schemas/timeline.yaml#/EventDigestDto
+    EventFact:
+      $ref: schemas/timeline.yaml#/EventFact
+    EventLoss:
+      $ref: schemas/timeline.yaml#/EventLoss
+    EventPayload:
+      $ref: schemas/timeline.yaml#/EventPayload
+    EventsResponseDto:
+      $ref: schemas/timeline.yaml#/EventsResponseDto
+    FreshnessDto:
+      $ref: schemas/timeline.yaml#/FreshnessDto
+    GapResponse:
+      $ref: schemas/sections.yaml#/GapResponse
+    HealthDomainResponse:
+      $ref: schemas/timeline.yaml#/HealthDomainResponse
+    HealthFactorCoverageResponse:
+      $ref: schemas/timeline.yaml#/HealthFactorCoverageResponse
+    HealthFloorEvidenceResponse:
+      $ref: schemas/timeline.yaml#/HealthFloorEvidenceResponse
+    HealthPointResponse:
+      $ref: schemas/timeline.yaml#/HealthPointResponse
+    HealthResponse:
+      $ref: schemas/timeline.yaml#/HealthResponse
+    HealthSourcePopulationResponse:
+      $ref: schemas/timeline.yaml#/HealthSourcePopulationResponse
+    HealthSummaryResponse:
+      $ref: schemas/timeline.yaml#/HealthSummaryResponse
+    HeatmapGrid:
+      $ref: schemas/ui.yaml#/HeatmapGrid
+    HeatmapQuality:
+      $ref: schemas/ui.yaml#/HeatmapQuality
+    HeatmapResponse:
+      $ref: schemas/ui.yaml#/HeatmapResponse
+    HeatmapRow:
+      $ref: schemas/ui.yaml#/HeatmapRow
+    IncidentEvidenceResponse:
+      $ref: schemas/analytics.yaml#/IncidentEvidenceResponse
+    IncidentFindingResponse:
+      $ref: schemas/analytics.yaml#/IncidentFindingResponse
+    IncidentFindingScopeResponse:
+      $ref: schemas/analytics.yaml#/IncidentFindingScopeResponse
+    IncidentIntervalResponse:
+      $ref: schemas/analytics.yaml#/IncidentIntervalResponse
+    IncidentMemberResponse:
+      $ref: schemas/analytics.yaml#/IncidentMemberResponse
+    IncidentResponse:
+      $ref: schemas/analytics.yaml#/IncidentResponse
+    IncidentsResponse:
+      $ref: schemas/analytics.yaml#/IncidentsResponse
+    InputSpec:
+      $ref: schemas/ui.yaml#/InputSpec
+    JoinSpec:
+      $ref: schemas/ui.yaml#/JoinSpec
+    JointCountDto:
+      $ref: schemas/timeline.yaml#/JointCountDto
+    LifecycleDigestDto:
+      $ref: schemas/timeline.yaml#/LifecycleDigestDto
+    LifecyclePayload:
+      $ref: schemas/timeline.yaml#/LifecyclePayload
+    LossDto:
+      $ref: schemas/timeline.yaml#/LossDto
+    MarkerPayload:
+      $ref: schemas/timeline.yaml#/MarkerPayload
+    MetricSpec:
+      $ref: schemas/ui.yaml#/MetricSpec
+    NoDataReason:
+      $ref: schemas/sections.yaml#/NoDataReason
+    NotablePreviewDto:
+      $ref: schemas/timeline.yaml#/NotablePreviewDto
+    OverviewResponseDto:
+      $ref: schemas/timeline.yaml#/OverviewResponseDto
+    PresetSpec:
+      $ref: schemas/ui.yaml#/PresetSpec
+    ProjectionCatalog:
+      $ref: schemas/ui.yaml#/ProjectionCatalog
+    RangeGap:
+      $ref: schemas/ui.yaml#/RangeGap
+    Ranking:
+      $ref: schemas/ui.yaml#/Ranking
+    Scope:
+      $ref: schemas/ui.yaml#/Scope
+    ScoreBounds:
+      $ref: schemas/ui.yaml#/ScoreBounds
+    SectionCatalogEntry:
+      $ref: schemas/sections.yaml#/SectionCatalogEntry
+    SectionColumnResponse:
+      $ref: schemas/sections.yaml#/SectionColumnResponse
+    SectionDiffResponse:
+      $ref: schemas/sections.yaml#/SectionDiffResponse
+    SectionPageResponse:
+      $ref: schemas/sections.yaml#/SectionPageResponse
+    SectionsBatchDiffResponse:
+      $ref: schemas/sections.yaml#/SectionsBatchDiffResponse
+    SectionsBatchResponse:
+      $ref: schemas/sections.yaml#/SectionsBatchResponse
+    SectionsResponse:
+      $ref: schemas/sections.yaml#/SectionsResponse
+    SegmentResponse:
+      $ref: schemas/sections.yaml#/SegmentResponse
+    SegmentSectionResponse:
+      $ref: schemas/sections.yaml#/SegmentSectionResponse
+    SegmentsResponse:
+      $ref: schemas/sections.yaml#/SegmentsResponse
+    SignalCountDto:
+      $ref: schemas/timeline.yaml#/SignalCountDto
+    SortSpec:
+      $ref: schemas/ui.yaml#/SortSpec
+    SqlstateCountDto:
+      $ref: schemas/timeline.yaml#/SqlstateCountDto
+    StateTransitionPayload:
+      $ref: schemas/timeline.yaml#/StateTransitionPayload
+    SuccessReasonResponse:
+      $ref: schemas/analytics.yaml#/SuccessReasonResponse
+    SummaryQuality:
+      $ref: schemas/ui.yaml#/SummaryQuality
+    SupportingEvidence:
+      $ref: schemas/timeline.yaml#/SupportingEvidence
+    TailPendingDto:
+      $ref: schemas/timeline.yaml#/TailPendingDto
+    TimelineMetaDto:
+      $ref: schemas/timeline.yaml#/TimelineMetaDto
+    ValueType:
+      $ref: schemas/ui.yaml#/ValueType
+    VersionResponse:
+      $ref: schemas/core.yaml#/VersionResponse
+    ViewSpec:
+      $ref: schemas/ui.yaml#/ViewSpec
+    ViewSummaryItem:
+      $ref: schemas/ui.yaml#/ViewSummaryItem
+    ViewSummaryResponse:
+      $ref: schemas/ui.yaml#/ViewSummaryResponse
+info:
+  description: Bounded local access to retained PostgreSQL telemetry and derived analysis.
+  license:
+    identifier: MIT
+    name: MIT
+  title: PgKronika Web API
+  version: 1.0.0
+openapi: 3.1.0
+paths:
+  /v1/anomalies:
+    $ref: paths/analytics.yaml#/~1v1~1anomalies
+  /v1/incidents:
+    $ref: paths/analytics.yaml#/~1v1~1incidents
+  /v1/section/{name}:
+    $ref: paths/sections.yaml#/~1v1~1section~1{name}
+  /v1/section/{name}/diff:
+    $ref: paths/sections.yaml#/~1v1~1section~1{name}~1diff
+  /v1/sections:
+    $ref: paths/sections.yaml#/~1v1~1sections
+  /v1/sections/batch:
+    $ref: paths/sections.yaml#/~1v1~1sections~1batch
+  /v1/sections/batch/diff:
+    $ref: paths/sections.yaml#/~1v1~1sections~1batch~1diff
+  /v1/segments:
+    $ref: paths/sections.yaml#/~1v1~1segments
+  /v1/timeline/events:
+    $ref: paths/timeline.yaml#/~1v1~1timeline~1events
+  /v1/timeline/health:
+    $ref: paths/timeline.yaml#/~1v1~1timeline~1health
+  /v1/timeline/heatmap:
+    $ref: paths/ui.yaml#/~1v1~1timeline~1heatmap
+  /v1/timeline/overview:
+    $ref: paths/timeline.yaml#/~1v1~1timeline~1overview
+  /v1/ui/catalog:
+    $ref: paths/ui.yaml#/~1v1~1ui~1catalog
+  /v1/version:
+    $ref: paths/core.yaml#/~1v1~1version
+  /v1/views/summary:
+    $ref: paths/ui.yaml#/~1v1~1views~1summary
+tags:
+- description: Process and wire-format metadata.
+  name: core
+- description: Registry catalogs, retained rows, and counter diffs.
+  name: sections
+- description: Bounded anomaly and incident analysis.
+  name: analytics
+- description: Typed event, health, and overview projections.
+  name: timeline
+- description: Stable indexed projections consumed by the embedded UI.
+  name: ui

@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::anomaly::{EpisodeHit, MAX_SCORE_WORK, ScanCounts, ScanParams, rank, scan_section};
 use crate::api_error::{ApiError, LimitResource, QueryConstraint, QueryParameter};
+use crate::api_response::AnomaliesResponse;
 use crate::params::{
     QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64, parse_limit_default,
     query_error_response_without_cursor,
@@ -179,6 +180,7 @@ fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorR
 #[utoipa::path(
     get,
     path = "/v1/anomalies",
+    tag = "analytics",
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
@@ -187,11 +189,16 @@ fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorR
         ("threshold" = Option<f64>, Query),
         ("eps_rel" = Option<f64>, Query),
         ("limit" = Option<usize>, Query),
-        ("section" = Option<String>, Query),
+        ("section" = Option<String>, Query, example = "pg_stat_database"),
     ),
     responses(
-        (status = 200, description = "OK"),
-        (status = "default", description = "API error", body = ApiError),
+        (status = 200, description = "Ranked anomaly episodes and scan accounting", body = AnomaliesResponse),
+        (status = 400, description = "Invalid or oversized query shape", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 404, description = "Unknown section", body = ApiError),
+        (status = 413, description = "Store query limit exceeded", body = ApiError),
+        (status = 503, description = "Analytic capacity unavailable", body = ApiError),
+        (status = 500, description = "Store read or analysis failed", body = ApiError),
     )
 )]
 pub(crate) async fn anomalies(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {

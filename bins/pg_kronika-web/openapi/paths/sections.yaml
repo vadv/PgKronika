@@ -1,0 +1,368 @@
+/v1/section/{name}:
+  get:
+    description: |-
+      The reader does the query (ts filter, sort, union columns, gaps); this
+      handler parses params and shapes the result. A stale snapshot degrades to
+      gaps inside the reader, so it stays a `200`.
+    operationId: section_data
+    parameters:
+    - example: pg_stat_database
+      in: path
+      name: name
+      required: true
+      schema:
+        type: string
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: limit
+      required: false
+      schema:
+        minimum: 0
+        type: integer
+    - in: query
+      name: cursor
+      required: false
+      schema:
+        type: string
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/sections.yaml#/SectionPageResponse
+        description: Bounded page of decoded section rows
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query or cursor
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '404':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Unknown section
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store read failed
+    summary: |-
+      `GET /v1/section/{name}?from&to&limit` — one section's rows over the
+      window, decoded and serialized to JSON.
+    tags:
+    - sections
+/v1/section/{name}/diff:
+  get:
+    description: |-
+      Resolves the section's identity and cumulative columns from the registry,
+      reads the window in one page, and folds each series through the diff core.
+    operationId: section_diff
+    parameters:
+    - example: pg_stat_database
+      in: path
+      name: name
+      required: true
+      schema:
+        type: string
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/sections.yaml#/SectionDiffResponse
+        description: Per-entity deltas and rates
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '404':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Unknown section
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store read failed
+    summary: |-
+      `GET /v1/section/{name}/diff?from&to` — per-entity deltas and rates
+      over a window.
+    tags:
+    - sections
+/v1/sections:
+  get:
+    description: |-
+      One entry per logical name: its semantics, sort key, and the union of its
+      versions' columns (first appearance across ascending `type_id`).
+    operationId: sections
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/sections.yaml#/SectionsResponse
+        description: Logical section catalog
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+    summary: '`GET /v1/sections` — static catalog of section types from the registry.'
+    tags:
+    - sections
+/v1/sections/batch:
+  get:
+    description: |-
+      One decode of each overlapping segment serves every requested section, so a
+      multi-metric view costs one pass, not one per section. An unknown name fails
+      the whole request.
+    operationId: sections_batch
+    parameters:
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - example: pg_stat_database,pg_stat_wal
+      in: query
+      name: names
+      required: true
+      schema:
+        type: string
+    - in: query
+      name: limit
+      required: false
+      schema:
+        minimum: 0
+        type: integer
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/sections.yaml#/SectionsBatchResponse
+        description: Section pages keyed by logical name
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '404':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Unknown section
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store read failed
+    summary: |-
+      `GET /v1/sections/batch?from&to&names=a,b,c&limit` — several sections
+      over one window, each as its own page keyed by name.
+    tags:
+    - sections
+/v1/sections/batch/diff:
+  get:
+    description: |-
+      One decode of each overlapping segment serves every requested section, so a
+      multi-metric diff costs one segment pass, not one per section. An unknown name
+      fails the whole request.
+    operationId: sections_batch_diff
+    parameters:
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - example: pg_stat_database,pg_stat_wal
+      in: query
+      name: names
+      required: true
+      schema:
+        type: string
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/sections.yaml#/SectionsBatchDiffResponse
+        description: Section diffs keyed by logical name
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '404':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Unknown section
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store read failed
+    summary: |-
+      `GET /v1/sections/batch/diff?from&to&names=a,b,c` — diffs for several
+      sections over one window, each keyed by name.
+    tags:
+    - sections
+/v1/segments:
+  get:
+    operationId: segments
+    parameters:
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/sections.yaml#/SegmentsResponse
+        description: Segments overlapping the requested range
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Store read failed
+    summary: |-
+      `GET /v1/segments?from&to` — segments overlapping the
+      window, catalog metadata only (no section bodies decoded).
+    tags:
+    - sections

@@ -1,0 +1,26 @@
+/v1/version:
+  get:
+    description: Static body, `application/json`.
+    operationId: version
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/core.yaml#/VersionResponse
+        description: API and container format versions
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+    summary: '`GET /v1/version` — the API and container format versions this build serves.'
+    tags:
+    - core

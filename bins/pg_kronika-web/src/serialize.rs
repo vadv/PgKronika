@@ -1,7 +1,7 @@
 use kronika_analytics::Direction;
-use kronika_reader::{
-    DiffAt, DiffPoint, OutRow, Reason, Scalar, SectionPage, SeriesDiff, Value as CellValue,
-};
+use kronika_reader::Value as CellValue;
+#[cfg(test)]
+use kronika_reader::{DiffAt, DiffPoint, Reason, Scalar, SeriesDiff};
 use kronika_registry::{ColumnClass, ColumnType, Semantics};
 use serde_json::{Value, json};
 
@@ -26,37 +26,9 @@ pub(crate) fn value_to_json(value: &CellValue) -> Value {
     }
 }
 
-/// Shape one output row as a JSON object keyed by column name.
-pub(crate) fn row_to_json(row: &OutRow) -> Value {
-    let object = row
-        .iter()
-        .map(|(name, value)| (name.clone(), value_to_json(value)))
-        .collect();
-    Value::Object(object)
-}
-
-/// Shape a [`SectionPage`] as the `/v1/section` response body.
-pub(crate) fn page_to_json(page: &SectionPage) -> Value {
-    let rows: Vec<Value> = page.rows.iter().map(row_to_json).collect();
-    let gaps: Vec<Value> = page
-        .gaps
-        .iter()
-        .map(|gap| json!({ "from": gap.from, "to": gap.to }))
-        .collect();
-    let next_cursor = page
-        .next_cursor
-        .as_ref()
-        .map_or(Value::Null, |cursor| Value::String(cursor.encode()));
-    json!({
-        "section": page.section,
-        "rows": rows,
-        "gaps": gaps,
-        "next_cursor": next_cursor,
-    })
-}
-
 /// Shape a section's diff over a window: an array of per-entity series, each
 /// with its identity key and a point list per cumulative column.
+#[cfg(test)]
 pub(crate) fn series_diff_to_json(identity: &[&str], series: &[SeriesDiff]) -> Value {
     let out = series
         .iter()
@@ -80,6 +52,7 @@ pub(crate) fn series_diff_to_json(identity: &[&str], series: &[SeriesDiff]) -> V
     Value::Array(out)
 }
 
+#[cfg(test)]
 fn point_to_json(at: &DiffAt) -> Value {
     match at.point {
         DiffPoint::Value {
@@ -104,6 +77,7 @@ fn point_to_json(at: &DiffAt) -> Value {
     reason = "a delta above i64::MAX is astronomically rare for a real counter; \
               the lossy f64 fallback keeps the response numeric"
 )]
+#[cfg(test)]
 fn scalar_to_json(scalar: Scalar) -> Value {
     match scalar {
         Scalar::Int(v) => i64::try_from(v).map_or_else(|_| finite(v as f64), Value::from),
@@ -117,6 +91,7 @@ fn finite(v: f64) -> Value {
     if v.is_finite() { v.into() } else { Value::Null }
 }
 
+#[cfg(test)]
 const fn reason_name(reason: Reason) -> &'static str {
     match reason {
         Reason::Reset => "reset",

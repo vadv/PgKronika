@@ -1,0 +1,492 @@
+AnomaliesResponse:
+  description: Complete response contract of the cross-section anomaly scan.
+  properties:
+    complete:
+      type: boolean
+    coverage:
+      $ref: '#/AnomalyCoverageResponse'
+    episodes:
+      items:
+        $ref: '#/AnomalyEpisodeResponse'
+      type: array
+    eps_rel:
+      format: double
+      type: number
+    from:
+      format: int64
+      type: integer
+    limit:
+      minimum: 0
+      type: integer
+    plan_analysis:
+      type: object
+    plan_signals:
+      items:
+        type: object
+      type: array
+    schema_version:
+      format: int32
+      minimum: 0
+      type: integer
+    sections:
+      additionalProperties:
+        $ref: '#/AnomalySectionResponse'
+      propertyNames:
+        type: string
+      type: object
+    skipped:
+      items:
+        $ref: '#/AnomalySkippedSectionResponse'
+      type: array
+    status:
+      type: string
+    step_us:
+      format: int64
+      type: integer
+    threshold:
+      format: double
+      type: number
+    to:
+      format: int64
+      type: integer
+    truncation:
+      $ref: '#/AnomalyTruncationResponse'
+    window_us:
+      format: int64
+      type: integer
+  required:
+  - schema_version
+  - from
+  - to
+  - window_us
+  - step_us
+  - threshold
+  - eps_rel
+  - limit
+  - status
+  - complete
+  - coverage
+  - truncation
+  - episodes
+  - plan_signals
+  - sections
+  - plan_analysis
+  - skipped
+  type: object
+AnomalyCoverageResponse:
+  description: Request-wide anomaly scan coverage.
+  properties:
+    plan_positions_evaluated:
+      format: int64
+      minimum: 0
+      type: integer
+    plan_sections_analyzed:
+      format: int64
+      minimum: 0
+      type: integer
+    sections_requested:
+      minimum: 0
+      type: integer
+    sections_scanned:
+      format: int64
+      minimum: 0
+      type: integer
+    sections_skipped:
+      minimum: 0
+      type: integer
+  required:
+  - sections_requested
+  - sections_scanned
+  - sections_skipped
+  - plan_sections_analyzed
+  - plan_positions_evaluated
+  type: object
+AnomalyEpisodeParametersResponse:
+  description: Detector parameters repeated with each generic anomaly episode.
+  properties:
+    eps_abs:
+      format: double
+      type:
+      - number
+      - 'null'
+    eps_rel:
+      format: double
+      type: number
+    min_current_points:
+      minimum: 0
+      type: integer
+    min_reference_points:
+      minimum: 0
+      type: integer
+    reference_model:
+      type: string
+    retrospective:
+      type: boolean
+    threshold:
+      format: double
+      type: number
+  required:
+  - reference_model
+  - retrospective
+  - threshold
+  - eps_abs
+  - eps_rel
+  - min_reference_points
+  - min_current_points
+  type: object
+AnomalyEpisodeResponse:
+  description: One ranked generic anomaly episode.
+  properties:
+    column:
+      type: string
+    direction:
+      type: string
+    end:
+      format: int64
+      type: integer
+    parameters:
+      $ref: '#/AnomalyEpisodeParametersResponse'
+    peak:
+      $ref: '#/AnomalyPeakResponse'
+    peak_ts:
+      format: int64
+      type: integer
+    section:
+      type: string
+    series:
+      additionalProperties:
+        $ref: common.yaml#/ApiValue
+      propertyNames:
+        type: string
+      type: object
+    signal_id:
+      type: string
+    start:
+      format: int64
+      type: integer
+  required:
+  - signal_id
+  - section
+  - series
+  - column
+  - start
+  - end
+  - peak_ts
+  - direction
+  - parameters
+  - peak
+  type: object
+AnomalyNotEvaluatedResponse:
+  description: Counts explaining why a generic anomaly series was not evaluated.
+  properties:
+    all_no_data:
+      format: int64
+      minimum: 0
+      type: integer
+    cur_too_small:
+      format: int64
+      minimum: 0
+      type: integer
+    discontinuity:
+      format: int64
+      minimum: 0
+      type: integer
+    non_finite:
+      format: int64
+      minimum: 0
+      type: integer
+    ref_too_small:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - ref_too_small
+  - cur_too_small
+  - all_no_data
+  - non_finite
+  - discontinuity
+  type: object
+AnomalyPeakResponse:
+  description: Values behind the peak anomaly verdict.
+  properties:
+    m:
+      format: double
+      type:
+      - number
+      - 'null'
+    mad_ref:
+      format: double
+      type:
+      - number
+      - 'null'
+    med_cur:
+      format: double
+      type:
+      - number
+      - 'null'
+    med_ref:
+      format: double
+      type:
+      - number
+      - 'null'
+    n_cur:
+      minimum: 0
+      type: integer
+    n_ref:
+      minimum: 0
+      type: integer
+    sigma_used:
+      format: double
+      type:
+      - number
+      - 'null'
+  required:
+  - m
+  - med_cur
+  - med_ref
+  - mad_ref
+  - sigma_used
+  - n_cur
+  - n_ref
+  type: object
+AnomalySectionResponse:
+  description: Per-section generic anomaly scan accounting.
+  properties:
+    episodes_truncated:
+      format: int64
+      minimum: 0
+      type: integer
+    evaluated:
+      format: int64
+      minimum: 0
+      type: integer
+    nodata_points:
+      format: int64
+      minimum: 0
+      type: integer
+    not_evaluated:
+      $ref: '#/AnomalyNotEvaluatedResponse'
+    series_total:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - series_total
+  - evaluated
+  - not_evaluated
+  - nodata_points
+  - episodes_truncated
+  type: object
+AnomalySkippedSectionResponse:
+  description: A section omitted from a successful, explicitly partial anomaly response.
+  properties:
+    reason:
+      $ref: '#/SuccessReasonResponse'
+    section:
+      type: string
+  required:
+  - section
+  - reason
+  type: object
+AnomalyTruncationResponse:
+  description: Bounded-result counters for dropped anomaly evidence.
+  properties:
+    episodes_dropped_total:
+      format: int64
+      minimum: 0
+      type: integer
+    global_episodes_dropped:
+      format: int64
+      minimum: 0
+      type: integer
+    global_plan_signals_dropped:
+      format: int64
+      minimum: 0
+      type: integer
+    plan_signals_dropped_total:
+      format: int64
+      minimum: 0
+      type: integer
+    section_episodes_dropped:
+      format: int64
+      minimum: 0
+      type: integer
+    section_plan_signals_dropped:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - section_episodes_dropped
+  - global_episodes_dropped
+  - episodes_dropped_total
+  - section_plan_signals_dropped
+  - global_plan_signals_dropped
+  - plan_signals_dropped_total
+  type: object
+IncidentEvidenceResponse:
+  anyOf:
+  - type: string
+  - type: object
+  description: Symbolic or structured evidence attached to an incident finding.
+IncidentFindingResponse:
+  description: One diagnostic finding and its bounded supporting evidence.
+  properties:
+    confidence:
+      type: string
+    evidence:
+      items:
+        $ref: '#/IncidentEvidenceResponse'
+      type: array
+    lens_id:
+      type: string
+    role:
+      type: string
+    scope:
+      $ref: '#/IncidentFindingScopeResponse'
+  required:
+  - lens_id
+  - role
+  - confidence
+  - scope
+  - evidence
+  type: object
+IncidentFindingScopeResponse:
+  description: Scope to which an incident finding applies.
+  properties:
+    column:
+      type: string
+    identity:
+      items:
+        $ref: common.yaml#/ApiValue
+      type: array
+    logical_section:
+      type: string
+  required:
+  - logical_section
+  - column
+  - identity
+  type: object
+IncidentIntervalResponse:
+  description: One half-open interval in an incident response.
+  properties:
+    from:
+      format: int64
+      type: integer
+    to:
+      format: int64
+      type: integer
+  required:
+  - from
+  - to
+  type: object
+IncidentMemberResponse:
+  description: One anomaly episode referenced by a clustered incident.
+  properties:
+    column:
+      type: string
+    from:
+      format: int64
+      type: integer
+    identity:
+      items:
+        $ref: common.yaml#/ApiValue
+      type: array
+    logical_section:
+      type: string
+    to:
+      format: int64
+      type: integer
+  required:
+  - logical_section
+  - column
+  - identity
+  - from
+  - to
+  type: object
+IncidentResponse:
+  description: One cluster of related anomaly episodes.
+  properties:
+    evaluation_complete:
+      type: boolean
+    finding_evaluation_status:
+      type: string
+    findings:
+      items:
+        $ref: '#/IncidentFindingResponse'
+      type: array
+    incident_key:
+      type: string
+    interval:
+      $ref: '#/IncidentIntervalResponse'
+    members:
+      items:
+        $ref: '#/IncidentMemberResponse'
+      type: array
+  required:
+  - interval
+  - incident_key
+  - members
+  - findings
+  - evaluation_complete
+  - finding_evaluation_status
+  type: object
+IncidentsResponse:
+  description: Complete response contract of incident clustering and diagnosis.
+  properties:
+    analysis_status:
+      type: string
+    catalog:
+      type: object
+    clustering_complete:
+      type: boolean
+    complete:
+      type: boolean
+    coverage_by_section:
+      type: object
+    data_age_seconds:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    data_quality:
+      type: object
+    from:
+      format: int64
+      type: integer
+    incidents:
+      items:
+        $ref: '#/IncidentResponse'
+      type: array
+    log:
+      type: object
+    skipped:
+      type: object
+    to:
+      format: int64
+      type: integer
+  required:
+  - from
+  - to
+  - complete
+  - clustering_complete
+  - analysis_status
+  - incidents
+  - coverage_by_section
+  - data_age_seconds
+  - catalog
+  - log
+  - data_quality
+  - skipped
+  type: object
+SuccessReasonResponse:
+  description: Machine-readable reason carried inside a successful partial response.
+  properties:
+    kind:
+      type: string
+    params:
+      type: object
+  required:
+  - kind
+  - params
+  type: object

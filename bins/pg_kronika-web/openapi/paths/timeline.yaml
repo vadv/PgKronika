@@ -1,0 +1,204 @@
+/v1/timeline/events:
+  get:
+    operationId: events
+    parameters:
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: limit
+      required: false
+      schema:
+        minimum: 0
+        type: integer
+    - in: query
+      name: cursor
+      required: false
+      schema:
+        type: string
+    - example: warning
+      in: query
+      name: min_severity
+      required: false
+      schema:
+        type: string
+    - example: pg.database.deadlock_delta
+      in: query
+      name: kind
+      required: false
+      schema:
+        type: string
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/timeline.yaml#/EventsResponseDto
+        description: Paginated notable timeline events
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query or cursor
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '410':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Cursor expired or retained view is gone
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Timeline query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Timeline read or render failed
+      '503':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Cursor or cold-build capacity unavailable
+    summary: '`GET /v1/timeline/events?from=..&to=..&limit=..&cursor=..`.'
+    tags:
+    - timeline
+/v1/timeline/health:
+  get:
+    operationId: health
+    parameters:
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: step
+      required: false
+      schema:
+        format: int64
+        minimum: 0
+        type: integer
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/timeline.yaml#/HealthResponse
+        description: Timeline health line
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Timeline query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Timeline read or render failed
+      '503':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Cold-build capacity unavailable
+    summary: '`GET /v1/timeline/health?from=..&to=..&step=..`.'
+    tags:
+    - timeline
+/v1/timeline/overview:
+  get:
+    operationId: overview
+    parameters:
+    - in: query
+      name: from
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: to
+      required: true
+      schema:
+        format: int64
+        type: integer
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/timeline.yaml#/OverviewResponseDto
+        description: Timeline overview
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Timeline query limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Timeline read or render failed
+      '503':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Cold-build capacity unavailable
+    summary: '`GET /v1/timeline/overview?from_us=..&to_us=..`.'
+    tags:
+    - timeline
