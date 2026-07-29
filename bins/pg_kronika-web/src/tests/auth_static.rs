@@ -154,7 +154,7 @@ async fn static_unknown_ui_path_serves_spa_shell() {
 }
 
 #[tokio::test]
-async fn static_unknown_v1_path_is_problem_details() {
+async fn static_unknown_v1_path_is_a_json_api_error() {
     let (status, content_type, body) = raw_request(None, "/v1/does-not-exist", None).await;
     assert_eq!(
         status,
@@ -162,11 +162,11 @@ async fn static_unknown_v1_path_is_problem_details() {
         "an unknown /v1 path is a 404"
     );
     assert!(
-        content_type.starts_with("application/problem+json"),
-        "the 404 is Problem Details, not the HTML shell"
+        content_type.starts_with("application/json"),
+        "the 404 is a JSON API error, not the HTML shell"
     );
     let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
-    assert_problem(&value, status, "route_not_found", serde_json::json!({}));
+    assert_api_error(&value, status, "route_not_found", serde_json::json!({}));
 }
 
 #[tokio::test]

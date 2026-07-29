@@ -834,7 +834,7 @@ async fn incident_read_failure_is_sanitized() {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
-        Some("application/problem+json")
+        Some("application/json")
     );
     let bytes = response
         .into_body()
@@ -843,7 +843,7 @@ async fn incident_read_failure_is_sanitized() {
         .expect("read body")
         .to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON error");
-    assert_problem(
+    assert_api_error(
         &body,
         StatusCode::INTERNAL_SERVER_ERROR,
         "store_read_failed",

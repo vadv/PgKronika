@@ -41,6 +41,10 @@ macro_rules! closed_string_enum {
             $visibility const COUNT: usize = [$(stringify!($variant)),+].len();
 
             #[cfg(test)]
+            #[allow(
+                dead_code,
+                reason = "some closed enums are runtime-only after OpenAPI contract tests were removed"
+            )]
             $visibility const ALL: [Self; Self::COUNT] = [
                 $(Self::$variant),+
             ];
@@ -94,6 +98,7 @@ use tracing_subscriber as _;
 use criterion as _;
 
 mod anomaly;
+mod api_error;
 mod auth;
 pub(crate) mod handlers;
 #[allow(
@@ -107,7 +112,6 @@ mod incident_response;
 pub(crate) mod overview;
 mod params;
 mod plan_anomaly;
-mod problem;
 #[cfg(feature = "qualification")]
 #[doc(hidden)]
 pub mod qualification;
@@ -142,7 +146,7 @@ pub(crate) struct PublishedStoreView {
     timeline: Arc<overview::view::DescriptorView>,
 }
 
-type TimelineFlightResult = Result<Arc<[u8]>, problem::ApiProblem>;
+type TimelineFlightResult = Result<Arc<[u8]>, api_error::ApiError>;
 
 #[derive(Debug)]
 pub(crate) struct TimelineFlight {
@@ -842,7 +846,7 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
             get(handlers::v1::sections_batch_diff),
         )
         .method_not_allowed_fallback(|| async {
-            problem::ApiProblem::method_not_allowed("GET, HEAD")
+            api_error::ApiError::method_not_allowed("GET, HEAD")
         })
         .fallback(handlers::static_::static_handler);
     if let Some(cfg) = auth {

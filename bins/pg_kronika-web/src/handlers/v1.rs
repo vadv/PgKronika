@@ -13,11 +13,11 @@ use kronika_registry::{
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::api_error::{ApiError, ExpectedValue, LimitResource, QueryParameter, count_u64};
 use crate::params::{
     QueryParams, parse_cursor, parse_i64, parse_limit, query_error_response,
     query_error_response_without_cursor,
 };
-use crate::problem::{ApiProblem, ExpectedValue, LimitResource, QueryParameter, count_u64};
 use crate::serialize::{
     column_class_name, column_type_name, page_to_json, semantics_name, series_diff_to_json,
 };
@@ -48,7 +48,7 @@ const BATCH_DIFF_PARAMS: &[QueryParameter] = &[
 /// `GET /v1/version` — the API and container format versions this build serves.
 ///
 /// Static body, `application/json`.
-pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiProblem> {
+pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
     QueryParams::parse(raw.as_deref(), &[])?;
     Ok(Json(
         json!({ "api": "v1", "format_version": crate::FORMAT_VERSION }),
@@ -59,7 +59,7 @@ pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiP
 ///
 /// One entry per logical name: its semantics, sort key, and the union of its
 /// versions' columns (first appearance across ascending `type_id`).
-pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiProblem> {
+pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
     QueryParams::parse(raw.as_deref(), &[])?;
     let mut by_name: BTreeMap<&'static str, Vec<&'static kronika_registry::TypeContract>> =
         BTreeMap::new();
@@ -99,7 +99,7 @@ pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, Api
 pub(crate) async fn segments(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiProblem> {
+) -> Result<Json<Value>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -151,8 +151,8 @@ pub(crate) async fn section_data(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiProblem> {
-    let Path(name) = path.map_err(|_rejection| ApiProblem::unknown_section("invalid"))?;
+) -> Result<Json<Value>, ApiError> {
+    let Path(name) = path.map_err(|_rejection| ApiError::unknown_section("invalid"))?;
     let params = QueryParams::parse(raw.as_deref(), PAGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -177,17 +177,17 @@ pub(crate) async fn section_data(
 pub(crate) async fn sections_batch(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<Value>, ApiProblem> {
+) -> Result<Json<Value>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), BATCH_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
     let limit = parse_limit(&params)?;
     let raw = params
         .get(QueryParameter::Names)
-        .ok_or_else(|| ApiProblem::missing_query_parameter(QueryParameter::Names))?;
+        .ok_or_else(|| ApiError::missing_query_parameter(QueryParameter::Names))?;
     let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
     if names.is_empty() {
-        return Err(ApiProblem::invalid_query_parameter(
+        return Err(ApiError::invalid_query_parameter(
             QueryParameter::Names,
             ExpectedValue::SectionList,
         ));
@@ -207,8 +207,8 @@ pub(crate) async fn sections_batch(
     }
 }
 
-/// The error half of a handler result: one closed Problem Details response.
-type ErrorResponse = ApiProblem;
+/// The error half of a handler result: one closed API error response.
+type ErrorResponse = ApiError;
 
 /// One section's diff as a JSON object (`section`, `identity`, `series`).
 type DiffObject = serde_json::Map<String, Value>;
@@ -296,7 +296,7 @@ fn section_diff_object(
     gates: &Gates,
 ) -> Result<DiffObject, ErrorResponse> {
     if page.next_cursor.is_some() {
-        return Err(ApiProblem::query_limit_exceeded(
+        return Err(ApiError::query_limit_exceeded(
             LimitResource::Rows,
             count_u64(DIFF_MAX_ROWS),
             None,
@@ -328,7 +328,7 @@ pub(crate) async fn section_diff(
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ErrorResponse> {
-    let Path(name) = path.map_err(|_rejection| ApiProblem::unknown_section("invalid"))?;
+    let Path(name) = path.map_err(|_rejection| ApiError::unknown_section("invalid"))?;
     let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
@@ -367,10 +367,10 @@ pub(crate) async fn sections_batch_diff(
     let to = parse_i64(&params, QueryParameter::To)?;
     let raw = params
         .get(QueryParameter::Names)
-        .ok_or_else(|| ApiProblem::missing_query_parameter(QueryParameter::Names))?;
+        .ok_or_else(|| ApiError::missing_query_parameter(QueryParameter::Names))?;
     let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
     if names.is_empty() {
-        return Err(ApiProblem::invalid_query_parameter(
+        return Err(ApiError::invalid_query_parameter(
             QueryParameter::Names,
             ExpectedValue::SectionList,
         ));

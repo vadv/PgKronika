@@ -3,7 +3,7 @@
 use serde::Serialize;
 use serde::ser::SerializeMap as _;
 
-use crate::problem::count_u64;
+use crate::api_error::count_u64;
 
 closed_string_enum! {
     /// Stable reason kinds owned by the product rather than a source.

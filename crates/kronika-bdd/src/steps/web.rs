@@ -64,14 +64,6 @@ async fn web_section_row_by_key(
     web::assert_row_where(&page, &keys, &expected)
 }
 
-/// Assert the transport-level, locale-neutral Problem Details contract.
-#[then("an invalid web API request returns locale-neutral Problem Details")]
-async fn web_locale_neutral_problem(world: &mut BddWorld) -> Result<()> {
-    let segment = world.harness.segment()?.clone();
-    let dir = segment.data_root();
-    web::assert_locale_neutral_problem(dir).await
-}
-
 /// Assert the collected status row reports successful default `PostgreSQL` log collection.
 #[then("the web API reports PostgreSQL log state collecting")]
 async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {

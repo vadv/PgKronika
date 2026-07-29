@@ -22,13 +22,13 @@ use tower::ServiceExt;
 use super::{AppState, AuthConfig, OverviewConfig, app};
 
 mod anomalies;
+mod api_errors;
 mod auth_static;
 mod incidents;
 mod overview_admission;
 mod overview_resilience;
 mod overview_timeline;
 mod probes_metrics;
-mod problems;
 mod sections;
 mod ui_catalog;
 mod ui_data;
@@ -181,12 +181,7 @@ async fn capture_json(response: Response) -> CapturedResponse {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     assert!(
-        matches!(
-            media_type,
-            Some(value)
-                if value.starts_with("application/json")
-                    || value.starts_with("application/problem+json")
-        ),
+        matches!(media_type, Some(value) if value.starts_with("application/json")),
         "response must carry a JSON media type, got {media_type:?}"
     );
     let bytes = response
@@ -207,37 +202,23 @@ async fn capture_json(response: Response) -> CapturedResponse {
     clippy::needless_pass_by_value,
     reason = "callers construct one-use JSON params fixtures inline"
 )]
-fn assert_problem(
+fn assert_api_error(
     body: &serde_json::Value,
     status: StatusCode,
     code: &str,
     params: serde_json::Value,
 ) {
-    let object = body.as_object().expect("problem body is an object");
-    let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
-    keys.sort_unstable();
     assert_eq!(
-        keys,
-        ["code", "instance", "params", "status", "type"],
-        "problem has exactly the normative fields"
+        body,
+        &serde_json::json!({
+            "code": code,
+            "params": params,
+        })
     );
-    assert_eq!(body["status"], u64::from(status.as_u16()));
-    assert_eq!(body["code"], code);
-    assert_eq!(body["params"], params);
-    assert_eq!(
-        body["type"],
-        format!("https://pgkronika.dev/problems/{}", code.replace('_', "-"))
-    );
-    let instance = body["instance"].as_str().expect("problem instance string");
-    let request_id = instance
-        .strip_prefix("https://pgkronika.dev/problems/occurrences/")
-        .expect("problem instance prefix");
-    assert_eq!(request_id.len(), 32);
     assert!(
-        request_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "request id is lowercase hexadecimal"
+        status.is_client_error() || status.is_server_error(),
+        "API error status must be 4xx or 5xx, got {status}"
     );
-    assert_eq!(request_id, request_id.to_ascii_lowercase());
 }
 
 pub(crate) fn bgwriter_row(ts: i64) -> BgwriterCheckpointer {

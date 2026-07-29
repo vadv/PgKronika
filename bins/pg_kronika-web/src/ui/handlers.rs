@@ -14,10 +14,10 @@ use super::catalog::ProjectionCatalog;
 use super::data::view_summary;
 use super::heatmap::{HeatmapError, HeatmapRequest, heatmap as build_heatmap};
 use crate::AppState;
-use crate::params::{QueryParams, parse_i64};
-use crate::problem::{
-    ApiProblem, ExpectedValue, LimitResource, QueryConstraint, QueryParameter, count_u64,
+use crate::api_error::{
+    ApiError, ExpectedValue, LimitResource, QueryConstraint, QueryParameter, count_u64,
 };
+use crate::params::{QueryParams, parse_i64};
 
 /// Maximum serialized projection catalog response.
 const MAX_CATALOG_RESPONSE_BYTES: usize = 512 * 1024;
@@ -42,7 +42,7 @@ const HEATMAP_PARAMS: &[QueryParameter] = &[
 pub(crate) async fn summary(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<axum::Json<super::data::ViewSummaryResponse>, ApiProblem> {
+) -> Result<axum::Json<super::data::ViewSummaryResponse>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), SUMMARY_PARAMS)?;
     let at_us = parse_i64(&params, QueryParameter::At)?;
     let (snapshot, descriptor_view) = state.overview_request_view();
@@ -50,25 +50,23 @@ pub(crate) async fn summary(
     let response = tokio::task::spawn_blocking(move || view_summary(&snapshot, &live, at_us))
         .await
         .map_err(|join| {
-            let problem = ApiProblem::internal_error();
+            let error = ApiError::internal_error();
             tracing::error!(
                 event = "api_ui_summary_worker_failed",
-                request_id = problem.request_id(),
                 error = ?join,
                 "UI summary worker failed"
             );
-            problem
+            error
         })?
         .map_err(|read| {
-            let problem = ApiProblem::store_read_failed();
+            let error = ApiError::store_read_failed();
             tracing::error!(
                 event = "api_ui_summary_read_failed",
-                request_id = problem.request_id(),
                 error = %read,
                 at_us,
                 "UI summary OVF read failed"
             );
-            problem
+            error
         })?;
     Ok(axum::Json(response))
 }
@@ -77,16 +75,16 @@ pub(crate) async fn summary(
 pub(crate) async fn heatmap(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
-) -> Result<Response<Body>, ApiProblem> {
+) -> Result<Response<Body>, ApiError> {
     let params = QueryParams::parse(raw.as_deref(), HEATMAP_PARAMS)?;
     let from_us = parse_i64(&params, QueryParameter::From)?;
     let to_us = parse_i64(&params, QueryParameter::To)?;
     let span = to_us
         .checked_sub(from_us)
         .filter(|span| *span > 0)
-        .ok_or_else(|| ApiProblem::invalid_query_constraint(QueryConstraint::FromBeforeTo))?;
+        .ok_or_else(|| ApiError::invalid_query_constraint(QueryConstraint::FromBeforeTo))?;
     if span > MAX_HEATMAP_SPAN_US {
-        return Err(ApiProblem::query_shape_limit_exceeded(
+        return Err(ApiError::query_shape_limit_exceeded(
             LimitResource::QuerySpanUs,
             u64::try_from(MAX_HEATMAP_SPAN_US).expect("positive constant"),
             u64::try_from(span).ok(),
@@ -94,7 +92,7 @@ pub(crate) async fn heatmap(
     }
     let view_name = required_projection_code(&params, QueryParameter::View)?;
     let view = kronika_analytics::web_projection::web_view_by_name(view_name).ok_or_else(|| {
-        ApiProblem::invalid_query_parameter(QueryParameter::View, ExpectedValue::ProjectionCode)
+        ApiError::invalid_query_parameter(QueryParameter::View, ExpectedValue::ProjectionCode)
     })?;
     let metric_name = required_projection_code(&params, QueryParameter::Metric)?;
     let metric = view
@@ -102,10 +100,7 @@ pub(crate) async fn heatmap(
         .iter()
         .find(|metric| metric.name == metric_name)
         .ok_or_else(|| {
-            ApiProblem::invalid_query_parameter(
-                QueryParameter::Metric,
-                ExpectedValue::ProjectionCode,
-            )
+            ApiError::invalid_query_parameter(QueryParameter::Metric, ExpectedValue::ProjectionCode)
         })?;
     let buckets = bounded_count(
         &params,
@@ -137,28 +132,26 @@ pub(crate) async fn heatmap(
     })
     .await
     .map_err(|join| {
-        let problem = ApiProblem::internal_error();
+        let error = ApiError::internal_error();
         tracing::error!(
             event = "api_ui_heatmap_worker_failed",
-            request_id = problem.request_id(),
             error = ?join,
             "UI heatmap worker failed"
         );
-        problem
+        error
     })?
-    .map_err(|error| heatmap_problem(&error))?;
-    let body = serde_json::to_vec(&response).map_err(|error| {
-        let problem = ApiProblem::internal_error();
+    .map_err(|error| heatmap_error(&error))?;
+    let body = serde_json::to_vec(&response).map_err(|cause| {
+        let api_error = ApiError::internal_error();
         tracing::error!(
             event = "api_ui_heatmap_serialize_failed",
-            request_id = problem.request_id(),
-            error = %error,
+            error = %cause,
             "UI heatmap serialization failed"
         );
-        problem
+        api_error
     })?;
     if body.len() > MAX_HEATMAP_RESPONSE_BYTES {
-        return Err(ApiProblem::query_limit_exceeded(
+        return Err(ApiError::query_limit_exceeded(
             LimitResource::Bytes,
             count_u64(MAX_HEATMAP_RESPONSE_BYTES),
             Some(count_u64(body.len())),
@@ -175,11 +168,11 @@ pub(crate) async fn heatmap(
 fn required_projection_code(
     params: &QueryParams,
     parameter: QueryParameter,
-) -> Result<&str, ApiProblem> {
+) -> Result<&str, ApiError> {
     params
         .get(parameter)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiProblem::missing_query_parameter(parameter))
+        .ok_or_else(|| ApiError::missing_query_parameter(parameter))
 }
 
 fn bounded_count(
@@ -187,38 +180,37 @@ fn bounded_count(
     parameter: QueryParameter,
     default: usize,
     maximum: usize,
-) -> Result<usize, ApiProblem> {
+) -> Result<usize, ApiError> {
     params.get(parameter).map_or(Ok(default), |raw| {
         raw.parse::<usize>()
             .ok()
             .filter(|value| (1..=maximum).contains(value))
             .ok_or_else(|| {
-                ApiProblem::invalid_query_parameter(parameter, ExpectedValue::PositiveInteger)
+                ApiError::invalid_query_parameter(parameter, ExpectedValue::PositiveInteger)
             })
     })
 }
 
-fn heatmap_problem(error: &HeatmapError) -> ApiProblem {
+fn heatmap_error(error: &HeatmapError) -> ApiError {
     match error {
         HeatmapError::Read(read) => {
-            let problem = ApiProblem::store_read_failed();
+            let error = ApiError::store_read_failed();
             tracing::error!(
                 event = "api_ui_heatmap_read_failed",
-                request_id = problem.request_id(),
                 error = %read,
                 "UI heatmap OVF read failed"
             );
-            problem
+            error
         }
-        HeatmapError::TooManySegments => ApiProblem::query_shape_limit_exceeded(
+        HeatmapError::TooManySegments => ApiError::query_shape_limit_exceeded(
             LimitResource::SelectedSegments,
             count_u64(crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS),
             None,
         ),
         HeatmapError::TooManyCandidates => {
-            ApiProblem::query_shape_limit_exceeded(LimitResource::Rows, 16_384, None)
+            ApiError::query_shape_limit_exceeded(LimitResource::Rows, 16_384, None)
         }
-        HeatmapError::Arithmetic => ApiProblem::internal_error(),
+        HeatmapError::Arithmetic => ApiError::internal_error(),
     }
 }
 
@@ -227,53 +219,49 @@ pub(crate) async fn catalog(
     State(state): State<AppState>,
     RawQuery(raw): RawQuery,
     headers: HeaderMap,
-) -> Result<Response<Body>, ApiProblem> {
+) -> Result<Response<Body>, ApiError> {
     QueryParams::parse(raw.as_deref(), CATALOG_PARAMS)?;
     let snapshot = state.snapshot();
     let observed = tokio::task::spawn_blocking(move || observed_type_ids(&snapshot))
         .await
         .map_err(|join| {
-            let problem = ApiProblem::internal_error();
+            let error = ApiError::internal_error();
             tracing::error!(
                 event = "api_ui_catalog_worker_failed",
-                request_id = problem.request_id(),
                 error = ?join,
                 "UI catalog worker failed"
             );
-            problem
+            error
         })?
         .map_err(|read| {
-            let problem = ApiProblem::store_read_failed();
+            let error = ApiError::store_read_failed();
             tracing::error!(
                 event = "api_ui_catalog_read_failed",
-                request_id = problem.request_id(),
                 error = %read,
                 "UI catalog metadata read failed"
             );
-            problem
+            error
         })?;
 
     let catalog = ProjectionCatalog::for_type_ids(&observed);
-    let body = serde_json::to_vec(&catalog).map_err(|error| {
-        let problem = ApiProblem::internal_error();
+    let body = serde_json::to_vec(&catalog).map_err(|cause| {
+        let api_error = ApiError::internal_error();
         tracing::error!(
             event = "api_ui_catalog_serialize_failed",
-            request_id = problem.request_id(),
-            error = %error,
+            error = %cause,
             "UI catalog serialization failed"
         );
-        problem
+        api_error
     })?;
     if body.len() > MAX_CATALOG_RESPONSE_BYTES {
-        let problem = ApiProblem::internal_error();
+        let error = ApiError::internal_error();
         tracing::error!(
             event = "api_ui_catalog_response_oversized",
-            request_id = problem.request_id(),
             observed_bytes = body.len(),
             limit_bytes = MAX_CATALOG_RESPONSE_BYTES,
             "static UI catalog exceeded its response contract"
         );
-        return Err(problem);
+        return Err(error);
     }
 
     let etag = catalog_etag(&body);

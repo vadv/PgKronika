@@ -1027,7 +1027,7 @@ async fn anomalies_reject_degenerate_parameters() {
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "query_limit_exceeded",
@@ -1044,7 +1044,7 @@ async fn anomalies_reject_degenerate_parameters() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is a 404");
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "unknown_section",

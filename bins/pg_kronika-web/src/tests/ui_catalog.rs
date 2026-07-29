@@ -9,7 +9,7 @@ use tower::ServiceExt;
 use crate::ui::catalog::{Availability, ProjectionCatalog};
 use crate::{app, tests::test_metrics_handle};
 
-use super::{assert_problem, serve, serve_captured, state_for_dir, write_bgwriter_segment};
+use super::{assert_api_error, serve, serve_captured, state_for_dir, write_bgwriter_segment};
 
 fn first_type_id(section: &str) -> u32 {
     registry()
@@ -209,7 +209,7 @@ async fn ui_catalog_rejects_unknown_parameters() {
 
     let (status, body) = serve(dir.path(), "/v1/ui/catalog?extra=1").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "unknown_query_parameter",

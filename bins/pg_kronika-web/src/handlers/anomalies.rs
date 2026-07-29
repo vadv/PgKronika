@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::anomaly::{EpisodeHit, MAX_SCORE_WORK, ScanCounts, ScanParams, rank, scan_section};
+use crate::api_error::{ApiError, LimitResource, QueryConstraint, QueryParameter};
 use crate::params::{
     QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64, parse_limit_default,
     query_error_response_without_cursor,
@@ -22,7 +23,6 @@ use crate::plan_anomaly::{
     PLAN_CONTEXT_SECTIONS, PlanContext, PlanScan, PlanSignal, is_plan_section, rank_plan_signals,
     scan_plan_section,
 };
-use crate::problem::{ApiProblem, LimitResource, QueryConstraint, QueryParameter};
 use crate::reason::{ApiReason, MaterializationResource};
 use crate::serialize::episode_to_json;
 
@@ -52,7 +52,7 @@ const ANOMALY_PARAMS: &[QueryParameter] = &[
     QueryParameter::Section,
 ];
 
-type ErrorResponse = ApiProblem;
+type ErrorResponse = ApiError;
 
 struct SectionScan {
     identity: Vec<&'static str>,
@@ -129,7 +129,7 @@ fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorR
     let from = parse_i64(params, QueryParameter::From)?;
     let to = parse_i64(params, QueryParameter::To)?;
     if from >= to {
-        return Err(ApiProblem::invalid_query_constraint(
+        return Err(ApiError::invalid_query_constraint(
             QueryConstraint::FromBeforeTo,
         ));
     }
@@ -139,7 +139,7 @@ fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorR
     let eps_rel = parse_f64_non_negative(params, QueryParameter::EpsRel, EPS_REL_DEFAULT)?;
     let limit = parse_limit_default(params, LIMIT_DEFAULT)?;
     if from.checked_add(window).is_none_or(|first| first > to) {
-        return Err(ApiProblem::invalid_query_constraint(
+        return Err(ApiError::invalid_query_constraint(
             QueryConstraint::WindowWithinInterval,
         ));
     }
@@ -148,12 +148,12 @@ fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorR
         .and_then(|span| span.checked_sub(window))
         .map(|scannable| scannable / step + 2);
     let Some(positions) = positions else {
-        return Err(ApiProblem::invalid_query_constraint(
+        return Err(ApiError::invalid_query_constraint(
             QueryConstraint::FiniteScan,
         ));
     };
     if positions > MAX_POSITIONS {
-        return Err(ApiProblem::query_limit_exceeded(
+        return Err(ApiError::query_limit_exceeded(
             LimitResource::WindowPositions,
             u64::try_from(MAX_POSITIONS).unwrap_or(u64::MAX),
             u64::try_from(positions).ok(),
@@ -179,14 +179,14 @@ fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorR
 pub(crate) async fn anomalies(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     let params = match QueryParams::parse(raw.as_deref(), ANOMALY_PARAMS) {
         Ok(params) => params,
-        Err(problem) => return problem.into_response(),
+        Err(error) => return error.into_response(),
     };
     let request = match validate_request(&params) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
     let Ok(permit) = state.try_acquire_analytic() else {
-        return ApiProblem::analytic_capacity_unavailable().into_response();
+        return ApiError::analytic_capacity_unavailable().into_response();
     };
 
     match tokio::task::spawn_blocking(move || {
@@ -198,14 +198,13 @@ pub(crate) async fn anomalies(State(state): State<AppState>, RawQuery(raw): RawQ
         Ok(Ok(body)) => body.into_response(),
         Ok(Err(error)) => error.into_response(),
         Err(join) => {
-            let problem = ApiProblem::internal_error();
+            let error = ApiError::internal_error();
             tracing::error!(
                 event = "api_analytic_worker_failed",
-                request_id = problem.request_id(),
                 error = ?join,
                 "anomaly worker failed"
             );
-            problem.into_response()
+            error.into_response()
         }
     }
 }
@@ -220,7 +219,7 @@ fn validate_request(params: &QueryParams) -> Result<AnomalyRequest, ErrorRespons
     let (scan, limit) = parse_scan_params(params)?;
     let names = match params.get(QueryParameter::Section) {
         Some(name) => {
-            let logical = logical_section(name).ok_or_else(|| ApiProblem::unknown_section(name))?;
+            let logical = logical_section(name).ok_or_else(|| ApiError::unknown_section(name))?;
             vec![logical.name]
         }
         None => scannable_sections(),

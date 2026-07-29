@@ -58,7 +58,7 @@ async fn batch_diff_serves_each_requested_section_keyed_by_name() {
 async fn batch_diff_rejects_a_missing_names_parameter() {
     let (_dir, status, body) = fixture_response("/v1/sections/batch/diff?from=0&to=9000").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_problem(
+    assert_api_error(
         &body,
         status,
         "missing_query_parameter",

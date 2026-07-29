@@ -15,7 +15,7 @@ use kronika_store::CatalogSummary;
 use tower::ServiceExt as _;
 
 use super::{
-    assert_problem, bgwriter_row, capture_json, test_metrics_handle, write_bgwriter_segment,
+    assert_api_error, bgwriter_row, capture_json, test_metrics_handle, write_bgwriter_segment,
 };
 use crate::overview::admission::ColdWorkWeight;
 use crate::overview::selection::{
@@ -336,7 +336,7 @@ async fn all_timeline_routes_reject_before_cache_flight_capacity_or_cursor_work(
             .await
             .expect("route");
         let response = capture_json(response).await;
-        assert_problem(
+        assert_api_error(
             &response.body,
             StatusCode::BAD_REQUEST,
             "query_limit_exceeded",
@@ -345,14 +345,7 @@ async fn all_timeline_routes_reject_before_cache_flight_capacity_or_cursor_work(
                 "limit": ABSOLUTE_MAX_SELECTED_SEGMENTS,
             }),
         );
-        assert_eq!(response.media_type(), Some("application/problem+json"));
-        assert_eq!(
-            response
-                .headers
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("no-store")
-        );
+        assert_eq!(response.media_type(), Some("application/json"));
         assert_eq!(state.response_cache.len(), 0);
         assert_eq!(state.cursor_registry().pinned_views(), 0);
     }
@@ -381,7 +374,7 @@ async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
         .await
         .expect("route");
     let response = capture_json(response).await;
-    assert_problem(
+    assert_api_error(
         &response.body,
         StatusCode::SERVICE_UNAVAILABLE,
         "cold_build_overloaded",
@@ -393,13 +386,6 @@ async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
             .get(header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok()),
         Some("7")
-    );
-    assert_eq!(
-        response
-            .headers
-            .get(header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok()),
-        Some("no-store")
     );
     assert_eq!(state.response_cache.len(), 0);
 }
