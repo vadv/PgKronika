@@ -1,6 +1,18 @@
 # Контракт реализации incident-анализа
 
-Дата: 2026-07-17. Статус: целевой дизайн; код incident-движка не реализован.
+Дата: 2026-07-17. Исходный статус документа: целевой дизайн; код
+incident-движка тогда не был реализован.
+
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** I0-I4 core, reader adapter, endpoint, evaluators,
+  evidence/snapshot semantics, часть source-period provenance, bounds,
+  deterministic IDs и catalog-accounting BDD.
+- **Осталось:** I5 и второй срез §8 — полный runtime period/clock-domain
+  provenance, роли P/I/D, entity joins, `track_planning` и per-entity
+  attribution; в §9 — route-level blocker/over-cap/planning/PostgreSQL 15-18
+  BDD и load-budget/RSS artifact. Отклонённые temporal-direction и
+  response-shape обещания не являются будущей работой.
 
 Этот документ задаёт границы, поток данных, ресурсную модель, API и порядок
 реализации `GET /v1/incidents`. Семантика отдельных линз задана в

@@ -1,5 +1,13 @@
 # Контракт `kronika-diff`
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** точная арифметика пар, grouping, gap/reset/GUC gating,
+  reader/API/OpenAPI и сопутствующие тесты.
+- **Осталось:** передавать семантику `SnapshotFull`/`Changed` в fold:
+  возвращать `FirstPoint` после наблюдавшегося отсутствия `SnapshotFull`,
+  сохранять непрерывность `Changed` и добавить обе регрессии.
+
 `kronika-diff` — домен-независимый интерпретатор контрактов реестра. Знание о
 версиях PostgreSQL, GUC и составе системных views остаётся в
 `kronika-registry`.

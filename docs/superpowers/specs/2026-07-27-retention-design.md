@@ -4,6 +4,18 @@
 dump/карантина (2026-07-27-dump-design.md): карантинные улики входят в
 бюджет и являются кандидатами на удаление.
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** конфигурация, 60-second enforcement, hourly
+  reconciliation, ordered victims, post-publish enforcement, logging и
+  convergence tests.
+- **Осталось:** учитывать orphan OVF bytes в fixed mode; согласовать
+  историческое «без full scan» с намеренным hourly rescan; добавить whole-tree
+  и partition/statvfs данные в dump summary; выполнить live BDD для fixed
+  deletion, minimum degradation/continued collection, `auto:P` на tmpfs с
+  foreign pressure, victim order/counter convergence и concurrent-reader/web
+  lifecycle.
+
 ## Задача
 
 Сегодня дерево данных растёт без ограничений: PGM никто не удаляет,

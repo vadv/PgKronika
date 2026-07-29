@@ -6,6 +6,17 @@
 Статус документа: архитектурное решение. Раздел 2 и план реализации описывают
 исходную исследованную ревизию; раздел 8.4 сверен с текущей реализацией
 
+**Статус: PARTIAL.**
+
+- **Уже реализовано:** typed UTC `YYYY/MM/DD/N.*` layout во writer, collector,
+  store, reader и overview, включая bounded recovery/quarantine.
+- **Осталось:** реальные ext4/XFS power-loss/failpoint evidence; отдельная
+  PostgreSQL 15-18 матрица для root rejection, midnight/multi-day/month,
+  GC/quota и demo; multi-process матрица; 1-day/30-day/1-year/5-year
+  cold/warm, FD, RSS, syscall и GC qualification с порогами. Strict-stop и
+  root-only grammar нужно согласовать с production
+  `.pgkronika-quarantine-v1` и tolerant bounded quarantine.
+
 ## Краткий вывод
 
 PgKronika использует одну обязательную раскладку готовых сегментов:

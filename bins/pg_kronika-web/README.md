@@ -228,7 +228,7 @@ semantics require them. Unknown sections return `404`, malformed parameters
 return `400`, and existing input or materialization ceilings return `413`.
 The selected sealed-segment request-shape limit is a `400`.
 See the [OpenAPI contract](openapi.json) and the
-[normative machine API specification](../../docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md).
+[normative machine API specification](../../docs/superpowers/implemented/specs/2026-07-21-i18n-machine-api-contract.md).
 
 ## Query and analysis contracts
 

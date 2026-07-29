@@ -1,9 +1,18 @@
 # Маршруты машинного API — план развития
 
-Статус: follow-up к
-[`2026-07-21-i18n-machine-api-contract.md`](../specs/2026-07-21-i18n-machine-api-contract.md).
+Исходный статус документа: follow-up к
+[`2026-07-21-i18n-machine-api-contract.md`](../implemented/specs/2026-07-21-i18n-machine-api-contract.md).
 Текущий `/v1` содержит только `GET`-ресурсы со стандартным `HEAD`; их
 `Allow: GET, HEAD` корректен.
+
+**Статус: FUTURE.**
+
+- **Уже реализовано:** текущие `/v1` routes зарегистрированы вручную;
+  OpenAPI → Router и query-allowlist проверки есть; пока все операции `GET`,
+  общий `Allow: GET, HEAD` корректен.
+- **Осталось:** единый статический manifest method/path/query для всех `/v1`,
+  двусторонняя Router ↔ OpenAPI проверка или генерация и resource-specific
+  `Allow` из manifest до первого non-GET route.
 
 ## Границы
 
