@@ -1810,22 +1810,33 @@ mod tests {
 
     #[test]
     fn complete_failure_and_collector_loss_remain_factual() {
-        for (snapshot, collection, expected_state, expected_total) in [
+        let loss_snapshot = SnapshotCoverageV1 {
+            collected: 50,
+            ..snapshot_coverage(1_002_001, 4, 2, 50)
+        };
+        let loss_collection = CollectionCoverageV1 {
+            collected: 50,
+            ..collection_coverage(1_002_001, 50, true, 3)
+        };
+        for (snapshot, collection, expected_collected, expected_state, expected_total) in [
             (
                 snapshot_coverage(1_002_001, 0, 0, 0),
                 None,
+                0,
                 CollectionReadState::Complete,
                 Some(0),
             ),
             (
                 snapshot_coverage(1_002_001, 3, 2, 0),
                 Some(collection_coverage(1_002_001, 0, true, 1)),
+                0,
                 CollectionReadState::ReadFailure,
                 None,
             ),
             (
-                snapshot_coverage(1_002_001, 4, 2, u32::MAX),
-                Some(collection_coverage(1_002_001, u32::MAX, true, 3)),
+                loss_snapshot,
+                Some(loss_collection),
+                50,
                 CollectionReadState::CollectorLimitOrLoss,
                 None,
             ),
@@ -1837,6 +1848,7 @@ mod tests {
                 .collection_state_at(2, COVERAGE_TS)
                 .expect("statement status");
 
+            assert_eq!(status.collected(), expected_collected);
             assert_eq!(status.source_total(), expected_total);
             assert_eq!(status.read_state(), expected_state);
         }

@@ -1,7 +1,5 @@
 # Exact Section Collection Coverage Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Return factual `collected/source_total` status for statements, plans, tables, and indexes with one PostgreSQL source pass and bounded OVF-only web reads.
 
 **Architecture:** Each PostgreSQL query materializes its source once and calculates an exact window count over that materialization. The collector persists one canonical snapshot marker per attempted view read, the reader projects those markers into the sole `UiSummary` revision 1 layout, and `/v1/views/summary` reads only that bounded block.
@@ -36,10 +34,12 @@
 
 - [ ] **Step 1: Write failing SQL contract tests**
 
-For every supported layout, assert that the emitted SQL has one source reference in
-the `source AS MATERIALIZED` body, uses `count(*) OVER ()::int8 AS source_total`,
-contains no scalar count over the PostgreSQL source, and makes all candidate/final
-reads through `source`. Statements additionally require exactly one
+For every supported layout, assert that the emitted SQL has one source CTE,
+uses `count(*) OVER ()::int8 AS source_total`, contains no scalar count over
+the PostgreSQL source, and makes all candidate/final reads through `source`.
+PostgreSQL 12+ must use `source AS MATERIALIZED (...)`; PostgreSQL 10/11 must
+use `source AS (...)` without the unsupported keyword. Statements additionally
+require exactly one
 `pg_stat_statements(false)`, two bounded ordinal candidate axes, a final
 ordinal-only join, and `NULL::text AS query`. For tables and indexes also
 assert `$2::int8 AS ts_us`.
@@ -49,7 +49,12 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
 }
 
-assert!(query.contains("source AS MATERIALIZED"));
+if server_major >= 12 {
+    assert!(query.contains("source AS MATERIALIZED ("));
+} else {
+    assert!(query.contains("source AS ("));
+    assert!(!query.contains("AS MATERIALIZED"));
+}
 assert!(query.contains("count(*) OVER ()::int8 AS source_total"));
 assert!(!query.contains("(SELECT count(*) FROM pg_stat_user_tables)"));
 assert_eq!(occurrences(query, "FROM pg_stat_user_tables"), 1);
@@ -69,9 +74,10 @@ missing `$2` timestamps in the current SQL.
 
 - [ ] **Step 3: Implement one materialized source per family**
 
-Use this concrete shape for tables and apply the same source/candidate structure to
-the other families while preserving each layout's existing selected columns and
-joins:
+Use this PostgreSQL 12+ shape for tables and apply the same source/candidate
+structure to the other families while preserving each layout's existing selected
+columns and joins. On PostgreSQL 10/11, emit `source AS (...)`; those releases
+materialize CTEs implicitly:
 
 ```sql
 WITH source AS MATERIALIZED (
@@ -390,7 +396,7 @@ Add collection mask capacity and `CollectionStatus` vector capacity to
 cargo test -p kronika-reader web_index::summary
 cargo test -p pg_kronika-dump --test dump
 git add crates/kronika-reader bins/pg_kronika-dump/tests/dump.rs
-git commit -m "feat(ovf): store collection status in ui summary v2"
+git commit -m "feat(ovf): store collection status in ui summary revision 1"
 ```
 
 ### Task 6: Project coverage into the bounded UI summary

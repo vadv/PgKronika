@@ -735,7 +735,7 @@ PG17 заменил `max_dead_tuples` / `num_dead_tuples` на
 `double precision`, миллисекунды) — в PG18 (V4).
 
 Отбор кандидатов — чисто механический: объединение top-N таблиц по сырым
-колонкам (N по умолчанию 500, env `KRONIKA_PG_MAX_TABLES`):
+колонкам (N по умолчанию 500, env `KRONIKA_PG_MAX_TABLES`, допустимо 1–546):
 
 - активность: `seq_scan + idx_scan + n_tup_ins/upd/del` (PG16+ — `GREATEST(last_seq_scan, last_idx_scan)`);
 - запись: `n_tup_ins + n_tup_upd + n_tup_del` DESC — на PG16+ ось активности это давность чтения, и таблица только под запись иначе теряется;
@@ -834,8 +834,9 @@ SQLSTATE 57014 — расширить и повторить базу, иначе
 колонок тайминга.
 
 Отбор кандидатов — чисто механический: объединение top-N индексов по сырым
-колонкам (N по умолчанию 500, свой env `KRONIKA_PG_MAX_INDEXES` — отдельно от
-`KRONIKA_PG_MAX_TABLES`). Каждая ось добавляет `indexrelid` последним ключом
+колонкам (N по умолчанию 500, свой env `KRONIKA_PG_MAX_INDEXES`, допустимо
+1–819 — отдельно от `KRONIKA_PG_MAX_TABLES`). Каждая ось добавляет
+`indexrelid` последним ключом
 `ORDER BY`, чтобы top-N был детерминированным при равных значениях:
 
 - `idx_scan` DESC, `indexrelid`;

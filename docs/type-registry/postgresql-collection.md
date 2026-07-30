@@ -92,7 +92,9 @@ SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';
 ≤ 1.7 → `1_002_001`, 1.8 → `_002`, 1.9 → `_003`, 1.10 → `_004`, 1.11 → `_005`,
 ≥ 1.12 → `_006`. Нераспознанная строка выбирает legacy-раскладку.
 
-Один числовой запрос без текста:
+Один числовой запрос без текста использует явное `AS MATERIALIZED` на
+PostgreSQL 12+ и неявно материализуемое `AS (...)` на PostgreSQL 10/11.
+Ниже показана форма для PostgreSQL 12+:
 
 ```sql
 /* pg_kronika:<version> <source-file> */
@@ -342,7 +344,8 @@ dead tuples `n_dead_tup` ∪ `age(relfrozenxid)` ∪ `mxid_age(relminmxid)`), б
 
 Для индексов (`1_014`) схема аналогична и симметрична таблицам: один запрос на
 базу по `per_db()` под тем же адаптивным `statement_timeout`, свой env
-`KRONIKA_PG_MAX_INDEXES` как per-axis top-N (отдельно от `KRONIKA_PG_MAX_TABLES`).
+`KRONIKA_PG_MAX_INDEXES` как per-axis top-N (допустимо 1–819, отдельно от
+`KRONIKA_PG_MAX_TABLES`, для которого допустимо 1–546).
 Источники строки:
 
 - `pg_stat_user_indexes`;

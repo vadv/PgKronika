@@ -155,6 +155,20 @@ impl SourceCoverage {
         self.collector_loss || self.exceeds_wire_bounds() || self.collected > self.total
     }
 
+    /// A conservative source lower bound that remains valid on collector loss.
+    ///
+    /// Collected rows prove that the source had at least that many rows. Raising
+    /// an inconsistent internal total to this bound keeps the wire counters
+    /// readable while [`Self::read_state`] and [`Self::exact_total`] continue to
+    /// expose the loss and suppress an exact total.
+    const fn wire_total(self) -> u64 {
+        if self.total < self.collected {
+            self.collected
+        } else {
+            self.total
+        }
+    }
+
     /// Canonical `SnapshotCoverageV1` state and visibility.
     ///
     /// Priority is collector loss, read failure, permission, source limit,
@@ -193,7 +207,7 @@ impl SourceCoverage {
             section_type_id,
             read_state,
             visibility,
-            self.total,
+            self.wire_total(),
             usize::try_from(self.collected).unwrap_or(usize::MAX),
         )
     }
@@ -388,6 +402,20 @@ const fn user_indexes_order_by(major: u32) -> &'static str {
     }
 }
 
+fn collection_coverage_row(record: &CoverageRecord, order_by: StrId) -> CollectionCoverageV1 {
+    CollectionCoverageV1 {
+        ts: Ts(record.ts),
+        section_type_id: record.section_type_id,
+        total: u32::try_from(record.coverage.wire_total()).unwrap_or(u32::MAX),
+        unknown_total: record.coverage.exact_total().is_none(),
+        collected: u32::try_from(record.coverage.collected).unwrap_or(u32::MAX),
+        max_n: record.max_n,
+        order_by,
+        cutoff_value: record.cutoff_value,
+        reason: record.coverage.reason(),
+    }
+}
+
 /// Buffer one `1_023_001` row per truncated source.
 ///
 /// # Errors
@@ -400,17 +428,8 @@ pub(crate) fn push_coverage(
 ) -> Result<()> {
     for record in records {
         let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
-        let row = CollectionCoverageV1 {
-            ts: Ts(record.ts),
-            section_type_id: record.section_type_id,
-            total: u32::try_from(record.coverage.total).unwrap_or(u32::MAX),
-            unknown_total: record.coverage.exact_total().is_none(),
-            collected: u32::try_from(record.coverage.collected).unwrap_or(u32::MAX),
-            max_n: record.max_n,
-            order_by: intern(record.order_by.as_bytes())?,
-            cutoff_value: record.cutoff_value,
-            reason: record.coverage.reason(),
-        };
+        let order_by = intern(record.order_by.as_bytes())?;
+        let row = collection_coverage_row(record, order_by);
         buffer_row(buffers, row)?;
     }
     Ok(())
@@ -418,7 +437,8 @@ pub(crate) fn push_coverage(
 
 #[cfg(test)]
 mod snapshot_tests {
-    use super::snapshot_coverage;
+    use super::{CoverageRecord, SourceCoverage, collection_coverage_row, snapshot_coverage};
+    use kronika_registry::StrId;
 
     #[test]
     fn marker_keeps_complete_and_failure_states_distinct() {
@@ -429,5 +449,39 @@ mod snapshot_tests {
         assert_eq!((failed.read_state, failed.visibility), (3, 2));
         assert_eq!(complete.collector_pid, failed.collector_pid);
         assert_eq!(complete.collector_started_at, failed.collector_started_at);
+    }
+
+    #[test]
+    fn collector_loss_rows_keep_collected_as_a_conservative_wire_total() {
+        let coverage = SourceCoverage {
+            total: 40,
+            collected: 50,
+            ..SourceCoverage::new_attempt()
+        };
+        let snapshot = coverage.snapshot_marker(10, 1_013_003);
+        assert_eq!(
+            (
+                snapshot.source_total,
+                snapshot.collected,
+                snapshot.read_state,
+                snapshot.visibility,
+            ),
+            (50, 50, 4, 2)
+        );
+
+        let collection = collection_coverage_row(
+            &CoverageRecord {
+                ts: 10,
+                section_type_id: 1_013_003,
+                coverage,
+                max_n: 500,
+                order_by: "reads|writes",
+                cutoff_value: None,
+            },
+            StrId(1),
+        );
+        assert_eq!((collection.total, collection.collected), (50, 50));
+        assert!(collection.unknown_total);
+        assert_eq!(collection.reason, 3);
     }
 }

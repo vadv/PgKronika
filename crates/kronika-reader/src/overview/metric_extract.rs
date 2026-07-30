@@ -2015,6 +2015,33 @@ mod tests {
     }
 
     #[test]
+    fn collector_loss_lower_bound_decodes_as_an_unknown_total() {
+        let snapshot = SnapshotCoverageV1 {
+            read_state: 4,
+            visibility: 2,
+            source_total: 50,
+            collected: 50,
+            ..test_snapshot_coverage()
+        };
+        let collection = CollectionCoverageV1 {
+            total: 50,
+            unknown_total: true,
+            collected: 50,
+            reason: 3,
+            ..test_collection_coverage()
+        };
+        let coverage =
+            source_coverage(&[snapshot_section(snapshot), collection_section(collection)])
+                .expect("collector loss with a conservative lower bound remains readable");
+        let merged = coverage[&TEST_COVERAGE_SOURCE][0];
+        assert_eq!(merged.source_total, 50);
+        assert_eq!(merged.collected, 50);
+        assert_eq!(merged.read_state, 4);
+        assert_eq!(merged.visibility, 2);
+        assert!(!merged.total_exact);
+    }
+
+    #[test]
     fn pg_context_falls_forward_only_when_the_epoch_predates_the_sample() {
         let timeline = ResetTimeline {
             pg: vec![(200, 50, Some(150))],

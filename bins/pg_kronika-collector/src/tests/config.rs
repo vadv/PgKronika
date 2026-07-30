@@ -72,8 +72,18 @@ fn log_state_runtime_check_rejects_direct_and_symlinked_paths_inside_data_root()
 }
 
 #[test]
-fn cardinality_validation_passes_at_defaults() {
+fn cardinality_validation_accepts_defaults_and_upper_boundaries() {
     assert!(validate_cardinality(500, 500).is_ok());
+    assert!(validate_cardinality(546, 819).is_ok());
+}
+
+#[test]
+fn cardinality_validation_rejects_zero_limits() {
+    let tables = validate_cardinality(0, 500).expect_err("zero tables must fail");
+    assert!(tables.to_string().contains("KRONIKA_PG_MAX_TABLES"));
+
+    let indexes = validate_cardinality(500, 0).expect_err("zero indexes must fail");
+    assert!(indexes.to_string().contains("KRONIKA_PG_MAX_INDEXES"));
 }
 
 #[test]

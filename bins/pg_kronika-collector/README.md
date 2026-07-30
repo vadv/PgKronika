@@ -98,8 +98,8 @@ uncovered or skipped work instead of reporting it as complete data. See
 
 | Variable | Default | Contract |
 | --- | ---: | --- |
-| `KRONIKA_PG_MAX_TABLES` | `500` | Top N per table-selection axis and database. |
-| `KRONIKA_PG_MAX_INDEXES` | `500` | Top N per index-selection axis and database. |
+| `KRONIKA_PG_MAX_TABLES` | `500` | Top N per table-selection axis and database. Accepted range: 1–546. |
+| `KRONIKA_PG_MAX_INDEXES` | `500` | Top N per index-selection axis and database. Accepted range: 1–819. |
 | `KRONIKA_PG_MAX_STATEMENTS` | `500` | Top N per statement-selection axis; the two-axis union retains at most 2N rows. Accepted range: 1–32768. |
 | `KRONIKA_PG_MAX_LOCK_ROWS` | `1000` | Maximum lock waiters, edges, and nodes accepted for a section. |
 | `KRONIKA_PG_MAX_PLANS` | `500` | Maximum plan rows in one read. |

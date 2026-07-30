@@ -2,7 +2,7 @@
 
 Дата: 2026-07-30.
 
-Статус: реализовано в PR #144 поверх `main` с PR #146.
+Статус: реализовано.
 
 ## Цель
 
@@ -25,7 +25,7 @@
 1. Collector создаёт минимальную дополнительную нагрузку на PostgreSQL.
 2. Web читает статус быстро, без последовательного сканирования PGM-секций.
 
-## Что уже есть
+## Исходное состояние
 
 Формат полноты состоит из двух секций:
 
@@ -34,26 +34,26 @@
 - `CollectionCoverageV1` (`type_id=1_023_001`) объясняет top-N и ошибки,
   хранит `unknown_total`, `max_n`, `order_by`, `cutoff_value` и `reason`.
 
-Collector уже пишет `SnapshotCoverageV1` для `statements` и обоих вариантов
-`plans`. Для `tables` и `indexes` collector сейчас пишет только
-`CollectionCoverageV1` и только при усечении или ошибке.
+До изменения collector писал `SnapshotCoverageV1` для `statements` и обоих
+вариантов `plans`. Для `tables` и `indexes` он писал только
+`CollectionCoverageV1`, причём лишь при усечении или ошибке.
 
-Reader умеет разбирать обе coverage-секции для аналитических факторов, но этот
-путь не обслуживает статусы UI-view. Недеплоенный layout `UiSummaryBlock`
-revision 1 можно изменить без миграции и поддержки прежних OVF.
+Reader разбирал обе coverage-секции для аналитических факторов, но этот путь не
+обслуживал статусы UI-view. Недеплоенный layout `UiSummaryBlock` revision 1
+можно было изменить без миграции и поддержки прежних OVF.
 
 `GET /v1/views/summary` уже работает только поверх OVF `UiSummary`. Ручка не
 декодирует исходные PGM-секции, и это ограничение сохраняется.
 
-## Подтверждённая проблема нагрузки
+## Нагрузка до изменения
 
-Текущие SQL-запросы повторно обходят источники:
+SQL-запросы повторно обходили источники:
 
-- `statements_query` отдельно обращается к `pg_stat_statements` для каждой оси
+- `statements_query` отдельно обращался к `pg_stat_statements` для каждой оси
   candidate selection, финальной выборки и `count(*)`;
-- vadv `pg_store_plans` вызывается для top-N и ещё раз для `count(*)`;
-- ossc `pg_store_plans` вызывается для top-N и ещё раз для `count(*)`;
-- запросы `tables` и `indexes` повторно читают statistics view из candidate
+- vadv `pg_store_plans` вызывался для top-N и ещё раз для `count(*)`;
+- ossc `pg_store_plans` вызывался для top-N и ещё раз для `count(*)`;
+- запросы `tables` и `indexes` повторно читали statistics view из candidate
   selection, финальной выборки и `count(*)`.
 
 `pg_stat_statements` хранит тексты запросов во внешнем файле. Вызов
@@ -65,10 +65,12 @@ OSSC `pg_store_plans` 1.x не имеет аргумента `showtext`. Его 
 SQL. Поэтому приём `LIMIT N+1` не устраняет основной полный проход и не даёт
 достаточного выигрыша, чтобы отказаться от фактического `M`.
 
-## Решение: один materialized source
+## Решение: один материализованный CTE `source`
 
-Каждый запрос строит один `MATERIALIZED` CTE `source`. Точный total вычисляется
-оконной функцией над тем же набором:
+Каждый запрос строит один CTE `source`. На PostgreSQL 12+ используется явное
+`AS MATERIALIZED`; PostgreSQL 10/11 используют `AS (...)`, где CTE
+материализуется неявно. Точный total вычисляется оконной функцией над тем же
+набором. Для PostgreSQL 12+ форма запроса выглядит так:
 
 ```sql
 WITH source AS MATERIALIZED (
@@ -81,9 +83,10 @@ FROM source s
 ```
 
 Candidate selection и финальная выборка обращаются только к `source`.
-Скалярных подзапросов `(SELECT count(*) FROM <source>)` не остаётся.
-`MATERIALIZED` запрещает planner размножить вызов SRF при нескольких ссылках на
-CTE.
+Скалярных подзапросов `(SELECT count(*) FROM <source>)` не остаётся. Явная
+материализация на PostgreSQL 12+ и обязательная материализация CTE на
+PostgreSQL 10/11 не позволяют планировщику повторно вычислять SRF при
+нескольких ссылках.
 
 Пустой `source` даёт фактический total `0`: отсутствие первой строки результата
 трактуется как успешный пустой набор только после успешного выполнения запроса.
@@ -99,7 +102,7 @@ CTE.
 строк, после чего результат соединяется с `source` только по уникальному
 `source_ordinal`. Соединение по смысловому ключу с полями, допускающими `NULL`,
 не используется, поэтому `queryid = NULL` не размножает строки. Порядок при
-равных значениях включает `userid`, `dbid`, допускающий `NULL` `queryid`,
+равных значениях включает `userid`, `dbid`, `queryid ASC NULLS LAST`,
 `toplevel` для раскладок 1.9+ и `source_ordinal`; `toplevel` также входит в
 полную идентичность этих раскладок.
 
@@ -178,9 +181,11 @@ coverage, но API не выдаёт её как `source_total`.
 считается `unknown`.
 
 `SnapshotCoverageV1` и `CollectionCoverageV1` используют `u32`. Перед
-преобразованием collector проверяет переполнение. Насыщенное значение
-`u32::MAX` нельзя публиковать как точный total: попытка получает
-`collector_limit_or_loss`, а API возвращает `source_total=null`.
+преобразованием collector проверяет переполнение. Если внутреннее значение
+`total` меньше `collected`, collector перед записью увеличивает `total` до
+доказанной нижней границы `collected`, а попытка получает
+`collector_limit_or_loss`. Насыщенное значение `u32::MAX` также нельзя
+публиковать как точный total: API возвращает `source_total=null`.
 
 Reader объединяет `SnapshotCoverageV1` и `CollectionCoverageV1` по
 `(section_type_id, ts)`. `unknown_total=true` запрещает публиковать total.
@@ -307,7 +312,8 @@ PGM-файлов.
 
 ### SQL и source-pg
 
-- Каждый запрос содержит `MATERIALIZED` и `count(*) OVER ()`.
+- Каждый запрос содержит `count(*) OVER ()`; PostgreSQL 12+ использует
+  `AS MATERIALIZED`, PostgreSQL 10/11 — неявно материализуемый `AS (...)`.
 - SQL не содержит скалярного `count(*)` по исходному SRF или view.
 - Каждый исходный SRF или statistics view встречается в запросе один раз.
 - Две оси statements/tables/indexes читают только CTE `source`.
@@ -354,8 +360,8 @@ PGM-файлов.
 
 ## Порядок реализации
 
-1. Перестроить SQL четырёх source families на один materialized source и exact
-   window count.
+1. Перестроить SQL четырёх семейств источников на один материализуемый CTE с
+   точным `count(*) OVER ()`.
 2. Ввести общий `cycle_ts_us` для tables/indexes и coverage всех четырёх view.
 3. Научить reader канонически объединять две coverage-секции.
 4. Добавить collection status в единственный layout `UiSummary` revision 1.
