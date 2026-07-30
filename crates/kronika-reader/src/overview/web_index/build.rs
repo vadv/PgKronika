@@ -19,9 +19,9 @@ use kronika_format::ReadAt;
 use kronika_registry::{Cell, Row, registry};
 
 use super::{
-    EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, IndexStatus,
-    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, TimeGrid, UiSummaryBlock, ViewSummary,
-    mask_len,
+    CollectionReadState, CollectionStatus, CollectionVisibility, EntityDictionaryEntry,
+    EntityMetric, EntitySeries, EntitySeriesBlock, IndexStatus, METRIC_FLAG_CANONICAL,
+    MetricAggregation, MetricStatus, TimeGrid, UiSummaryBlock, ViewSummary, mask_len,
 };
 use crate::{Dictionary, PgmBodyReadStats, PgmUnit, Resolved};
 
@@ -30,6 +30,8 @@ use super::super::facts::{BuildError, SourceError};
 use super::super::limits::Bounds;
 
 const TOP_K: usize = 64;
+const COLLECTION_COVERAGE: &str = "collection_coverage";
+const SNAPSHOT_COVERAGE: &str = "snapshot_coverage";
 
 /// Populated web-index blocks derived from one PGM unit.
 pub(crate) struct WebIndexBlocks {
@@ -59,7 +61,32 @@ struct SummaryInput {
     view_revision: u16,
     status: IndexStatus,
     populations: BTreeMap<i64, u64>,
+    collections: BTreeMap<i64, CollectionStatus>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectionFact {
+    ts_us: i64,
+    read_state: u8,
+    visibility: u8,
+    source_total: u64,
+    collected: u64,
+    total_exact: bool,
+}
+
+#[derive(Debug, Default)]
+struct CollectionFacts {
+    snapshot: Option<CollectionFact>,
+    collection: Option<CollectionFact>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewCollection {
+    source_type: u32,
+    status: CollectionStatus,
+}
+
+type CollectionTimeline = BTreeMap<(u16, i64), ViewCollection>;
 
 struct Candidate {
     key: Vec<u8>,
@@ -111,13 +138,14 @@ pub(crate) fn build_web_index<R: ReadAt>(
                 .map(|contract| contract.name)
         })
         .collect::<BTreeSet<_>>();
-    let needed_sections = web_views()
+    let mut needed_sections = web_views()
         .iter()
         .filter(|view| view.name != "events")
         .flat_map(|view| view.inputs)
         .flat_map(|input| input.sections)
         .copied()
         .collect::<BTreeSet<_>>();
+    needed_sections.extend([COLLECTION_COVERAGE, SNAPSHOT_COVERAGE]);
     let mut decoded = Vec::new();
     let mut decoded_rows = 0_u64;
     for (ordinal, entry) in unit.catalog().entries.iter().enumerate() {
@@ -145,14 +173,23 @@ pub(crate) fn build_web_index<R: ReadAt>(
             rows,
         });
     }
-    let dictionary = if decoded.iter().any(|section| !section.rows.is_empty()) {
+    let dictionary = if decoded.iter().any(|section| {
+        !matches!(section.name, COLLECTION_COVERAGE | SNAPSHOT_COVERAGE) && !section.rows.is_empty()
+    }) {
         unit.dictionary()?
     } else {
         Dictionary::default()
     };
     let grid = TimeGrid::for_range(min_ts, max_ts).map_err(block_build_error)?;
-    let (summary, summary_inputs) =
-        build_summary(&decoded, &available_sections, observations, grid, bounds)?;
+    let collections = canonical_collections(&decoded)?;
+    let (summary, summary_inputs) = build_summary(
+        &decoded,
+        &available_sections,
+        &collections,
+        observations,
+        grid,
+        bounds,
+    )?;
     let mut series = Vec::new();
     for view in web_views() {
         if view.name == "events" {
@@ -198,9 +235,210 @@ pub(crate) fn build_web_index<R: ReadAt>(
     })
 }
 
+fn canonical_collections(decoded: &[DecodedSection]) -> Result<CollectionTimeline, BuildError> {
+    let mut facts = BTreeMap::<(u32, i64), CollectionFacts>::new();
+    for section in decoded {
+        match section.name {
+            SNAPSHOT_COVERAGE => {
+                for row in &section.rows {
+                    let source_type = coverage_u32(row, "section_type_id")?;
+                    let read_state = coverage_u32(row, "read_state")?;
+                    let visibility = coverage_u32(row, "visibility")?;
+                    let source_total = u64::from(coverage_u32(row, "source_total")?);
+                    let collected = u64::from(coverage_u32(row, "collected")?);
+                    if read_state > 4
+                        || visibility > 2
+                        || collected > source_total
+                        || read_state == 0 && collected != source_total
+                        || read_state == 1 && collected >= source_total
+                    {
+                        return corrupt();
+                    }
+                    let fact = CollectionFact {
+                        ts_us: row_ts(row)?,
+                        read_state: u8::try_from(read_state).map_err(|_error| corrupt_error())?,
+                        visibility: u8::try_from(visibility).map_err(|_error| corrupt_error())?,
+                        source_total,
+                        collected,
+                        total_exact: read_state <= 1,
+                    };
+                    insert_collection_fact(&mut facts, source_type, fact, true)?;
+                }
+            }
+            COLLECTION_COVERAGE => {
+                for row in &section.rows {
+                    let reason = coverage_u32(row, "reason")?;
+                    if reason > 3 {
+                        return corrupt();
+                    }
+                    let source_type = coverage_u32(row, "section_type_id")?;
+                    let source_total = u64::from(coverage_u32(row, "total")?);
+                    let collected = u64::from(coverage_u32(row, "collected")?);
+                    if collected > source_total {
+                        return corrupt();
+                    }
+                    let fact = CollectionFact {
+                        ts_us: row_ts(row)?,
+                        read_state: match reason {
+                            2 => 2,
+                            1 | 3 => 3,
+                            _ => 1,
+                        },
+                        visibility: match reason {
+                            2 => 1,
+                            1 | 3 => 2,
+                            _ => 0,
+                        },
+                        source_total,
+                        collected,
+                        total_exact: !coverage_bool(row, "unknown_total")?,
+                    };
+                    insert_collection_fact(&mut facts, source_type, fact, false)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut collections = BTreeMap::new();
+    for ((source_type, ts), facts) in facts {
+        let fact = merge_collection_facts(&facts)?;
+        let Some(view) = collection_view(source_type) else {
+            continue;
+        };
+        let status = CollectionStatus::new(
+            fact.collected,
+            fact.total_exact.then_some(fact.source_total),
+            collection_read_state(fact.read_state)?,
+            collection_visibility(fact.visibility)?,
+        )
+        .map_err(|_error| corrupt_error())?;
+        if collections
+            .insert(
+                (view.code, ts),
+                ViewCollection {
+                    source_type,
+                    status,
+                },
+            )
+            .is_some()
+        {
+            return corrupt();
+        }
+    }
+    Ok(collections)
+}
+
+fn insert_collection_fact(
+    facts: &mut BTreeMap<(u32, i64), CollectionFacts>,
+    source_type: u32,
+    fact: CollectionFact,
+    snapshot: bool,
+) -> Result<(), BuildError> {
+    let pair = facts.entry((source_type, fact.ts_us)).or_default();
+    let slot = if snapshot {
+        &mut pair.snapshot
+    } else {
+        &mut pair.collection
+    };
+    if slot.replace(fact).is_some() {
+        return corrupt();
+    }
+    Ok(())
+}
+
+fn merge_collection_facts(facts: &CollectionFacts) -> Result<CollectionFact, BuildError> {
+    let Some(snapshot) = facts.snapshot else {
+        return facts.collection.ok_or_else(corrupt_error);
+    };
+    let Some(collection) = facts.collection else {
+        return Ok(snapshot);
+    };
+    if snapshot.ts_us != collection.ts_us || snapshot.collected != collection.collected {
+        return corrupt();
+    }
+    let source_total = match (snapshot.total_exact, collection.total_exact) {
+        (true, true) if snapshot.source_total != collection.source_total => return corrupt(),
+        (true, false) if collection.source_total > snapshot.source_total => return corrupt(),
+        (false, true) if snapshot.source_total > collection.source_total => return corrupt(),
+        (_, true) => collection.source_total,
+        _ => snapshot.source_total.max(collection.source_total),
+    };
+    if snapshot.read_state == 0 && snapshot.collected != source_total
+        || snapshot.read_state == 1 && snapshot.collected >= source_total
+    {
+        return corrupt();
+    }
+    Ok(CollectionFact {
+        source_total,
+        total_exact: collection.total_exact,
+        ..snapshot
+    })
+}
+
+fn collection_view(source_type: u32) -> Option<&'static WebView> {
+    let source_name = registry()
+        .iter()
+        .find(|contract| contract.type_id.get() == source_type)?
+        .name;
+    web_views().iter().find(|view| {
+        view.name != "events"
+            && view
+                .inputs
+                .first()
+                .is_some_and(|input| input.sections.contains(&source_name))
+    })
+}
+
+const fn collection_read_state(code: u8) -> Result<CollectionReadState, BuildError> {
+    match code {
+        0 => Ok(CollectionReadState::Complete),
+        1 => Ok(CollectionReadState::SourceLimit),
+        2 => Ok(CollectionReadState::Permission),
+        3 => Ok(CollectionReadState::ReadFailure),
+        4 => Ok(CollectionReadState::CollectorLimitOrLoss),
+        _ => corrupt(),
+    }
+}
+
+const fn collection_visibility(code: u8) -> Result<CollectionVisibility, BuildError> {
+    match code {
+        0 => Ok(CollectionVisibility::Full),
+        1 => Ok(CollectionVisibility::Restricted),
+        2 => Ok(CollectionVisibility::Unknown),
+        _ => corrupt(),
+    }
+}
+
+fn coverage_u32(row: &Row, field: &str) -> Result<u32, BuildError> {
+    match row.get(field) {
+        Some(Cell::U32(value)) => Ok(*value),
+        Some(Cell::I16(value)) => u32::try_from(*value).map_err(|_error| corrupt_error()),
+        Some(Cell::I32(value)) => u32::try_from(*value).map_err(|_error| corrupt_error()),
+        Some(Cell::I64(value)) => u32::try_from(*value).map_err(|_error| corrupt_error()),
+        _ => corrupt(),
+    }
+}
+
+fn coverage_bool(row: &Row, field: &str) -> Result<bool, BuildError> {
+    match row.get(field) {
+        Some(Cell::Bool(value)) => Ok(*value),
+        _ => corrupt(),
+    }
+}
+
+const fn corrupt<T>() -> Result<T, BuildError> {
+    Err(corrupt_error())
+}
+
+const fn corrupt_error() -> BuildError {
+    BuildError::Source(SourceError::Corrupt)
+}
+
 fn build_summary(
     decoded: &[DecodedSection],
     available_sections: &BTreeSet<&'static str>,
+    collections: &CollectionTimeline,
     observations: &[EventObservation],
     grid: TimeGrid,
     bounds: &Bounds,
@@ -215,6 +453,7 @@ fn build_summary(
         .collect::<BTreeSet<_>>();
     for view in web_views() {
         let mut populations = BTreeMap::<i64, u64>::new();
+        let mut population_types = BTreeMap::<i64, u32>::new();
         if view.name == "events" {
             for observation in observations {
                 let ts = observation.time().sort_ts_us;
@@ -228,10 +467,45 @@ fn build_summary(
                 all_times.insert(ts);
                 let population = populations.entry(ts).or_default();
                 *population = population.checked_add(1).ok_or(BuildError::Overflow)?;
+                match population_types.entry(ts) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(row.type_id);
+                    }
+                    std::collections::btree_map::Entry::Occupied(slot)
+                        if *slot.get() == row.type_id => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(BuildError::Source(SourceError::Corrupt));
+                    }
+                }
             }
         }
+        let mut view_collections = BTreeMap::new();
+        for ((_, ts), collection) in
+            collections.range((view.code, i64::MIN)..=(view.code, i64::MAX))
+        {
+            all_times.insert(*ts);
+            match populations.get(ts) {
+                Some(population) if *population != collection.status.collected() => {
+                    return Err(BuildError::Source(SourceError::Corrupt));
+                }
+                None => {
+                    populations.insert(*ts, collection.status.collected());
+                }
+                Some(_) => {}
+            }
+            match population_types.get(ts) {
+                Some(actual_type) if *actual_type != collection.source_type => {
+                    return Err(BuildError::Source(SourceError::Corrupt));
+                }
+                None => {
+                    population_types.insert(*ts, collection.source_type);
+                }
+                Some(_) => {}
+            }
+            view_collections.insert(*ts, collection.status);
+        }
         let available = input_available(available_sections, &view.inputs[0]);
-        let status = if !available {
+        let status = if !available && view_collections.is_empty() {
             IndexStatus::Gated
         } else if populations.is_empty() {
             IndexStatus::Empty
@@ -243,6 +517,7 @@ fn build_summary(
             view_revision: view.revision,
             status,
             populations,
+            collections: view_collections,
         });
     }
     let snapshot_times = all_times.into_iter().collect::<Vec<_>>();
@@ -253,7 +528,9 @@ fn build_summary(
     for input in &inputs {
         let mut presence = vec![0_u8; mask_len(snapshot_times.len())];
         let mut notable = vec![0_u8; presence.len()];
+        let mut collection_presence = vec![0_u8; presence.len()];
         let mut populations = Vec::with_capacity(input.populations.len());
+        let mut collections = Vec::with_capacity(input.collections.len());
         for (index, ts) in snapshot_times.iter().enumerate() {
             if let Some(population) = input.populations.get(ts) {
                 presence[index / 8] |= 1 << (index % 8);
@@ -265,15 +542,21 @@ fn build_summary(
                 }
                 populations.push(*population);
             }
+            if let Some(collection) = input.collections.get(ts) {
+                collection_presence[index / 8] |= 1 << (index % 8);
+                collections.push(*collection);
+            }
         }
         views.push(
-            ViewSummary::new(
+            ViewSummary::new_with_collection(
                 input.view_code,
                 input.view_revision,
                 input.status,
                 presence,
                 notable,
                 populations,
+                collection_presence,
+                collections,
                 bounds,
             )
             .map_err(block_build_error)?,
@@ -1222,10 +1505,133 @@ const fn block_build_error(error: BlockError) -> BuildError {
 #[cfg(test)]
 mod tests {
     use kronika_analytics::web_projection::{WebAggregation, web_view_by_name};
-    use kronika_registry::{Cell, Row, registry};
+    use kronika_format::{PartMeta, SectionInput, build_part};
+    use kronika_registry::collection_coverage::CollectionCoverageV1;
+    use kronika_registry::pg_stat_user_indexes::PgStatUserIndexesV1;
+    use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
+    use kronika_registry::{Cell, Row, Section, StrId, Ts, registry};
 
-    use super::{candidate, encode_candidate};
+    use super::{build_web_index, candidate, encode_candidate};
+    use crate::PgmUnit;
+    use crate::overview::facts::{BuildError, SourceError};
     use crate::overview::limits::LIMIT;
+    use crate::overview::web_index::{CollectionReadState, CollectionVisibility, UiSummaryBlock};
+
+    const COVERAGE_TS: i64 = 100;
+
+    fn snapshot_coverage(
+        section_type_id: u32,
+        read_state: u8,
+        visibility: u8,
+        source_total: u32,
+    ) -> SnapshotCoverageV1 {
+        SnapshotCoverageV1 {
+            ts: Ts(COVERAGE_TS),
+            section_type_id,
+            collector_pid: 42,
+            collector_started_at: Ts(1),
+            read_state,
+            visibility,
+            source_total,
+            collected: 0,
+        }
+    }
+
+    fn collection_coverage(
+        section_type_id: u32,
+        total: u32,
+        unknown_total: bool,
+        reason: u8,
+    ) -> CollectionCoverageV1 {
+        CollectionCoverageV1 {
+            ts: Ts(COVERAGE_TS),
+            section_type_id,
+            total,
+            unknown_total,
+            collected: 0,
+            max_n: 500,
+            order_by: StrId(1),
+            cutoff_value: None,
+            reason,
+        }
+    }
+
+    fn coverage_pgm(
+        snapshots: &[SnapshotCoverageV1],
+        collections: &[CollectionCoverageV1],
+    ) -> Vec<u8> {
+        coverage_pgm_with_sources(Vec::new(), snapshots, collections)
+    }
+
+    fn coverage_pgm_with_sources(
+        mut bodies: Vec<(u32, u32, Vec<u8>)>,
+        snapshots: &[SnapshotCoverageV1],
+        collections: &[CollectionCoverageV1],
+    ) -> Vec<u8> {
+        if !collections.is_empty() {
+            bodies.push((
+                1_023_001,
+                u32::try_from(collections.len()).expect("small collection fixture"),
+                CollectionCoverageV1::encode(collections).expect("encode collection coverage"),
+            ));
+        }
+        if !snapshots.is_empty() {
+            bodies.push((
+                1_038_001,
+                u32::try_from(snapshots.len()).expect("small snapshot fixture"),
+                SnapshotCoverageV1::encode(snapshots).expect("encode snapshot coverage"),
+            ));
+        }
+        bodies.sort_unstable_by_key(|(type_id, _, _)| *type_id);
+        let inputs = bodies
+            .iter()
+            .map(|(type_id, rows, body)| SectionInput {
+                type_id: *type_id,
+                rows: *rows,
+                body,
+            })
+            .collect::<Vec<_>>();
+        build_part(
+            &inputs,
+            PartMeta {
+                min_ts: COVERAGE_TS,
+                max_ts: COVERAGE_TS,
+            },
+        )
+    }
+
+    fn index_row() -> PgStatUserIndexesV1 {
+        PgStatUserIndexesV1 {
+            ts: Ts(COVERAGE_TS),
+            datid: 1,
+            datname: StrId(1),
+            indexrelid: 2,
+            relid: 3,
+            schemaname: StrId(2),
+            relname: StrId(3),
+            indexrelname: StrId(4),
+            tablespace: StrId(5),
+            idx_scan: 1,
+            idx_tup_read: 2,
+            idx_tup_fetch: 3,
+            main_fork_bytes: 8_192,
+            indisunique: false,
+            indisprimary: false,
+            indisvalid: true,
+            indisexclusion: false,
+            indisready: true,
+            amname: StrId(6),
+            indexdef: StrId(7),
+            idx_blks_read: 4,
+            idx_blks_hit: 5,
+        }
+    }
+
+    fn build_summary(bytes: &[u8]) -> Result<UiSummaryBlock, BuildError> {
+        let unit =
+            PgmUnit::open(bytes).map_err(|_error| BuildError::Source(SourceError::Corrupt))?;
+        build_web_index(&unit, &[], COVERAGE_TS, COVERAGE_TS, &LIMIT).map(|blocks| blocks.summary)
+    }
 
     #[test]
     fn quantization_preserves_observed_zero_and_missing_as_distinct() {
@@ -1263,5 +1669,124 @@ mod tests {
                 .iter()
                 .all(|field| row.contract().column(field).is_some())
         }));
+    }
+
+    #[test]
+    fn physical_coverage_maps_to_all_four_collection_views() {
+        for (source_type, view_code) in [
+            (1_002_001, 2),
+            (1_003_001, 3),
+            (1_004_001, 3),
+            (1_013_001, 4),
+            (1_014_001, 5),
+        ] {
+            let snapshot = snapshot_coverage(source_type, 1, 0, 10);
+            let collection = collection_coverage(source_type, 10, false, 0);
+            let bytes = coverage_pgm(&[snapshot], &[collection]);
+            let summary = build_summary(&bytes).expect("build collection summary");
+            let (_, status) = summary
+                .collection_state_at(view_code, COVERAGE_TS)
+                .expect("mapped collection status");
+
+            assert_eq!(status.collected(), 0);
+            assert_eq!(status.source_total(), Some(10));
+            assert_eq!(status.read_state(), CollectionReadState::SourceLimit);
+            assert_eq!(status.visibility(), CollectionVisibility::Full);
+        }
+    }
+
+    #[test]
+    fn complete_failure_and_collector_loss_remain_factual() {
+        for (snapshot, collection, expected_state, expected_total) in [
+            (
+                snapshot_coverage(1_002_001, 0, 0, 0),
+                None,
+                CollectionReadState::Complete,
+                Some(0),
+            ),
+            (
+                snapshot_coverage(1_002_001, 3, 2, 0),
+                Some(collection_coverage(1_002_001, 0, true, 1)),
+                CollectionReadState::ReadFailure,
+                None,
+            ),
+            (
+                snapshot_coverage(1_002_001, 4, 2, u32::MAX),
+                Some(collection_coverage(1_002_001, u32::MAX, true, 3)),
+                CollectionReadState::CollectorLimitOrLoss,
+                None,
+            ),
+        ] {
+            let collections = collection.into_iter().collect::<Vec<_>>();
+            let bytes = coverage_pgm(&[snapshot], &collections);
+            let summary = build_summary(&bytes).expect("build factual state");
+            let (_, status) = summary
+                .collection_state_at(2, COVERAGE_TS)
+                .expect("statement status");
+
+            assert_eq!(status.source_total(), expected_total);
+            assert_eq!(status.read_state(), expected_state);
+        }
+    }
+
+    #[test]
+    fn duplicate_and_revision_conflicting_coverage_is_corrupt() {
+        let duplicate = snapshot_coverage(1_002_001, 0, 0, 0);
+        let bytes = coverage_pgm(&[duplicate, duplicate], &[]);
+        assert!(matches!(
+            build_summary(&bytes),
+            Err(BuildError::Source(SourceError::Corrupt))
+        ));
+
+        let ossc = snapshot_coverage(1_003_001, 0, 0, 0);
+        let vadv = snapshot_coverage(1_004_001, 0, 0, 0);
+        let bytes = coverage_pgm(&[ossc, vadv], &[]);
+        assert!(matches!(
+            build_summary(&bytes),
+            Err(BuildError::Source(SourceError::Corrupt))
+        ));
+    }
+
+    #[test]
+    fn source_population_must_equal_collected_and_match_its_revision() {
+        let source = PgStatUserIndexesV1::encode(&[index_row()]).expect("encode source row");
+        let source_section = vec![(1_014_001, 1, source.clone())];
+        let snapshot = SnapshotCoverageV1 {
+            collected: 1,
+            ..snapshot_coverage(1_014_001, 1, 0, 10)
+        };
+        let collection = CollectionCoverageV1 {
+            collected: 1,
+            ..collection_coverage(1_014_001, 10, false, 0)
+        };
+        let bytes = coverage_pgm_with_sources(source_section, &[snapshot], &[collection]);
+        let summary = build_summary(&bytes).expect("matching source population");
+        assert_eq!(summary.population_at(5, COVERAGE_TS), Some(1));
+        assert_eq!(
+            summary
+                .collection_state_at(5, COVERAGE_TS)
+                .map(|(_, status)| status.collected()),
+            Some(1)
+        );
+
+        let mismatched = coverage_pgm_with_sources(
+            vec![(1_014_001, 1, source.clone())],
+            &[snapshot_coverage(1_014_001, 1, 0, 10)],
+            &[collection_coverage(1_014_001, 10, false, 0)],
+        );
+        assert!(matches!(
+            build_summary(&mismatched),
+            Err(BuildError::Source(SourceError::Corrupt))
+        ));
+
+        let wrong_revision = SnapshotCoverageV1 {
+            collected: 1,
+            ..snapshot_coverage(1_014_002, 1, 0, 10)
+        };
+        let bytes = coverage_pgm_with_sources(vec![(1_014_001, 1, source)], &[wrong_revision], &[]);
+        assert!(matches!(
+            build_summary(&bytes),
+            Err(BuildError::Source(SourceError::Corrupt))
+        ));
     }
 }
