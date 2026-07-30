@@ -80,6 +80,12 @@ closed_string_enum! {
         Cursor => "cursor",
         MinSeverity => "min_severity",
         Kind => "kind",
+        Span => "span",
+        Preset => "preset",
+        Database => "database",
+        Q => "q",
+        Sort => "sort",
+        Order => "order",
     }
 }
 
@@ -105,6 +111,12 @@ impl QueryParameter {
             b"cursor" => Some(Self::Cursor),
             b"min_severity" => Some(Self::MinSeverity),
             b"kind" => Some(Self::Kind),
+            b"span" => Some(Self::Span),
+            b"preset" => Some(Self::Preset),
+            b"database" => Some(Self::Database),
+            b"q" => Some(Self::Q),
+            b"sort" => Some(Self::Sort),
+            b"order" => Some(Self::Order),
             _ => None,
         }
     }
@@ -142,6 +154,10 @@ impl Serialize for InvalidParameterLocation {
 
 closed_string_enum! {
     /// Expected machine types for invalid query parameters.
+    #[allow(
+        dead_code,
+        reason = "frame-only expected values become runtime-used when the frame route is registered"
+    )]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum ExpectedValue {
         UrlEncodedQuery => "url_encoded_query",
@@ -154,6 +170,7 @@ closed_string_enum! {
         SectionList => "section_list",
         Severity => "severity",
         ProjectionCode => "projection_code",
+        SortOrder => "sort_order",
     }
 }
 

@@ -217,7 +217,10 @@ impl ProjectionCatalog {
     }
 
     /// Stable view list in ascending `view_code` order.
-    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "the frame request parser is wired into the HTTP router in a later task"
+    )]
     #[must_use]
     pub(crate) fn views(&self) -> &[ViewSpec] {
         &self.views
