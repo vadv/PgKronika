@@ -5,6 +5,8 @@
 
 pub(crate) mod cursor;
 pub(crate) mod dto;
+pub(crate) mod projection;
+mod query;
 
 use kronika_analytics::web_projection::{WebView, web_view_by_name};
 use sha2::{Digest, Sha256};

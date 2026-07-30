@@ -11,6 +11,8 @@ use crate::ui::catalog::ProjectionCatalog;
 use crate::ui::frame::FrameRequest;
 use crate::ui::frame::cursor::{FrameCursor, SortKey};
 use crate::ui::frame::dto::ClassificationResultDto;
+use crate::ui::frame::projection::{ProjectionInput, project_input};
+use kronika_reader::{OutRow, Value};
 
 fn catalog() -> ProjectionCatalog {
     ProjectionCatalog::for_type_ids(&BTreeSet::new())
@@ -309,4 +311,212 @@ fn classified_dto_preserves_every_level_and_comparison_spelling() {
             spelling
         );
     }
+}
+
+fn out_row(values: &[(&str, Value)]) -> OutRow {
+    values
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), value.clone()))
+        .collect()
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the golden keeps all nine projection fixtures adjacent for completeness review"
+)]
+fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
+    let fixtures = [
+        (
+            "activity",
+            "pg_stat_activity",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("pid", Value::I64(7)),
+                ("backend_start", Value::Ts(1)),
+                ("usename", Value::Str("alice".to_owned())),
+                ("datname", Value::Str("app".to_owned())),
+                ("application_name", Value::Str("psql".to_owned())),
+                ("state", Value::Str("active".to_owned())),
+                ("query", Value::Str("secret".to_owned())),
+                ("query_start", Value::Ts(10)),
+            ]),
+            6,
+        ),
+        (
+            "statements",
+            "pg_stat_statements",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("queryid", Value::I64(8)),
+                ("userid", Value::U64(2)),
+                ("dbid", Value::U64(3)),
+                ("toplevel", Value::Bool(true)),
+                ("query", Value::Str("secret".to_owned())),
+                ("calls", Value::U64(10)),
+                ("rows", Value::U64(20)),
+                ("total_exec_time", Value::F64(30.0)),
+            ]),
+            8,
+        ),
+        (
+            "plans",
+            "pg_store_plans_vadv",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("dbid", Value::U64(3)),
+                ("userid", Value::U64(2)),
+                ("planid", Value::I64(9)),
+                ("queryid", Value::I64(8)),
+                ("plan", Value::Str("secret".to_owned())),
+                ("calls", Value::U64(10)),
+                ("total_time", Value::F64(30.0)),
+                ("rows", Value::U64(20)),
+            ]),
+            5,
+        ),
+        (
+            "tables",
+            "pg_stat_user_tables",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("datid", Value::U64(3)),
+                ("relid", Value::U64(4)),
+                ("schemaname", Value::Str("public".to_owned())),
+                ("relname", Value::Str("orders".to_owned())),
+                ("seq_scan", Value::U64(10)),
+                ("idx_scan", Value::U64(20)),
+                ("n_live_tup", Value::I64(90)),
+                ("n_dead_tup", Value::I64(10)),
+            ]),
+            6,
+        ),
+        (
+            "indexes",
+            "pg_stat_user_indexes",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("datid", Value::U64(3)),
+                ("indexrelid", Value::U64(5)),
+                ("schemaname", Value::Str("public".to_owned())),
+                ("relname", Value::Str("orders".to_owned())),
+                ("indexrelname", Value::Str("orders_pkey".to_owned())),
+                ("idx_scan", Value::U64(10)),
+                ("idx_tup_read", Value::U64(20)),
+            ]),
+            4,
+        ),
+        (
+            "vacuum",
+            "pg_stat_progress_vacuum",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("pid", Value::I64(11)),
+                ("datid", Value::U64(3)),
+                ("relid", Value::U64(4)),
+                ("phase", Value::Str("scanning heap".to_owned())),
+                ("heap_blks_total", Value::U64(100)),
+                ("heap_blks_scanned", Value::U64(25)),
+                ("num_dead_tuples", Value::U64(5)),
+            ]),
+            5,
+        ),
+        (
+            "processes",
+            "os_process",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("pid", Value::I64(12)),
+                ("starttime", Value::Ts(1)),
+                ("comm", Value::Str("postgres".to_owned())),
+                ("rmem_kb", Value::U64(1_024)),
+                ("cmdline", Value::Str("secret".to_owned())),
+            ]),
+            4,
+        ),
+        (
+            "locks",
+            "pg_locks",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("pid", Value::I64(13)),
+                ("backend_start", Value::Ts(1)),
+                ("usename", Value::Str("alice".to_owned())),
+                ("application_name", Value::Str("psql".to_owned())),
+                ("lock_relname", Value::Str("orders".to_owned())),
+                ("query", Value::Str("secret".to_owned())),
+            ]),
+            5,
+        ),
+        (
+            "events",
+            "pg_log_errors",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("severity", Value::U64(3)),
+                ("category", Value::U64(2)),
+                ("sample", Value::Str("secret".to_owned())),
+            ]),
+            3,
+        ),
+    ];
+
+    for (view, section, row, expected_cells) in fixtures {
+        let request = FrameRequest::parse(view, Some("at=20"), &catalog()).expect("request");
+        let frame = project_input(
+            &request,
+            &catalog(),
+            ProjectionInput::single(20, section, row),
+        )
+        .unwrap_or_else(|error| panic!("{view}: {error:?}"));
+        assert_eq!(frame.rows.len(), 1, "{view}");
+        assert_eq!(frame.rows[0].cells.len(), expected_cells, "{view}");
+        assert!(
+            frame.rows[0]
+                .cells
+                .iter()
+                .all(|cell| cell != &crate::ui::frame::dto::FrameValue::String("secret".into())),
+            "{view} leaked a lazy field"
+        );
+    }
+}
+
+#[test]
+fn frame_pagination_filters_then_sorts_by_value_and_entity() {
+    let request = FrameRequest::parse(
+        "processes",
+        Some("at=20&preset=memory&q=post&sort=rss&order=desc&limit=1"),
+        &catalog(),
+    )
+    .expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(2)),
+            ("starttime", Value::Ts(1)),
+            ("comm", Value::Str("postgres".to_owned())),
+            ("rmem_kb", Value::U64(10)),
+        ]),
+    );
+    input.push(
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(1)),
+            ("starttime", Value::Ts(1)),
+            ("comm", Value::Str("postgres".to_owned())),
+            ("rmem_kb", Value::U64(20)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.matched, 2);
+    assert_eq!(frame.rows.len(), 1);
+    assert_eq!(
+        frame.rows[0].cells[0],
+        crate::ui::frame::dto::FrameValue::Number(1.0)
+    );
+    assert!(frame.next.is_some());
 }
