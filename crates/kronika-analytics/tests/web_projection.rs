@@ -43,6 +43,15 @@ fn registry_has_nine_unique_ordered_views_with_one_canonical_metric_each() {
 #[test]
 fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
     let statements = web_view_by_name("statements").expect("statements view");
+    assert_eq!(statements.revision, 2);
+    assert_eq!(
+        statements
+            .inputs
+            .iter()
+            .map(|input| input.code)
+            .collect::<Vec<_>>(),
+        vec!["statements", "settings"]
+    );
     assert_eq!(
         statements
             .metrics
@@ -63,8 +72,8 @@ fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
             (
                 1,
                 "time",
-                1,
-                1,
+                2,
+                6,
                 "sum",
                 "sum(positive_delta(total_exec_time))",
                 true,

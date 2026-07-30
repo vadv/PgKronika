@@ -7,6 +7,8 @@ use kronika_registry::registry;
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use super::thresholds::binding_for;
+
 /// Catalog schema revision.
 const CATALOG_REVISION: u16 = 1;
 
@@ -119,6 +121,12 @@ pub(crate) struct ColumnSpec {
     /// Formula when this is a derived projection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formula: Option<&'static str>,
+    /// Public unit code when the value has a stable numeric unit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<&'static str>,
+    /// Bound numeric threshold policy, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold_metric: Option<&'static str>,
     /// Whether frame omits the value and detail loads it.
     pub lazy: bool,
     /// Input groups required by this column.
@@ -317,12 +325,15 @@ fn raw_column(
     source: &'static str,
     lazy: bool,
     requires: &[&'static str],
+    unit: Option<&'static str>,
 ) -> ColumnSpec {
     ColumnSpec {
         code,
         value_type,
         source: Some(source),
         formula: None,
+        unit,
+        threshold_metric: None,
         lazy,
         requires: requires.to_vec(),
         availability: Availability::Gated,
@@ -334,12 +345,15 @@ fn derived_column(
     value_type: ValueType,
     formula: &'static str,
     requires: &[&'static str],
+    unit: Option<&'static str>,
 ) -> ColumnSpec {
     ColumnSpec {
         code,
         value_type,
         source: None,
         formula: Some(formula),
+        unit,
+        threshold_metric: None,
         lazy: false,
         requires: requires.to_vec(),
         availability: Availability::Gated,
@@ -350,12 +364,15 @@ const fn unavailable_column(
     code: &'static str,
     value_type: ValueType,
     source: &'static str,
+    unit: Option<&'static str>,
 ) -> ColumnSpec {
     ColumnSpec {
         code,
         value_type,
         source: Some(source),
         formula: None,
+        unit,
+        threshold_metric: None,
         lazy: false,
         requires: Vec::new(),
         availability: Availability::NotCollected,
@@ -382,7 +399,7 @@ fn view(
     projection: &'static WebView,
     scope: Scope,
     joins: Vec<JoinSpec>,
-    columns: Vec<ColumnSpec>,
+    mut columns: Vec<ColumnSpec>,
     presets: Vec<PresetSpec>,
 ) -> ViewSpec {
     let canonical_metric = projection
@@ -391,6 +408,10 @@ fn view(
         .find(|metric| metric.canonical)
         .expect("shared projection has one canonical metric")
         .name;
+    for column in &mut columns {
+        column.threshold_metric =
+            binding_for(projection.name, column.code).map(|binding| binding.metric_id.as_str());
+    }
     ViewSpec {
         view_code: projection.code,
         code: projection.name,
@@ -421,13 +442,21 @@ fn activity_view() -> ViewSpec {
         provenance: "pid_and_process_start_match",
     }];
     let columns = vec![
-        raw_column("pid", ValueType::I64, "activity.pid", false, &["activity"]),
+        raw_column(
+            "pid",
+            ValueType::I64,
+            "activity.pid",
+            false,
+            &["activity"],
+            None,
+        ),
         raw_column(
             "user",
             ValueType::Text,
             "activity.usename",
             false,
             &["activity"],
+            None,
         ),
         raw_column(
             "database",
@@ -435,6 +464,7 @@ fn activity_view() -> ViewSpec {
             "activity.datname",
             false,
             &["activity"],
+            None,
         ),
         raw_column(
             "application",
@@ -442,6 +472,7 @@ fn activity_view() -> ViewSpec {
             "activity.application_name",
             false,
             &["activity"],
+            None,
         ),
         raw_column(
             "state",
@@ -449,12 +480,14 @@ fn activity_view() -> ViewSpec {
             "activity.state",
             false,
             &["activity"],
+            None,
         ),
         derived_column(
             "wait_event",
             ValueType::Text,
             "join_non_null(wait_event_type, ':', wait_event)",
             &["activity"],
+            None,
         ),
         raw_column(
             "query",
@@ -462,24 +495,28 @@ fn activity_view() -> ViewSpec {
             "activity.query",
             true,
             &["activity"],
+            None,
         ),
         derived_column(
             "query_duration_us",
             ValueType::F64,
             "snapshot_ts - query_start",
             &["activity"],
+            Some("us"),
         ),
         derived_column(
             "transaction_duration_us",
             ValueType::F64,
             "snapshot_ts - xact_start",
             &["activity"],
+            Some("us"),
         ),
         derived_column(
             "cpu",
             ValueType::F64,
             "positive_delta(utime + stime) / elapsed",
             &["activity", "process"],
+            None,
         ),
     ];
     let presets = vec![
@@ -545,6 +582,7 @@ fn statements_view() -> ViewSpec {
             "statements.queryid",
             false,
             &["statements"],
+            None,
         ),
         raw_column(
             "query",
@@ -552,60 +590,100 @@ fn statements_view() -> ViewSpec {
             "statements.query",
             true,
             &["statements"],
+            None,
         ),
         derived_column(
             "calls",
             ValueType::F64,
             "positive_delta(calls)",
             &["statements"],
+            None,
         ),
         derived_column(
             "total",
             ValueType::F64,
             "positive_delta(total_exec_time)",
             &["statements"],
+            None,
+        ),
+        derived_column(
+            "ms_per_row",
+            ValueType::F64,
+            "positive_delta(total_exec_time) / positive_delta(rows)",
+            &["statements"],
+            Some("ms"),
         ),
         derived_column(
             "mean",
             ValueType::F64,
-            "positive_delta(total_exec_time) / max(positive_delta(calls), 1)",
+            "positive_delta(total_exec_time) / positive_delta(calls)",
             &["statements"],
+            Some("ms"),
+        ),
+        derived_column(
+            "time_pct",
+            ValueType::F64,
+            "100 * positive_delta(total_exec_time) / sum_after_database_filter(positive_delta(total_exec_time))",
+            &["statements"],
+            Some("percent"),
+        ),
+        derived_column(
+            "plan_time_pct",
+            ValueType::F64,
+            "100 * positive_delta(total_plan_time) / (positive_delta(total_plan_time) + positive_delta(total_exec_time)) when pg_stat_statements.track_planning = 'on'",
+            &["statements", "settings"],
+            Some("percent"),
         ),
         derived_column(
             "rows",
             ValueType::F64,
             "positive_delta(rows)",
             &["statements"],
+            None,
         ),
         derived_column(
             "hit_pct",
             ValueType::F64,
             "100 * positive_delta(shared_blks_hit) / max(positive_delta(shared_blks_hit + shared_blks_read), 1)",
             &["statements"],
+            None,
         ),
         derived_column(
             "blks_read",
             ValueType::F64,
             "positive_delta(shared_blks_read + local_blks_read)",
             &["statements"],
+            None,
         ),
         derived_column(
             "temp_written",
             ValueType::F64,
             "positive_delta(temp_blks_written)",
             &["statements"],
+            None,
         ),
         derived_column(
             "wal_bytes",
             ValueType::F64,
             "positive_delta(wal_bytes)",
             &["statements"],
+            None,
         ),
     ];
     let presets = vec![
         preset(
             "time",
-            &["queryid", "query", "calls", "total", "mean", "rows"],
+            &[
+                "queryid",
+                "query",
+                "calls",
+                "total",
+                "mean",
+                "ms_per_row",
+                "time_pct",
+                "plan_time_pct",
+                "rows",
+            ],
             "total",
             "desc",
         ),
@@ -637,22 +715,50 @@ fn plans_view() -> ViewSpec {
         Scope::Database,
         Vec::new(),
         vec![
-            raw_column("planid", ValueType::I64, "plans.planid", false, &["plans"]),
-            raw_column("plan", ValueType::Text, "plans.plan", true, &["plans"]),
+            raw_column(
+                "planid",
+                ValueType::I64,
+                "plans.planid",
+                false,
+                &["plans"],
+                None,
+            ),
+            raw_column(
+                "plan",
+                ValueType::Text,
+                "plans.plan",
+                true,
+                &["plans"],
+                None,
+            ),
             derived_column(
                 "queryid",
                 ValueType::I64,
                 "coalesce(queryid, queryid_stat_statements)",
                 &["plans"],
+                None,
             ),
-            derived_column("calls", ValueType::F64, "positive_delta(calls)", &["plans"]),
+            derived_column(
+                "calls",
+                ValueType::F64,
+                "positive_delta(calls)",
+                &["plans"],
+                None,
+            ),
             derived_column(
                 "mean",
                 ValueType::F64,
                 "positive_delta(total_time) / max(positive_delta(calls), 1)",
                 &["plans"],
+                None,
             ),
-            derived_column("rows", ValueType::F64, "positive_delta(rows)", &["plans"]),
+            derived_column(
+                "rows",
+                ValueType::F64,
+                "positive_delta(rows)",
+                &["plans"],
+                None,
+            ),
         ],
         vec![
             preset(
@@ -683,6 +789,10 @@ fn plans_view() -> ViewSpec {
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the view is a declarative projection registry kept together for review"
+)]
 fn tables_view() -> ViewSpec {
     view(
         projection("tables"),
@@ -694,6 +804,7 @@ fn tables_view() -> ViewSpec {
                 ValueType::Text,
                 "qualify(schemaname, relname)",
                 &["tables"],
+                None,
             ),
             raw_column(
                 "seq_scan",
@@ -701,6 +812,7 @@ fn tables_view() -> ViewSpec {
                 "tables.seq_scan",
                 false,
                 &["tables"],
+                None,
             ),
             raw_column(
                 "idx_scan",
@@ -708,12 +820,45 @@ fn tables_view() -> ViewSpec {
                 "tables.idx_scan",
                 false,
                 &["tables"],
+                None,
             ),
             derived_column(
                 "dead_pct",
                 ValueType::F64,
                 "100 * n_dead_tup / max(n_live_tup + n_dead_tup, 1)",
                 &["tables"],
+                Some("percent"),
+            ),
+            raw_column(
+                "dead_tuples",
+                ValueType::I64,
+                "tables.n_dead_tup",
+                false,
+                &["tables"],
+                Some("count"),
+            ),
+            derived_column(
+                "seq_scan_pct",
+                ValueType::F64,
+                "100 * positive_delta(seq_scan) / (positive_delta(seq_scan) + positive_delta(idx_scan))",
+                &["tables"],
+                Some("percent"),
+            ),
+            raw_column(
+                "modified_since_analyze",
+                ValueType::I64,
+                "tables.n_mod_since_analyze",
+                false,
+                &["tables"],
+                Some("count"),
+            ),
+            raw_column(
+                "inserted_since_vacuum",
+                ValueType::I64,
+                "tables.n_ins_since_vacuum",
+                false,
+                &["tables"],
+                Some("count"),
             ),
             raw_column(
                 "last_autovacuum",
@@ -721,26 +866,67 @@ fn tables_view() -> ViewSpec {
                 "tables.last_autovacuum",
                 false,
                 &["tables"],
+                None,
+            ),
+            derived_column(
+                "autovacuum_age_seconds",
+                ValueType::F64,
+                "(snapshot_ts - last_autovacuum) / 1000000",
+                &["tables"],
+                Some("seconds"),
+            ),
+            derived_column(
+                "autoanalyze_age_seconds",
+                ValueType::F64,
+                "(snapshot_ts - last_autoanalyze) / 1000000",
+                &["tables"],
+                Some("seconds"),
             ),
         ],
         vec![
             preset(
                 "activity",
-                &["relation", "seq_scan", "idx_scan", "dead_pct"],
+                &[
+                    "relation",
+                    "seq_scan",
+                    "idx_scan",
+                    "seq_scan_pct",
+                    "dead_pct",
+                    "dead_tuples",
+                ],
                 "dead_pct",
                 "desc",
             ),
-            preset("writes", &["relation", "dead_pct"], "dead_pct", "desc"),
+            preset(
+                "writes",
+                &[
+                    "relation",
+                    "modified_since_analyze",
+                    "inserted_since_vacuum",
+                    "dead_pct",
+                ],
+                "inserted_since_vacuum",
+                "desc",
+            ),
             preset(
                 "maintenance",
-                &["relation", "dead_pct", "last_autovacuum"],
-                "dead_pct",
+                &[
+                    "relation",
+                    "dead_pct",
+                    "dead_tuples",
+                    "modified_since_analyze",
+                    "inserted_since_vacuum",
+                    "last_autovacuum",
+                    "autovacuum_age_seconds",
+                    "autoanalyze_age_seconds",
+                ],
+                "autovacuum_age_seconds",
                 "desc",
             ),
             preset(
                 "io",
-                &["relation", "seq_scan", "idx_scan"],
-                "seq_scan",
+                &["relation", "seq_scan", "idx_scan", "seq_scan_pct"],
+                "seq_scan_pct",
                 "desc",
             ),
         ],
@@ -759,6 +945,7 @@ fn indexes_view() -> ViewSpec {
                 "indexes.indexrelname",
                 false,
                 &["indexes"],
+                None,
             ),
             raw_column(
                 "table",
@@ -766,18 +953,21 @@ fn indexes_view() -> ViewSpec {
                 "indexes.relname",
                 false,
                 &["indexes"],
+                None,
             ),
             derived_column(
                 "scans",
                 ValueType::F64,
                 "positive_delta(idx_scan)",
                 &["indexes"],
+                None,
             ),
             derived_column(
                 "rows_per_scan",
                 ValueType::F64,
                 "positive_delta(idx_tup_read) / max(positive_delta(idx_scan), 1)",
                 &["indexes"],
+                None,
             ),
         ],
         vec![
@@ -799,27 +989,51 @@ fn vacuum_view() -> ViewSpec {
         Scope::Database,
         Vec::new(),
         vec![
-            raw_column("pid", ValueType::I64, "vacuum.pid", false, &["vacuum"]),
-            raw_column("table", ValueType::U64, "vacuum.relid", false, &["vacuum"]),
-            raw_column("phase", ValueType::Text, "vacuum.phase", false, &["vacuum"]),
+            raw_column(
+                "pid",
+                ValueType::I64,
+                "vacuum.pid",
+                false,
+                &["vacuum"],
+                None,
+            ),
+            raw_column(
+                "table",
+                ValueType::U64,
+                "vacuum.relid",
+                false,
+                &["vacuum"],
+                None,
+            ),
+            raw_column(
+                "phase",
+                ValueType::Text,
+                "vacuum.phase",
+                false,
+                &["vacuum"],
+                None,
+            ),
             raw_column(
                 "is_autovacuum",
                 ValueType::Bool,
                 "vacuum.is_autovacuum",
                 false,
                 &["vacuum"],
+                None,
             ),
             derived_column(
                 "progress",
                 ValueType::F64,
                 "heap_blks_scanned / max(heap_blks_total, 1)",
                 &["vacuum"],
+                None,
             ),
             derived_column(
                 "dead_tuples",
                 ValueType::F64,
                 "coalesce(num_dead_tuples, num_dead_item_ids)",
                 &["vacuum"],
+                None,
             ),
         ],
         vec![
@@ -847,13 +1061,28 @@ fn vacuum_view() -> ViewSpec {
 
 fn processes_view() -> ViewSpec {
     let mut columns = vec![
-        raw_column("pid", ValueType::I64, "process.pid", false, &["process"]),
-        raw_column("type", ValueType::Text, "process.comm", false, &["process"]),
+        raw_column(
+            "pid",
+            ValueType::I64,
+            "process.pid",
+            false,
+            &["process"],
+            None,
+        ),
+        raw_column(
+            "type",
+            ValueType::Text,
+            "process.comm",
+            false,
+            &["process"],
+            None,
+        ),
         derived_column(
             "cpu",
             ValueType::F64,
             "positive_delta(utime + stime) / elapsed",
             &["process"],
+            None,
         ),
         raw_column(
             "rss",
@@ -861,25 +1090,29 @@ fn processes_view() -> ViewSpec {
             "process.rmem_kb",
             false,
             &["process"],
+            Some("kib"),
         ),
-        unavailable_column("pss", ValueType::I64, "smaps_rollup.pss_kb"),
+        unavailable_column("pss", ValueType::I64, "smaps_rollup.pss_kb", None),
         derived_column(
             "read_bytes_per_second",
             ValueType::F64,
             "positive_delta(read_bytes) / elapsed",
             &["process"],
+            None,
         ),
         derived_column(
             "write_bytes_per_second",
             ValueType::F64,
             "positive_delta(write_bytes) / elapsed",
             &["process"],
+            None,
         ),
         derived_column(
             "block_delay",
             ValueType::F64,
             "positive_delta(blkdelay_ticks) / elapsed",
             &["process"],
+            None,
         ),
         raw_column(
             "command",
@@ -887,6 +1120,7 @@ fn processes_view() -> ViewSpec {
             "process.cmdline",
             true,
             &["process"],
+            None,
         ),
     ];
     columns.shrink_to_fit();
@@ -931,18 +1165,20 @@ fn locks_view() -> ViewSpec {
         Scope::Database,
         Vec::new(),
         vec![
-            raw_column("pid", ValueType::I64, "locks.pid", false, &["locks"]),
+            raw_column("pid", ValueType::I64, "locks.pid", false, &["locks"], None),
             derived_column(
                 "user_application",
                 ValueType::Text,
                 "join_non_null(usename, ' / ', application_name)",
                 &["locks"],
+                None,
             ),
             derived_column(
                 "lock",
                 ValueType::Text,
                 "join_non_null(wait_event_type, ':', wait_event)",
                 &["locks"],
+                None,
             ),
             raw_column(
                 "target",
@@ -950,14 +1186,23 @@ fn locks_view() -> ViewSpec {
                 "locks.lock_relname",
                 false,
                 &["locks"],
+                None,
             ),
             derived_column(
                 "wait_or_hold_us",
                 ValueType::F64,
                 "proven_wait_or_hold_duration_us",
                 &["locks"],
+                None,
             ),
-            raw_column("query", ValueType::Text, "locks.query", true, &["locks"]),
+            raw_column(
+                "query",
+                ValueType::Text,
+                "locks.query",
+                true,
+                &["locks"],
+                None,
+            ),
         ],
         vec![
             preset(
@@ -1008,6 +1253,7 @@ fn events_view() -> ViewSpec {
                 "events.ts",
                 false,
                 &["events"],
+                None,
             ),
             raw_column(
                 "severity",
@@ -1015,6 +1261,7 @@ fn events_view() -> ViewSpec {
                 "events.severity",
                 false,
                 &["events"],
+                None,
             ),
             raw_column(
                 "type",
@@ -1022,6 +1269,7 @@ fn events_view() -> ViewSpec {
                 "events.category",
                 false,
                 &["events"],
+                None,
             ),
             raw_column(
                 "duration",
@@ -1029,6 +1277,7 @@ fn events_view() -> ViewSpec {
                 "events.duration_us",
                 false,
                 &["events"],
+                None,
             ),
             raw_column(
                 "message",
@@ -1036,6 +1285,7 @@ fn events_view() -> ViewSpec {
                 "events.message",
                 true,
                 &["events"],
+                None,
             ),
         ],
         vec![

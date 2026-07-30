@@ -3,10 +3,12 @@ use std::collections::BTreeSet;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
+use kronika_analytics::MetricId;
 use kronika_registry::registry;
 use tower::ServiceExt;
 
 use crate::ui::catalog::{Availability, ProjectionCatalog};
+use crate::ui::thresholds::{BindingDisposition, threshold_projections};
 use crate::{app, tests::test_metrics_handle};
 
 use super::{assert_api_error, serve, serve_captured, state_for_dir, write_bgwriter_segment};
@@ -61,6 +63,160 @@ fn every_preset_returns_its_sort_column() {
 }
 
 #[test]
+fn threshold_manifest_is_exhaustive_unique_and_bound_to_catalog_columns() {
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let manifest = threshold_projections();
+
+    assert_eq!(manifest.len(), MetricId::ALL.len());
+    assert_eq!(
+        manifest
+            .iter()
+            .map(|entry| entry.metric_id)
+            .collect::<Vec<_>>(),
+        MetricId::ALL
+    );
+    assert_eq!(
+        manifest
+            .iter()
+            .filter(|entry| matches!(entry.disposition, BindingDisposition::Bound { .. }))
+            .count(),
+        14
+    );
+    assert_eq!(
+        manifest
+            .iter()
+            .filter(|entry| matches!(entry.disposition, BindingDisposition::Deferred(_)))
+            .count(),
+        55
+    );
+
+    let mut bound_columns = BTreeSet::new();
+    for entry in manifest {
+        let BindingDisposition::Bound { view, column, .. } = entry.disposition else {
+            continue;
+        };
+        assert!(
+            bound_columns.insert((view, column)),
+            "duplicate threshold binding for {view}.{column}"
+        );
+        let view_spec = catalog
+            .views()
+            .iter()
+            .find(|candidate| candidate.code == view)
+            .unwrap_or_else(|| panic!("{} binds unknown view {view}", entry.metric_id.as_str()));
+        assert!(
+            view_spec
+                .columns
+                .iter()
+                .any(|candidate| candidate.code == column),
+            "{} binds unknown column {view}.{column}",
+            entry.metric_id.as_str()
+        );
+    }
+}
+
+#[test]
+fn threshold_catalog_metadata_exposes_only_the_fourteen_bound_columns() {
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let actual = catalog
+        .views()
+        .iter()
+        .flat_map(|view| {
+            view.columns.iter().filter_map(move |column| {
+                column
+                    .threshold_metric
+                    .map(|metric| (view.code, column.code, metric, column.unit))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual,
+        vec![
+            (
+                "activity",
+                "query_duration_us",
+                "pg.activity.query_duration_seconds",
+                Some("us"),
+            ),
+            (
+                "activity",
+                "transaction_duration_us",
+                "pg.activity.transaction_duration_seconds",
+                Some("us"),
+            ),
+            (
+                "statements",
+                "ms_per_row",
+                "pg.statements.milliseconds_per_row",
+                Some("ms"),
+            ),
+            (
+                "statements",
+                "mean",
+                "pg.statements.mean_time_ms",
+                Some("ms"),
+            ),
+            (
+                "statements",
+                "time_pct",
+                "pg.statements.time_pct",
+                Some("percent"),
+            ),
+            (
+                "statements",
+                "plan_time_pct",
+                "pg.statements.plan_time_pct",
+                Some("percent"),
+            ),
+            (
+                "tables",
+                "dead_pct",
+                "pg.tables.dead_tuple_pct",
+                Some("percent"),
+            ),
+            (
+                "tables",
+                "dead_tuples",
+                "pg.tables.dead_tuples",
+                Some("count"),
+            ),
+            (
+                "tables",
+                "seq_scan_pct",
+                "pg.tables.sequential_scan_pct",
+                Some("percent"),
+            ),
+            (
+                "tables",
+                "modified_since_analyze",
+                "pg.tables.modified_since_analyze",
+                Some("count"),
+            ),
+            (
+                "tables",
+                "inserted_since_vacuum",
+                "pg.tables.inserted_since_vacuum",
+                Some("count"),
+            ),
+            (
+                "tables",
+                "autovacuum_age_seconds",
+                "pg.tables.autovacuum_age_seconds",
+                Some("seconds"),
+            ),
+            (
+                "tables",
+                "autoanalyze_age_seconds",
+                "pg.tables.autoanalyze_age_seconds",
+                Some("seconds"),
+            ),
+            ("processes", "rss", "os.process.rss_kib", Some("kib"),),
+        ]
+    );
+}
+
+#[test]
 fn statements_metrics_publish_explicit_formulas_and_units() {
     let observed = BTreeSet::from([first_type_id("pg_stat_statements")]);
     let catalog = ProjectionCatalog::for_type_ids(&observed);
@@ -86,7 +242,7 @@ fn statements_metrics_publish_explicit_formulas_and_units() {
             (
                 "time",
                 "sum(positive_delta(total_exec_time))",
-                "us",
+                "ms",
                 Availability::Available,
             ),
             (

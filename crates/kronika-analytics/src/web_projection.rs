@@ -28,6 +28,8 @@ impl WebAggregation {
 pub enum WebUnit {
     /// Microseconds.
     Microseconds,
+    /// Milliseconds.
+    Milliseconds,
     /// Dimensionless count.
     Count,
     /// `PostgreSQL` blocks.
@@ -44,6 +46,7 @@ impl WebUnit {
     pub const fn code(self) -> u16 {
         match self {
             Self::Microseconds => 1,
+            Self::Milliseconds => 6,
             Self::Count => 2,
             Self::Blocks => 3,
             Self::Ratio => 4,
@@ -56,6 +59,7 @@ impl WebUnit {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Microseconds => "us",
+            Self::Milliseconds => "ms",
             Self::Count => "count",
             Self::Blocks => "blocks",
             Self::Ratio => "ratio",
@@ -187,10 +191,16 @@ const ACTIVITY_INPUTS: &[WebInput] = &[
         sections: &["os_process"],
     },
 ];
-const STATEMENTS_INPUTS: &[WebInput] = &[WebInput {
-    code: "statements",
-    sections: &["pg_stat_statements"],
-}];
+const STATEMENTS_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "statements",
+        sections: &["pg_stat_statements"],
+    },
+    WebInput {
+        code: "settings",
+        sections: &["pg_settings"],
+    },
+];
 const PLANS_INPUTS: &[WebInput] = &[WebInput {
     code: "plans",
     sections: &["pg_store_plans_ossc", "pg_store_plans_vadv"],
@@ -287,8 +297,8 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 1,
         name: "time",
-        revision: 1,
-        unit: WebUnit::Microseconds,
+        revision: 2,
+        unit: WebUnit::Milliseconds,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
             field_sets: &[&["total_exec_time"], &["total_time"]],
@@ -536,7 +546,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 2,
         name: "statements",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         inputs: STATEMENTS_INPUTS,
         metrics: STATEMENT_METRICS,
