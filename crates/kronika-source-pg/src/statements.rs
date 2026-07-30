@@ -8,7 +8,7 @@
 //! the extension can be pinned independently of the server.
 //!
 //! Candidate selection keeps top-N statements by `total_exec_time` and by
-//! `calls`. A source ordinal identifies each materialized row, including
+//! `calls`. `WITH ORDINALITY` identifies each materialized row, including
 //! otherwise indistinguishable rows whose `queryid` is masked.
 //!
 //! `queryid` is nullable when `compute_query_id` is off or PostgreSQL masks it.
@@ -203,28 +203,33 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              s.parallel_workers_launched, s.stats_since, s.minmax_stats_since"
         }
     };
-    let selection = format!(
+    let tie_breakers = match version {
+        StatementsVersion::V1 | StatementsVersion::V2 => {
+            "userid, dbid, queryid ASC NULLS LAST, source_ordinal"
+        }
+        StatementsVersion::V3
+        | StatementsVersion::V4
+        | StatementsVersion::V5
+        | StatementsVersion::V6 => {
+            "userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal"
+        }
+    };
+    let candidates = format!(
         "WITH source AS {materialized}( \
-           SELECT row_number() OVER (ORDER BY {source_columns}) AS source_ordinal, \
-                  {source_columns}, count(*) OVER ()::int8 AS source_total \
-           FROM pg_stat_statements(false) s \
-         ), ranked AS ( \
-           SELECT source_ordinal, \
-                  row_number() OVER ( \
-                    ORDER BY {time_axis} DESC NULLS LAST, calls DESC NULLS LAST, source_ordinal \
-                  ) AS time_rank, \
-                  row_number() OVER ( \
-                    ORDER BY calls DESC NULLS LAST, {time_axis} DESC NULLS LAST, source_ordinal \
-                  ) AS calls_rank \
-           FROM source \
-         ), selected AS ( \
-           SELECT source_ordinal, time_rank, calls_rank \
-           FROM ranked \
-           WHERE time_rank <= GREATEST($1, 0::int8) \
-              OR calls_rank <= GREATEST($1, 0::int8) \
+           SELECT s.ordinality AS source_ordinal, {source_columns}, \
+                  count(*) OVER ()::int8 AS source_total \
+           FROM pg_stat_statements(false) WITH ORDINALITY AS s \
+         ), candidates AS ( \
+           (SELECT source_ordinal FROM source \
+            ORDER BY {time_axis} DESC NULLS LAST, calls DESC NULLS LAST, {tie_breakers} \
+            LIMIT GREATEST($1, 0::int8)) \
+           UNION \
+           (SELECT source_ordinal FROM source \
+            ORDER BY calls DESC NULLS LAST, {time_axis} DESC NULLS LAST, {tie_breakers} \
+            LIMIT GREATEST($1, 0::int8)) \
          ) "
     );
-    let join = "s JOIN selected c ON c.source_ordinal = s.source_ordinal \
+    let join = "s JOIN candidates c ON c.source_ordinal = s.source_ordinal \
          LEFT JOIN pg_database d ON d.oid = s.dbid \
          LEFT JOIN pg_roles r ON r.oid = s.userid";
     // `source_total` rides in the same statement as the candidate read, so
@@ -233,11 +238,10 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
               s.source_total";
     let ident = "s.queryid, s.userid, s.dbid, d.datname::text AS datname, \
                  r.rolname::text AS usename, NULL::text AS query";
-    let order =
-        " ORDER BY LEAST(c.time_rank, c.calls_rank), c.time_rank, c.calls_rank, c.source_ordinal";
+    let order = " ORDER BY c.source_ordinal";
     let body = match version {
         StatementsVersion::V1 => format!(
-            "{selection}SELECT {ident}, \
+            "{candidates}SELECT {ident}, \
                s.calls, s.rows, \
                s.total_time, s.min_time, s.max_time, s.mean_time, s.stddev_time, \
                s.shared_blks_hit, s.shared_blks_read, s.shared_blks_dirtied, s.shared_blks_written, \
@@ -248,7 +252,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              FROM source {join}{order}"
         ),
         StatementsVersion::V2 => format!(
-            "{selection}SELECT {ident}, \
+            "{candidates}SELECT {ident}, \
                s.calls, s.rows, s.plans, \
                s.total_exec_time, s.total_plan_time, \
                s.min_exec_time, s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
@@ -262,7 +266,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              FROM source {join}{order}"
         ),
         StatementsVersion::V3 => format!(
-            "{selection}SELECT {ident}, s.toplevel, \
+            "{candidates}SELECT {ident}, s.toplevel, \
                s.calls, s.rows, s.plans, \
                s.total_exec_time, s.total_plan_time, \
                s.min_exec_time, s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
@@ -276,7 +280,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              FROM source {join}{order}"
         ),
         StatementsVersion::V4 => format!(
-            "{selection}SELECT {ident}, s.toplevel, \
+            "{candidates}SELECT {ident}, s.toplevel, \
                s.calls, s.rows, s.plans, \
                s.total_exec_time, s.total_plan_time, \
                s.min_exec_time, s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
@@ -293,7 +297,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              FROM source {join}{order}"
         ),
         StatementsVersion::V5 => format!(
-            "{selection}SELECT {ident}, s.toplevel, \
+            "{candidates}SELECT {ident}, s.toplevel, \
                s.calls, s.rows, s.plans, \
                s.total_exec_time, s.total_plan_time, \
                s.min_exec_time, s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
@@ -315,7 +319,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              FROM source {join}{order}"
         ),
         StatementsVersion::V6 => format!(
-            "{selection}SELECT {ident}, s.toplevel, \
+            "{candidates}SELECT {ident}, s.toplevel, \
                s.calls, s.rows, s.plans, \
                s.total_exec_time, s.total_plan_time, \
                s.min_exec_time, s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
@@ -1092,11 +1096,19 @@ mod tests {
             assert!(q.contains("source AS MATERIALIZED"), "{q}");
             assert!(q.contains("count(*) OVER ()::int8 AS source_total"), "{q}");
             assert_eq!(
-                q.match_indices("FROM pg_stat_statements(false)").count(),
+                q.match_indices("FROM pg_stat_statements(false) WITH ORDINALITY")
+                    .count(),
                 1,
                 "the PostgreSQL source must be read once: {q}"
             );
+            assert_eq!(
+                q.match_indices("LIMIT GREATEST($1, 0::int8)").count(),
+                2,
+                "each candidate axis must have the configured bound: {q}"
+            );
             assert!(!q.contains("FROM pg_stat_statements s"), "{q}");
+            assert!(!q.contains("FROM pg_stat_statements "), "{q}");
+            assert!(!q.contains("pg_stat_statements(true)"), "{q}");
             assert!(!q.contains("s.query,"), "{q}");
             assert!(!q.contains("LEFT(s.query"), "{q}");
             assert!(!q.contains("s.*"), "{q}");
@@ -1104,14 +1116,44 @@ mod tests {
                 !q.contains("(SELECT count(*) FROM pg_stat_statements)"),
                 "{q}"
             );
-            assert!(q.contains("row_number() OVER (ORDER BY s.userid, s.dbid, s.queryid"));
-            assert!(q.contains("JOIN selected c ON c.source_ordinal = s.source_ordinal"));
+            assert!(q.contains("s.ordinality AS source_ordinal"), "{q}");
+            assert!(q.contains("candidates AS"), "{q}");
+            assert!(q.contains("UNION"), "{q}");
+            assert!(
+                q.contains("JOIN candidates c ON c.source_ordinal = s.source_ordinal"),
+                "{q}"
+            );
             assert!(!q.contains("IS NOT DISTINCT FROM"), "{q}");
-            assert!(q.contains("time_rank <= GREATEST($1, 0::int8)"));
-            assert!(q.contains("calls_rank <= GREATEST($1, 0::int8)"));
-            assert!(q.contains("ORDER BY LEAST(c.time_rank, c.calls_rank)"));
+            assert!(!q.contains("row_number()"), "{q}");
+            assert!(!q.contains("time_rank"), "{q}");
+            assert!(!q.contains("calls_rank"), "{q}");
+            assert!(q.contains("ORDER BY c.source_ordinal"), "{q}");
             // No threshold verdict, no GUC-based branch in the SQL.
             assert!(!q.contains("current_setting"));
+        }
+
+        for v in [StatementsVersion::V1, StatementsVersion::V2] {
+            let q = statements_query(v, 18);
+            assert!(
+                q.contains("userid, dbid, queryid ASC NULLS LAST, source_ordinal"),
+                "{q}"
+            );
+            assert!(!q.contains("queryid ASC NULLS LAST, toplevel"), "{q}");
+        }
+
+        for v in [
+            StatementsVersion::V3,
+            StatementsVersion::V4,
+            StatementsVersion::V5,
+            StatementsVersion::V6,
+        ] {
+            let q = statements_query(v, 18);
+            assert!(
+                q.contains(
+                    "userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal"
+                ),
+                "{q}"
+            );
         }
     }
 

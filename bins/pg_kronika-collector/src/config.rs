@@ -271,6 +271,7 @@ impl Config {
         let intervals = intervals_from_env()?;
         let log = log_config_from_env(&out_dir)?;
         validate_cardinality(max_tables, max_indexes)?;
+        validate_max_statements(max_statements)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
         validate_max_plans(max_plans)?;
@@ -599,6 +600,22 @@ pub(crate) fn validate_max_plans(max_plans: i64) -> Result<()> {
     anyhow::ensure!(
         max_plans > 0 && max_plans <= cap,
         "KRONIKA_PG_MAX_PLANS must be in 1..={cap}, got {max_plans}"
+    );
+    Ok(())
+}
+
+/// Reject a statements per-axis top-N that can overflow a single section.
+///
+/// The two candidate axes can be disjoint, so the encoded section may contain
+/// up to `2 * max_statements` rows.
+///
+/// # Errors
+/// Returns an error naming the env and its per-axis bound when out of range.
+pub(crate) fn validate_max_statements(max_statements: i64) -> Result<()> {
+    let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")? / 2;
+    anyhow::ensure!(
+        max_statements > 0 && max_statements <= cap,
+        "KRONIKA_PG_MAX_STATEMENTS must be in 1..={cap}, got {max_statements}"
     );
     Ok(())
 }
