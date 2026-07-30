@@ -34,9 +34,9 @@ registry type IDs, HTTP routes и UI columns.
 PR заканчивается проверяемым API vertical slice, а не декоративной клиентской
 подсветкой.
 
-Текущий runtime обслуживает один storage root и не имеет публичной source
-identity. Новый endpoint не принимает устаревший параметр `source` из ранней
-версии web UI design.
+Текущий runtime обслуживает один storage root и не поддерживает выбор другого
+root в HTTP API. Новый endpoint не принимает устаревший параметр `source` из
+ранней версии web UI design.
 
 ## Цели
 

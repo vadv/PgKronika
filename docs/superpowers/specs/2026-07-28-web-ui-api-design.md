@@ -20,7 +20,7 @@ OVF, reader, writer и API реализуются как один текущий
 Класса 1 уточнён в
 `2026-07-30-threshold-frame-integration-design.md`. Он не возвращает
 устаревший параметр `source`, потому что runtime обслуживает один storage root
-и публичная source identity удалена.
+и не поддерживает выбор другого root в HTTP API.
 
 ## Задача
 
