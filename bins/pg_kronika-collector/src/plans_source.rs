@@ -776,8 +776,9 @@ async fn collect_plans_for_fork(
 /// Collect ossc rows and apply the byte budget to their inline plan texts.
 ///
 /// A zero budget switches to the numeric-only query, so no plan text crosses
-/// the network at all. With a budget, the server truncates per row by
-/// characters and each text is byte-capped in Rust to
+/// the network at all; the upstream SRF still materializes plan data in the
+/// server backend. With a budget, the server truncates per row by characters
+/// and each text is byte-capped in Rust to
 /// `min(max_plan_text, remaining budget)` before accounting; tail rows past
 /// the budget seal a NULL plan. Rows whose identity the upstream masked for
 /// lack of `pg_read_all_stats` are dropped and reported.

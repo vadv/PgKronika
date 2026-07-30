@@ -1505,11 +1505,13 @@ const fn block_build_error(error: BlockError) -> BuildError {
 #[cfg(test)]
 mod tests {
     use kronika_analytics::web_projection::{WebAggregation, web_view_by_name};
-    use kronika_format::{PartMeta, SectionInput, build_part};
+    use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::collection_coverage::CollectionCoverageV1;
+    use kronika_registry::pg_stat_statements::PgStatStatementsV2;
     use kronika_registry::pg_stat_user_indexes::PgStatUserIndexesV1;
     use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
     use kronika_registry::{Cell, Row, Section, StrId, Ts, registry};
+    use kronika_writer::{Interner, dict};
 
     use super::{build_web_index, candidate, encode_candidate};
     use crate::PgmUnit;
@@ -1627,6 +1629,90 @@ mod tests {
         }
     }
 
+    fn statement_row(ts: i64, calls: i64, query: Option<StrId>) -> PgStatStatementsV2 {
+        let calls_f64 = f64::from(i32::try_from(calls).expect("small fixture count"));
+        PgStatStatementsV2 {
+            ts: Ts(ts),
+            queryid: Some(7),
+            userid: 10,
+            dbid: 20,
+            datname: None,
+            usename: None,
+            query,
+            calls,
+            rows: calls * 2,
+            plans: calls,
+            total_exec_time: calls_f64 * 10.0,
+            total_plan_time: calls_f64,
+            min_exec_time: 0.0,
+            max_exec_time: 0.0,
+            mean_exec_time: 0.0,
+            stddev_exec_time: 0.0,
+            min_plan_time: 0.0,
+            max_plan_time: 0.0,
+            mean_plan_time: 0.0,
+            stddev_plan_time: 0.0,
+            shared_blks_hit: calls,
+            shared_blks_read: 0,
+            shared_blks_dirtied: 0,
+            shared_blks_written: 0,
+            local_blks_hit: 0,
+            local_blks_read: 0,
+            local_blks_dirtied: 0,
+            local_blks_written: 0,
+            temp_blks_read: 0,
+            temp_blks_written: 0,
+            blk_read_time: 0.0,
+            blk_write_time: 0.0,
+            wal_records: 0,
+            wal_fpi: 0,
+            wal_bytes: 0,
+        }
+    }
+
+    fn statements_pgm(include_query_text: bool) -> Vec<u8> {
+        let mut interner =
+            Interner::new(DictLimits::new(4_096, 1 << 20).expect("dictionary limits"));
+        let query = StrId(
+            interner
+                .intern(b"select secret_statement_text")
+                .expect("intern query")
+                .get(),
+        );
+        let query = include_query_text.then_some(query);
+        let rows = [
+            statement_row(COVERAGE_TS, 10, query),
+            statement_row(COVERAGE_TS + 60_000_000, 20, query),
+        ];
+        let mut bodies = vec![(
+            1_002_002,
+            u32::try_from(rows.len()).expect("small statement fixture"),
+            PgStatStatementsV2::encode(&rows).expect("encode statements"),
+        )];
+        bodies.extend(
+            dict::encode(interner.window())
+                .expect("encode dictionary")
+                .into_iter()
+                .map(|section| (section.type_id, section.rows, section.body)),
+        );
+        bodies.sort_unstable_by_key(|(type_id, _, _)| *type_id);
+        let inputs = bodies
+            .iter()
+            .map(|(type_id, rows, body)| SectionInput {
+                type_id: *type_id,
+                rows: *rows,
+                body,
+            })
+            .collect::<Vec<_>>();
+        build_part(
+            &inputs,
+            PartMeta {
+                min_ts: COVERAGE_TS,
+                max_ts: COVERAGE_TS + 60_000_000,
+            },
+        )
+    }
+
     fn build_summary(bytes: &[u8]) -> Result<UiSummaryBlock, BuildError> {
         let unit =
             PgmUnit::open(bytes).map_err(|_error| BuildError::Source(SourceError::Corrupt))?;
@@ -1669,6 +1755,33 @@ mod tests {
                 .iter()
                 .all(|field| row.contract().column(field).is_some())
         }));
+    }
+
+    #[test]
+    fn statement_query_text_does_not_change_ovf_or_diagnostic_inputs() {
+        let with_text = PgmUnit::open(statements_pgm(true)).expect("text-bearing statements");
+        let without_text = PgmUnit::open(statements_pgm(false)).expect("numeric statements");
+        let with_text = build_web_index(
+            &with_text,
+            &[],
+            COVERAGE_TS,
+            COVERAGE_TS + 60_000_000,
+            &LIMIT,
+        )
+        .expect("build text-bearing web index");
+        let without_text = build_web_index(
+            &without_text,
+            &[],
+            COVERAGE_TS,
+            COVERAGE_TS + 60_000_000,
+            &LIMIT,
+        )
+        .expect("build numeric web index");
+
+        // These are the persisted numeric blocks consumed by overview,
+        // anomaly, and incident requests.
+        assert_eq!(with_text.summary, without_text.summary);
+        assert_eq!(with_text.series, without_text.series);
     }
 
     #[test]

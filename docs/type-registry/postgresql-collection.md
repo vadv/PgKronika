@@ -70,14 +70,16 @@ FROM pg_stat_activity;
 
 ## `1_002_001`..`1_002_006` statements
 
-`pg_stat_statements` — представление уровня кластера: строка содержит
-`(userid, dbid, queryid)`, а `dbid` указывает базу выполнения. Коллектор выполняет
-один запрос из базы, где установлено расширение. Источник выбирается и кэшируется:
-сначала `pool.main()`, затем покрытые соединения `per_db()`. На ошибке запроса,
-закрытом соединении, пропавшем расширении или изменении `extversion` кэш
-сбрасывается и запускается ограниченное повторное обнаружение. Поиск источника
-видит только `pool.main()` и покрытые per-db соединения; базы вне лимита пула
-останутся невидимыми до появления явной настройки исходной БД.
+`pg_stat_statements` — представление уровня кластера. До версии расширения 1.9
+идентичность строки — `(userid, dbid, queryid)`, а с 1.9 —
+`(userid, dbid, queryid, toplevel)`; `dbid` указывает базу выполнения.
+Коллектор выполняет один запрос из базы, где установлено расширение. Источник
+выбирается и кэшируется: сначала `pool.main()`, затем покрытые соединения
+`per_db()`. На ошибке запроса, закрытом соединении, пропавшем расширении или
+изменении `extversion` кэш сбрасывается и запускается ограниченное повторное
+обнаружение. Поиск источника видит только `pool.main()` и покрытые per-db
+соединения; базы вне лимита пула останутся невидимыми до появления явной
+настройки исходной БД.
 
 Раскладка выбирается по версии расширения, а не по мажору сервера. Проба:
 
@@ -90,37 +92,54 @@ SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';
 ≤ 1.7 → `1_002_001`, 1.8 → `_002`, 1.9 → `_003`, 1.10 → `_004`, 1.11 → `_005`,
 ≥ 1.12 → `_006`. Нераспознанная строка выбирает legacy-раскладку.
 
-Один запрос со встроенным усечением текста (без второй фазы):
+Один числовой запрос без текста:
 
 ```sql
 /* pg_kronika:<version> <source-file> */
-WITH candidates AS (
-  (SELECT userid, dbid, queryid FROM pg_stat_statements
-     ORDER BY total_exec_time DESC NULLS LAST LIMIT $1)
+WITH source AS MATERIALIZED (
+  SELECT
+    s.ordinality AS source_ordinal,
+    s.userid, s.dbid, s.queryid, s.toplevel,
+    s.calls, s.total_exec_time, ...,
+    count(*) OVER ()::int8 AS source_total
+  FROM pg_stat_statements(false) WITH ORDINALITY AS s
+),
+candidates AS (
+  (SELECT source_ordinal FROM source
+     ORDER BY total_exec_time DESC NULLS LAST, calls DESC NULLS LAST,
+       userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal
+     LIMIT GREATEST($1, 0::int8))
   UNION
-  (SELECT userid, dbid, queryid FROM pg_stat_statements
-     ORDER BY calls DESC NULLS LAST LIMIT $1)
+  (SELECT source_ordinal FROM source
+     ORDER BY calls DESC NULLS LAST, total_exec_time DESC NULLS LAST,
+       userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal
+     LIMIT GREATEST($1, 0::int8))
 )
 SELECT
   s.queryid, s.userid, s.dbid,
   d.datname::text AS datname, r.rolname::text AS usename,
-  LEFT(s.query, 5000) AS query,
-  ...
-FROM pg_stat_statements s
-JOIN candidates c ON c.userid = s.userid AND c.dbid = s.dbid
-  AND c.queryid IS NOT DISTINCT FROM s.queryid
+  NULL::text AS query,
+  ..., s.source_total
+FROM source s
+JOIN candidates c ON c.source_ordinal = s.source_ordinal
 LEFT JOIN pg_database d ON d.oid = s.dbid
-LEFT JOIN pg_roles r ON r.oid = s.userid;
+LEFT JOIN pg_roles r ON r.oid = s.userid
+ORDER BY c.source_ordinal;
 ```
 
 Отбор кандидатов объединяет две оси top-N: по `total_exec_time` (в
 legacy-раскладке — по `total_time`) и по `calls`, без порогов и вердиктов в SQL
 (см. `1_002` в `postgresql.md`). Лимит на ось — `KRONIKA_PG_MAX_STATEMENTS`, по
-умолчанию 500. Текст берётся прямо в `SELECT` как `LEFT(query, 5000)` и
-интернируется. `IS NOT DISTINCT FROM` в join нужен, чтобы строка с `NULL`
-`queryid` (выключенный `compute_query_id`) совпала со своим кандидатом. Для
-legacy-раскладки используются старые имена колонок времени (`total_time` и т.
-п.); переименование `blk_*_time` → `shared_blk_*_time` начинается с версии
+умолчанию 500. Обе оси читают один материализованный CTE `source`;
+`count(*) OVER ()` даёт точное общее количество строк того же набора.
+`UNION` кандидатов по `source_ordinal` сохраняет не более `2N` строк, а
+итоговое соединение только по уникальному `source_ordinal` не размножает
+строки с `queryid = NULL`. В раскладках с версии расширения 1.9 `toplevel`
+входит и в полную идентичность, и в порядок при равных значениях; более старые
+раскладки его не содержат. Поле `query` остаётся в схеме, но штатный сбор всегда
+пишет `NULL`, поэтому текст запроса не читается и не интернируется. Для
+legacy-раскладки используются старые имена колонок времени (`total_time` и
+т. п.); переименование `blk_*_time` → `shared_blk_*_time` начинается с версии
 расширения 1.11.
 
 ## `1_003_001` / `1_004_001` store_plans
@@ -155,9 +174,11 @@ per-db подключения, затем кэширует найденную б
   (`KRONIKA_PG_MAX_PLANS`, дефолт 500).
 - Шаг 2: текст на строку —
   `pg_store_plans_textplan(pg_store_plans_get_plan(userid, dbid, queryid,
-  planid))`, усечение `KRONIKA_PG_MAX_PLAN_TEXT` (дефолт 32768 байт), общий
-  бюджет чтения `KRONIKA_PG_PLAN_TEXT_BUDGET` (дефолт 8 MiB); строки после
-  бюджета пишутся с `plan = NULL`.
+  planid))`; серверный `left()` ограничивает текст
+  `KRONIKA_PG_MAX_PLAN_TEXT` символами, после чего коллектор применяет тот же
+  предел в байтах (по границе UTF-8) и общий бюджет
+  `KRONIKA_PG_PLAN_TEXT_BUDGET` (по умолчанию 8 MiB). Строки после бюджета
+  пишутся с `plan = NULL`.
 
 Идентичность строки: `(dbid, userid, planid)` — ровно так расширение ключует
 entry: в ключ уходит нулевой query id, поэтому запросы с одинаковой
@@ -191,23 +212,31 @@ pg_store_plans'`; `track_io_timing = on`, если нужны ненулевые
 2.1 функции `pg_store_plans(boolean)` и `pg_store_plans_get_plan(...)`
 исполняемы PUBLIC, поэтому тексты чужих планов доступны любому пользователю.
 Для отдельной роли коллектора нужно отозвать PUBLIC-доступ и выдать ей
-точечный `GRANT EXECUTE`. Сегменты PGM с этой секцией содержат тексты планов
-(имена объектов, предикаты) — как и тексты запросов из `1_002`, это
-чувствительный артефакт; сбор текстов отключается `KRONIKA_PG_PLAN_TEXT_BUDGET=0`.
+точечный `GRANT EXECUTE`. Сегменты PGM с этой секцией могут содержать тексты
+планов (имена объектов, предикаты), поэтому это чувствительный артефакт. В
+штатном числовом сборе `1_002` тексты запросов не сохраняются. Сбор текстов
+планов отключается `KRONIKA_PG_PLAN_TEXT_BUDGET=0`.
 
 Сбор `1_003_001` (ossc upstream 1.10) отличается по существу: идентичность
 записи — `(dbid, userid, queryid, planid)` с настоящим 64-битным core query
 id, планы остаются per-query, `queryid` соединяется с `1_002` напрямую и без
 оговорок. Без `compute_query_id = on` расширение не записывает entries вовсе.
 View отдаёт текст плана сам, поэтому сбор — один запрос с серверным усечением
-`left(plan, KRONIKA_PG_MAX_PLAN_TEXT)`; байтовый бюджет применяется к уже
-полученным строкам и ограничивает только словарь сегмента, не серверную
-работу и не сеть. Тайминги раздельные по классам блоков
+`left(plan, KRONIKA_PG_MAX_PLAN_TEXT)`. Внешний top-N ограничивает число
+переданных строк, а `left()` — число символов текста в каждой из них. Эти
+ограничения не мешают OSSC SRF сначала прочитать файл планов и материализовать
+полный набор в серверном процессе PostgreSQL. Байтовый бюджет применяется к
+уже полученным строкам и ограничивает сохраняемые данные и память коллектора,
+но при ненулевом бюджете не ограничивает уже выполненную серверную
+материализацию или передачу.
+Тайминги раздельные по классам блоков
 (`shared/local/temp_blk_{read,write}_time`); `slow_log_calls` и
 `*_plan_time` у upstream отсутствуют. Байтовый контракт тот же: серверный
 `left()` режет символы, клиент добивает каждый текст по границе UTF-8 до
 `min(лимит, остаток бюджета)`; нулевой бюджет переключает сбор на
-numeric-запрос — текст не пересекает сеть. Без `pg_read_all_stats` upstream
+числовой запрос — текст не пересекает сеть и не выделяется в коллекторе, но SRF
+по-прежнему материализует его в серверном процессе PostgreSQL. Без
+`pg_read_all_stats` upstream
 маскирует чужие строки: `queryid`/`planid` приходят `NULL` (сборщик
 пропускает такие строки и пишет их число в лог), а текст плана заменяется
 `<insufficient privilege>` — для полного охвата роли сборщика нужна

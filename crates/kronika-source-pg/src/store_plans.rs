@@ -271,8 +271,10 @@ fn row_from_pg(row: &tokio_postgres::Row) -> StorePlansRow {
     }
 }
 
-/// Fetch one plan text through `pg_store_plans_get_plan`, truncated to
-/// `max_len` bytes.
+/// Fetch one plan text through `pg_store_plans_get_plan`.
+///
+/// `PostgreSQL` applies `max_len` as a character limit through `left()`. The
+/// caller enforces the byte contract after this function returns.
 ///
 /// Returns `None` when the entry vanished between enumeration and this call
 /// (deallocated under memory pressure or reset).
@@ -619,7 +621,8 @@ fn store_plans_ossc_query(server_major: u32) -> Cow<'static, str> {
 /// The numeric-only ossc query: plan texts never cross the network.
 ///
 /// Used when the plan-text budget is zero; the `plan` column is projected as
-/// `NULL` so no text is transferred or allocated by the collector.
+/// `NULL` so no text is transferred or allocated by the collector. The
+/// upstream SRF still materializes its plan data in the server backend.
 fn store_plans_ossc_numeric_query(server_major: u32) -> Cow<'static, str> {
     materialized_cte_query(
         marked!(

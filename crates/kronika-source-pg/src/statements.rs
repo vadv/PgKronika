@@ -11,12 +11,12 @@
 //! `calls`. `WITH ORDINALITY` identifies each materialized row, including
 //! otherwise indistinguishable rows whose `queryid` is masked.
 //!
-//! `queryid` is nullable when `compute_query_id` is off or PostgreSQL masks it.
-//! The numeric core calls `pg_stat_statements(false)`, so `query` is always
-//! `NULL`. `datname` and `usename` are resolved through `LEFT JOIN`, so they are
-//! `None` for an oid with no catalog row. Collection returns owned rows; the
-//! caller interns the names into the segment dictionary. The typed layout lives
-//! in `kronika-registry` (`PgStatStatementsV1`..`V6`).
+//! `queryid` is nullable when `PostgreSQL` masks another role's identity. The
+//! numeric core calls `pg_stat_statements(false)`, so `query` is always `NULL`.
+//! `datname` and `usename` are resolved through `LEFT JOIN`, so they are `None`
+//! for an oid with no catalog row. Collection returns owned rows; the caller
+//! interns the names into the segment dictionary. The typed layout lives in
+//! `kronika-registry` (`PgStatStatementsV1`..`V6`).
 
 use kronika_registry::pg_stat_statements::{
     PgStatStatementsV1, PgStatStatementsV2, PgStatStatementsV3, PgStatStatementsV4,
@@ -210,9 +210,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
         StatementsVersion::V3
         | StatementsVersion::V4
         | StatementsVersion::V5
-        | StatementsVersion::V6 => {
-            "userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal"
-        }
+        | StatementsVersion::V6 => "userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal",
     };
     let candidates = format!(
         "WITH source AS {materialized}( \
@@ -356,7 +354,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
 pub struct StatementsRow {
     /// Snapshot time, unix microseconds.
     pub ts: i64,
-    /// Query id; `None` when `compute_query_id` is off.
+    /// Query id; `None` when unavailable or privilege-masked.
     pub queryid: Option<i64>,
     /// Role oid the statement ran as.
     pub userid: u32,
@@ -1149,9 +1147,7 @@ mod tests {
         ] {
             let q = statements_query(v, 18);
             assert!(
-                q.contains(
-                    "userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal"
-                ),
+                q.contains("userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal"),
                 "{q}"
             );
         }

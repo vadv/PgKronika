@@ -4,7 +4,11 @@ Feature: Collector writes upstream pg_store_plans to section pg_store_plans.ossc
   the vadv fork, the upstream keys an entry by (userid, dbid, queryid, planid)
   with the real core query id, so plans stay per-statement and queryid joins
   pg_stat_statements directly. The view carries plan text inline; the
-  collector reads it in one query with a server-side per-row truncation.
+  collector reads it in one query with a server-side per-row truncation. That
+  truncation and the outer top-N bound transfer and collector allocations, but
+  the upstream SRF still reads the full plan file and materializes the result
+  in the server backend. A zero text budget projects NULL and avoids text
+  transfer without changing that backend work.
 
   @pg15 @serial
   Scenario: a repeated statement seals its own plan row

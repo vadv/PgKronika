@@ -90,13 +90,18 @@ CTE.
 
 ### Statements
 
-`source` один раз материализует `pg_stat_statements` вместе с текстами запросов и
-`source_total`. Обе оси top-N (`total_exec_time`/`total_time` и `calls`) читают
-этот CTE.
+`source` один раз вызывает числовой `pg_stat_statements(false) WITH ORDINALITY`.
+Явная проекция не включает текст запроса, `query` в результате всегда `NULL`,
+а `count(*) OVER ()` возвращает точный `source_total` того же набора.
 
-Такой запрос загружает тексты один раз. Отдельный
-`pg_stat_statements(false)` для count не нужен: он сохранил бы второй проход,
-хотя точный total уже получается в единственной материализации.
+Обе оси top-N (`total_exec_time`/`total_time` и `calls`) выбирают только
+`source_ordinal` под отдельным `LIMIT N`. Их `UNION` содержит не более `2N`
+строк, после чего результат соединяется с `source` только по уникальному
+`source_ordinal`. Соединение по смысловому ключу с полями, допускающими `NULL`,
+не используется, поэтому `queryid = NULL` не размножает строки. Порядок при
+равных значениях включает `userid`, `dbid`, допускающий `NULL` `queryid`,
+`toplevel` для раскладок 1.9+ и `source_ordinal`; `toplevel` также входит в
+полную идентичность этих раскладок.
 
 ### Plans vadv
 
@@ -109,6 +114,11 @@ CTE.
 `source` материализует `pg_store_plans` один раз. `count(*) OVER ()` возвращает
 точное число записей из этой материализации. Внешние `ORDER BY total_time` и
 `LIMIT` выбирают top-N, не вызывая SRF повторно.
+
+OSSC SRF до внешней проекции читает файл планов и материализует полный набор в
+серверном процессе PostgreSQL. Поэтому top-N, `left(plan, ...)` и `NULL` при
+нулевом бюджете ограничивают передачу и память коллектора, но не серверную
+материализацию внутри расширения.
 
 Если ossc скрывает identity чужих строк, `source_total` всё равно равен
 фактическому числу строк SRF. Collector исключает строки без identity из
@@ -301,8 +311,12 @@ PGM-файлов.
 - SQL не содержит скалярного `count(*)` по исходному SRF или view.
 - Каждый исходный SRF или statistics view встречается в запросе один раз.
 - Две оси statements/tables/indexes читают только CTE `source`.
+- Statements вызывают только `pg_stat_statements(false)`, не материализуют
+  query text, выбирают не более `2N` уникальных ordinal и пишут `query=NULL`.
 - vadv использует `pg_store_plans(false)`.
-- ossc использует один `pg_store_plans` и возвращает exact total.
+- ossc использует один `pg_store_plans` и возвращает exact total; outer top-N
+  и `NULL` не считаются ограничением серверной материализации внутри
+  расширения.
 - tables/indexes используют переданный `cycle_ts_us`.
 
 ### Collector

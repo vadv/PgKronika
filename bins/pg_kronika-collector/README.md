@@ -100,10 +100,10 @@ uncovered or skipped work instead of reporting it as complete data. See
 | --- | ---: | --- |
 | `KRONIKA_PG_MAX_TABLES` | `500` | Top N per table-selection axis and database. |
 | `KRONIKA_PG_MAX_INDEXES` | `500` | Top N per index-selection axis and database. |
-| `KRONIKA_PG_MAX_STATEMENTS` | `500` | Top N per statement-selection axis. |
+| `KRONIKA_PG_MAX_STATEMENTS` | `500` | Top N per statement-selection axis; the two-axis union retains at most 2N rows. Accepted range: 1–32768. |
 | `KRONIKA_PG_MAX_LOCK_ROWS` | `1000` | Maximum lock waiters, edges, and nodes accepted for a section. |
 | `KRONIKA_PG_MAX_PLANS` | `500` | Maximum plan rows in one read. |
-| `KRONIKA_PG_MAX_PLAN_TEXT` | `32768` | Per-plan text limit; accepted range is 1–65536 bytes. |
+| `KRONIKA_PG_MAX_PLAN_TEXT` | `32768` | Per-plan stored-byte cap; PostgreSQL first applies the same number as a character cap. Accepted range: 1–65536. |
 | `KRONIKA_PG_PLAN_TEXT_BUDGET` | `8388608` | Total plan-text bytes per read; `0` disables plan text, maximum 16 MiB. |
 | `KRONIKA_PG_PLANS_INTERVAL_S` | `300` | Minimum interval between `pg_store_plans` reads. |
 | `KRONIKA_OS_MAX_DISKS` | `256` | Lowest `(major, minor)` disk devices retained. |

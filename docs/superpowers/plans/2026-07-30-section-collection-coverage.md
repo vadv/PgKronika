@@ -39,7 +39,10 @@
 For every supported layout, assert that the emitted SQL has one source reference in
 the `source AS MATERIALIZED` body, uses `count(*) OVER ()::int8 AS source_total`,
 contains no scalar count over the PostgreSQL source, and makes all candidate/final
-reads through `source`. For tables and indexes also assert `$2::int8 AS ts_us`.
+reads through `source`. Statements additionally require exactly one
+`pg_stat_statements(false)`, two bounded ordinal candidate axes, a final
+ordinal-only join, and `NULL::text AS query`. For tables and indexes also
+assert `$2::int8 AS ts_us`.
 
 ```rust
 fn occurrences(haystack: &str, needle: &str) -> usize {
@@ -85,10 +88,18 @@ FROM source s
 JOIN candidates c ON c.relid = s.relid
 ```
 
-The five source bodies are exactly `pg_stat_statements`,
+Statements use `pg_stat_statements(false) WITH ORDINALITY`: each axis selects
+only `source_ordinal` under its own `LIMIT`, their `UNION` has at most `2N`
+rows, and the final query joins only by ordinal. Layouts 1.9 and newer include
+`toplevel` in identity and tie-break ordering. The source projection excludes
+query text and the final `query` field is `NULL`.
+
+The five source bodies are exactly `pg_stat_statements(false)`,
 `pg_store_plans(false)`, zero-argument `pg_store_plans()`,
 `pg_stat_user_tables`, and `pg_stat_user_indexes`. Empty successful results
-continue to infer exact total zero.
+continue to infer exact total zero. For OSSC, outer top-N and a `NULL` plan
+projection bound transfer and collector allocations, not the extension reading
+the full plan file and materializing the result in the server backend.
 
 - [ ] **Step 4: Pass the cycle timestamp through table/index collectors**
 
