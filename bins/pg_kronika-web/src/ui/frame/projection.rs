@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 
 use kronika_analytics::web_projection::WebView;
 use kronika_reader::{
-    Gap, LIMIT, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SnapshotNeighbors, Value,
-    WebIndexReadError, logical_section, sections_from_sealed_descriptor_with_limits,
+    Gap, LIMIT, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SealedQuerySession, SectionPage,
+    SnapshotNeighbors, Value, WebIndexReadError, logical_section,
 };
 use kronika_registry::ColumnType;
 
@@ -158,8 +158,8 @@ impl ProjectionInput {
         snapshot_ts_us: i64,
         predecessor_ts_us: Option<i64>,
         neighbors: SnapshotNeighbors,
-        current: BTreeMap<String, kronika_reader::SectionPage>,
-        previous: BTreeMap<String, kronika_reader::SectionPage>,
+        current: BTreeMap<String, SectionPage>,
+        previous: BTreeMap<String, SectionPage>,
     ) -> Self {
         let mut gaps = Vec::new();
         let current = current
@@ -328,6 +328,11 @@ fn read_projection_input(
         .iter()
         .flat_map(|input| input.sections.iter().copied())
         .collect::<Vec<_>>();
+    let exact_section_names = section_names
+        .iter()
+        .copied()
+        .filter(|name| *name != "pg_settings")
+        .collect::<Vec<_>>();
     let cursors = BTreeMap::new();
     let current_descriptor = resolved
         .current_descriptor
@@ -349,38 +354,39 @@ fn read_projection_input(
             from: previous,
             to: neighbors.current,
         });
-    let separate_predecessor = rate_previous.is_some()
-        && resolved
-            .previous_descriptor
-            .is_some_and(|descriptor| descriptor != current_descriptor);
-    let read_count = 1 + usize::from(separate_predecessor);
-    let query_limits = QueryLimits::with_bytes(
-        limits.rows / read_count,
-        limits.cells / read_count,
-        limits.bytes / read_count,
-    );
-    let current = sections_from_sealed_descriptor_with_limits(
-        snapshot,
+    let query_limits = QueryLimits::with_bytes(limits.rows, limits.cells, limits.bytes);
+    let mut query = SealedQuerySession::new(snapshot, query_limits);
+    let mut current = query.sections(
         &current_descriptor,
-        current_descriptor.min_ts,
         neighbors.current,
-        &section_names,
+        neighbors.current,
+        &exact_section_names,
         &cursors,
-        query_limits,
     )?;
-    let previous = match (rate_previous, resolved.previous_descriptor.as_ref()) {
-        (Some(_), Some(previous_descriptor)) if *previous_descriptor == current_descriptor => {
-            current.clone()
-        }
-        (Some(previous), Some(previous_descriptor)) => sections_from_sealed_descriptor_with_limits(
-            snapshot,
-            previous_descriptor,
-            previous,
-            previous,
-            &section_names,
+    reject_internal_continuation(&current, limits.rows)?;
+    if section_names.contains(&"pg_settings") {
+        let settings = query.sections(
+            &current_descriptor,
+            current_descriptor.min_ts,
+            neighbors.current,
+            &["pg_settings"],
             &cursors,
-            query_limits,
-        )?,
+        )?;
+        reject_internal_continuation(&settings, limits.rows)?;
+        current.extend(settings);
+    }
+    let previous = match (rate_previous, resolved.previous_descriptor.as_ref()) {
+        (Some(previous), Some(previous_descriptor)) => {
+            let pages = query.sections(
+                previous_descriptor,
+                previous,
+                previous,
+                &exact_section_names,
+                &cursors,
+            )?;
+            reject_internal_continuation(&pages, limits.rows)?;
+            pages
+        }
         _ => BTreeMap::new(),
     };
     let mut input = ProjectionInput::from_pages(
@@ -394,6 +400,16 @@ fn read_projection_input(
         input.push_gap(gap);
     }
     Ok(input)
+}
+
+fn reject_internal_continuation(
+    pages: &BTreeMap<String, SectionPage>,
+    max_rows: usize,
+) -> Result<(), QueryError> {
+    if pages.values().any(|page| page.next_cursor.is_some()) {
+        return Err(QueryError::RowsTooLarge { max_rows });
+    }
+    Ok(())
 }
 
 fn preset_requires_predecessor(

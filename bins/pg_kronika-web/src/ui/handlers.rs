@@ -16,7 +16,7 @@ use super::frame::FrameRequest;
 use super::frame::MAX_FRAME_RESPONSE_BYTES;
 use super::frame::dto::FrameResponse;
 use super::frame::projection::{
-    FrameError, FrameLimits, ProjectedFrame, cursor_for, project_frame,
+    FrameError, FrameLimits, ProjectedFrame, ProjectionError, cursor_for, project_frame,
 };
 use super::frame::spark::{SparkError, attach_sparks};
 use super::heatmap::{HeatmapError, HeatmapRequest, HeatmapResponse, heatmap as build_heatmap};
@@ -148,6 +148,9 @@ fn bounded_frame_body(
 fn frame_build_error(error: FrameBuildError) -> ApiError {
     match error {
         FrameBuildError::Frame(FrameError::CursorExpired) => ApiError::cursor_expired(),
+        FrameBuildError::Frame(FrameError::Projection(ProjectionError::Cursor)) => {
+            ApiError::invalid_cursor()
+        }
         FrameBuildError::Frame(FrameError::Query(error)) => frame_query_error(error),
         FrameBuildError::Frame(FrameError::WebIndex(_))
         | FrameBuildError::Spark(SparkError::Read(_)) => {
@@ -185,6 +188,9 @@ fn frame_build_error(error: FrameBuildError) -> ApiError {
 )]
 fn frame_query_error(error: kronika_reader::QueryError) -> ApiError {
     match error {
+        kronika_reader::QueryError::RowsTooLarge { max_rows } => {
+            ApiError::query_limit_exceeded(LimitResource::Rows, count_u64(max_rows), None)
+        }
         kronika_reader::QueryError::ResultTooLarge { max_cells } => {
             ApiError::query_limit_exceeded(LimitResource::Cells, count_u64(max_cells), None)
         }

@@ -332,6 +332,9 @@ fn read_error_response(error: QueryError) -> ApiError {
         QueryError::UnknownSection(name) => {
             logged_internal_error("api_registry_section_missing", &name)
         }
+        QueryError::RowsTooLarge { max_rows } => {
+            ApiError::query_limit_exceeded(LimitResource::Rows, count_u64(max_rows), None)
+        }
         QueryError::ResultTooLarge { max_cells } => {
             ApiError::query_limit_exceeded(LimitResource::Cells, count_u64(max_cells), None)
         }

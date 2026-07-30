@@ -812,6 +812,10 @@ fn statement_row(ts: i64, calls: i64, rows: i64, exec_ms: f64, plan_ms: f64) -> 
 }
 
 fn frame_statement_planning_fixture() -> tempfile::TempDir {
+    frame_statement_planning_fixture_with_extra_current(false)
+}
+
+fn frame_statement_planning_fixture_with_extra_current(extra_current: bool) -> tempfile::TempDir {
     let mut interner =
         kronika_writer::Interner::new(DictLimits::new(32, 4_096).expect("dictionary limits"));
     let mut intern = |value: &str| {
@@ -834,10 +838,15 @@ fn frame_statement_planning_fixture() -> tempfile::TempDir {
         boot_val: Some(intern("off")),
         reset_val: Some(intern("on")),
     }];
-    let statements = [
+    let mut statements = vec![
         statement_row(1_500, 10, 20, 100.0, 25.0),
         statement_row(1_600, 12, 24, 120.0, 30.0),
     ];
+    if extra_current {
+        let mut extra = statement_row(1_600, 4, 8, 40.0, 10.0);
+        extra.queryid = Some(8);
+        statements.push(extra);
+    }
     let settings_body = PgSettingsV1::encode(&settings).expect("encode settings fixture");
     let statements_body =
         PgStatStatementsV2::encode(&statements).expect("encode statements fixture");
@@ -925,8 +934,16 @@ fn frame_uses_last_known_track_planning_from_the_same_exact_pgm() {
         FrameRequest::parse("statements", Some("at=1600"), &catalog()).expect("frame request");
     kronika_reader::qualification_reset_open_unit_calls();
 
-    let frame = project_frame(&snapshot, &request, &catalog(), FrameLimits::default())
-        .expect("frame projection");
+    let frame = project_frame(
+        &snapshot,
+        &request,
+        &catalog(),
+        FrameLimits {
+            rows: 1,
+            ..FrameLimits::default()
+        },
+    )
+    .expect("frame projection");
 
     assert_eq!(kronika_reader::qualification_open_unit_calls(), 1);
     let row = frame.rows.first().expect("statement row");
@@ -945,6 +962,32 @@ fn frame_uses_last_known_track_planning_from_the_same_exact_pgm() {
         .find(|classification| classification.column == "plan_time_pct")
         .expect("plan_time_pct classification");
     assert!(matches!(classification.result, Classified::Verdict(_)));
+}
+
+#[test]
+fn frame_rejects_an_internally_paginated_exact_snapshot() {
+    let directory = frame_statement_planning_fixture_with_extra_current(true);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let request =
+        FrameRequest::parse("statements", Some("at=1600"), &catalog()).expect("frame request");
+
+    let error = project_frame(
+        &snapshot,
+        &request,
+        &catalog(),
+        FrameLimits {
+            rows: 1,
+            cells: 2_000_000,
+            bytes: 32 * 1024 * 1024,
+        },
+    )
+    .expect_err("a partial exact snapshot must not be projected");
+    assert!(matches!(
+        error,
+        crate::ui::frame::projection::FrameError::Query(kronika_reader::QueryError::RowsTooLarge {
+            max_rows: 1
+        })
+    ));
 }
 
 #[test]
@@ -1112,6 +1155,32 @@ async fn frame_event_cursor_tiles_every_matching_row() {
 
     assert_eq!(returned, 201);
     assert!(cursor.is_none());
+}
+
+#[tokio::test]
+async fn frame_rejects_a_missing_cursor_anchor_as_invalid_cursor() {
+    let directory = frame_many_event_fixture();
+    let uri = "/v1/frame/events?at=2000&span=1ms&limit=200";
+    let (status, body) = super::serve(directory.path(), uri).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let cursor = FrameCursor::decode(body["page"]["next"].as_str().expect("first page cursor"))
+        .expect("decode first page cursor");
+    let changed = FrameCursor::new(
+        cursor.view_code(),
+        cursor.view_revision(),
+        cursor.snapshot_ts_us(),
+        cursor.query_fingerprint(),
+        cursor.sort_key().clone(),
+        vec![u8::MAX; cursor.entity().len()],
+    )
+    .expect("changed bounded anchor")
+    .encode()
+    .expect("encode changed anchor");
+
+    let uri = format!("{uri}&cursor={changed}");
+    let (status, body) = super::serve(directory.path(), &uri).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_cursor");
 }
 
 fn operand_row(operands: RowOperands) -> ProjectedRow {

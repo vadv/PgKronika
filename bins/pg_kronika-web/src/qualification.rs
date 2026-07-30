@@ -2836,7 +2836,7 @@ mod tests {
         }
         let state = AppState::new(snapshot).expect("build structural frame state");
         let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
-        let raw = format!("at={current_ts_us}&span=24h&preset=memory&limit=200");
+        let raw = format!("at={current_ts_us}&span=24h&preset=cpu&limit=200");
         let request =
             FrameRequest::parse("processes", Some(&raw), &catalog).expect("frame request");
         let request_snapshot = (*state.snapshot()).clone();
