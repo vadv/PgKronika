@@ -688,6 +688,10 @@ fn statement_filter_uses_the_final_returned_time_percent() {
 }
 
 fn frame_event_fixture() -> tempfile::TempDir {
+    frame_event_fixture_with_historical_gated_segment(false)
+}
+
+fn frame_event_fixture_with_historical_gated_segment(historical_gated: bool) -> tempfile::TempDir {
     let rows = [
         PgLogLifecycleV1 {
             ts: Ts(1_500),
@@ -723,6 +727,28 @@ fn frame_event_fixture() -> tempfile::TempDir {
         },
     );
     let directory = tempfile::tempdir().expect("tempdir");
+    if historical_gated {
+        let body = kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer::encode(&[
+            super::bgwriter_row(1_000),
+        ])
+        .expect("encode historical gated fixture");
+        let historical = build_part(
+            &[SectionInput {
+                type_id: 1_006_001,
+                rows: 1,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: 1_000,
+                max_ts: 1_000,
+            },
+        );
+        crate::test_layout::write_named_pgm(
+            directory.path(),
+            "frame-events-history.pgm",
+            &historical,
+        );
+    }
     crate::test_layout::write_named_pgm(directory.path(), "frame-events.pgm", &pgm);
     let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
     let store = FactStore::new(directory.path());
@@ -732,6 +758,33 @@ fn frame_event_fixture() -> tempfile::TempDir {
             .expect("publish web index");
     }
     directory
+}
+
+#[test]
+fn frame_quality_ignores_an_unselected_historical_summary_status() {
+    let directory = frame_event_fixture_with_historical_gated_segment(true);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let request =
+        FrameRequest::parse("events", Some("at=1600&span=1ms"), &catalog()).expect("request");
+
+    let frame = project_frame(&snapshot, &request, &catalog(), FrameLimits::default())
+        .expect("frame projection");
+
+    assert_eq!(frame.snapshot_ts_us, 1_600);
+    assert!(frame.quality.gated.is_empty());
+    assert!(frame.quality.unavailable_revision.is_empty());
+    assert!(frame.quality.resource_limited.is_empty());
+
+    let before_current =
+        FrameRequest::parse("events", Some("at=1000&span=1ms"), &catalog()).expect("request");
+    let frame = project_frame(
+        &snapshot,
+        &before_current,
+        &catalog(),
+        FrameLimits::default(),
+    )
+    .expect("empty frame");
+    assert_eq!(frame.quality.gated, ["events"]);
 }
 
 fn frame_many_event_fixture() -> tempfile::TempDir {

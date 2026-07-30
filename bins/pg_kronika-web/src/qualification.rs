@@ -2852,6 +2852,9 @@ mod tests {
         assert_eq!(kronika_reader::qualification_open_unit_calls(), 2);
         assert_eq!(frame.matched, FRAME_MATCHING_ROWS);
         assert_eq!(frame.rows.len(), 200);
+        assert!(frame.quality.gated.is_empty());
+        assert!(frame.quality.unavailable_revision.is_empty());
+        assert!(frame.quality.resource_limited.is_empty());
 
         let live = Arc::clone(state.overview_view().live());
         attach_sparks(&request_snapshot, &live, &request, &mut frame)

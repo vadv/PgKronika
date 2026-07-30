@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 
 use kronika_analytics::web_projection::WebView;
 use kronika_reader::{
-    Gap, LIMIT, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SealedQuerySession, SectionPage,
-    SnapshotNeighbors, Value, WebIndexReadError, logical_section,
+    Gap, IndexStatus, LIMIT, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SealedQuerySession,
+    SectionPage, SnapshotNeighbors, Value, WebIndexReadError, logical_section,
 };
 use kronika_registry::ColumnType;
 
@@ -268,6 +268,15 @@ pub(crate) fn project_frame(
         if request.cursor.is_some() {
             return Err(FrameError::CursorExpired);
         }
+        let mut quality = FrameQuality {
+            snapshots: 0,
+            gaps: vec![Gap {
+                from: request.at_us,
+                to: request.at_us,
+            }],
+            ..FrameQuality::default()
+        };
+        merge_summary_quality(&mut quality, resolved.fallback_quality, request.view.name);
         return Ok(ProjectedFrame {
             snapshot_ts_us: request.at_us,
             predecessor_ts_us: None,
@@ -277,17 +286,7 @@ pub(crate) fn project_frame(
                 next: resolved.next,
             },
             rows: Vec::new(),
-            quality: FrameQuality {
-                snapshots: 0,
-                gaps: vec![Gap {
-                    from: request.at_us,
-                    to: request.at_us,
-                }],
-                gated: resolved.gated,
-                unavailable_revision: resolved.unavailable_revision,
-                resource_limited: resolved.resource_limited,
-                active_tail: false,
-            },
+            quality,
             matched: 0,
             next: None,
         });
@@ -302,15 +301,18 @@ pub(crate) fn project_frame(
 
     let input = read_projection_input(snapshot, request, catalog, limits, &resolved, neighbors)?;
     let mut frame = project_input(request, catalog, input)?;
-    frame.quality.gated.extend(resolved.gated);
-    frame
-        .quality
-        .unavailable_revision
-        .extend(resolved.unavailable_revision);
-    frame
-        .quality
-        .resource_limited
-        .extend(resolved.resource_limited);
+    merge_summary_quality(
+        &mut frame.quality,
+        resolved.current_quality,
+        request.view.name,
+    );
+    if frame.predecessor_ts_us.is_some() {
+        merge_summary_quality(
+            &mut frame.quality,
+            resolved.previous_quality,
+            request.view.name,
+        );
+    }
     Ok(frame)
 }
 
@@ -459,20 +461,32 @@ struct ResolvedSnapshot {
     neighbors: Option<SnapshotNeighbors>,
     current_descriptor: Option<kronika_reader::SegmentDescriptor>,
     previous_descriptor: Option<kronika_reader::SegmentDescriptor>,
+    current_quality: Option<SnapshotSummaryQuality>,
+    previous_quality: Option<SnapshotSummaryQuality>,
+    fallback_quality: Option<SnapshotSummaryQuality>,
     next: Option<i64>,
-    gated: Vec<String>,
-    unavailable_revision: Vec<String>,
-    resource_limited: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotEvidence {
+    descriptor: kronika_reader::SegmentDescriptor,
+    quality: SnapshotSummaryQuality,
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotSummaryQuality {
+    Complete,
+    Gated,
+    UnavailableRevision,
+    ResourceLimited,
 }
 
 fn resolve_snapshot(
     snapshot: &LocalDirSnapshot,
     request: &FrameRequest,
 ) -> Result<ResolvedSnapshot, FrameError> {
-    let mut snapshots = BTreeMap::new();
-    let mut gated = Vec::new();
-    let mut unavailable_revision = Vec::new();
-    let mut resource_limited = Vec::new();
+    let mut snapshots = BTreeMap::<i64, SnapshotEvidence>::new();
+    let mut fallback_quality = None;
     let mut descriptors = snapshot.sealed_descriptors().collect::<Vec<_>>();
     descriptors
         .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
@@ -485,19 +499,12 @@ fn resolve_snapshot(
         else {
             continue;
         };
-        if view.view_revision() != request.view.revision {
-            unavailable_revision.push(request.view.name.to_owned());
-            continue;
+        let quality = summary_quality(view.view_revision(), request.view.revision, view.status());
+        if descriptor.min_ts <= request.at_us {
+            fallback_quality = Some(quality);
         }
-        match view.status() {
-            kronika_reader::IndexStatus::Gated => gated.push(request.view.name.to_owned()),
-            kronika_reader::IndexStatus::UnsupportedType => {
-                unavailable_revision.push(request.view.name.to_owned());
-            }
-            kronika_reader::IndexStatus::ResourceLimited => {
-                resource_limited.push(request.view.name.to_owned());
-            }
-            kronika_reader::IndexStatus::Complete | kronika_reader::IndexStatus::Empty => {}
+        if view.view_revision() != request.view.revision {
+            continue;
         }
         for (index, timestamp) in summary.snapshot_times().iter().copied().enumerate() {
             if view
@@ -505,17 +512,17 @@ fn resolve_snapshot(
                 .get(index / 8)
                 .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
             {
-                snapshots.insert(timestamp, descriptor);
+                snapshots.insert(
+                    timestamp,
+                    SnapshotEvidence {
+                        descriptor,
+                        quality,
+                    },
+                );
             }
         }
     }
     let all_times = snapshots.keys().copied().collect::<Vec<_>>();
-    gated.sort();
-    gated.dedup();
-    unavailable_revision.sort();
-    unavailable_revision.dedup();
-    resource_limited.sort();
-    resource_limited.dedup();
 
     let upper = all_times.partition_point(|timestamp| *timestamp <= request.at_us);
     let current = upper
@@ -531,19 +538,54 @@ fn resolve_snapshot(
         current,
         next,
     });
-    let current_descriptor = current.and_then(|timestamp| snapshots.get(&timestamp).copied());
-    let previous_descriptor = neighbors
+    let current_evidence = current
+        .and_then(|timestamp| snapshots.get(&timestamp))
+        .copied();
+    let previous_evidence = neighbors
         .and_then(|neighbors| neighbors.previous)
-        .and_then(|timestamp| snapshots.get(&timestamp).copied());
+        .and_then(|timestamp| snapshots.get(&timestamp))
+        .copied();
     Ok(ResolvedSnapshot {
         neighbors,
-        current_descriptor,
-        previous_descriptor,
+        current_descriptor: current_evidence.map(|evidence| evidence.descriptor),
+        previous_descriptor: previous_evidence.map(|evidence| evidence.descriptor),
+        current_quality: current_evidence.map(|evidence| evidence.quality),
+        previous_quality: previous_evidence.map(|evidence| evidence.quality),
+        fallback_quality,
         next,
-        gated,
-        unavailable_revision,
-        resource_limited,
     })
+}
+
+const fn summary_quality(
+    actual_revision: u16,
+    expected_revision: u16,
+    status: IndexStatus,
+) -> SnapshotSummaryQuality {
+    if actual_revision != expected_revision {
+        return SnapshotSummaryQuality::UnavailableRevision;
+    }
+    match status {
+        IndexStatus::Complete | IndexStatus::Empty => SnapshotSummaryQuality::Complete,
+        IndexStatus::Gated => SnapshotSummaryQuality::Gated,
+        IndexStatus::UnsupportedType => SnapshotSummaryQuality::UnavailableRevision,
+        IndexStatus::ResourceLimited => SnapshotSummaryQuality::ResourceLimited,
+    }
+}
+
+fn merge_summary_quality(
+    quality: &mut FrameQuality,
+    summary: Option<SnapshotSummaryQuality>,
+    view: &str,
+) {
+    let target = match summary {
+        Some(SnapshotSummaryQuality::Gated) => &mut quality.gated,
+        Some(SnapshotSummaryQuality::UnavailableRevision) => &mut quality.unavailable_revision,
+        Some(SnapshotSummaryQuality::ResourceLimited) => &mut quality.resource_limited,
+        Some(SnapshotSummaryQuality::Complete) | None => return,
+    };
+    if !target.iter().any(|existing| existing == view) {
+        target.push(view.to_owned());
+    }
 }
 
 impl fmt::Display for ProjectionError {
