@@ -3,9 +3,15 @@
     reason = "frame response DTOs are consumed by the projection and HTTP tasks"
 )]
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::{Boundary, Classified, Comparison, Evidence, Level, NotClassifiedReason};
 use serde::Serialize;
 use utoipa::{PartialSchema, ToSchema};
+
+use super::FrameRequest;
+use super::projection::{ProjectedFrame, selected_columns};
+use crate::ui::catalog::{ProjectionCatalog, ValueType};
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct FrameResponse {
@@ -169,6 +175,99 @@ pub(crate) enum EvidenceDto {
 pub(crate) struct SparkDto {
     pub values: Vec<Option<f64>>,
     pub complete: bool,
+}
+
+impl FrameResponse {
+    pub(crate) fn from_projected(
+        request: &FrameRequest,
+        catalog: &ProjectionCatalog,
+        frame: &ProjectedFrame,
+    ) -> Result<Self, super::projection::ProjectionError> {
+        let columns = selected_columns(request, catalog)?
+            .into_iter()
+            .map(|column| FrameColumnDto {
+                code: column.code,
+                value_type: value_type_spelling(column.value_type),
+                unit: column.unit,
+                threshold_metric: column.threshold_metric,
+            })
+            .collect();
+        let rows = frame
+            .rows
+            .iter()
+            .map(|row| FrameRowDto {
+                entity: URL_SAFE_NO_PAD.encode(&row.entity),
+                label: row.label.clone(),
+                cells: row.cells.clone(),
+                classifications: row
+                    .classifications
+                    .iter()
+                    .map(|classification| CellClassificationDto {
+                        column: classification.column,
+                        metric: classification.metric_id.as_str(),
+                        result: classification.result.into(),
+                    })
+                    .collect(),
+                spark: row.spark.clone(),
+            })
+            .collect();
+        let mut gated = frame.quality.gated.clone();
+        let mut unavailable_revision = frame.quality.unavailable_revision.clone();
+        let mut resource_limited = frame.quality.resource_limited.clone();
+        for values in [&mut gated, &mut unavailable_revision, &mut resource_limited] {
+            values.sort();
+            values.dedup();
+        }
+        let complete = frame.quality.gaps.is_empty()
+            && gated.is_empty()
+            && unavailable_revision.is_empty()
+            && resource_limited.is_empty()
+            && frame.rows.iter().all(|row| row.spark.complete);
+        Ok(Self {
+            view: request.view.name,
+            snapshot_ts_us: frame.snapshot_ts_us.to_string(),
+            rate_prev_ts_us: frame.predecessor_ts_us.map(|value| value.to_string()),
+            neighbors: FrameNeighborsDto {
+                prev_us: frame.neighbors.previous.map(|value| value.to_string()),
+                next_us: frame.neighbors.next.map(|value| value.to_string()),
+            },
+            columns,
+            rows,
+            page: FramePageDto {
+                returned: frame.rows.len(),
+                matched: frame.matched,
+                next: frame.next.clone(),
+            },
+            quality: FrameQualityDto {
+                status: if complete { "complete" } else { "partial" },
+                snapshots: frame.quality.snapshots,
+                gaps: frame
+                    .quality
+                    .gaps
+                    .iter()
+                    .map(|gap| FrameGapDto {
+                        from_us: gap.from.to_string(),
+                        to_us: gap.to.to_string(),
+                    })
+                    .collect(),
+                gated,
+                unavailable_revision,
+                resource_limited,
+                active_tail: frame.quality.active_tail,
+            },
+        })
+    }
+}
+
+const fn value_type_spelling(value_type: ValueType) -> &'static str {
+    match value_type {
+        ValueType::I64 => "i64",
+        ValueType::U64 => "u64",
+        ValueType::F64 => "f64",
+        ValueType::Bool => "bool",
+        ValueType::Text => "text",
+        ValueType::Timestamp => "timestamp",
+    }
 }
 
 impl From<Classified> for ClassificationResultDto {

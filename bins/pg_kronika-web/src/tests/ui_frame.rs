@@ -532,8 +532,7 @@ fn frame_pagination_filters_then_sorts_by_value_and_entity() {
     assert!(frame.next.is_some());
 }
 
-#[test]
-fn frame_spark_uses_the_selected_view_ovf_series() {
+fn frame_event_fixture() -> tempfile::TempDir {
     let rows = [
         PgLogLifecycleV1 {
             ts: Ts(1_500),
@@ -577,6 +576,12 @@ fn frame_spark_uses_the_selected_view_ovf_series() {
             .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
             .expect("publish web index");
     }
+    directory
+}
+
+#[test]
+fn frame_spark_uses_the_selected_view_ovf_series() {
+    let directory = frame_event_fixture();
     let state = super::state_for_dir(directory.path());
     let request =
         FrameRequest::parse("events", Some("at=1600&span=1ms"), &catalog()).expect("frame request");
@@ -596,6 +601,47 @@ fn frame_spark_uses_the_selected_view_ovf_series() {
 
     assert_eq!(frame.rows[0].spark.values.len(), 60);
     assert!(frame.rows[0].spark.values.iter().any(Option::is_some));
+}
+
+#[tokio::test]
+async fn frame_http_returns_bounded_classified_shape_and_rejects_before_io() {
+    let directory = frame_event_fixture();
+    let (status, body) = super::serve(directory.path(), "/v1/frame/events?at=1600&span=1ms").await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["view"], "events");
+    assert_eq!(body["snapshot_ts_us"], "1600");
+    assert_eq!(body["columns"].as_array().map(Vec::len), Some(3));
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["rows"][0]["cells"].as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        body["rows"][0]["classifications"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        body["rows"][0]["spark"]["values"].as_array().map(Vec::len),
+        Some(60)
+    );
+    assert!(serde_json::to_vec(&body).expect("serialize").len() <= 1_048_576);
+
+    for uri in [
+        "/v1/frame/missing?at=1",
+        "/v1/frame/events?at=1&at=2",
+        "/v1/frame/events?at=1&order=sideways",
+    ] {
+        let (_directory, status, body) = super::fixture_response(uri).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{uri}");
+        assert!(
+            matches!(
+                body["code"].as_str(),
+                Some(
+                    "invalid_query_parameter"
+                        | "duplicate_query_parameter"
+                        | "unknown_query_parameter"
+                )
+            ),
+            "{uri}: {body}"
+        );
+    }
 }
 
 fn operand_row(operands: RowOperands) -> ProjectedRow {

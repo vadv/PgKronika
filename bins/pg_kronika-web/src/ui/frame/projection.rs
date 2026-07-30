@@ -82,6 +82,7 @@ pub(crate) struct ProjectedRow {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FrameQuality {
+    pub snapshots: usize,
     pub gaps: Vec<Gap>,
     pub gated: Vec<String>,
     pub unavailable_revision: Vec<String>,
@@ -260,6 +261,7 @@ pub(crate) fn project_frame(
             },
             rows: Vec::new(),
             quality: FrameQuality {
+                snapshots: 0,
                 gaps: vec![Gap {
                     from: request.at_us,
                     to: request.at_us,
@@ -533,6 +535,7 @@ pub(crate) fn project_input(
         neighbors: input.neighbors,
         rows: paged.rows,
         quality: FrameQuality {
+            snapshots: 1 + usize::from(input.predecessor_ts_us.is_some()),
             gaps: input.gaps,
             ..FrameQuality::default()
         },

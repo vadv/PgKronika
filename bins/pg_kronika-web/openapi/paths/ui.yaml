@@ -1,3 +1,99 @@
+/v1/frame/{view}:
+  get:
+    operationId: frame
+    parameters:
+    - in: path
+      name: view
+      required: true
+      schema:
+        type: string
+    - in: query
+      name: at
+      required: true
+      schema:
+        format: int64
+        type: integer
+    - in: query
+      name: span
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: preset
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: database
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: q
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: sort
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: order
+      required: false
+      schema:
+        type: string
+    - in: query
+      name: limit
+      required: false
+      schema:
+        minimum: 0
+        type: integer
+    - in: query
+      name: cursor
+      required: false
+      schema:
+        type: string
+    responses:
+      '200':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/ui.yaml#/FrameResponse
+        description: Bounded classified frame
+      '400':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Invalid frame query
+      '401':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Authentication required
+      '410':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Frame cursor snapshot expired
+      '413':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Frame resource limit exceeded
+      '500':
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ApiError
+        description: Frame storage or render failed
+    summary: '`GET /v1/frame/{view}` - bounded exact UI rows with server-owned verdicts.'
+    tags:
+    - ui
 /v1/timeline/heatmap:
   get:
     operationId: heatmap
