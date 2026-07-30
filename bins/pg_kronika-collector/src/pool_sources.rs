@@ -1,6 +1,6 @@
 use crate::budget::{PoolBudget, PoolSource};
 use crate::config::Config;
-use crate::coverage::SourceCoverage;
+use crate::coverage::{CoverageAttempt, SourceCoverage};
 use crate::logging::{
     LogLevel, field, layout_id, log_database_collection_finish, log_database_collection_retry,
     log_database_collection_skip, log_database_collection_start, log_event, section_name,
@@ -9,11 +9,27 @@ use crate::scheduler::{DueSet, SourceKind};
 use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 use crate::statements_source::{StatementsSourceCache, collect_statements_cached};
 use kronika_source_pg::incident_gauges::{FreezeHorizonRow, collect_freeze_horizons};
-use kronika_source_pg::pool::{AdaptiveTimeout, ConnectionPool};
+use kronika_source_pg::pool::{AdaptiveTimeout, ConnectionPool, DEFAULT_MAX_DATABASES};
 use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
 use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion, collect_user_indexes};
 use kronika_source_pg::user_tables::{UserTablesRow, UserTablesVersion, collect_user_tables};
 use std::time::Instant;
+
+/// Carry pool connection failures and the database cap into the same attempt
+/// as the successful per-database reads.
+fn record_pool_gaps(pool: &ConnectionPool, coverage: &mut SourceCoverage) {
+    let covered_target = pool
+        .expected()
+        .iter()
+        .take(DEFAULT_MAX_DATABASES)
+        .all(|expected| pool.per_db().iter().any(|db| db.datname == *expected));
+    if !covered_target {
+        coverage.record_other_failure();
+    }
+    if pool.expected().len() > DEFAULT_MAX_DATABASES {
+        coverage.record_collector_loss();
+    }
+}
 
 /// Collect `pg_stat_user_tables` from every pool database, returning owned rows.
 ///
@@ -33,10 +49,11 @@ async fn collect_user_tables_all(
     cycle_ts_us: i64,
 ) -> (
     Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
-    SourceCoverage,
+    CoverageAttempt,
 ) {
     let mut user_tables = Vec::new();
-    let mut coverage = SourceCoverage::default();
+    let mut coverage = SourceCoverage::new_attempt();
+    record_pool_gaps(pool, &mut coverage);
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     let type_id = user_tables_type_id(major);
     for db in pool.per_db() {
@@ -67,12 +84,11 @@ async fn collect_user_tables_all(
             }
             match collect_user_tables(db.client(), major, config.max_tables, cycle_ts_us).await {
                 Ok((version, rows, source_total)) => {
-                    coverage.collected += rows.len() as u64;
+                    coverage.record_success(rows.len(), source_total);
                     // The total rides in the same statement as the rows, so
                     // it describes exactly the population they were cut from.
                     // Every selection axis is an unfiltered ORDER BY, so an
                     // empty read means an empty source: a zero total is exact.
-                    coverage.total += source_total;
                     log_database_collection_finish(
                         type_id,
                         &db.datname,
@@ -98,7 +114,7 @@ async fn collect_user_tables_all(
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
-                    coverage.other_skips += 1;
+                    coverage.record_other_failure();
                     log_database_collection_skip(
                         type_id,
                         &db.datname,
@@ -110,16 +126,15 @@ async fn collect_user_tables_all(
                 }
                 Err(err) => {
                     let reason = if is_sqlstate(&err, "57014") {
-                        coverage.timeouts += 1;
+                        coverage.record_timeout();
                         "statement_timeout"
                     } else if is_sqlstate(&err, "42501") {
-                        coverage.permission_skips += 1;
+                        coverage.record_permission_failure();
                         "permission_denied"
                     } else {
-                        coverage.other_skips += 1;
+                        coverage.record_other_failure();
                         "query_failed"
                     };
-                    coverage.unknown_total = true;
                     log_database_collection_skip(
                         type_id,
                         &db.datname,
@@ -132,7 +147,14 @@ async fn collect_user_tables_all(
             }
         }
     }
-    (user_tables, coverage)
+    (
+        user_tables,
+        CoverageAttempt {
+            ts: cycle_ts_us,
+            section_type_id: type_id,
+            coverage,
+        },
+    )
 }
 
 /// Collect the two-axis freeze candidates from every database.
@@ -200,10 +222,11 @@ async fn collect_user_indexes_all(
     cycle_ts_us: i64,
 ) -> (
     Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)>,
-    SourceCoverage,
+    CoverageAttempt,
 ) {
     let mut user_indexes = Vec::new();
-    let mut coverage = SourceCoverage::default();
+    let mut coverage = SourceCoverage::new_attempt();
+    record_pool_gaps(pool, &mut coverage);
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     let type_id = user_indexes_type_id(major);
     for db in pool.per_db() {
@@ -234,10 +257,9 @@ async fn collect_user_indexes_all(
             }
             match collect_user_indexes(db.client(), major, config.max_indexes, cycle_ts_us).await {
                 Ok((version, rows, source_total)) => {
-                    coverage.collected += rows.len() as u64;
+                    coverage.record_success(rows.len(), source_total);
                     // Same-statement total; an empty read means an empty
                     // source, so the zero total is exact.
-                    coverage.total += source_total;
                     log_database_collection_finish(
                         type_id,
                         &db.datname,
@@ -263,7 +285,7 @@ async fn collect_user_indexes_all(
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
-                    coverage.other_skips += 1;
+                    coverage.record_other_failure();
                     log_database_collection_skip(
                         type_id,
                         &db.datname,
@@ -275,16 +297,15 @@ async fn collect_user_indexes_all(
                 }
                 Err(err) => {
                     let reason = if is_sqlstate(&err, "57014") {
-                        coverage.timeouts += 1;
+                        coverage.record_timeout();
                         "statement_timeout"
                     } else if is_sqlstate(&err, "42501") {
-                        coverage.permission_skips += 1;
+                        coverage.record_permission_failure();
                         "permission_denied"
                     } else {
-                        coverage.other_skips += 1;
+                        coverage.record_other_failure();
                         "query_failed"
                     };
-                    coverage.unknown_total = true;
                     log_database_collection_skip(
                         type_id,
                         &db.datname,
@@ -297,7 +318,14 @@ async fn collect_user_indexes_all(
             }
         }
     }
-    (user_indexes, coverage)
+    (
+        user_indexes,
+        CoverageAttempt {
+            ts: cycle_ts_us,
+            section_type_id: type_id,
+            coverage,
+        },
+    )
 }
 
 /// What the sized pool sources produced this cycle.
@@ -305,9 +333,9 @@ pub(crate) struct PoolReads {
     pub(crate) statements: Option<(StatementsVersion, Vec<StatementsRow>, u64)>,
     pub(crate) user_tables: Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
     pub(crate) freeze_horizons: Vec<FreezeHorizonRow>,
-    pub(crate) tables_cov: SourceCoverage,
+    pub(crate) tables_attempt: CoverageAttempt,
     pub(crate) user_indexes: Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)>,
-    pub(crate) indexes_cov: SourceCoverage,
+    pub(crate) indexes_attempt: CoverageAttempt,
     pub(crate) deferred: Vec<SourceKind>,
 }
 
@@ -339,7 +367,8 @@ pub(crate) async fn read_pool_sources(
     } else {
         None
     };
-    let (user_tables, freeze_horizons, tables_cov) = if due.has(SourceKind::UserTables) {
+    let tables_type_id = user_tables_type_id(major);
+    let (user_tables, freeze_horizons, tables_attempt) = if due.has(SourceKind::UserTables) {
         if pool_budget.admit(PoolSource::UserTables, cycle_start.elapsed(), due.forced()) {
             let (tables, coverage) =
                 collect_user_tables_all(pool, major, config, cycle_ts_us).await;
@@ -347,28 +376,43 @@ pub(crate) async fn read_pool_sources(
             (tables, freeze, coverage)
         } else {
             deferred.push(SourceKind::UserTables);
-            (Vec::new(), Vec::new(), SourceCoverage::default())
+            (
+                Vec::new(),
+                Vec::new(),
+                CoverageAttempt::not_attempted(cycle_ts_us, tables_type_id),
+            )
         }
     } else {
-        (Vec::new(), Vec::new(), SourceCoverage::default())
+        (
+            Vec::new(),
+            Vec::new(),
+            CoverageAttempt::not_attempted(cycle_ts_us, tables_type_id),
+        )
     };
-    let (user_indexes, indexes_cov) = if due.has(SourceKind::UserIndexes) {
+    let indexes_type_id = user_indexes_type_id(major);
+    let (user_indexes, indexes_attempt) = if due.has(SourceKind::UserIndexes) {
         if pool_budget.admit(PoolSource::UserIndexes, cycle_start.elapsed(), due.forced()) {
             collect_user_indexes_all(pool, major, config, cycle_ts_us).await
         } else {
             deferred.push(SourceKind::UserIndexes);
-            (Vec::new(), SourceCoverage::default())
+            (
+                Vec::new(),
+                CoverageAttempt::not_attempted(cycle_ts_us, indexes_type_id),
+            )
         }
     } else {
-        (Vec::new(), SourceCoverage::default())
+        (
+            Vec::new(),
+            CoverageAttempt::not_attempted(cycle_ts_us, indexes_type_id),
+        )
     };
     PoolReads {
         statements,
         user_tables,
         freeze_horizons,
-        tables_cov,
+        tables_attempt,
         user_indexes,
-        indexes_cov,
+        indexes_attempt,
         deferred,
     }
 }

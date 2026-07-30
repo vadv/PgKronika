@@ -48,7 +48,7 @@ use buffering::{
     push_statements, push_user_indexes, push_user_tables,
 };
 use config::Config;
-use coverage::{CoverageInputs, collect_coverage_records, push_coverage, snapshot_coverage};
+use coverage::{CoverageInputs, SourceCoverage, collect_coverage_records, push_coverage};
 use kronika_layout::{DataRoot, LayoutLimits, QuarantineStatus, TemporaryKind, WriterOwner};
 use kronika_source_log::LogCollector;
 use kronika_source_os::{OsScope, ProcFs, detect_container};
@@ -534,9 +534,9 @@ async fn snapshot_and_seal(
         statements,
         user_tables,
         freeze_horizons,
-        tables_cov,
+        tables_attempt,
         user_indexes,
-        indexes_cov,
+        indexes_attempt,
         deferred,
     } = read_pool_sources(
         pool,
@@ -564,8 +564,8 @@ async fn snapshot_and_seal(
         config,
         &CoverageInputs {
             default_ts: main_src.ts.0,
-            tables: tables_cov,
-            indexes: indexes_cov,
+            tables: tables_attempt,
+            indexes: indexes_attempt,
             statements: &statements,
             plans: &store_plans_rows,
         },
@@ -622,28 +622,28 @@ async fn snapshot_and_seal(
     push_os_sources(&mut buffers, &os)?;
     push_coverage(&mut buffers, &mut interner, &coverage)?;
     let mut completeness = Vec::new();
+    for attempt in [tables_attempt, indexes_attempt] {
+        if attempt.coverage.attempted {
+            completeness.push(
+                attempt
+                    .coverage
+                    .snapshot_marker(attempt.ts, attempt.section_type_id),
+            );
+        }
+    }
     if let Some((version, rows, source_total)) = &statements {
-        completeness.push(snapshot_coverage(
-            rows.first().map_or(main_src.ts.0, |row| row.ts),
-            statements_source::statements_type_id(*version),
-            u8::from(*source_total != u64::try_from(rows.len()).unwrap_or(u64::MAX)),
-            0,
-            *source_total,
-            rows.len(),
-        ));
+        completeness.push(
+            SourceCoverage::successful(*source_total, rows.len()).snapshot_marker(
+                rows.first().map_or(main_src.ts.0, |row| row.ts),
+                statements_source::statements_type_id(*version),
+            ),
+        );
     }
     if let Some(snapshot) = &store_plans_rows {
-        completeness.push(snapshot_coverage(
-            snapshot.snapshot_ts,
-            snapshot.read.type_id(),
-            u8::from(
-                snapshot.source_total
-                    != u64::try_from(snapshot.read.rows_len()).unwrap_or(u64::MAX),
-            ),
-            0,
-            snapshot.source_total,
-            snapshot.read.rows_len(),
-        ));
+        completeness.push(
+            SourceCoverage::successful(snapshot.source_total, snapshot.read.rows_len())
+                .snapshot_marker(snapshot.snapshot_ts, snapshot.read.type_id()),
+        );
     }
     push_snapshot_coverages(&mut buffers, &completeness)?;
     if let Some(collection) = log_collection.as_mut() {
