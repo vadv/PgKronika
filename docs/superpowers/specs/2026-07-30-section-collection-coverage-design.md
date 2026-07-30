@@ -2,8 +2,7 @@
 
 Дата: 2026-07-30.
 
-Статус: решения согласованы, ветка rebased на `main` с PR #146; письменная
-спецификация готова к review перед планом реализации.
+Статус: реализовано в PR #144 поверх `main` с PR #146.
 
 ## Цель
 
@@ -40,8 +39,8 @@ Collector уже пишет `SnapshotCoverageV1` для `statements` и обои
 `CollectionCoverageV1` и только при усечении или ошибке.
 
 Reader умеет разбирать обе coverage-секции для аналитических факторов, но этот
-путь не обслуживает статусы UI-view. `UiSummaryBlock` revision 1 хранит только
-времена снимков, population, notable и статус индекса.
+путь не обслуживает статусы UI-view. Недеплоенный layout `UiSummaryBlock`
+revision 1 можно изменить без миграции и поддержки прежних OVF.
 
 `GET /v1/views/summary` уже работает только поверх OVF `UiSummary`. Ручка не
 декодирует исходные PGM-секции, и это ограничение сохраняется.
@@ -178,10 +177,10 @@ Reader объединяет `SnapshotCoverageV1` и `CollectionCoverageV1` по
 Совпадающие записи дополняют друг друга, а не считаются дубликатами только при
 побайтовом равенстве внутренних представлений.
 
-## UiSummary revision 2
+## UiSummary
 
-`UiSummaryBlock` revision 2 добавляет к каждому `ViewSummary` collection status
-на общей таблице времён:
+Текущий layout `UiSummaryBlock` revision 1 хранит для каждого `ViewSummary`
+collection status на общей таблице времён:
 
 - presence mask для collection status;
 - `collected`;
@@ -196,9 +195,10 @@ Coverage физической секции сопоставляется с view 
 - `pg_stat_user_tables` -> `tables`;
 - `pg_stat_user_indexes` -> `indexes`.
 
-Revision 1 продолжает декодироваться. Для старого блока collection status
-отсутствует. OVF — производный индекс, поэтому новые или перестроенные блоки
-записываются только в revision 2; миграция PGM не требуется.
+Revision не повышается: формат ещё не развёрнут промышленно, поэтому revision 1
+изменяется на месте. Прежний недеплоенный layout намеренно не декодируется.
+OVF является производным индексом и при необходимости строится заново; кода
+миграции нет.
 
 ## Быстрый путь чтения
 
@@ -256,7 +256,7 @@ PGM-файлов.
 ```
 
 Поля `total_quality`, lower bound и оценочный total в этот API не добавляются.
-Для revision 1, старого PGM без достаточного provenance и недоступного view
+При отсутствии достаточного coverage provenance или недоступном view
 `collection=null`.
 
 Строковые значения:
@@ -287,7 +287,8 @@ PGM-файлов.
 - Ошибка одной базы не превращает известную часть total в полный total.
 - Два противоречащих coverage-факта для одного `(section_type_id, ts)` означают
   повреждённый источник и не публикуются.
-- Неизвестная revision `UiSummary` отклоняется; revision 1 и 2 читаются явно.
+- `UiSummary` принимает только текущий revision 1 layout; другие revision и
+  прежний недеплоенный layout отклоняются.
 - Ошибка collection status не превращает успешный bounded summary response в
   transport error, если состояние можно вернуть как `collection` с
   `read_state`.
@@ -314,8 +315,8 @@ PGM-файлов.
 
 ### Reader и OVF
 
-- `UiSummary` revision 2 round-trip сохраняет collection status.
-- Revision 1 декодируется с `collection=None`.
+- `UiSummary` revision 1 round-trip сохраняет collection status.
+- Прежний layout revision 1 без collection status отклоняется.
 - Coverage четырёх физических секций попадает в правильные view.
 - Несогласованные counts, states и дубликаты отклоняются.
 - Bounds учитывают память новых masks и значений.
@@ -343,7 +344,7 @@ PGM-файлов.
    window count.
 2. Ввести общий `cycle_ts_us` для tables/indexes и coverage всех четырёх view.
 3. Научить reader канонически объединять две coverage-секции.
-4. Добавить collection status в `UiSummary` revision 2 с чтением revision 1.
+4. Добавить collection status в единственный layout `UiSummary` revision 1.
 5. Расширить `/v1/views/summary` и OpenAPI.
 6. Закрепить отсутствие PGM scan и фактические counts consumer- и
    qualification-тестами.

@@ -3,8 +3,7 @@ use super::super::bytes::{ByteReader, ByteWriter};
 use super::super::limits::Bounds;
 use super::{IndexStatus, TimeGrid, bit_is_set, mask_len, validate_mask};
 
-const SUMMARY_REVISION_V1: u16 = 1;
-const SUMMARY_REVISION: u16 = 2;
+const SUMMARY_REVISION: u16 = 1;
 
 #[cfg(test)]
 std::thread_local! {
@@ -540,7 +539,7 @@ impl UiSummaryBlock {
         }
         let mut reader = ByteReader::new(body);
         let revision = reader.u16_le()?;
-        if !matches!(revision, SUMMARY_REVISION_V1 | SUMMARY_REVISION) {
+        if revision != SUMMARY_REVISION {
             return Err(BlockError::InvalidEnum);
         }
         let grid =
@@ -595,7 +594,7 @@ impl UiSummaryBlock {
                 populations.push(reader.uvarint(u64::MAX)?);
             }
             let (collection_presence, collections) =
-                decode_collections(&mut reader, revision, presence_len, snapshot_times.len())?;
+                decode_collections(&mut reader, presence_len, snapshot_times.len())?;
             let coverage = reader.take(coverage_len)?.to_vec();
             validate_mask(&coverage, usize::from(grid.bucket_count()))?;
             views.push(ViewSummary::new_with_collection(
@@ -855,13 +854,9 @@ fn read_optional_uvarint(reader: &mut ByteReader<'_>) -> Result<Option<u64>, Blo
 
 fn decode_collections(
     reader: &mut ByteReader<'_>,
-    revision: u16,
     presence_len: usize,
     timestamp_count: usize,
 ) -> Result<(Vec<u8>, Vec<CollectionStatus>), BlockError> {
-    if revision == SUMMARY_REVISION_V1 {
-        return Ok((vec![0_u8; presence_len], Vec::new()));
-    }
     let presence = reader.take(presence_len)?.to_vec();
     validate_mask(&presence, timestamp_count)?;
     let count = presence
@@ -891,7 +886,7 @@ mod tests {
     use crate::overview::bytes::ByteWriter;
     use crate::overview::limits::LIMIT;
 
-    fn revision_one_summary_body() -> Vec<u8> {
+    fn old_summary_body_without_collection() -> Vec<u8> {
         let mut writer = ByteWriter::new();
         writer.u16_le(1);
         writer.i64_le(0);
@@ -911,13 +906,9 @@ mod tests {
         writer.into_bytes()
     }
 
-    fn raw_revision_two_summary_body(
-        collection_mask: u8,
-        read_state: u8,
-        visibility: u8,
-    ) -> Vec<u8> {
+    fn raw_summary_body(collection_mask: u8, read_state: u8, visibility: u8) -> Vec<u8> {
         let mut writer = ByteWriter::new();
-        writer.u16_le(2);
+        writer.u16_le(1);
         writer.i64_le(0);
         writer.u32_le(60);
         writer.u16_le(1);
@@ -1011,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_summary_revision_two_round_trips_collection_and_reads_revision_one() {
+    fn ui_summary_revision_one_round_trips_collection_and_rejects_old_layout() {
         let status = CollectionStatus::new(
             500,
             Some(4_800),
@@ -1044,14 +1035,14 @@ mod tests {
         .expect("summary");
         let body = block.encode_body();
 
-        assert_eq!(u16::from_le_bytes([body[0], body[1]]), 2);
-        let decoded = UiSummaryBlock::decode(&body, &LIMIT).expect("revision two");
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), 1);
+        let decoded = UiSummaryBlock::decode(&body, &LIMIT).expect("revision one");
         assert_eq!(decoded.collection_state_at(1, 100), Some((100, status)));
 
-        let revision_one =
-            UiSummaryBlock::decode(&revision_one_summary_body(), &LIMIT).expect("revision one");
-        assert_eq!(revision_one.population_at(1, 100), Some(500));
-        assert_eq!(revision_one.collection_state_at(1, 100), None);
+        assert!(
+            UiSummaryBlock::decode(&old_summary_body_without_collection(), &LIMIT).is_err(),
+            "the undeployed old layout is intentionally unsupported"
+        );
     }
 
     #[test]
@@ -1142,10 +1133,10 @@ mod tests {
     }
 
     #[test]
-    fn ui_summary_revision_two_rejects_malformed_collection_wire_data() {
+    fn ui_summary_rejects_malformed_collection_wire_data() {
         assert_eq!(
             UiSummaryBlock::decode(
-                &raw_revision_two_summary_body(
+                &raw_summary_body(
                     0b0000_0010,
                     CollectionReadState::SourceLimit.code(),
                     CollectionVisibility::Full.code(),
@@ -1156,20 +1147,20 @@ mod tests {
         );
         assert_eq!(
             UiSummaryBlock::decode(
-                &raw_revision_two_summary_body(1, 99, CollectionVisibility::Full.code()),
+                &raw_summary_body(1, 99, CollectionVisibility::Full.code()),
                 &LIMIT,
             ),
             Err(BlockError::InvalidEnum)
         );
         assert_eq!(
             UiSummaryBlock::decode(
-                &raw_revision_two_summary_body(1, CollectionReadState::SourceLimit.code(), 99,),
+                &raw_summary_body(1, CollectionReadState::SourceLimit.code(), 99,),
                 &LIMIT,
             ),
             Err(BlockError::InvalidEnum)
         );
 
-        let body = raw_revision_two_summary_body(
+        let body = raw_summary_body(
             1,
             CollectionReadState::SourceLimit.code(),
             CollectionVisibility::Full.code(),
@@ -1183,8 +1174,12 @@ mod tests {
             Err(BlockError::AboveBound)
         );
 
-        let mut unknown_revision = revision_one_summary_body();
-        unknown_revision[..2].copy_from_slice(&3_u16.to_le_bytes());
+        let mut unknown_revision = raw_summary_body(
+            1,
+            CollectionReadState::SourceLimit.code(),
+            CollectionVisibility::Full.code(),
+        );
+        unknown_revision[..2].copy_from_slice(&2_u16.to_le_bytes());
         assert_eq!(
             UiSummaryBlock::decode(&unknown_revision, &LIMIT),
             Err(BlockError::InvalidEnum)

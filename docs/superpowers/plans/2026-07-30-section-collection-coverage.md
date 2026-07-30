@@ -4,7 +4,7 @@
 
 **Goal:** Return factual `collected/source_total` status for statements, plans, tables, and indexes with one PostgreSQL source pass and bounded OVF-only web reads.
 
-**Architecture:** Each PostgreSQL query materializes its source once and calculates an exact window count over that materialization. The collector persists one canonical snapshot marker per attempted view read, the reader projects those markers into `UiSummary` revision 2, and `/v1/views/summary` reads only that bounded block.
+**Architecture:** Each PostgreSQL query materializes its source once and calculates an exact window count over that materialization. The collector persists one canonical snapshot marker per attempted view read, the reader projects those markers into the sole `UiSummary` revision 1 layout, and `/v1/views/summary` reads only that bounded block.
 
 **Tech Stack:** Rust 1.96, Tokio PostgreSQL, typed PGM registry sections, PGKOVF binary blocks, Axum, Serde, Utoipa/OpenAPI.
 
@@ -15,7 +15,8 @@
 - `tables` and `indexes` counts aggregate all configured databases under one `cycle_ts_us`.
 - `/v1/views/summary` does not read PGM bodies, dictionaries, raw coverage sections, entity series, or source rows.
 - Existing PGM coverage types remain unchanged.
-- `UiSummary` revision 1 remains readable with `collection=None`; newly built summaries use revision 2.
+- `UiSummary` revision 1 changes in place because the format is not deployed.
+- No legacy decoder, format migration, or compatibility revision is added.
 - Frontend number formatting is outside this implementation.
 
 ---
@@ -290,7 +291,7 @@ Expected: the current byte-for-byte equality rule rejects a legitimate
 
 Require equal timestamps and collected counts. Accept an inexact lower bound not
 greater than an exact total. Use snapshot state/visibility as authoritative when
-present; use collection reason only for legacy collection-only data. Contradicting
+present; use collection reason only for collection-only data. Contradicting
 exact totals, impossible bounds, or state invariants remain corruption.
 
 - [ ] **Step 4: Verify GREEN and commit**
@@ -301,7 +302,7 @@ git add crates/kronika-reader/src/overview/metric_extract.rs
 git commit -m "fix(reader): merge complementary coverage facts"
 ```
 
-### Task 5: `UiSummary` revision 2 collection codec
+### Task 5: `UiSummary` collection codec
 
 **Files:**
 - Modify: `crates/kronika-reader/src/overview/web_index/summary.rs`
@@ -330,7 +331,7 @@ let status = CollectionStatus::new(
     CollectionVisibility::Full,
 )?;
 assert_eq!(decoded.collection_state_at(1, 100), Some((100, status)));
-assert_eq!(decode_revision_one_fixture()?.collection_state_at(1, 100), None);
+assert!(decode_old_layout_fixture().is_err());
 assert!(CollectionStatus::new(
     500, Some(400), CollectionReadState::SourceLimit,
     CollectionVisibility::Full
@@ -357,16 +358,15 @@ pub struct CollectionStatus {
 }
 ```
 
-Revision 2 stores a per-view collection presence mask and one compact record per set
+Revision 1 stores a per-view collection presence mask and one compact record per set
 bit: collected varint, nullable exact total, state code, visibility code. Preserve
 `ViewSummary::new` as the no-collection convenience constructor for existing
 callers; `new_with_collection` performs all cross-field validation.
 
-- [ ] **Step 4: Decode both revisions**
+- [ ] **Step 4: Keep one wire layout**
 
-Branch explicitly on wire revision 1 or 2. Revision 1 reads the old layout and
-creates empty collection masks. Encoding always writes revision 2. Unknown revisions
-return `BlockError::InvalidEnum`.
+Encode and decode only the new revision 1 layout. Reject the previous undeployed
+layout and every other revision. Do not add migration or compatibility code.
 
 - [ ] **Step 5: Include new buffers in memory accounting**
 
@@ -463,7 +463,7 @@ Publish a real OVF from a PGM fixture and assert:
 }
 ```
 
-Add complete, permission/restricted, read-failure/null, and revision-1/null cases.
+Add complete, permission/restricted, read-failure/null, and absent-coverage/null cases.
 Retain assertions for existing `population`, `status`, and `notable`.
 
 - [ ] **Step 2: Verify RED**
