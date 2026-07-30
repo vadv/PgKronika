@@ -5,6 +5,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::{
     Boundary, Classified, Comparison, Evidence, Level, MetricInput, NotClassifiedReason, Verdict,
 };
+use kronika_format::{PartMeta, SectionInput, build_part};
+use kronika_reader::{FactStore, LIMIT, LocalDirSnapshot, OutRow, Value};
+use kronika_registry::pg_log::PgLogLifecycleV1;
+use kronika_registry::{Section, Ts};
 
 use crate::api_error::ErrorCode;
 use crate::ui::catalog::ProjectionCatalog;
@@ -12,12 +16,13 @@ use crate::ui::frame::FrameRequest;
 use crate::ui::frame::cursor::{FrameCursor, SortKey};
 use crate::ui::frame::dto::ClassificationResultDto;
 use crate::ui::frame::projection::{
-    DeltaOperand, ProjectedRow, RowOperands, StatementOperands, TableOperands,
+    DeltaOperand, FrameLimits, ProjectedRow, RowOperands, StatementOperands, TableOperands,
+    project_frame,
 };
 use crate::ui::frame::projection::{ProjectionInput, project_input};
+use crate::ui::frame::spark::attach_sparks;
 use crate::ui::frame::threshold::{FrameThresholdContext, prepare_input};
 use crate::ui::thresholds::OperandKind;
-use kronika_reader::{OutRow, Value};
 
 fn catalog() -> ProjectionCatalog {
     ProjectionCatalog::for_type_ids(&BTreeSet::new())
@@ -476,6 +481,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
         .unwrap_or_else(|error| panic!("{view}: {error:?}"));
         assert_eq!(frame.rows.len(), 1, "{view}");
         assert_eq!(frame.rows[0].cells.len(), expected_cells, "{view}");
+        assert!(frame.rows[0].spark.values.is_empty(), "{view}");
         assert!(
             frame.rows[0]
                 .cells
@@ -526,6 +532,72 @@ fn frame_pagination_filters_then_sorts_by_value_and_entity() {
     assert!(frame.next.is_some());
 }
 
+#[test]
+fn frame_spark_uses_the_selected_view_ovf_series() {
+    let rows = [
+        PgLogLifecycleV1 {
+            ts: Ts(1_500),
+            kind: 0,
+            pid: Some(42),
+            signal: Some(9),
+            shutdown_mode: None,
+            message: None,
+            query_detail: None,
+            dict_dropped_fields: 0,
+        },
+        PgLogLifecycleV1 {
+            ts: Ts(1_600),
+            kind: 0,
+            pid: Some(43),
+            signal: Some(15),
+            shutdown_mode: None,
+            message: None,
+            query_detail: None,
+            dict_dropped_fields: 0,
+        },
+    ];
+    let body = PgLogLifecycleV1::encode(&rows).expect("encode lifecycle fixture");
+    let pgm = build_part(
+        &[SectionInput {
+            type_id: 1_028_001,
+            rows: u32::try_from(rows.len()).expect("fixture rows"),
+            body: &body,
+        }],
+        PartMeta {
+            min_ts: 1_500,
+            max_ts: 1_600,
+        },
+    );
+    let directory = tempfile::tempdir().expect("tempdir");
+    crate::test_layout::write_named_pgm(directory.path(), "frame-events.pgm", &pgm);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish web index");
+    }
+    let state = super::state_for_dir(directory.path());
+    let request =
+        FrameRequest::parse("events", Some("at=1600&span=1ms"), &catalog()).expect("frame request");
+    let mut request_snapshot = (*state.snapshot()).clone();
+    let mut frame = project_frame(
+        &mut request_snapshot,
+        &request,
+        &catalog(),
+        FrameLimits::default(),
+    )
+    .expect("frame projection");
+    assert_eq!(frame.rows.len(), 1);
+    assert!(frame.rows[0].spark.values.is_empty());
+
+    let live = std::sync::Arc::clone(state.overview_view().live());
+    attach_sparks(&request_snapshot, &live, &request, &mut frame).expect("spark merge");
+
+    assert_eq!(frame.rows[0].spark.values.len(), 60);
+    assert!(frame.rows[0].spark.values.iter().any(Option::is_some));
+}
+
 fn operand_row(operands: RowOperands) -> ProjectedRow {
     ProjectedRow {
         entity: vec![1],
@@ -533,6 +605,10 @@ fn operand_row(operands: RowOperands) -> ProjectedRow {
         cells: Vec::new(),
         operands,
         classifications: Vec::new(),
+        spark: crate::ui::frame::dto::SparkDto {
+            values: Vec::new(),
+            complete: false,
+        },
         values: Vec::new(),
         database: None,
         searchable: String::new(),

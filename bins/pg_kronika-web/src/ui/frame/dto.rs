@@ -165,7 +165,7 @@ pub(crate) enum EvidenceDto {
     },
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub(crate) struct SparkDto {
     pub values: Vec<Option<f64>>,
     pub complete: bool,

@@ -12,7 +12,7 @@ use kronika_registry::ColumnType;
 
 use super::FrameRequest;
 use super::cursor::FrameCursor;
-use super::dto::FrameValue;
+use super::dto::{FrameValue, SparkDto};
 use super::query::{filter_sort_page, value_sort_key};
 use super::threshold::{CellClassification, FrameThresholdContext, classify_row};
 use crate::ui::catalog::{ColumnSpec, ProjectionCatalog, ValueType, ViewSpec};
@@ -74,6 +74,7 @@ pub(crate) struct ProjectedRow {
     pub cells: Vec<FrameValue>,
     pub operands: RowOperands,
     pub classifications: Vec<CellClassification>,
+    pub spark: SparkDto,
     pub(crate) values: Vec<(&'static str, FrameValue)>,
     pub(crate) database: Option<String>,
     pub(crate) searchable: String,
@@ -611,6 +612,10 @@ fn row_shell(
             ..RowOperands::default()
         },
         classifications: Vec::new(),
+        spark: SparkDto {
+            values: Vec::new(),
+            complete: false,
+        },
         values: Vec::new(),
         database: text(row, "datname").map(str::to_owned),
         searchable: searchable(row),
