@@ -2,7 +2,8 @@
 
 Дата: 2026-07-30.
 
-Статус: согласовано для реализации после rebase на `main` с PR #146.
+Статус: решения согласованы, ветка rebased на `main` с PR #146; письменная
+спецификация готова к review перед планом реализации.
 
 ## Цель
 
@@ -134,7 +135,9 @@ $2::int8 AS ts_us
 
 ## Coverage collector
 
-Collector формирует `SnapshotCoverageV1` для всех четырёх view:
+Collector формирует `SnapshotCoverageV1` для всех четырёх view. Marker
+записывается для каждой начатой попытки, если collector уже определил физический
+`section_type_id`, включая попытки с permission error и read failure:
 
 | View | `section_type_id` | Область counts |
 | --- | --- | --- |
@@ -151,12 +154,19 @@ Collector формирует `SnapshotCoverageV1` для всех четырёх
 | `collected == source_total`, ошибок нет | `complete` | `full` | точное число |
 | `collected < source_total`, ошибок нет | `source_limit` | `full` | точное число |
 | ossc вернул masked rows | `permission` | `restricted` | точное число |
-| одна из баз не прочитана | `read_failure` | `unknown` | `null` |
+| SQL permission error не позволил прочитать источник | `permission` | `restricted` | `null` |
+| timeout или другая ошибка не позволили прочитать источник | `read_failure` | `unknown` | `null` |
 | collector потерял строки или вышел за форматный предел | `collector_limit_or_loss` | `unknown` | `null` |
 
 Если часть баз не прочитана, `collected` остаётся фактической суммой записанных
 строк успешных баз. Известная часть total может сохраниться во внутреннем
 coverage, но API не выдаёт её как `source_total`.
+
+Если одна попытка содержит несколько причин, состояние выбирается по приоритету:
+`collector_limit_or_loss`, `read_failure`, `permission`, `source_limit`,
+`complete`. `visibility=restricted` применяется только когда все известные
+ограничения вызваны правами; при read failure или collector loss видимость
+считается `unknown`.
 
 `SnapshotCoverageV1` и `CollectionCoverageV1` используют `u32`. Перед
 преобразованием collector проверяет переполнение. Насыщенное значение
@@ -271,6 +281,8 @@ PGM-файлов.
 - `collected` и ненулевой `source_total` не превышают форматные bounds.
 - При `read_state=complete` выполняется `collected == source_total`.
 - При `read_state=source_limit` выполняется `collected < source_total`.
+- Если collection status присутствует, для того же view и cycle timestamp
+  выполняется `population == collection.collected`.
 - `source_total` присутствует в API только при доказанном точном count.
 - Ошибка одной базы не превращает известную часть total в полный total.
 - Два противоречащих coverage-факта для одного `(section_type_id, ts)` означают
