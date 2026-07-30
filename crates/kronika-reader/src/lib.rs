@@ -72,6 +72,9 @@ pub use refresh::{
     classify_transition, part_id,
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta, WebIndexReadError};
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub use snapshot::{qualification_open_unit_calls, qualification_reset_open_unit_calls};
 
 /// Returns the versioned registry-backed all-family parity qualification fixture.
 ///

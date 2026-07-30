@@ -7,14 +7,17 @@ OVF, reader, writer и API реализуются как один текущий
 
 **Статус: PARTIAL.**
 
-- **Уже реализовано:** `/v1/ui/catalog`, `/v1/views/summary` и
-  `/v1/timeline/heatmap` с OpenAPI и integration tests.
-- **Осталось:** `/v1/ui/context`, `/v1/frame/{view}`,
-  `/v1/entity/{view}/{entity}` для point/history и `/v1/storage`;
-  predecessor-aware 1-2-PGM frames, server filter/sort/page counts, lazy
-  detail, bounded history, whole-storage/statvfs/write-rate data; три
+- **Уже реализовано:** `/v1/ui/catalog`, `/v1/views/summary`,
+  `/v1/timeline/heatmap` и bounded `/v1/frame/{view}` для всех девяти views с
+  OpenAPI и integration tests. Frame включает 14 числовых threshold bindings,
+  доказанного predecessor, server filter/sort/page и sparks только из OVF.
+- **Осталось:** `/v1/ui/context`, `/v1/entity/{view}/{entity}` для
+  point/history и `/v1/storage`; lazy detail, bounded history,
+  whole-storage/statvfs/write-rate data; три
   byte-accounted cache с reservation/singleflight/cancellation и N=96/N=1 440
-  resource qualification. Это delivery steps 4-6.
+  qualification для оставшихся consumer. Frame отдельно прошёл структурную
+  qualification на 96 обычных и 1 440 early-sealed сегментах. Это оставшаяся
+  часть delivery steps 4-6.
 
 Первый отдельный vertical slice для `/v1/frame/{view}` и числовых verdicts
 Класса 1 уточнён в
@@ -667,8 +670,8 @@ Gated metric, неполный spark и approximate ranking являются
    `EntitySeries(view)`, bounds, codec и typed identity.
 2. Projection catalog с формулами, gates, presets и availability.
 3. `/v1/timeline/heatmap` и `/v1/views/summary` только поверх OVF.
-4. `/v1/ui/context` и `/v1/frame/{view}` с projection decode,
-   pagination и sparks.
+4. `/v1/frame/{view}` с projection decode, pagination и sparks реализован;
+   `/v1/ui/context` остаётся последующей работой.
 5. `/v1/entity/{view}/{entity}` и lazy row dock.
 6. `/v1/storage`, кеши и end-to-end budget qualification.
 
@@ -677,7 +680,7 @@ Gated metric, неполный spark и approximate ranking являются
 заявленный бюджет.
 
 Числовой vertical slice из
-`2026-07-30-threshold-frame-integration-design.md` реализует frame раньше
+`2026-07-30-threshold-frame-integration-design.md` реализовал frame раньше
 context, но не меняет порядок остальных delivery steps.
 
 ## Проверка контракта

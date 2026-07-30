@@ -63,6 +63,11 @@ fn frame_query_rejects_invalid_shapes_before_storage_access() {
         ),
         (
             "activity",
+            "at=1&sort=query",
+            ErrorCode::InvalidQueryParameter,
+        ),
+        (
+            "activity",
             "at=1&order=sideways",
             ErrorCode::InvalidQueryParameter,
         ),
@@ -532,6 +537,41 @@ fn frame_pagination_filters_then_sorts_by_value_and_entity() {
     assert!(frame.next.is_some());
 }
 
+#[test]
+fn frame_text_sort_pagination_uses_the_bounded_cursor_key_consistently() {
+    let prefix = "x".repeat(64);
+    let raw = "at=20&preset=phase&sort=phase&order=asc&limit=1";
+    let request = FrameRequest::parse("vacuum", Some(raw), &catalog()).expect("first request");
+    let mut input = ProjectionInput::empty(20);
+    for (pid, suffix) in [(2, "a"), (1, "z")] {
+        input.push(
+            "pg_stat_progress_vacuum",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("pid", Value::I64(pid)),
+                ("datid", Value::U64(3)),
+                (
+                    "relid",
+                    Value::U64(u64::try_from(pid).expect("positive fixture pid")),
+                ),
+                ("phase", Value::Str(format!("{prefix}{suffix}"))),
+                ("heap_blks_total", Value::U64(100)),
+                ("heap_blks_scanned", Value::U64(25)),
+            ]),
+        );
+    }
+
+    let first = project_input(&request, &catalog(), input.clone()).expect("first page");
+    assert_eq!(first.rows.len(), 1);
+    let first_pid = first.rows[0].cells[0].clone();
+    let cursor = first.next.expect("next cursor");
+    let raw = format!("{raw}&cursor={cursor}");
+    let request = FrameRequest::parse("vacuum", Some(&raw), &catalog()).expect("second request");
+    let second = project_input(&request, &catalog(), input).expect("second page");
+    assert_eq!(second.rows.len(), 1);
+    assert_ne!(second.rows[0].cells[0], first_pid);
+}
+
 fn frame_event_fixture() -> tempfile::TempDir {
     let rows = [
         PgLogLifecycleV1 {
@@ -579,6 +619,43 @@ fn frame_event_fixture() -> tempfile::TempDir {
     directory
 }
 
+fn frame_many_event_fixture() -> tempfile::TempDir {
+    let rows = (0..201)
+        .map(|index| PgLogLifecycleV1 {
+            ts: Ts(2_000),
+            kind: 0,
+            pid: Some(index),
+            signal: Some(9),
+            shutdown_mode: None,
+            message: None,
+            query_detail: None,
+            dict_dropped_fields: 0,
+        })
+        .collect::<Vec<_>>();
+    let body = PgLogLifecycleV1::encode(&rows).expect("encode bounded lifecycle fixture");
+    let pgm = build_part(
+        &[SectionInput {
+            type_id: 1_028_001,
+            rows: u32::try_from(rows.len()).expect("fixture rows"),
+            body: &body,
+        }],
+        PartMeta {
+            min_ts: 2_000,
+            max_ts: 2_000,
+        },
+    );
+    let directory = tempfile::tempdir().expect("tempdir");
+    crate::test_layout::write_named_pgm(directory.path(), "frame-many-events.pgm", &pgm);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish web index");
+    }
+    directory
+}
+
 #[test]
 fn frame_spark_uses_the_selected_view_ovf_series() {
     let directory = frame_event_fixture();
@@ -586,6 +663,7 @@ fn frame_spark_uses_the_selected_view_ovf_series() {
     let request =
         FrameRequest::parse("events", Some("at=1600&span=1ms"), &catalog()).expect("frame request");
     let mut request_snapshot = (*state.snapshot()).clone();
+    kronika_reader::qualification_reset_open_unit_calls();
     let mut frame = project_frame(
         &mut request_snapshot,
         &request,
@@ -593,12 +671,14 @@ fn frame_spark_uses_the_selected_view_ovf_series() {
         FrameLimits::default(),
     )
     .expect("frame projection");
+    assert_eq!(kronika_reader::qualification_open_unit_calls(), 2);
     assert_eq!(frame.rows.len(), 1);
     assert!(frame.rows[0].spark.values.is_empty());
 
     let live = std::sync::Arc::clone(state.overview_view().live());
     attach_sparks(&request_snapshot, &live, &request, &mut frame).expect("spark merge");
 
+    assert_eq!(kronika_reader::qualification_open_unit_calls(), 2);
     assert_eq!(frame.rows[0].spark.values.len(), 60);
     assert!(frame.rows[0].spark.values.iter().any(Option::is_some));
 }
@@ -642,6 +722,22 @@ async fn frame_http_returns_bounded_classified_shape_and_rejects_before_io() {
             "{uri}: {body}"
         );
     }
+}
+
+#[tokio::test]
+async fn frame_qualification_caps_rows_and_serialized_response() {
+    let directory = frame_many_event_fixture();
+    let (status, body) = super::serve(
+        directory.path(),
+        "/v1/frame/events?at=2000&span=1ms&limit=200",
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["page"]["matched"], 201);
+    assert_eq!(body["page"]["returned"], 200);
+    assert!(body["page"]["next"].is_string());
+    assert!(serde_json::to_vec(&body).expect("serialize").len() <= 1_048_576);
 }
 
 fn operand_row(operands: RowOperands) -> ProjectedRow {

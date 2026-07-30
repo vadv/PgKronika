@@ -112,7 +112,9 @@ impl FrameRequest {
         let sort = view_spec
             .columns
             .iter()
-            .find(|column| column.code == sort && preset.columns.contains(&column.code))
+            .find(|column| {
+                column.code == sort && preset.columns.contains(&column.code) && !column.lazy
+            })
             .map(|column| column.code)
             .ok_or_else(|| {
                 ApiError::invalid_query_parameter(

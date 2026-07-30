@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use super::FrameRequest;
 use super::cursor::SortKey;
 use super::dto::FrameValue;
-use super::projection::{ProjectedRow, ProjectionError, compare_frame_values, cursor_for};
+use super::projection::{ProjectedRow, ProjectionError, cursor_for};
 
 pub(crate) struct PagedRows {
     pub rows: Vec<ProjectedRow>,
@@ -49,12 +49,12 @@ pub(crate) fn filter_sort_page(
 }
 
 fn compare_rows(request: &FrameRequest, left: &ProjectedRow, right: &ProjectedRow) -> Ordering {
-    let left_value = cell(left, request.sort);
-    let right_value = cell(right, request.sort);
-    let order = compare_frame_values(left_value, right_value);
+    let left_value = value_sort_key(cell(left, request.sort));
+    let right_value = value_sort_key(cell(right, request.sort));
+    let order = compare_sort_keys(&left_value, &right_value);
     let order = if request.descending
-        && !matches!(left_value, FrameValue::Null)
-        && !matches!(right_value, FrameValue::Null)
+        && !matches!(left_value, SortKey::Null)
+        && !matches!(right_value, SortKey::Null)
     {
         order.reverse()
     } else {
