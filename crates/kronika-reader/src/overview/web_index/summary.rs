@@ -3,11 +3,157 @@ use super::super::bytes::{ByteReader, ByteWriter};
 use super::super::limits::Bounds;
 use super::{IndexStatus, TimeGrid, bit_is_set, mask_len, validate_mask};
 
-const SUMMARY_REVISION: u16 = 1;
+const SUMMARY_REVISION_V1: u16 = 1;
+const SUMMARY_REVISION: u16 = 2;
 
 #[cfg(test)]
 std::thread_local! {
     static ENCODE_BODY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Outcome of one physical source read represented in the UI summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionReadState {
+    /// Every source row was retained.
+    Complete,
+    /// The collector retained a configured exact subset.
+    SourceLimit,
+    /// `PostgreSQL` permissions hid rows or rejected the read.
+    Permission,
+    /// The source could not be read.
+    ReadFailure,
+    /// A collector bound or loss made the total unsafe.
+    CollectorLimitOrLoss,
+}
+
+impl CollectionReadState {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Complete => 0,
+            Self::SourceLimit => 1,
+            Self::Permission => 2,
+            Self::ReadFailure => 3,
+            Self::CollectorLimitOrLoss => 4,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, BlockError> {
+        match code {
+            0 => Ok(Self::Complete),
+            1 => Ok(Self::SourceLimit),
+            2 => Ok(Self::Permission),
+            3 => Ok(Self::ReadFailure),
+            4 => Ok(Self::CollectorLimitOrLoss),
+            _ => Err(BlockError::InvalidEnum),
+        }
+    }
+}
+
+/// Visibility `PostgreSQL` gave the collector for one source read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionVisibility {
+    /// The source was fully visible.
+    Full,
+    /// Permissions restricted the visible rows.
+    Restricted,
+    /// A failed or lossy read cannot prove visibility.
+    Unknown,
+}
+
+impl CollectionVisibility {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Full => 0,
+            Self::Restricted => 1,
+            Self::Unknown => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, BlockError> {
+        match code {
+            0 => Ok(Self::Full),
+            1 => Ok(Self::Restricted),
+            2 => Ok(Self::Unknown),
+            _ => Err(BlockError::InvalidEnum),
+        }
+    }
+}
+
+/// Factual row counts and source-read state for one view snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionStatus {
+    collected: u64,
+    source_total: Option<u64>,
+    read_state: CollectionReadState,
+    visibility: CollectionVisibility,
+}
+
+impl CollectionStatus {
+    /// Creates a collection status after validating all count/state invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockError::Malformed`] when counts contradict the state or
+    /// visibility.
+    pub fn new(
+        collected: u64,
+        source_total: Option<u64>,
+        read_state: CollectionReadState,
+        visibility: CollectionVisibility,
+    ) -> Result<Self, BlockError> {
+        if source_total.is_some_and(|total| collected > total) {
+            return Err(BlockError::Malformed);
+        }
+        let valid = match read_state {
+            CollectionReadState::Complete => {
+                matches!(visibility, CollectionVisibility::Full)
+                    && matches!(source_total, Some(total) if collected == total)
+            }
+            CollectionReadState::SourceLimit => {
+                matches!(visibility, CollectionVisibility::Full)
+                    && matches!(source_total, Some(total) if collected < total)
+            }
+            CollectionReadState::Permission => {
+                matches!(visibility, CollectionVisibility::Restricted)
+            }
+            CollectionReadState::ReadFailure | CollectionReadState::CollectorLimitOrLoss => {
+                matches!(visibility, CollectionVisibility::Unknown) && source_total.is_none()
+            }
+        };
+        if !valid {
+            return Err(BlockError::Malformed);
+        }
+        Ok(Self {
+            collected,
+            source_total,
+            read_state,
+            visibility,
+        })
+    }
+
+    /// Rows durably retained for the view snapshot.
+    #[must_use]
+    pub const fn collected(self) -> u64 {
+        self.collected
+    }
+
+    /// Exact source row count, or `None` when it was not proven.
+    #[must_use]
+    pub const fn source_total(self) -> Option<u64> {
+        self.source_total
+    }
+
+    /// Result of the source read.
+    #[must_use]
+    pub const fn read_state(self) -> CollectionReadState {
+        self.read_state
+    }
+
+    /// Visibility of the physical source.
+    #[must_use]
+    pub const fn visibility(self) -> CollectionVisibility {
+        self.visibility
+    }
 }
 
 /// Per-snapshot population and collection status of one UI view.
@@ -19,6 +165,8 @@ pub struct ViewSummary {
     snapshot_presence: Vec<u8>,
     notable_presence: Vec<u8>,
     populations: Vec<u64>,
+    collection_presence: Vec<u8>,
+    collections: Vec<CollectionStatus>,
     coverage_mask: Vec<u8>,
 }
 
@@ -61,6 +209,48 @@ impl ViewSummary {
         populations: Vec<u64>,
         bounds: &Bounds,
     ) -> Result<Self, BlockError> {
+        let maximum_mask = mask_len(
+            usize::try_from(bounds.web_summary_timestamps)
+                .map_err(|_error| BlockError::AboveBound)?,
+        );
+        if snapshot_presence.len() > maximum_mask {
+            return Err(BlockError::AboveBound);
+        }
+        let collection_presence = vec![0_u8; snapshot_presence.len()];
+        Self::new_with_collection(
+            view_code,
+            view_revision,
+            status,
+            snapshot_presence,
+            notable_presence,
+            populations,
+            collection_presence,
+            Vec::new(),
+            bounds,
+        )
+    }
+
+    /// Creates one view with per-snapshot collection status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockError`] for invalid identities, masks, counts, state
+    /// invariants, or population values that disagree with `collected`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments are the complete bounded wire representation of one view"
+    )]
+    pub fn new_with_collection(
+        view_code: u16,
+        view_revision: u16,
+        status: IndexStatus,
+        snapshot_presence: Vec<u8>,
+        notable_presence: Vec<u8>,
+        populations: Vec<u64>,
+        collection_presence: Vec<u8>,
+        collections: Vec<CollectionStatus>,
+        bounds: &Bounds,
+    ) -> Result<Self, BlockError> {
         if view_code == 0 || view_revision == 0 {
             return Err(BlockError::Malformed);
         }
@@ -68,14 +258,22 @@ impl ViewSummary {
             usize::try_from(bounds.web_summary_timestamps)
                 .map_err(|_error| BlockError::AboveBound)?,
         );
-        if snapshot_presence.len() > maximum_mask || notable_presence.len() > maximum_mask {
+        if snapshot_presence.len() > maximum_mask
+            || notable_presence.len() > maximum_mask
+            || collection_presence.len() > maximum_mask
+        {
             return Err(BlockError::AboveBound);
         }
         if snapshot_presence.len() != notable_presence.len()
+            || snapshot_presence.len() != collection_presence.len()
             || notable_presence
                 .iter()
                 .zip(&snapshot_presence)
                 .any(|(notable, present)| notable & !present != 0)
+            || collection_presence
+                .iter()
+                .zip(&snapshot_presence)
+                .any(|(collection, present)| collection & !present != 0)
         {
             return Err(BlockError::Malformed);
         }
@@ -86,6 +284,41 @@ impl ViewSummary {
         if populations.len() != set_bits {
             return Err(BlockError::Malformed);
         }
+        let collection_bits = collection_presence
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum::<usize>();
+        if collections.len() != collection_bits {
+            return Err(BlockError::Malformed);
+        }
+        let mut population_index = 0;
+        let mut collection_index = 0;
+        let mask_bits = snapshot_presence
+            .len()
+            .checked_mul(8)
+            .ok_or(BlockError::AboveBound)?;
+        for index in 0..mask_bits {
+            let population = if bit_is_set(&snapshot_presence, index) {
+                let value = populations
+                    .get(population_index)
+                    .copied()
+                    .ok_or(BlockError::Malformed)?;
+                population_index += 1;
+                Some(value)
+            } else {
+                None
+            };
+            if bit_is_set(&collection_presence, index) {
+                let collection = collections
+                    .get(collection_index)
+                    .copied()
+                    .ok_or(BlockError::Malformed)?;
+                collection_index += 1;
+                if population != Some(collection.collected()) {
+                    return Err(BlockError::Malformed);
+                }
+            }
+        }
         Ok(Self {
             view_code,
             view_revision,
@@ -93,6 +326,8 @@ impl ViewSummary {
             snapshot_presence,
             notable_presence,
             populations,
+            collection_presence,
+            collections,
             coverage_mask: Vec::new(),
         })
     }
@@ -133,6 +368,18 @@ impl ViewSummary {
         &self.populations
     }
 
+    /// Collection-status presence bits over the shared timestamp table.
+    #[must_use]
+    pub fn collection_presence(&self) -> &[u8] {
+        &self.collection_presence
+    }
+
+    /// Collection statuses ordered by set bits in `collection_presence`.
+    #[must_use]
+    pub fn collections(&self) -> &[CollectionStatus] {
+        &self.collections
+    }
+
     /// Bucket coverage derived from the shared timestamps.
     #[must_use]
     pub fn coverage_mask(&self) -> &[u8] {
@@ -147,6 +394,16 @@ impl ViewSummary {
             .filter(|candidate| bit_is_set(&self.snapshot_presence, *candidate))
             .count();
         self.populations.get(population_index).copied()
+    }
+
+    fn collection_at_index(&self, index: usize) -> Option<CollectionStatus> {
+        if !bit_is_set(&self.collection_presence, index) {
+            return None;
+        }
+        let collection_index = (0..index)
+            .filter(|candidate| bit_is_set(&self.collection_presence, *candidate))
+            .count();
+        self.collections.get(collection_index).copied()
     }
 }
 
@@ -233,7 +490,10 @@ impl UiSummaryBlock {
         let coverage_len = mask_len(usize::from(grid.bucket_count()));
         for view in &mut views {
             validate_mask(&view.snapshot_presence, snapshot_times.len())?;
-            if view.snapshot_presence.len() != presence_len {
+            validate_mask(&view.collection_presence, snapshot_times.len())?;
+            if view.snapshot_presence.len() != presence_len
+                || view.collection_presence.len() != presence_len
+            {
                 return Err(BlockError::Malformed);
             }
             view.coverage_mask = vec![0_u8; coverage_len];
@@ -279,7 +539,8 @@ impl UiSummaryBlock {
             return Err(BlockError::AboveBound);
         }
         let mut reader = ByteReader::new(body);
-        if reader.u16_le()? != SUMMARY_REVISION {
+        let revision = reader.u16_le()?;
+        if !matches!(revision, SUMMARY_REVISION_V1 | SUMMARY_REVISION) {
             return Err(BlockError::InvalidEnum);
         }
         let grid =
@@ -333,15 +594,19 @@ impl UiSummaryBlock {
             for _ in 0..population_count {
                 populations.push(reader.uvarint(u64::MAX)?);
             }
+            let (collection_presence, collections) =
+                decode_collections(&mut reader, revision, presence_len, snapshot_times.len())?;
             let coverage = reader.take(coverage_len)?.to_vec();
             validate_mask(&coverage, usize::from(grid.bucket_count()))?;
-            views.push(ViewSummary::new(
+            views.push(ViewSummary::new_with_collection(
                 view_code,
                 view_revision,
                 status,
                 presence,
                 notable,
                 populations,
+                collection_presence,
+                collections,
                 bounds,
             )?);
             stored_coverages.push(coverage);
@@ -442,6 +707,27 @@ impl UiSummaryBlock {
         })
     }
 
+    /// Last collection status of `view_code` at or before `at_us`.
+    #[must_use]
+    pub fn collection_state_at(
+        &self,
+        view_code: u16,
+        at_us: i64,
+    ) -> Option<(i64, CollectionStatus)> {
+        let view = self
+            .views
+            .binary_search_by_key(&view_code, ViewSummary::view_code)
+            .ok()
+            .and_then(|index| self.views.get(index))?;
+        let upper = self
+            .snapshot_times
+            .partition_point(|timestamp| *timestamp <= at_us);
+        (0..upper).rev().find_map(|index| {
+            view.collection_at_index(index)
+                .map(|status| (self.snapshot_times[index], status))
+        })
+    }
+
     /// Shared bucket grid, or `None` for the canonical empty summary.
     #[must_use]
     pub const fn grid(&self) -> Option<TimeGrid> {
@@ -469,6 +755,12 @@ impl UiSummaryBlock {
                 .checked_add(view.snapshot_presence.capacity())?
                 .checked_add(view.notable_presence.capacity())?
                 .checked_add(view.populations.capacity().checked_mul(size_of::<u64>())?)?
+                .checked_add(view.collection_presence.capacity())?
+                .checked_add(
+                    view.collections
+                        .capacity()
+                        .checked_mul(size_of::<CollectionStatus>())?,
+                )?
                 .checked_add(view.coverage_mask.capacity())
         })?;
 
@@ -509,6 +801,13 @@ impl UiSummaryBlock {
             for population in &view.populations {
                 writer.uvarint(*population);
             }
+            writer.bytes(&view.collection_presence);
+            for collection in &view.collections {
+                writer.uvarint(collection.collected());
+                write_optional_uvarint(&mut writer, collection.source_total());
+                writer.u8(collection.read_state().code());
+                writer.u8(collection.visibility().code());
+            }
             writer.bytes(&view.coverage_mask);
         }
         writer.into_bytes()
@@ -536,12 +835,111 @@ fn nonnegative_i64(value: i64) -> u64 {
     }
 }
 
+fn write_optional_uvarint(writer: &mut ByteWriter, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            writer.u8(1);
+            writer.uvarint(value);
+        }
+        None => writer.u8(0),
+    }
+}
+
+fn read_optional_uvarint(reader: &mut ByteReader<'_>) -> Result<Option<u64>, BlockError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(reader.uvarint(u64::MAX)?)),
+        _ => Err(BlockError::InvalidEnum),
+    }
+}
+
+fn decode_collections(
+    reader: &mut ByteReader<'_>,
+    revision: u16,
+    presence_len: usize,
+    timestamp_count: usize,
+) -> Result<(Vec<u8>, Vec<CollectionStatus>), BlockError> {
+    if revision == SUMMARY_REVISION_V1 {
+        return Ok((vec![0_u8; presence_len], Vec::new()));
+    }
+    let presence = reader.take(presence_len)?.to_vec();
+    validate_mask(&presence, timestamp_count)?;
+    let count = presence
+        .iter()
+        .map(|byte| byte.count_ones() as usize)
+        .sum::<usize>();
+    let mut collections = Vec::with_capacity(count);
+    for _ in 0..count {
+        collections.push(CollectionStatus::new(
+            reader.uvarint(u64::MAX)?,
+            read_optional_uvarint(reader)?,
+            CollectionReadState::from_code(reader.u8()?)?,
+            CollectionVisibility::from_code(reader.u8()?)?,
+        )?);
+    }
+    Ok((presence, collections))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{IndexStatus, TimeGrid};
-    use super::{ENCODE_BODY_CALLS, SnapshotNeighbors, UiSummaryBlock, ViewSummary};
+    use super::{
+        CollectionReadState, CollectionStatus, CollectionVisibility, ENCODE_BODY_CALLS,
+        SnapshotNeighbors, UiSummaryBlock, ViewSummary,
+    };
     use crate::overview::block::BlockError;
+    use crate::overview::bytes::ByteWriter;
     use crate::overview::limits::LIMIT;
+
+    fn revision_one_summary_body() -> Vec<u8> {
+        let mut writer = ByteWriter::new();
+        writer.u16_le(1);
+        writer.i64_le(0);
+        writer.u32_le(60);
+        writer.u16_le(1);
+        writer.u32_le(1);
+        writer.uvarint(100);
+        writer.u16_le(1);
+        writer.u16_le(1);
+        writer.u16_le(1);
+        writer.u8(IndexStatus::Complete.code());
+        writer.u8(1);
+        writer.u8(0);
+        writer.u32_le(1);
+        writer.uvarint(500);
+        writer.u8(1);
+        writer.into_bytes()
+    }
+
+    fn raw_revision_two_summary_body(
+        collection_mask: u8,
+        read_state: u8,
+        visibility: u8,
+    ) -> Vec<u8> {
+        let mut writer = ByteWriter::new();
+        writer.u16_le(2);
+        writer.i64_le(0);
+        writer.u32_le(60);
+        writer.u16_le(1);
+        writer.u32_le(1);
+        writer.uvarint(100);
+        writer.u16_le(1);
+        writer.u16_le(1);
+        writer.u16_le(1);
+        writer.u8(IndexStatus::Complete.code());
+        writer.u8(1);
+        writer.u8(0);
+        writer.u32_le(1);
+        writer.uvarint(500);
+        writer.u8(collection_mask);
+        writer.uvarint(500);
+        writer.u8(1);
+        writer.uvarint(4_800);
+        writer.u8(read_state);
+        writer.u8(visibility);
+        writer.u8(1);
+        writer.into_bytes()
+    }
 
     fn summary_with_presence(
         snapshot_times: &[i64],
@@ -610,6 +1008,187 @@ mod tests {
         assert_eq!(decoded, block);
         assert_eq!(decoded.views()[0].view_code(), 1);
         assert_eq!(decoded.snapshot_times(), &[0, 60_000_000, 120_000_000]);
+    }
+
+    #[test]
+    fn ui_summary_revision_two_round_trips_collection_and_reads_revision_one() {
+        let status = CollectionStatus::new(
+            500,
+            Some(4_800),
+            CollectionReadState::SourceLimit,
+            CollectionVisibility::Full,
+        )
+        .expect("valid source limit");
+        assert_eq!(status.collected(), 500);
+        assert_eq!(status.source_total(), Some(4_800));
+        assert_eq!(status.read_state(), CollectionReadState::SourceLimit);
+        assert_eq!(status.visibility(), CollectionVisibility::Full);
+        let view = ViewSummary::new_with_collection(
+            1,
+            1,
+            IndexStatus::Complete,
+            vec![1],
+            vec![0],
+            vec![500],
+            vec![1],
+            vec![status],
+            &LIMIT,
+        )
+        .expect("view with collection");
+        let block = UiSummaryBlock::new(
+            TimeGrid::for_range(100, 100).expect("grid"),
+            vec![100],
+            vec![view],
+            &LIMIT,
+        )
+        .expect("summary");
+        let body = block.encode_body();
+
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), 2);
+        let decoded = UiSummaryBlock::decode(&body, &LIMIT).expect("revision two");
+        assert_eq!(decoded.collection_state_at(1, 100), Some((100, status)));
+
+        let revision_one =
+            UiSummaryBlock::decode(&revision_one_summary_body(), &LIMIT).expect("revision one");
+        assert_eq!(revision_one.population_at(1, 100), Some(500));
+        assert_eq!(revision_one.collection_state_at(1, 100), None);
+    }
+
+    #[test]
+    fn collection_status_rejects_non_factual_state_combinations() {
+        let invalid = [
+            (
+                500,
+                Some(400),
+                CollectionReadState::SourceLimit,
+                CollectionVisibility::Full,
+            ),
+            (
+                500,
+                Some(501),
+                CollectionReadState::Complete,
+                CollectionVisibility::Full,
+            ),
+            (
+                500,
+                Some(500),
+                CollectionReadState::SourceLimit,
+                CollectionVisibility::Full,
+            ),
+            (
+                500,
+                Some(500),
+                CollectionReadState::ReadFailure,
+                CollectionVisibility::Unknown,
+            ),
+            (
+                500,
+                Some(500),
+                CollectionReadState::CollectorLimitOrLoss,
+                CollectionVisibility::Unknown,
+            ),
+            (
+                500,
+                None,
+                CollectionReadState::Permission,
+                CollectionVisibility::Full,
+            ),
+        ];
+        for (collected, total, read_state, visibility) in invalid {
+            assert_eq!(
+                CollectionStatus::new(collected, total, read_state, visibility),
+                Err(BlockError::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn collection_presence_requires_the_same_snapshot_population() {
+        let status = CollectionStatus::new(
+            5,
+            Some(10),
+            CollectionReadState::SourceLimit,
+            CollectionVisibility::Full,
+        )
+        .expect("valid status");
+        assert_eq!(
+            ViewSummary::new_with_collection(
+                1,
+                1,
+                IndexStatus::Complete,
+                vec![1],
+                vec![0],
+                vec![6],
+                vec![1],
+                vec![status],
+                &LIMIT,
+            ),
+            Err(BlockError::Malformed)
+        );
+        assert_eq!(
+            ViewSummary::new_with_collection(
+                1,
+                1,
+                IndexStatus::Complete,
+                vec![1],
+                vec![0],
+                vec![5],
+                vec![2],
+                vec![status],
+                &LIMIT,
+            ),
+            Err(BlockError::Malformed)
+        );
+    }
+
+    #[test]
+    fn ui_summary_revision_two_rejects_malformed_collection_wire_data() {
+        assert_eq!(
+            UiSummaryBlock::decode(
+                &raw_revision_two_summary_body(
+                    0b0000_0010,
+                    CollectionReadState::SourceLimit.code(),
+                    CollectionVisibility::Full.code(),
+                ),
+                &LIMIT,
+            ),
+            Err(BlockError::Malformed)
+        );
+        assert_eq!(
+            UiSummaryBlock::decode(
+                &raw_revision_two_summary_body(1, 99, CollectionVisibility::Full.code()),
+                &LIMIT,
+            ),
+            Err(BlockError::InvalidEnum)
+        );
+        assert_eq!(
+            UiSummaryBlock::decode(
+                &raw_revision_two_summary_body(1, CollectionReadState::SourceLimit.code(), 99,),
+                &LIMIT,
+            ),
+            Err(BlockError::InvalidEnum)
+        );
+
+        let body = raw_revision_two_summary_body(
+            1,
+            CollectionReadState::SourceLimit.code(),
+            CollectionVisibility::Full.code(),
+        );
+        let tight = crate::overview::limits::Bounds {
+            web_summary_decoded_bytes: body.len() as u64 - 1,
+            ..LIMIT
+        };
+        assert_eq!(
+            UiSummaryBlock::decode(&body, &tight),
+            Err(BlockError::AboveBound)
+        );
+
+        let mut unknown_revision = revision_one_summary_body();
+        unknown_revision[..2].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(
+            UiSummaryBlock::decode(&unknown_revision, &LIMIT),
+            Err(BlockError::InvalidEnum)
+        );
     }
 
     #[test]
@@ -787,6 +1366,8 @@ mod tests {
                     view.snapshot_presence.capacity()
                         + view.notable_presence.capacity()
                         + view.populations.capacity() * size_of::<u64>()
+                        + view.collection_presence.capacity()
+                        + view.collections.capacity() * size_of::<CollectionStatus>()
                         + view.coverage_mask.capacity()
                 })
                 .sum::<usize>();
