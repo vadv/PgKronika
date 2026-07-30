@@ -86,21 +86,6 @@ pub(crate) fn value_sort_key(value: &FrameValue) -> SortKey {
     }
 }
 
-fn compare_sort_keys(left: &SortKey, right: &SortKey) -> Ordering {
-    match (left, right) {
-        (SortKey::Null, SortKey::Null) => Ordering::Equal,
-        (SortKey::Null, _) => Ordering::Greater,
-        (_, SortKey::Null) => Ordering::Less,
-        (SortKey::Signed(left), SortKey::Signed(right))
-        | (SortKey::Timestamp(left), SortKey::Timestamp(right)) => left.cmp(right),
-        (SortKey::Unsigned(left), SortKey::Unsigned(right)) => left.cmp(right),
-        (SortKey::Float(left), SortKey::Float(right)) => left.total_cmp(right),
-        (SortKey::Boolean(left), SortKey::Boolean(right)) => left.cmp(right),
-        (SortKey::TextPrefix(left), SortKey::TextPrefix(right)) => left.cmp(right),
-        (left, right) => left.tag().cmp(&right.tag()),
-    }
-}
-
 fn compare_values(left: &FrameValue, right: &FrameValue) -> Ordering {
     match (left, right) {
         (FrameValue::Null, FrameValue::Null) => Ordering::Equal,
@@ -119,19 +104,5 @@ const fn frame_value_tag(value: &FrameValue) -> u8 {
         FrameValue::Number(_) => 1,
         FrameValue::Boolean(_) => 2,
         FrameValue::String(_) => 3,
-    }
-}
-
-impl SortKey {
-    pub(crate) const fn tag(&self) -> u8 {
-        match self {
-            Self::Null => 0,
-            Self::Signed(_) => 1,
-            Self::Unsigned(_) => 2,
-            Self::Float(_) => 3,
-            Self::Boolean(_) => 4,
-            Self::Timestamp(_) => 5,
-            Self::TextPrefix(_) => 6,
-        }
     }
 }

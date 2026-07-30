@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
@@ -487,6 +486,7 @@ fn resolve_snapshot(
 ) -> Result<ResolvedSnapshot, FrameError> {
     let mut snapshots = BTreeMap::<i64, SnapshotEvidence>::new();
     let mut fallback_quality = None;
+    let mut next = None;
     let mut descriptors = snapshot.sealed_descriptors().collect::<Vec<_>>();
     descriptors
         .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
@@ -506,51 +506,56 @@ fn resolve_snapshot(
         if view.view_revision() != request.view.revision {
             continue;
         }
-        for (index, timestamp) in summary.snapshot_times().iter().copied().enumerate() {
-            if view
-                .snapshot_presence()
-                .get(index / 8)
-                .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
-            {
-                snapshots.insert(
-                    timestamp,
-                    SnapshotEvidence {
-                        descriptor,
-                        quality,
-                    },
-                );
+        let evidence = SnapshotEvidence {
+            descriptor,
+            quality,
+        };
+        let local_neighbors = summary.snapshot_neighbors(request.view.code, request.at_us);
+        if let Some(local_neighbors) = local_neighbors {
+            if let Some(previous) = local_neighbors.previous {
+                snapshots.insert(previous, evidence);
             }
+            snapshots.insert(local_neighbors.current, evidence);
+        }
+        let local_next = local_neighbors.map_or_else(
+            || {
+                let upper = summary
+                    .snapshot_times()
+                    .partition_point(|timestamp| *timestamp <= request.at_us);
+                (upper..summary.snapshot_times().len())
+                    .find(|index| {
+                        view.snapshot_presence()
+                            .get(index / 8)
+                            .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
+                    })
+                    .map(|index| summary.snapshot_times()[index])
+            },
+            |local_neighbors| local_neighbors.next,
+        );
+        if let Some(local_next) = local_next {
+            next = Some(next.map_or(local_next, |current: i64| current.min(local_next)));
         }
     }
-    let all_times = snapshots.keys().copied().collect::<Vec<_>>();
 
-    let upper = all_times.partition_point(|timestamp| *timestamp <= request.at_us);
-    let current = upper
-        .checked_sub(1)
-        .and_then(|index| all_times.get(index))
-        .copied();
-    let next = all_times.get(upper).copied();
-    let neighbors = current.map(|current| SnapshotNeighbors {
-        previous: upper
-            .checked_sub(2)
-            .and_then(|index| all_times.get(index))
-            .copied(),
+    // Each summary's two newest candidates are sufficient for the global pair.
+    let mut newest = snapshots.iter().rev();
+    let current_evidence = newest
+        .next()
+        .map(|(timestamp, evidence)| (*timestamp, *evidence));
+    let previous_evidence = newest
+        .next()
+        .map(|(timestamp, evidence)| (*timestamp, *evidence));
+    let neighbors = current_evidence.map(|(current, _evidence)| SnapshotNeighbors {
+        previous: previous_evidence.map(|(previous, _evidence)| previous),
         current,
         next,
     });
-    let current_evidence = current
-        .and_then(|timestamp| snapshots.get(&timestamp))
-        .copied();
-    let previous_evidence = neighbors
-        .and_then(|neighbors| neighbors.previous)
-        .and_then(|timestamp| snapshots.get(&timestamp))
-        .copied();
     Ok(ResolvedSnapshot {
         neighbors,
-        current_descriptor: current_evidence.map(|evidence| evidence.descriptor),
-        previous_descriptor: previous_evidence.map(|evidence| evidence.descriptor),
-        current_quality: current_evidence.map(|evidence| evidence.quality),
-        previous_quality: previous_evidence.map(|evidence| evidence.quality),
+        current_descriptor: current_evidence.map(|(_timestamp, evidence)| evidence.descriptor),
+        previous_descriptor: previous_evidence.map(|(_timestamp, evidence)| evidence.descriptor),
+        current_quality: current_evidence.map(|(_timestamp, evidence)| evidence.quality),
+        previous_quality: previous_evidence.map(|(_timestamp, evidence)| evidence.quality),
         fallback_quality,
         next,
     })
@@ -590,7 +595,12 @@ fn merge_summary_quality(
 
 impl fmt::Display for ProjectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::MissingCatalogView => f.write_str("catalog view is missing"),
+            Self::MissingPreset => f.write_str("catalog preset is missing"),
+            Self::InvalidValue(name) => write!(f, "invalid {name} value"),
+            Self::Cursor => f.write_str("cursor anchor is missing"),
+        }
     }
 }
 
@@ -1639,18 +1649,6 @@ fn unsigned_integer(row: &OutRow, name: &str) -> Option<u64> {
         Some(Value::U64(value)) => Some(*value),
         Some(Value::I64(value)) => u64::try_from(*value).ok(),
         _ => None,
-    }
-}
-
-pub(crate) fn compare_frame_values(left: &FrameValue, right: &FrameValue) -> Ordering {
-    match (left, right) {
-        (FrameValue::Null, FrameValue::Null) => Ordering::Equal,
-        (FrameValue::Null, _) => Ordering::Greater,
-        (_, FrameValue::Null) => Ordering::Less,
-        (FrameValue::Number(left), FrameValue::Number(right)) => left.total_cmp(right),
-        (FrameValue::Boolean(left), FrameValue::Boolean(right)) => left.cmp(right),
-        (FrameValue::String(left), FrameValue::String(right)) => left.cmp(right),
-        (left, right) => value_sort_key(left).tag().cmp(&value_sort_key(right).tag()),
     }
 }
 

@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "frame contracts are wired into projection and HTTP consumers in later tasks"
-)]
-
 pub(crate) mod cursor;
 pub(crate) mod dto;
 pub(crate) mod projection;
