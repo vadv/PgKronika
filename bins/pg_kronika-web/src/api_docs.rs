@@ -36,6 +36,7 @@ fn configured() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::overview::handlers::events))
         .routes(routes!(crate::overview::handlers::health))
         .routes(routes!(crate::ui::handlers::heatmap))
+        .routes(routes!(crate::ui::handlers::frame))
         .routes(routes!(crate::ui::handlers::catalog))
         .routes(routes!(crate::ui::handlers::summary))
         .routes(routes!(crate::handlers::anomalies::anomalies))
@@ -69,6 +70,7 @@ mod tests {
         ("GET", "/v1/timeline/events", "events"),
         ("GET", "/v1/timeline/health", "health"),
         ("GET", "/v1/timeline/heatmap", "heatmap"),
+        ("GET", "/v1/frame/{view}", "frame"),
         ("GET", "/v1/ui/catalog", "catalog"),
         ("GET", "/v1/views/summary", "summary"),
         ("GET", "/v1/anomalies", "anomalies"),
@@ -123,6 +125,7 @@ mod tests {
             ("events", "timeline"),
             ("health", "timeline"),
             ("heatmap", "ui"),
+            ("frame", "ui"),
             ("catalog", "ui"),
             ("summary", "ui"),
             ("anomalies", "analytics"),
@@ -162,6 +165,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn frame_declares_only_its_bounded_contract_responses() {
+        let document = serde_json::to_value(document()).expect("serialize OpenAPI");
+        let operation = &document["paths"]["/v1/frame/{view}"]["get"];
+        let responses = operation["responses"].as_object().expect("frame responses");
+        assert_eq!(
+            responses.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["200", "400", "401", "410", "413", "500"]
+        );
+        assert_eq!(
+            responses["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/FrameResponse"
+        );
     }
 
     #[test]

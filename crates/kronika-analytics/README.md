@@ -127,8 +127,23 @@ must be passed as `MetricInput::NotApplicable`.
 
 The catalog is a static slice and lookup is O(1). One classification is
 deterministic, allocation-free, I/O-free, clock-free, and O(1); callers provide
-all operands including current time for age policies. No HTTP response, OpenAPI
-schema, or embedded-UI mapping consumes this catalog yet.
+all operands including current time for age policies.
+
+The bounded `GET /v1/frame/{view}` adapter in `pg_kronika-web` is the first
+consumer. Its exhaustive manifest binds 14 per-cell numeric policies and
+defers the other 55 `MetricId` values with typed reasons. Web prepares exact
+typed operands from a current snapshot and proven predecessor, then serializes
+the returned `Classified`; it does not copy policy numbers, operators, zero
+semantics, boundaries, or evidence rules. No binding and a bound input that
+returns `NotClassifiedReason` remain different wire states. Config-bound
+autovacuum policies stay deferred until relation reloptions are durably
+collected. Frame reads the exact sealed descriptor selected by `UiSummary`;
+planning settings come from that same PGM. Delta views admit a predecessor
+only within their typed 15-minute `max_rate_gap`, otherwise the cell remains
+gap/not-classified and the second PGM is not opened. When two PGMs are needed,
+they share one row, cell, and owned-byte materialization ceiling. Search is
+limited to the public label and selected non-lazy cells returned by the frame.
+The production frontend is not part of this integration.
 
 This Class 1 contract answers whether an observation crossed a fixed operator
 policy. The separate [`anomaly`](src/anomaly/mod.rs) module implements Class 2:

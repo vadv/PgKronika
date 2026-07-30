@@ -55,15 +55,16 @@ pub use overview::{
     METRIC_FLAG_CANONICAL, ManifestEntryDescriptor, MetricAggregation, MetricStatus, PersistError,
     PersistFailureClass, PersistMode, PersistModeSnapshot, PersistenceProbeOutcome, ResetMarker,
     ResetMarkersBlock, ResolvedPattern, SealOutcome, SegmentContext, SegmentFacts,
-    SourceDescriptor, SourceError, SourceManifestBlock, StringTableBlock, TargetedDictionaryRead,
-    TargetedDictionaryStats, TimeGrid, UiSummaryBlock, ViewSummary, dictionary_context_id,
-    lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
+    SnapshotNeighbors, SourceDescriptor, SourceError, SourceManifestBlock, StringTableBlock,
+    TargetedDictionaryRead, TargetedDictionaryStats, TimeGrid, UiSummaryBlock, ViewSummary,
+    dictionary_context_id, lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
-    OutRow, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SectionPage, SeriesDiff,
-    SeriesValues, Value, apply_collection_gating, apply_gating, diff_section, gate_readings,
-    gauge_section, latest_section_row, logical_section, section, section_with_limits, sections,
+    OutRow, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SealedQuerySession,
+    SectionPage, SeriesDiff, SeriesValues, Value, apply_collection_gating, apply_gating,
+    diff_section, gate_readings, gauge_section, latest_section_row, logical_section, section,
+    section_with_limits, sections, sections_from_sealed_descriptor_with_limits,
     sections_with_limits, select_gate,
 };
 pub use refresh::{
@@ -72,6 +73,9 @@ pub use refresh::{
     classify_transition, part_id,
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta, WebIndexReadError};
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub use snapshot::{qualification_open_unit_calls, qualification_reset_open_unit_calls};
 
 /// Returns the versioned registry-backed all-family parity qualification fixture.
 ///

@@ -49,6 +49,16 @@ pub(crate) fn write_named_pgm(root: &Path, name: &str, bytes: &[u8]) -> PathBuf 
     path
 }
 
+#[allow(
+    dead_code,
+    reason = "used by the feature-gated structural qualification test"
+)]
+pub(crate) fn write_segment_pgm(root: &Path, segment_id: i64, bytes: &[u8]) -> PathBuf {
+    let path = file_path(root, address(segment_id), FileKind::Pgm);
+    std::fs::write(&path, bytes).expect("write fixture PGM");
+    path
+}
+
 pub(crate) fn journal_bytes(segment_id: SegmentId, parts: &[&[u8]]) -> Vec<u8> {
     let mut body = Vec::new();
     for part in parts {

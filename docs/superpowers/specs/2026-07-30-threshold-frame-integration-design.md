@@ -2,7 +2,7 @@
 
 Дата: 2026-07-30.
 
-Статус: утверждено для отдельного PR после слияния PR #140 и PR #145.
+Статус: реализовано в отдельной ветке после слияния PR #140 и PR #145.
 
 Пошаговая реализация:
 `../plans/2026-07-30-threshold-frame-integration.md`.
@@ -29,10 +29,10 @@ registry type IDs, HTTP routes и UI columns.
 - девять стабильных `WebView`;
 - сгенерированный многофайловый OpenAPI.
 
-`GET /v1/frame/{view}` ещё не существует. Production frontend также не
-реализован: embedded `static/index.html` остаётся заглушкой. Поэтому отдельный
-PR заканчивается проверяемым API vertical slice, а не декоративной клиентской
-подсветкой.
+До integration PR `GET /v1/frame/{view}` не существовал. Production frontend
+по-прежнему не реализован: embedded `static/index.html` остаётся заглушкой.
+Результатом является проверяемый API vertical slice, а не декоративная
+клиентская подсветка.
 
 Текущий runtime обслуживает один storage root и не поддерживает выбор другого
 root в HTTP API. Новый endpoint не принимает устаревший параметр `source` из
@@ -182,7 +182,9 @@ pub fn snapshot_neighbors(
 Frame читает PGM, содержащий `current`. Второй PGM разрешён только когда
 cumulative column требует predecessor, а `UiSummary` доказал его timestamp.
 Промежуточные пустые PGM не читаются. Gap, reset, смена identity или превышение
-`max_rate_gap` дают `NotClassified`, а не приблизительный delta.
+типизированного `max_rate_gap=15m` дают `NotClassified`, а не приблизительный
+delta; при превышении границы второй PGM не открывается. Настройка
+`track_planning` берётся только из того же PGM, что и current snapshot.
 
 ### Endpoint
 
@@ -198,7 +200,7 @@ GET /v1/frame/{view}
 | `span` | spark range; default `1h`, maximum `24h` |
 | `preset` | optional; default — первый preset view |
 | `database` | optional точный database label для database-scoped view |
-| `q` | optional UTF-8 substring filter, не больше 256 bytes |
+| `q` | optional UTF-8 substring filter по public label и возвращаемым selected non-lazy cells, не больше 256 bytes |
 | `sort` | optional column code; default из preset |
 | `order` | `asc` или `desc`; default из preset |
 | `limit` | `1..=200`, default `100` |
@@ -424,6 +426,20 @@ binding operands или evidence JSON требуют явного projection rev
 - Пороги и операторы остаются только в `kronika-analytics`.
 - DTO/OpenAPI и generated files совпадают.
 - Focused, workspace и dependency gates проходят.
+
+## Реализация и qualification
+
+Frame реализован для всех девяти `WebView`. Manifest покрывает 69 `MetricId`
+ровно один раз: 14 `Bound` и 55 `Deferred`. Exact snapshot и predecessor
+выбираются по `UiSummary`; projection открывает не более двух PGM, а spark
+читает только `EntitySeries` выбранного view. Lazy query, plan и message поля
+во frame не возвращаются.
+
+Instrumented fixture содержит 96 обычных, 1 440 early-sealed и два process
+сегмента. Выбранный view отсутствует во всех промежуточных сегментах, current
+содержит 201 строку и EntitySeries top-K misses. Qualification доказала два
+открытия PGM до и после spark, ограничение страницы 200 строками и
+сериализованный ответ не более 1 МиБ.
 
 ## Последующие работы
 

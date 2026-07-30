@@ -2689,7 +2689,187 @@ fn evidence_binary(kind: &str, path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use kronika_registry::StrId;
+    use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::os_process::OsProcess;
+
     use super::*;
+    use crate::ui::catalog::ProjectionCatalog;
+    use crate::ui::frame::FrameRequest;
+    use crate::ui::frame::dto::FrameResponse;
+    use crate::ui::frame::projection::{FrameLimits, project_frame};
+    use crate::ui::frame::spark::attach_sparks;
+
+    const FRAME_NORMAL_SEGMENTS: usize = 96;
+    const FRAME_EARLY_SEALED_SEGMENTS: usize = 1_440;
+    const FRAME_MATCHING_ROWS: usize = 201;
+    const FRAME_RESPONSE_MAX_BYTES: usize = 1_048_576;
+
+    fn structural_bgwriter_part(ts_us: i64) -> Vec<u8> {
+        let body = BgwriterCheckpointer::encode(&[BgwriterCheckpointer {
+            ts: Ts(ts_us),
+            checkpoints_timed: 0,
+            checkpoints_req: 0,
+            checkpoint_write_time: 0.0,
+            checkpoint_sync_time: 0.0,
+            buffers_checkpoint: 0,
+            restartpoints_timed: None,
+            restartpoints_req: None,
+            restartpoints_done: None,
+            buffers_clean: 0,
+            maxwritten_clean: 0,
+            buffers_backend: Some(0),
+            buffers_backend_fsync: Some(0),
+            buffers_alloc: 0,
+            bgwriter_stats_reset: Ts(ts_us),
+            checkpointer_stats_reset: None,
+        }])
+        .expect("encode structural bgwriter row");
+        build_part(
+            &[SectionInput {
+                type_id: 1_006_001,
+                rows: 1,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: ts_us,
+                max_ts: ts_us,
+            },
+        )
+    }
+
+    fn structural_process_part(ts_us: i64, rows: usize) -> Vec<u8> {
+        let rows = (0..rows)
+            .map(|index| {
+                let index = i64::try_from(index).expect("fixture row index");
+                OsProcess {
+                    ts: Ts(ts_us),
+                    pid: i32::try_from(index).expect("fixture pid"),
+                    starttime: Ts(1_700_000_000_000_000 + index),
+                    ppid: 1,
+                    uid: 1_000,
+                    euid: 1_000,
+                    gid: 1_000,
+                    egid: 1_000,
+                    state: b'S',
+                    num_threads: 1,
+                    tty: 0,
+                    comm: StrId(0),
+                    cmdline: None,
+                    utime: index,
+                    stime: index,
+                    nice: 0,
+                    prio: 20,
+                    rtprio: 0,
+                    policy: 0,
+                    curcpu: 0,
+                    rundelay_ns: 0,
+                    blkdelay_ticks: 0,
+                    nvcsw: 0,
+                    nivcsw: 0,
+                    minflt: 0,
+                    majflt: 0,
+                    vmem_kb: 2_048,
+                    rmem_kb: 1_024 + index,
+                    vswap_kb: 0,
+                    syscr: None,
+                    syscw: None,
+                    rchar: None,
+                    wchar: None,
+                    read_bytes: None,
+                    write_bytes: None,
+                    cancelled_write_bytes: None,
+                    exit_signal: 17,
+                    scope: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let body = OsProcess::encode(&rows).expect("encode structural process rows");
+        build_part(
+            &[SectionInput {
+                type_id: 1_100_001,
+                rows: u32::try_from(rows.len()).expect("fixture row count"),
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: ts_us,
+                max_ts: ts_us,
+            },
+        )
+    }
+
+    #[test]
+    #[ignore = "creates 1,538 PGM/OVF pairs for the structural frame read-budget gate"]
+    fn frame_structural_read_budget_is_independent_of_segment_count() {
+        const FIRST_TS_US: i64 = 1_721_865_600_000_000;
+        let directory = tempfile::tempdir().expect("structural frame fixture");
+        crate::test_layout::write_segment_pgm(
+            directory.path(),
+            FIRST_TS_US,
+            &structural_process_part(FIRST_TS_US, 1),
+        );
+        let intermediate = FRAME_NORMAL_SEGMENTS + FRAME_EARLY_SEALED_SEGMENTS;
+        for index in 0..intermediate {
+            let ts_us = FIRST_TS_US + i64::try_from(index + 1).expect("segment offset");
+            crate::test_layout::write_segment_pgm(
+                directory.path(),
+                ts_us,
+                &structural_bgwriter_part(ts_us),
+            );
+        }
+        let current_ts_us = FIRST_TS_US + i64::try_from(intermediate + 1).expect("current offset");
+        crate::test_layout::write_segment_pgm(
+            directory.path(),
+            current_ts_us,
+            &structural_process_part(current_ts_us, FRAME_MATCHING_ROWS),
+        );
+
+        let snapshot = LocalDirSnapshot::open(directory.path()).expect("open structural fixture");
+        assert_eq!(snapshot.sealed_descriptors().count(), intermediate + 2);
+        let store = FactStore::new(directory.path());
+        for descriptor in snapshot.sealed_descriptors() {
+            snapshot
+                .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+                .expect("publish structural OVF");
+        }
+        let state = AppState::new(snapshot).expect("build structural frame state");
+        let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+        let raw = format!("at={current_ts_us}&span=24h&preset=cpu&limit=200");
+        let request =
+            FrameRequest::parse("processes", Some(&raw), &catalog).expect("frame request");
+        let request_snapshot = (*state.snapshot()).clone();
+
+        kronika_reader::qualification_reset_open_unit_calls();
+        let mut frame = project_frame(
+            &request_snapshot,
+            &request,
+            &catalog,
+            FrameLimits::default(),
+        )
+        .expect("project structural frame");
+        assert_eq!(kronika_reader::qualification_open_unit_calls(), 2);
+        assert_eq!(frame.matched, FRAME_MATCHING_ROWS);
+        assert_eq!(frame.rows.len(), 200);
+        assert!(frame.quality.gated.is_empty());
+        assert!(frame.quality.unavailable_revision.is_empty());
+        assert!(frame.quality.resource_limited.is_empty());
+
+        let live = Arc::clone(state.overview_view().live());
+        attach_sparks(&request_snapshot, &live, &request, &mut frame)
+            .expect("attach structural sparks");
+        assert_eq!(kronika_reader::qualification_open_unit_calls(), 2);
+        assert!(
+            frame.rows.iter().any(|row| !row.spark.complete),
+            "EntitySeries top-K misses must remain visible as incomplete sparks"
+        );
+
+        let response =
+            FrameResponse::from_projected(&request, &catalog, &frame).expect("frame response");
+        let bytes = serde_json::to_vec(&response).expect("serialize frame response");
+        assert!(bytes.len() <= FRAME_RESPONSE_MAX_BYTES, "{}", bytes.len());
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]

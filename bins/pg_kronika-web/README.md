@@ -162,6 +162,7 @@ request rows or run an analysis.
 | `GET /v1/ui/catalog` | optional `If-None-Match` header | Returns the nine stable UI views with inputs, joins, metric formulas, columns, presets, and availability. It reads PGM catalog metadata only, returns a strong ETag, and answers a matching validator with `304`. |
 | `GET /v1/views/summary` | `at` | Returns the latest exact population, status, and notable state at or before the cursor for all nine UI views. Sealed data reads only the shared `UiSummary` OVF block; a current active tail is merged from memory. |
 | `GET /v1/timeline/heatmap` | `view`, `metric`, `from`, `to`; optional `buckets`, `top` | Merges the selected view's local top-K series into a bounded heatmap with score bounds and an exact-ranking proof. The half-open range is limited to 24 hours, `buckets` to `1..=256`, `top` to `1..=64`, and the serialized response to 512 KiB. Sealed requests read only `EntitySeries(view)` and never a PGM body. |
+| `GET /v1/frame/{view}` | required `at`; optional `span`, `preset`, `database`, `q`, `sort`, `order`, `limit`, `cursor` | Returns one exact, server-filtered page for any of the nine UI views. Bound numeric cells carry the ready `Classified` verdict, exact boundary, and evidence. |
 | `GET /v1/sections` | none | Shows which logical datasets can be queried and gives each dataset's semantics, sort key, and union of registered columns. |
 | `GET /v1/segments` | `from`, `to` | Shows which segments overlap the requested period and how many rows each section contains. It reads catalog metadata, not section bodies. |
 | `GET /v1/section/{name}` | `from`, `to`; optional `limit`, `cursor` | Returns the selected dataset as time-ordered rows. The response also names unreadable or missing intervals in `gaps` and supplies `next_cursor` when more rows remain. |
@@ -191,6 +192,36 @@ an observed zero (`0`). `ranking.exact` is true only when every returned lower
 score bound beats all later and unseen upper bounds. Any incomplete block is
 reported in the response quality and makes the proof inexact. Current
 `active.parts` web-index blocks use the same merge path in memory.
+
+Frame selects the latest exact snapshot at or before `at` and a proven
+predecessor for delta formulas. It opens at most one current and one
+predecessor PGM; sparks read only `UiSummary` and the selected view's
+`EntitySeries` OVF blocks. `span` defaults to one hour and is capped at 24
+hours. `limit` defaults to 100 and is capped at 200, decoded `q` is capped at
+256 UTF-8 bytes, the opaque cursor at 512 bytes, the existing query string at
+8,192 bytes, and JSON at 1 MiB. Response truncation occurs only between rows.
+Unknown, duplicate, or invalid projection parameters are rejected before PGM
+I/O. A cursor is bound to the projection revision, exact snapshot, and
+normalized query.
+
+Exactly 14 per-cell bindings are active:
+`activity.query_duration_us`, `activity.transaction_duration_us`,
+`statements.ms_per_row`, `statements.mean`, `statements.time_pct`,
+`statements.plan_time_pct`, `tables.dead_pct`, `tables.dead_tuples`,
+`tables.seq_scan_pct`, `tables.modified_since_analyze`,
+`tables.inserted_since_vacuum`, `tables.autovacuum_age_seconds`,
+`tables.autoanalyze_age_seconds`, and `processes.rss`. The threshold manifest
+classifies the other 55 `MetricId` values as typed deferred entries. A column
+without a binding has no classification entry; a bound column whose operands
+are missing, gated, reset, discontinuous, invalid, or inapplicable returns
+`not_classified` with the exact reason. It is never coerced to zero. Threshold
+numbers, operators, zero semantics, boundaries, and evidence come from
+`kronika-analytics`; formula strings in the catalog are descriptive and are
+not evaluated.
+
+Config-bound autovacuum rules remain deferred until relation reloptions are
+durably collected. Categorical rules and the production frontend are not part
+of this frame slice; the embedded HTML layout is unchanged.
 
 Timeline `from`/`to` ranges are half-open and limited to 31 days. Timeline
 health `step` is an integer number of microseconds and is raised when necessary
@@ -238,7 +269,7 @@ make openapi
 ```
 
 CI rejects a diff in the committed tree. The library contract tests require
-named JSON success schemas, explicit statuses, and domain tags for all 15
+named JSON success schemas, explicit statuses, and domain tags for all 16
 operations. `make openapi-bundle` creates an uncommitted single-file bundle
 under `target/` on demand.
 

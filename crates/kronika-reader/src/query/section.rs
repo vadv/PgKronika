@@ -7,11 +7,14 @@
 //! timestamp, ordered by the section's sort key, and truncated to `limit`.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::query::cursor::Cursor;
 use crate::query::logical::{LogicalSection, logical_section};
 use crate::query::value::{Gap, OutRow, Value, cell_to_value};
-use crate::{Cell, LocalDirSnapshot, ReadError, Resolved};
+use crate::{
+    Cell, LocalDirSnapshot, OpenUnit, ReadError, Resolved, SealedFactError, SegmentDescriptor,
+};
 
 /// How many times `sections` refreshes a stale snapshot before giving up on the
 /// stale unit and letting its time fall into a gap.
@@ -134,6 +137,13 @@ pub enum QueryError {
     BadCursor(String),
     /// Reading a unit or decoding a section failed.
     Read(ReadError),
+    /// The exact sealed descriptor selected by the caller is unavailable or stale.
+    SealedDescriptor(SealedFactError),
+    /// A complete result would exceed the permitted row page.
+    RowsTooLarge {
+        /// Maximum rows one section page may return.
+        max_rows: usize,
+    },
     /// The matching rows exceed the query materialization budget.
     ResultTooLarge {
         /// Maximum cells a query may retain.
@@ -373,6 +383,294 @@ pub fn sections_with_limits(
     Ok(pages)
 }
 
+/// Read several logical sections from one exact sealed descriptor.
+///
+/// Unlike [`sections_with_limits`], this path never scans or opens another
+/// unit whose time range overlaps the requested window. It is intended for
+/// callers that selected a PGM through reader-authored index metadata.
+///
+/// # Errors
+///
+/// Returns [`QueryError::UnknownSection`] for an unregistered name,
+/// [`QueryError::SealedDescriptor`] when the pinned descriptor is unavailable
+/// or stale, and the same decode and resource errors as
+/// [`sections_with_limits`].
+pub fn sections_from_sealed_descriptor_with_limits(
+    snap: &LocalDirSnapshot,
+    descriptor: &SegmentDescriptor,
+    from: i64,
+    to: i64,
+    names: &[&str],
+    cursors: &BTreeMap<String, Cursor>,
+    limits: QueryLimits,
+) -> Result<BTreeMap<String, SectionPage>, QueryError> {
+    SealedQuerySession::new(snap, limits).sections(descriptor, from, to, names, cursors)
+}
+
+const MAX_EXACT_QUERY_DESCRIPTORS: usize = 2;
+
+struct OpenedSealedQuery {
+    descriptor: SegmentDescriptor,
+    unit: OpenUnit,
+    dictionary: Option<crate::Dictionary>,
+}
+
+/// Bounded exact-descriptor query state shared by one higher-level request.
+///
+/// The session pins at most two sealed PGMs. Repeated reads of one descriptor
+/// reuse its opened unit and dictionary, while every read shares the same
+/// work, cell, and owned-byte accounting.
+pub struct SealedQuerySession<'a> {
+    snap: &'a LocalDirSnapshot,
+    limits: QueryLimits,
+    work_budget: QueryWorkBudget,
+    materialization: MaterializationUsage,
+    opened: Vec<OpenedSealedQuery>,
+}
+
+impl fmt::Debug for SealedQuerySession<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealedQuerySession")
+            .field("limits", &self.limits)
+            .field("opened_descriptors", &self.opened.len())
+            .field("materialized_cells", &self.materialization.cells)
+            .field("materialized_bytes", &self.materialization.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> SealedQuerySession<'a> {
+    /// Start one bounded exact-descriptor request.
+    #[must_use]
+    pub fn new(snap: &'a LocalDirSnapshot, limits: QueryLimits) -> Self {
+        let limits = QueryLimits {
+            rows: limits.rows,
+            cells: limits.cells.min(MAX_MATERIALIZED_CELLS),
+            bytes: limits.bytes.min(MAX_MATERIALIZED_BYTES),
+            work: limits.work,
+        };
+        Self {
+            snap,
+            limits,
+            work_budget: QueryWorkBudget::new(limits.work),
+            materialization: MaterializationUsage::default(),
+            opened: Vec::with_capacity(MAX_EXACT_QUERY_DESCRIPTORS),
+        }
+    }
+
+    /// Read logical sections from one exact sealed descriptor.
+    ///
+    /// Calls on the same session share all budgets and reuse a previously
+    /// opened descriptor. At most two distinct descriptors may be pinned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError::UnknownSection`] before I/O for an unregistered
+    /// name, [`QueryError::SealedDescriptor`] for an unavailable or stale
+    /// descriptor, and typed resource or decode errors for bounded reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a successfully loaded descriptor loses its dictionary,
+    /// which indicates an internal reader invariant violation.
+    pub fn sections(
+        &mut self,
+        descriptor: &SegmentDescriptor,
+        from: i64,
+        to: i64,
+        names: &[&str],
+        cursors: &BTreeMap<String, Cursor>,
+    ) -> Result<BTreeMap<String, SectionPage>, QueryError> {
+        let mut requested = Vec::with_capacity(names.len());
+        for &name in names {
+            let logical =
+                logical_section(name).ok_or_else(|| QueryError::UnknownSection(name.to_owned()))?;
+            requested.push((name.to_owned(), logical));
+        }
+        let mut requested_type_ids = requested
+            .iter()
+            .flat_map(|(_, logical)| logical.type_ids.iter().copied())
+            .collect::<Vec<_>>();
+        requested_type_ids.sort_unstable();
+        requested_type_ids.dedup();
+
+        let opened_index = self.open_descriptor(descriptor)?;
+        let has_requested_rows = self.opened[opened_index]
+            .unit
+            .catalog()
+            .entries
+            .iter()
+            .any(|entry| entry.rows != 0 && requested_type_ids.contains(&entry.type_id));
+        let mut buffers = vec![Vec::new(); requested.len()];
+        if has_requested_rows {
+            self.load_dictionary(opened_index)?;
+            let query = GatherQuery {
+                from,
+                to,
+                requested: &requested,
+                requested_type_ids: &requested_type_ids,
+                skip_stale: false,
+                limits: self.limits,
+            };
+            let opened = &self.opened[opened_index];
+            let dictionary = opened
+                .dictionary
+                .as_ref()
+                .expect("a requested row loads its sealed dictionary");
+            decode_requested_rows(
+                &opened.unit,
+                dictionary,
+                &query,
+                &mut buffers,
+                &mut self.materialization,
+            )
+            .map_err(|error| {
+                query_error_from_gather(error, self.limits.cells, self.limits.bytes)
+            })?;
+        }
+
+        let gaps = coverage_gaps(from, to, &[(descriptor.min_ts, descriptor.max_ts)]);
+        Ok(finish_pages(
+            requested,
+            buffers,
+            &gaps,
+            cursors,
+            self.limits.rows,
+        ))
+    }
+
+    fn open_descriptor(&mut self, descriptor: &SegmentDescriptor) -> Result<usize, QueryError> {
+        if let Some(index) = self
+            .opened
+            .iter()
+            .position(|opened| opened.descriptor == *descriptor)
+        {
+            return Ok(index);
+        }
+        if self.opened.len() == MAX_EXACT_QUERY_DESCRIPTORS {
+            return Err(QueryError::WorkLimitExceeded {
+                resource: QueryWorkResource::Units,
+                limit: MAX_EXACT_QUERY_DESCRIPTORS as u64,
+                observed: (MAX_EXACT_QUERY_DESCRIPTORS + 1) as u64,
+            });
+        }
+        self.work_budget.charge_unit().map_err(|error| {
+            query_error_from_gather(error, self.limits.cells, self.limits.bytes)
+        })?;
+        let eager_open_bytes = self
+            .snap
+            .sealed_query_eager_open_bytes(descriptor)
+            .map_err(QueryError::SealedDescriptor)?;
+        self.work_budget
+            .charge_catalog_read(eager_open_bytes)
+            .map_err(|error| {
+                query_error_from_gather(error, self.limits.cells, self.limits.bytes)
+            })?;
+        let unit = self
+            .snap
+            .open_sealed_for_query_by_descriptor(descriptor)
+            .map_err(QueryError::SealedDescriptor)?;
+        self.opened.push(OpenedSealedQuery {
+            descriptor: *descriptor,
+            unit: OpenUnit::Sealed(unit),
+            dictionary: None,
+        });
+        Ok(self.opened.len() - 1)
+    }
+
+    fn load_dictionary(&mut self, opened_index: usize) -> Result<(), QueryError> {
+        if self.opened[opened_index].dictionary.is_some() {
+            return Ok(());
+        }
+        let dictionary_read_bytes = self.opened[opened_index]
+            .unit
+            .catalog()
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.type_id,
+                    kronika_registry::DICT_STRINGS_TYPE_ID | kronika_registry::DICT_BLOBS_TYPE_ID
+                )
+            })
+            .fold(0_u64, |bytes, entry| bytes.saturating_add(entry.len));
+        self.work_budget
+            .charge_dictionary_read(dictionary_read_bytes)
+            .map_err(|error| {
+                query_error_from_gather(error, self.limits.cells, self.limits.bytes)
+            })?;
+        let dictionary = self.opened[opened_index]
+            .unit
+            .dictionary()
+            .map_err(QueryError::Read)?;
+        self.opened[opened_index].dictionary = Some(dictionary);
+        Ok(())
+    }
+}
+
+fn query_error_from_gather(error: GatherError, max_cells: usize, max_bytes: usize) -> QueryError {
+    match error {
+        GatherError::Stale => unreachable!("exact sealed decoding cannot report a live-unit race"),
+        GatherError::Read(error) => QueryError::Read(error),
+        GatherError::ResultTooLarge => QueryError::ResultTooLarge { max_cells },
+        GatherError::MaterializedBytesTooLarge => {
+            QueryError::MaterializedBytesTooLarge { max_bytes }
+        }
+        GatherError::WorkLimitExceeded {
+            resource,
+            limit,
+            observed,
+        } => QueryError::WorkLimitExceeded {
+            resource,
+            limit,
+            observed,
+        },
+    }
+}
+
+fn finish_pages(
+    requested: Vec<(String, LogicalSection)>,
+    buffers: Vec<Vec<OutRow>>,
+    gaps: &[Gap],
+    cursors: &BTreeMap<String, Cursor>,
+    limit: usize,
+) -> BTreeMap<String, SectionPage> {
+    let mut pages = BTreeMap::new();
+    for ((name, logical), mut rows) in requested.into_iter().zip(buffers) {
+        let columns: Vec<&str> = logical.columns.iter().map(|col| col.name).collect();
+        rows.sort_by(|a, b| compare_full(a, b, &columns, logical.sort_key));
+
+        if let Some(cursor) = cursors.get(&name) {
+            let cursor_row: OutRow = columns
+                .iter()
+                .map(|&name| name.to_owned())
+                .zip(cursor.values.iter().cloned())
+                .collect();
+            let start = rows.partition_point(|row| {
+                compare_full(row, &cursor_row, &columns, logical.sort_key)
+                    != std::cmp::Ordering::Greater
+            });
+            rows.drain(..start);
+        }
+
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let next_cursor = rows.last().filter(|_| has_more).map(|row| Cursor {
+            values: row.iter().map(|(_, value)| value.clone()).collect(),
+        });
+        pages.insert(
+            name.clone(),
+            SectionPage {
+                section: name,
+                rows,
+                gaps: gaps.to_owned(),
+                next_cursor,
+            },
+        );
+    }
+    pages
+}
+
 /// Failure while gathering a window's rows.
 #[derive(Debug)]
 enum GatherError {
@@ -529,7 +827,7 @@ fn gather(
 }
 
 fn decode_requested_rows(
-    unit: &crate::OpenUnit,
+    unit: &OpenUnit,
     dict: &crate::Dictionary,
     query: &GatherQuery<'_>,
     buffers: &mut [Vec<OutRow>],
@@ -791,8 +1089,9 @@ mod tests {
     use kronika_registry::{StrId, Ts};
 
     use super::{
-        Cursor, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, Value,
-        charge_materialization, section, section_with_limits, sections,
+        Cursor, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SealedQuerySession,
+        Value, charge_materialization, section, section_with_limits, sections,
+        sections_from_sealed_descriptor_with_limits,
     };
     use crate::LocalDirSnapshot;
     use crate::query::logical::logical_section;
@@ -984,6 +1283,134 @@ mod tests {
     }
 
     #[test]
+    fn exact_descriptor_query_reads_only_the_selected_sealed_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let body_a = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(3000, 3)])
+            .expect("encode");
+        let part_a = part_from(&[(1_008_001, 2, body_a)], 1000, 3000);
+        write_pgm(dir.path(), 1000, &part_a);
+
+        let body_b = PgStatArchiver::encode(&[archiver_row(2000, 2), archiver_row(4000, 4)])
+            .expect("encode");
+        let part_b = part_from(&[(1_008_001, 2, body_b)], 2000, 4000);
+        write_pgm(dir.path(), 2000, &part_b);
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let descriptor = snap
+            .sealed_descriptors()
+            .find(|descriptor| descriptor.min_ts == 1000)
+            .expect("first descriptor");
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+        let pages = sections_from_sealed_descriptor_with_limits(
+            &snap,
+            &descriptor,
+            1000,
+            3000,
+            &["pg_stat_archiver"],
+            &no_cursors(),
+            QueryLimits::new(100, 10_000),
+        )
+        .expect("exact descriptor query");
+
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 1);
+        let page = pages.get("pg_stat_archiver").expect("archiver page");
+        let ts = page
+            .rows
+            .iter()
+            .map(|row| cell(row, "ts"))
+            .collect::<Vec<_>>();
+        assert_eq!(ts, vec![&Value::Ts(1000), &Value::Ts(3000)]);
+    }
+
+    #[test]
+    fn exact_query_session_shares_work_across_two_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file_ts, row_ts) in [(1000, 1000), (2000, 2000)] {
+            let body = PgStatArchiver::encode(&[archiver_row(row_ts, 1)]).expect("encode");
+            write_pgm(
+                dir.path(),
+                file_ts,
+                &part_from(&[(1_008_001, 1, body)], row_ts, row_ts),
+            );
+        }
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let descriptors = snap.sealed_descriptors().collect::<Vec<_>>();
+        let limits = QueryLimits::new(100, 10_000).with_work_limits(QueryWorkLimits::new(
+            1,
+            u64::MAX,
+            u64::MAX,
+        ));
+        let mut query = SealedQuerySession::new(&snap, limits);
+        query
+            .sections(
+                &descriptors[0],
+                1000,
+                1000,
+                &["pg_stat_archiver"],
+                &no_cursors(),
+            )
+            .expect("first exact descriptor");
+        let error = query
+            .sections(
+                &descriptors[1],
+                2000,
+                2000,
+                &["pg_stat_archiver"],
+                &no_cursors(),
+            )
+            .expect_err("second descriptor exceeds the shared unit budget");
+        assert!(matches!(
+            error,
+            QueryError::WorkLimitExceeded {
+                resource: QueryWorkResource::Units,
+                limit: 1,
+                observed: 2,
+            }
+        ));
+    }
+
+    #[test]
+    fn exact_query_session_reuses_one_pgm_and_shares_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(3000, 3)])
+            .expect("encode");
+        write_pgm(
+            dir.path(),
+            1000,
+            &part_from(&[(1_008_001, 2, body)], 1000, 3000),
+        );
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let descriptor = snap.sealed_descriptors().next().expect("descriptor");
+        let row_cells = logical_section("pg_stat_archiver")
+            .expect("logical archiver")
+            .columns
+            .len();
+        let mut query = SealedQuerySession::new(&snap, QueryLimits::new(100, row_cells));
+        OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+        query
+            .sections(
+                &descriptor,
+                1000,
+                1000,
+                &["pg_stat_archiver"],
+                &no_cursors(),
+            )
+            .expect("first window");
+        let error = query
+            .sections(
+                &descriptor,
+                3000,
+                3000,
+                &["pg_stat_archiver"],
+                &no_cursors(),
+            )
+            .expect_err("second row exceeds shared cell budget");
+
+        assert!(matches!(error, QueryError::ResultTooLarge { .. }));
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
     fn union_across_versions_fills_missing_column_with_null() {
         let dir = tempfile::tempdir().unwrap();
         // V3 unit carries leader_pid; V1 unit does not.
@@ -1113,7 +1540,9 @@ mod tests {
         match err {
             QueryError::UnknownSection(name) => assert_eq!(name, "no_such_section"),
             other @ (QueryError::Read(_)
+            | QueryError::SealedDescriptor(_)
             | QueryError::BadCursor(_)
+            | QueryError::RowsTooLarge { .. }
             | QueryError::ResultTooLarge { .. }
             | QueryError::MaterializedBytesTooLarge { .. }
             | QueryError::WorkLimitExceeded { .. }) => {

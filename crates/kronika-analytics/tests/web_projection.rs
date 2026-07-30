@@ -43,6 +43,15 @@ fn registry_has_nine_unique_ordered_views_with_one_canonical_metric_each() {
 #[test]
 fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
     let statements = web_view_by_name("statements").expect("statements view");
+    assert_eq!(statements.revision, 2);
+    assert_eq!(
+        statements
+            .inputs
+            .iter()
+            .map(|input| input.code)
+            .collect::<Vec<_>>(),
+        vec!["statements", "settings"]
+    );
     assert_eq!(
         statements
             .metrics
@@ -63,8 +72,8 @@ fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
             (
                 1,
                 "time",
-                1,
-                1,
+                2,
+                6,
                 "sum",
                 "sum(positive_delta(total_exec_time))",
                 true,
@@ -107,6 +116,29 @@ fn events_input_names_match_the_registry_contract_names() {
             "pg_log_gap",
             "pg_log_temp_files",
             "pg_log_source_status",
+        ]
+    );
+}
+
+#[test]
+fn only_delta_views_publish_a_bounded_predecessor_gap() {
+    let gaps = web_views()
+        .iter()
+        .map(|view| (view.name, view.max_rate_gap_us))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        gaps,
+        vec![
+            ("activity", Some(900_000_000)),
+            ("statements", Some(900_000_000)),
+            ("plans", Some(900_000_000)),
+            ("tables", Some(900_000_000)),
+            ("indexes", Some(900_000_000)),
+            ("vacuum", None),
+            ("processes", Some(900_000_000)),
+            ("locks", None),
+            ("events", None),
         ]
     );
 }

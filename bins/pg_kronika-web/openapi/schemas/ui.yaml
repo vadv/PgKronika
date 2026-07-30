@@ -6,6 +6,51 @@ Availability:
   - not_collected
   - unsupported_type
   type: string
+BoundaryDto:
+  properties:
+    operator:
+      type: string
+    value:
+      format: double
+      type: number
+  required:
+  - operator
+  - value
+  type: object
+CellClassificationDto:
+  properties:
+    column:
+      type: string
+    metric:
+      type: string
+    result:
+      $ref: '#/ClassificationResultDto'
+  required:
+  - column
+  - metric
+  - result
+  type: object
+ClassificationResultDto:
+  oneOf:
+  - $ref: '#/ClassifiedResultDto'
+  - $ref: '#/NotClassifiedResultDto'
+ClassifiedResultDto:
+  properties:
+    boundary:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/BoundaryDto'
+    evidence:
+      $ref: '#/EvidenceDto'
+    level:
+      type: string
+    status:
+      type: string
+  required:
+  - status
+  - level
+  - evidence
+  type: object
 ColumnSpec:
   description: One table or detail projection column.
   properties:
@@ -33,9 +78,19 @@ ColumnSpec:
       type:
       - string
       - 'null'
+    threshold_metric:
+      description: Bound numeric threshold policy, when one exists.
+      type:
+      - string
+      - 'null'
     type:
       $ref: '#/ValueType'
       description: Public value shape.
+    unit:
+      description: Public unit code when the value has a stable numeric unit.
+      type:
+      - string
+      - 'null'
   required:
   - code
   - type
@@ -43,6 +98,271 @@ ColumnSpec:
   - requires
   - availability
   type: object
+EvidenceDto:
+  oneOf:
+  - properties:
+      kind:
+        enum:
+        - scalar
+        type: string
+      observed:
+        format: double
+        type: number
+    required:
+    - observed
+    - kind
+    type: object
+  - properties:
+      denominator:
+        format: double
+        type: number
+      kind:
+        enum:
+        - fraction
+        type: string
+      numerator:
+        format: double
+        type: number
+      value:
+        format: double
+        type: number
+    required:
+    - numerator
+    - denominator
+    - value
+    - kind
+    type: object
+  - properties:
+      kind:
+        enum:
+        - limit
+        type: string
+      limit:
+        format: double
+        type: number
+      observed:
+        format: double
+        type: number
+    required:
+    - observed
+    - limit
+    - kind
+    type: object
+  - properties:
+      count:
+        format: double
+        type: number
+      floor:
+        $ref: '#/BoundaryDto'
+      kind:
+        enum:
+        - ratio_with_floor
+        type: string
+      ratio:
+        format: double
+        type: number
+    required:
+    - ratio
+    - count
+    - floor
+    - kind
+    type: object
+  - properties:
+      age_seconds:
+        format: double
+        type: number
+      epoch_seconds:
+        format: double
+        type: number
+      kind:
+        enum:
+        - age
+        type: string
+      now_seconds:
+        format: double
+        type: number
+    required:
+    - epoch_seconds
+    - now_seconds
+    - age_seconds
+    - kind
+    type: object
+  - properties:
+      absolute_ceiling_bytes:
+        $ref: '#/BoundaryDto'
+      available_bytes:
+        format: double
+        type: number
+      available_fraction:
+        format: double
+        type: number
+      kind:
+        enum:
+        - free_capacity
+        type: string
+      total_bytes:
+        format: double
+        type: number
+    required:
+    - available_bytes
+    - total_bytes
+    - available_fraction
+    - absolute_ceiling_bytes
+    - kind
+    type: object
+FrameColumnDto:
+  properties:
+    code:
+      type: string
+    threshold_metric:
+      type:
+      - string
+      - 'null'
+    type:
+      type: string
+    unit:
+      type:
+      - string
+      - 'null'
+  required:
+  - code
+  - type
+  type: object
+FrameGapDto:
+  properties:
+    from_us:
+      type: string
+    to_us:
+      type: string
+  required:
+  - from_us
+  - to_us
+  type: object
+FrameNeighborsDto:
+  properties:
+    next_us:
+      type:
+      - string
+      - 'null'
+    prev_us:
+      type:
+      - string
+      - 'null'
+  type: object
+FramePageDto:
+  properties:
+    matched:
+      minimum: 0
+      type: integer
+    next:
+      type:
+      - string
+      - 'null'
+    returned:
+      minimum: 0
+      type: integer
+  required:
+  - returned
+  - matched
+  type: object
+FrameQualityDto:
+  properties:
+    active_tail:
+      type: boolean
+    gaps:
+      items:
+        $ref: '#/FrameGapDto'
+      type: array
+    gated:
+      items:
+        type: string
+      type: array
+    resource_limited:
+      items:
+        type: string
+      type: array
+    snapshots:
+      minimum: 0
+      type: integer
+    status:
+      type: string
+    unavailable_revision:
+      items:
+        type: string
+      type: array
+  required:
+  - status
+  - snapshots
+  - gaps
+  - gated
+  - unavailable_revision
+  - resource_limited
+  - active_tail
+  type: object
+FrameResponse:
+  properties:
+    columns:
+      items:
+        $ref: '#/FrameColumnDto'
+      type: array
+    neighbors:
+      $ref: '#/FrameNeighborsDto'
+    page:
+      $ref: '#/FramePageDto'
+    quality:
+      $ref: '#/FrameQualityDto'
+    rate_prev_ts_us:
+      type:
+      - string
+      - 'null'
+    rows:
+      items:
+        $ref: '#/FrameRowDto'
+      type: array
+    snapshot_ts_us:
+      type: string
+    view:
+      type: string
+  required:
+  - view
+  - snapshot_ts_us
+  - neighbors
+  - columns
+  - rows
+  - page
+  - quality
+  type: object
+FrameRowDto:
+  properties:
+    cells:
+      items:
+        $ref: '#/FrameValue'
+      type: array
+    classifications:
+      items:
+        $ref: '#/CellClassificationDto'
+      type: array
+    entity:
+      type: string
+    label:
+      type: string
+    spark:
+      $ref: '#/SparkDto'
+  required:
+  - entity
+  - label
+  - cells
+  - classifications
+  - spark
+  type: object
+FrameValue:
+  anyOf:
+  - type: 'null'
+  - format: double
+    type: number
+  - type: boolean
+  - type: string
+  description: A finite frame scalar; wide integers and timestamps use decimal strings.
 HeatmapGrid:
   properties:
     bucket_count:
@@ -229,6 +549,16 @@ MetricSpec:
   - requires
   - availability
   type: object
+NotClassifiedResultDto:
+  properties:
+    reason:
+      type: string
+    status:
+      type: string
+  required:
+  - status
+  - reason
+  type: object
 PresetSpec:
   description: Named ordered subset of view columns.
   properties:
@@ -316,6 +646,21 @@ SortSpec:
   required:
   - column
   - order
+  type: object
+SparkDto:
+  properties:
+    complete:
+      type: boolean
+    values:
+      items:
+        format: double
+        type:
+        - number
+        - 'null'
+      type: array
+  required:
+  - values
+  - complete
   type: object
 SummaryQuality:
   properties:

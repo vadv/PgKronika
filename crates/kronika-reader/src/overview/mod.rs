@@ -76,7 +76,8 @@ pub use publish::{
 };
 pub use web_index::{
     EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, IndexStatus,
-    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, TimeGrid, UiSummaryBlock, ViewSummary,
+    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, SnapshotNeighbors, TimeGrid,
+    UiSummaryBlock, ViewSummary,
 };
 pub(crate) use web_index::{read_entity_series, read_ui_summary};
 

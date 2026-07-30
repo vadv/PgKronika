@@ -28,8 +28,16 @@ components:
       $ref: schemas/ui.yaml#/Availability
     BlobValue:
       $ref: schemas/common.yaml#/BlobValue
+    BoundaryDto:
+      $ref: schemas/ui.yaml#/BoundaryDto
     CapacityPayload:
       $ref: schemas/timeline.yaml#/CapacityPayload
+    CellClassificationDto:
+      $ref: schemas/ui.yaml#/CellClassificationDto
+    ClassificationResultDto:
+      $ref: schemas/ui.yaml#/ClassificationResultDto
+    ClassifiedResultDto:
+      $ref: schemas/ui.yaml#/ClassifiedResultDto
     ColumnSpec:
       $ref: schemas/ui.yaml#/ColumnSpec
     CounterDeltaPayload:
@@ -60,6 +68,24 @@ components:
       $ref: schemas/timeline.yaml#/EventPayload
     EventsResponseDto:
       $ref: schemas/timeline.yaml#/EventsResponseDto
+    EvidenceDto:
+      $ref: schemas/ui.yaml#/EvidenceDto
+    FrameColumnDto:
+      $ref: schemas/ui.yaml#/FrameColumnDto
+    FrameGapDto:
+      $ref: schemas/ui.yaml#/FrameGapDto
+    FrameNeighborsDto:
+      $ref: schemas/ui.yaml#/FrameNeighborsDto
+    FramePageDto:
+      $ref: schemas/ui.yaml#/FramePageDto
+    FrameQualityDto:
+      $ref: schemas/ui.yaml#/FrameQualityDto
+    FrameResponse:
+      $ref: schemas/ui.yaml#/FrameResponse
+    FrameRowDto:
+      $ref: schemas/ui.yaml#/FrameRowDto
+    FrameValue:
+      $ref: schemas/ui.yaml#/FrameValue
     FreshnessDto:
       $ref: schemas/timeline.yaml#/FreshnessDto
     GapResponse:
@@ -118,6 +144,8 @@ components:
       $ref: schemas/ui.yaml#/MetricSpec
     NoDataReason:
       $ref: schemas/sections.yaml#/NoDataReason
+    NotClassifiedResultDto:
+      $ref: schemas/ui.yaml#/NotClassifiedResultDto
     NotablePreviewDto:
       $ref: schemas/timeline.yaml#/NotablePreviewDto
     OverviewResponseDto:
@@ -158,6 +186,8 @@ components:
       $ref: schemas/timeline.yaml#/SignalCountDto
     SortSpec:
       $ref: schemas/ui.yaml#/SortSpec
+    SparkDto:
+      $ref: schemas/ui.yaml#/SparkDto
     SqlstateCountDto:
       $ref: schemas/timeline.yaml#/SqlstateCountDto
     StateTransitionPayload:
@@ -193,6 +223,8 @@ openapi: 3.1.0
 paths:
   /v1/anomalies:
     $ref: paths/analytics.yaml#/~1v1~1anomalies
+  /v1/frame/{view}:
+    $ref: paths/ui.yaml#/~1v1~1frame~1{view}
   /v1/incidents:
     $ref: paths/analytics.yaml#/~1v1~1incidents
   /v1/section/{name}:

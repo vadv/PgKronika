@@ -332,6 +332,9 @@ fn read_error_response(error: QueryError) -> ApiError {
         QueryError::UnknownSection(name) => {
             logged_internal_error("api_registry_section_missing", &name)
         }
+        QueryError::RowsTooLarge { max_rows } => {
+            ApiError::query_limit_exceeded(LimitResource::Rows, count_u64(max_rows), None)
+        }
         QueryError::ResultTooLarge { max_cells } => {
             ApiError::query_limit_exceeded(LimitResource::Cells, count_u64(max_cells), None)
         }
@@ -355,6 +358,13 @@ fn read_error_response(error: QueryError) -> ApiError {
             logged_internal_error("api_reader_cursor_invariant", &message)
         }
         QueryError::Read(read) => logged_store_read_error(&read),
+        QueryError::SealedDescriptor(_) => {
+            tracing::error!(
+                event = "api_store_descriptor_read_failed",
+                "store descriptor query failed"
+            );
+            ApiError::store_read_failed()
+        }
     }
 }
 

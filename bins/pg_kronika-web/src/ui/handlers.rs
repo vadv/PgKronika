@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -12,6 +12,13 @@ use sha2::{Digest as _, Sha256};
 
 use super::catalog::ProjectionCatalog;
 use super::data::{ViewSummaryResponse, view_summary};
+use super::frame::FrameRequest;
+use super::frame::MAX_FRAME_RESPONSE_BYTES;
+use super::frame::dto::FrameResponse;
+use super::frame::projection::{
+    FrameError, FrameLimits, ProjectedFrame, ProjectionError, cursor_for, project_frame,
+};
+use super::frame::spark::{SparkError, attach_sparks};
 use super::heatmap::{HeatmapError, HeatmapRequest, HeatmapResponse, heatmap as build_heatmap};
 use crate::AppState;
 use crate::api_error::{
@@ -37,6 +44,188 @@ const HEATMAP_PARAMS: &[QueryParameter] = &[
     QueryParameter::Buckets,
     QueryParameter::Top,
 ];
+
+/// `GET /v1/frame/{view}` - bounded exact UI rows with server-owned verdicts.
+#[utoipa::path(
+    get,
+    path = "/v1/frame/{view}",
+    tag = "ui",
+    params(
+        ("view" = String, Path),
+        ("at" = i64, Query),
+        ("span" = Option<String>, Query),
+        ("preset" = Option<String>, Query),
+        ("database" = Option<String>, Query),
+        ("q" = Option<String>, Query),
+        ("sort" = Option<String>, Query),
+        ("order" = Option<String>, Query),
+        ("limit" = Option<usize>, Query),
+        ("cursor" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "Bounded classified frame", body = FrameResponse),
+        (status = 400, description = "Invalid frame query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 410, description = "Frame cursor snapshot expired", body = ApiError),
+        (status = 413, description = "Frame resource limit exceeded", body = ApiError),
+        (status = 500, description = "Frame storage or render failed", body = ApiError),
+    )
+)]
+pub(crate) async fn frame(
+    State(state): State<AppState>,
+    Path(view): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let request = FrameRequest::parse(&view, raw.as_deref(), &catalog)?;
+    let (snapshot, descriptor_view) = state.overview_request_view();
+    let live = Arc::clone(descriptor_view.live());
+    let result = tokio::task::spawn_blocking(move || {
+        let request_snapshot = (*snapshot).clone();
+        let mut projected = project_frame(
+            &request_snapshot,
+            &request,
+            &catalog,
+            FrameLimits::default(),
+        )
+        .map_err(FrameBuildError::Frame)?;
+        attach_sparks(&request_snapshot, &live, &request, &mut projected)
+            .map_err(FrameBuildError::Spark)?;
+        bounded_frame_body(&request, &catalog, &mut projected)
+    })
+    .await
+    .map_err(|_join| {
+        tracing::error!(
+            event = "api_ui_frame_worker_failed",
+            "UI frame worker failed"
+        );
+        ApiError::internal_error()
+    })?
+    .map_err(frame_build_error)?;
+
+    let mut response = Response::new(Body::from(result));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+#[derive(Debug)]
+enum FrameBuildError {
+    Frame(FrameError),
+    Spark(SparkError),
+    Serialize,
+    ResponseTooLarge { observed: usize },
+}
+
+fn bounded_frame_body(
+    request: &FrameRequest,
+    catalog: &ProjectionCatalog,
+    frame: &mut ProjectedFrame,
+) -> Result<Vec<u8>, FrameBuildError> {
+    loop {
+        let response = FrameResponse::from_projected(request, catalog, frame)
+            .map_err(|_error| FrameBuildError::Serialize)?;
+        let body = serde_json::to_vec(&response).map_err(|_error| FrameBuildError::Serialize)?;
+        if body.len() <= MAX_FRAME_RESPONSE_BYTES {
+            return Ok(body);
+        }
+        if frame.rows.len() <= 1 {
+            return Err(FrameBuildError::ResponseTooLarge {
+                observed: body.len(),
+            });
+        }
+        frame.rows.pop();
+        let last = frame.rows.last().ok_or(FrameBuildError::Serialize)?;
+        frame.next = Some(
+            cursor_for(request, frame.snapshot_ts_us, last)
+                .map_err(|_error| FrameBuildError::Serialize)?,
+        );
+    }
+}
+
+fn frame_build_error(error: FrameBuildError) -> ApiError {
+    match error {
+        FrameBuildError::Frame(FrameError::CursorExpired) => ApiError::cursor_expired(),
+        FrameBuildError::Frame(FrameError::Projection(ProjectionError::Cursor)) => {
+            ApiError::invalid_cursor()
+        }
+        FrameBuildError::Frame(FrameError::Query(error)) => frame_query_error(error),
+        FrameBuildError::Frame(FrameError::WebIndex(_))
+        | FrameBuildError::Spark(SparkError::Read(_)) => {
+            tracing::error!(
+                event = "api_ui_frame_store_read_failed",
+                "UI frame storage read failed"
+            );
+            ApiError::store_read_failed()
+        }
+        FrameBuildError::Spark(SparkError::TooManySegments) => ApiError::query_limit_exceeded(
+            LimitResource::SelectedSegments,
+            count_u64(crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS),
+            None,
+        ),
+        FrameBuildError::ResponseTooLarge { observed } => ApiError::query_limit_exceeded(
+            LimitResource::Bytes,
+            count_u64(MAX_FRAME_RESPONSE_BYTES),
+            Some(count_u64(observed)),
+        ),
+        FrameBuildError::Frame(FrameError::Projection(_))
+        | FrameBuildError::Spark(SparkError::Arithmetic)
+        | FrameBuildError::Serialize => {
+            tracing::error!(
+                event = "api_ui_frame_internal_failed",
+                "UI frame projection or serialization failed"
+            );
+            ApiError::internal_error()
+        }
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the owned worker error is consumed here and never retained or exposed"
+)]
+fn frame_query_error(error: kronika_reader::QueryError) -> ApiError {
+    match error {
+        kronika_reader::QueryError::RowsTooLarge { max_rows } => {
+            ApiError::query_limit_exceeded(LimitResource::Rows, count_u64(max_rows), None)
+        }
+        kronika_reader::QueryError::ResultTooLarge { max_cells } => {
+            ApiError::query_limit_exceeded(LimitResource::Cells, count_u64(max_cells), None)
+        }
+        kronika_reader::QueryError::MaterializedBytesTooLarge { max_bytes } => {
+            ApiError::query_limit_exceeded(LimitResource::Bytes, count_u64(max_bytes), None)
+        }
+        kronika_reader::QueryError::WorkLimitExceeded {
+            resource,
+            limit,
+            observed,
+        } => {
+            let resource = match resource {
+                kronika_reader::QueryWorkResource::Units => LimitResource::Units,
+                kronika_reader::QueryWorkResource::CatalogBytes
+                | kronika_reader::QueryWorkResource::DictionaryBytes => LimitResource::Bytes,
+            };
+            ApiError::query_limit_exceeded(resource, limit, Some(observed))
+        }
+        kronika_reader::QueryError::Read(_) | kronika_reader::QueryError::SealedDescriptor(_) => {
+            tracing::error!(
+                event = "api_ui_frame_pgm_read_failed",
+                "UI frame PGM read failed"
+            );
+            ApiError::store_read_failed()
+        }
+        kronika_reader::QueryError::UnknownSection(_)
+        | kronika_reader::QueryError::BadCursor(_) => {
+            tracing::error!(
+                event = "api_ui_frame_internal_query_failed",
+                "UI frame internal section query failed"
+            );
+            ApiError::internal_error()
+        }
+    }
+}
 
 /// `GET /v1/views/summary?at=<us>` — exact indexed populations.
 #[utoipa::path(

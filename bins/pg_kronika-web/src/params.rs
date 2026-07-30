@@ -229,6 +229,16 @@ pub(crate) fn query_error_response(error: &QueryError) -> ApiError {
             );
             error
         }
+        QueryError::SealedDescriptor(_) => {
+            tracing::error!(
+                event = "api_store_descriptor_read_failed",
+                "store descriptor query failed"
+            );
+            ApiError::store_read_failed()
+        }
+        QueryError::RowsTooLarge { max_rows } => {
+            ApiError::query_limit_exceeded(LimitResource::Rows, count_u64(*max_rows), None)
+        }
         QueryError::ResultTooLarge { max_cells } => {
             ApiError::query_limit_exceeded(LimitResource::Cells, count_u64(*max_cells), None)
         }

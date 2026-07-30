@@ -80,14 +80,33 @@ struct JournalPrefixDigest([u8; 32]);
 // Counts `open_unit` calls so batch tests can assert a unit is opened once.
 // Thread-local, so parallel tests do not perturb each other; a test resets it
 // to 0 before the call it measures.
-#[cfg(test)]
+#[cfg(any(test, feature = "qualification"))]
 thread_local! {
     pub(crate) static OPEN_UNIT_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     pub(crate) static FORCED_STALE_OPEN_UNIT_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     pub(crate) static DECODE_ROWS_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+/// Resets the per-thread PGM open counter used by structural qualification.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub fn qualification_reset_open_unit_calls() {
+    OPEN_UNIT_CALLS.with(|calls| calls.set(0));
+}
+
+/// Returns the per-thread PGM open count used by structural qualification.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+#[must_use]
+pub fn qualification_open_unit_calls() -> usize {
+    OPEN_UNIT_CALLS.with(std::cell::Cell::get)
 }
 
 /// A unit opened once for decoding many sections.
@@ -1007,6 +1026,39 @@ impl LocalDirSnapshot {
             })
     }
 
+    pub(crate) fn sealed_query_eager_open_bytes(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<u64, SealedFactError> {
+        let sealed = self
+            .scan
+            .sealed
+            .iter()
+            .find(|sealed| SealedLocator::from_segment_id(sealed.address.id) == descriptor.locator)
+            .ok_or(SealedFactError::DescriptorUnavailable {
+                locator: descriptor.locator,
+            })?;
+        if SegmentDescriptor::from_summary(descriptor.locator, sealed.identity, &sealed.summary)
+            != *descriptor
+        {
+            return Err(SealedFactError::StaleDescriptor {
+                locator: descriptor.locator,
+            });
+        }
+        Ok(u64::from(sealed.summary.catalog_len)
+            .saturating_add(MAGIC.len() as u64)
+            .saturating_add(TAIL_INDEX_LEN as u64))
+    }
+
+    pub(crate) fn open_sealed_for_query_by_descriptor(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<PgmUnit<std::fs::File>, SealedFactError> {
+        #[cfg(any(test, feature = "qualification"))]
+        OPEN_UNIT_CALLS.with(|calls| calls.set(calls.get() + 1));
+        self.open_sealed_by_descriptor(descriptor)
+    }
+
     /// Opens one active journal part by its exact refresh descriptor.
     ///
     /// The descriptor is matched against the journal generation, byte range,
@@ -1190,7 +1242,7 @@ impl LocalDirSnapshot {
         idx: usize,
         handle: UnitHandle,
     ) -> Result<OpenUnit, ReadError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "qualification"))]
         OPEN_UNIT_CALLS.with(|c| c.set(c.get() + 1));
         #[cfg(test)]
         if FORCED_STALE_OPEN_UNIT_CALLS.with(|calls| {

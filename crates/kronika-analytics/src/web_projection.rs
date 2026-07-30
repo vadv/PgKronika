@@ -28,6 +28,8 @@ impl WebAggregation {
 pub enum WebUnit {
     /// Microseconds.
     Microseconds,
+    /// Milliseconds.
+    Milliseconds,
     /// Dimensionless count.
     Count,
     /// `PostgreSQL` blocks.
@@ -44,6 +46,7 @@ impl WebUnit {
     pub const fn code(self) -> u16 {
         match self {
             Self::Microseconds => 1,
+            Self::Milliseconds => 6,
             Self::Count => 2,
             Self::Blocks => 3,
             Self::Ratio => 4,
@@ -56,6 +59,7 @@ impl WebUnit {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Microseconds => "us",
+            Self::Milliseconds => "ms",
             Self::Count => "count",
             Self::Blocks => "blocks",
             Self::Ratio => "ratio",
@@ -171,11 +175,15 @@ pub struct WebView {
     pub revision: u16,
     /// Typed identity encoding revision.
     pub identity_revision: u16,
+    /// Largest elapsed interval that can prove a cumulative-counter delta.
+    pub max_rate_gap_us: Option<i64>,
     /// Physical input families.
     pub inputs: &'static [WebInput],
     /// Heatmap and spark metrics.
     pub metrics: &'static [WebMetric],
 }
+
+const DELTA_MAX_RATE_GAP_US: i64 = 15 * 60 * 1_000_000;
 
 const ACTIVITY_INPUTS: &[WebInput] = &[
     WebInput {
@@ -187,10 +195,16 @@ const ACTIVITY_INPUTS: &[WebInput] = &[
         sections: &["os_process"],
     },
 ];
-const STATEMENTS_INPUTS: &[WebInput] = &[WebInput {
-    code: "statements",
-    sections: &["pg_stat_statements"],
-}];
+const STATEMENTS_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "statements",
+        sections: &["pg_stat_statements"],
+    },
+    WebInput {
+        code: "settings",
+        sections: &["pg_settings"],
+    },
+];
 const PLANS_INPUTS: &[WebInput] = &[WebInput {
     code: "plans",
     sections: &["pg_store_plans_ossc", "pg_store_plans_vadv"],
@@ -287,8 +301,8 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 1,
         name: "time",
-        revision: 1,
-        unit: WebUnit::Microseconds,
+        revision: 2,
+        unit: WebUnit::Milliseconds,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
             field_sets: &[&["total_exec_time"], &["total_time"]],
@@ -530,14 +544,16 @@ const WEB_VIEWS: &[WebView] = &[
         name: "activity",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: ACTIVITY_INPUTS,
         metrics: ACTIVITY_METRICS,
     },
     WebView {
         code: 2,
         name: "statements",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: STATEMENTS_INPUTS,
         metrics: STATEMENT_METRICS,
     },
@@ -546,6 +562,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "plans",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PLANS_INPUTS,
         metrics: PLAN_METRICS,
     },
@@ -554,6 +571,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "tables",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: TABLES_INPUTS,
         metrics: TABLE_METRICS,
     },
@@ -562,6 +580,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "indexes",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: INDEXES_INPUTS,
         metrics: INDEX_METRICS,
     },
@@ -570,6 +589,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "vacuum",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: None,
         inputs: VACUUM_INPUTS,
         metrics: VACUUM_METRICS,
     },
@@ -578,6 +598,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "processes",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PROCESS_INPUTS,
         metrics: PROCESS_METRICS,
     },
@@ -586,6 +607,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "locks",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: None,
         inputs: LOCK_INPUTS,
         metrics: LOCK_METRICS,
     },
@@ -594,6 +616,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "events",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: None,
         inputs: EVENT_INPUTS,
         metrics: EVENT_METRICS,
     },

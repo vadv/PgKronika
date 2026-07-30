@@ -16,7 +16,8 @@ pub use gauge::{ColumnValues, SeriesValues, gauge_section};
 pub use latest::latest_section_row;
 pub use logical::{LogicalColumn, LogicalSection, logical_section};
 pub use section::{
-    QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SectionPage, section,
-    section_with_limits, sections, sections_with_limits,
+    QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SealedQuerySession, SectionPage,
+    section, section_with_limits, sections, sections_from_sealed_descriptor_with_limits,
+    sections_with_limits,
 };
 pub use value::{Gap, OutRow, Value};
