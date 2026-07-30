@@ -3,11 +3,13 @@
 mod cgroup;
 mod cpu;
 mod memory;
+mod postgres_tables;
 mod pressure;
+mod storage;
 
 use super::{
-    Boundary, Classified, Comparison, Direction, FractionPolicy, MetricInput, Policy, ScalarPolicy,
-    ZeroDisposition,
+    AgePolicy, Boundary, Classified, Comparison, Direction, FractionPolicy, FreeCapacityPolicy,
+    MetricInput, Policy, RatioWithFloorPolicy, ScalarPolicy, ZeroDisposition,
 };
 
 /// Stable identity of one built-in absolute-threshold metric.
@@ -64,11 +66,45 @@ pub enum MetricId {
     OsCgroupMemoryHeadroomPercent,
     /// cgroup out-of-memory kill count delta.
     OsCgroupMemoryOomKillsDelta,
+    /// Maximum disk utilization percentage.
+    OsDiskUtilPercent,
+    /// Maximum disk request latency in milliseconds.
+    OsDiskMaxAwaitMilliseconds,
+    /// Disk read request latency in milliseconds.
+    OsDiskReadAwaitMilliseconds,
+    /// Disk write request latency in milliseconds.
+    OsDiskWriteAwaitMilliseconds,
+    /// Filesystem capacity available by relative and absolute amount.
+    OsFilesystemFreeCapacity,
+    /// Process block-I/O delay delta in seconds.
+    OsProcessBlockDelaySecondsDelta,
+    /// Disk blocks read per second.
+    OsDiskBlocksReadPerSecond,
+    /// Network interface errors per second.
+    OsNetworkErrorsPerSecond,
+    /// Network interface drops per second.
+    OsNetworkDropsPerSecond,
+    /// Dead-tuple fraction gated by the absolute dead-tuple count.
+    PgTablesDeadTuplePercent,
+    /// Dead-tuple count.
+    PgTablesDeadTuples,
+    /// Sequential scan percentage.
+    PgTablesSequentialScanPercent,
+    /// Tuples modified since the last analyze.
+    PgTablesModifiedSinceAnalyze,
+    /// Tuples inserted since the last vacuum.
+    PgTablesInsertedSinceVacuum,
+    /// Applicable table age since the last autovacuum.
+    PgTablesAutovacuumAgeSeconds,
+    /// Applicable table age since the last autoanalyze.
+    PgTablesAutoanalyzeAgeSeconds,
+    /// Temporary bytes written per second.
+    PgTablesTempBytesPerSecond,
 }
 
 impl MetricId {
     /// Every built-in metric in canonical catalog order.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 42] = [
         Self::OsProcessCpuPercent,
         Self::OsLoadAvg1PerCore,
         Self::OsCpuIdlePercent,
@@ -94,6 +130,23 @@ impl MetricId {
         Self::OsCgroupMemoryAnonPercent,
         Self::OsCgroupMemoryHeadroomPercent,
         Self::OsCgroupMemoryOomKillsDelta,
+        Self::OsDiskUtilPercent,
+        Self::OsDiskMaxAwaitMilliseconds,
+        Self::OsDiskReadAwaitMilliseconds,
+        Self::OsDiskWriteAwaitMilliseconds,
+        Self::OsFilesystemFreeCapacity,
+        Self::OsProcessBlockDelaySecondsDelta,
+        Self::OsDiskBlocksReadPerSecond,
+        Self::OsNetworkErrorsPerSecond,
+        Self::OsNetworkDropsPerSecond,
+        Self::PgTablesDeadTuplePercent,
+        Self::PgTablesDeadTuples,
+        Self::PgTablesSequentialScanPercent,
+        Self::PgTablesModifiedSinceAnalyze,
+        Self::PgTablesInsertedSinceVacuum,
+        Self::PgTablesAutovacuumAgeSeconds,
+        Self::PgTablesAutoanalyzeAgeSeconds,
+        Self::PgTablesTempBytesPerSecond,
     ];
 
     /// Stable diagnostic and future adapter code.
@@ -125,6 +178,23 @@ impl MetricId {
             Self::OsCgroupMemoryAnonPercent => "os.cgroup.memory_anon_pct",
             Self::OsCgroupMemoryHeadroomPercent => "os.cgroup.memory_headroom_pct",
             Self::OsCgroupMemoryOomKillsDelta => "os.cgroup.memory_oom_kills_delta",
+            Self::OsDiskUtilPercent => "os.disk.util_pct",
+            Self::OsDiskMaxAwaitMilliseconds => "os.disk.max_await_ms",
+            Self::OsDiskReadAwaitMilliseconds => "os.disk.read_await_ms",
+            Self::OsDiskWriteAwaitMilliseconds => "os.disk.write_await_ms",
+            Self::OsFilesystemFreeCapacity => "os.filesystem.free_capacity",
+            Self::OsProcessBlockDelaySecondsDelta => "os.process.block_delay_seconds_delta",
+            Self::OsDiskBlocksReadPerSecond => "os.disk.blocks_read_per_second",
+            Self::OsNetworkErrorsPerSecond => "os.network.errors_per_second",
+            Self::OsNetworkDropsPerSecond => "os.network.drops_per_second",
+            Self::PgTablesDeadTuplePercent => "pg.tables.dead_tuple_pct",
+            Self::PgTablesDeadTuples => "pg.tables.dead_tuples",
+            Self::PgTablesSequentialScanPercent => "pg.tables.sequential_scan_pct",
+            Self::PgTablesModifiedSinceAnalyze => "pg.tables.modified_since_analyze",
+            Self::PgTablesInsertedSinceVacuum => "pg.tables.inserted_since_vacuum",
+            Self::PgTablesAutovacuumAgeSeconds => "pg.tables.autovacuum_age_seconds",
+            Self::PgTablesAutoanalyzeAgeSeconds => "pg.tables.autoanalyze_age_seconds",
+            Self::PgTablesTempBytesPerSecond => "pg.tables.temp_bytes_per_second",
         }
     }
 }
@@ -174,7 +244,7 @@ pub struct CatalogEntry {
     pub calibration: Calibration,
 }
 
-const CATALOG: [CatalogEntry; 25] = [
+const CATALOG: [CatalogEntry; 42] = [
     cpu::OS_PROCESS_CPU_PERCENT,
     cpu::OS_LOAD_AVG1_PER_CORE,
     cpu::OS_CPU_IDLE_PERCENT,
@@ -200,6 +270,23 @@ const CATALOG: [CatalogEntry; 25] = [
     cgroup::OS_CGROUP_MEMORY_ANON_PERCENT,
     cgroup::OS_CGROUP_MEMORY_HEADROOM_PERCENT,
     cgroup::OS_CGROUP_MEMORY_OOM_KILLS_DELTA,
+    storage::OS_DISK_UTIL_PERCENT,
+    storage::OS_DISK_MAX_AWAIT_MILLISECONDS,
+    storage::OS_DISK_READ_AWAIT_MILLISECONDS,
+    storage::OS_DISK_WRITE_AWAIT_MILLISECONDS,
+    storage::OS_FILESYSTEM_FREE_CAPACITY,
+    storage::OS_PROCESS_BLOCK_DELAY_SECONDS_DELTA,
+    storage::OS_DISK_BLOCKS_READ_PER_SECOND,
+    storage::OS_NETWORK_ERRORS_PER_SECOND,
+    storage::OS_NETWORK_DROPS_PER_SECOND,
+    postgres_tables::PG_TABLES_DEAD_TUPLE_PERCENT,
+    postgres_tables::PG_TABLES_DEAD_TUPLES,
+    postgres_tables::PG_TABLES_SEQUENTIAL_SCAN_PERCENT,
+    postgres_tables::PG_TABLES_MODIFIED_SINCE_ANALYZE,
+    postgres_tables::PG_TABLES_INSERTED_SINCE_VACUUM,
+    postgres_tables::PG_TABLES_AUTOVACUUM_AGE_SECONDS,
+    postgres_tables::PG_TABLES_AUTOANALYZE_AGE_SECONDS,
+    postgres_tables::PG_TABLES_TEMP_BYTES_PER_SECOND,
 ];
 
 /// Canonical built-in threshold catalog.
@@ -260,6 +347,65 @@ pub(super) const fn fraction_entry(
     }
 }
 
+pub(super) const fn ratio_with_floor_entry(
+    id: MetricId,
+    unit: Unit,
+    warning: Boundary,
+    critical: Boundary,
+    floor: Boundary,
+) -> CatalogEntry {
+    let ratio = valid_scalar(
+        Direction::HigherIsWorse,
+        Some(warning),
+        Some(critical),
+        ZeroDisposition::Classify,
+    );
+    CatalogEntry {
+        id,
+        policy: Policy::RatioWithFloor(valid_ratio_with_floor(ratio, floor)),
+        unit,
+        calibration: Calibration::Provisional,
+    }
+}
+
+pub(super) const fn age_entry(id: MetricId, warning: Boundary, critical: Boundary) -> CatalogEntry {
+    let age = valid_scalar(
+        Direction::HigherIsWorse,
+        Some(warning),
+        Some(critical),
+        ZeroDisposition::Classify,
+    );
+    CatalogEntry {
+        id,
+        policy: Policy::AgeGated(valid_age(age)),
+        unit: Unit::Seconds,
+        calibration: Calibration::Provisional,
+    }
+}
+
+pub(super) const fn free_capacity_entry(
+    id: MetricId,
+    warning: Boundary,
+    critical: Boundary,
+    absolute_ceiling_bytes: Boundary,
+) -> CatalogEntry {
+    let available_fraction = valid_scalar(
+        Direction::LowerIsWorse,
+        Some(warning),
+        Some(critical),
+        ZeroDisposition::Classify,
+    );
+    CatalogEntry {
+        id,
+        policy: Policy::FreeCapacity(valid_free_capacity(
+            available_fraction,
+            absolute_ceiling_bytes,
+        )),
+        unit: Unit::Bytes,
+        calibration: Calibration::Provisional,
+    }
+}
+
 #[expect(
     clippy::panic,
     reason = "an invalid built-in policy must fail constant evaluation"
@@ -273,6 +419,42 @@ const fn valid_scalar(
     match ScalarPolicy::new(direction, warning, critical, zero) {
         Ok(policy) => policy,
         Err(_) => panic!("invalid built-in scalar policy"),
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "an invalid built-in policy must fail constant evaluation"
+)]
+const fn valid_ratio_with_floor(ratio: ScalarPolicy, floor: Boundary) -> RatioWithFloorPolicy {
+    match RatioWithFloorPolicy::new(ratio, floor) {
+        Ok(policy) => policy,
+        Err(_) => panic!("invalid built-in ratio floor"),
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "an invalid built-in policy must fail constant evaluation"
+)]
+const fn valid_age(age: ScalarPolicy) -> AgePolicy {
+    match AgePolicy::new(age) {
+        Ok(policy) => policy,
+        Err(_) => panic!("invalid built-in age policy"),
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "an invalid built-in policy must fail constant evaluation"
+)]
+const fn valid_free_capacity(
+    available_fraction: ScalarPolicy,
+    absolute_ceiling_bytes: Boundary,
+) -> FreeCapacityPolicy {
+    match FreeCapacityPolicy::new(available_fraction, absolute_ceiling_bytes) {
+        Ok(policy) => policy,
+        Err(_) => panic!("invalid built-in free-capacity policy"),
     }
 }
 
