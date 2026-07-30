@@ -30,7 +30,14 @@ pub(crate) fn filter_sort_page(
     let matched = rows.len();
 
     if let Some(cursor) = &request.cursor {
-        rows.retain(|row| compare_cursor(request, row, cursor.sort_key(), cursor.entity()).is_gt());
+        let position = rows
+            .iter()
+            .position(|row| row.entity == cursor.entity())
+            .filter(|position| {
+                value_sort_key(cell(&rows[*position], request.sort)) == *cursor.sort_key()
+            })
+            .ok_or(ProjectionError::Cursor)?;
+        rows.drain(..=position);
     }
     let has_more = rows.len() > request.limit;
     rows.truncate(request.limit);
@@ -49,37 +56,18 @@ pub(crate) fn filter_sort_page(
 }
 
 fn compare_rows(request: &FrameRequest, left: &ProjectedRow, right: &ProjectedRow) -> Ordering {
-    let left_value = value_sort_key(cell(left, request.sort));
-    let right_value = value_sort_key(cell(right, request.sort));
-    let order = compare_sort_keys(&left_value, &right_value);
+    let left_value = cell(left, request.sort);
+    let right_value = cell(right, request.sort);
+    let order = compare_values(left_value, right_value);
     let order = if request.descending
-        && !matches!(left_value, SortKey::Null)
-        && !matches!(right_value, SortKey::Null)
+        && !matches!(left_value, FrameValue::Null)
+        && !matches!(right_value, FrameValue::Null)
     {
         order.reverse()
     } else {
         order
     };
     order.then_with(|| left.entity.cmp(&right.entity))
-}
-
-fn compare_cursor(
-    request: &FrameRequest,
-    row: &ProjectedRow,
-    cursor_key: &SortKey,
-    cursor_entity: &[u8],
-) -> Ordering {
-    let row_key = value_sort_key(cell(row, request.sort));
-    let order = compare_sort_keys(&row_key, cursor_key);
-    let order = if request.descending
-        && !matches!(row_key, SortKey::Null)
-        && !matches!(cursor_key, SortKey::Null)
-    {
-        order.reverse()
-    } else {
-        order
-    };
-    order.then_with(|| row.entity.as_slice().cmp(cursor_entity))
 }
 
 fn cell<'a>(row: &'a ProjectedRow, code: &str) -> &'a FrameValue {
@@ -110,6 +98,27 @@ fn compare_sort_keys(left: &SortKey, right: &SortKey) -> Ordering {
         (SortKey::Boolean(left), SortKey::Boolean(right)) => left.cmp(right),
         (SortKey::TextPrefix(left), SortKey::TextPrefix(right)) => left.cmp(right),
         (left, right) => left.tag().cmp(&right.tag()),
+    }
+}
+
+fn compare_values(left: &FrameValue, right: &FrameValue) -> Ordering {
+    match (left, right) {
+        (FrameValue::Null, FrameValue::Null) => Ordering::Equal,
+        (FrameValue::Null, _) => Ordering::Greater,
+        (_, FrameValue::Null) => Ordering::Less,
+        (FrameValue::Number(left), FrameValue::Number(right)) => left.total_cmp(right),
+        (FrameValue::Boolean(left), FrameValue::Boolean(right)) => left.cmp(right),
+        (FrameValue::String(left), FrameValue::String(right)) => left.cmp(right),
+        (left, right) => frame_value_tag(left).cmp(&frame_value_tag(right)),
+    }
+}
+
+const fn frame_value_tag(value: &FrameValue) -> u8 {
+    match value {
+        FrameValue::Null => 0,
+        FrameValue::Number(_) => 1,
+        FrameValue::Boolean(_) => 2,
+        FrameValue::String(_) => 3,
     }
 }
 

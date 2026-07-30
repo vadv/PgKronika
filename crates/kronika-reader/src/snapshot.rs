@@ -1026,6 +1026,39 @@ impl LocalDirSnapshot {
             })
     }
 
+    pub(crate) fn sealed_query_eager_open_bytes(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<u64, SealedFactError> {
+        let sealed = self
+            .scan
+            .sealed
+            .iter()
+            .find(|sealed| SealedLocator::from_segment_id(sealed.address.id) == descriptor.locator)
+            .ok_or(SealedFactError::DescriptorUnavailable {
+                locator: descriptor.locator,
+            })?;
+        if SegmentDescriptor::from_summary(descriptor.locator, sealed.identity, &sealed.summary)
+            != *descriptor
+        {
+            return Err(SealedFactError::StaleDescriptor {
+                locator: descriptor.locator,
+            });
+        }
+        Ok(u64::from(sealed.summary.catalog_len)
+            .saturating_add(MAGIC.len() as u64)
+            .saturating_add(TAIL_INDEX_LEN as u64))
+    }
+
+    pub(crate) fn open_sealed_for_query_by_descriptor(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<PgmUnit<std::fs::File>, SealedFactError> {
+        #[cfg(any(test, feature = "qualification"))]
+        OPEN_UNIT_CALLS.with(|calls| calls.set(calls.get() + 1));
+        self.open_sealed_by_descriptor(descriptor)
+    }
+
     /// Opens one active journal part by its exact refresh descriptor.
     ///
     /// The descriptor is matched against the journal generation, byte range,

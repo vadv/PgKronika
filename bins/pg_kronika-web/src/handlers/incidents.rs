@@ -355,6 +355,13 @@ fn read_error_response(error: QueryError) -> ApiError {
             logged_internal_error("api_reader_cursor_invariant", &message)
         }
         QueryError::Read(read) => logged_store_read_error(&read),
+        QueryError::SealedDescriptor(_) => {
+            tracing::error!(
+                event = "api_store_descriptor_read_failed",
+                "store descriptor query failed"
+            );
+            ApiError::store_read_failed()
+        }
     }
 }
 

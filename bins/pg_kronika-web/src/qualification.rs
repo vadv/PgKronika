@@ -2839,11 +2839,11 @@ mod tests {
         let raw = format!("at={current_ts_us}&span=24h&preset=memory&limit=200");
         let request =
             FrameRequest::parse("processes", Some(&raw), &catalog).expect("frame request");
-        let mut request_snapshot = (*state.snapshot()).clone();
+        let request_snapshot = (*state.snapshot()).clone();
 
         kronika_reader::qualification_reset_open_unit_calls();
         let mut frame = project_frame(
-            &mut request_snapshot,
+            &request_snapshot,
             &request,
             &catalog,
             FrameLimits::default(),

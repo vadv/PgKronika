@@ -141,7 +141,14 @@ critical-границей `Boundary` и fixed-size `Evidence`, где сохра
 политик, операторы, zero semantics, boundary и правила evidence не копируются.
 Отсутствие binding и `NotClassifiedReason` для bound-входа остаются разными
 wire-состояниями. Config-bound политики autovacuum отложены до устойчивого
-сбора relation reloptions. Production frontend в эту интеграцию не входит.
+сбора relation reloptions. Frame читает точный sealed descriptor, выбранный
+через `UiSummary`; настройки planning берутся из того же PGM. Для delta-view
+predecessor допустим только в пределах типизированного 15-минутного
+`max_rate_gap`, иначе ячейка остаётся gap/not-classified, а второй PGM не
+открывается. Когда нужны два PGM, они разделяют один общий лимит materialization
+по строкам, ячейкам и owned bytes. Поиск ограничен публичной меткой и выбранными
+non-lazy ячейками, которые возвращает frame. Production frontend в эту
+интеграцию не входит.
 
 Этот контракт Класса 1 отвечает на вопрос, пересекло ли наблюдение фиксированную
 операторскую границу. Отдельный модуль [`anomaly`](src/anomaly/mod.rs) реализует

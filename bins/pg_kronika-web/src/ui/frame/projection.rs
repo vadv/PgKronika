@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use kronika_analytics::web_projection::WebView;
 use kronika_reader::{
     Gap, LIMIT, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SnapshotNeighbors, Value,
-    WebIndexReadError, logical_section, sections_with_limits,
+    WebIndexReadError, logical_section, sections_from_sealed_descriptor_with_limits,
 };
 use kronika_registry::ColumnType;
 
@@ -70,6 +70,7 @@ pub(crate) struct RowOperands {
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectedRow {
     pub entity: Vec<u8>,
+    pub spark_entity: Vec<u8>,
     pub label: String,
     pub cells: Vec<FrameValue>,
     pub operands: RowOperands,
@@ -143,6 +144,16 @@ impl ProjectionInput {
             .push(row);
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_previous(&mut self, timestamp_us: i64, section: &str, row: OutRow) {
+        self.predecessor_ts_us = Some(timestamp_us);
+        self.neighbors.previous = Some(timestamp_us);
+        self.previous
+            .entry(section.to_owned())
+            .or_default()
+            .push(row);
+    }
+
     pub(crate) fn from_pages(
         snapshot_ts_us: i64,
         predecessor_ts_us: Option<i64>,
@@ -175,6 +186,12 @@ impl ProjectionInput {
             previous,
             gaps,
         }
+    }
+
+    fn push_gap(&mut self, gap: Gap) {
+        self.gaps.push(gap);
+        self.gaps.sort_by_key(|gap| (gap.from, gap.to));
+        self.gaps.dedup();
     }
 }
 
@@ -241,7 +258,7 @@ impl From<ProjectionError> for FrameError {
 }
 
 pub(crate) fn project_frame(
-    snapshot: &mut LocalDirSnapshot,
+    snapshot: &LocalDirSnapshot,
     request: &FrameRequest,
     catalog: &ProjectionCatalog,
     limits: FrameLimits,
@@ -283,45 +300,8 @@ pub(crate) fn project_frame(
         return Err(FrameError::CursorExpired);
     }
 
-    let section_names = request
-        .view
-        .inputs
-        .iter()
-        .flat_map(|input| input.sections.iter().copied())
-        .collect::<Vec<_>>();
-    let query_limits = QueryLimits::with_bytes(limits.rows, limits.cells, limits.bytes);
-    let cursors = BTreeMap::new();
-    let current = sections_with_limits(
-        snapshot,
-        neighbors.current,
-        neighbors.current,
-        &section_names,
-        &cursors,
-        query_limits,
-    )?;
-    let previous = if let Some(previous) = neighbors.previous {
-        sections_with_limits(
-            snapshot,
-            previous,
-            previous,
-            &section_names,
-            &cursors,
-            query_limits,
-        )?
-    } else {
-        BTreeMap::new()
-    };
-    let mut frame = project_input(
-        request,
-        catalog,
-        ProjectionInput::from_pages(
-            neighbors.current,
-            neighbors.previous,
-            neighbors,
-            current,
-            previous,
-        ),
-    )?;
+    let input = read_projection_input(snapshot, request, catalog, limits, &resolved, neighbors)?;
+    let mut frame = project_input(request, catalog, input)?;
     frame.quality.gated.extend(resolved.gated);
     frame
         .quality
@@ -334,8 +314,135 @@ pub(crate) fn project_frame(
     Ok(frame)
 }
 
+fn read_projection_input(
+    snapshot: &LocalDirSnapshot,
+    request: &FrameRequest,
+    catalog: &ProjectionCatalog,
+    limits: FrameLimits,
+    resolved: &ResolvedSnapshot,
+    neighbors: SnapshotNeighbors,
+) -> Result<ProjectionInput, FrameError> {
+    let section_names = request
+        .view
+        .inputs
+        .iter()
+        .flat_map(|input| input.sections.iter().copied())
+        .collect::<Vec<_>>();
+    let cursors = BTreeMap::new();
+    let current_descriptor = resolved
+        .current_descriptor
+        .ok_or(ProjectionError::MissingCatalogView)?;
+    let needs_predecessor = preset_requires_predecessor(request, catalog)?;
+    let rate_previous = neighbors.previous.filter(|previous| {
+        needs_predecessor
+            && neighbors
+                .current
+                .checked_sub(*previous)
+                .zip(request.view.max_rate_gap_us)
+                .is_some_and(|(gap, maximum)| gap > 0 && gap <= maximum)
+    });
+    let rate_gap = needs_predecessor
+        .then_some(neighbors.previous)
+        .flatten()
+        .filter(|previous| Some(*previous) != rate_previous)
+        .map(|previous| Gap {
+            from: previous,
+            to: neighbors.current,
+        });
+    let separate_predecessor = rate_previous.is_some()
+        && resolved
+            .previous_descriptor
+            .is_some_and(|descriptor| descriptor != current_descriptor);
+    let read_count = 1 + usize::from(separate_predecessor);
+    let query_limits = QueryLimits::with_bytes(
+        limits.rows / read_count,
+        limits.cells / read_count,
+        limits.bytes / read_count,
+    );
+    let current = sections_from_sealed_descriptor_with_limits(
+        snapshot,
+        &current_descriptor,
+        current_descriptor.min_ts,
+        neighbors.current,
+        &section_names,
+        &cursors,
+        query_limits,
+    )?;
+    let previous = match (rate_previous, resolved.previous_descriptor.as_ref()) {
+        (Some(_), Some(previous_descriptor)) if *previous_descriptor == current_descriptor => {
+            current.clone()
+        }
+        (Some(previous), Some(previous_descriptor)) => sections_from_sealed_descriptor_with_limits(
+            snapshot,
+            previous_descriptor,
+            previous,
+            previous,
+            &section_names,
+            &cursors,
+            query_limits,
+        )?,
+        _ => BTreeMap::new(),
+    };
+    let mut input = ProjectionInput::from_pages(
+        neighbors.current,
+        rate_previous,
+        neighbors,
+        current,
+        previous,
+    );
+    if let Some(gap) = rate_gap {
+        input.push_gap(gap);
+    }
+    Ok(input)
+}
+
+fn preset_requires_predecessor(
+    request: &FrameRequest,
+    catalog: &ProjectionCatalog,
+) -> Result<bool, ProjectionError> {
+    let view = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == request.view.name)
+        .ok_or(ProjectionError::MissingCatalogView)?;
+    let preset = view
+        .presets
+        .iter()
+        .find(|preset| preset.code == request.preset)
+        .ok_or(ProjectionError::MissingPreset)?;
+    Ok(preset.columns.iter().any(|column| {
+        matches!(
+            (request.view.name, *column),
+            ("activity", "cpu")
+                | (
+                    "statements",
+                    "calls"
+                        | "total"
+                        | "ms_per_row"
+                        | "mean"
+                        | "time_pct"
+                        | "plan_time_pct"
+                        | "rows"
+                        | "hit_pct"
+                        | "blks_read"
+                        | "temp_written"
+                        | "wal_bytes"
+                )
+                | ("plans", "calls" | "mean" | "rows")
+                | ("tables", "seq_scan_pct")
+                | ("indexes", "scans" | "rows_per_scan")
+                | (
+                    "processes",
+                    "cpu" | "read_bytes_per_second" | "write_bytes_per_second" | "block_delay"
+                )
+        )
+    }))
+}
+
 struct ResolvedSnapshot {
     neighbors: Option<SnapshotNeighbors>,
+    current_descriptor: Option<kronika_reader::SegmentDescriptor>,
+    previous_descriptor: Option<kronika_reader::SegmentDescriptor>,
     next: Option<i64>,
     gated: Vec<String>,
     unavailable_revision: Vec<String>,
@@ -346,7 +453,7 @@ fn resolve_snapshot(
     snapshot: &LocalDirSnapshot,
     request: &FrameRequest,
 ) -> Result<ResolvedSnapshot, FrameError> {
-    let mut all_times = Vec::new();
+    let mut snapshots = BTreeMap::new();
     let mut gated = Vec::new();
     let mut unavailable_revision = Vec::new();
     let mut resource_limited = Vec::new();
@@ -382,12 +489,11 @@ fn resolve_snapshot(
                 .get(index / 8)
                 .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
             {
-                all_times.push(timestamp);
+                snapshots.insert(timestamp, descriptor);
             }
         }
     }
-    all_times.sort_unstable();
-    all_times.dedup();
+    let all_times = snapshots.keys().copied().collect::<Vec<_>>();
     gated.sort();
     gated.dedup();
     unavailable_revision.sort();
@@ -409,8 +515,14 @@ fn resolve_snapshot(
         current,
         next,
     });
+    let current_descriptor = current.and_then(|timestamp| snapshots.get(&timestamp).copied());
+    let previous_descriptor = neighbors
+        .and_then(|neighbors| neighbors.previous)
+        .and_then(|timestamp| snapshots.get(&timestamp).copied());
     Ok(ResolvedSnapshot {
         neighbors,
+        current_descriptor,
+        previous_descriptor,
         next,
         gated,
         unavailable_revision,
@@ -457,31 +569,44 @@ pub(crate) fn project_input(
     let mut previous = BTreeMap::new();
     for section in primary_sections {
         for row in input.previous.get(*section).into_iter().flatten() {
+            if timestamp(row, "ts")? != input.predecessor_ts_us {
+                continue;
+            }
             previous.insert(entity_for(request.view, section, row)?, row);
         }
     }
 
-    let track_planning = input
-        .current
-        .get("pg_settings")
-        .into_iter()
-        .flatten()
-        .filter(|row| {
-            text(row, "name").is_some_and(|name| name == "pg_stat_statements.track_planning")
-        })
-        .filter_map(|row| text(row, "setting"))
-        .next_back()
-        .is_some_and(|setting| setting == "on");
+    let mut track_planning_value = None;
+    for row in input.current.get("pg_settings").into_iter().flatten() {
+        if text(row, "name") != Some("pg_stat_statements.track_planning") {
+            continue;
+        }
+        let Some(timestamp) = timestamp(row, "ts")? else {
+            continue;
+        };
+        if timestamp <= input.snapshot_ts_us
+            && track_planning_value.is_none_or(|(selected, _)| timestamp > selected)
+        {
+            track_planning_value = text(row, "setting").map(|setting| (timestamp, setting));
+        }
+    }
+    let track_planning = track_planning_value.is_some_and(|(_timestamp, setting)| setting == "on");
     let has_gap = !input.gaps.is_empty();
     let mut rows = Vec::new();
-    for section in primary_sections {
-        for row in input.current.get(*section).into_iter().flatten() {
+    for (section_index, section) in primary_sections.iter().enumerate() {
+        for (row_index, row) in input
+            .current
+            .get(*section)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
             if timestamp(row, "ts")? != Some(input.snapshot_ts_us) {
                 continue;
             }
             let entity = entity_for(request.view, section, row)?;
             let predecessor = previous.get(&entity).copied();
-            rows.push(project_view(
+            let mut projected = project_view(
                 request.view,
                 view_spec,
                 &columns,
@@ -491,7 +616,11 @@ pub(crate) fn project_input(
                 &input,
                 track_planning,
                 has_gap,
-            )?);
+            )?;
+            if request.view.name == "events" {
+                projected.entity = event_frame_entity(section_index, row_index)?;
+            }
+            rows.push(projected);
         }
     }
 
@@ -504,17 +633,19 @@ pub(crate) fn project_input(
                     .as_ref()
                     .is_none_or(|database| row.database.as_ref() == Some(database))
             })
-            .filter_map(|row| row.operands.statements.as_ref())
-            .filter_map(|operands| match operands.exec_ms {
-                DeltaOperand::Value(value) => Some(value),
-                _ => None,
+            .try_fold(0.0, |sum, row| {
+                let operands = row.operands.statements.as_ref()?;
+                match operands.exec_ms {
+                    DeltaOperand::Value(value) => Some(sum + value),
+                    DeltaOperand::Missing | DeltaOperand::Reset | DeltaOperand::Gap => None,
+                }
             })
-            .sum::<f64>();
+            .filter(|denominator| *denominator > 0.0);
         for row in &mut rows {
             if let Some(operands) = &mut row.operands.statements {
-                operands.snapshot_exec_ms_delta_sum = (denominator > 0.0).then_some(denominator);
-                let value = match operands.exec_ms {
-                    DeltaOperand::Value(value) if denominator > 0.0 => {
+                operands.snapshot_exec_ms_delta_sum = denominator;
+                let value = match (operands.exec_ms, denominator) {
+                    (DeltaOperand::Value(value), Some(denominator)) => {
                         finite_frame(100.0 * value / denominator)
                     }
                     _ => FrameValue::Null,
@@ -525,6 +656,7 @@ pub(crate) fn project_input(
     }
     let threshold_context = FrameThresholdContext;
     for row in &mut rows {
+        row.searchable = public_searchable(&row.label, &row.values);
         row.classifications = classify_row(request.view.name, &columns, row, &threshold_context);
     }
 
@@ -608,6 +740,7 @@ fn row_shell(
     let entity = entity_for(view, section, row)?;
     Ok(ProjectedRow {
         label: label_for(view.name, row).unwrap_or_else(|| fallback_label(&entity)),
+        spark_entity: entity.clone(),
         entity,
         cells: Vec::new(),
         operands: RowOperands {
@@ -621,7 +754,7 @@ fn row_shell(
         },
         values: Vec::new(),
         database: text(row, "datname").map(str::to_owned),
-        searchable: searchable(row),
+        searchable: String::new(),
     })
 }
 
@@ -1009,6 +1142,17 @@ fn entity_for(view: &WebView, section: &str, row: &OutRow) -> Result<Vec<u8>, Pr
     Ok(entity)
 }
 
+fn event_frame_entity(section_index: usize, row_index: usize) -> Result<Vec<u8>, ProjectionError> {
+    let section_index =
+        u16::try_from(section_index).map_err(|_error| ProjectionError::InvalidValue("event"))?;
+    let row_index =
+        u32::try_from(row_index).map_err(|_error| ProjectionError::InvalidValue("event"))?;
+    let mut entity = Vec::with_capacity(6);
+    entity.extend_from_slice(&section_index.to_le_bytes());
+    entity.extend_from_slice(&row_index.to_le_bytes());
+    Ok(entity)
+}
+
 fn encode_value(
     output: &mut Vec<u8>,
     value: &Value,
@@ -1097,11 +1241,22 @@ fn fallback_label(entity: &[u8]) -> String {
         })
 }
 
-fn searchable(row: &OutRow) -> String {
-    row.iter()
-        .filter_map(|(_, value)| display(value))
-        .collect::<Vec<_>>()
-        .join("\u{0}")
+fn public_searchable(label: &str, values: &[(&str, FrameValue)]) -> String {
+    let mut searchable = label.to_owned();
+    for (_, value) in values {
+        searchable.push('\0');
+        match value {
+            FrameValue::Null => {}
+            FrameValue::Number(value) => {
+                write!(searchable, "{value}").expect("writing to String cannot fail");
+            }
+            FrameValue::Boolean(value) => {
+                searchable.push_str(if *value { "true" } else { "false" });
+            }
+            FrameValue::String(value) => searchable.push_str(value),
+        }
+    }
+    searchable
 }
 
 fn value<'a>(row: &'a OutRow, name: &str) -> Option<&'a Value> {

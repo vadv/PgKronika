@@ -2,13 +2,17 @@ use std::collections::BTreeSet;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use kronika_analytics::threshold::{Policy, catalog_entry, classify};
 use kronika_analytics::{
-    Boundary, Classified, Comparison, Evidence, Level, MetricInput, NotClassifiedReason, Verdict,
+    Boundary, Classified, Comparison, Evidence, Level, MetricId, MetricInput, NotClassifiedReason,
+    Verdict,
 };
-use kronika_format::{PartMeta, SectionInput, build_part};
+use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
 use kronika_reader::{FactStore, LIMIT, LocalDirSnapshot, OutRow, Value};
 use kronika_registry::pg_log::PgLogLifecycleV1;
-use kronika_registry::{Section, Ts};
+use kronika_registry::pg_settings::PgSettingsV1;
+use kronika_registry::pg_stat_statements::PgStatStatementsV2;
+use kronika_registry::{Section, StrId, Ts};
 
 use crate::api_error::ErrorCode;
 use crate::ui::catalog::ProjectionCatalog;
@@ -563,6 +567,11 @@ fn frame_text_sort_pagination_uses_the_bounded_cursor_key_consistently() {
 
     let first = project_input(&request, &catalog(), input.clone()).expect("first page");
     assert_eq!(first.rows.len(), 1);
+    assert_eq!(
+        first.rows[0].cells[0],
+        crate::ui::frame::dto::FrameValue::Number(2.0),
+        "full text order must compare the suffix after the bounded cursor prefix"
+    );
     let first_pid = first.rows[0].cells[0].clone();
     let cursor = first.next.expect("next cursor");
     let raw = format!("{raw}&cursor={cursor}");
@@ -570,6 +579,112 @@ fn frame_text_sort_pagination_uses_the_bounded_cursor_key_consistently() {
     let second = project_input(&request, &catalog(), input).expect("second page");
     assert_eq!(second.rows.len(), 1);
     assert_ne!(second.rows[0].cells[0], first_pid);
+}
+
+#[test]
+fn frame_filter_does_not_search_hidden_lazy_values() {
+    let request = FrameRequest::parse(
+        "processes",
+        Some("at=20&preset=memory&q=hidden-command"),
+        &catalog(),
+    )
+    .expect("request");
+    let input = ProjectionInput::single(
+        20,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(1)),
+            ("starttime", Value::Ts(1)),
+            ("comm", Value::Str("postgres".to_owned())),
+            ("rmem_kb", Value::U64(10)),
+            ("cmdline", Value::Str("hidden-command".to_owned())),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.matched, 0);
+    assert!(frame.rows.is_empty());
+}
+
+#[test]
+fn statement_time_percent_rejects_a_partial_reset_denominator() {
+    let request = FrameRequest::parse("statements", Some("at=20"), &catalog()).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    for (queryid, exec) in [(1, 20.0), (2, 40.0)] {
+        input.push(
+            "pg_stat_statements",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("queryid", Value::I64(queryid)),
+                ("userid", Value::U64(10)),
+                ("dbid", Value::U64(20)),
+                ("calls", Value::I64(2)),
+                ("rows", Value::I64(2)),
+                ("total_exec_time", Value::F64(exec)),
+            ]),
+        );
+    }
+    input.push_previous(
+        10,
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(1)),
+            ("rows", Value::I64(1)),
+            ("total_exec_time", Value::F64(10.0)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows.len(), 2);
+    assert!(frame.rows.iter().all(|row| {
+        row.operands
+            .statements
+            .as_ref()
+            .is_some_and(|operands| operands.snapshot_exec_ms_delta_sum.is_none())
+    }));
+}
+
+#[test]
+fn statement_filter_uses_the_final_returned_time_percent() {
+    let request =
+        FrameRequest::parse("statements", Some("at=20&q=25"), &catalog()).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    for (queryid, current_exec, previous_exec) in [(1, 30.0, 10.0), (2, 90.0, 30.0)] {
+        input.push(
+            "pg_stat_statements",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("queryid", Value::I64(queryid)),
+                ("userid", Value::U64(10)),
+                ("dbid", Value::U64(20)),
+                ("calls", Value::I64(2)),
+                ("rows", Value::I64(2)),
+                ("total_exec_time", Value::F64(current_exec)),
+            ]),
+        );
+        input.push_previous(
+            10,
+            "pg_stat_statements",
+            out_row(&[
+                ("ts", Value::Ts(10)),
+                ("queryid", Value::I64(queryid)),
+                ("userid", Value::U64(10)),
+                ("dbid", Value::U64(20)),
+                ("calls", Value::I64(1)),
+                ("rows", Value::I64(1)),
+                ("total_exec_time", Value::F64(previous_exec)),
+            ]),
+        );
+    }
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.matched, 1);
+    assert_eq!(frame.rows[0].label, "1");
 }
 
 fn frame_event_fixture() -> tempfile::TempDir {
@@ -656,29 +771,261 @@ fn frame_many_event_fixture() -> tempfile::TempDir {
     directory
 }
 
+fn statement_row(ts: i64, calls: i64, rows: i64, exec_ms: f64, plan_ms: f64) -> PgStatStatementsV2 {
+    PgStatStatementsV2 {
+        ts: Ts(ts),
+        queryid: Some(7),
+        userid: 10,
+        dbid: 20,
+        datname: None,
+        usename: None,
+        query: None,
+        calls,
+        rows,
+        plans: calls,
+        total_exec_time: exec_ms,
+        total_plan_time: plan_ms,
+        min_exec_time: 0.0,
+        max_exec_time: 0.0,
+        mean_exec_time: 0.0,
+        stddev_exec_time: 0.0,
+        min_plan_time: 0.0,
+        max_plan_time: 0.0,
+        mean_plan_time: 0.0,
+        stddev_plan_time: 0.0,
+        shared_blks_hit: 0,
+        shared_blks_read: 0,
+        shared_blks_dirtied: 0,
+        shared_blks_written: 0,
+        local_blks_hit: 0,
+        local_blks_read: 0,
+        local_blks_dirtied: 0,
+        local_blks_written: 0,
+        temp_blks_read: 0,
+        temp_blks_written: 0,
+        blk_read_time: 0.0,
+        blk_write_time: 0.0,
+        wal_records: 0,
+        wal_fpi: 0,
+        wal_bytes: 0,
+    }
+}
+
+fn frame_statement_planning_fixture() -> tempfile::TempDir {
+    let mut interner =
+        kronika_writer::Interner::new(DictLimits::new(32, 4_096).expect("dictionary limits"));
+    let mut intern = |value: &str| {
+        interner
+            .intern(value.as_bytes())
+            .map(|id| StrId(id.get()))
+            .expect("intern settings fixture")
+    };
+    let settings = [PgSettingsV1 {
+        ts: Ts(1_000),
+        name: intern("pg_stat_statements.track_planning"),
+        setting: intern("on"),
+        unit: None,
+        source: intern("configuration file"),
+        sourcefile: None,
+        sourceline: None,
+        pending_restart: false,
+        context: intern("sighup"),
+        vartype: intern("bool"),
+        boot_val: Some(intern("off")),
+        reset_val: Some(intern("on")),
+    }];
+    let statements = [
+        statement_row(1_500, 10, 20, 100.0, 25.0),
+        statement_row(1_600, 12, 24, 120.0, 30.0),
+    ];
+    let settings_body = PgSettingsV1::encode(&settings).expect("encode settings fixture");
+    let statements_body =
+        PgStatStatementsV2::encode(&statements).expect("encode statements fixture");
+    let dictionary =
+        kronika_writer::dict::encode(interner.window()).expect("encode fixture dictionary");
+    let mut sections = vec![
+        SectionInput {
+            type_id: 1_002_002,
+            rows: u32::try_from(statements.len()).expect("statement rows"),
+            body: &statements_body,
+        },
+        SectionInput {
+            type_id: 1_019_001,
+            rows: u32::try_from(settings.len()).expect("settings rows"),
+            body: &settings_body,
+        },
+    ];
+    sections.extend(dictionary.iter().map(|section| SectionInput {
+        type_id: section.type_id,
+        rows: section.rows,
+        body: &section.body,
+    }));
+    sections.sort_unstable_by_key(|section| section.type_id);
+    let pgm = build_part(
+        &sections,
+        PartMeta {
+            min_ts: 1_000,
+            max_ts: 1_600,
+        },
+    );
+    let directory = tempfile::tempdir().expect("tempdir");
+    crate::test_layout::write_named_pgm(directory.path(), "frame-statements.pgm", &pgm);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish web index");
+    }
+    directory
+}
+
+fn frame_statement_two_segment_fixture(gap_us: i64) -> (tempfile::TempDir, i64) {
+    let current_ts = 1_000 + gap_us;
+    let directory = tempfile::tempdir().expect("tempdir");
+    for (file, row) in [
+        (
+            "frame-statements-prev.pgm",
+            statement_row(1_000, 10, 20, 100.0, 0.0),
+        ),
+        (
+            "frame-statements-current.pgm",
+            statement_row(current_ts, 20, 40, 200.0, 0.0),
+        ),
+    ] {
+        let body = PgStatStatementsV2::encode(&[row]).expect("encode statement gap fixture");
+        let pgm = build_part(
+            &[SectionInput {
+                type_id: 1_002_002,
+                rows: 1,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: row.ts.0,
+                max_ts: row.ts.0,
+            },
+        );
+        crate::test_layout::write_named_pgm(directory.path(), file, &pgm);
+    }
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish web index");
+    }
+    (directory, current_ts)
+}
+
+#[test]
+fn frame_uses_last_known_track_planning_from_the_same_exact_pgm() {
+    let directory = frame_statement_planning_fixture();
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let request =
+        FrameRequest::parse("statements", Some("at=1600"), &catalog()).expect("frame request");
+    kronika_reader::qualification_reset_open_unit_calls();
+
+    let frame = project_frame(&snapshot, &request, &catalog(), FrameLimits::default())
+        .expect("frame projection");
+
+    assert_eq!(kronika_reader::qualification_open_unit_calls(), 1);
+    let row = frame.rows.first().expect("statement row");
+    let plan_column = row
+        .values
+        .iter()
+        .position(|(column, _)| *column == "plan_time_pct")
+        .expect("plan_time_pct column");
+    assert_eq!(
+        row.cells[plan_column],
+        crate::ui::frame::dto::FrameValue::Number(20.0)
+    );
+    let classification = row
+        .classifications
+        .iter()
+        .find(|classification| classification.column == "plan_time_pct")
+        .expect("plan_time_pct classification");
+    assert!(matches!(classification.result, Classified::Verdict(_)));
+}
+
+#[test]
+fn frame_does_not_open_or_use_a_predecessor_beyond_the_rate_gap() {
+    let (directory, current_ts) = frame_statement_two_segment_fixture(16 * 60 * 1_000_000);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let raw = format!("at={current_ts}");
+    let request = FrameRequest::parse("statements", Some(&raw), &catalog()).expect("request");
+    kronika_reader::qualification_reset_open_unit_calls();
+
+    let frame = project_frame(&snapshot, &request, &catalog(), FrameLimits::default())
+        .expect("frame projection");
+
+    assert_eq!(kronika_reader::qualification_open_unit_calls(), 1);
+    assert_eq!(frame.predecessor_ts_us, None);
+    assert_eq!(frame.neighbors.previous, Some(1_000));
+    assert!(!frame.quality.gaps.is_empty());
+    let row = frame.rows.first().expect("statement row");
+    assert!(matches!(
+        row.operands.statements,
+        Some(StatementOperands {
+            exec_ms: DeltaOperand::Gap,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn frame_materialization_budget_is_shared_by_two_pgm_reads() {
+    let (directory, current_ts) = frame_statement_two_segment_fixture(60 * 1_000_000);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let raw = format!("at={current_ts}");
+    let request = FrameRequest::parse("statements", Some(&raw), &catalog()).expect("request");
+    let one_statement_row_cells = kronika_reader::logical_section("pg_stat_statements")
+        .expect("logical statements")
+        .columns
+        .len();
+
+    let error = project_frame(
+        &snapshot,
+        &request,
+        &catalog(),
+        FrameLimits {
+            rows: 2,
+            cells: one_statement_row_cells,
+            bytes: 32 * 1024 * 1024,
+        },
+    )
+    .expect_err("two PGM reads exceed one request-wide materialization budget");
+
+    assert!(matches!(
+        error,
+        crate::ui::frame::projection::FrameError::Query(
+            kronika_reader::QueryError::ResultTooLarge { .. }
+        )
+    ));
+}
+
 #[test]
 fn frame_spark_uses_the_selected_view_ovf_series() {
     let directory = frame_event_fixture();
     let state = super::state_for_dir(directory.path());
     let request =
         FrameRequest::parse("events", Some("at=1600&span=1ms"), &catalog()).expect("frame request");
-    let mut request_snapshot = (*state.snapshot()).clone();
+    let request_snapshot = (*state.snapshot()).clone();
     kronika_reader::qualification_reset_open_unit_calls();
     let mut frame = project_frame(
-        &mut request_snapshot,
+        &request_snapshot,
         &request,
         &catalog(),
         FrameLimits::default(),
     )
     .expect("frame projection");
-    assert_eq!(kronika_reader::qualification_open_unit_calls(), 2);
+    assert_eq!(kronika_reader::qualification_open_unit_calls(), 1);
     assert_eq!(frame.rows.len(), 1);
     assert!(frame.rows[0].spark.values.is_empty());
 
     let live = std::sync::Arc::clone(state.overview_view().live());
     attach_sparks(&request_snapshot, &live, &request, &mut frame).expect("spark merge");
 
-    assert_eq!(kronika_reader::qualification_open_unit_calls(), 2);
+    assert_eq!(kronika_reader::qualification_open_unit_calls(), 1);
     assert_eq!(frame.rows[0].spark.values.len(), 60);
     assert!(frame.rows[0].spark.values.iter().any(Option::is_some));
 }
@@ -740,9 +1087,37 @@ async fn frame_qualification_caps_rows_and_serialized_response() {
     assert!(serde_json::to_vec(&body).expect("serialize").len() <= 1_048_576);
 }
 
+#[tokio::test]
+async fn frame_event_cursor_tiles_every_matching_row() {
+    let directory = frame_many_event_fixture();
+    let mut cursor: Option<String> = None;
+    let mut returned = 0_usize;
+    for _page in 0..3 {
+        let mut uri = "/v1/frame/events?at=2000&span=1ms&limit=200".to_owned();
+        if let Some(value) = &cursor {
+            uri.push_str("&cursor=");
+            uri.push_str(value);
+        }
+        let (status, body) = super::serve(directory.path(), &uri).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        returned += body["page"]["returned"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .expect("returned count");
+        cursor = body["page"]["next"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(returned, 201);
+    assert!(cursor.is_none());
+}
+
 fn operand_row(operands: RowOperands) -> ProjectedRow {
     ProjectedRow {
         entity: vec![1],
+        spark_entity: vec![1],
         label: "row".to_owned(),
         cells: Vec::new(),
         operands,
@@ -883,4 +1258,221 @@ fn threshold_inputs_cover_all_fourteen_typed_adapters() {
         ),
         MetricInput::NotApplicable
     );
+}
+
+fn warning_boundary(metric_id: MetricId) -> Boundary {
+    let scalar = match catalog_entry(metric_id).policy {
+        Policy::Scalar(policy) => policy,
+        Policy::RatioWithFloor(policy) => policy.ratio(),
+        Policy::AgeGated(policy) => policy.scalar(),
+        policy => panic!("unexpected bound frame policy: {policy:?}"),
+    };
+    scalar.warning().expect("bound frame warning boundary")
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    reason = "bounded catalog seconds fit i64 microseconds; each adapter needs distinct operands"
+)]
+fn boundary_row(kind: OperandKind, observed: f64, metric_id: MetricId) -> ProjectedRow {
+    let now_us = 2_000_000_000_000_i64;
+    let duration_start = || now_us - (observed * 1_000_000.0).round() as i64;
+    let mut operands = RowOperands {
+        snapshot_ts_us: now_us,
+        ..RowOperands::default()
+    };
+
+    match kind {
+        OperandKind::ActivityQueryDuration => {
+            operands.activity_state = Some("active".to_owned());
+            operands.query_start_us = Some(duration_start());
+        }
+        OperandKind::ActivityTransactionDuration => {
+            operands.transaction_start_us = Some(duration_start());
+        }
+        OperandKind::StatementMillisecondsPerRow => {
+            operands.statements = Some(StatementOperands {
+                rows: DeltaOperand::Value(1.0),
+                exec_ms: DeltaOperand::Value(observed),
+                ..StatementOperands::default()
+            });
+        }
+        OperandKind::StatementMeanMilliseconds => {
+            operands.statements = Some(StatementOperands {
+                calls: DeltaOperand::Value(1.0),
+                exec_ms: DeltaOperand::Value(observed),
+                ..StatementOperands::default()
+            });
+        }
+        OperandKind::StatementTimePercent => {
+            operands.statements = Some(StatementOperands {
+                exec_ms: DeltaOperand::Value(observed),
+                snapshot_exec_ms_delta_sum: Some(100.0),
+                ..StatementOperands::default()
+            });
+        }
+        OperandKind::StatementPlanTimePercent => {
+            operands.statements = Some(StatementOperands {
+                exec_ms: DeltaOperand::Value(100.0 - observed),
+                plan_ms: DeltaOperand::Value(observed),
+                planning_fields: true,
+                track_planning: true,
+                ..StatementOperands::default()
+            });
+        }
+        OperandKind::TableDeadTupleRatio => {
+            let floor = match catalog_entry(metric_id).policy {
+                Policy::RatioWithFloor(policy) => policy.floor().value,
+                policy => panic!("unexpected dead tuple policy: {policy:?}"),
+            };
+            let dead = floor + floor.max(1.0);
+            operands.table = Some(TableOperands {
+                live: Some(dead * (1.0 - observed) / observed),
+                dead: Some(dead),
+                ..TableOperands::default()
+            });
+        }
+        OperandKind::TableDeadTuples => {
+            operands.table = Some(TableOperands {
+                dead: Some(observed),
+                ..TableOperands::default()
+            });
+        }
+        OperandKind::TableSequentialScanPercent => {
+            operands.table = Some(TableOperands {
+                seq_scan: DeltaOperand::Value(observed),
+                idx_scan: DeltaOperand::Value(100.0 - observed),
+                ..TableOperands::default()
+            });
+        }
+        OperandKind::TableModifiedSinceAnalyze => {
+            operands.table = Some(TableOperands {
+                modified: Some(observed),
+                ..TableOperands::default()
+            });
+        }
+        OperandKind::TableInsertedSinceVacuum => {
+            operands.table = Some(TableOperands {
+                inserted: Some(Some(observed)),
+                ..TableOperands::default()
+            });
+        }
+        OperandKind::TableAutovacuumAge => {
+            operands.table = Some(TableOperands {
+                dead: Some(1.0),
+                last_autovacuum_us: Some(duration_start()),
+                ..TableOperands::default()
+            });
+        }
+        OperandKind::TableAutoanalyzeAge => {
+            operands.table = Some(TableOperands {
+                modified: Some(10_000.0),
+                last_autoanalyze_us: Some(duration_start()),
+                ..TableOperands::default()
+            });
+        }
+        OperandKind::ProcessRssKib => operands.process_rss_kib = Some(observed),
+    }
+
+    operand_row(operands)
+}
+
+fn prepared_observed(input: MetricInput) -> f64 {
+    match input {
+        MetricInput::Scalar(value) => value,
+        MetricInput::RatioWithFloor { ratio, .. } => ratio,
+        MetricInput::Age {
+            epoch_seconds,
+            now_seconds,
+            gate: true,
+        } => now_seconds - epoch_seconds,
+        input => panic!("unexpected prepared boundary input: {input:?}"),
+    }
+}
+
+#[test]
+fn every_bound_adapter_preserves_below_on_and_above_boundary_semantics() {
+    let cases = [
+        (
+            OperandKind::ActivityQueryDuration,
+            MetricId::PgActivityQueryDurationSeconds,
+        ),
+        (
+            OperandKind::ActivityTransactionDuration,
+            MetricId::PgActivityTransactionDurationSeconds,
+        ),
+        (
+            OperandKind::StatementMillisecondsPerRow,
+            MetricId::PgStatementsMillisecondsPerRow,
+        ),
+        (
+            OperandKind::StatementMeanMilliseconds,
+            MetricId::PgStatementsMeanTimeMilliseconds,
+        ),
+        (
+            OperandKind::StatementTimePercent,
+            MetricId::PgStatementsTimePercent,
+        ),
+        (
+            OperandKind::StatementPlanTimePercent,
+            MetricId::PgStatementsPlanTimePercent,
+        ),
+        (
+            OperandKind::TableDeadTupleRatio,
+            MetricId::PgTablesDeadTuplePercent,
+        ),
+        (OperandKind::TableDeadTuples, MetricId::PgTablesDeadTuples),
+        (
+            OperandKind::TableSequentialScanPercent,
+            MetricId::PgTablesSequentialScanPercent,
+        ),
+        (
+            OperandKind::TableModifiedSinceAnalyze,
+            MetricId::PgTablesModifiedSinceAnalyze,
+        ),
+        (
+            OperandKind::TableInsertedSinceVacuum,
+            MetricId::PgTablesInsertedSinceVacuum,
+        ),
+        (
+            OperandKind::TableAutovacuumAge,
+            MetricId::PgTablesAutovacuumAgeSeconds,
+        ),
+        (
+            OperandKind::TableAutoanalyzeAge,
+            MetricId::PgTablesAutoanalyzeAgeSeconds,
+        ),
+        (OperandKind::ProcessRssKib, MetricId::OsProcessRssKib),
+    ];
+    let context = FrameThresholdContext;
+
+    for (kind, metric_id) in cases {
+        let boundary = warning_boundary(metric_id);
+        let step = (boundary.value * 1e-6).max(0.001);
+        for (position, observed) in [
+            ("below", boundary.value - step),
+            ("on", boundary.value),
+            ("above", boundary.value + step),
+        ] {
+            let input = prepare_input(kind, &boundary_row(kind, observed, metric_id), &context);
+            let actual = prepared_observed(input);
+            assert!(
+                (actual - observed).abs() <= step * 1e-3,
+                "{kind:?} {position}: expected {observed}, got {actual}"
+            );
+            let Classified::Verdict(verdict) = classify(metric_id, input) else {
+                panic!("{kind:?} {position}: adapter did not classify");
+            };
+            let expected = match (position, boundary.operator) {
+                ("below", _) | ("on", Comparison::Above) => Level::Ok,
+                ("on", Comparison::AtLeast) | ("above", _) => Level::Warning,
+                (_, Comparison::Below | Comparison::AtMost) => {
+                    panic!("unexpected lower-is-worse frame boundary")
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(verdict.level, expected, "{kind:?} {position}");
+        }
+    }
 }

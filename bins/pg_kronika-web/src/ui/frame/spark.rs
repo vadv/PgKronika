@@ -200,7 +200,7 @@ fn merge_block(
             .dictionary()
             .iter()
             .enumerate()
-            .find(|(_index, dictionary)| dictionary.key() == row.entity)
+            .find(|(_index, dictionary)| dictionary.key() == row.spark_entity)
         else {
             row.spark.complete = false;
             continue;

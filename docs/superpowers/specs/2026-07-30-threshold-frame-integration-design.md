@@ -182,7 +182,9 @@ pub fn snapshot_neighbors(
 Frame читает PGM, содержащий `current`. Второй PGM разрешён только когда
 cumulative column требует predecessor, а `UiSummary` доказал его timestamp.
 Промежуточные пустые PGM не читаются. Gap, reset, смена identity или превышение
-`max_rate_gap` дают `NotClassified`, а не приблизительный delta.
+типизированного `max_rate_gap=15m` дают `NotClassified`, а не приблизительный
+delta; при превышении границы второй PGM не открывается. Настройка
+`track_planning` берётся только из того же PGM, что и current snapshot.
 
 ### Endpoint
 
@@ -198,7 +200,7 @@ GET /v1/frame/{view}
 | `span` | spark range; default `1h`, maximum `24h` |
 | `preset` | optional; default — первый preset view |
 | `database` | optional точный database label для database-scoped view |
-| `q` | optional UTF-8 substring filter, не больше 256 bytes |
+| `q` | optional UTF-8 substring filter по public label и возвращаемым selected non-lazy cells, не больше 256 bytes |
 | `sort` | optional column code; default из preset |
 | `order` | `asc` или `desc`; default из preset |
 | `limit` | `1..=200`, default `100` |

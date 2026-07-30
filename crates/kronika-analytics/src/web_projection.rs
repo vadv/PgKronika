@@ -175,11 +175,15 @@ pub struct WebView {
     pub revision: u16,
     /// Typed identity encoding revision.
     pub identity_revision: u16,
+    /// Largest elapsed interval that can prove a cumulative-counter delta.
+    pub max_rate_gap_us: Option<i64>,
     /// Physical input families.
     pub inputs: &'static [WebInput],
     /// Heatmap and spark metrics.
     pub metrics: &'static [WebMetric],
 }
+
+const DELTA_MAX_RATE_GAP_US: i64 = 15 * 60 * 1_000_000;
 
 const ACTIVITY_INPUTS: &[WebInput] = &[
     WebInput {
@@ -540,6 +544,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "activity",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: ACTIVITY_INPUTS,
         metrics: ACTIVITY_METRICS,
     },
@@ -548,6 +553,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "statements",
         revision: 2,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: STATEMENTS_INPUTS,
         metrics: STATEMENT_METRICS,
     },
@@ -556,6 +562,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "plans",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PLANS_INPUTS,
         metrics: PLAN_METRICS,
     },
@@ -564,6 +571,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "tables",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: TABLES_INPUTS,
         metrics: TABLE_METRICS,
     },
@@ -572,6 +580,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "indexes",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: INDEXES_INPUTS,
         metrics: INDEX_METRICS,
     },
@@ -580,6 +589,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "vacuum",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: None,
         inputs: VACUUM_INPUTS,
         metrics: VACUUM_METRICS,
     },
@@ -588,6 +598,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "processes",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PROCESS_INPUTS,
         metrics: PROCESS_METRICS,
     },
@@ -596,6 +607,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "locks",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: None,
         inputs: LOCK_INPUTS,
         metrics: LOCK_METRICS,
     },
@@ -604,6 +616,7 @@ const WEB_VIEWS: &[WebView] = &[
         name: "events",
         revision: 1,
         identity_revision: 1,
+        max_rate_gap_us: None,
         inputs: EVENT_INPUTS,
         metrics: EVENT_METRICS,
     },

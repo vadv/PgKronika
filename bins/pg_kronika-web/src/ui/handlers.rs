@@ -81,9 +81,9 @@ pub(crate) async fn frame(
     let (snapshot, descriptor_view) = state.overview_request_view();
     let live = Arc::clone(descriptor_view.live());
     let result = tokio::task::spawn_blocking(move || {
-        let mut request_snapshot = (*snapshot).clone();
+        let request_snapshot = (*snapshot).clone();
         let mut projected = project_frame(
-            &mut request_snapshot,
+            &request_snapshot,
             &request,
             &catalog,
             FrameLimits::default(),
@@ -203,7 +203,7 @@ fn frame_query_error(error: kronika_reader::QueryError) -> ApiError {
             };
             ApiError::query_limit_exceeded(resource, limit, Some(observed))
         }
-        kronika_reader::QueryError::Read(_) => {
+        kronika_reader::QueryError::Read(_) | kronika_reader::QueryError::SealedDescriptor(_) => {
             tracing::error!(
                 event = "api_ui_frame_pgm_read_failed",
                 "UI frame PGM read failed"

@@ -119,3 +119,26 @@ fn events_input_names_match_the_registry_contract_names() {
         ]
     );
 }
+
+#[test]
+fn only_delta_views_publish_a_bounded_predecessor_gap() {
+    let gaps = web_views()
+        .iter()
+        .map(|view| (view.name, view.max_rate_gap_us))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        gaps,
+        vec![
+            ("activity", Some(900_000_000)),
+            ("statements", Some(900_000_000)),
+            ("plans", Some(900_000_000)),
+            ("tables", Some(900_000_000)),
+            ("indexes", Some(900_000_000)),
+            ("vacuum", None),
+            ("processes", Some(900_000_000)),
+            ("locks", None),
+            ("events", None),
+        ]
+    );
+}

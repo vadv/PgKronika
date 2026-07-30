@@ -64,7 +64,7 @@ pub use query::{
     OutRow, QueryError, QueryLimits, QueryWorkLimits, QueryWorkResource, SectionPage, SeriesDiff,
     SeriesValues, Value, apply_collection_gating, apply_gating, diff_section, gate_readings,
     gauge_section, latest_section_row, logical_section, section, section_with_limits, sections,
-    sections_with_limits, select_gate,
+    sections_from_sealed_descriptor_with_limits, sections_with_limits, select_gate,
 };
 pub use refresh::{
     ByteRange, CatalogDigest, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor,
