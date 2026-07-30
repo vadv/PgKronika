@@ -5,7 +5,10 @@ import "./design/tokens.css";
 import { applyTheme, resolveTheme } from "./design/theme";
 import "./i18n";
 
-applyTheme(resolveTheme());
+// Boot applies the resolved theme without persisting it: only an explicit
+// user choice may freeze the theme in localStorage, otherwise the UI keeps
+// following prefers-color-scheme.
+applyTheme(resolveTheme(), false);
 
 const rootElement = document.getElementById("root");
 if (!rootElement) {

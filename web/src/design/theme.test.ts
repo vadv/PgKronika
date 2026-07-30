@@ -22,3 +22,10 @@ test("applyTheme sets data-theme on documentElement", () => {
   applyTheme("light");
   expect(document.documentElement.dataset.theme).toBe("light");
 });
+
+test("applyTheme with persist=false does not write localStorage", () => {
+  localStorage.clear();
+  applyTheme("dark", false);
+  expect(document.documentElement.dataset.theme).toBe("dark");
+  expect(localStorage.getItem("pgk-theme")).toBeNull();
+});

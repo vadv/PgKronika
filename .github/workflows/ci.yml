@@ -217,6 +217,7 @@ jobs:
       - coverage
       - overview-qualification
       - bdd-matrix
+      - frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -239,7 +240,8 @@ jobs:
             --job "test=${{ needs.test.result }}" \
             --job "coverage=${{ needs.coverage.result }}" \
             --job "overview-qualification=${{ needs.overview-qualification.result }}" \
-            --job "bdd-matrix=${{ needs.bdd-matrix.result }}"
+            --job "bdd-matrix=${{ needs.bdd-matrix.result }}" \
+            --job "frontend=${{ needs.frontend.result }}"
           sha256sum target/qualification/overview.final.json > target/qualification/overview.final.json.sha256
           python3 scripts/validate-overview-qualification.py \
             target/qualification/overview.final.json \
@@ -257,7 +259,7 @@ jobs:
             echo "- artifact: \`overview-parity-acceptance\`"
             echo "- decision: **PASS**"
             echo
-            echo 'All 18 rows are IMPLEMENTED and bound to the six successful predecessor jobs, the PostgreSQL 15–18 scenarios, the raw measurement checksum, and this final artifact checksum.'
+            echo 'All 18 rows are IMPLEMENTED and bound to the seven successful predecessor jobs, the PostgreSQL 15–18 scenarios, the raw measurement checksum, and this final artifact checksum.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:

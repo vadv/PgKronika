@@ -9,7 +9,9 @@ export function resolveTheme(): Theme {
     : "dark";
 }
 
-export function applyTheme(theme: Theme): void {
+export function applyTheme(theme: Theme, persist = true): void {
   document.documentElement.dataset.theme = theme;
-  localStorage.setItem(KEY, theme);
+  if (persist) {
+    localStorage.setItem(KEY, theme);
+  }
 }
