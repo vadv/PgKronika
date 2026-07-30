@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::{
-    Boundary, Classified, Comparison, Evidence, Level, NotClassifiedReason, Verdict,
+    Boundary, Classified, Comparison, Evidence, Level, MetricInput, NotClassifiedReason, Verdict,
 };
 
 use crate::api_error::ErrorCode;
@@ -11,7 +11,12 @@ use crate::ui::catalog::ProjectionCatalog;
 use crate::ui::frame::FrameRequest;
 use crate::ui::frame::cursor::{FrameCursor, SortKey};
 use crate::ui::frame::dto::ClassificationResultDto;
+use crate::ui::frame::projection::{
+    DeltaOperand, ProjectedRow, RowOperands, StatementOperands, TableOperands,
+};
 use crate::ui::frame::projection::{ProjectionInput, project_input};
+use crate::ui::frame::threshold::{FrameThresholdContext, prepare_input};
+use crate::ui::thresholds::OperandKind;
 use kronika_reader::{OutRow, Value};
 
 fn catalog() -> ProjectionCatalog {
@@ -519,4 +524,145 @@ fn frame_pagination_filters_then_sorts_by_value_and_entity() {
         crate::ui::frame::dto::FrameValue::Number(1.0)
     );
     assert!(frame.next.is_some());
+}
+
+fn operand_row(operands: RowOperands) -> ProjectedRow {
+    ProjectedRow {
+        entity: vec![1],
+        label: "row".to_owned(),
+        cells: Vec::new(),
+        operands,
+        classifications: Vec::new(),
+        values: Vec::new(),
+        database: None,
+        searchable: String::new(),
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive table keeps all fourteen adapters reviewable together"
+)]
+fn threshold_inputs_cover_all_fourteen_typed_adapters() {
+    let mut operands = RowOperands {
+        snapshot_ts_us: 30_000_000,
+        activity_state: Some("active".to_owned()),
+        query_start_us: Some(20_000_000),
+        transaction_start_us: Some(10_000_000),
+        statements: Some(StatementOperands {
+            calls: DeltaOperand::Value(2.0),
+            rows: DeltaOperand::Value(4.0),
+            exec_ms: DeltaOperand::Value(20.0),
+            plan_ms: DeltaOperand::Value(5.0),
+            planning_fields: true,
+            track_planning: true,
+            total_exec_ms: Some(100.0),
+            snapshot_exec_ms_delta_sum: Some(80.0),
+        }),
+        table: Some(TableOperands {
+            live: Some(90.0),
+            dead: Some(10.0),
+            seq_scan: DeltaOperand::Value(3.0),
+            idx_scan: DeltaOperand::Value(1.0),
+            modified: Some(12_000.0),
+            inserted: Some(Some(4_000.0)),
+            last_autovacuum_us: Some(20_000_000),
+            last_autoanalyze_us: Some(15_000_000),
+        }),
+        process_rss_kib: Some(1_024.0),
+    };
+    let context = FrameThresholdContext;
+    let row = operand_row(operands.clone());
+    let cases = [
+        (
+            OperandKind::ActivityQueryDuration,
+            MetricInput::Scalar(10.0),
+        ),
+        (
+            OperandKind::ActivityTransactionDuration,
+            MetricInput::Scalar(20.0),
+        ),
+        (
+            OperandKind::StatementMillisecondsPerRow,
+            MetricInput::Scalar(5.0),
+        ),
+        (
+            OperandKind::StatementMeanMilliseconds,
+            MetricInput::Scalar(10.0),
+        ),
+        (OperandKind::StatementTimePercent, MetricInput::Scalar(25.0)),
+        (
+            OperandKind::StatementPlanTimePercent,
+            MetricInput::Scalar(20.0),
+        ),
+        (
+            OperandKind::TableDeadTupleRatio,
+            MetricInput::RatioWithFloor {
+                ratio: 0.1,
+                count: 10.0,
+            },
+        ),
+        (OperandKind::TableDeadTuples, MetricInput::Scalar(10.0)),
+        (
+            OperandKind::TableSequentialScanPercent,
+            MetricInput::Scalar(75.0),
+        ),
+        (
+            OperandKind::TableModifiedSinceAnalyze,
+            MetricInput::Scalar(12_000.0),
+        ),
+        (
+            OperandKind::TableInsertedSinceVacuum,
+            MetricInput::Scalar(4_000.0),
+        ),
+        (
+            OperandKind::TableAutovacuumAge,
+            MetricInput::Age {
+                epoch_seconds: 20.0,
+                now_seconds: 30.0,
+                gate: true,
+            },
+        ),
+        (
+            OperandKind::TableAutoanalyzeAge,
+            MetricInput::Age {
+                epoch_seconds: 15.0,
+                now_seconds: 30.0,
+                gate: true,
+            },
+        ),
+        (OperandKind::ProcessRssKib, MetricInput::Scalar(1_024.0)),
+    ];
+    for (kind, expected) in cases {
+        assert_eq!(prepare_input(kind, &row, &context), expected, "{kind:?}");
+    }
+
+    operands.activity_state = Some("idle".to_owned());
+    assert_eq!(
+        prepare_input(
+            OperandKind::ActivityQueryDuration,
+            &operand_row(operands.clone()),
+            &context,
+        ),
+        MetricInput::NotApplicable
+    );
+    operands.statements.as_mut().expect("statements").calls = DeltaOperand::Reset;
+    assert_eq!(
+        prepare_input(
+            OperandKind::StatementMeanMilliseconds,
+            &operand_row(operands.clone()),
+            &context,
+        ),
+        MetricInput::Missing
+    );
+    operands.table.as_mut().expect("table").inserted = None;
+    assert_eq!(
+        prepare_input(
+            OperandKind::TableInsertedSinceVacuum,
+            &operand_row(operands),
+            &context,
+        ),
+        MetricInput::NotApplicable
+    );
 }

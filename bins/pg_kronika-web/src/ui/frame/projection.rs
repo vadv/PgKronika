@@ -14,6 +14,7 @@ use super::FrameRequest;
 use super::cursor::FrameCursor;
 use super::dto::FrameValue;
 use super::query::{filter_sort_page, value_sort_key};
+use super::threshold::{CellClassification, FrameThresholdContext, classify_row};
 use crate::ui::catalog::{ColumnSpec, ProjectionCatalog, ValueType, ViewSpec};
 
 const JS_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
@@ -36,6 +37,7 @@ pub(crate) struct StatementOperands {
     pub planning_fields: bool,
     pub track_planning: bool,
     pub total_exec_ms: Option<f64>,
+    pub snapshot_exec_ms_delta_sum: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -71,6 +73,7 @@ pub(crate) struct ProjectedRow {
     pub label: String,
     pub cells: Vec<FrameValue>,
     pub operands: RowOperands,
+    pub classifications: Vec<CellClassification>,
     pub(crate) values: Vec<(&'static str, FrameValue)>,
     pub(crate) database: Option<String>,
     pub(crate) searchable: String,
@@ -418,6 +421,10 @@ impl fmt::Display for ProjectionError {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "snapshot-wide denominator and classification ordering remain explicit in one pipeline"
+)]
 pub(crate) fn project_input(
     request: &FrameRequest,
     catalog: &ProjectionCatalog,
@@ -501,7 +508,8 @@ pub(crate) fn project_input(
             })
             .sum::<f64>();
         for row in &mut rows {
-            if let Some(operands) = &row.operands.statements {
+            if let Some(operands) = &mut row.operands.statements {
+                operands.snapshot_exec_ms_delta_sum = (denominator > 0.0).then_some(denominator);
                 let value = match operands.exec_ms {
                     DeltaOperand::Value(value) if denominator > 0.0 => {
                         finite_frame(100.0 * value / denominator)
@@ -511,6 +519,10 @@ pub(crate) fn project_input(
                 replace_value(row, "time_pct", value);
             }
         }
+    }
+    let threshold_context = FrameThresholdContext;
+    for row in &mut rows {
+        row.classifications = classify_row(request.view.name, &columns, row, &threshold_context);
     }
 
     let paged = filter_sort_page(request, input.snapshot_ts_us, rows)?;
@@ -598,6 +610,7 @@ fn row_shell(
             snapshot_ts_us,
             ..RowOperands::default()
         },
+        classifications: Vec::new(),
         values: Vec::new(),
         database: text(row, "datname").map(str::to_owned),
         searchable: searchable(row),
@@ -695,6 +708,7 @@ fn project_statements(
         planning_fields,
         track_planning,
         total_exec_ms: finite_number(row, "total_exec_time")?,
+        snapshot_exec_ms_delta_sum: None,
     });
     for column in columns {
         let value = match column.code {
@@ -788,7 +802,7 @@ fn project_tables(
             "relation" => joined(row, "schemaname", ".", "relname"),
             "seq_scan" => raw_frame(row, "seq_scan", column.value_type),
             "idx_scan" => raw_frame(row, "idx_scan", column.value_type),
-            "dead_pct" => ratio(live, dead, 100.0),
+            "dead_pct" => ratio(dead, live, 100.0),
             "dead_tuples" => raw_frame(row, "n_dead_tup", column.value_type),
             "seq_scan_pct" => percent_of_sum(seq, idx),
             "modified_since_analyze" => raw_frame(row, "n_mod_since_analyze", column.value_type),
@@ -925,6 +939,7 @@ fn project_events(
     input: &ProjectionInput,
 ) -> Result<ProjectedRow, ProjectionError> {
     let mut out = row_shell(view, section, row, input.snapshot_ts_us)?;
+    out.label = event_kind_code(section, row);
     for column in columns {
         let value = match column.code {
             "time" => raw_frame(row, "ts", column.value_type),
