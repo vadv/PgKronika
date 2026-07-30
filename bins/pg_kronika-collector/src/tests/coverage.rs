@@ -1,4 +1,5 @@
 use crate::coverage::{SourceCoverage, min_total_time};
+use crate::plans_source::plan_source_coverage;
 use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 use crate::statements_source::statements_type_id;
 use kronika_source_pg::statements::StatementsVersion;
@@ -21,6 +22,11 @@ fn coverage_state_machine_keeps_exact_facts_and_error_priority() {
     permission.record_permission_failure();
     assert_eq!(permission.read_state(), (2, 1));
     assert_eq!(permission.exact_total(), None);
+
+    let mut restricted = successful(100, 50);
+    restricted.record_permission_restriction();
+    assert_eq!(restricted.read_state(), (2, 1));
+    assert_eq!(restricted.exact_total(), Some(100));
 
     let mut timeout = permission;
     timeout.record_timeout();
@@ -52,6 +58,14 @@ fn attempted_empty_source_is_distinct_from_not_attempted() {
     let not_attempted = SourceCoverage::default();
     assert!(!not_attempted.attempted);
     assert_eq!(not_attempted.exact_total(), None);
+}
+
+#[test]
+fn ossc_masked_rows_keep_exact_total_with_restricted_visibility() {
+    let coverage = plan_source_coverage(100, 40, 10);
+    assert_eq!(coverage.collected, 40);
+    assert_eq!(coverage.exact_total(), Some(100));
+    assert_eq!(coverage.read_state(), (2, 1));
 }
 
 #[test]

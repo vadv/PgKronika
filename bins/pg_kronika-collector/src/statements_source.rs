@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::coverage::{CoverageAttempt, SourceCoverage, prefer_attempt, query_failure_attempt};
 use crate::logging::{
     CollectionFamily, LogLevel, duration_ms, field, layout_id, log_event, section_name,
 };
@@ -8,6 +9,40 @@ use kronika_source_pg::statements::{
 };
 use std::time::Instant;
 use tokio_postgres::Client;
+
+/// Optional statement rows and the factual attempt that produced or failed to
+/// produce them.
+#[derive(Debug, Default)]
+pub(crate) struct StatementsCollection {
+    pub(crate) read: Option<(StatementsVersion, Vec<StatementsRow>, u64)>,
+    pub(crate) attempt: Option<CoverageAttempt>,
+}
+
+impl StatementsCollection {
+    fn successful(
+        version: StatementsVersion,
+        rows: Vec<StatementsRow>,
+        source_total: u64,
+        default_ts: i64,
+    ) -> Self {
+        let ts = rows.first().map_or(default_ts, |row| row.ts);
+        let attempt = CoverageAttempt {
+            ts,
+            section_type_id: statements_type_id(version),
+            coverage: SourceCoverage::successful(source_total, rows.len()),
+        };
+        Self {
+            read: Some((version, rows, source_total)),
+            attempt: Some(attempt),
+        }
+    }
+
+    fn retain_attempt(&mut self, attempt: Option<CoverageAttempt>) {
+        if let Some(attempt) = attempt {
+            prefer_attempt(&mut self.attempt, attempt);
+        }
+    }
+}
 
 /// The `1_002` layout for the extension version being collected.
 pub(crate) const fn statements_type_id(version: StatementsVersion) -> u32 {
@@ -197,8 +232,9 @@ async fn collect_statements_from_candidate(
     candidate: StatementsCandidate<'_>,
     major: u32,
     config: &Config,
+    cycle_ts_us: i64,
     cache: &mut StatementsSourceCache,
-) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
+) -> StatementsCollection {
     let label = candidate.source.label();
     let started = Instant::now();
     log_event(
@@ -211,7 +247,7 @@ async fn collect_statements_from_candidate(
     );
     let extversion = match statements_extversion(candidate.client).await {
         Ok(Some(extversion)) => extversion,
-        Ok(None) => return None,
+        Ok(None) => return StatementsCollection::default(),
         Err(err) => {
             log_event(
                 LogLevel::Warn,
@@ -223,7 +259,7 @@ async fn collect_statements_from_candidate(
                     field("elapsed_ms", duration_ms(started.elapsed())),
                 ],
             );
-            return None;
+            return StatementsCollection::default();
         }
     };
     let version = statements_version(&extversion);
@@ -244,7 +280,7 @@ async fn collect_statements_from_candidate(
                     field("elapsed_ms", duration_ms(started.elapsed())),
                 ],
             );
-            Some((version, rows, source_total))
+            StatementsCollection::successful(version, rows, source_total, cycle_ts_us)
         }
         Err(err) => {
             let type_id = statements_type_id(version);
@@ -261,7 +297,14 @@ async fn collect_statements_from_candidate(
                     field("elapsed_ms", duration_ms(started.elapsed())),
                 ],
             );
-            None
+            StatementsCollection {
+                read: None,
+                attempt: Some(query_failure_attempt(
+                    cycle_ts_us,
+                    type_id,
+                    err.code().map(tokio_postgres::error::SqlState::code),
+                )),
+            }
         }
     }
 }
@@ -270,13 +313,17 @@ async fn discover_statements_source(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
+    cycle_ts_us: i64,
     cache: &mut StatementsSourceCache,
-) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
+) -> StatementsCollection {
+    let mut failed = StatementsCollection::default();
     for candidate in all_statements_candidates(pool) {
-        if let Some(rows) = collect_statements_from_candidate(candidate, major, config, cache).await
-        {
-            return Some(rows);
+        let mut collected =
+            collect_statements_from_candidate(candidate, major, config, cycle_ts_us, cache).await;
+        if collected.read.is_some() {
+            return collected;
         }
+        failed.retain_attempt(collected.attempt.take());
     }
     cache.mark_missing(covered_statement_databases(pool));
     log_event(
@@ -287,22 +334,26 @@ async fn discover_statements_source(
             field("reason", "no_usable_source"),
         ],
     );
-    None
+    failed
 }
 
 async fn rediscover_missing_statements_source(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
+    cycle_ts_us: i64,
     cache: &mut StatementsSourceCache,
-) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
+) -> StatementsCollection {
+    let mut failed = StatementsCollection::default();
     for candidate in incremental_statements_candidates(pool, cache) {
-        if let Some(rows) = collect_statements_from_candidate(candidate, major, config, cache).await
-        {
-            return Some(rows);
+        let mut collected =
+            collect_statements_from_candidate(candidate, major, config, cycle_ts_us, cache).await;
+        if collected.read.is_some() {
+            return collected;
         }
+        failed.retain_attempt(collected.attempt.take());
     }
-    None
+    failed
 }
 
 /// Collect `pg_stat_statements` from one cached source connection.
@@ -322,8 +373,10 @@ pub(crate) async fn collect_statements_cached(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
+    cycle_ts_us: i64,
     cache: &mut StatementsSourceCache,
-) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
+) -> StatementsCollection {
+    let mut failed_attempt = None;
     if let Some(cached) = cache.selected.clone() {
         let label = cached.source.label();
         let started = Instant::now();
@@ -349,7 +402,12 @@ pub(crate) async fn collect_statements_cached(
                                     field("elapsed_ms", duration_ms(started.elapsed())),
                                 ],
                             );
-                            return Some((cached.version, rows, source_total));
+                            return StatementsCollection::successful(
+                                cached.version,
+                                rows,
+                                source_total,
+                                cycle_ts_us,
+                            );
                         }
                         Err(err) => {
                             let type_id = statements_type_id(cached.version);
@@ -366,6 +424,14 @@ pub(crate) async fn collect_statements_cached(
                                     field("error", &err),
                                     field("elapsed_ms", duration_ms(started.elapsed())),
                                 ],
+                            );
+                            prefer_attempt(
+                                &mut failed_attempt,
+                                query_failure_attempt(
+                                    cycle_ts_us,
+                                    type_id,
+                                    err.code().map(tokio_postgres::error::SqlState::code),
+                                ),
                             );
                             cache.invalidate();
                         }
@@ -412,6 +478,14 @@ pub(crate) async fn collect_statements_cached(
                             field("elapsed_ms", duration_ms(started.elapsed())),
                         ],
                     );
+                    prefer_attempt(
+                        &mut failed_attempt,
+                        query_failure_attempt(
+                            cycle_ts_us,
+                            statements_type_id(cached.version),
+                            err.code().map(tokio_postgres::error::SqlState::code),
+                        ),
+                    );
                     cache.invalidate();
                 }
             }
@@ -426,6 +500,10 @@ pub(crate) async fn collect_statements_cached(
                     field("reason", "source_unavailable"),
                 ],
             );
+            prefer_attempt(
+                &mut failed_attempt,
+                query_failure_attempt(cycle_ts_us, statements_type_id(cached.version), None),
+            );
             cache.invalidate();
         }
     }
@@ -436,7 +514,12 @@ pub(crate) async fn collect_statements_cached(
         .as_ref()
         .is_some_and(|missing| missing.matches_covered(&covered))
     {
-        return rediscover_missing_statements_source(pool, major, config, cache).await;
+        let mut collected =
+            rediscover_missing_statements_source(pool, major, config, cycle_ts_us, cache).await;
+        collected.retain_attempt(failed_attempt);
+        return collected;
     }
-    discover_statements_source(pool, major, config, cache).await
+    let mut collected = discover_statements_source(pool, major, config, cycle_ts_us, cache).await;
+    collected.retain_attempt(failed_attempt);
+    collected
 }

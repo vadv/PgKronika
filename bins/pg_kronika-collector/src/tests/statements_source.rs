@@ -1,7 +1,22 @@
+use crate::coverage::query_failure_attempt;
 use crate::statements_source::{
     CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
 };
 use kronika_source_pg::statements::StatementsVersion;
+
+#[test]
+fn known_layout_query_failures_keep_a_typed_attempt() {
+    let permission = query_failure_attempt(10, 1_002_006, Some("42501"));
+    assert_eq!(permission.coverage.read_state(), (2, 1));
+    assert_eq!(permission.coverage.exact_total(), None);
+
+    let timeout = query_failure_attempt(20, 1_002_006, Some("57014"));
+    assert_eq!(timeout.coverage.read_state(), (3, 2));
+
+    let other = query_failure_attempt(30, 1_002_006, None);
+    assert_eq!(other.coverage.read_state(), (3, 2));
+    assert_eq!(other.section_type_id, 1_002_006);
+}
 
 #[test]
 fn cached_statements_source_tracks_extversion_and_layout() {

@@ -7,7 +7,9 @@ use crate::logging::{
 };
 use crate::scheduler::{DueSet, SourceKind};
 use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
-use crate::statements_source::{StatementsSourceCache, collect_statements_cached};
+use crate::statements_source::{
+    StatementsCollection, StatementsSourceCache, collect_statements_cached,
+};
 use kronika_source_pg::incident_gauges::{FreezeHorizonRow, collect_freeze_horizons};
 use kronika_source_pg::pool::{AdaptiveTimeout, ConnectionPool, DEFAULT_MAX_DATABASES};
 use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
@@ -331,6 +333,7 @@ async fn collect_user_indexes_all(
 /// What the sized pool sources produced this cycle.
 pub(crate) struct PoolReads {
     pub(crate) statements: Option<(StatementsVersion, Vec<StatementsRow>, u64)>,
+    pub(crate) statements_attempt: Option<CoverageAttempt>,
     pub(crate) user_tables: Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
     pub(crate) freeze_horizons: Vec<FreezeHorizonRow>,
     pub(crate) tables_attempt: CoverageAttempt,
@@ -357,15 +360,18 @@ pub(crate) async fn read_pool_sources(
     cycle_start: Instant,
 ) -> PoolReads {
     let mut deferred = Vec::new();
-    let statements = if due.has(SourceKind::Statements) {
+    let StatementsCollection {
+        read: statements,
+        attempt: statements_attempt,
+    } = if due.has(SourceKind::Statements) {
         if pool_budget.admit(PoolSource::Statements, cycle_start.elapsed(), due.forced()) {
-            collect_statements_cached(pool, major, config, statements_cache).await
+            collect_statements_cached(pool, major, config, cycle_ts_us, statements_cache).await
         } else {
             deferred.push(SourceKind::Statements);
-            None
+            StatementsCollection::default()
         }
     } else {
-        None
+        StatementsCollection::default()
     };
     let tables_type_id = user_tables_type_id(major);
     let (user_tables, freeze_horizons, tables_attempt) = if due.has(SourceKind::UserTables) {
@@ -408,6 +414,7 @@ pub(crate) async fn read_pool_sources(
     };
     PoolReads {
         statements,
+        statements_attempt,
         user_tables,
         freeze_horizons,
         tables_attempt,
