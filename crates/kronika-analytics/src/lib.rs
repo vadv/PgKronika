@@ -13,6 +13,12 @@
 //! non-finite, or overflowing inputs produce an explicit not-evaluated reason
 //! rather than a score.
 //!
+//! [`threshold`] classifies fixed-size numeric operands against a static
+//! catalog of 42 provisional resource and `PostgreSQL` table-maintenance
+//! policies. Classification is deterministic, allocation-free, I/O-free,
+//! clock-free, and preserves exact inapplicable or invalid-input reasons. No
+//! HTTP or embedded-UI adapter consumes the catalog yet.
+//!
 //! The functions allocate in proportion to their input slices or returned
 //! episodes. These functions do not impose request ceilings; adapters such as
 //! `pg_kronika-web` must bound samples, window positions, work, and output
@@ -27,6 +33,7 @@
 pub mod anomaly;
 pub mod diff;
 pub mod overview;
+pub mod threshold;
 pub mod web_projection;
 
 pub use anomaly::{
@@ -36,3 +43,7 @@ pub use anomaly::{
     compare_distributions, compare_per_unit, episodes, score_window,
 };
 pub use diff::{DiffPoint, Reason, Scalar, diff_pair};
+pub use threshold::{
+    Boundary, Calibration, CatalogEntry, Classified, Comparison, Evidence, Level, MetricId,
+    MetricInput, NotClassifiedReason, Unit, Verdict,
+};

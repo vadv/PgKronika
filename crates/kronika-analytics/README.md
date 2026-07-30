@@ -11,6 +11,7 @@ and builds series and facts, `kronika-analytics` applies common rules, and
 The analytics kernel is responsible for:
 
 - cumulative-counter differences and interval-derived rates;
+- fixed-size classification against provisional absolute resource thresholds;
 - robust anomaly scores and contiguous anomaly episodes;
 - call-normalized categorical-distribution and per-operation work comparisons;
 - checked counts, coverage, notable-event selection, and health evaluation for
@@ -48,6 +49,10 @@ plan call deltas and buffer deltas -> pg_kronika-web proves continuity
         -> kronika-analytics::compare_distributions / compare_per_unit
         -> pg_kronika-web adds typed, bounded plan evidence
 
+fixed-size metric operands -> kronika-analytics::threshold::classify
+        -> explainable absolute-threshold verdict
+        -> no HTTP or UI adapter is connected yet
+
 typed observations -> SegmentFacts / LiveView in kronika-reader
         -> IndexView in pg_kronika-web
         -> kronika-analytics::overview rules
@@ -84,6 +89,7 @@ checks whether alternate query paths mean the same thing.
 | Module | Purpose | Main entry points |
 | --- | --- | --- |
 | [`diff`](src/diff/mod.rs) | Lets the reader turn consecutive cumulative PGM samples into a value, reset, or invalid interval without treating no-data as zero. | `diff_pair`, `Scalar`, `DiffPoint`, `Reason` |
+| [`threshold`](src/threshold/mod.rs) | Classifies fixed-size metric operands against 69 provisional absolute-threshold policies without source or transport knowledge. | `MetricId`, `MetricInput`, `classify`, `catalog` |
 | [`anomaly`](src/anomaly/mod.rs) | Scores retrospective windows, folds adjacent triggers into episodes, compares normalized category mixtures, and compares work per operation. | `ScoreParams`, `score_window`, `episodes`, `DistributionParams`, `compare_distributions`, `PerUnitParams`, `compare_per_unit` |
 | [`overview::observation`](src/overview/observation.rs) | Gives reader-produced event facts validated payloads, provenance, and stable or view-scoped identities. | `EventObservation`, `SegmentIdentity`, `ObservationPayload` |
 | [`overview::counts`](src/overview/counts.rs) | Aggregates timeline errors by `(severity, category, SQLSTATE)` and lifecycle events with checked arithmetic. | `EventCounts`, `LifecycleCounts`, `CountLimits` |
@@ -93,6 +99,40 @@ checks whether alternate query paths mean the same thing.
 | [`overview::health`](src/overview/health.rs) | Combines eligible covered factors into health scores and preserves `Unknown` when required evidence is absent. | `HealthPolicy`, `RequiredFactorProfile`, `downsample_worst` |
 | [`overview::health_line`](src/overview/health_line.rs) | Applies the current event-only policy to the bucketed health line served by web. | `overview_health_policy`, `health_line` |
 | [`overview::oracle`](src/overview/oracle.rs) | Defines one bounded result containing observations, counts, and coverage for implementations in `kronika-reader` and `pg_kronika-web`; compares alternate query paths. | `RawOracle`, `query_bounded`, `semantic_divergences` |
+
+## Class 1 threshold catalog
+
+`threshold::classify(MetricId, MetricInput)` applies one of 69 built-in
+policies covering CPU and load, memory and swap, PSI, cgroup, storage, network,
+and PostgreSQL activity, connection capacity, cache/checkpoints, table
+maintenance, statements/plans, and replication. All current values are
+`Calibration::Provisional`: they are explicit starting points, not thresholds
+validated against representative production installations.
+
+The six input forms are scalar, fraction, observation with a dynamic limit,
+ratio with an absolute count floor, caller-gated age, and free capacity with
+relative and absolute conditions. An applicable input returns
+`Classified::Verdict` with its `Level`, the exact warning or critical
+`Boundary` that selected it, and fixed-size `Evidence` containing the operands
+and derived value. Missing input, a not-applicable rule, non-finite or
+out-of-domain numbers, an invalid denominator, and an adapter input-shape
+error remain distinct `NotClassifiedReason` values.
+
+Source adapters must provide reset-aware deltas for cumulative counters.
+Connection capacity is `client backend` count divided by a positive
+`max_connections`, so an absolute backend count is not classified without its
+server limit. Config-bound autovacuum indicators receive version- and
+reloption-aware effective thresholds; a disabled or inapplicable server rule
+must be passed as `MetricInput::NotApplicable`.
+
+The catalog is a static slice and lookup is O(1). One classification is
+deterministic, allocation-free, I/O-free, clock-free, and O(1); callers provide
+all operands including current time for age policies. No HTTP response, OpenAPI
+schema, or embedded-UI mapping consumes this catalog yet.
+
+This Class 1 contract answers whether an observation crossed a fixed operator
+policy. The separate [`anomaly`](src/anomaly/mod.rs) module implements Class 2:
+a modified z-score relative to the history of the same series.
 
 ## Rules behind the views
 

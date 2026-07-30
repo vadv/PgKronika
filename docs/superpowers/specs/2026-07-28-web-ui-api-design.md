@@ -16,6 +16,12 @@ OVF, reader, writer и API реализуются как один текущий
   byte-accounted cache с reservation/singleflight/cancellation и N=96/N=1 440
   resource qualification. Это delivery steps 4-6.
 
+Первый отдельный vertical slice для `/v1/frame/{view}` и числовых verdicts
+Класса 1 уточнён в
+`2026-07-30-threshold-frame-integration-design.md`. Он не возвращает
+устаревший параметр `source`, потому что runtime обслуживает один storage root
+и не поддерживает выбор другого root в HTTP API.
+
 ## Задача
 
 Интерфейс одновременно показывает:
@@ -669,6 +675,10 @@ Gated metric, неполный spark и approximate ranking являются
 Каждый шаг обязан иметь работающий consumer-тест. Endpoint не
 добавляется раньше блока или projection, который обеспечивает его
 заявленный бюджет.
+
+Числовой vertical slice из
+`2026-07-30-threshold-frame-integration-design.md` реализует frame раньше
+context, но не меняет порядок остальных delivery steps.
 
 ## Проверка контракта
 
