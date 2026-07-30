@@ -19,7 +19,7 @@ pub(crate) struct StatementsCollection {
 }
 
 impl StatementsCollection {
-    fn successful(
+    pub(crate) fn successful(
         version: StatementsVersion,
         rows: Vec<StatementsRow>,
         source_total: u64,
@@ -37,8 +37,10 @@ impl StatementsCollection {
         }
     }
 
-    fn retain_attempt(&mut self, attempt: Option<CoverageAttempt>) {
-        if let Some(attempt) = attempt {
+    pub(crate) fn retain_attempt(&mut self, attempt: Option<CoverageAttempt>) {
+        if self.read.is_none()
+            && let Some(attempt) = attempt
+        {
             prefer_attempt(&mut self.attempt, attempt);
         }
     }

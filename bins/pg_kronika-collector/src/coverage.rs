@@ -350,7 +350,6 @@ fn statements_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<C
 
 /// Coverage for a non-complete typed `pg_store_plans` attempt.
 ///
-/// The single selection axis makes the boundary meaningful: `cutoff_value`
 /// For successful reads, the single selection axis makes the boundary
 /// meaningful: `cutoff_value` is the smallest `total_time` that still made it
 /// into the section. Failed attempts have no boundary.
