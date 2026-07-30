@@ -55,9 +55,9 @@ pub use overview::{
     METRIC_FLAG_CANONICAL, ManifestEntryDescriptor, MetricAggregation, MetricStatus, PersistError,
     PersistFailureClass, PersistMode, PersistModeSnapshot, PersistenceProbeOutcome, ResetMarker,
     ResetMarkersBlock, ResolvedPattern, SealOutcome, SegmentContext, SegmentFacts,
-    SourceDescriptor, SourceError, SourceManifestBlock, StringTableBlock, TargetedDictionaryRead,
-    TargetedDictionaryStats, TimeGrid, UiSummaryBlock, ViewSummary, dictionary_context_id,
-    lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
+    SnapshotNeighbors, SourceDescriptor, SourceError, SourceManifestBlock, StringTableBlock,
+    TargetedDictionaryRead, TargetedDictionaryStats, TimeGrid, UiSummaryBlock, ViewSummary,
+    dictionary_context_id, lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,

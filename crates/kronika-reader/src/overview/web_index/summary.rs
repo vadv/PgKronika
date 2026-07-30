@@ -158,6 +158,17 @@ pub struct UiSummaryBlock {
     views: Vec<ViewSummary>,
 }
 
+/// Exact snapshots adjacent to the selected snapshot of one UI view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotNeighbors {
+    /// Previous present snapshot of the same view.
+    pub previous: Option<i64>,
+    /// Greatest present snapshot at or before the requested timestamp.
+    pub current: i64,
+    /// Next present snapshot of the same view.
+    pub next: Option<i64>,
+}
+
 impl UiSummaryBlock {
     /// Canonical empty summary used when a segment has no indexed views.
     #[must_use]
@@ -380,6 +391,35 @@ impl UiSummaryBlock {
             .map(|(timestamp, population, _notable)| (timestamp, population))
     }
 
+    /// Exact previous, current, and next snapshots for `view_code`.
+    #[must_use]
+    pub fn snapshot_neighbors(&self, view_code: u16, at_us: i64) -> Option<SnapshotNeighbors> {
+        let view = self
+            .views
+            .binary_search_by_key(&view_code, ViewSummary::view_code)
+            .ok()
+            .and_then(|index| self.views.get(index))?;
+        let upper = self
+            .snapshot_times
+            .partition_point(|timestamp| *timestamp <= at_us);
+        let current_index = (0..upper)
+            .rev()
+            .find(|index| bit_is_set(&view.snapshot_presence, *index))?;
+        let previous = (0..current_index)
+            .rev()
+            .find(|index| bit_is_set(&view.snapshot_presence, *index))
+            .map(|index| self.snapshot_times[index]);
+        let next = (current_index + 1..self.snapshot_times.len())
+            .find(|index| bit_is_set(&view.snapshot_presence, *index))
+            .map(|index| self.snapshot_times[index]);
+
+        Some(SnapshotNeighbors {
+            previous,
+            current: self.snapshot_times[current_index],
+            next,
+        })
+    }
+
     /// Last exact snapshot timestamp, population, and notable state.
     #[must_use]
     pub fn snapshot_state_at(&self, view_code: u16, at_us: i64) -> Option<(i64, u64, bool)> {
@@ -499,9 +539,40 @@ fn nonnegative_i64(value: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::super::{IndexStatus, TimeGrid};
-    use super::{ENCODE_BODY_CALLS, UiSummaryBlock, ViewSummary};
+    use super::{ENCODE_BODY_CALLS, SnapshotNeighbors, UiSummaryBlock, ViewSummary};
     use crate::overview::block::BlockError;
     use crate::overview::limits::LIMIT;
+
+    fn summary_with_presence(
+        snapshot_times: &[i64],
+        view_code: u16,
+        presence: &[bool],
+    ) -> UiSummaryBlock {
+        let grid = TimeGrid::for_range(
+            *snapshot_times.first().expect("first timestamp"),
+            *snapshot_times.last().expect("last timestamp"),
+        )
+        .expect("grid");
+        let mut mask = vec![0_u8; presence.len().div_ceil(8)];
+        let mut populations = Vec::new();
+        for (index, present) in presence.iter().copied().enumerate() {
+            if present {
+                mask[index / 8] |= 1 << (index % 8);
+                populations.push(index as u64);
+            }
+        }
+        let view = ViewSummary::new(
+            view_code,
+            1,
+            IndexStatus::Complete,
+            mask.clone(),
+            vec![0; mask.len()],
+            populations,
+            &LIMIT,
+        )
+        .expect("view");
+        UiSummaryBlock::new(grid, snapshot_times.to_vec(), vec![view], &LIMIT).expect("summary")
+    }
 
     #[test]
     fn ui_summary_round_trips_shared_snapshot_times() {
@@ -591,6 +662,63 @@ mod tests {
             block.snapshot_state_at(1, 50_000_000),
             Some((50_000_000, 11, true))
         );
+    }
+
+    #[test]
+    fn neighbors_skip_timestamps_where_the_view_is_absent() {
+        let block = summary_with_presence(
+            &[10_000_000, 20_000_000, 30_000_000, 40_000_000],
+            1,
+            &[true, false, true, true],
+        );
+
+        assert_eq!(
+            block.snapshot_neighbors(1, 35_000_000),
+            Some(SnapshotNeighbors {
+                previous: Some(10_000_000),
+                current: 30_000_000,
+                next: Some(40_000_000),
+            })
+        );
+        assert_eq!(block.snapshot_neighbors(1, 9_999_999), None);
+    }
+
+    #[test]
+    fn neighbors_select_exact_boundaries_and_keep_missing_sides_optional() {
+        let block = summary_with_presence(
+            &[10_000_000, 20_000_000, 30_000_000],
+            1,
+            &[true, false, true],
+        );
+
+        assert_eq!(
+            block.snapshot_neighbors(1, 10_000_000),
+            Some(SnapshotNeighbors {
+                previous: None,
+                current: 10_000_000,
+                next: Some(30_000_000),
+            })
+        );
+        assert_eq!(
+            block.snapshot_neighbors(1, 30_000_000),
+            Some(SnapshotNeighbors {
+                previous: Some(10_000_000),
+                current: 30_000_000,
+                next: None,
+            })
+        );
+    }
+
+    #[test]
+    fn neighbors_reject_unknown_or_snapshotless_views() {
+        let block = summary_with_presence(
+            &[10_000_000, 20_000_000, 30_000_000],
+            1,
+            &[false, false, false],
+        );
+
+        assert_eq!(block.snapshot_neighbors(1, 30_000_000), None);
+        assert_eq!(block.snapshot_neighbors(99, 30_000_000), None);
     }
 
     #[test]
