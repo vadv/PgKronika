@@ -1,4 +1,6 @@
 /target
+web/node_modules/
+web/dist/
 __pycache__/
 .schemathesis/
 .DS_Store
