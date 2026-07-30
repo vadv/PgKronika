@@ -27,6 +27,7 @@
 pub mod anomaly;
 pub mod diff;
 pub mod overview;
+pub mod threshold;
 pub mod web_projection;
 
 pub use anomaly::{
@@ -36,3 +37,6 @@ pub use anomaly::{
     compare_distributions, compare_per_unit, episodes, score_window,
 };
 pub use diff::{DiffPoint, Reason, Scalar, diff_pair};
+pub use threshold::{
+    Boundary, Classified, Comparison, Evidence, Level, MetricInput, NotClassifiedReason, Verdict,
+};
