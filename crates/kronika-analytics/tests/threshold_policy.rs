@@ -2,7 +2,7 @@
 
 use kronika_analytics::threshold::{
     AgePolicy, Direction, FractionPolicy, FreeCapacityPolicy, InputKind, InvalidPolicy, Policy,
-    RatioWithFloorPolicy, ScalarPolicy, ZeroDisposition,
+    RatioWithFloorPolicy, ScalarPolicy, WarningLimitPolicy, ZeroDisposition,
 };
 use kronika_analytics::{
     Boundary, Classified, Comparison, Evidence, Level, MetricInput, NotClassifiedReason, Verdict,
@@ -263,6 +263,51 @@ fn fraction_policy_retains_operands_and_rejects_invalid_denominators() {
             denominator: 1.0,
         }),
         Classified::NotClassified(NotClassifiedReason::OutOfDomain)
+    );
+}
+
+#[test]
+fn warning_limit_accepts_zero_and_retains_the_effective_boundary() {
+    let policy = Policy::WarningLimit(
+        WarningLimitPolicy::new(Comparison::Above, ZeroDisposition::Classify)
+            .expect("valid warning-limit policy"),
+    );
+
+    assert_eq!(policy.input_kind(), InputKind::Limit);
+    assert_eq!(
+        level(policy.classify(MetricInput::Limit {
+            observed: 0.0,
+            limit: 0.0,
+        })),
+        Level::Ok
+    );
+    assert_eq!(
+        policy.classify(MetricInput::Limit {
+            observed: 1.0,
+            limit: 0.0,
+        }),
+        Classified::Verdict(Verdict {
+            level: Level::Warning,
+            boundary: Some(boundary(Comparison::Above, 0.0)),
+            evidence: Evidence::Limit {
+                observed: 1.0,
+                limit: 0.0,
+            },
+        })
+    );
+    assert_eq!(
+        policy.classify(MetricInput::Limit {
+            observed: -1.0,
+            limit: 0.0,
+        }),
+        Classified::NotClassified(NotClassifiedReason::OutOfDomain)
+    );
+    assert_eq!(
+        policy.classify(MetricInput::Limit {
+            observed: 1.0,
+            limit: f64::NAN,
+        }),
+        Classified::NotClassified(NotClassifiedReason::NonFinite)
     );
 }
 

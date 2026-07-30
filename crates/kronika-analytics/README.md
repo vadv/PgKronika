@@ -89,7 +89,7 @@ checks whether alternate query paths mean the same thing.
 | Module | Purpose | Main entry points |
 | --- | --- | --- |
 | [`diff`](src/diff/mod.rs) | Lets the reader turn consecutive cumulative PGM samples into a value, reset, or invalid interval without treating no-data as zero. | `diff_pair`, `Scalar`, `DiffPoint`, `Reason` |
-| [`threshold`](src/threshold/mod.rs) | Classifies fixed-size metric operands against 42 provisional absolute-threshold policies without source or transport knowledge. | `MetricId`, `MetricInput`, `classify`, `catalog` |
+| [`threshold`](src/threshold/mod.rs) | Classifies fixed-size metric operands against 69 provisional absolute-threshold policies without source or transport knowledge. | `MetricId`, `MetricInput`, `classify`, `catalog` |
 | [`anomaly`](src/anomaly/mod.rs) | Scores retrospective windows, folds adjacent triggers into episodes, compares normalized category mixtures, and compares work per operation. | `ScoreParams`, `score_window`, `episodes`, `DistributionParams`, `compare_distributions`, `PerUnitParams`, `compare_per_unit` |
 | [`overview::observation`](src/overview/observation.rs) | Gives reader-produced event facts validated payloads, provenance, and stable or view-scoped identities. | `EventObservation`, `SegmentIdentity`, `ObservationPayload` |
 | [`overview::counts`](src/overview/counts.rs) | Aggregates timeline errors by `(severity, category, SQLSTATE)` and lifecycle events with checked arithmetic. | `EventCounts`, `LifecycleCounts`, `CountLimits` |
@@ -102,19 +102,28 @@ checks whether alternate query paths mean the same thing.
 
 ## Class 1 threshold catalog
 
-`threshold::classify(MetricId, MetricInput)` applies one of 42 built-in
+`threshold::classify(MetricId, MetricInput)` applies one of 69 built-in
 policies covering CPU and load, memory and swap, PSI, cgroup, storage, network,
-and PostgreSQL table maintenance. All current values are
+and PostgreSQL activity, connection capacity, cache/checkpoints, table
+maintenance, statements/plans, and replication. All current values are
 `Calibration::Provisional`: they are explicit starting points, not thresholds
 validated against representative production installations.
 
-The five input forms are scalar, fraction, ratio with an absolute count floor,
-caller-gated age, and free capacity with relative and absolute conditions.
-An applicable input returns `Classified::Verdict` with its `Level`, the exact
-warning or critical `Boundary` that selected it, and fixed-size `Evidence`
-containing the operands and derived value. Missing input, a not-applicable
-rule, non-finite or out-of-domain numbers, an invalid denominator, and an
-adapter input-shape error remain distinct `NotClassifiedReason` values.
+The six input forms are scalar, fraction, observation with a dynamic limit,
+ratio with an absolute count floor, caller-gated age, and free capacity with
+relative and absolute conditions. An applicable input returns
+`Classified::Verdict` with its `Level`, the exact warning or critical
+`Boundary` that selected it, and fixed-size `Evidence` containing the operands
+and derived value. Missing input, a not-applicable rule, non-finite or
+out-of-domain numbers, an invalid denominator, and an adapter input-shape
+error remain distinct `NotClassifiedReason` values.
+
+Source adapters must provide reset-aware deltas for cumulative counters.
+Connection capacity is `client backend` count divided by a positive
+`max_connections`, so an absolute backend count is not classified without its
+server limit. Config-bound autovacuum indicators receive version- and
+reloption-aware effective thresholds; a disabled or inapplicable server rule
+must be passed as `MetricInput::NotApplicable`.
 
 The catalog is a static slice and lookup is O(1). One classification is
 deterministic, allocation-free, I/O-free, clock-free, and O(1); callers provide

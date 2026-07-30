@@ -3,13 +3,17 @@
 mod cgroup;
 mod cpu;
 mod memory;
+mod postgres_activity;
+mod postgres_io;
+mod postgres_replication;
+mod postgres_statements;
 mod postgres_tables;
 mod pressure;
 mod storage;
 
 use super::{
     AgePolicy, Boundary, Classified, Comparison, Direction, FractionPolicy, FreeCapacityPolicy,
-    MetricInput, Policy, RatioWithFloorPolicy, ScalarPolicy, ZeroDisposition,
+    MetricInput, Policy, RatioWithFloorPolicy, ScalarPolicy, WarningLimitPolicy, ZeroDisposition,
 };
 
 /// Stable identity of one built-in absolute-threshold metric.
@@ -100,11 +104,65 @@ pub enum MetricId {
     PgTablesAutoanalyzeAgeSeconds,
     /// Temporary bytes written per second.
     PgTablesTempBytesPerSecond,
+    /// Duration of an applicable non-idle query.
+    PgActivityQueryDurationSeconds,
+    /// Duration of a transaction.
+    PgActivityTransactionDurationSeconds,
+    /// Client backend count divided by `max_connections`.
+    PgActivityClientBackendCapacity,
+    /// Sessions currently idle in a transaction.
+    PgActivityIdleInTransactionSessions,
+    /// Sessions waiting on another session.
+    PgActivityBlockedSessions,
+    /// Queries exceeding the adapter's long-query definition.
+    PgActivityLongQueries,
+    /// Transactions exceeding the adapter's long-transaction definition.
+    PgActivityLongTransactions,
+    /// Rolled-back transactions as a percentage of completed transactions.
+    PgDatabaseRollbackPercent,
+    /// Reset-aware deadlock count delta.
+    PgDatabaseDeadlocksDelta,
+    /// Database buffer-cache hit percentage.
+    PgDatabaseCacheHitPercent,
+    /// Database I/O cache hit percentage.
+    PgDatabaseIoCacheHitPercent,
+    /// Effective database cache hit percentage.
+    PgDatabaseEffectiveCacheHitPercent,
+    /// Completed checkpoints per minute.
+    PgCheckpointerCheckpointsPerMinute,
+    /// Reset-aware checkpoint write-time delta in milliseconds.
+    PgCheckpointerWriteTimeMillisecondsDelta,
+    /// Backend-written buffers per second.
+    PgBgwriterBuffersBackendPerSecond,
+    /// Reset-aware `maxwritten_clean` count delta.
+    PgBgwriterMaxwrittenCleanDelta,
+    /// Client backend evictions per second.
+    PgBgwriterClientEvictionsPerSecond,
+    /// Statement execution time per returned row.
+    PgStatementsMillisecondsPerRow,
+    /// Mean statement execution time.
+    PgStatementsMeanTimeMilliseconds,
+    /// Percentage of statement execution time.
+    PgStatementsTimePercent,
+    /// Planning time as a percentage of total statement time.
+    PgStatementsPlanTimePercent,
+    /// Distinct plan count for one statement.
+    PgStatementsPlanCount,
+    /// Physical replication replay lag.
+    PgReplicationReplayLagSeconds,
+    /// Reset-aware recovery conflict count delta.
+    PgDatabaseRecoveryConflictsDelta,
+    /// Dead tuple count has crossed its effective vacuum threshold.
+    PgTablesVacuumThresholdExceeded,
+    /// Modified tuple count has crossed its effective analyze threshold.
+    PgTablesAnalyzeThresholdExceeded,
+    /// Inserted tuple count has crossed its effective insert-vacuum threshold.
+    PgTablesInsertVacuumThresholdExceeded,
 }
 
 impl MetricId {
     /// Every built-in metric in canonical catalog order.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 69] = [
         Self::OsProcessCpuPercent,
         Self::OsLoadAvg1PerCore,
         Self::OsCpuIdlePercent,
@@ -147,6 +205,33 @@ impl MetricId {
         Self::PgTablesAutovacuumAgeSeconds,
         Self::PgTablesAutoanalyzeAgeSeconds,
         Self::PgTablesTempBytesPerSecond,
+        Self::PgActivityQueryDurationSeconds,
+        Self::PgActivityTransactionDurationSeconds,
+        Self::PgActivityClientBackendCapacity,
+        Self::PgActivityIdleInTransactionSessions,
+        Self::PgActivityBlockedSessions,
+        Self::PgActivityLongQueries,
+        Self::PgActivityLongTransactions,
+        Self::PgDatabaseRollbackPercent,
+        Self::PgDatabaseDeadlocksDelta,
+        Self::PgDatabaseCacheHitPercent,
+        Self::PgDatabaseIoCacheHitPercent,
+        Self::PgDatabaseEffectiveCacheHitPercent,
+        Self::PgCheckpointerCheckpointsPerMinute,
+        Self::PgCheckpointerWriteTimeMillisecondsDelta,
+        Self::PgBgwriterBuffersBackendPerSecond,
+        Self::PgBgwriterMaxwrittenCleanDelta,
+        Self::PgBgwriterClientEvictionsPerSecond,
+        Self::PgStatementsMillisecondsPerRow,
+        Self::PgStatementsMeanTimeMilliseconds,
+        Self::PgStatementsTimePercent,
+        Self::PgStatementsPlanTimePercent,
+        Self::PgStatementsPlanCount,
+        Self::PgReplicationReplayLagSeconds,
+        Self::PgDatabaseRecoveryConflictsDelta,
+        Self::PgTablesVacuumThresholdExceeded,
+        Self::PgTablesAnalyzeThresholdExceeded,
+        Self::PgTablesInsertVacuumThresholdExceeded,
     ];
 
     /// Stable diagnostic and future adapter code.
@@ -195,6 +280,37 @@ impl MetricId {
             Self::PgTablesAutovacuumAgeSeconds => "pg.tables.autovacuum_age_seconds",
             Self::PgTablesAutoanalyzeAgeSeconds => "pg.tables.autoanalyze_age_seconds",
             Self::PgTablesTempBytesPerSecond => "pg.tables.temp_bytes_per_second",
+            Self::PgActivityQueryDurationSeconds => "pg.activity.query_duration_seconds",
+            Self::PgActivityTransactionDurationSeconds => {
+                "pg.activity.transaction_duration_seconds"
+            }
+            Self::PgActivityClientBackendCapacity => "pg.activity.client_backend_capacity",
+            Self::PgActivityIdleInTransactionSessions => "pg.activity.idle_in_transaction_sessions",
+            Self::PgActivityBlockedSessions => "pg.activity.blocked_sessions",
+            Self::PgActivityLongQueries => "pg.activity.long_queries",
+            Self::PgActivityLongTransactions => "pg.activity.long_transactions",
+            Self::PgDatabaseRollbackPercent => "pg.database.rollback_pct",
+            Self::PgDatabaseDeadlocksDelta => "pg.database.deadlocks_delta",
+            Self::PgDatabaseCacheHitPercent => "pg.database.cache_hit_pct",
+            Self::PgDatabaseIoCacheHitPercent => "pg.database.io_cache_hit_pct",
+            Self::PgDatabaseEffectiveCacheHitPercent => "pg.database.effective_cache_hit_pct",
+            Self::PgCheckpointerCheckpointsPerMinute => "pg.checkpointer.checkpoints_per_minute",
+            Self::PgCheckpointerWriteTimeMillisecondsDelta => "pg.checkpointer.write_time_ms_delta",
+            Self::PgBgwriterBuffersBackendPerSecond => "pg.bgwriter.buffers_backend_per_second",
+            Self::PgBgwriterMaxwrittenCleanDelta => "pg.bgwriter.maxwritten_clean_delta",
+            Self::PgBgwriterClientEvictionsPerSecond => "pg.bgwriter.client_evictions_per_second",
+            Self::PgStatementsMillisecondsPerRow => "pg.statements.milliseconds_per_row",
+            Self::PgStatementsMeanTimeMilliseconds => "pg.statements.mean_time_ms",
+            Self::PgStatementsTimePercent => "pg.statements.time_pct",
+            Self::PgStatementsPlanTimePercent => "pg.statements.plan_time_pct",
+            Self::PgStatementsPlanCount => "pg.statements.plan_count",
+            Self::PgReplicationReplayLagSeconds => "pg.replication.replay_lag_seconds",
+            Self::PgDatabaseRecoveryConflictsDelta => "pg.database.recovery_conflicts_delta",
+            Self::PgTablesVacuumThresholdExceeded => "pg.tables.vacuum_threshold_exceeded",
+            Self::PgTablesAnalyzeThresholdExceeded => "pg.tables.analyze_threshold_exceeded",
+            Self::PgTablesInsertVacuumThresholdExceeded => {
+                "pg.tables.insert_vacuum_threshold_exceeded"
+            }
         }
     }
 }
@@ -216,6 +332,8 @@ pub enum Unit {
     Seconds,
     /// Count per second.
     CountPerSecond,
+    /// Count per minute.
+    CountPerMinute,
     /// Bytes per second.
     BytesPerSecond,
     /// Bytes.
@@ -244,7 +362,7 @@ pub struct CatalogEntry {
     pub calibration: Calibration,
 }
 
-const CATALOG: [CatalogEntry; 42] = [
+const CATALOG: [CatalogEntry; 69] = [
     cpu::OS_PROCESS_CPU_PERCENT,
     cpu::OS_LOAD_AVG1_PER_CORE,
     cpu::OS_CPU_IDLE_PERCENT,
@@ -287,6 +405,33 @@ const CATALOG: [CatalogEntry; 42] = [
     postgres_tables::PG_TABLES_AUTOVACUUM_AGE_SECONDS,
     postgres_tables::PG_TABLES_AUTOANALYZE_AGE_SECONDS,
     postgres_tables::PG_TABLES_TEMP_BYTES_PER_SECOND,
+    postgres_activity::PG_ACTIVITY_QUERY_DURATION_SECONDS,
+    postgres_activity::PG_ACTIVITY_TRANSACTION_DURATION_SECONDS,
+    postgres_activity::PG_ACTIVITY_CLIENT_BACKEND_CAPACITY,
+    postgres_activity::PG_ACTIVITY_IDLE_IN_TRANSACTION_SESSIONS,
+    postgres_activity::PG_ACTIVITY_BLOCKED_SESSIONS,
+    postgres_activity::PG_ACTIVITY_LONG_QUERIES,
+    postgres_activity::PG_ACTIVITY_LONG_TRANSACTIONS,
+    postgres_activity::PG_DATABASE_ROLLBACK_PERCENT,
+    postgres_activity::PG_DATABASE_DEADLOCKS_DELTA,
+    postgres_io::PG_DATABASE_CACHE_HIT_PERCENT,
+    postgres_io::PG_DATABASE_IO_CACHE_HIT_PERCENT,
+    postgres_io::PG_DATABASE_EFFECTIVE_CACHE_HIT_PERCENT,
+    postgres_io::PG_CHECKPOINTER_CHECKPOINTS_PER_MINUTE,
+    postgres_io::PG_CHECKPOINTER_WRITE_TIME_MILLISECONDS_DELTA,
+    postgres_io::PG_BGWRITER_BUFFERS_BACKEND_PER_SECOND,
+    postgres_io::PG_BGWRITER_MAXWRITTEN_CLEAN_DELTA,
+    postgres_io::PG_BGWRITER_CLIENT_EVICTIONS_PER_SECOND,
+    postgres_statements::PG_STATEMENTS_MILLISECONDS_PER_ROW,
+    postgres_statements::PG_STATEMENTS_MEAN_TIME_MILLISECONDS,
+    postgres_statements::PG_STATEMENTS_TIME_PERCENT,
+    postgres_statements::PG_STATEMENTS_PLAN_TIME_PERCENT,
+    postgres_statements::PG_STATEMENTS_PLAN_COUNT,
+    postgres_replication::PG_REPLICATION_REPLAY_LAG_SECONDS,
+    postgres_replication::PG_DATABASE_RECOVERY_CONFLICTS_DELTA,
+    postgres_tables::PG_TABLES_VACUUM_THRESHOLD_EXCEEDED,
+    postgres_tables::PG_TABLES_ANALYZE_THRESHOLD_EXCEEDED,
+    postgres_tables::PG_TABLES_INSERT_VACUUM_THRESHOLD_EXCEEDED,
 ];
 
 /// Canonical built-in threshold catalog.
@@ -342,6 +487,20 @@ pub(super) const fn fraction_entry(
     CatalogEntry {
         id,
         policy: Policy::Fraction(FractionPolicy::new(scalar)),
+        unit,
+        calibration: Calibration::Provisional,
+    }
+}
+
+pub(super) const fn warning_limit_entry(
+    id: MetricId,
+    unit: Unit,
+    operator: Comparison,
+    zero: ZeroDisposition,
+) -> CatalogEntry {
+    CatalogEntry {
+        id,
+        policy: Policy::WarningLimit(valid_warning_limit(operator, zero)),
         unit,
         calibration: Calibration::Provisional,
     }
@@ -419,6 +578,17 @@ const fn valid_scalar(
     match ScalarPolicy::new(direction, warning, critical, zero) {
         Ok(policy) => policy,
         Err(_) => panic!("invalid built-in scalar policy"),
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "an invalid built-in policy must fail constant evaluation"
+)]
+const fn valid_warning_limit(operator: Comparison, zero: ZeroDisposition) -> WarningLimitPolicy {
+    match WarningLimitPolicy::new(operator, zero) {
+        Ok(policy) => policy,
+        Err(_) => panic!("invalid built-in warning-limit policy"),
     }
 }
 

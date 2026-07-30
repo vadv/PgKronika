@@ -2,8 +2,8 @@
 
 use kronika_analytics::threshold::{
     AgePolicy, Calibration, CatalogEntry, Direction, FractionPolicy, FreeCapacityPolicy, InputKind,
-    MetricId, Policy, RatioWithFloorPolicy, ScalarPolicy, Unit, ZeroDisposition, catalog,
-    catalog_entry, classify,
+    MetricId, Policy, RatioWithFloorPolicy, ScalarPolicy, Unit, WarningLimitPolicy,
+    ZeroDisposition, catalog, catalog_entry, classify,
 };
 use kronika_analytics::{
     Boundary, Classified, Comparison, Level, MetricInput, NotClassifiedReason,
@@ -56,6 +56,18 @@ fn fraction_entry(id: MetricId, warning: Boundary, critical: Boundary) -> Catalo
         id,
         policy: Policy::Fraction(FractionPolicy::new(scalar)),
         unit: Unit::Ratio,
+        calibration: Calibration::Provisional,
+    }
+}
+
+fn warning_limit_entry(id: MetricId) -> CatalogEntry {
+    CatalogEntry {
+        id,
+        policy: Policy::WarningLimit(
+            WarningLimitPolicy::new(Comparison::Above, ZeroDisposition::Classify)
+                .expect("valid golden warning-limit policy"),
+        ),
+        unit: Unit::Count,
         calibration: Calibration::Provisional,
     }
 }
@@ -120,7 +132,7 @@ fn free_capacity_entry() -> CatalogEntry {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the independent golden table intentionally lists all 42 entries"
+    reason = "the independent golden table intentionally lists all 69 entries"
 )]
 fn golden_catalog() -> Vec<CatalogEntry> {
     vec![
@@ -431,6 +443,198 @@ fn golden_catalog() -> Vec<CatalogEntry> {
             None,
             ZeroDisposition::Inactive,
         ),
+        scalar_entry(
+            MetricId::PgActivityQueryDurationSeconds,
+            Unit::Seconds,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::AtLeast, 1.0)),
+            Some(boundary(Comparison::AtLeast, 30.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgActivityTransactionDurationSeconds,
+            Unit::Seconds,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::AtLeast, 5.0)),
+            Some(boundary(Comparison::AtLeast, 60.0)),
+            ZeroDisposition::Classify,
+        ),
+        fraction_entry(
+            MetricId::PgActivityClientBackendCapacity,
+            boundary(Comparison::AtLeast, 0.70),
+            boundary(Comparison::AtLeast, 0.90),
+        ),
+        scalar_entry(
+            MetricId::PgActivityIdleInTransactionSessions,
+            Unit::Count,
+            Direction::HigherIsWorse,
+            None,
+            Some(boundary(Comparison::Above, 0.0)),
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgActivityBlockedSessions,
+            Unit::Count,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 0.0)),
+            Some(boundary(Comparison::AtLeast, 5.0)),
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgActivityLongQueries,
+            Unit::Count,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 0.0)),
+            Some(boundary(Comparison::AtLeast, 5.0)),
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgActivityLongTransactions,
+            Unit::Count,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 0.0)),
+            Some(boundary(Comparison::AtLeast, 3.0)),
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgDatabaseRollbackPercent,
+            Unit::Percent,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 3.0)),
+            Some(boundary(Comparison::Above, 10.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgDatabaseDeadlocksDelta,
+            Unit::Count,
+            Direction::HigherIsWorse,
+            None,
+            Some(boundary(Comparison::Above, 0.0)),
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgDatabaseCacheHitPercent,
+            Unit::Percent,
+            Direction::LowerIsWorse,
+            Some(boundary(Comparison::Below, 99.0)),
+            Some(boundary(Comparison::Below, 90.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgDatabaseIoCacheHitPercent,
+            Unit::Percent,
+            Direction::LowerIsWorse,
+            Some(boundary(Comparison::Below, 99.0)),
+            Some(boundary(Comparison::Below, 90.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgDatabaseEffectiveCacheHitPercent,
+            Unit::Percent,
+            Direction::LowerIsWorse,
+            Some(boundary(Comparison::Below, 99.0)),
+            Some(boundary(Comparison::Below, 90.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgCheckpointerCheckpointsPerMinute,
+            Unit::CountPerMinute,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 2.0)),
+            None,
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgCheckpointerWriteTimeMillisecondsDelta,
+            Unit::Milliseconds,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 30_000.0)),
+            Some(boundary(Comparison::Above, 120_000.0)),
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgBgwriterBuffersBackendPerSecond,
+            Unit::CountPerSecond,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 0.0)),
+            None,
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgBgwriterMaxwrittenCleanDelta,
+            Unit::Count,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 0.0)),
+            None,
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgBgwriterClientEvictionsPerSecond,
+            Unit::CountPerSecond,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 0.0)),
+            Some(boundary(Comparison::AtLeast, 10.0)),
+            ZeroDisposition::Inactive,
+        ),
+        scalar_entry(
+            MetricId::PgStatementsMillisecondsPerRow,
+            Unit::Milliseconds,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::AtLeast, 10.0)),
+            Some(boundary(Comparison::AtLeast, 100.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgStatementsMeanTimeMilliseconds,
+            Unit::Milliseconds,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::AtLeast, 10.0)),
+            Some(boundary(Comparison::AtLeast, 100.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgStatementsTimePercent,
+            Unit::Percent,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::AtLeast, 20.0)),
+            Some(boundary(Comparison::AtLeast, 50.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgStatementsPlanTimePercent,
+            Unit::Percent,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::AtLeast, 50.0)),
+            Some(boundary(Comparison::AtLeast, 80.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgStatementsPlanCount,
+            Unit::Count,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 1.0)),
+            Some(boundary(Comparison::Above, 3.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgReplicationReplayLagSeconds,
+            Unit::Seconds,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 10.0)),
+            Some(boundary(Comparison::Above, 60.0)),
+            ZeroDisposition::Classify,
+        ),
+        scalar_entry(
+            MetricId::PgDatabaseRecoveryConflictsDelta,
+            Unit::Count,
+            Direction::HigherIsWorse,
+            Some(boundary(Comparison::Above, 0.0)),
+            None,
+            ZeroDisposition::Inactive,
+        ),
+        warning_limit_entry(MetricId::PgTablesVacuumThresholdExceeded),
+        warning_limit_entry(MetricId::PgTablesAnalyzeThresholdExceeded),
+        warning_limit_entry(MetricId::PgTablesInsertVacuumThresholdExceeded),
     ]
 }
 
@@ -440,6 +644,10 @@ const fn valid_input(kind: InputKind) -> MetricInput {
         InputKind::Fraction => MetricInput::Fraction {
             numerator: 0.0,
             denominator: 1.0,
+        },
+        InputKind::Limit => MetricInput::Limit {
+            observed: 0.0,
+            limit: 0.0,
         },
         InputKind::RatioWithFloor => MetricInput::RatioWithFloor {
             ratio: 0.0,
@@ -464,6 +672,10 @@ const fn negative_zero_input(kind: InputKind) -> MetricInput {
             numerator: -0.0,
             denominator: 1.0,
         },
+        InputKind::Limit => MetricInput::Limit {
+            observed: -0.0,
+            limit: -0.0,
+        },
         InputKind::RatioWithFloor => MetricInput::RatioWithFloor {
             ratio: -0.0,
             count: -0.0,
@@ -487,6 +699,7 @@ const fn wrong_input(kind: InputKind) -> MetricInput {
             denominator: 1.0,
         },
         InputKind::Fraction
+        | InputKind::Limit
         | InputKind::RatioWithFloor
         | InputKind::Age
         | InputKind::FreeCapacity => MetricInput::Scalar(0.0),
@@ -498,8 +711,8 @@ fn complete_catalog_matches_the_public_golden_table() {
     let expected = golden_catalog();
 
     assert_eq!(catalog(), expected.as_slice());
-    assert_eq!(catalog().len(), 42);
-    assert_eq!(MetricId::ALL.len(), 42);
+    assert_eq!(catalog().len(), 69);
+    assert_eq!(MetricId::ALL.len(), 69);
     assert_eq!(
         catalog().iter().map(|entry| entry.id).collect::<Vec<_>>(),
         MetricId::ALL
@@ -667,4 +880,120 @@ fn dead_tuple_floor_and_age_gate_are_preserved() {
         ),
         Classified::NotClassified(NotClassifiedReason::NotApplicable)
     );
+}
+
+#[test]
+fn connection_capacity_uses_max_connections_as_its_denominator() {
+    for (numerator, denominator, expected) in [
+        (5.0, 35.0, Level::Ok),
+        (70.0, 100.0, Level::Warning),
+        (90.0, 100.0, Level::Critical),
+    ] {
+        assert_eq!(
+            level(classify(
+                MetricId::PgActivityClientBackendCapacity,
+                MetricInput::Fraction {
+                    numerator,
+                    denominator,
+                },
+            )),
+            expected
+        );
+    }
+
+    assert_eq!(
+        classify(
+            MetricId::PgActivityClientBackendCapacity,
+            MetricInput::Fraction {
+                numerator: 5.0,
+                denominator: 0.0,
+            },
+        ),
+        Classified::NotClassified(NotClassifiedReason::InvalidDenominator)
+    );
+}
+
+#[test]
+fn new_postgres_boundaries_preserve_strict_and_inclusive_operators() {
+    for (id, value, expected) in [
+        (
+            MetricId::PgActivityTransactionDurationSeconds,
+            5.0,
+            Level::Warning,
+        ),
+        (MetricId::PgActivityBlockedSessions, 5.0, Level::Critical),
+        (MetricId::PgDatabaseRollbackPercent, 3.0, Level::Ok),
+        (MetricId::PgDatabaseCacheHitPercent, 90.0, Level::Warning),
+        (MetricId::PgCheckpointerCheckpointsPerMinute, 2.0, Level::Ok),
+        (
+            MetricId::PgCheckpointerWriteTimeMillisecondsDelta,
+            120_000.0,
+            Level::Warning,
+        ),
+        (
+            MetricId::PgStatementsMillisecondsPerRow,
+            100.0,
+            Level::Critical,
+        ),
+        (MetricId::PgStatementsPlanCount, 3.0, Level::Warning),
+        (
+            MetricId::PgReplicationReplayLagSeconds,
+            60.0,
+            Level::Warning,
+        ),
+    ] {
+        assert_eq!(level(classify(id, MetricInput::Scalar(value))), expected);
+    }
+}
+
+#[test]
+fn event_indicators_and_config_bound_limits_keep_zero_semantics() {
+    assert_eq!(
+        level(classify(
+            MetricId::PgBgwriterClientEvictionsPerSecond,
+            MetricInput::Scalar(0.0),
+        )),
+        Level::Inactive
+    );
+    assert_eq!(
+        level(classify(
+            MetricId::PgBgwriterClientEvictionsPerSecond,
+            MetricInput::Scalar(f64::EPSILON),
+        )),
+        Level::Warning
+    );
+    assert_eq!(
+        level(classify(
+            MetricId::PgBgwriterClientEvictionsPerSecond,
+            MetricInput::Scalar(10.0),
+        )),
+        Level::Critical
+    );
+
+    for id in [
+        MetricId::PgTablesVacuumThresholdExceeded,
+        MetricId::PgTablesAnalyzeThresholdExceeded,
+        MetricId::PgTablesInsertVacuumThresholdExceeded,
+    ] {
+        assert_eq!(
+            level(classify(
+                id,
+                MetricInput::Limit {
+                    observed: 0.0,
+                    limit: 0.0,
+                },
+            )),
+            Level::Ok
+        );
+        assert_eq!(
+            level(classify(
+                id,
+                MetricInput::Limit {
+                    observed: f64::EPSILON,
+                    limit: 0.0,
+                },
+            )),
+            Level::Warning
+        );
+    }
 }

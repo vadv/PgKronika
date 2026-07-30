@@ -10,5 +10,5 @@ pub use model::{
 };
 pub use policy::{
     AgePolicy, Direction, FractionPolicy, FreeCapacityPolicy, InputKind, InvalidPolicy, Policy,
-    RatioWithFloorPolicy, ScalarPolicy, ZeroDisposition,
+    RatioWithFloorPolicy, ScalarPolicy, WarningLimitPolicy, ZeroDisposition,
 };

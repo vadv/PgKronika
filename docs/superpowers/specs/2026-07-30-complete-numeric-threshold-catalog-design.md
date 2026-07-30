@@ -12,9 +12,11 @@ locks и событий журнала остаются отдельной по�
 
 ## Решение
 
-Каталог сохраняет существующие `MetricInput`, `Policy`, `Evidence` и
-детерминированную классификацию O(1). Новые метрики используют `Scalar` или
-`Fraction`; новый архетип политики не требуется.
+Каталог сохраняет детерминированную классификацию O(1). Capacity использует
+существующий `Fraction`, а config-bound autovacuum-индикаторы добавляют
+fixed-size `Limit { observed, limit }`, `Evidence::Limit` и
+`Policy::WarningLimit`. Этот вход допускает законный нулевой effective
+threshold и сохраняет фактическую динамическую границу в verdict.
 
 Ёмкость connection pool не определяется абсолютным числом активных сессий.
 Адаптер передаёт число строк `pg_stat_activity` с
@@ -28,10 +30,10 @@ Config-bound правила autovacuum принимают наблюдаемый
 вычисленный effective threshold. Effective threshold обязан учитывать
 версию PostgreSQL, `pg_settings` и применимые relation/TOAST reloptions.
 Каталог не вычисляет серверную формулу и не соединяет несогласованные
-снимки. Отношение `observed / effective_threshold > 1` даёт warning без
-выдуманного critical-множителя. Отключённое или неприменимое правило
-передаётся как `MetricInput::NotApplicable`; нулевой или отрицательный
-denominator остаётся `InvalidDenominator`.
+снимки. Строгое `observed > effective_threshold` даёт warning без выдуманного
+critical-множителя. Нулевой effective threshold допустим; отрицательный
+limit даёт `OutOfDomain`. Отключённое или неприменимое правило передаётся как
+`MetricInput::NotApplicable`.
 
 ## Новые политики
 
@@ -98,9 +100,9 @@ denominator остаётся `InvalidDenominator`.
 
 | `MetricId` | Вход | warn | crit |
 | --- | --- | ---: | ---: |
-| `pg.tables.vacuum_threshold_ratio` | dead tuples / effective vacuum threshold | `> 1` | `-` |
-| `pg.tables.analyze_threshold_ratio` | modified tuples / effective analyze threshold | `> 1` | `-` |
-| `pg.tables.insert_vacuum_threshold_ratio` | inserted tuples / effective insert-vacuum threshold | `> 1` | `-` |
+| `pg.tables.vacuum_threshold_exceeded` | dead tuples, effective vacuum threshold | `observed > limit` | `-` |
+| `pg.tables.analyze_threshold_exceeded` | modified tuples, effective analyze threshold | `observed > limit` | `-` |
+| `pg.tables.insert_vacuum_threshold_exceeded` | inserted tuples, effective insert-vacuum threshold | `observed > limit` | `-` |
 
 Эти три записи сообщают о пересечении серверного условия запуска, а не
 утверждают, что autovacuum сломан или обязан уже завершиться.

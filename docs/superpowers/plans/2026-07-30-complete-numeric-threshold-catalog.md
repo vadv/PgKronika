@@ -4,7 +4,7 @@
 
 **Goal:** Extend the typed Class 1 catalog from 42 to 69 numeric policies, including `max_connections` capacity and effective-autovacuum-threshold inputs.
 
-**Architecture:** Keep the fixed-size `MetricInput` and `Policy` model unchanged. Split new catalog constants by PostgreSQL domain, register them in one canonical `MetricId`/`CATALOG` order, and let adapters supply reset-aware deltas and effective configuration limits.
+**Architecture:** Keep classification fixed-size and add a dynamic `Limit` input for effective autovacuum thresholds, which may legally be zero. Split new catalog constants by PostgreSQL domain, register them in one canonical `MetricId`/`CATALOG` order, and let adapters supply reset-aware deltas and effective configuration limits.
 
 **Tech Stack:** Rust 2024, existing `kronika-analytics` threshold module, built-in tests, no new dependencies.
 
@@ -42,17 +42,18 @@ fraction_entry(
 ```
 
 Use `scalar_entry` for the 23 remaining research policies. Add a warning-only
-fraction fixture for:
+dynamic-limit fixture for:
 
 ```rust
-MetricId::PgTablesVacuumThresholdRatio
-MetricId::PgTablesAnalyzeThresholdRatio
-MetricId::PgTablesInsertVacuumThresholdRatio
+MetricId::PgTablesVacuumThresholdExceeded
+MetricId::PgTablesAnalyzeThresholdExceeded
+MetricId::PgTablesInsertVacuumThresholdExceeded
 ```
 
-Each config-bound entry uses `Direction::HigherIsWorse`,
-`warning = Some(Above(1.0))`, `critical = None`,
-`ZeroDisposition::Classify`, and `Unit::Ratio`.
+Each config-bound entry uses `Policy::WarningLimit`,
+`operator = Comparison::Above`, `ZeroDisposition::Classify`, and
+`Unit::Count`. Its `MetricInput::Limit` retains the actual effective threshold
+and accepts `limit = 0`.
 
 - [ ] **Step 2: Add behavior tests**
 
@@ -96,7 +97,7 @@ cargo test -p kronika-analytics --test threshold_catalog
 
 Expected: compilation fails because the new `MetricId` variants do not exist.
 
-### Task 2: PostgreSQL Catalog Modules
+### Task 2: Dynamic Limit and PostgreSQL Catalog Modules
 
 **Files:**
 - Create: `crates/kronika-analytics/src/threshold/catalog/postgres_activity.rs`
@@ -105,6 +106,8 @@ Expected: compilation fails because the new `MetricId` variants do not exist.
 - Create: `crates/kronika-analytics/src/threshold/catalog/postgres_replication.rs`
 - Modify: `crates/kronika-analytics/src/threshold/catalog/postgres_tables.rs`
 - Modify: `crates/kronika-analytics/src/threshold/catalog/mod.rs`
+- Modify: `crates/kronika-analytics/src/threshold/model.rs`
+- Modify: `crates/kronika-analytics/src/threshold/policy.rs`
 
 **Interfaces:**
 - Consumes: `scalar_entry`, `fraction_entry`, `boundary`, `MetricId`, `Unit`, and exact thresholds from the design.
@@ -131,12 +134,13 @@ critical = Some(boundary(Comparison::AtLeast, 10.0))
 zero = ZeroDisposition::Inactive
 ```
 
-- [ ] **Step 3: Add warning-only fraction construction**
+- [ ] **Step 3: Add warning-only dynamic-limit construction**
 
-Add a crate-private const helper that builds `Policy::Fraction` with
-`warning = Some(boundary)`, `critical = None`, and a caller-supplied
-`ZeroDisposition`. Use it only for the three effective autovacuum threshold
-ratios.
+Add `MetricInput::Limit { observed, limit }`, matching `Evidence::Limit`,
+`InputKind::Limit`, and `Policy::WarningLimit`. The policy accepts finite
+non-negative operands, including `limit = 0`, and returns warning only when
+`observed > limit`. Add a crate-private const helper for the three effective
+autovacuum threshold policies.
 
 - [ ] **Step 4: Register the constants**
 

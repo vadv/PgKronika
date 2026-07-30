@@ -29,6 +29,8 @@ pub enum InputKind {
     Scalar,
     /// A numerator and denominator.
     Fraction,
+    /// An observation and a caller-provided effective limit.
+    Limit,
     /// A ratio and companion absolute count.
     RatioWithFloor,
     /// An epoch, caller-provided current time, and applicability gate.
@@ -155,6 +157,40 @@ impl FractionPolicy {
     }
 }
 
+/// A validated warning policy over a caller-provided effective limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarningLimitPolicy {
+    operator: Comparison,
+    zero: ZeroDisposition,
+}
+
+impl WarningLimitPolicy {
+    /// Validate a higher-is-worse comparison against a dynamic limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPolicy::DirectionMismatch`] unless `operator` is
+    /// [`Comparison::Above`] or [`Comparison::AtLeast`].
+    pub const fn new(operator: Comparison, zero: ZeroDisposition) -> Result<Self, InvalidPolicy> {
+        if !matches!(operator, Comparison::Above | Comparison::AtLeast) {
+            return Err(InvalidPolicy::DirectionMismatch);
+        }
+        Ok(Self { operator, zero })
+    }
+
+    /// Comparison applied to the caller-provided limit.
+    #[must_use]
+    pub const fn operator(self) -> Comparison {
+        self.operator
+    }
+
+    /// Exact-zero behavior.
+    #[must_use]
+    pub const fn zero_disposition(self) -> ZeroDisposition {
+        self.zero
+    }
+}
+
 /// A validated ratio policy gated by a companion absolute-count floor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RatioWithFloorPolicy {
@@ -278,6 +314,8 @@ pub enum Policy {
     Scalar(ScalarPolicy),
     /// A scalar policy applied to a derived numerator-to-denominator fraction.
     Fraction(FractionPolicy),
+    /// A warning policy applied to a caller-provided effective limit.
+    WarningLimit(WarningLimitPolicy),
     /// A ratio policy gated by an absolute companion-count floor.
     RatioWithFloor(RatioWithFloorPolicy),
     /// An age policy gated by caller-provided applicability.
@@ -293,6 +331,7 @@ impl Policy {
         match self {
             Self::Scalar(_) => InputKind::Scalar,
             Self::Fraction(_) => InputKind::Fraction,
+            Self::WarningLimit(_) => InputKind::Limit,
             Self::RatioWithFloor(_) => InputKind::RatioWithFloor,
             Self::AgeGated(_) => InputKind::Age,
             Self::FreeCapacity(_) => InputKind::FreeCapacity,
@@ -310,6 +349,7 @@ impl Policy {
             MetricInput::Scalar(value) => match self {
                 Self::Scalar(policy) => classify_scalar(*policy, value),
                 Self::Fraction(_)
+                | Self::WarningLimit(_)
                 | Self::RatioWithFloor(_)
                 | Self::AgeGated(_)
                 | Self::FreeCapacity(_) => input_shape_mismatch(),
@@ -320,15 +360,26 @@ impl Policy {
             } => match self {
                 Self::Fraction(policy) => classify_fraction(*policy, numerator, denominator),
                 Self::Scalar(_)
+                | Self::WarningLimit(_)
+                | Self::RatioWithFloor(_)
+                | Self::AgeGated(_)
+                | Self::FreeCapacity(_) => input_shape_mismatch(),
+            },
+            MetricInput::Limit { observed, limit } => match self {
+                Self::WarningLimit(policy) => classify_warning_limit(*policy, observed, limit),
+                Self::Scalar(_)
+                | Self::Fraction(_)
                 | Self::RatioWithFloor(_)
                 | Self::AgeGated(_)
                 | Self::FreeCapacity(_) => input_shape_mismatch(),
             },
             MetricInput::RatioWithFloor { ratio, count } => match self {
                 Self::RatioWithFloor(policy) => classify_ratio_with_floor(*policy, ratio, count),
-                Self::Scalar(_) | Self::Fraction(_) | Self::AgeGated(_) | Self::FreeCapacity(_) => {
-                    input_shape_mismatch()
-                }
+                Self::Scalar(_)
+                | Self::Fraction(_)
+                | Self::WarningLimit(_)
+                | Self::AgeGated(_)
+                | Self::FreeCapacity(_) => input_shape_mismatch(),
             },
             MetricInput::Age {
                 epoch_seconds,
@@ -338,6 +389,7 @@ impl Policy {
                 Self::AgeGated(policy) => classify_age(*policy, epoch_seconds, now_seconds, gate),
                 Self::Scalar(_)
                 | Self::Fraction(_)
+                | Self::WarningLimit(_)
                 | Self::RatioWithFloor(_)
                 | Self::FreeCapacity(_) => input_shape_mismatch(),
             },
@@ -350,6 +402,7 @@ impl Policy {
                 }
                 Self::Scalar(_)
                 | Self::Fraction(_)
+                | Self::WarningLimit(_)
                 | Self::RatioWithFloor(_)
                 | Self::AgeGated(_) => input_shape_mismatch(),
             },
@@ -406,6 +459,29 @@ fn classify_fraction(policy: FractionPolicy, numerator: f64, denominator: f64) -
             value,
         },
     )
+}
+
+fn classify_warning_limit(policy: WarningLimitPolicy, observed: f64, limit: f64) -> Classified {
+    if !observed.is_finite() || !limit.is_finite() {
+        return Classified::NotClassified(NotClassifiedReason::NonFinite);
+    }
+    if observed < 0.0 || limit < 0.0 {
+        return Classified::NotClassified(NotClassifiedReason::OutOfDomain);
+    }
+    let observed = normalize_zero(observed);
+    let limit = normalize_zero(limit);
+    let evidence = Evidence::Limit { observed, limit };
+    if observed == 0.0 && policy.zero == ZeroDisposition::Inactive {
+        return verdict(Level::Inactive, None, evidence);
+    }
+    let boundary = Boundary {
+        operator: policy.operator,
+        value: limit,
+    };
+    if boundary.matches(observed) {
+        return verdict(Level::Warning, Some(boundary), evidence);
+    }
+    verdict(Level::Ok, None, evidence)
 }
 
 fn classify_ratio_with_floor(policy: RatioWithFloorPolicy, ratio: f64, count: f64) -> Classified {

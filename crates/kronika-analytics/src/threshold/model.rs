@@ -88,6 +88,13 @@ pub enum MetricInput {
         /// Strictly positive denominator.
         denominator: f64,
     },
+    /// An observation compared with a caller-provided non-negative limit.
+    Limit {
+        /// Non-negative observation.
+        observed: f64,
+        /// Non-negative effective limit.
+        limit: f64,
+    },
     /// A ratio gated by an absolute count floor.
     RatioWithFloor {
         /// Non-negative ratio where `1.0` means 100 percent.
@@ -129,6 +136,13 @@ pub enum Evidence {
         denominator: f64,
         /// Validated quotient.
         value: f64,
+    },
+    /// An observation and its caller-provided effective limit.
+    Limit {
+        /// Validated observation.
+        observed: f64,
+        /// Validated effective limit.
+        limit: f64,
     },
     /// Ratio and absolute count evaluated against a floor.
     RatioWithFloor {

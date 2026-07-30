@@ -2,7 +2,7 @@
 
 use super::{
     CatalogEntry, Comparison, Direction, MetricId, Unit, ZeroDisposition, age_entry, boundary,
-    ratio_with_floor_entry, scalar_entry,
+    ratio_with_floor_entry, scalar_entry, warning_limit_entry,
 };
 
 pub(super) const PG_TABLES_DEAD_TUPLE_PERCENT: CatalogEntry = ratio_with_floor_entry(
@@ -68,4 +68,25 @@ pub(super) const PG_TABLES_TEMP_BYTES_PER_SECOND: CatalogEntry = scalar_entry(
     Some(boundary(Comparison::Above, 0.0)),
     None,
     ZeroDisposition::Inactive,
+);
+
+pub(super) const PG_TABLES_VACUUM_THRESHOLD_EXCEEDED: CatalogEntry = warning_limit_entry(
+    MetricId::PgTablesVacuumThresholdExceeded,
+    Unit::Count,
+    Comparison::Above,
+    ZeroDisposition::Classify,
+);
+
+pub(super) const PG_TABLES_ANALYZE_THRESHOLD_EXCEEDED: CatalogEntry = warning_limit_entry(
+    MetricId::PgTablesAnalyzeThresholdExceeded,
+    Unit::Count,
+    Comparison::Above,
+    ZeroDisposition::Classify,
+);
+
+pub(super) const PG_TABLES_INSERT_VACUUM_THRESHOLD_EXCEEDED: CatalogEntry = warning_limit_entry(
+    MetricId::PgTablesInsertVacuumThresholdExceeded,
+    Unit::Count,
+    Comparison::Above,
+    ZeroDisposition::Classify,
 );
