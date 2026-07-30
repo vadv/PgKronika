@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import "./design/tokens.css";
 import { applyTheme, resolveTheme } from "./design/theme";
+import "./i18n";
 
 applyTheme(resolveTheme());
 

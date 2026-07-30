@@ -1,0 +1,12 @@
+{
+  "app.title": "PgKronika",
+  "tabs.activity": "Activity",
+  "tabs.statements": "Statements",
+  "tabs.plans": "Plans",
+  "tabs.tables": "Tables",
+  "tabs.indexes": "Indexes",
+  "tabs.vacuum": "Vacuum",
+  "tabs.processes": "Processes",
+  "tabs.locks": "Locks",
+  "tabs.events": "Events"
+}

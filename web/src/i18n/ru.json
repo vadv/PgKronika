@@ -1,0 +1,12 @@
+{
+  "app.title": "PgKronika",
+  "tabs.activity": "Активность",
+  "tabs.statements": "Запросы",
+  "tabs.plans": "Планы",
+  "tabs.tables": "Таблицы",
+  "tabs.indexes": "Индексы",
+  "tabs.vacuum": "Vacuum",
+  "tabs.processes": "Процессы",
+  "tabs.locks": "Блокировки",
+  "tabs.events": "События"
+}
