@@ -195,6 +195,7 @@ fn incremental_statements_candidates<'a>(
 
 async fn collect_statements_from_candidate(
     candidate: StatementsCandidate<'_>,
+    major: u32,
     config: &Config,
     cache: &mut StatementsSourceCache,
 ) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
@@ -226,7 +227,7 @@ async fn collect_statements_from_candidate(
         }
     };
     let version = statements_version(&extversion);
-    match collect_statements(candidate.client, version, config.max_statements).await {
+    match collect_statements(candidate.client, major, version, config.max_statements).await {
         Ok((rows, source_total)) => {
             let version = cache.store(candidate.source, extversion);
             let type_id = statements_type_id(version);
@@ -267,11 +268,13 @@ async fn collect_statements_from_candidate(
 
 async fn discover_statements_source(
     pool: &ConnectionPool,
+    major: u32,
     config: &Config,
     cache: &mut StatementsSourceCache,
 ) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
     for candidate in all_statements_candidates(pool) {
-        if let Some(rows) = collect_statements_from_candidate(candidate, config, cache).await {
+        if let Some(rows) = collect_statements_from_candidate(candidate, major, config, cache).await
+        {
             return Some(rows);
         }
     }
@@ -289,11 +292,13 @@ async fn discover_statements_source(
 
 async fn rediscover_missing_statements_source(
     pool: &ConnectionPool,
+    major: u32,
     config: &Config,
     cache: &mut StatementsSourceCache,
 ) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
     for candidate in incremental_statements_candidates(pool, cache) {
-        if let Some(rows) = collect_statements_from_candidate(candidate, config, cache).await {
+        if let Some(rows) = collect_statements_from_candidate(candidate, major, config, cache).await
+        {
             return Some(rows);
         }
     }
@@ -315,6 +320,7 @@ async fn rediscover_missing_statements_source(
 )]
 pub(crate) async fn collect_statements_cached(
     pool: &ConnectionPool,
+    major: u32,
     config: &Config,
     cache: &mut StatementsSourceCache,
 ) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
@@ -324,7 +330,9 @@ pub(crate) async fn collect_statements_cached(
         if let Some(client) = statement_client(pool, &cached.source) {
             match statements_extversion(client).await {
                 Ok(Some(extversion)) if cached.matches_extversion(&extversion) => {
-                    match collect_statements(client, cached.version, config.max_statements).await {
+                    match collect_statements(client, major, cached.version, config.max_statements)
+                        .await
+                    {
                         Ok((rows, source_total)) => {
                             let type_id = statements_type_id(cached.version);
                             log_event(
@@ -428,7 +436,7 @@ pub(crate) async fn collect_statements_cached(
         .as_ref()
         .is_some_and(|missing| missing.matches_covered(&covered))
     {
-        return rediscover_missing_statements_source(pool, config, cache).await;
+        return rediscover_missing_statements_source(pool, major, config, cache).await;
     }
-    discover_statements_source(pool, config, cache).await
+    discover_statements_source(pool, major, config, cache).await
 }

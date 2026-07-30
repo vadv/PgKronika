@@ -30,6 +30,7 @@ async fn collect_user_tables_all(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
+    cycle_ts_us: i64,
 ) -> (
     Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
     SourceCoverage,
@@ -64,7 +65,7 @@ async fn collect_user_tables_all(
                     ],
                 );
             }
-            match collect_user_tables(db.client(), major, config.max_tables).await {
+            match collect_user_tables(db.client(), major, config.max_tables, cycle_ts_us).await {
                 Ok((version, rows, source_total)) => {
                     coverage.collected += rows.len() as u64;
                     // The total rides in the same statement as the rows, so
@@ -196,6 +197,7 @@ async fn collect_user_indexes_all(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
+    cycle_ts_us: i64,
 ) -> (
     Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)>,
     SourceCoverage,
@@ -230,7 +232,7 @@ async fn collect_user_indexes_all(
                     ],
                 );
             }
-            match collect_user_indexes(db.client(), major, config.max_indexes).await {
+            match collect_user_indexes(db.client(), major, config.max_indexes, cycle_ts_us).await {
                 Ok((version, rows, source_total)) => {
                     coverage.collected += rows.len() as u64;
                     // Same-statement total; an empty read means an empty
@@ -312,10 +314,15 @@ pub(crate) struct PoolReads {
 /// Read the due sized sources under the cycle budget, in priority order:
 /// statements first, indexes last. Under pressure, the most expensive source is
 /// deferred first.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pool reads share the server layout, cycle timestamp, scheduler state, and one mutable budget"
+)]
 pub(crate) async fn read_pool_sources(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
+    cycle_ts_us: i64,
     statements_cache: &mut StatementsSourceCache,
     due: &DueSet,
     pool_budget: &mut PoolBudget,
@@ -324,7 +331,7 @@ pub(crate) async fn read_pool_sources(
     let mut deferred = Vec::new();
     let statements = if due.has(SourceKind::Statements) {
         if pool_budget.admit(PoolSource::Statements, cycle_start.elapsed(), due.forced()) {
-            collect_statements_cached(pool, config, statements_cache).await
+            collect_statements_cached(pool, major, config, statements_cache).await
         } else {
             deferred.push(SourceKind::Statements);
             None
@@ -334,7 +341,8 @@ pub(crate) async fn read_pool_sources(
     };
     let (user_tables, freeze_horizons, tables_cov) = if due.has(SourceKind::UserTables) {
         if pool_budget.admit(PoolSource::UserTables, cycle_start.elapsed(), due.forced()) {
-            let (tables, coverage) = collect_user_tables_all(pool, major, config).await;
+            let (tables, coverage) =
+                collect_user_tables_all(pool, major, config, cycle_ts_us).await;
             let freeze = collect_freeze_horizons_all(pool, config).await;
             (tables, freeze, coverage)
         } else {
@@ -346,7 +354,7 @@ pub(crate) async fn read_pool_sources(
     };
     let (user_indexes, indexes_cov) = if due.has(SourceKind::UserIndexes) {
         if pool_budget.admit(PoolSource::UserIndexes, cycle_start.elapsed(), due.forced()) {
-            collect_user_indexes_all(pool, major, config).await
+            collect_user_indexes_all(pool, major, config, cycle_ts_us).await
         } else {
             deferred.push(SourceKind::UserIndexes);
             (Vec::new(), SourceCoverage::default())

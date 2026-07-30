@@ -542,6 +542,7 @@ async fn snapshot_and_seal(
         pool,
         major,
         config,
+        main_src.ts.0,
         statements_cache,
         due,
         pool_budget,

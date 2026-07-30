@@ -16,8 +16,10 @@
 //! returns owned rows; the caller interns the strings into the segment dictionary.
 //! The typed layout lives in `kronika-registry` (`PgStatUserIndexesV1`..`V2`).
 
+use crate::materialized_cte_query;
 use kronika_registry::pg_stat_user_indexes::{PgStatUserIndexesV1, PgStatUserIndexesV2};
 use kronika_registry::{StrId, Ts};
+use std::borrow::Cow;
 use tokio_postgres::Client;
 
 /// Prefix a query (one or more literal fragments) with the kronika marker
@@ -79,18 +81,21 @@ pub const fn user_indexes_version(major: u32) -> UserIndexesVersion {
 /// against the section row cap.
 pub const INDEX_TOPN_AXES: i64 = 4;
 
-/// The SQL for one layout; `$1` is the per-axis top-N row count. See the module
-/// doc for the candidate-selection rationale.
+/// The SQL for one layout; `$1` is the per-axis top-N row count and `$2` is the
+/// collector's cycle timestamp. See the module doc for the candidate-selection
+/// rationale.
 #[must_use]
-pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
-    match version {
+pub fn user_indexes_query(version: UserIndexesVersion, server_major: u32) -> Cow<'static, str> {
+    let query = match version {
         UserIndexesVersion::V1 => marked!(
-            "WITH candidates AS ( \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_scan, 0) DESC, indexrelid LIMIT $1) \
+            "WITH source AS MATERIALIZED ( \
+               SELECT s.*, count(*) OVER ()::int8 AS source_total FROM pg_stat_user_indexes s \
+             ), candidates AS ( \
+               (SELECT indexrelid FROM source ORDER BY COALESCE(idx_scan, 0) DESC, indexrelid LIMIT $1) \
                UNION \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_tup_read, 0) DESC, indexrelid LIMIT $1) \
+               (SELECT indexrelid FROM source ORDER BY COALESCE(idx_tup_read, 0) DESC, indexrelid LIMIT $1) \
                UNION \
-               (SELECT i.indexrelid FROM pg_stat_user_indexes i JOIN pg_class c ON c.oid = i.indexrelid \
+               (SELECT i.indexrelid FROM source i JOIN pg_class c ON c.oid = i.indexrelid \
                   ORDER BY c.relpages DESC, i.indexrelid LIMIT $1) \
              ) \
              SELECT \
@@ -111,9 +116,9 @@ pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
             indexdef_max_len!(),
             "), '')::text AS indexdef, \
                COALESCE(io.idx_blks_read, 0) AS idx_blks_read, COALESCE(io.idx_blks_hit, 0) AS idx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
-               (SELECT count(*) FROM pg_stat_user_indexes) AS source_total \
-             FROM pg_stat_user_indexes i \
+               $2::int8 AS ts_us, \
+               i.source_total \
+             FROM source i \
              JOIN candidates cand ON cand.indexrelid = i.indexrelid \
              LEFT JOIN pg_class cl ON cl.oid = i.indexrelid \
              LEFT JOIN pg_tablespace ts ON ts.oid = cl.reltablespace \
@@ -122,15 +127,17 @@ pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
              LEFT JOIN pg_statio_user_indexes io ON io.indexrelid = i.indexrelid"
         ),
         UserIndexesVersion::V2 => marked!(
-            "WITH candidates AS ( \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_scan, 0) DESC, indexrelid LIMIT $1) \
+            "WITH source AS MATERIALIZED ( \
+               SELECT s.*, count(*) OVER ()::int8 AS source_total FROM pg_stat_user_indexes s \
+             ), candidates AS ( \
+               (SELECT indexrelid FROM source ORDER BY COALESCE(idx_scan, 0) DESC, indexrelid LIMIT $1) \
                UNION \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_tup_read, 0) DESC, indexrelid LIMIT $1) \
+               (SELECT indexrelid FROM source ORDER BY COALESCE(idx_tup_read, 0) DESC, indexrelid LIMIT $1) \
                UNION \
-               (SELECT i.indexrelid FROM pg_stat_user_indexes i JOIN pg_class c ON c.oid = i.indexrelid \
+               (SELECT i.indexrelid FROM source i JOIN pg_class c ON c.oid = i.indexrelid \
                   ORDER BY c.relpages DESC, i.indexrelid LIMIT $1) \
                UNION \
-               (SELECT indexrelid FROM pg_stat_user_indexes WHERE last_idx_scan IS NOT NULL \
+               (SELECT indexrelid FROM source WHERE last_idx_scan IS NOT NULL \
                   ORDER BY last_idx_scan DESC, indexrelid LIMIT $1) \
              ) \
              SELECT \
@@ -152,9 +159,9 @@ pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
             indexdef_max_len!(),
             "), '')::text AS indexdef, \
                COALESCE(io.idx_blks_read, 0) AS idx_blks_read, COALESCE(io.idx_blks_hit, 0) AS idx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
-               (SELECT count(*) FROM pg_stat_user_indexes) AS source_total \
-             FROM pg_stat_user_indexes i \
+               $2::int8 AS ts_us, \
+               i.source_total \
+             FROM source i \
              JOIN candidates cand ON cand.indexrelid = i.indexrelid \
              LEFT JOIN pg_class cl ON cl.oid = i.indexrelid \
              LEFT JOIN pg_tablespace ts ON ts.oid = cl.reltablespace \
@@ -162,7 +169,8 @@ pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
              LEFT JOIN pg_index ix ON ix.indexrelid = i.indexrelid \
              LEFT JOIN pg_statio_user_indexes io ON io.indexrelid = i.indexrelid"
         ),
-    }
+    };
+    materialized_cte_query(query, server_major)
 }
 
 /// One raw `pg_stat_user_indexes` row, a version-agnostic superset.
@@ -332,10 +340,12 @@ pub async fn collect_user_indexes(
     client: &Client,
     major: u32,
     max_indexes: i64,
+    cycle_ts_us: i64,
 ) -> Result<(UserIndexesVersion, Vec<UserIndexesRow>, u64), tokio_postgres::Error> {
     let version = user_indexes_version(major);
+    let query = user_indexes_query(version, major);
     let rows = client
-        .query(user_indexes_query(version), &[&max_indexes])
+        .query(query.as_ref(), &[&max_indexes, &cycle_ts_us])
         .await?;
     let source_total = rows
         .first()
@@ -405,15 +415,16 @@ mod tests {
 
     #[test]
     fn query_has_version_specific_columns_and_marker() {
-        assert!(!user_indexes_query(UserIndexesVersion::V1).contains("last_idx_scan"));
-        assert!(user_indexes_query(UserIndexesVersion::V2).contains("last_idx_scan"));
+        assert!(!user_indexes_query(UserIndexesVersion::V1, 18).contains("last_idx_scan"));
+        assert!(user_indexes_query(UserIndexesVersion::V2, 18).contains("last_idx_scan"));
         // The recency axis skips never-scanned indexes so it does not fill its
         // slots arbitrarily; they are still caught by the relpages/size axis.
         assert!(
-            user_indexes_query(UserIndexesVersion::V2).contains("WHERE last_idx_scan IS NOT NULL")
+            user_indexes_query(UserIndexesVersion::V2, 18)
+                .contains("WHERE last_idx_scan IS NOT NULL")
         );
         for v in [UserIndexesVersion::V1, UserIndexesVersion::V2] {
-            let q = user_indexes_query(v);
+            let q = user_indexes_query(v, 18);
             assert!(q.contains("pg_kronika"));
             assert!(q.contains("pg_stat_user_indexes"));
             assert!(q.contains("LEFT JOIN pg_statio_user_indexes"));
@@ -440,6 +451,18 @@ mod tests {
             assert!(q.contains("COALESCE(io.idx_blks_hit, 0)"));
             // Every axis breaks ties on indexrelid for a deterministic top-N.
             assert!(q.contains(", indexrelid LIMIT $1"));
+            assert!(q.contains("source AS MATERIALIZED"), "{q}");
+            assert!(q.contains("count(*) OVER ()::int8 AS source_total"), "{q}");
+            assert_eq!(
+                q.match_indices("FROM pg_stat_user_indexes").count(),
+                1,
+                "the PostgreSQL source must be read once: {q}"
+            );
+            assert!(
+                !q.contains("(SELECT count(*) FROM pg_stat_user_indexes)"),
+                "{q}"
+            );
+            assert!(q.contains("$2::int8 AS ts_us"), "{q}");
             // No threshold "big-unused" verdict, no GUC-based branch in the SQL.
             assert!(!q.contains("idx_scan = 0"));
             assert!(!q.contains("current_setting"));
@@ -447,11 +470,22 @@ mod tests {
     }
 
     #[test]
+    fn collection_cte_uses_only_server_supported_materialization_syntax() {
+        let legacy = user_indexes_query(UserIndexesVersion::V1, 11);
+        assert!(legacy.contains("source AS ("), "{legacy}");
+        assert!(!legacy.contains("AS MATERIALIZED"), "{legacy}");
+
+        let modern = user_indexes_query(UserIndexesVersion::V1, 12);
+        assert!(modern.contains("source AS MATERIALIZED ("), "{modern}");
+    }
+
+    #[test]
     fn indexdef_cap_matches_sql_literal() {
         // The integer cap and the literal spliced into the SQL must agree.
         assert_eq!(indexdef_max_len(), 5000);
         assert!(
-            user_indexes_query(UserIndexesVersion::V1).contains(&indexdef_max_len().to_string())
+            user_indexes_query(UserIndexesVersion::V1, 18)
+                .contains(&indexdef_max_len().to_string())
         );
     }
 

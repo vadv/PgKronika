@@ -163,11 +163,11 @@ async fn collect_verified_plans(
             Err(error) => return SnapshotAttempt::ProvenanceUnavailable(error),
         };
     let snapshot_ts = before.0.ts;
-    let (read, source_total) = match collect_plans_for_fork(client, config, fork, snapshot_ts).await
-    {
-        Ok(read) => read,
-        Err(error) => return SnapshotAttempt::QueryFailed(error),
-    };
+    let (read, source_total) =
+        match collect_plans_for_fork(client, major, config, fork, snapshot_ts).await {
+            Ok(read) => read,
+            Err(error) => return SnapshotAttempt::QueryFailed(error),
+        };
     let after =
         match collect_plan_reset_metadata(pool.main(), major, statements.as_ref(), &plans).await {
             Ok(reset) => reset,
@@ -603,6 +603,7 @@ const PLAN_TEXT_DEADLINE: Duration = Duration::from_secs(10);
 /// Run the fork's collection path and wrap the rows for sealing.
 async fn collect_plans_for_fork(
     client: &Client,
+    major: u32,
     config: &Config,
     fork: PlansFork,
     snapshot_ts: i64,
@@ -610,12 +611,12 @@ async fn collect_plans_for_fork(
     match fork {
         PlansFork::Vadv => {
             let (rows, source_total) =
-                collect_plans_with_texts(client, config, snapshot_ts).await?;
+                collect_plans_with_texts(client, major, config, snapshot_ts).await?;
             Ok((PlansRead::Vadv(rows), source_total))
         }
         PlansFork::Ossc => {
             let (rows, source_total) =
-                collect_ossc_plans_with_budget(client, config, snapshot_ts).await?;
+                collect_ossc_plans_with_budget(client, major, config, snapshot_ts).await?;
             Ok((PlansRead::Ossc(rows), source_total))
         }
     }
@@ -631,13 +632,14 @@ async fn collect_plans_for_fork(
 /// lack of `pg_read_all_stats` are dropped and reported.
 async fn collect_ossc_plans_with_budget(
     client: &Client,
+    major: u32,
     config: &Config,
     snapshot_ts: i64,
 ) -> Result<(Vec<StorePlansOsscRow>, u64), tokio_postgres::Error> {
     let started = Instant::now();
     let text_cap = (config.plan_text_budget > 0).then_some(config.max_plan_text);
     let (mut rows, masked, source_total) =
-        collect_store_plans_ossc(client, config.max_plans, text_cap, snapshot_ts).await?;
+        collect_store_plans_ossc(client, major, config.max_plans, text_cap, snapshot_ts).await?;
     if masked > 0 {
         log_event(
             LogLevel::Warn,
@@ -694,12 +696,13 @@ async fn collect_ossc_plans_with_budget(
 /// text phase only.
 async fn collect_plans_with_texts(
     client: &Client,
+    major: u32,
     config: &Config,
     snapshot_ts: i64,
 ) -> Result<(Vec<StorePlansRow>, u64), tokio_postgres::Error> {
     let started = Instant::now();
     let (mut rows, source_total) =
-        collect_store_plans(client, config.max_plans, snapshot_ts).await?;
+        collect_store_plans(client, major, config.max_plans, snapshot_ts).await?;
     let mut budget = config.plan_text_budget;
     let mut fetched = 0_usize;
     for row in &mut rows {
