@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use kronika_analytics::web_projection::web_views;
 use kronika_reader::{
-    IndexStatus, LIMIT, LiveState, LiveView, LocalDirSnapshot, UiSummaryBlock, WebIndexReadError,
+    CollectionReadState, CollectionStatus, CollectionVisibility, IndexStatus, LIMIT, LiveState,
+    LiveView, LocalDirSnapshot, UiSummaryBlock, WebIndexReadError,
 };
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -25,6 +26,17 @@ struct ViewSummaryItem {
     population: Option<u64>,
     status: &'static str,
     notable: bool,
+    #[schema(required = true)]
+    collection: Option<CollectionStatusDto>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct CollectionStatusDto {
+    collected: u64,
+    #[schema(required = true)]
+    source_total: Option<u64>,
+    read_state: &'static str,
+    visibility: &'static str,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -41,6 +53,7 @@ struct SummaryQuality {
 #[derive(Clone, Copy)]
 struct ResolvedView {
     snapshot: Option<(i64, u64, bool)>,
+    collection: Option<CollectionStatus>,
     status: IndexStatus,
 }
 
@@ -108,6 +121,9 @@ pub(crate) fn view_summary(
                 population: exact.map(|(_timestamp, population, _notable)| population),
                 status,
                 notable: exact.is_some_and(|(_timestamp, _population, notable)| notable),
+                collection: resolved
+                    .and_then(|resolved| resolved.collection)
+                    .map(collection_status_dto),
             }
         })
         .collect();
@@ -145,9 +161,16 @@ fn resolve_summary(summary: &UiSummaryBlock, at_us: i64, resolved: &mut [Option<
             continue;
         };
         let exact = summary.snapshot_state_at(view.code, at_us);
+        let collection = exact.and_then(|(timestamp, _population, _notable)| {
+            summary
+                .collection_state_at(view.code, timestamp)
+                .filter(|(collection_ts, _status)| *collection_ts == timestamp)
+                .map(|(_collection_ts, status)| status)
+        });
         if exact.is_some() || block_view.status() != IndexStatus::Complete {
             resolved[index] = Some(ResolvedView {
                 snapshot: exact,
+                collection,
                 status: block_view.status(),
             });
         }
@@ -161,5 +184,32 @@ const fn status_code(status: IndexStatus) -> &'static str {
         IndexStatus::Gated => "gated",
         IndexStatus::UnsupportedType => "unsupported_type",
         IndexStatus::ResourceLimited => "resource_limited",
+    }
+}
+
+const fn collection_status_dto(status: CollectionStatus) -> CollectionStatusDto {
+    CollectionStatusDto {
+        collected: status.collected(),
+        source_total: status.source_total(),
+        read_state: collection_read_state(status.read_state()),
+        visibility: collection_visibility(status.visibility()),
+    }
+}
+
+const fn collection_read_state(state: CollectionReadState) -> &'static str {
+    match state {
+        CollectionReadState::Complete => "complete",
+        CollectionReadState::SourceLimit => "source_limit",
+        CollectionReadState::Permission => "permission",
+        CollectionReadState::ReadFailure => "read_failure",
+        CollectionReadState::CollectorLimitOrLoss => "collector_limit_or_loss",
+    }
+}
+
+const fn collection_visibility(visibility: CollectionVisibility) -> &'static str {
+    match visibility {
+        CollectionVisibility::Full => "full",
+        CollectionVisibility::Restricted => "restricted",
+        CollectionVisibility::Unknown => "unknown",
     }
 }
