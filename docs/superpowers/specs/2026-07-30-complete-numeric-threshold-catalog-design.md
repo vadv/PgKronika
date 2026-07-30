@@ -2,7 +2,8 @@
 
 Дата: 2026-07-30.
 
-Статус: утверждено к реализации в PR с типизированным каталогом.
+Статус: реализовано в PR с типизированным каталогом; первый HTTP consumer
+описан в `2026-07-30-threshold-frame-integration-design.md`.
 
 Документ расширяет
 `2026-07-29-absolute-threshold-catalog-design.md`: к первым 42 политикам
@@ -133,3 +134,11 @@ limit даёт `OutOfDomain`. Отключённое или неприменим
   event type.
 - Калибровка provisional-порогов на демостенде.
 - Диагноз причин нагрузки по одному числовому вердикту.
+
+## Следующий этап
+
+Отдельный PR реализует numeric vertical slice из
+`2026-07-30-threshold-frame-integration-design.md`: projection bindings,
+bounded `GET /v1/frame/{view}`, сериализацию `Classified` и OpenAPI tests.
+Категориальные правила, aggregate views, config-bound operands без
+сохранённых relation reloptions и production frontend в этот PR не входят.
