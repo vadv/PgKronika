@@ -25,6 +25,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/data/quality": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /v1/data/quality` - freshness, coverage, producer and integrity facts. */
+        get: operations["data_quality"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/entity/{view}/{entity}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /v1/entity/{view}/{entity}` - one entity detail or bounded history. */
+        get: operations["entity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/frame/{view}": {
         parameters: {
             query?: never;
@@ -195,6 +229,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/storage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /v1/storage` - bounded root accounting, retention and capacity forecast. */
+        get: operations["storage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/timeline/events": {
         parameters: {
             query?: never;
@@ -263,6 +314,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/timeline/spine": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /v1/timeline/spine` - aligned host load and IO PSI series. */
+        get: operations["spine"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/ui/catalog": {
         parameters: {
             query?: never;
@@ -272,6 +340,23 @@ export interface paths {
         };
         /** `GET /v1/ui/catalog` — stable UI projections. */
         get: operations["catalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/ui/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /v1/ui/context` - one exact instance, host, database and replication snapshot. */
+        get: operations["context"];
         put?: never;
         post?: never;
         delete?: never;
@@ -480,6 +565,12 @@ export interface components {
             /** Format: double */
             value: number;
         };
+        CapabilityDto: {
+            code: string;
+            kind: string;
+            reason: string | null;
+            status: string;
+        };
         /** @description Published filesystem capacity evidence. */
         CapacityPayload: {
             /** Format: int64 */
@@ -488,10 +579,21 @@ export interface components {
             /** Format: int64 */
             total_bytes: number;
         };
+        CategoricalClassificationDto: {
+            code: string | null;
+            column: string;
+            level: string | null;
+            reason: string | null;
+            status: string;
+        };
         CellClassificationDto: {
             column: string;
             metric: string;
             result: components["schemas"]["ClassificationResultDto"];
+        };
+        CellStatusDto: {
+            reason: string | null;
+            status: string;
         };
         ClassificationResultDto: components["schemas"]["ClassifiedResultDto"] | components["schemas"]["NotClassifiedResultDto"];
         ClassifiedResultDto: {
@@ -526,8 +628,74 @@ export interface components {
             threshold_metric?: string | null;
             /** @description Public value shape. */
             type: components["schemas"]["ValueType"];
+            /** @description Machine reason when the column is not available. */
+            unavailable_reason?: string | null;
             /** @description Public unit code when the value has a stable numeric unit. */
             unit?: string | null;
+        };
+        ContextDatabase: {
+            entity: string;
+            name: string;
+            /** Format: int32 */
+            oid: number;
+            visibility: string;
+        };
+        ContextGap: {
+            from_us: string;
+            to_us: string;
+        };
+        ContextHost: {
+            boot_id?: string | null;
+            kernel_version?: string | null;
+            logical_cpu_count?: number | null;
+            logical_cpu_count_reason?: string | null;
+        };
+        ContextInstance: {
+            hostname?: string | null;
+            pg_system_identifier?: string | null;
+            pg_system_identifier_reason?: string | null;
+            /** Format: int64 */
+            pg_version_num?: number | null;
+            role?: string | null;
+            role_reason?: string | null;
+        };
+        ContextQuality: {
+            active_tail: boolean;
+            gaps: components["schemas"]["ContextGap"][];
+            gated: string[];
+            status: string;
+        };
+        ContextReplica: {
+            application_name?: string | null;
+            entity: string;
+            /** Format: int64 */
+            pid: number;
+            replay_lag_reason?: string | null;
+            /** Format: int64 */
+            replay_lag_us?: number | null;
+            state?: string | null;
+            sync_state?: string | null;
+        };
+        ContextReplication: {
+            instance?: null | components["schemas"]["ContextReplicationInstance"];
+            replicas: components["schemas"]["ContextReplica"][];
+        };
+        ContextReplicationInstance: {
+            replay_lag_reason?: string | null;
+            /** Format: int64 */
+            replay_lag_us?: number | null;
+            /** Format: int64 */
+            streaming_replicas: number;
+            /** Format: int64 */
+            timeline_id: number;
+        };
+        ContextResponse: {
+            databases: components["schemas"]["ContextDatabase"][];
+            host: components["schemas"]["ContextHost"];
+            instance: components["schemas"]["ContextInstance"];
+            quality: components["schemas"]["ContextQuality"];
+            replication: components["schemas"]["ContextReplication"];
+            snapshot_ts_us: string;
         };
         /** @description Published exact counter-pair fields. */
         CounterDeltaPayload: {
@@ -541,12 +709,30 @@ export interface components {
             /** Format: int64 */
             reset_epoch: number;
         };
+        CoverageDto: {
+            /** Format: int64 */
+            complete_snapshots: number;
+            /** Format: int64 */
+            expected_snapshots: number | null;
+            /** Format: int64 */
+            observed_snapshots: number;
+        };
         /** @description One half-open wire interval. */
         CoverageSpanDto: {
             /** Format: int64 */
             from_us: number;
             /** Format: int64 */
             to_us: number;
+        };
+        DataQualityResponse: {
+            capabilities: components["schemas"]["CapabilityDto"][];
+            coverage: components["schemas"]["CoverageDto"];
+            freshness: components["schemas"]["FreshnessDto"];
+            gaps: components["schemas"]["QualityGap"][];
+            integrity: components["schemas"]["IntegrityDto"];
+            producer: components["schemas"]["ProducerDto"];
+            quality: components["schemas"]["QualityDto"];
+            status: string;
         };
         /** @description An observation where no valid delta can be derived. */
         DiffNoDataPoint: {
@@ -581,6 +767,49 @@ export interface components {
         EntityDto: {
             id: string;
             kind: string;
+        };
+        EntityFieldDto: {
+            code: string;
+            reason: string | null;
+            status: string;
+            value: components["schemas"]["FrameValue"];
+        };
+        EntityGapDto: {
+            from_us: string;
+            to_us: string;
+        };
+        EntityHistoryResponse: {
+            columns: string[];
+            entity: string;
+            mode: string;
+            page: components["schemas"]["EntityPageDto"];
+            quality: components["schemas"]["EntityQualityDto"];
+            snapshots: components["schemas"]["EntitySnapshotDto"][];
+            view: string;
+        };
+        EntityPageDto: {
+            next: string | null;
+        };
+        EntityPointResponse: {
+            entity: string;
+            fields: components["schemas"]["EntityFieldDto"][];
+            mode: string;
+            quality: components["schemas"]["EntityQualityDto"];
+            related: components["schemas"]["RelatedEntityDto"][];
+            snapshot_ts_us: string;
+            view: string;
+        };
+        EntityQualityDto: {
+            gaps: components["schemas"]["EntityGapDto"][];
+            gated: string[];
+            status: string;
+        };
+        EntityResponse: components["schemas"]["EntityPointResponse"] | components["schemas"]["EntityHistoryResponse"];
+        EntitySnapshotDto: {
+            reasons: (string | null)[];
+            statuses: string[];
+            ts_us: string;
+            values: components["schemas"]["FrameValue"][];
         };
         /** @description Published grouped-error fields. */
         ErrorPayload: {
@@ -707,8 +936,26 @@ export interface components {
             /** Format: double */
             total_bytes: number;
         };
+        FilesystemDto: {
+            /** Format: int64 */
+            available_bytes: number;
+            /** Format: int64 */
+            total_bytes: number;
+            /** Format: double */
+            used_fraction: number;
+        };
+        ForecastDto: {
+            /** Format: double */
+            full_in_days: number | null;
+            full_in_days_reason: string | null;
+            window_us: string;
+            /** Format: int64 */
+            write_rate_bytes_per_day: number | null;
+        };
         FrameColumnDto: {
             code: string;
+            /** @description Whether the column is materialized only for sort or field filtering. */
+            hidden: boolean;
             threshold_metric?: string | null;
             type: string;
             unit?: string | null;
@@ -746,6 +993,8 @@ export interface components {
             view: string;
         };
         FrameRowDto: {
+            categorical_classifications: components["schemas"]["CategoricalClassificationDto"][];
+            cell_statuses: components["schemas"]["CellStatusDto"][];
             cells: components["schemas"]["FrameValue"][];
             classifications: components["schemas"]["CellClassificationDto"][];
             entity: string;
@@ -754,14 +1003,11 @@ export interface components {
         };
         /** @description A finite frame scalar; wide integers and timestamps use decimal strings. */
         FrameValue: null | number | boolean | string;
-        /** @description Publication freshness and independent quality axes. */
         FreshnessDto: {
-            completeness: string;
-            /** Format: int64 */
-            data_through_us: number | null;
-            physical_count_semantics: string;
-            retained_exactness: string;
-            status: string;
+            age_us: string | null;
+            data_through_us: string | null;
+            expected_period_us: string | null;
+            state: string;
         };
         /** @description Half-open range where section data is unavailable. */
         GapResponse: {
@@ -877,10 +1123,12 @@ export interface components {
         /** @description One diagnostic finding and its bounded supporting evidence. */
         IncidentFindingResponse: {
             confidence: string;
+            confidence_cap: string;
             evidence: components["schemas"]["IncidentEvidenceResponse"][];
             lens_id: string;
             role: string;
             scope: components["schemas"]["IncidentFindingScopeResponse"];
+            slug: string;
         };
         /** @description Scope to which an incident finding applies. */
         IncidentFindingScopeResponse: {
@@ -905,14 +1153,35 @@ export interface components {
             /** Format: int64 */
             to: number;
         };
+        /** @description Stored provenance for one proven relationship between incident findings. */
+        IncidentRelationProvenanceResponse: {
+            contract: string;
+            fields: string[];
+        };
+        /** @description One relationship backed by typed join evidence retained by the evaluator. */
+        IncidentRelationResponse: {
+            from_finding: number;
+            kind: string;
+            provenance: components["schemas"]["IncidentRelationProvenanceResponse"];
+            to_finding: number;
+        };
         /** @description One cluster of related anomaly episodes. */
         IncidentResponse: {
+            category_code: string;
+            coincident_count: number;
             evaluation_complete: boolean;
+            finding_count: number;
             finding_evaluation_status: string;
             findings: components["schemas"]["IncidentFindingResponse"][];
             incident_key: string;
             interval: components["schemas"]["IncidentIntervalResponse"];
+            level: string;
+            /** Format: int32 */
+            level_policy_revision: number;
             members: components["schemas"]["IncidentMemberResponse"][];
+            peak_ts_us: string;
+            relations: components["schemas"]["IncidentRelationResponse"][];
+            summary_code: string;
         };
         /** @description Complete response contract of incident clustering and diagnosis. */
         IncidentsResponse: {
@@ -942,6 +1211,13 @@ export interface components {
             logical_sections: string[];
             /** @description Supported physical type IDs for the logical sections. */
             type_ids: number[];
+            /** @description Machine reason when the input is not available. */
+            unavailable_reason?: string | null;
+        };
+        IntegrityDto: {
+            orphan_overviews: number;
+            quarantined_entries: number;
+            readable_segments: number;
         };
         /** @description A proven or conditional relationship between two inputs. */
         JoinSpec: {
@@ -1011,6 +1287,8 @@ export interface components {
              * @description Independently changeable projection revision.
              */
             revision: number;
+            /** @description Machine reason when the metric is not available. */
+            unavailable_reason?: string | null;
             /** @description Public unit code. */
             unit: string;
         };
@@ -1052,6 +1330,13 @@ export interface components {
             /** @description Default sort. */
             sort: components["schemas"]["SortSpec"];
         };
+        ProducerDto: {
+            /** Format: int32 */
+            collector_pid: number | null;
+            collector_started_at_us: string | null;
+            last_status_at_us: string | null;
+            state: string;
+        };
         /** @description Complete source-aware catalog response. */
         ProjectionCatalog: {
             /**
@@ -1061,6 +1346,15 @@ export interface components {
             revision: number;
             views: components["schemas"]["ViewSpec"][];
         };
+        QualityDto: {
+            gated: string[];
+            status: string;
+        };
+        QualityGap: {
+            from_us: string;
+            reason: string;
+            to_us: string;
+        };
         RangeGap: {
             from_us: string;
             to_us: string;
@@ -1069,6 +1363,25 @@ export interface components {
             exact: boolean;
             /** Format: double */
             unseen_upper: number;
+        };
+        RelatedEntityDto: {
+            entity: string;
+            provenance: components["schemas"]["RelationProvenanceDto"];
+            relation: string;
+            view: string;
+        };
+        RelationProvenanceDto: {
+            fields: string[];
+            kind: string;
+        };
+        RetentionDto: {
+            /** Format: int64 */
+            configured_limit: number | null;
+            /** Format: int64 */
+            effective_limit_bytes: number | null;
+            mode: string | null;
+            reason: string | null;
+            status: string;
         };
         /**
          * @description UI ownership scope of one view.
@@ -1156,6 +1469,40 @@ export interface components {
             complete: boolean;
             values: (number | null)[];
         };
+        SpineGap: {
+            from_us: string;
+            reason: string;
+            to_us: string;
+        };
+        SpineGrid: {
+            bucket_count: number;
+            from_us: string;
+            to_us: string;
+        };
+        SpineQuality: {
+            active_tail: boolean;
+            gaps: components["schemas"]["SpineGap"][];
+            gated: string[];
+            resource_limited: string[];
+            snapshots: number;
+            status: string;
+        };
+        SpineResponse: {
+            grid: components["schemas"]["SpineGrid"];
+            quality: components["schemas"]["SpineQuality"];
+            series: components["schemas"]["SpineSeries"][];
+        };
+        SpineSeries: {
+            aggregation: string;
+            code: string;
+            unit: string;
+            value_statuses: components["schemas"]["SpineValueStatus"][];
+            values: (number | null)[];
+        };
+        SpineValueStatus: {
+            reason?: string | null;
+            status: string;
+        };
         /** @description One SQLSTATE digest entry. */
         SqlstateCountDto: {
             code: string;
@@ -1173,6 +1520,14 @@ export interface components {
             population_total: number;
             /** Format: int32 */
             previous_state: number;
+        };
+        StorageResponse: {
+            filesystem: components["schemas"]["FilesystemDto"];
+            forecast: components["schemas"]["ForecastDto"];
+            integrity: components["schemas"]["IntegrityDto"];
+            quality: components["schemas"]["QualityDto"];
+            retention: components["schemas"]["RetentionDto"];
+            used_bytes: components["schemas"]["UsedBytesDto"];
         };
         /** @description Machine-readable reason carried inside a successful partial response. */
         SuccessReasonResponse: {
@@ -1225,6 +1580,18 @@ export interface components {
             /** Format: int64 */
             view_generation: number;
         };
+        UsedBytesDto: {
+            /** Format: int64 */
+            journal: number;
+            /** Format: int64 */
+            other: number;
+            /** Format: int64 */
+            ovf: number;
+            /** Format: int64 */
+            pgm: number;
+            /** Format: int64 */
+            quarantine: number;
+        };
         /**
          * @description Public scalar shape of one projected column.
          * @enum {string}
@@ -1236,12 +1603,23 @@ export interface components {
             /** Format: int32 */
             format_version: number;
         };
+        /** @description UI operations supported by one projection identity. */
+        ViewCapabilities: {
+            /** @description Point detail can resolve the typed entity identity. */
+            detail: boolean;
+            /** @description History can follow the identity across snapshots. */
+            history: boolean;
+            /** @description At least one proven relation can be returned. */
+            related: boolean;
+        };
         /** @description One stable UI projection. */
         ViewSpec: {
             /** @description Source-specific view availability. */
             availability: components["schemas"]["Availability"];
             /** @description Metric used by the canonical row spark. */
             canonical_metric: string;
+            /** @description Supported detail API operations. */
+            capabilities: components["schemas"]["ViewCapabilities"];
             /** @description Public URL and JSON code. */
             code: string;
             /** @description Frame and detail columns. */
@@ -1275,6 +1653,9 @@ export interface components {
         ViewSummaryItem: {
             collection: null | components["schemas"]["CollectionStatusDto"];
             notable: boolean;
+            /** Format: int64 */
+            notable_count: number;
+            notable_level: string;
             /** Format: int64 */
             population: number | null;
             snapshot_ts_us: string | null;
@@ -1379,12 +1760,148 @@ export interface operations {
             };
         };
     };
+    data_quality: {
+        parameters: {
+            query: {
+                from: number;
+                to: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retained data quality facts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataQualityResponse"];
+                };
+            };
+            /** @description Invalid or oversized quality query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Serialized response limit exceeded */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Quality status or index read failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    entity: {
+        parameters: {
+            query?: {
+                at?: number;
+                include?: string;
+                from?: number;
+                to?: number;
+                columns?: string;
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                view: string;
+                entity: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Entity detail or history page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityResponse"];
+                };
+            };
+            /** @description Invalid entity token or query mode */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Entity no longer exists at the selected snapshot */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Entity history or response limit exceeded */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Entity projection or storage read failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
     frame: {
         parameters: {
             query: {
                 at: number;
                 span?: string;
                 preset?: string;
+                columns?: string;
                 database?: string;
                 q?: string;
                 sort?: string;
@@ -1923,6 +2440,62 @@ export interface operations {
             };
         };
     };
+    storage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Storage accounting and capacity facts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StorageResponse"];
+                };
+            };
+            /** @description Unexpected query parameter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Serialized response limit exceeded */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Storage inventory or status read failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
     events: {
         parameters: {
             query: {
@@ -2208,6 +2781,66 @@ export interface operations {
             };
         };
     };
+    spine: {
+        parameters: {
+            query: {
+                from: number;
+                to: number;
+                buckets?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aligned indexed host signals */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpineResponse"];
+                };
+            };
+            /** @description Invalid or oversized query shape */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Serialized response limit exceeded */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description UI index read or render failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
     catalog: {
         parameters: {
             query?: never;
@@ -2254,6 +2887,64 @@ export interface operations {
                 };
             };
             /** @description Catalog read or render failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    context: {
+        parameters: {
+            query: {
+                at: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact UI context snapshot */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContextResponse"];
+                };
+            };
+            /** @description Invalid context query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Serialized response limit exceeded */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description Context storage or render failed */
             500: {
                 headers: {
                     [name: string]: unknown;

@@ -41,6 +41,11 @@ export function makeViewSpec(overrides: Partial<ViewSpec> = {}): ViewSpec {
     columns: [],
     presets: [],
     canonical_metric: "metric",
+    capabilities: {
+      detail: false,
+      history: false,
+      related: false,
+    },
     ...overrides,
   };
 }

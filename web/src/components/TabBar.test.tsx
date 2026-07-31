@@ -18,6 +18,8 @@ const summaries = new Map<string, ViewSummaryItem>([
       population: 142,
       status: "complete",
       notable: false,
+      notable_level: "none",
+      notable_count: 0,
       collection: null,
     },
   ],
