@@ -8,5 +8,8 @@
   "tabs.vacuum": "Vacuum",
   "tabs.processes": "Processes",
   "tabs.locks": "Locks",
-  "tabs.events": "Events"
+  "tabs.events": "Events",
+  "heatmap.metric": "Metric",
+  "heatmap.partial": "partial data",
+  "heatmap.empty": "no data in range"
 }
