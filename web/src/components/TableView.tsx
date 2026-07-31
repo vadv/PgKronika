@@ -67,7 +67,11 @@ function formatCell(value: FrameValue, column: FrameColumnDto): string {
   if (value === null) return "—";
   if (typeof value === "boolean") return value ? "✓" : "✗";
   if (typeof value === "number") return formatNumber(value, column.unit);
-  if (NUMERIC_TYPES.has(column.type) && value.trim() !== "" && !Number.isNaN(Number(value))) {
+  if (
+    NUMERIC_TYPES.has(column.type) &&
+    value.trim() !== "" &&
+    !Number.isNaN(Number(value))
+  ) {
     return formatNumber(Number(value), column.unit);
   }
   return value;
@@ -81,7 +85,9 @@ function verdictColor(result: ClassificationResultDto): string | undefined {
   return undefined;
 }
 
-function nullTitle(result: ClassificationResultDto | undefined): string | undefined {
+function nullTitle(
+  result: ClassificationResultDto | undefined,
+): string | undefined {
   if (result === undefined || "level" in result) return undefined;
   return `${result.status}: ${result.reason}`;
 }
@@ -180,6 +186,7 @@ export function TableView(props: TableViewProps) {
 
   // First page arrived: adopt it unless it is just the cached base of an
   // already accumulated list; report the matched count once per change.
+  const onMatched = props.onMatched;
   useEffect(() => {
     const data = frame.data;
     if (data === undefined || cursor !== null) return;
@@ -190,9 +197,9 @@ export function TableView(props: TableViewProps) {
     );
     if (lastMatched.current !== data.page.matched) {
       lastMatched.current = data.page.matched;
-      props.onMatched?.(data.page.matched);
+      onMatched?.(data.page.matched);
     }
-  }, [frame.data, cursor, frameKey, props.onMatched]);
+  }, [frame.data, cursor, frameKey, onMatched]);
 
   // A stale cursor fails the follow-up request; keep the loaded rows and
   // offer a reset instead of losing them.
@@ -239,7 +246,8 @@ export function TableView(props: TableViewProps) {
   }
 
   const rows = pages !== null && pages.key === frameKey ? pages.rows : [];
-  const nextCursor = pages !== null && pages.key === frameKey ? pages.next : null;
+  const nextCursor =
+    pages !== null && pages.key === frameKey ? pages.next : null;
   const loadingMore = cursor !== null && frame.isLoading;
 
   const headerCellStyle = (code: string): React.CSSProperties => ({
@@ -310,9 +318,8 @@ export function TableView(props: TableViewProps) {
           {rows.map((row) => {
             const selected = props.entity === row.entity;
             return (
-              // jsx-a11y: the whole row is one selectable control; keyboard
-              // activation mirrors click through onKeyDown below.
-              // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex
+              // The whole row is one selectable control; keyboard activation
+              // mirrors click through onKeyDown below.
               <tr
                 key={row.entity}
                 tabIndex={0}
@@ -323,7 +330,9 @@ export function TableView(props: TableViewProps) {
                   if (e.key === "Enter") props.onSelectRow(row.entity);
                 }}
                 onMouseEnter={() => setHovered(row.entity)}
-                onMouseLeave={() => setHovered((h) => (h === row.entity ? null : h))}
+                onMouseLeave={() =>
+                  setHovered((h) => (h === row.entity ? null : h))
+                }
                 style={{
                   cursor: "pointer",
                   background:
@@ -341,13 +350,18 @@ export function TableView(props: TableViewProps) {
                   return (
                     <td
                       key={column.code}
-                      title={value === null ? nullTitle(classification?.result) : undefined}
+                      title={
+                        value === null
+                          ? nullTitle(classification?.result)
+                          : undefined
+                      }
                       style={{
                         padding: "2px 8px",
                         borderBottom: "1px solid var(--border)",
                         color:
                           classification !== undefined
-                            ? (verdictColor(classification.result) ?? "var(--fg)")
+                            ? (verdictColor(classification.result) ??
+                              "var(--fg)")
                             : value === null
                               ? "var(--fg-dim)"
                               : "var(--fg)",

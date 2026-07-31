@@ -5,8 +5,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import {
   makeEventFact,
   makeEventsResponse,
-  makeHealthPoint,
-  makeHealthResponse,
+  makeSpineResponse,
 } from "../testkit/apiFixtures";
 import { Spine, type SpineProps } from "./Spine";
 
@@ -17,26 +16,24 @@ const AT_US = 1_722_500_000_000_000;
 const WINDOW_US = 86_400_000_000;
 const FROM_US = AT_US - WINDOW_US;
 
-const healthFixture = makeHealthResponse({
-  points: [
-    makeHealthPoint({
-      interval: { from_us: FROM_US, to_us: FROM_US + 3_600_000_000 },
-      overall_score: 1,
-    }),
-    makeHealthPoint({
-      interval: {
-        from_us: FROM_US + 3_600_000_000,
-        to_us: FROM_US + 7_200_000_000,
-      },
-      overall_score: 0.5,
-    }),
-    makeHealthPoint({
-      interval: {
-        from_us: FROM_US + 7_200_000_000,
-        to_us: FROM_US + 10_800_000_000,
-      },
-      overall_score: null,
-    }),
+const spineFixture = makeSpineResponse({
+  grid: {
+    from_us: String(FROM_US),
+    to_us: String(AT_US),
+    bucket_count: 3,
+  },
+  series: [
+    {
+      code: "host.load1",
+      unit: "loadavg",
+      aggregation: "avg",
+      values: [1, 0.5, null],
+      value_statuses: [
+        { status: "ok", reason: null },
+        { status: "ok", reason: null },
+        { status: "missing", reason: "no_snapshots" },
+      ],
+    },
   ],
 });
 
@@ -75,7 +72,7 @@ function stubFetch() {
           : input.href;
     const body = url.includes("/v1/timeline/events")
       ? eventsFixture
-      : healthFixture;
+      : spineFixture;
     return Promise.resolve(jsonResponse(body));
   });
 }
@@ -112,7 +109,7 @@ function renderSpine(overrides: Partial<SpineProps> = {}) {
   return render(<Spine {...props} />, { wrapper });
 }
 
-test("renders gutter, health polyline, cursor and event markers", async () => {
+test("renders gutter, load polyline, cursor and event markers", async () => {
   const { container } = renderSpine();
   await waitFor(() =>
     expect(screen.getByTestId("spine-health-line")).toBeDefined(),
@@ -120,11 +117,18 @@ test("renders gutter, health polyline, cursor and event markers", async () => {
   expect(screen.getByTestId("spine-gutter").style.width).toBe("158px");
   expect(screen.getByTestId("spine-cursor")).toBeDefined();
   expect(container.querySelectorAll("[data-tick]")).toHaveLength(25);
-  // Checkpoint marker glyph; null-score point is dropped from the polyline.
+  // Checkpoint marker glyph; null bucket breaks the polyline into a segment.
   expect(screen.getByText("▲")).toBeDefined();
   expect(screen.getByText("●")).toBeDefined();
   const points = screen.getByTestId("spine-health-line").getAttribute("points");
   expect(points?.split(" ")).toHaveLength(2);
+  // Missing bucket surfaces as a dot whose title carries the wire status.
+  const missing = screen.getByTestId("spine-missing-point");
+  expect(missing.querySelector("title")?.textContent).toContain("no_snapshots");
+  // Metric caption shows the selected series (untranslated key in tests).
+  expect(screen.getByTestId("spine-metric").textContent).toContain(
+    "spine.load",
+  );
   // Untranslated i18n keys surface verbatim: REPLAY mode for a fixed cursor.
   expect(screen.getByRole("button", { name: /replay/ })).toBeDefined();
 });

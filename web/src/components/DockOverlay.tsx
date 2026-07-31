@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useFrame } from "../api/frame";
+import { useEntity } from "../api/entity";
 import { useIncidents } from "../api/incidents";
 import type {
+  EntityHistoryResponse,
+  EntityPointResponse,
   FrameValue,
   IncidentFindingResponse,
   IncidentResponse,
@@ -26,18 +28,14 @@ function confidenceColor(confidence: string): string {
   return "var(--border)";
 }
 
-/** Threshold verdict level → color, mirroring the table cell coloring. */
-function levelColor(level: string): string {
-  if (level === "critical") return "var(--sev-crit)";
-  if (level === "warning") return "var(--sev-warn)";
-  if (level === "ok") return "var(--sev-ok)";
-  return "var(--fg-dim)";
+/** Entity field status → color: honest null/missing fields stay dim. */
+function fieldStatusColor(status: string): string {
+  return status === "available" ? "var(--fg)" : "var(--fg-dim)";
 }
 
 function maxConfidence(incident: IncidentResponse): string {
   if (incident.findings.some((f) => f.confidence === "high")) return "high";
-  if (incident.findings.some((f) => f.confidence === "medium"))
-    return "medium";
+  if (incident.findings.some((f) => f.confidence === "medium")) return "medium";
   return "low";
 }
 
@@ -46,7 +44,9 @@ function formatCell(value: FrameValue): string {
   return String(value);
 }
 
-function formatEvidence(evidence: IncidentFindingResponse["evidence"]): string[] {
+function formatEvidence(
+  evidence: IncidentFindingResponse["evidence"],
+): string[] {
   return evidence.map((e) => (typeof e === "string" ? e : JSON.stringify(e)));
 }
 
@@ -103,9 +103,7 @@ const tabButtonStyle = (active: boolean) =>
     color: active ? "var(--accent)" : "var(--fg)",
     background: "none",
     border: "none",
-    borderBottom: active
-      ? "2px solid var(--accent)"
-      : "2px solid transparent",
+    borderBottom: active ? "2px solid var(--accent)" : "2px solid transparent",
     cursor: "pointer",
   }) as const;
 
@@ -278,7 +276,9 @@ function IncidentsDock(props: {
   return (
     <div>
       {incidents.isSuccess && list.length === 0 && (
-        <div style={{ color: "var(--fg-dim)" }}>{t("dock.incidents.empty")}</div>
+        <div style={{ color: "var(--fg-dim)" }}>
+          {t("dock.incidents.empty")}
+        </div>
       )}
       {list.map((incident) => (
         <button
@@ -321,23 +321,170 @@ function IncidentsDock(props: {
   );
 }
 
+function EntityPointView(props: { data: EntityPointResponse }) {
+  return (
+    <div
+      data-kv
+      style={{
+        display: "grid",
+        gridTemplateColumns: "130px 1fr",
+        gap: "2px 8px",
+        alignItems: "baseline",
+      }}
+    >
+      {props.data.fields.map((field) => {
+        const isSql =
+          typeof field.value === "string" &&
+          (field.value.length > 60 || field.value.includes("\n"));
+        return isSql ? (
+          <div
+            key={field.code}
+            style={{ gridColumn: "1 / -1", marginBlock: "4px" }}
+          >
+            <div
+              style={{
+                color: "var(--fg-dim)",
+                fontFamily: "var(--mono-font)",
+              }}
+            >
+              {field.code}
+            </div>
+            <pre
+              data-sql
+              style={{
+                margin: 0,
+                fontFamily: "var(--mono-font)",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                color: "var(--fg)",
+                border: "1px solid var(--border)",
+                borderRadius: "4px",
+                padding: "4px 6px",
+              }}
+            >
+              {field.value}
+            </pre>
+          </div>
+        ) : (
+          <div key={field.code} style={{ display: "contents" }}>
+            <span
+              style={{
+                color: "var(--fg-dim)",
+                fontFamily: "var(--mono-font)",
+              }}
+            >
+              {field.code}
+            </span>
+            <span
+              data-status={field.status}
+              title={field.reason ?? field.status}
+              style={{
+                fontFamily: "var(--mono-font)",
+                color: fieldStatusColor(field.status),
+                overflowWrap: "break-word",
+              }}
+            >
+              {formatCell(field.value)}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+const historyHeadCellStyle = {
+  textAlign: "start",
+  color: "var(--fg-dim)",
+  fontWeight: "normal",
+  borderBottom: "1px solid var(--border)",
+  padding: "2px 6px 2px 0",
+} as const;
+
+const historyCellStyle = {
+  borderBottom: "1px solid var(--border)",
+  padding: "2px 6px 2px 0",
+  overflowWrap: "break-word",
+} as const;
+
+function EntityHistoryView(props: { data: EntityHistoryResponse }) {
+  const { t } = useTranslation();
+  const { data } = props;
+  return (
+    <div>
+      <table
+        style={{
+          borderCollapse: "collapse",
+          fontFamily: "var(--mono-font)",
+          width: "100%",
+        }}
+      >
+        <thead>
+          <tr>
+            <th style={historyHeadCellStyle}>ts</th>
+            {data.columns.map((column) => (
+              <th key={column} style={historyHeadCellStyle}>
+                {column}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {data.snapshots.map((snapshot) => (
+            <tr key={snapshot.ts_us}>
+              <td style={{ ...historyCellStyle, color: "var(--fg-dim)" }}>
+                {formatIntervalTime(Number(snapshot.ts_us))}
+              </td>
+              {data.columns.map((column, i) => {
+                const status = snapshot.statuses[i] ?? "unavailable";
+                const reason = snapshot.reasons[i] ?? null;
+                return (
+                  <td
+                    key={column}
+                    data-status={status}
+                    title={reason ?? status}
+                    style={{
+                      ...historyCellStyle,
+                      color: fieldStatusColor(status),
+                    }}
+                  >
+                    {formatCell(snapshot.values[i] ?? null)}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {data.page.next !== null && (
+        <div
+          style={{
+            color: "var(--fg-dim)",
+            fontFamily: "var(--mono-font)",
+            marginBlockStart: "4px",
+          }}
+        >
+          {t("dock.row.morePages")}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RowDock(props: {
   state: UiState;
   view: ViewSpec | undefined;
   onPatch: (patch: Partial<UiState>) => void;
 }) {
   const { t } = useTranslation();
-  const frame = useFrame({
+  const entity = useEntity({
     view: props.state.view,
-    at: props.state.at ?? String(Date.now() * 1000),
-    span: props.state.span,
-    preset: props.state.preset,
-    q: props.state.q,
-    sort: props.state.sort,
-    order: props.state.order,
+    entity: props.state.entity ?? "",
+    at: props.state.at ?? undefined,
   });
-  const row = frame.data?.rows.find((r) => r.entity === props.state.entity);
   const viewCode = props.view?.code ?? props.state.view;
+  const data = props.state.entity === null ? undefined : entity.data;
+  const missing = props.state.entity === null || entity.isError;
 
   return (
     <div>
@@ -351,88 +498,22 @@ function RowDock(props: {
       >
         {viewCode} · {props.state.entity ?? "—"}
       </div>
-      {frame.isSuccess && !row && (
+      {missing && (
         <div style={{ color: "var(--fg-dim)" }}>{t("dock.row.missing")}</div>
       )}
-      {frame.data && row && (
+      {data && data.quality.status !== "complete" && (
         <div
-          data-kv
           style={{
-            display: "grid",
-            gridTemplateColumns: "130px 1fr",
-            gap: "2px 8px",
-            alignItems: "baseline",
+            color: "var(--fg-dim)",
+            fontFamily: "var(--mono-font)",
+            marginBlockEnd: "6px",
           }}
         >
-          {frame.data.columns.map((column, i) => {
-            const value = row.cells[i] ?? null;
-            const classification = row.classifications.find(
-              (c) => c.column === column.code,
-            );
-            const level =
-              classification && "level" in classification.result
-                ? classification.result.level
-                : undefined;
-            const isSql =
-              column.type === "text" &&
-              typeof value === "string" &&
-              (value.length > 60 || value.includes("\n"));
-            return isSql ? (
-              <div
-                key={column.code}
-                style={{ gridColumn: "1 / -1", marginBlock: "4px" }}
-              >
-                <div
-                  style={{
-                    color: "var(--fg-dim)",
-                    fontFamily: "var(--mono-font)",
-                  }}
-                >
-                  {column.code}
-                </div>
-                <pre
-                  data-sql
-                  style={{
-                    margin: 0,
-                    fontFamily: "var(--mono-font)",
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    color: "var(--fg)",
-                    border: "1px solid var(--border)",
-                    borderRadius: "4px",
-                    padding: "4px 6px",
-                  }}
-                >
-                  {value}
-                </pre>
-              </div>
-            ) : (
-              <div key={column.code} style={{ display: "contents" }}>
-                <span
-                  style={{
-                    color: "var(--fg-dim)",
-                    fontFamily: "var(--mono-font)",
-                  }}
-                >
-                  {column.code}
-                </span>
-                <span
-                  data-verdict={level}
-                  title={level}
-                  style={{
-                    fontFamily: "var(--mono-font)",
-                    color:
-                      level !== undefined ? levelColor(level) : "var(--fg)",
-                    overflowWrap: "break-word",
-                  }}
-                >
-                  {formatCell(value)}
-                </span>
-              </div>
-            );
-          })}
+          {t("dock.row.partial")}
         </div>
       )}
+      {data && "fields" in data && <EntityPointView data={data} />}
+      {data && "snapshots" in data && <EntityHistoryView data={data} />}
       <div style={{ display: "flex", gap: "8px", marginBlockStart: "8px" }}>
         {viewCode === "statements" && (
           <button
@@ -541,7 +622,11 @@ export function DockOverlay(props: DockOverlayProps) {
           onPatch={props.onPatch}
         />
       ) : (
-        <RowDock state={props.state} view={props.view} onPatch={props.onPatch} />
+        <RowDock
+          state={props.state}
+          view={props.view}
+          onPatch={props.onPatch}
+        />
       )}
     </aside>
   );

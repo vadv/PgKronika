@@ -1,8 +1,7 @@
 import { useTranslation } from "react-i18next";
 import type { ReactNode } from "react";
-import type { SummaryQuality, ViewSummaryItem } from "../api/types";
-
-type Collection = NonNullable<ViewSummaryItem["collection"]>;
+import { useDataQuality } from "../api/dataQuality";
+import { useStorage } from "../api/storage";
 
 function Square(props: { color: string }) {
   return (
@@ -39,49 +38,52 @@ function Row(props: { label: string; children: ReactNode }) {
   );
 }
 
-function ratio(c: Collection): number {
-  if (c.source_total === null || c.source_total <= 0) return 1;
-  return c.collected / c.source_total;
+/** FreshnessDto carries int64 µs as decimal strings. */
+function formatAge(us: string | null): string {
+  if (us === null) return "—";
+  return `${Math.round(Number(us) / 1_000_000)}s`;
+}
+
+function formatTs(us: string | null): string {
+  if (us === null) return "—";
+  return new Date(Number(us) / 1000).toISOString();
+}
+
+function formatBytes(n: number): string {
+  if (n <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log2(n) / 10));
+  const v = n / 2 ** (10 * i);
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function freshnessColor(state: string): string {
+  if (state === "fresh") return "var(--sev-ok)";
+  if (state === "stale") return "var(--sev-warn)";
+  return "var(--fg-dim)";
 }
 
 export interface DataHealthPopoverProps {
-  quality: SummaryQuality;
-  views: ViewSummaryItem[];
+  /** Window start (int64 µs, decimal string). */
+  from: string;
+  /** Window end (int64 µs, decimal string). */
+  to: string;
 }
 
 export function DataHealthPopover(props: DataHealthPopoverProps) {
   const { t } = useTranslation();
-  const { quality } = props;
+  const quality = useDataQuality({ from: props.from, to: props.to });
+  const storage = useStorage();
+  const dq = quality.data;
+  const st = storage.data;
 
-  const fresh =
-    quality.status === "complete" && !quality.active_tail
-      ? "var(--sev-ok)"
-      : "var(--sev-warn)";
-
-  const skipped: { label: string; codes: string[] }[] = [
-    { label: t("popover.gated"), codes: quality.gated },
-    { label: t("popover.resourceLimited"), codes: quality.resource_limited },
-    {
-      label: t("popover.unavailableRevision"),
-      codes: quality.unavailable_revision,
-    },
-  ].filter((s) => s.codes.length > 0);
-
-  const collected = props.views.filter(
-    (v): v is ViewSummaryItem & { collection: Collection } =>
-      v.collection !== null,
+  // Capabilities with a non-available status are the skipped lenses.
+  const skipped = (dq?.capabilities ?? []).filter(
+    (c) => c.status !== "available",
   );
-  const totalCollected = collected.reduce(
-    (sum, v) => sum + v.collection.collected,
-    0,
-  );
-  const totalSource = collected.reduce(
-    (sum, v) => sum + (v.collection.source_total ?? 0),
-    0,
-  );
-  const worst = [...collected]
-    .sort((a, b) => ratio(a.collection) - ratio(b.collection))
-    .slice(0, 3);
+  const integrityBad = st
+    ? st.integrity.quarantined_entries > 0 || st.integrity.orphan_overviews > 0
+    : false;
 
   return (
     <div
@@ -104,45 +106,99 @@ export function DataHealthPopover(props: DataHealthPopoverProps) {
         gap: "4px",
       }}
     >
-      <Row label={t("popover.freshness")}>
-        <Square color={fresh} />
-        <span>
-          {quality.status}
-          {quality.active_tail ? ` · ${t("popover.activeTail")}` : ""}
-        </span>
-      </Row>
-      <Row label={t("popover.coverage")}>
-        <span>
-          {quality.snapshots} {t("popover.snapshots")}
-        </span>
-      </Row>
-      <Row label={t("popover.gaps")}>
-        {quality.gaps.length === 0 ? (
-          <span>{t("popover.none")}</span>
-        ) : (
-          <span>{quality.gaps.join(", ")}</span>
-        )}
-      </Row>
-      {skipped.map((s) => (
-        <Row key={s.label} label={s.label}>
-          <Square color="var(--sev-warn)" />
-          <span>{s.codes.join(", ")}</span>
+      {!dq ? (
+        <Row label={t("popover.loading")}>
+          <span>{quality.isError ? String(quality.error) : "…"}</span>
         </Row>
-      ))}
-      {collected.length > 0 && (
-        <Row label={t("popover.views")}>
-          <span>
-            {totalCollected}/{totalSource}
-          </span>
-        </Row>
+      ) : (
+        <>
+          <Row label={t("popover.freshness")}>
+            <Square color={freshnessColor(dq.freshness.state)} />
+            <span>
+              {dq.freshness.state} · {t("popover.age")}{" "}
+              {formatAge(dq.freshness.age_us)} · {t("popover.dataThrough")}{" "}
+              {formatTs(dq.freshness.data_through_us)}
+            </span>
+          </Row>
+          <Row label={t("popover.coverage")}>
+            <span>
+              {dq.coverage.observed_snapshots}/
+              {dq.coverage.expected_snapshots ?? "—"} · {t("popover.complete")}:{" "}
+              {dq.coverage.complete_snapshots}
+            </span>
+          </Row>
+          <Row label={t("popover.gaps")}>
+            {dq.gaps.length === 0 ? (
+              <span>{t("popover.none")}</span>
+            ) : (
+              <span>
+                {dq.gaps
+                  .map(
+                    (g) =>
+                      `${formatTs(g.from_us)}→${formatTs(g.to_us)} · ${g.reason}`,
+                  )
+                  .join(", ")}
+              </span>
+            )}
+          </Row>
+          <Row label={t("popover.lensesSkipped")}>
+            {skipped.length === 0 ? (
+              <span>{t("popover.none")}</span>
+            ) : (
+              <span>
+                {skipped.map((c) => `${c.code}: ${c.reason ?? "—"}`).join(", ")}
+              </span>
+            )}
+          </Row>
+        </>
       )}
-      {worst.map((v) => (
-        <Row key={v.view} label={`${t("popover.worst")}: ${v.view}`}>
+      {!st ? (
+        <Row label={t("popover.storage")}>
           <span>
-            {v.collection.collected}/{v.collection.source_total ?? "—"}
+            {storage.isError ? String(storage.error) : t("popover.loading")}
           </span>
         </Row>
-      ))}
+      ) : (
+        <>
+          <Row label={t("popover.storage")}>
+            <span>
+              {formatBytes(
+                st.filesystem.total_bytes - st.filesystem.available_bytes,
+              )}{" "}
+              / {formatBytes(st.filesystem.total_bytes)}
+            </span>
+          </Row>
+          <Row label={t("popover.retention")}>
+            <span title={st.retention.reason ?? undefined}>
+              {st.retention.status} ·{" "}
+              {st.retention.effective_limit_bytes === null
+                ? "—"
+                : formatBytes(st.retention.effective_limit_bytes)}
+            </span>
+          </Row>
+          <Row label={t("popover.fullIn")}>
+            <span
+              title={
+                st.forecast.full_in_days === null
+                  ? (st.forecast.full_in_days_reason ?? undefined)
+                  : undefined
+              }
+            >
+              {st.forecast.full_in_days ?? "—"}
+            </span>
+          </Row>
+          <Row label={t("popover.integrity")}>
+            <Square
+              color={integrityBad ? "var(--sev-warn)" : "var(--sev-ok)"}
+            />
+            <span>
+              {t("popover.readable")} {st.integrity.readable_segments} ·{" "}
+              {t("popover.quarantined")} {st.integrity.quarantined_entries} ·{" "}
+              {t("popover.orphans")} {st.integrity.orphan_overviews}
+            </span>
+          </Row>
+        </>
+      )}
     </div>
   );
 }

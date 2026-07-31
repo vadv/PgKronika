@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useTimelineEvents, useTimelineHealth } from "../api/timeline";
-import type { EventFact, HealthPointResponse } from "../api/types";
+import { useTimelineSpine } from "../api/spine";
+import { useTimelineEvents } from "../api/timeline";
+import type { EventFact, SpineSeries } from "../api/types";
 import { SPANS } from "../state/url";
 
 export interface SpineProps {
@@ -25,6 +26,8 @@ const SVG_WIDTH = 1000;
 const TICK_COUNT = 24;
 const LIVE_REFRESH_MS = 5000;
 const KEYBOARD_STEP_US = 300 * 1_000_000;
+/** Grid resolution requested from `/v1/timeline/spine`. */
+const SPINE_BUCKETS = 96;
 /** Repeat shift-click within this share of the window clears the baseline. */
 const BASELINE_CLEAR_FRACTION = 0.02;
 
@@ -54,22 +57,59 @@ function severityColor(event: EventFact): string {
   return "var(--sev-warn)";
 }
 
-function pointY(score: number): number {
-  const clamped = Math.min(1, Math.max(0, score));
+function pointY(fraction: number): number {
+  const clamped = Math.min(1, Math.max(0, fraction));
   return SVG_HEIGHT - 6 - clamped * (SVG_HEIGHT - 12);
 }
 
-function healthPolyline(points: HealthPointResponse[], fromUs: number): string {
-  return points
-    .filter((p) => p.overall_score !== null)
-    .map((p) => {
-      const mid = (p.interval.from_us + p.interval.to_us) / 2;
-      const x = ((mid - fromUs) / WINDOW_US) * SVG_WIDTH;
-      // `overall_score` is a 0..1 fraction on the wire (null = no data).
-      const y = pointY(p.overall_score ?? 0);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+// Primary series: the first one that carries at least one real sample. The
+// API orders series by relevance (host load first, PSI after it), so we do
+// not hardcode a metric code — we only skip series that came back empty.
+function pickPrimarySeries(series: SpineSeries[]): SpineSeries | null {
+  return (
+    series.find((s) => s.values.some((v) => v !== null)) ?? series[0] ?? null
+  );
+}
+
+interface BucketGeometry {
+  gridFromUs: number;
+  bucketSpanUs: number;
+}
+
+function bucketX(geom: BucketGeometry, index: number, fromUs: number): number {
+  const mid = geom.gridFromUs + (index + 0.5) * geom.bucketSpanUs;
+  return ((mid - fromUs) / WINDOW_US) * SVG_WIDTH;
+}
+
+/** Contiguous non-null runs of the series, as SVG `points` strings. */
+function seriesSegments(
+  series: SpineSeries,
+  geom: BucketGeometry,
+  fromUs: number,
+): string[] {
+  const n = series.values.length;
+  if (n === 0) return [];
+  // Values arrive in the series' own unit, so scale by the observed max
+  // instead of assuming a 0..1 fraction.
+  const max = series.values.reduce<number>(
+    (m, v) => (v !== null && v > m ? v : m),
+    0,
+  );
+  const scale = max > 0 ? max : 1;
+  const segments: string[] = [];
+  let current: string[] = [];
+  series.values.forEach((v, i) => {
+    if (v === null) {
+      if (current.length > 0) segments.push(current.join(" "));
+      current = [];
+      return;
+    }
+    const x = bucketX(geom, i, fromUs);
+    const y = pointY(v / scale);
+    current.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  });
+  if (current.length > 0) segments.push(current.join(" "));
+  return segments;
 }
 
 export function Spine(props: SpineProps) {
@@ -88,11 +128,23 @@ export function Spine(props: SpineProps) {
   const from = String(fromUs);
   const to = String(toUs);
 
-  const health = useTimelineHealth({ from, to });
+  const spine = useTimelineSpine({ from, to, buckets: SPINE_BUCKETS });
   const events = useTimelineEvents({ from, to, limit: 50 });
 
   const cursorX = (us: number) => ((us - fromUs) / WINDOW_US) * SVG_WIDTH;
-  const polyline = healthPolyline(health.data?.points ?? [], fromUs);
+  const primary = spine.data ? pickPrimarySeries(spine.data.series) : null;
+  const geom: BucketGeometry | null = spine.data
+    ? {
+        gridFromUs: Number(spine.data.grid.from_us),
+        bucketSpanUs:
+          (Number(spine.data.grid.to_us) - Number(spine.data.grid.from_us)) /
+          Math.max(1, spine.data.grid.bucket_count),
+      }
+    : null;
+  const segments =
+    primary !== null && geom !== null
+      ? seriesSegments(primary, geom, fromUs)
+      : [];
   const baselineUs = props.baseline !== null ? Number(props.baseline) : null;
   const visibleEvents = (events.data?.events ?? []).filter((e) => {
     const ts = e.occurred_at_us ?? e.sort_ts_us;
@@ -196,6 +248,14 @@ export function Spine(props: SpineProps) {
         >
           {cursorLabel}
         </span>
+        {primary !== null && (
+          <span
+            data-testid="spine-metric"
+            style={{ fontFamily: "var(--mono-font)", color: "var(--fg-dim)" }}
+          >
+            {t("spine.load", { code: primary.code, unit: primary.unit })}
+          </span>
+        )}
       </div>
       <div style={{ display: "flex", alignItems: "stretch" }}>
         <div
@@ -233,16 +293,41 @@ export function Spine(props: SpineProps) {
               strokeWidth="1"
             />
           ))}
-          {polyline !== "" && (
+          {segments.map((points, i) => (
             <polyline
+              key={i}
               data-testid="spine-health-line"
-              points={polyline}
+              points={points}
               fill="none"
               stroke="var(--accent)"
               strokeWidth="1.5"
               vectorEffect="non-scaling-stroke"
             />
-          )}
+          ))}
+          {primary !== null &&
+            geom !== null &&
+            primary.values.map((v, i) => {
+              if (v !== null) return null;
+              // Honest missing: the bucket has no sample, the polyline breaks
+              // here; the dot carries the wire status for hover.
+              const status = primary.value_statuses[i];
+              return (
+                <circle
+                  key={i}
+                  data-testid="spine-missing-point"
+                  cx={bucketX(geom, i, fromUs)}
+                  cy={SVG_HEIGHT - 8}
+                  r={2}
+                  fill="var(--sev-warn)"
+                >
+                  <title>
+                    {status
+                      ? `${t("spine.missing")}: ${status.reason ?? status.status}`
+                      : t("spine.missing")}
+                  </title>
+                </circle>
+              );
+            })}
           {baselineUs !== null &&
             baselineUs >= fromUs &&
             baselineUs <= toUs && (

@@ -9,8 +9,7 @@ export interface StatusBarProps {
 
 export function StatusBar(props: StatusBarProps) {
   const { t } = useTranslation();
-  const notable =
-    props.summary?.views.filter((v) => v.notable).length ?? 0;
+  const notable = props.summary?.views.filter((v) => v.notable).length ?? 0;
   return (
     <footer
       style={{
