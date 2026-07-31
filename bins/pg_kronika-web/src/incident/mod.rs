@@ -40,14 +40,14 @@ pub(crate) use events::{
     event_catalog_ids, event_catalog_metadata,
 };
 pub(crate) use evidence::{
-    CounterEvidence, Evidence, Finding, GaugeEvidence, GaugeMeasurement, SampledLockEdge,
+    CounterEvidence, Evidence, Finding, GaugeEvidence, GaugeMeasurement, Role, SampledLockEdge,
     SourceWindow, SourceWindowGapReason,
 };
 #[cfg(test)]
 pub(crate) use evidence::{
     CounterEvidenceInput, CounterEvidenceWindow, CounterEvidenceWindowInput,
-    CounterMeasurementKind, CounterOperand, CounterOperandPurpose, DirectEvidence, GaugeEntity,
-    GaugeUnit, GaugeValueInput, LockParticipant, ThresholdKind,
+    CounterMeasurementKind, CounterOperand, CounterOperandPurpose, DirectEvidence, EntityJoinEvidence,
+    FindingScope, GaugeEntity, GaugeUnit, GaugeValueInput, LockParticipant, ThresholdKind,
 };
 #[allow(
     unused_imports,

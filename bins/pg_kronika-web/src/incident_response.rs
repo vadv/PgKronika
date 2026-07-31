@@ -1,6 +1,6 @@
 //! JSON contract for incident clustering responses.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kronika_reader::Gap;
 use serde_json::{Value, json};
@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::anomaly::ScanParams;
 use crate::incident::{
     CounterEvidence, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence, Finding,
-    GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
+    GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage, Role,
     SampledLockEdge, SourceWindow, SourceWindowGapReason,
 };
 use crate::incident_input::{
@@ -102,7 +102,7 @@ fn incident_to_json(incident: &Incident) -> Value {
     let coincident_count = incident
         .findings
         .iter()
-        .filter(|finding| finding.role().label() == "coincident")
+        .filter(|finding| matches!(finding.role(), Role::Coincident))
         .count();
     let focus = incident_focus(incident);
     json!({
@@ -289,6 +289,14 @@ fn evidence_to_json(evidence: &Evidence) -> Value {
 }
 
 fn incident_relations_to_json(incident: &Incident) -> Vec<Value> {
+    // Section-bucketed candidates keep the join scan linear in findings.
+    let mut by_section: HashMap<&'static str, Vec<usize>> = HashMap::new();
+    for (index, finding) in incident.findings.iter().enumerate() {
+        by_section
+            .entry(finding.scope().logical_section())
+            .or_default()
+            .push(index);
+    }
     let mut emitted = BTreeSet::new();
     let mut relations = Vec::new();
     for (from_finding, finding) in incident.findings.iter().enumerate() {
@@ -296,9 +304,12 @@ fn incident_relations_to_json(incident: &Incident) -> Vec<Value> {
             let Evidence::EntityJoin(join) = evidence else {
                 continue;
             };
-            for (to_finding, target) in incident.findings.iter().enumerate() {
+            let Some(candidates) = by_section.get(join.target_section()) else {
+                continue;
+            };
+            for to_finding in candidates.iter().copied() {
                 if from_finding == to_finding
-                    || !join.matches(target.scope())
+                    || !join.matches(incident.findings[to_finding].scope())
                     || !emitted.insert((from_finding, to_finding, join.contract()))
                 {
                     continue;
@@ -1007,6 +1018,38 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_join_matches_only_the_proven_scope() {
+        use crate::incident::{EntityJoinEvidence, FindingScope};
+        use std::sync::Arc;
+
+        let join = EntityJoinEvidence::new(
+            "statement_plan",
+            &["queryid", "dbid", "userid"],
+            "pg_store_plans_ossc",
+            Arc::from(vec![IdentityValue::I64(7)]),
+        );
+        let prefixed = FindingScope::from_parts(
+            "pg_store_plans_ossc",
+            "total_time",
+            Arc::from(vec![IdentityValue::I64(7), IdentityValue::I64(20)]),
+        );
+        let other_identity = FindingScope::from_parts(
+            "pg_store_plans_ossc",
+            "total_time",
+            Arc::from(vec![IdentityValue::I64(8)]),
+        );
+        let other_section = FindingScope::from_parts(
+            "pg_stat_statements",
+            "c",
+            Arc::from(vec![IdentityValue::I64(7)]),
+        );
+
+        assert!(join.matches(&prefixed));
+        assert!(!join.matches(&other_identity), "coincidence is not a link");
+        assert!(!join.matches(&other_section), "cross-section is not a link");
+    }
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
     const APPLIED_IDS: &[&str] = &[
