@@ -115,3 +115,25 @@ test("row label click reports the entity", async () => {
   fireEvent.click(screen.getByText("alpha"));
   expect(onSelectEntity).toHaveBeenCalledWith("e1");
 });
+
+test("partial chip tooltip lists localized quality reasons", async () => {
+  const original = fixture.quality;
+  fixture.quality = makeHeatmapQuality({
+    status: "partial",
+    gaps: [{ from_us: "1", to_us: "2" }],
+    gated: ["statements"],
+    resource_limited: [],
+    active_tail: true,
+  });
+  const { container } = renderStrip();
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  const chip = screen.getByText("heatmap.partial");
+  fireEvent.mouseEnter(chip);
+  await waitFor(() =>
+    expect(container.querySelector("[role='tooltip']")).not.toBeNull(),
+  );
+  const tip = container.querySelector("[role='tooltip']")?.textContent ?? "";
+  expect(tip).toContain("heatmap.quality.gated");
+  expect(tip).toContain("heatmap.quality.active_tail");
+  fixture.quality = original;
+});

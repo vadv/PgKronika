@@ -11,21 +11,23 @@ function formatValue(v: number): string {
 
 /** Localized breakdown of heatmap quality reasons for the partial chip:
  * a bare "partial data" gives the operator nothing to act on. */
-function qualityReasons(
+function qualityReasonRows(
   quality: HeatmapQuality,
   t: (key: string, opts?: Record<string, unknown>) => string,
-): string {
-  const parts: string[] = [];
+): Array<{ code: string; label: string }> {
+  const rows: Array<{ code: string; label: string }> = [];
   const push = (code: string, count: number) => {
-    if (count > 0) parts.push(t(`heatmap.quality.${code}`, { count }));
+    if (count > 0)
+      rows.push({ code, label: t(`heatmap.quality.${code}`, { count }) });
   };
   push("gaps", quality.gaps.length);
   push("gated", quality.gated.length);
   push("unavailable_revision", quality.unavailable_revision.length);
   push("resource_limited", quality.resource_limited.length);
   push("unbounded_segments", quality.unbounded_segments.length);
-  if (quality.active_tail) parts.push(t("heatmap.quality.active_tail"));
-  return parts.join("\n");
+  if (quality.active_tail)
+    rows.push({ code: "active_tail", label: t("heatmap.quality.active_tail") });
+  return rows;
 }
 
 export function HeatmapStrip(props: {
@@ -131,21 +133,29 @@ export function HeatmapStrip(props: {
           (heatmap.data.quality.gaps.length > 0 ||
             (heatmap.data.quality.status !== "complete" &&
               !heatmap.data.quality.active_tail)) && (
-            <span
-              title={qualityReasons(heatmap.data.quality, t)}
-              style={{
-                fontFamily: "var(--ui-font)",
-                fontSize: "var(--text-xs)",
-                fontWeight: 600,
-                color: "var(--sev-warn-fg)",
-                background: "var(--sev-warn-bg)",
-                borderRadius: "var(--radius-sm)",
-                padding: "1px 8px",
-                whiteSpace: "pre-line",
-              }}
+            <Tooltip
+              content={
+                <span style={{ display: "grid", gap: "2px" }}>
+                  {qualityReasonRows(heatmap.data.quality, t).map((row) => (
+                    <TipRow key={row.code} label={row.code} value={row.label} />
+                  ))}
+                </span>
+              }
             >
-              {t("heatmap.partial")}
-            </span>
+              <span
+                style={{
+                  fontFamily: "var(--ui-font)",
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 600,
+                  color: "var(--sev-warn-fg)",
+                  background: "var(--sev-warn-bg)",
+                  borderRadius: "var(--radius-sm)",
+                  padding: "1px 8px",
+                }}
+              >
+                {t("heatmap.partial")}
+              </span>
+            </Tooltip>
           )}
         {/* Verdict legend: the colors mean thresholds, not decoration. */}
         <span

@@ -256,3 +256,23 @@ test("copy link writes the canonical share URL and shows a toast for 1.7s", () =
   });
   expect(screen.queryByTestId("toast")).toBeNull();
 });
+
+test("instance chip tooltip shows host, pg version and cpu from context", async () => {
+  renderHeader({
+    context: makeContextResponse({
+      instance: {
+        hostname: "prod-1",
+        pg_version_num: 170003,
+        pg_system_identifier: "7300000000000000000",
+        role: "primary",
+      },
+      host: { logical_cpu_count: 16 },
+    }),
+  });
+  fireEvent.mouseEnter(screen.getByTestId("instance-chip"));
+  await waitFor(() => expect(screen.getByRole("tooltip")).toBeDefined());
+  const tip = screen.getByRole("tooltip").textContent ?? "";
+  expect(tip).toContain("prod-1");
+  expect(tip).toContain("17.3");
+  expect(tip).toContain("16");
+});
