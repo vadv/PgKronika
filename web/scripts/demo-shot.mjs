@@ -20,13 +20,18 @@ const browser = await puppeteer.launch({
   args: ["--no-sandbox", "--disable-dev-shm-usage"],
 });
 
+// Pin the cursor (`at`): in LIVE mode the shell derives `at` from Date.now()
+// on every render, so queries re-fire each second and networkidle0 never
+// settles. Replay mode keeps all query keys stable.
+const AT = Date.now() * 1000;
+
 for (const theme of ["dark", "light"]) {
   const page = await browser.newPage();
   await page.setViewport({ width: 1600, height: 900 });
   await page.evaluateOnNewDocument((t) => {
     localStorage.setItem("pgk-theme", t);
   }, theme);
-  await page.goto(`${BASE}/#source=local&view=statements`, {
+  await page.goto(`${BASE}/#source=local&view=statements&at=${AT}`, {
     waitUntil: "networkidle0",
   });
   // Let the heatmap query settle after networkidle.

@@ -29,13 +29,15 @@ web/src/          vite build      bins/pg_kronika-web/static/   (gitignored)
 
 The build output is not tracked as a tree — it produced thousand-line
 generated diffs on every change. One deterministic tarball is committed
-instead: identical sources give an identical archive, so the file is
-reviewable as a checksum rather than as content.
+instead, so the file is reviewable as a checksum rather than as content.
+Byte-identity holds within one toolchain; across zlib builds the gzip stream
+can differ for identical content, which is why CI compares content, not
+bytes.
 
 **A change under `web/src/` is not complete until `make web-frontend` has been
 re-run in the same commit.** Otherwise the binary keeps serving the previous UI
-while the diff claims otherwise. CI enforces this by rebuilding the tarball and
-failing on any difference.
+while the diff claims otherwise. CI enforces this by rebuilding the SPA and
+failing on any content difference against the committed tarball.
 
 ## Commands
 
