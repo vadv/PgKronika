@@ -55,14 +55,45 @@ export interface ProjectionCatalog {
   views: ViewSpec[];
 }
 
-export interface QualityMeta {
-  status: "complete" | "partial" | "unavailable";
+export interface RangeGap {
+  from_us: string;
+  to_us: string;
+}
+
+export type QualityStatus = "complete" | "partial";
+
+/**
+ * Summary and heatmap quality look alike but are not interchangeable: summary
+ * reports `gaps` as opaque tokens, heatmap as time ranges, and only heatmap
+ * carries `unbounded_segments`. Sharing one type here hid the difference until
+ * a non-empty response exposed it.
+ */
+export interface SummaryQuality {
+  status: QualityStatus;
   snapshots: number;
-  gaps: { from_us: string; to_us: string }[];
+  gaps: string[];
   gated: string[];
   unavailable_revision: string[];
   resource_limited: string[];
-  active_tail?: boolean;
+  active_tail: boolean;
+}
+
+export interface HeatmapQuality {
+  status: QualityStatus;
+  snapshots: number;
+  gaps: RangeGap[];
+  gated: string[];
+  unavailable_revision: string[];
+  resource_limited: string[];
+  unbounded_segments: string[];
+  active_tail: boolean;
+}
+
+export interface CollectionStatusDto {
+  collected: number;
+  source_total: number | null;
+  read_state: string;
+  visibility: string;
 }
 
 export interface ViewSummaryItem {
@@ -71,12 +102,13 @@ export interface ViewSummaryItem {
   population: number | null;
   status: string;
   notable: boolean;
+  collection: CollectionStatusDto | null;
 }
 
 export interface SummaryResponse {
   at_us: string;
   views: ViewSummaryItem[];
-  quality: QualityMeta;
+  quality: SummaryQuality;
 }
 
 export interface HeatmapRow {
@@ -91,5 +123,5 @@ export interface HeatmapResponse {
   grid: { from_us: string; to_us: string; bucket_count: number };
   ranking: { exact: boolean; unseen_upper: number };
   rows: HeatmapRow[];
-  quality: QualityMeta & { unbounded_segments?: string[] };
+  quality: HeatmapQuality;
 }

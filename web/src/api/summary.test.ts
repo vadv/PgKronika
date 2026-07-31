@@ -8,7 +8,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 test("useSummary requests /v1/views/summary?at=", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-    new Response('{"at_us":"1","views":[],"quality":{"status":"complete","snapshots":0,"gaps":[],"gated":[],"unavailable_revision":[],"resource_limited":[]}}', { status: 200 }),
+    new Response('{"at_us":"1","views":[],"quality":{"status":"complete","snapshots":0,"gaps":[],"gated":[],"unavailable_revision":[],"resource_limited":[],"active_tail":false}}', { status: 200 }),
   ));
   const client = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) =>

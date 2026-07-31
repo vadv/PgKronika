@@ -17,6 +17,7 @@ const summaries = new Map<string, ViewSummaryItem>([
       population: 142,
       status: "complete",
       notable: false,
+      collection: null,
     },
   ],
 ]);

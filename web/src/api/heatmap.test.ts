@@ -8,7 +8,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 test("useHeatmap builds query with all params", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-    new Response('{"grid":{"from_us":"0","to_us":"1","bucket_count":56},"ranking":{"exact":false,"unseen_upper":0},"rows":[],"quality":{"status":"partial","snapshots":0,"gaps":[],"gated":[],"unavailable_revision":[],"resource_limited":[]}}', { status: 200 }),
+    new Response('{"grid":{"from_us":"0","to_us":"1","bucket_count":56},"ranking":{"exact":false,"unseen_upper":0},"rows":[],"quality":{"status":"partial","snapshots":0,"gaps":[],"gated":[],"unavailable_revision":[],"resource_limited":[],"unbounded_segments":[],"active_tail":false}}', { status: 200 }),
   ));
   const client = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) =>

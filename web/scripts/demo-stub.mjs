@@ -52,6 +52,7 @@ function summaryResponse(at) {
       population: POPULATIONS[i] ?? 0,
       status: "complete",
       notable: false,
+      collection: null,
     })),
     quality: {
       status: "complete",
