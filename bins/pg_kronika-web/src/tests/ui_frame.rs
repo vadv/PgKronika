@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::threshold::{Policy, catalog_entry, classify};
+use kronika_analytics::web_projection::web_view_by_name;
 use kronika_analytics::{
     Boundary, Classified, Comparison, Evidence, Level, MetricId, MetricInput, NotClassifiedReason,
     Verdict,
@@ -26,10 +27,26 @@ use crate::ui::frame::projection::{
 use crate::ui::frame::projection::{ProjectionInput, project_input};
 use crate::ui::frame::spark::attach_sparks;
 use crate::ui::frame::threshold::{FrameThresholdContext, prepare_input};
+use crate::ui::snapshot::{resolve_snapshot_at, resolve_view_snapshot};
 use crate::ui::thresholds::OperandKind;
 
 fn catalog() -> ProjectionCatalog {
     ProjectionCatalog::for_type_ids(&BTreeSet::new())
+}
+
+#[test]
+fn snapshot_resolvers_select_the_latest_snapshot_at_or_before_at() {
+    let directory = frame_event_fixture();
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let events = web_view_by_name("events").expect("events view");
+
+    let resolved = resolve_view_snapshot(&snapshot, events, 1_550).expect("view snapshot");
+    assert_eq!(resolved.neighbors.expect("view neighbors").current, 1_500);
+
+    let resolved = resolve_snapshot_at(&snapshot, 1_550)
+        .expect("snapshot lookup")
+        .expect("snapshot");
+    assert_eq!(resolved.timestamp_us, 1_500);
 }
 
 #[test]

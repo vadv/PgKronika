@@ -86,6 +86,8 @@ closed_string_enum! {
         Q => "q",
         Sort => "sort",
         Order => "order",
+        Columns => "columns",
+        Include => "include",
     }
 }
 
@@ -117,6 +119,8 @@ impl QueryParameter {
             b"q" => Some(Self::Q),
             b"sort" => Some(Self::Sort),
             b"order" => Some(Self::Order),
+            b"columns" => Some(Self::Columns),
+            b"include" => Some(Self::Include),
             _ => None,
         }
     }
@@ -171,6 +175,8 @@ closed_string_enum! {
         Severity => "severity",
         ProjectionCode => "projection_code",
         SortOrder => "sort_order",
+        EntityToken => "entity_token",
+        ProjectionColumnList => "projection_column_list",
     }
 }
 
@@ -183,6 +189,9 @@ closed_string_enum! {
         EpsilonNotGreaterThanMaxClusterSpan => "epsilon_not_greater_than_max_cluster_span",
         MaxClusterSpanWithinInterval => "max_cluster_span_within_interval",
         FiniteScan => "finite_scan",
+        PointOrHistory => "point_or_history",
+        HistorySupported => "history_supported",
+        PresetOrColumns => "preset_or_columns",
     }
 }
 

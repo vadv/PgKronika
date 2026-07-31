@@ -60,7 +60,7 @@ PGM/OVF reader, `kronika-layout`, Cargo tests, generated multifile OpenAPI.
   `snapshot::resolve_view_snapshot(snapshot, view, at_us) -> Result<ResolvedViewSnapshot, WebIndexReadError>`.
 - Consumes: existing `UiSummaryBlock`, `SnapshotNeighbors`, `SegmentDescriptor`.
 
-- [ ] **Step 1: Write failing closed-registry and snapshot-selection tests**
+- [x] **Step 1: Write failing closed-registry and snapshot-selection tests**
 
 ```rust
 #[test]
@@ -88,7 +88,7 @@ fn snapshot_at_resolver_is_independent_of_public_view_coverage() {
 }
 ```
 
-- [ ] **Step 2: Run RED tests**
+- [x] **Step 2: Run RED tests**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -100,7 +100,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 Expected: compilation fails because the new enum variants and
 `resolve_view_snapshot` do not exist.
 
-- [ ] **Step 3: Add closed values and extract the shared resolver**
+- [x] **Step 3: Add closed values and extract the shared resolver**
 
 ```rust
 pub(crate) struct ResolvedViewSnapshot {
@@ -139,7 +139,7 @@ pub(crate) fn resolve_view_snapshot(
 Update frame to call the extracted helper without changing its existing
 response.
 
-- [ ] **Step 4: Run GREEN and regression tests**
+- [x] **Step 4: Run GREEN and regression tests**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -152,7 +152,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 
 Expected: all selected tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git add bins/pg_kronika-web/src/api_error.rs \

@@ -4,8 +4,8 @@ use std::fmt::Write as _;
 
 use kronika_analytics::web_projection::WebView;
 use kronika_reader::{
-    Gap, IndexStatus, LIMIT, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SealedQuerySession,
-    SectionPage, SnapshotNeighbors, Value, WebIndexReadError, logical_section,
+    Gap, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SealedQuerySession, SectionPage,
+    SnapshotNeighbors, Value, WebIndexReadError, logical_section,
 };
 use kronika_registry::ColumnType;
 
@@ -15,6 +15,7 @@ use super::dto::{FrameValue, SparkDto};
 use super::query::{filter_sort_page, value_sort_key};
 use super::threshold::{CellClassification, FrameThresholdContext, classify_row};
 use crate::ui::catalog::{ColumnSpec, ProjectionCatalog, ValueType, ViewSpec};
+use crate::ui::snapshot::{ResolvedViewSnapshot, SnapshotSummaryQuality, resolve_view_snapshot};
 
 const JS_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -262,7 +263,7 @@ pub(crate) fn project_frame(
     catalog: &ProjectionCatalog,
     limits: FrameLimits,
 ) -> Result<ProjectedFrame, FrameError> {
-    let resolved = resolve_snapshot(snapshot, request)?;
+    let resolved = resolve_view_snapshot(snapshot, request.view, request.at_us)?;
     let Some(neighbors) = resolved.neighbors else {
         if request.cursor.is_some() {
             return Err(FrameError::CursorExpired);
@@ -320,7 +321,7 @@ fn read_projection_input(
     request: &FrameRequest,
     catalog: &ProjectionCatalog,
     limits: FrameLimits,
-    resolved: &ResolvedSnapshot,
+    resolved: &ResolvedViewSnapshot,
     neighbors: SnapshotNeighbors,
 ) -> Result<ProjectionInput, FrameError> {
     let section_names = request
@@ -454,127 +455,6 @@ fn preset_requires_predecessor(
                 )
         )
     }))
-}
-
-struct ResolvedSnapshot {
-    neighbors: Option<SnapshotNeighbors>,
-    current_descriptor: Option<kronika_reader::SegmentDescriptor>,
-    previous_descriptor: Option<kronika_reader::SegmentDescriptor>,
-    current_quality: Option<SnapshotSummaryQuality>,
-    previous_quality: Option<SnapshotSummaryQuality>,
-    fallback_quality: Option<SnapshotSummaryQuality>,
-    next: Option<i64>,
-}
-
-#[derive(Clone, Copy)]
-struct SnapshotEvidence {
-    descriptor: kronika_reader::SegmentDescriptor,
-    quality: SnapshotSummaryQuality,
-}
-
-#[derive(Clone, Copy)]
-enum SnapshotSummaryQuality {
-    Complete,
-    Gated,
-    UnavailableRevision,
-    ResourceLimited,
-}
-
-fn resolve_snapshot(
-    snapshot: &LocalDirSnapshot,
-    request: &FrameRequest,
-) -> Result<ResolvedSnapshot, FrameError> {
-    let mut snapshots = BTreeMap::<i64, SnapshotEvidence>::new();
-    let mut fallback_quality = None;
-    let mut next = None;
-    let mut descriptors = snapshot.sealed_descriptors().collect::<Vec<_>>();
-    descriptors
-        .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
-    for descriptor in descriptors {
-        let (summary, _stats) = snapshot.read_ui_summary(&descriptor, &LIMIT)?;
-        let Some(view) = summary
-            .views()
-            .iter()
-            .find(|view| view.view_code() == request.view.code)
-        else {
-            continue;
-        };
-        let quality = summary_quality(view.view_revision(), request.view.revision, view.status());
-        if descriptor.min_ts <= request.at_us {
-            fallback_quality = Some(quality);
-        }
-        if view.view_revision() != request.view.revision {
-            continue;
-        }
-        let evidence = SnapshotEvidence {
-            descriptor,
-            quality,
-        };
-        let local_neighbors = summary.snapshot_neighbors(request.view.code, request.at_us);
-        if let Some(local_neighbors) = local_neighbors {
-            if let Some(previous) = local_neighbors.previous {
-                snapshots.insert(previous, evidence);
-            }
-            snapshots.insert(local_neighbors.current, evidence);
-        }
-        let local_next = local_neighbors.map_or_else(
-            || {
-                let upper = summary
-                    .snapshot_times()
-                    .partition_point(|timestamp| *timestamp <= request.at_us);
-                (upper..summary.snapshot_times().len())
-                    .find(|index| {
-                        view.snapshot_presence()
-                            .get(index / 8)
-                            .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
-                    })
-                    .map(|index| summary.snapshot_times()[index])
-            },
-            |local_neighbors| local_neighbors.next,
-        );
-        if let Some(local_next) = local_next {
-            next = Some(next.map_or(local_next, |current: i64| current.min(local_next)));
-        }
-    }
-
-    // Each summary's two newest candidates are sufficient for the global pair.
-    let mut newest = snapshots.iter().rev();
-    let current_evidence = newest
-        .next()
-        .map(|(timestamp, evidence)| (*timestamp, *evidence));
-    let previous_evidence = newest
-        .next()
-        .map(|(timestamp, evidence)| (*timestamp, *evidence));
-    let neighbors = current_evidence.map(|(current, _evidence)| SnapshotNeighbors {
-        previous: previous_evidence.map(|(previous, _evidence)| previous),
-        current,
-        next,
-    });
-    Ok(ResolvedSnapshot {
-        neighbors,
-        current_descriptor: current_evidence.map(|(_timestamp, evidence)| evidence.descriptor),
-        previous_descriptor: previous_evidence.map(|(_timestamp, evidence)| evidence.descriptor),
-        current_quality: current_evidence.map(|(_timestamp, evidence)| evidence.quality),
-        previous_quality: previous_evidence.map(|(_timestamp, evidence)| evidence.quality),
-        fallback_quality,
-        next,
-    })
-}
-
-const fn summary_quality(
-    actual_revision: u16,
-    expected_revision: u16,
-    status: IndexStatus,
-) -> SnapshotSummaryQuality {
-    if actual_revision != expected_revision {
-        return SnapshotSummaryQuality::UnavailableRevision;
-    }
-    match status {
-        IndexStatus::Complete | IndexStatus::Empty => SnapshotSummaryQuality::Complete,
-        IndexStatus::Gated => SnapshotSummaryQuality::Gated,
-        IndexStatus::UnsupportedType => SnapshotSummaryQuality::UnavailableRevision,
-        IndexStatus::ResourceLimited => SnapshotSummaryQuality::ResourceLimited,
-    }
 }
 
 fn merge_summary_quality(
