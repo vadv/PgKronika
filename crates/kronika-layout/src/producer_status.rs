@@ -1,10 +1,12 @@
 //! Bounded revisioned collector status stored at the data-root boundary.
 
+use std::ffi::CString;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::path::Path;
 
+use rustix::fs::{AtFlags, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
 /// Published collector-status control file.
@@ -35,7 +37,7 @@ pub enum ProducerState {
 pub enum RetentionStatus {
     /// Fixed whole-tree byte ceiling.
     Fixed {
-        /// Whole-tree byte ceiling.
+        /// Target in bytes; zero is rejected at publication.
         target_bytes: u64,
     },
     /// Maximum used fraction of the backing filesystem.
@@ -46,7 +48,7 @@ pub enum RetentionStatus {
 }
 
 impl RetentionStatus {
-    /// Builds a fixed non-zero byte target.
+    /// Builds a fixed byte target; a zero target is rejected at publication.
     #[must_use]
     pub const fn fixed(target_bytes: u64) -> Self {
         Self::Fixed { target_bytes }
@@ -77,15 +79,15 @@ impl RetentionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProducerStatus {
-    /// Wire revision.
+    /// Wire revision; only an exact match decodes.
     pub revision: u16,
     /// Explicitly published lifecycle state.
     pub state: ProducerState,
-    /// Collector process id.
+    /// Publishing collector's process id, non-zero.
     pub collector_pid: u32,
-    /// Process start time, unix microseconds.
+    /// Collector start time as Unix epoch microseconds.
     pub collector_started_at_us: i64,
-    /// Last successful status publication, unix microseconds.
+    /// Last successful publication as Unix epoch microseconds.
     pub last_status_at_us: i64,
     /// Configured retention target, absent when rotation is disabled.
     pub retention: Option<RetentionStatus>,
@@ -183,8 +185,8 @@ impl From<serde_json::Error> for ProducerStatusError {
 ///
 /// Returns a typed failure for I/O, oversized, malformed, or invalid content.
 pub fn read_producer_status(root: &Path) -> Result<Option<ProducerStatus>, ProducerStatusError> {
-    let path = root.join(PRODUCER_STATUS_NAME);
-    let file = match File::open(path) {
+    let directory = open_root_directory(root)?;
+    let file = match open_leaf(&directory, PRODUCER_STATUS_NAME, OFlags::RDONLY) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -218,30 +220,66 @@ pub fn write_producer_status(
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STATUS_BYTES {
         return Err(ProducerStatusError::TooLarge);
     }
-    let temporary = root.join(PRODUCER_STATUS_TEMP_NAME);
-    let destination = root.join(PRODUCER_STATUS_NAME);
-    let result = publish_status(&temporary, &destination, root, &bytes);
+    let directory = open_root_directory(root)?;
+    let result = publish_status(&directory, &bytes);
     if result.is_err() {
-        drop(std::fs::remove_file(&temporary));
+        let name = leaf_cstring(PRODUCER_STATUS_TEMP_NAME)?;
+        let _ = rustix::fs::unlinkat(&directory, name, AtFlags::empty());
     }
     result
 }
 
-fn publish_status(
-    temporary: &Path,
-    destination: &Path,
-    root: &Path,
-    bytes: &[u8],
-) -> Result<(), ProducerStatusError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(temporary)?;
+fn publish_status(directory: &File, bytes: &[u8]) -> Result<(), ProducerStatusError> {
+    let mut file = open_leaf(
+        directory,
+        PRODUCER_STATUS_TEMP_NAME,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+    )?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(temporary, destination)?;
-    File::open(root)?.sync_all()?;
+    let temporary = leaf_cstring(PRODUCER_STATUS_TEMP_NAME)?;
+    let destination = leaf_cstring(PRODUCER_STATUS_NAME)?;
+    rustix::fs::renameat(directory, temporary, directory, destination).map_err(errno_to_status)?;
+    directory.sync_all()?;
     Ok(())
+}
+
+/// Every status-file operation stays relative to an already-open directory
+/// descriptor and refuses symlinks, matching the layout discipline.
+fn open_root_directory(root: &Path) -> Result<File, ProducerStatusError> {
+    rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        if error == rustix::io::Errno::LOOP {
+            ProducerStatusError::Invalid
+        } else {
+            errno_to_status(error)
+        }
+    })
+}
+
+fn open_leaf(directory: &File, name: &str, access: OFlags) -> io::Result<File> {
+    let name = leaf_cstring(name)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    rustix::fs::openat(
+        directory,
+        name,
+        access | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::RUSR | Mode::WUSR | Mode::RGRP,
+    )
+    .map(File::from)
+    .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+fn leaf_cstring(name: &str) -> Result<CString, ProducerStatusError> {
+    CString::new(name).map_err(|_error| ProducerStatusError::Invalid)
+}
+
+fn errno_to_status(error: rustix::io::Errno) -> ProducerStatusError {
+    io::Error::from_raw_os_error(error.raw_os_error()).into()
 }
