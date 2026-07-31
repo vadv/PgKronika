@@ -89,19 +89,21 @@ const dockStyle = {
   // min() keeps the dock inside narrow viewports: on mobile triage
   // (<760px) the dock is the only path to incidents/findings.
   width: "min(100vw, clamp(400px, 32vw, 560px))",
-  background: "var(--bg-raised)",
+  background: "var(--bg-overlay)",
   borderInlineStart: "1px solid var(--border)",
+  boxShadow: "var(--shadow-pop)",
   color: "var(--fg)",
   fontFamily: "var(--ui-font)",
   overflowY: "auto",
   zIndex: 10,
-  padding: "8px",
+  padding: "12px",
 } as const;
 
 const tabButtonStyle = (active: boolean) =>
   ({
-    fontFamily: "var(--mono-font)",
-    color: active ? "var(--accent)" : "var(--fg)",
+    fontFamily: "var(--ui-font)",
+    fontSize: "var(--text-sm)",
+    color: active ? "var(--accent-strong)" : "var(--fg)",
     background: "none",
     border: "none",
     borderBottom: active ? "2px solid var(--accent)" : "2px solid transparent",

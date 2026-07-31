@@ -46,7 +46,10 @@ function formatAge(us: string | null): string {
 
 function formatTs(us: string | null): string {
   if (us === null) return "—";
-  return new Date(Number(us) / 1000).toISOString();
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "short",
+    timeStyle: "medium",
+  }).format(new Date(Number(us) / 1000));
 }
 
 function formatBytes(n: number): string {
@@ -92,15 +95,19 @@ export function DataHealthPopover(props: DataHealthPopoverProps) {
         left: 0,
         zIndex: 10,
         minWidth: "360px",
-        padding: "8px",
-        background: "var(--bg-raised)",
+        maxWidth: "min(92vw, 480px)",
+        marginTop: "6px",
+        padding: "10px 12px",
+        background: "var(--bg-overlay)",
         border: "1px solid var(--border)",
+        borderRadius: "var(--radius-lg)",
+        boxShadow: "var(--shadow-pop)",
         color: "var(--fg)",
         fontFamily: "var(--mono-font)",
-        fontSize: "12px",
+        fontSize: "var(--text-sm)",
         display: "flex",
         flexDirection: "column",
-        gap: "4px",
+        gap: "6px",
       }}
     >
       {!dq ? (

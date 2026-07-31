@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ContextResponse, IncidentsResponse } from "../api/types";
+import { button, chip, chipInteractive, text, verdictTint } from "../design/ui";
 import type { UiState } from "../state/url";
 import { DataHealthPopover } from "./DataHealthPopover";
 
@@ -53,7 +54,14 @@ function Clock() {
     second: "2-digit",
   }).format(now);
   return (
-    <span data-testid="clock" style={{ fontFamily: "var(--mono-font)" }}>
+    <span
+      data-testid="clock"
+      style={{
+        fontFamily: "var(--mono-font)",
+        fontSize: "var(--text-sm)",
+        color: "var(--fg-dim)",
+      }}
+    >
       {text}
     </span>
   );
@@ -77,19 +85,8 @@ function CopyLinkButton(props: { url: string }) {
   };
   return (
     <span style={{ position: "relative" }}>
-      <button
-        type="button"
-        onClick={copy}
-        style={{
-          fontFamily: "var(--mono-font)",
-          color: "var(--fg)",
-          background: "none",
-          border: "1px solid var(--border)",
-          padding: "2px 8px",
-          cursor: "pointer",
-        }}
-      >
-        {t("header.copyLink")}
+      <button type="button" onClick={copy} style={button}>
+        ⧉ {t("header.copyLink")}
       </button>
       {copied && (
         <span
@@ -99,12 +96,16 @@ function CopyLinkButton(props: { url: string }) {
             position: "absolute",
             top: "100%",
             right: 0,
-            marginTop: "4px",
-            padding: "2px 8px",
-            background: "var(--bg-raised)",
+            marginTop: "6px",
+            padding: "3px 8px",
+            background: "var(--bg-overlay)",
             border: "1px solid var(--border)",
-            color: "var(--sev-ok)",
+            borderRadius: "var(--radius-sm)",
+            boxShadow: "var(--shadow-pop)",
+            color: "var(--sev-ok-fg)",
+            fontSize: text.sm,
             whiteSpace: "nowrap",
+            zIndex: 20,
           }}
         >
           {t("header.linkCopied")}
@@ -114,18 +115,6 @@ function CopyLinkButton(props: { url: string }) {
   );
 }
 
-const chipStyle = {
-  display: "inline-flex",
-  alignItems: "center",
-  gap: "6px",
-  fontFamily: "var(--mono-font)",
-  fontSize: "12px",
-  color: "var(--fg)",
-  background: "var(--bg-raised)",
-  border: "1px solid var(--border)",
-  padding: "2px 8px",
-} as const;
-
 function Dot(props: { color: string; square?: boolean }) {
   return (
     <span
@@ -134,8 +123,9 @@ function Dot(props: { color: string; square?: boolean }) {
         display: "inline-block",
         width: "8px",
         height: "8px",
-        borderRadius: props.square ? 0 : "50%",
+        borderRadius: props.square ? "2px" : "50%",
         background: props.color,
+        flexShrink: 0,
       }}
     />
   );
@@ -152,7 +142,7 @@ function RoleChip(props: { context: ContextResponse | undefined }) {
       : `${Math.round(repl.replay_lag_us / 1_000_000)}s`;
   return (
     <span
-      style={chipStyle}
+      style={chip}
       data-testid="role-chip"
       title={
         instance?.role == null
@@ -160,16 +150,17 @@ function RoleChip(props: { context: ContextResponse | undefined }) {
           : undefined
       }
     >
-      {role}
+      <span style={{ color: "var(--fg-strong)", fontWeight: 600 }}>{role}</span>
       {repl && (
         <span
+          style={{ color: "var(--fg-dim)" }}
           title={
             repl.replay_lag_us == null
               ? (repl.replay_lag_reason ?? undefined)
               : undefined
           }
         >
-          {` · ${repl.streaming_replicas} ${t("header.replicas")} · ${t("header.lag")} ${lag}`}
+          {`${repl.streaming_replicas} ${t("header.replicas")} · ${t("header.lag")} ${lag}`}
         </span>
       )}
     </span>
@@ -199,17 +190,20 @@ export function Header(props: HeaderProps) {
       style={{
         display: "flex",
         alignItems: "center",
-        gap: "8px",
-        padding: "4px 8px",
+        gap: "6px",
+        flexWrap: "wrap",
+        padding: "6px 12px",
         background: "var(--bg)",
         borderBottom: "1px solid var(--border)",
         color: "var(--fg)",
         fontFamily: "var(--ui-font)",
       }}
     >
-      <span style={chipStyle} data-testid="instance-chip">
+      <span style={chip} data-testid="instance-chip">
         <Dot color="var(--sev-ok)" />
-        {props.context?.instance.hostname ?? "local"}
+        <span style={{ color: "var(--fg-strong)", fontWeight: 600 }}>
+          {props.context?.instance.hostname ?? "local"}
+        </span>
       </span>
 
       <RoleChip context={props.context} />
@@ -220,7 +214,7 @@ export function Header(props: HeaderProps) {
           data-testid="data-health-chip"
           aria-expanded={props.dataHealthOpen}
           onClick={props.onToggleDataHealth}
-          style={{ ...chipStyle, cursor: "pointer" }}
+          style={chipInteractive}
         >
           <Dot square color={healthColor[health]} />
           {t("header.data")}: {t(healthLabelKey[health])}
@@ -233,7 +227,7 @@ export function Header(props: HeaderProps) {
           type="button"
           data-testid="incidents-critical"
           onClick={props.onOpenIncidents}
-          style={{ ...chipStyle, cursor: "pointer" }}
+          style={{ ...chipInteractive, ...verdictTint("critical") }}
         >
           <Dot square color="var(--sev-crit)" />
           {t("header.critical")}: {critical}
@@ -244,7 +238,7 @@ export function Header(props: HeaderProps) {
           type="button"
           data-testid="incidents-warning"
           onClick={props.onOpenIncidents}
-          style={{ ...chipStyle, cursor: "pointer" }}
+          style={{ ...chipInteractive, ...verdictTint("warning") }}
         >
           <Dot square color="var(--sev-warn)" />
           {t("header.warning")}: {warning}

@@ -78,11 +78,15 @@ function formatCell(value: FrameValue, column: FrameColumnDto): string {
   return value;
 }
 
-/** Verdict color from a classification result, if it is a classified one. */
-function verdictColor(result: ClassificationResultDto): string | undefined {
+/** Verdict tint (background wash + foreground) from a classification result. */
+function verdictTintOf(
+  result: ClassificationResultDto,
+): { background: string; color: string } | undefined {
   if (!("level" in result)) return undefined;
-  if (result.level === "warning") return "var(--sev-warn)";
-  if (result.level === "critical") return "var(--sev-crit)";
+  if (result.level === "warning")
+    return { background: "var(--sev-warn-bg)", color: "var(--sev-warn-fg)" };
+  if (result.level === "critical")
+    return { background: "var(--sev-crit-bg)", color: "var(--sev-crit-fg)" };
   return undefined;
 }
 
@@ -301,13 +305,16 @@ export function TableView(props: TableViewProps) {
     position: "sticky",
     top: 0,
     zIndex: 1,
-    background: "var(--bg)",
-    borderBottom: "1px solid var(--border)",
-    padding: "2px 8px",
+    background: "var(--bg-raised)",
+    borderBottom: "1px solid var(--border-strong)",
+    padding: "6px 10px 4px",
     textAlign: "start",
-    fontWeight: "normal",
+    fontFamily: "var(--ui-font)",
+    fontSize: "var(--text-xs)",
+    fontWeight: 600,
+    letterSpacing: "var(--tracking-caps)",
     textTransform: "uppercase",
-    color: props.sort === code ? "var(--accent)" : "var(--fg-dim)",
+    color: props.sort === code ? "var(--accent-strong)" : "var(--fg-dim)",
     whiteSpace: "nowrap",
   });
 
@@ -327,7 +334,15 @@ export function TableView(props: TableViewProps) {
   };
 
   return (
-    <section style={{ fontFamily: "var(--mono-font)", overflow: "auto" }}>
+    <section
+      style={{
+        fontFamily: "var(--mono-font)",
+        overflow: "auto",
+        background: "var(--bg-raised)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-md)",
+      }}
+    >
       <table
         aria-label={props.view.code}
         style={{ borderCollapse: "collapse", width: "100%" }}
@@ -401,10 +416,13 @@ export function TableView(props: TableViewProps) {
                 style={{
                   cursor: "pointer",
                   background:
-                    selected || hovered === row.entity
-                      ? "var(--bg-raised)"
-                      : "transparent",
+                    selected === true
+                      ? "var(--active-bg)"
+                      : hovered === row.entity
+                        ? "var(--hover-bg)"
+                        : "transparent",
                   boxShadow: selected ? "inset 2px 0 0 var(--accent)" : "none",
+                  transition: "background var(--transition-fast)",
                 }}
               >
                 {columns.map(({ column, cellIndex }) => {
@@ -414,6 +432,11 @@ export function TableView(props: TableViewProps) {
                   );
                   const cellStatus = row.cell_statuses[cellIndex];
                   const meta = columnMeta.get(column.code);
+                  const tint =
+                    classification !== undefined
+                      ? verdictTintOf(classification.result)
+                      : undefined;
+                  const numeric = NUMERIC_TYPES.has(column.type);
                   return (
                     <td
                       key={column.code}
@@ -430,15 +453,13 @@ export function TableView(props: TableViewProps) {
                           : whyTitle(classification?.result)
                       }
                       style={{
-                        padding: "2px 8px",
+                        padding: "3px 10px",
                         borderBottom: "1px solid var(--border)",
-                        color:
-                          classification !== undefined
-                            ? (verdictColor(classification.result) ??
-                              "var(--fg)")
-                            : value === null
-                              ? "var(--fg-dim)"
-                              : "var(--fg)",
+                        fontSize: "var(--text-md)",
+                        textAlign: numeric ? "end" : "start",
+                        ...(tint ?? {
+                          color: value === null ? "var(--fg-dim)" : "var(--fg)",
+                        }),
                         whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",
@@ -463,17 +484,61 @@ export function TableView(props: TableViewProps) {
         </tbody>
       </table>
       {frame.isLoading && cursor === null && (
-        <div style={{ padding: "8px", color: "var(--fg-dim)" }}>
-          {t("table.loading")}
+        <div style={{ padding: "8px" }} aria-busy="true">
+          {[0, 1, 2, 3].map((i) => (
+            <div
+              key={i}
+              style={{
+                height: "18px",
+                marginBlockEnd: "8px",
+                background: "var(--skeleton)",
+                borderRadius: "var(--radius-sm)",
+                animation: "pgk-pulse 1.4s ease-in-out infinite",
+                width: `${88 - i * 12}%`,
+              }}
+            />
+          ))}
         </div>
       )}
       {frame.isError && !cursorExpired && (
-        <div style={{ padding: "8px", color: "var(--sev-crit)" }}>
+        <div
+          role="alert"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            padding: "12px",
+            color: "var(--sev-crit-fg)",
+          }}
+        >
           {t("table.error")}
+          <button
+            type="button"
+            onClick={() => void frame.refetch()}
+            style={{
+              fontFamily: "var(--ui-font)",
+              fontSize: "var(--text-sm)",
+              color: "var(--fg)",
+              background: "var(--bg-raised)",
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-sm)",
+              padding: "2px 8px",
+              cursor: "pointer",
+            }}
+          >
+            {t("table.retry")}
+          </button>
         </div>
       )}
       {frame.isSuccess && rows.length === 0 && (
-        <div style={{ padding: "8px", color: "var(--fg-dim)" }}>
+        <div
+          style={{
+            padding: "24px 12px",
+            textAlign: "center",
+            color: "var(--fg-dim)",
+            fontFamily: "var(--ui-font)",
+          }}
+        >
           {t("table.empty")}
         </div>
       )}
@@ -481,8 +546,11 @@ export function TableView(props: TableViewProps) {
         <div
           role="status"
           style={{
-            padding: "8px",
-            color: "var(--sev-warn)",
+            padding: "8px 12px",
+            color: "var(--sev-warn-fg)",
+            background: "var(--sev-warn-bg)",
+            borderRadius: "var(--radius-sm)",
+            margin: "8px",
           }}
         >
           {t("table.cursor_expired")}
@@ -494,15 +562,16 @@ export function TableView(props: TableViewProps) {
           disabled={loadingMore}
           onClick={() => setCursorState({ key: frameKey, value: nextCursor })}
           style={{
-            fontFamily: "var(--mono-font)",
-            color: "var(--accent)",
+            fontFamily: "var(--ui-font)",
+            fontSize: "var(--text-sm)",
+            color: "var(--accent-strong)",
             background: "none",
             border: "none",
-            padding: "8px",
+            padding: "8px 12px",
             cursor: "pointer",
           }}
         >
-          {t("table.more")}
+          {t("table.more")} →
         </button>
       )}
     </section>

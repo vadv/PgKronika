@@ -54,45 +54,134 @@ export function HeatmapStrip(props: {
   );
 
   return (
-    <section style={{ fontFamily: "var(--mono-font)", padding: "4px 8px" }}>
+    <section
+      style={{
+        fontFamily: "var(--mono-font)",
+        background: "var(--bg-raised)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-md)",
+        padding: "8px 12px 10px",
+      }}
+    >
       <div
         style={{
           display: "flex",
-          gap: "var(--gap, 4px)",
-          alignItems: "baseline",
+          gap: "8px",
+          alignItems: "center",
+          flexWrap: "wrap",
         }}
       >
-        <span style={{ color: "var(--fg-dim)" }}>{t("heatmap.metric")}</span>
-        {metrics.map((m) => (
-          <button
-            key={m.code}
-            onClick={() => props.onMetricChange(m.code)}
-            style={{
-              fontFamily: "var(--mono-font)",
-              color: props.metric === m.code ? "var(--accent)" : "var(--fg)",
-              background: "none",
-              border: "none",
-              borderBottom:
-                props.metric === m.code
-                  ? "2px solid var(--accent)"
-                  : "2px solid transparent",
-              cursor: "pointer",
-            }}
-          >
-            {m.code}
-          </button>
-        ))}
+        <span
+          style={{
+            fontFamily: "var(--ui-font)",
+            fontSize: "var(--text-xs)",
+            fontWeight: 600,
+            textTransform: "uppercase",
+            letterSpacing: "var(--tracking-caps)",
+            color: "var(--fg-dim)",
+          }}
+        >
+          {t("heatmap.metric")}
+        </span>
+        <div
+          role="group"
+          aria-label={t("heatmap.metric")}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--radius-sm)",
+            overflow: "hidden",
+          }}
+        >
+          {metrics.map((m) => (
+            <button
+              key={m.code}
+              onClick={() => props.onMetricChange(m.code)}
+              aria-pressed={props.metric === m.code}
+              style={{
+                fontFamily: "var(--ui-font)",
+                fontSize: "var(--text-xs)",
+                padding: "2px 8px",
+                border: "none",
+                background:
+                  props.metric === m.code ? "var(--active-bg)" : "transparent",
+                color:
+                  props.metric === m.code
+                    ? "var(--accent-strong)"
+                    : "var(--fg-dim)",
+                cursor: "pointer",
+                transition:
+                  "color var(--transition-fast), background var(--transition-fast)",
+              }}
+            >
+              {m.code}
+            </button>
+          ))}
+        </div>
         {heatmap.data &&
           (heatmap.data.quality.gaps.length > 0 ||
             (heatmap.data.quality.status !== "complete" &&
               !heatmap.data.quality.active_tail)) && (
             <span
               title={qualityReasons(heatmap.data.quality, t)}
-              style={{ color: "var(--sev-warn)", whiteSpace: "pre-line" }}
+              style={{
+                fontFamily: "var(--ui-font)",
+                fontSize: "var(--text-xs)",
+                fontWeight: 600,
+                color: "var(--sev-warn-fg)",
+                background: "var(--sev-warn-bg)",
+                borderRadius: "var(--radius-sm)",
+                padding: "1px 8px",
+                whiteSpace: "pre-line",
+              }}
             >
               {t("heatmap.partial")}
             </span>
           )}
+        {/* Verdict legend: the colors mean thresholds, not decoration. */}
+        <span
+          style={{
+            marginInlineStart: "auto",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "4px",
+            fontFamily: "var(--ui-font)",
+            fontSize: "var(--text-xs)",
+            color: "var(--fg-dim)",
+          }}
+        >
+          <span
+            style={{
+              width: 10,
+              height: 10,
+              background: "var(--heat-1)",
+              borderRadius: 2,
+            }}
+          />
+          {t("heatmap.legend.normal")}
+          <span
+            style={{
+              width: 10,
+              height: 10,
+              background: "var(--heat-2)",
+              borderRadius: 2,
+              marginInlineStart: 6,
+            }}
+          />
+          {t("heatmap.legend.warning")}
+          <span
+            style={{
+              width: 10,
+              height: 10,
+              background: "var(--heat-3)",
+              borderRadius: 2,
+              marginInlineStart: 6,
+            }}
+          />
+          {t("heatmap.legend.critical")}
+        </span>
       </div>
       {heatmap.isSuccess && rows.length === 0 && (
         <div style={{ color: "var(--fg-dim)" }}>{t("heatmap.empty")}</div>
@@ -101,8 +190,9 @@ export function HeatmapStrip(props: {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: `160px repeat(${bucketCount}, 1fr)`,
-            marginTop: "4px",
+            gridTemplateColumns: `180px repeat(${bucketCount}, 1fr)`,
+            marginTop: "8px",
+            gap: "2px 0",
           }}
         >
           {rows.map((r) => (
@@ -132,8 +222,10 @@ export function HeatmapStrip(props: {
                   data-empty={v === null ? "true" : undefined}
                   title={`${r.label}: ${v === null ? "—" : formatValue(v)}`}
                   style={{
-                    width: "12px",
-                    height: "14px",
+                    width: "11px",
+                    height: "13px",
+                    margin: "0.5px",
+                    borderRadius: "2px",
                     background: heatColor(
                       v === null ? null : max > 0 ? v / max : 0,
                     ),

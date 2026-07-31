@@ -10,30 +10,45 @@ export function TabBar(props: {
 }) {
   const { t } = useTranslation();
   return (
-    <div role="tablist" style={{ display: "flex", gap: "var(--gap, 4px)" }}>
+    <div
+      role="tablist"
+      style={{
+        display: "flex",
+        gap: "2px",
+        borderBottom: "1px solid var(--border)",
+        paddingInline: "var(--space-2)",
+      }}
+    >
       {props.views.map((v) => {
         const gated = v.availability !== "available";
         const summary = props.summaries.get(v.code);
+        const active = props.active === v.code;
         return (
           <button
             key={v.code}
             role="tab"
-            aria-selected={props.active === v.code}
+            aria-selected={active}
             aria-disabled={gated}
             style={{
-              fontFamily: "var(--mono-font)",
+              display: "inline-flex",
+              alignItems: "baseline",
+              gap: "4px",
+              fontFamily: "var(--ui-font)",
+              fontSize: "var(--text-md)",
+              padding: "4px 8px",
               color: gated
                 ? "var(--fg-dim)"
-                : props.active === v.code
-                  ? "var(--accent)"
+                : active
+                  ? "var(--accent-strong)"
                   : "var(--fg)",
+              fontWeight: active ? 600 : 400,
               background: "none",
               border: "none",
-              borderBottom:
-                props.active === v.code
-                  ? "2px solid var(--accent)"
-                  : "2px solid transparent",
+              borderBottom: active
+                ? "2px solid var(--accent)"
+                : "2px solid transparent",
               cursor: gated ? "default" : "pointer",
+              transition: "color var(--transition-fast)",
             }}
             onClick={() => !gated && props.onSelect(v.code)}
           >

@@ -93,5 +93,10 @@
   "heatmap.quality.active_tail": "open write window (normal live state)",
   "alertbar.reasons.gaps": "gaps: {count, plural, one{#} other{#}}",
   "alertbar.reasons.unavailable_revision": "unavailable revision: {count, plural, one{#} other{#}}",
-  "alertbar.reasons.resource_limited": "resource limited: {count, plural, one{#} other{#}}"
+  "alertbar.reasons.resource_limited": "resource limited: {count, plural, one{#} other{#}}",
+  "table.retry": "retry",
+  "heatmap.legend.normal": "normal",
+  "heatmap.legend.warning": "warn",
+  "heatmap.legend.critical": "crit",
+  "toolbar.presets": "presets"
 }
