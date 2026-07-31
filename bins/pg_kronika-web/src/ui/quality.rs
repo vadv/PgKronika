@@ -5,10 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use kronika_analytics::web_projection::web_views;
 use kronika_layout::{ProducerState, ProducerStatus};
 use kronika_reader::{
-    CollectionReadState, IndexStatus, LIMIT, LiveState, LiveView, LocalDirSnapshot, UiSummaryBlock,
+    CollectionReadState, IndexStatus, LiveState, LiveView, LocalDirSnapshot, UiSummaryBlock,
 };
 use serde::Serialize;
 use utoipa::ToSchema;
+
+use super::snapshot::read_summary_tolerant;
 
 #[derive(Debug, Clone, Copy)]
 #[allow(
@@ -249,12 +251,19 @@ pub(crate) fn build_data_quality(
     let mut readable_segments = 0_usize;
     let mut corrupt_segments = 0_usize;
     for descriptor in &descriptors {
-        let Ok((summary, _stats)) = snapshot.read_ui_summary(descriptor, &LIMIT) else {
-            corrupt_segments = corrupt_segments.saturating_add(1);
-            continue;
-        };
-        readable_segments = readable_segments.saturating_add(1);
-        inventory.scan(&summary, &request);
+        match read_summary_tolerant(snapshot, descriptor) {
+            Ok(Some(summary)) => {
+                readable_segments = readable_segments.saturating_add(1);
+                inventory.scan(&summary, &request);
+            }
+            // A stale-contract sidecar degrades availability, not integrity.
+            Ok(None) => {
+                inventory.resource_limited.insert("index_revision");
+            }
+            Err(_) => {
+                corrupt_segments = corrupt_segments.saturating_add(1);
+            }
+        }
     }
     for facts in &live_chunks {
         inventory.scan(facts.ui_summary(), &request);

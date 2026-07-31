@@ -1,17 +1,19 @@
 //! Bounded merge of internal host-signal OVF blocks.
 
+use kronika_analytics::web_projection::WebUnit;
 use kronika_reader::{
-    EntityMetric, EntitySeriesBlock, HOST_SIGNALS_IDENTITY_REVISION, HOST_SIGNALS_VIEW_CODE,
-    HOST_SIGNALS_VIEW_REVISION, IndexStatus, LIMIT, LOAD_PER_CPU_METRIC_CODE, LiveState, LiveView,
-    LocalDirSnapshot, MetricAggregation, MetricStatus, PSI_IO_SOME_METRIC_CODE, WebIndexReadError,
+    CacheReadError, EntityMetric, EntitySeriesBlock, HOST_SIGNALS_IDENTITY_REVISION,
+    HOST_SIGNALS_VIEW_CODE, HOST_SIGNALS_VIEW_REVISION, IndexStatus, LIMIT,
+    LOAD_PER_CPU_METRIC_CODE, LiveState, LiveView, LocalDirSnapshot, MetricAggregation,
+    MetricStatus, PSI_IO_SOME_METRIC_CODE, WebIndexReadError,
 };
 use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
 
-const LOAD_UNIT_CODE: u16 = 4;
-const PSI_UNIT_CODE: u16 = 7;
+const LOAD_UNIT_CODE: u16 = WebUnit::Ratio.code();
+const PSI_UNIT_CODE: u16 = WebUnit::Percent.code();
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SpineRequest {
@@ -307,8 +309,14 @@ pub(crate) fn spine(
         .map(|descriptor| (descriptor.min_ts, descriptor.max_ts))
         .collect::<Vec<_>>();
     for descriptor in &descriptors {
-        let (block, _stats) =
-            snapshot.read_entity_series(descriptor, HOST_SIGNALS_VIEW_CODE, &LIMIT)?;
+        let block = match snapshot.read_entity_series(descriptor, HOST_SIGNALS_VIEW_CODE, &LIMIT) {
+            Ok((block, _stats)) => block,
+            Err(WebIndexReadError::Cache(CacheReadError::Incompatible)) => {
+                push_unique(&mut merged.resource_limited, "host_signals");
+                continue;
+            }
+            Err(error) => return Err(SpineError::Read(error)),
+        };
         match block {
             Some(block) => merged.merge_block(&block, request)?,
             None => merged.mark_missing_block(),

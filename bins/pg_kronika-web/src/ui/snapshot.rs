@@ -4,8 +4,23 @@ use std::collections::BTreeMap;
 
 use kronika_analytics::web_projection::WebView;
 use kronika_reader::{
-    IndexStatus, LIMIT, LocalDirSnapshot, SegmentDescriptor, SnapshotNeighbors, WebIndexReadError,
+    CacheReadError, IndexStatus, LIMIT, LocalDirSnapshot, SegmentDescriptor, SnapshotNeighbors,
+    UiSummaryBlock, WebIndexReadError,
 };
+
+/// Reads one descriptor's summary, degrading a sidecar written under another
+/// contract into a typed skip: the data is intact, only the index is stale.
+/// Corruption, absence, and I/O failures stay hard errors.
+pub(crate) fn read_summary_tolerant(
+    snapshot: &LocalDirSnapshot,
+    descriptor: &SegmentDescriptor,
+) -> Result<Option<UiSummaryBlock>, WebIndexReadError> {
+    match snapshot.read_ui_summary(descriptor, &LIMIT) {
+        Ok((summary, _stats)) => Ok(Some(summary)),
+        Err(WebIndexReadError::Cache(CacheReadError::Incompatible)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResolvedSnapshotAt {
@@ -58,7 +73,9 @@ pub(crate) fn resolve_snapshot_at(
         {
             break;
         }
-        let (summary, _stats) = snapshot.read_ui_summary(descriptor, &LIMIT)?;
+        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
+            continue;
+        };
         let upper = summary
             .snapshot_times()
             .partition_point(|timestamp| *timestamp <= at_us);
@@ -102,7 +119,12 @@ pub(crate) fn resolve_view_snapshot(
         if settled {
             break;
         }
-        let (summary, _stats) = snapshot.read_ui_summary(descriptor, &LIMIT)?;
+        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
+            if fallback_quality.is_none() && descriptor.min_ts <= at_us {
+                fallback_quality = Some(SnapshotSummaryQuality::UnavailableRevision);
+            }
+            continue;
+        };
         let Some(view_summary) = summary
             .views()
             .iter()

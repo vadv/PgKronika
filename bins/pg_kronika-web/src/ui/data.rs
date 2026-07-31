@@ -4,11 +4,13 @@ use std::collections::BTreeSet;
 
 use kronika_analytics::web_projection::web_views;
 use kronika_reader::{
-    CollectionReadState, CollectionStatus, CollectionVisibility, IndexStatus, LIMIT, LiveState,
-    LiveView, LocalDirSnapshot, Notability, NotableLevel, UiSummaryBlock, WebIndexReadError,
+    CollectionReadState, CollectionStatus, CollectionVisibility, IndexStatus, LiveState, LiveView,
+    LocalDirSnapshot, Notability, NotableLevel, UiSummaryBlock, WebIndexReadError,
 };
 use serde::Serialize;
 use utoipa::ToSchema;
+
+use super::snapshot::read_summary_tolerant;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ViewSummaryResponse {
@@ -93,12 +95,16 @@ pub(crate) fn view_summary(
             }
         }
     }
+    let mut incompatible_seen = false;
     for descriptor in descriptors
         .iter()
         .rev()
         .filter(|descriptor| descriptor.min_ts <= at_us)
     {
-        let (summary, _stats) = snapshot.read_ui_summary(descriptor, &LIMIT)?;
+        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
+            incompatible_seen = true;
+            continue;
+        };
         resolve_summary(&summary, at_us, &mut resolved);
         if resolved.iter().all(Option::is_some) {
             break;
@@ -123,6 +129,7 @@ pub(crate) fn view_summary(
                 Some(IndexStatus::Gated) => gated.push(view.name),
                 Some(IndexStatus::UnsupportedType) => unavailable_revision.push(view.name),
                 Some(IndexStatus::ResourceLimited) => resource_limited.push(view.name),
+                None if incompatible_seen => unavailable_revision.push(view.name),
                 _ => {}
             }
             ViewSummaryItem {
