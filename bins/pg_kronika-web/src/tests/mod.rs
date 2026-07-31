@@ -33,6 +33,7 @@ mod sections;
 mod ui_catalog;
 mod ui_context;
 mod ui_data;
+mod ui_entity;
 mod ui_frame;
 mod ui_quality;
 mod ui_spine;

@@ -603,7 +603,7 @@ git commit -m "feat(web): add bounded storage API"
 - Reuses projection evaluation and database/user scoped identity; related
   links require explicit `RelationProvenanceDto`.
 
-- [ ] **Step 1: Write failing entity mode/token tests**
+- [x] **Step 1: Write failing entity mode/token tests**
 
 ```rust
 #[test]
@@ -616,7 +616,7 @@ fn entity_request_requires_exactly_one_point_or_history_mode() {
 }
 ```
 
-- [ ] **Step 2: Run parser RED test**
+- [x] **Step 2: Run parser RED test**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -625,7 +625,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 
 Expected: `EntityRequest` is absent.
 
-- [ ] **Step 3: Implement parser, opaque cursor and stable event tokens**
+- [x] **Step 3: Implement parser, opaque cursor and stable event tokens**
 
 ```rust
 pub(crate) enum EntityMode {
@@ -644,7 +644,7 @@ Reject malformed base64url/revision before I/O. Replace frame event
 section/row ordinals with token bytes containing identity revision, stable
 event identity and snapshot binding.
 
-- [ ] **Step 4: Write failing point/history/related HTTP tests**
+- [x] **Step 4: Write failing point/history/related HTTP tests**
 
 ```rust
 #[tokio::test]
@@ -667,7 +667,7 @@ async fn entity_history_tiles_snapshots_without_duplicates_and_preserves_null_re
 }
 ```
 
-- [ ] **Step 5: Run HTTP RED tests**
+- [x] **Step 5: Run HTTP RED tests**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -678,7 +678,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 
 Expected: route is absent.
 
-- [ ] **Step 6: Implement point, related provenance and bounded history**
+- [x] **Step 6: Implement point, related provenance and bounded history**
 
 ```rust
 #[derive(Debug, Serialize, ToSchema)]
@@ -696,7 +696,7 @@ once, reads at most 32 descriptors sequentially, keeps one decoded segment
 outside caches, emits at most 2 000 snapshots/2 MiB and binds cursor to view,
 entity, columns, range and last timestamp.
 
-- [ ] **Step 7: Run GREEN tests and commit**
+- [x] **Step 7: Run GREEN tests and commit**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \

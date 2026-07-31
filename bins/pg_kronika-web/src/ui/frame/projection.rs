@@ -8,6 +8,7 @@ use kronika_reader::{
     SnapshotNeighbors, Value, WebIndexReadError, logical_section,
 };
 use kronika_registry::ColumnType;
+use sha2::{Digest, Sha256};
 
 use super::FrameRequest;
 use super::cursor::FrameCursor;
@@ -100,6 +101,23 @@ pub(crate) struct ProjectedFrame {
     pub quality: FrameQuality,
     pub matched: usize,
     pub next: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectedRelation {
+    pub relation: &'static str,
+    pub view: &'static str,
+    pub entity: Vec<u8>,
+    pub fields: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectedEntity {
+    pub requested_ts_us: i64,
+    pub snapshot_ts_us: i64,
+    pub row: Option<ProjectedRow>,
+    pub relations: Vec<ProjectedRelation>,
+    pub quality: FrameQuality,
 }
 
 #[derive(Debug, Clone)]
@@ -299,7 +317,16 @@ pub(crate) fn project_frame(
         return Err(FrameError::CursorExpired);
     }
 
-    let input = read_projection_input(snapshot, request, catalog, limits, &resolved, neighbors)?;
+    let needs_predecessor = preset_requires_predecessor(request, catalog)?;
+    let input = read_projection_input(
+        snapshot,
+        request.view,
+        needs_predecessor,
+        false,
+        limits,
+        &resolved,
+        neighbors,
+    )?;
     let mut frame = project_input(request, catalog, input)?;
     merge_summary_quality(
         &mut frame.quality,
@@ -316,16 +343,259 @@ pub(crate) fn project_frame(
     Ok(frame)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the entity adapter keeps the exact view, token, columns, relation mode and shared projection limits explicit"
+)]
+pub(crate) fn project_entity_at(
+    snapshot: &LocalDirSnapshot,
+    view: &'static WebView,
+    at_us: i64,
+    entity: &[u8],
+    columns: &[&ColumnSpec],
+    catalog: &ProjectionCatalog,
+    include_related: bool,
+    limits: FrameLimits,
+) -> Result<ProjectedEntity, FrameError> {
+    let resolved = resolve_view_snapshot(snapshot, view, at_us)?;
+    let Some(neighbors) = resolved.neighbors else {
+        let mut quality = FrameQuality {
+            gaps: vec![Gap {
+                from: at_us,
+                to: at_us,
+            }],
+            ..FrameQuality::default()
+        };
+        merge_summary_quality(&mut quality, resolved.fallback_quality, view.name);
+        return Ok(ProjectedEntity {
+            requested_ts_us: at_us,
+            snapshot_ts_us: at_us,
+            row: None,
+            relations: Vec::new(),
+            quality,
+        });
+    };
+    let input = read_projection_input(
+        snapshot,
+        view,
+        columns_require_predecessor(view, columns),
+        true,
+        limits,
+        &resolved,
+        neighbors,
+    )?;
+    let view_spec = catalog
+        .views()
+        .iter()
+        .find(|candidate| candidate.code == view.name)
+        .ok_or(ProjectionError::MissingCatalogView)?;
+    let primary_sections = view.inputs[0].sections;
+    let mut previous = BTreeMap::new();
+    for section in primary_sections {
+        for row in input.previous.get(*section).into_iter().flatten() {
+            if timestamp(row, "ts")? != input.predecessor_ts_us {
+                continue;
+            }
+            previous.insert(
+                entity_for(
+                    view,
+                    section,
+                    row,
+                    input.predecessor_ts_us.unwrap_or(input.snapshot_ts_us),
+                )?,
+                row,
+            );
+        }
+    }
+    let track_planning = input
+        .current
+        .get("pg_settings")
+        .into_iter()
+        .flatten()
+        .filter(|row| text(row, "name") == Some("pg_stat_statements.track_planning"))
+        .filter_map(|row| timestamp(row, "ts").ok().flatten().map(|at| (at, row)))
+        .filter(|(at, _row)| *at <= input.snapshot_ts_us)
+        .max_by_key(|(at, _row)| *at)
+        .is_some_and(|(_at, row)| text(row, "setting") == Some("on"));
+    let has_gap = !input.gaps.is_empty();
+    let mut source = None;
+    let mut projected = None;
+    for section in primary_sections {
+        for row in input.current.get(*section).into_iter().flatten() {
+            if timestamp(row, "ts")? != Some(input.snapshot_ts_us) {
+                continue;
+            }
+            let row_entity = entity_for(view, section, row, input.snapshot_ts_us)?;
+            if row_entity != entity {
+                continue;
+            }
+            let predecessor = previous.get(&row_entity).copied();
+            projected = Some(project_view(
+                view,
+                view_spec,
+                columns,
+                section,
+                row,
+                predecessor,
+                &input,
+                track_planning,
+                has_gap,
+            )?);
+            source = Some((*section, row));
+            break;
+        }
+        if projected.is_some() {
+            break;
+        }
+    }
+    if view.name == "statements"
+        && columns.iter().any(|column| column.code == "time_pct")
+        && let Some(row) = &mut projected
+    {
+        let denominator = statement_denominator(view, &input, &previous, has_gap)?;
+        let replacement = row
+            .operands
+            .statements
+            .as_ref()
+            .and_then(|operands| match (operands.exec_ms, denominator) {
+                (DeltaOperand::Value(value), Some(denominator)) => {
+                    Some(finite_frame(100.0 * value / denominator))
+                }
+                _ => None,
+            })
+            .unwrap_or(FrameValue::Null);
+        replace_value(row, "time_pct", replacement);
+    }
+    if let Some(row) = &mut projected {
+        row.searchable = public_searchable(&row.label, &row.values);
+        row.classifications = classify_row(view.name, columns, row, &FrameThresholdContext);
+    }
+    let relations = match (
+        include_related,
+        view.name,
+        source,
+        resolved.current_descriptor.as_ref(),
+    ) {
+        (true, "statements", Some((_section, row)), Some(descriptor)) => {
+            statement_plan_relations(snapshot, descriptor, input.snapshot_ts_us, row, limits)?
+        }
+        _ => Vec::new(),
+    };
+    let mut quality = FrameQuality {
+        snapshots: usize::from(projected.is_some()),
+        gaps: input.gaps,
+        ..FrameQuality::default()
+    };
+    merge_summary_quality(&mut quality, resolved.current_quality, view.name);
+    if input.predecessor_ts_us.is_some() {
+        merge_summary_quality(&mut quality, resolved.previous_quality, view.name);
+    }
+    Ok(ProjectedEntity {
+        requested_ts_us: at_us,
+        snapshot_ts_us: input.snapshot_ts_us,
+        row: projected,
+        relations,
+        quality,
+    })
+}
+
+fn statement_denominator(
+    view: &'static WebView,
+    input: &ProjectionInput,
+    previous: &BTreeMap<Vec<u8>, &OutRow>,
+    has_gap: bool,
+) -> Result<Option<f64>, ProjectionError> {
+    let mut denominator = 0.0;
+    for section in view.inputs[0].sections {
+        for row in input.current.get(*section).into_iter().flatten() {
+            if timestamp(row, "ts")? != Some(input.snapshot_ts_us) {
+                continue;
+            }
+            let entity = entity_for(view, section, row, input.snapshot_ts_us)?;
+            let delta = delta(
+                row,
+                previous.get(&entity).copied(),
+                "total_exec_time",
+                has_gap,
+            );
+            let DeltaOperand::Value(value) = delta else {
+                return Ok(None);
+            };
+            denominator += value;
+        }
+    }
+    Ok((denominator > 0.0).then_some(denominator))
+}
+
+fn statement_plan_relations(
+    snapshot: &LocalDirSnapshot,
+    descriptor: &kronika_reader::SegmentDescriptor,
+    snapshot_ts_us: i64,
+    statement: &OutRow,
+    limits: FrameLimits,
+) -> Result<Vec<ProjectedRelation>, FrameError> {
+    let Some(statement_queryid) =
+        value(statement, "queryid").filter(|value| **value != Value::Null)
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(statement_dbid) = value(statement, "dbid").filter(|value| **value != Value::Null)
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(statement_userid) = value(statement, "userid").filter(|value| **value != Value::Null)
+    else {
+        return Ok(Vec::new());
+    };
+    let plan_view = kronika_analytics::web_projection::web_view_by_name("plans")
+        .ok_or(ProjectionError::MissingCatalogView)?;
+    let mut query = SealedQuerySession::new(
+        snapshot,
+        QueryLimits::with_bytes(limits.rows, limits.cells, limits.bytes),
+    );
+    let pages = query.sections(
+        descriptor,
+        snapshot_ts_us,
+        snapshot_ts_us,
+        &["pg_store_plans_ossc", "pg_store_plans_vadv"],
+        &BTreeMap::new(),
+    )?;
+    reject_internal_continuation(&pages, limits.rows)?;
+    let mut relations = Vec::new();
+    for section in ["pg_store_plans_ossc", "pg_store_plans_vadv"] {
+        for row in pages.get(section).into_iter().flat_map(|page| &page.rows) {
+            if timestamp(row, "ts")? != Some(snapshot_ts_us)
+                || value(row, "dbid") != Some(statement_dbid)
+                || value(row, "userid") != Some(statement_userid)
+                || value(row, "queryid").or_else(|| value(row, "queryid_stat_statements"))
+                    != Some(statement_queryid)
+            {
+                continue;
+            }
+            relations.push(ProjectedRelation {
+                relation: "statement_plan",
+                view: "plans",
+                entity: entity_for(plan_view, section, row, snapshot_ts_us)?,
+                fields: vec!["queryid", "dbid", "userid"],
+            });
+        }
+    }
+    relations.sort_by(|left, right| left.entity.cmp(&right.entity));
+    relations.dedup_by(|left, right| left.entity == right.entity);
+    Ok(relations)
+}
+
 fn read_projection_input(
     snapshot: &LocalDirSnapshot,
-    request: &FrameRequest,
-    catalog: &ProjectionCatalog,
+    view: &'static WebView,
+    needs_predecessor: bool,
+    same_descriptor_only: bool,
     limits: FrameLimits,
     resolved: &ResolvedViewSnapshot,
     neighbors: SnapshotNeighbors,
 ) -> Result<ProjectionInput, FrameError> {
-    let section_names = request
-        .view
+    let section_names = view
         .inputs
         .iter()
         .flat_map(|input| input.sections.iter().copied())
@@ -339,14 +609,23 @@ fn read_projection_input(
     let current_descriptor = resolved
         .current_descriptor
         .ok_or(ProjectionError::MissingCatalogView)?;
-    let needs_predecessor = preset_requires_predecessor(request, catalog)?;
     let rate_previous = neighbors.previous.filter(|previous| {
         needs_predecessor
             && neighbors
                 .current
                 .checked_sub(*previous)
-                .zip(request.view.max_rate_gap_us)
+                .zip(view.max_rate_gap_us)
                 .is_some_and(|(gap, maximum)| gap > 0 && gap <= maximum)
+            && (!same_descriptor_only
+                || resolved
+                    .previous_descriptor
+                    .as_ref()
+                    .is_some_and(|previous| {
+                        resolved
+                            .current_descriptor
+                            .as_ref()
+                            .is_some_and(|current| current.locator == previous.locator)
+                    }))
     });
     let rate_gap = needs_predecessor
         .then_some(neighbors.previous)
@@ -428,33 +707,44 @@ fn preset_requires_predecessor(
         .iter()
         .find(|preset| preset.code == request.preset)
         .ok_or(ProjectionError::MissingPreset)?;
-    Ok(preset.columns.iter().any(|column| {
-        matches!(
-            (request.view.name, *column),
-            ("activity", "cpu")
-                | (
-                    "statements",
-                    "calls"
-                        | "total"
-                        | "ms_per_row"
-                        | "mean"
-                        | "time_pct"
-                        | "plan_time_pct"
-                        | "rows"
-                        | "hit_pct"
-                        | "blks_read"
-                        | "temp_written"
-                        | "wal_bytes"
-                )
-                | ("plans", "calls" | "mean" | "rows")
-                | ("tables", "seq_scan_pct")
-                | ("indexes", "scans" | "rows_per_scan")
-                | (
-                    "processes",
-                    "cpu" | "read_bytes_per_second" | "write_bytes_per_second" | "block_delay"
-                )
-        )
-    }))
+    Ok(preset
+        .columns
+        .iter()
+        .any(|column| column_requires_predecessor(request.view.name, column)))
+}
+
+fn columns_require_predecessor(view: &WebView, columns: &[&ColumnSpec]) -> bool {
+    columns
+        .iter()
+        .any(|column| column_requires_predecessor(view.name, column.code))
+}
+
+fn column_requires_predecessor(view: &str, column: &str) -> bool {
+    matches!(
+        (view, column),
+        ("activity", "cpu")
+            | (
+                "statements",
+                "calls"
+                    | "total"
+                    | "ms_per_row"
+                    | "mean"
+                    | "time_pct"
+                    | "plan_time_pct"
+                    | "rows"
+                    | "hit_pct"
+                    | "blks_read"
+                    | "temp_written"
+                    | "wal_bytes"
+            )
+            | ("plans", "calls" | "mean" | "rows")
+            | ("tables", "seq_scan_pct")
+            | ("indexes", "scans" | "rows_per_scan")
+            | (
+                "processes",
+                "cpu" | "read_bytes_per_second" | "write_bytes_per_second" | "block_delay"
+            )
+    )
 }
 
 fn merge_summary_quality(
@@ -520,7 +810,15 @@ pub(crate) fn project_input(
             if timestamp(row, "ts")? != input.predecessor_ts_us {
                 continue;
             }
-            previous.insert(entity_for(request.view, section, row)?, row);
+            previous.insert(
+                entity_for(
+                    request.view,
+                    section,
+                    row,
+                    input.predecessor_ts_us.unwrap_or(input.snapshot_ts_us),
+                )?,
+                row,
+            );
         }
     }
 
@@ -541,20 +839,14 @@ pub(crate) fn project_input(
     let track_planning = track_planning_value.is_some_and(|(_timestamp, setting)| setting == "on");
     let has_gap = !input.gaps.is_empty();
     let mut rows = Vec::new();
-    for (section_index, section) in primary_sections.iter().enumerate() {
-        for (row_index, row) in input
-            .current
-            .get(*section)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
+    for section in primary_sections {
+        for row in input.current.get(*section).into_iter().flatten() {
             if timestamp(row, "ts")? != Some(input.snapshot_ts_us) {
                 continue;
             }
-            let entity = entity_for(request.view, section, row)?;
+            let entity = entity_for(request.view, section, row, input.snapshot_ts_us)?;
             let predecessor = previous.get(&entity).copied();
-            let mut projected = project_view(
+            let projected = project_view(
                 request.view,
                 view_spec,
                 &columns,
@@ -565,9 +857,6 @@ pub(crate) fn project_input(
                 track_planning,
                 has_gap,
             )?;
-            if request.view.name == "events" {
-                projected.entity = event_frame_entity(section_index, row_index)?;
-            }
             rows.push(projected);
         }
     }
@@ -685,10 +974,15 @@ fn row_shell(
     row: &OutRow,
     snapshot_ts_us: i64,
 ) -> Result<ProjectedRow, ProjectionError> {
-    let entity = entity_for(view, section, row)?;
+    let entity = entity_for(view, section, row, snapshot_ts_us)?;
+    let spark_entity = if view.name == "events" {
+        event_series_entity(view, section, row)?
+    } else {
+        entity.clone()
+    };
     Ok(ProjectedRow {
         label: label_for(view.name, row).unwrap_or_else(|| fallback_label(&entity)),
-        spark_entity: entity.clone(),
+        spark_entity,
         entity,
         cells: Vec::new(),
         operands: RowOperands {
@@ -727,6 +1021,7 @@ fn project_activity(
             "application" => raw_frame(row, "application_name", column.value_type),
             "state" => raw_frame(row, "state", column.value_type),
             "wait_event" => joined(row, "wait_event_type", ":", "wait_event"),
+            "query" => raw_frame(row, "query", column.value_type),
             "query_duration_us" => duration_us(input.snapshot_ts_us, row, "query_start")?,
             "transaction_duration_us" => duration_us(input.snapshot_ts_us, row, "xact_start")?,
             "cpu" => {
@@ -802,6 +1097,7 @@ fn project_statements(
     for column in columns {
         let value = match column.code {
             "queryid" => raw_frame(row, "queryid", column.value_type),
+            "query" => raw_frame(row, "query", column.value_type),
             "calls" => delta_frame(calls),
             "total" => delta_frame(exec),
             "ms_per_row" => divide_delta(exec, rows),
@@ -849,6 +1145,7 @@ fn project_plans(
     for column in columns {
         let value = match column.code {
             "planid" => raw_frame(row, "planid", column.value_type),
+            "plan" => raw_frame(row, "plan", column.value_type),
             "queryid" => raw_frame(row, "queryid", column.value_type),
             "calls" => delta_frame(calls),
             "mean" => divide_delta(total, calls),
@@ -982,6 +1279,7 @@ fn project_processes(
             "read_bytes_per_second" => rate_sum(row, previous, &["read_bytes"], input, has_gap),
             "write_bytes_per_second" => rate_sum(row, previous, &["write_bytes"], input, has_gap),
             "block_delay" => rate_sum(row, previous, &["blkdelay_ticks"], input, has_gap),
+            "command" => raw_frame(row, "cmdline", column.value_type),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1013,6 +1311,7 @@ fn project_locks(
                 .map_or(FrameValue::Null, |start| {
                     finite_frame((input.snapshot_ts_us - start) as f64)
                 }),
+            "query" => raw_frame(row, "query", column.value_type),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1035,6 +1334,7 @@ fn project_events(
             "severity" => raw_frame(row, "severity", column.value_type),
             "type" => event_type(row, section),
             "duration" => event_duration(row),
+            "message" => raw_frame(row, "message", column.value_type),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1049,15 +1349,24 @@ fn replace_value(row: &mut ProjectedRow, code: &str, replacement: FrameValue) {
     }
 }
 
-fn entity_for(view: &WebView, section: &str, row: &OutRow) -> Result<Vec<u8>, ProjectionError> {
+fn entity_for(
+    view: &WebView,
+    section: &str,
+    row: &OutRow,
+    snapshot_ts_us: i64,
+) -> Result<Vec<u8>, ProjectionError> {
     if view.name == "events" {
-        let category = event_kind_code(section, row);
-        let len = u16::try_from(category.len())
-            .map_err(|_error| ProjectionError::InvalidValue("event"))?;
-        let mut entity = Vec::with_capacity(4 + category.len());
+        let mut hasher = Sha256::new();
+        hasher.update(b"pgkronika-event-entity-v1");
+        hash_bytes(&mut hasher, section.as_bytes());
+        for (column, value) in row {
+            hash_bytes(&mut hasher, column.as_bytes());
+            hash_value(&mut hasher, value);
+        }
+        let mut entity = Vec::with_capacity(42);
         entity.extend_from_slice(&view.identity_revision.to_le_bytes());
-        entity.extend_from_slice(&len.to_le_bytes());
-        entity.extend_from_slice(category.as_bytes());
+        entity.extend_from_slice(&snapshot_ts_us.to_le_bytes());
+        entity.extend_from_slice(&hasher.finalize());
         return Ok(entity);
     }
     let logical = logical_section(section).ok_or(ProjectionError::MissingCatalogView)?;
@@ -1090,15 +1399,68 @@ fn entity_for(view: &WebView, section: &str, row: &OutRow) -> Result<Vec<u8>, Pr
     Ok(entity)
 }
 
-fn event_frame_entity(section_index: usize, row_index: usize) -> Result<Vec<u8>, ProjectionError> {
-    let section_index =
-        u16::try_from(section_index).map_err(|_error| ProjectionError::InvalidValue("event"))?;
-    let row_index =
-        u32::try_from(row_index).map_err(|_error| ProjectionError::InvalidValue("event"))?;
-    let mut entity = Vec::with_capacity(6);
-    entity.extend_from_slice(&section_index.to_le_bytes());
-    entity.extend_from_slice(&row_index.to_le_bytes());
+fn event_series_entity(
+    view: &WebView,
+    section: &str,
+    row: &OutRow,
+) -> Result<Vec<u8>, ProjectionError> {
+    let category = event_kind_code(section, row);
+    let len =
+        u16::try_from(category.len()).map_err(|_error| ProjectionError::InvalidValue("event"))?;
+    let mut entity = Vec::with_capacity(4 + category.len());
+    entity.extend_from_slice(&view.identity_revision.to_le_bytes());
+    entity.extend_from_slice(&len.to_le_bytes());
+    entity.extend_from_slice(category.as_bytes());
     Ok(entity)
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_value(hasher: &mut Sha256, value: &Value) {
+    match value {
+        Value::Null => hasher.update([0]),
+        Value::I64(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        }
+        Value::U64(value) => {
+            hasher.update([2]);
+            hasher.update(value.to_le_bytes());
+        }
+        Value::F64(value) => {
+            hasher.update([3]);
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        Value::Bool(value) => hasher.update([4, u8::from(*value)]),
+        Value::Ts(value) => {
+            hasher.update([5]);
+            hasher.update(value.to_le_bytes());
+        }
+        Value::Str(value) => {
+            hasher.update([6]);
+            hash_bytes(hasher, value.as_bytes());
+        }
+        Value::Blob {
+            text,
+            full_len,
+            truncated,
+        } => {
+            hasher.update([7]);
+            hash_bytes(hasher, text.as_bytes());
+            hasher.update(full_len.to_le_bytes());
+            hasher.update([u8::from(*truncated)]);
+        }
+        Value::ListI32(values) => {
+            hasher.update([8]);
+            hasher.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+    }
 }
 
 fn encode_value(

@@ -1161,6 +1161,19 @@ async fn frame_http_returns_bounded_classified_shape_and_rejects_before_io() {
         body["rows"][0]["spark"]["values"].as_array().map(Vec::len),
         Some(60)
     );
+    let event_entity = URL_SAFE_NO_PAD
+        .decode(
+            body["rows"][0]["entity"]
+                .as_str()
+                .expect("event entity token"),
+        )
+        .expect("decode event entity");
+    assert_eq!(event_entity.len(), 42);
+    assert_eq!(u16::from_le_bytes(event_entity[..2].try_into().unwrap()), 1);
+    assert_eq!(
+        i64::from_le_bytes(event_entity[2..10].try_into().unwrap()),
+        1_600
+    );
     assert!(serde_json::to_vec(&body).expect("serialize").len() <= 1_048_576);
 
     for uri in [

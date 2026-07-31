@@ -13,6 +13,7 @@ use sha2::{Digest as _, Sha256};
 use super::catalog::ProjectionCatalog;
 use super::context::{ContextError, ContextLimits, ContextResponse, build_context};
 use super::data::{ViewSummaryResponse, view_summary};
+use super::entity::{EntityError, EntityRequest, EntityResponse, entity as build_entity};
 use super::frame::FrameRequest;
 use super::frame::MAX_FRAME_RESPONSE_BYTES;
 use super::frame::dto::FrameResponse;
@@ -34,6 +35,7 @@ use crate::params::{QueryParams, parse_i64};
 const MAX_CATALOG_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_CONTEXT_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_DATA_QUALITY_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_ENTITY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HEATMAP_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_SPINE_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_STORAGE_RESPONSE_BYTES: usize = 64 * 1024;
@@ -64,6 +66,102 @@ const SPINE_PARAMS: &[QueryParameter] = &[
     QueryParameter::Buckets,
 ];
 const STORAGE_PARAMS: &[QueryParameter] = &[];
+
+/// `GET /v1/entity/{view}/{entity}` - one entity detail or bounded history.
+#[utoipa::path(
+    get,
+    path = "/v1/entity/{view}/{entity}",
+    tag = "ui",
+    params(
+        ("view" = String, Path),
+        ("entity" = String, Path),
+        ("at" = Option<i64>, Query),
+        ("include" = Option<String>, Query),
+        ("from" = Option<i64>, Query),
+        ("to" = Option<i64>, Query),
+        ("columns" = Option<String>, Query),
+        ("limit" = Option<usize>, Query),
+        ("cursor" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "Entity detail or history page", body = EntityResponse),
+        (status = 400, description = "Invalid entity token or query mode", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 410, description = "Entity no longer exists at the selected snapshot", body = ApiError),
+        (status = 413, description = "Entity history or response limit exceeded", body = ApiError),
+        (status = 500, description = "Entity projection or storage read failed", body = ApiError),
+    )
+)]
+pub(crate) async fn entity(
+    State(state): State<AppState>,
+    Path((view, encoded_entity)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let request = EntityRequest::parse(&view, &encoded_entity, raw.as_deref(), &catalog)?;
+    let snapshot = state.snapshot();
+    let result = tokio::task::spawn_blocking(move || {
+        let response = build_entity(&snapshot, &request, &catalog).map_err(entity_error)?;
+        let body = serde_json::to_vec(&response).map_err(|cause| {
+            tracing::error!(
+                event = "api_ui_entity_serialize_failed",
+                error = %cause,
+                "entity serialization failed"
+            );
+            ApiError::internal_error()
+        })?;
+        if body.len() > MAX_ENTITY_RESPONSE_BYTES {
+            return Err(ApiError::query_limit_exceeded(
+                LimitResource::Bytes,
+                count_u64(MAX_ENTITY_RESPONSE_BYTES),
+                Some(count_u64(body.len())),
+            ));
+        }
+        Ok::<_, ApiError>(body)
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_entity_worker_failed",
+            error = ?join,
+            "entity worker failed"
+        );
+        ApiError::internal_error()
+    })??;
+    let mut response = Response::new(Body::from(result));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+fn entity_error(error: EntityError) -> ApiError {
+    match error {
+        EntityError::Gone => ApiError::view_gone(),
+        EntityError::SelectedSegments { observed } => ApiError::query_limit_exceeded(
+            LimitResource::SelectedSegments,
+            count_u64(super::entity::MAX_HISTORY_SEGMENTS),
+            Some(count_u64(observed)),
+        ),
+        EntityError::Frame(FrameError::Query(error)) => frame_query_error(error),
+        EntityError::Frame(FrameError::WebIndex(_)) | EntityError::WebIndex(_) => {
+            tracing::error!(
+                event = "api_ui_entity_store_read_failed",
+                "entity storage read failed"
+            );
+            ApiError::store_read_failed()
+        }
+        EntityError::Frame(FrameError::CursorExpired) => ApiError::cursor_expired(),
+        EntityError::Frame(FrameError::Projection(_)) | EntityError::Cursor => {
+            tracing::error!(
+                event = "api_ui_entity_projection_failed",
+                "entity projection failed"
+            );
+            ApiError::internal_error()
+        }
+    }
+}
 
 /// `GET /v1/storage` - bounded root accounting, retention and capacity forecast.
 #[utoipa::path(

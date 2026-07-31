@@ -135,6 +135,7 @@ impl QueryParameter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidParameterLocation {
     Query,
+    Entity,
     Parameter(QueryParameter),
 }
 
@@ -151,6 +152,7 @@ impl Serialize for InvalidParameterLocation {
     {
         match self {
             Self::Query => serializer.serialize_str("query"),
+            Self::Entity => serializer.serialize_str("entity"),
             Self::Parameter(parameter) => parameter.serialize(serializer),
         }
     }

@@ -3,6 +3,7 @@
 pub(crate) mod catalog;
 pub(crate) mod context;
 pub(crate) mod data;
+pub(crate) mod entity;
 pub(crate) mod frame;
 pub(crate) mod handlers;
 pub(crate) mod heatmap;
