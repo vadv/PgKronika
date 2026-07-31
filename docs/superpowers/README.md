@@ -6,31 +6,32 @@
 | Каталог | Смысл | Specs | Plans |
 | --- | --- | ---: | ---: |
 | [`specs/`](specs/), [`plans/`](plans/) | Активные `PARTIAL`/`FUTURE`: есть точный незакрытый объём | 16 | 4 |
-| [`implemented/specs/`](implemented/specs/), [`implemented/plans/`](implemented/plans/) | Полностью реализованные контракты и планы | 6 | 14 |
-| [`archive/specs/`](archive/specs/), [`archive/plans/`](archive/plans/) | Заменённые или отклонённые варианты | 1 | 1 |
+| [`implemented/specs/`](implemented/specs/), [`implemented/plans/`](implemented/plans/) | Полностью реализованные контракты и планы | 12 | 14 |
+| [`archive/specs/`](archive/specs/), [`archive/plans/`](archive/plans/) | Заменённые или отклонённые варианты | 3 | 1 |
 
 В количества входят только датированные документы, без этого README.
+Статусы сверены с кодом на `45fbd64` (2026-07-31).
 
 ## Активные спецификации
 
 | Документ | Статус | Точный остаток |
 | --- | --- | --- |
-| [`pg_stat_user_tables`](specs/2026-06-29-pg-stat-user-tables-design.md) | `PARTIAL` | V1/V2 codec round-trips; live PostgreSQL 15/16/18 BDD с двумя базами, type IDs и dictionary names; согласование старой PG14 строки с матрицей 15-18. |
-| [`pg_locks` wait tree](specs/2026-07-01-pg-locks-wait-tree-design.md) | `PARTIAL` | Независимый от ошибок/лимита activity waiter signal, over-cap regression, live PostgreSQL 15/16/18 BDD и согласование старой PG14 строки. |
-| [`pg_kronika-web` production readiness](specs/2026-07-12-web-prod-readiness-design.md) | `PARTIAL` | Fail-fast validation неверного `KRONIKA_WEB_LOG` и startup-тест. |
-| [`kronika-diff`](specs/2026-07-14-kronika-diff-design.md) | `PARTIAL` | Передача `SnapshotFull`/`Changed` в fold, `FirstPoint` после исчезновения snapshot row и две регрессии. |
-| [Incident lenses](specs/2026-07-16-kronika-incident-lenses-design.md) | `PARTIAL` | 24 strict `EntityJoin`, planning/period/clock/attribution/role inputs, route-level PostgreSQL 15-18 BDD и load/RSS qualification. |
-| [Incident implementation](specs/2026-07-17-kronika-incident-implementation.md) | `PARTIAL` | I5/§8 period/clock, P/I/D, joins, planning и attribution; §9 route-level matrix и load/RSS artifact. |
-| [Overview index and timeline](specs/2026-07-22-overview-index-timeline-api.md) | `PARTIAL` | Четыре решения §23: calibration, deployment limits, maintenance/topology и UI; согласование flat-scan текста с UTC layout. |
-| [PGM size reduction](specs/2026-07-26-pgm-size-reduction-research.md) | `PARTIAL` | Полный PG15-18 producer→restart→consumers→OVF сценарий, ext4/XFS crash/fsync/strace и natural-corpus size/RSS/I/O qualification. |
-| [Segment directory layout](specs/2026-07-26-segment-directory-layout-research.md) | `PARTIAL` | ext4/XFS power-loss, PG15-18 layout/GC/demo, multi-process и 1-day…5-year resource matrices; согласование quarantine grammar. |
-| [`pg_kronika-dump`](specs/2026-07-27-dump-design.md) | `PARTIAL` | PG15-18 torn-journal lifecycle: collector readiness, сохранение улики, следующее окно и web refresh с quarantine evidence. |
-| [Diagnostics metric gaps](specs/2026-07-27-metrics-gap-design.md) | `PARTIAL` | Typed deadlock extraction (`T1-5`), auto_explain parsing/storage (`T3-3`) и остальные 24 active IDs. |
-| [Retention](specs/2026-07-27-retention-design.md) | `PARTIAL` | Orphan OVF accounting, честный hourly-rescan контракт, dump FS totals и fixed/auto/concurrent-reader live BDD. |
-| [Entity-series OVF blocks](specs/2026-07-28-entity-series-block-design.md) | `PARTIAL` | Cross-segment predecessor, multi-input projections, per-view `resource_limited` budgets и полная resource/ranking qualification. |
-| [Diagnostics roadmap](specs/2026-07-28-diagnostics-roadmap-design.md) | `PARTIAL` | Десять dependency bands: score/services, coverage, frontend, core facts, catalogs, progress/inspector, product actions, Tier 3 и external access. |
-| [Health Score diagnostics](specs/2026-07-28-health-score-diagnostics-design.md) | `PARTIAL` | 0-100 scoring/honesty, Health services, universal coverage, catalog/progress/inspector/compare/settings/log/client work и qualification/RBAC/audit. |
-| [Full UI Web API](specs/2026-07-28-web-ui-api-design.md) | `PARTIAL` | Context/frame/entity/storage routes, predecessor-aware frames, filtering/detail/history, three bounded caches и N=96/1 440 qualification. |
+| [`pg_stat_user_tables`](specs/2026-06-29-pg-stat-user-tables-design.md) | `PARTIAL` | V1/V2 codec round-trips; live PostgreSQL 15/16/18 BDD с двумя базами, type IDs и dictionary names. |
+| [`pg_locks` wait tree](specs/2026-07-01-pg-locks-wait-tree-design.md) | `PARTIAL` | Независимый от ошибок/лимита activity waiter signal, over-cap regression, live PostgreSQL 15/16/18 BDD; doc-долг: `docs/type-registry/postgresql.md:585` утверждает live-матрицу PG 14-18 (фактически только PG17). |
+| [`pg_kronika-web` production readiness](specs/2026-07-12-web-prod-readiness-design.md) | `PARTIAL` | Fail-fast validation неверного `KRONIKA_WEB_LOG` и startup-тест; doc-долг: устаревшее утверждение спеки про реализованный RFC 9457 (ошибки теперь `{code, params}`, #138). |
+| [`kronika-diff`](specs/2026-07-14-kronika-diff-design.md) | `PARTIAL` | Передача `SnapshotFull`/`Changed` в fold, `FirstPoint` после исчезновения snapshot row и две регрессии. Крейт слит в `kronika-analytics` (`d302725`), контракт актуален. |
+| [Incident lenses](specs/2026-07-16-kronika-incident-lenses-design.md) | `PARTIAL` | 24 strict `EntityJoin`, `track_planning` gate, runtime period/clock-domain provenance, P/I/D-окна, per-entity attribution, route-level PostgreSQL 15-18 BDD и load/RSS qualification. |
+| [Incident implementation](specs/2026-07-17-kronika-incident-implementation.md) | `PARTIAL` | I5/§8 второй срез (period/clock, P/I/D, joins, planning, attribution); §9 route-level matrix и load/RSS artifact. Зафиксировано отклонение: handler подставляет `ClockRelation::Simultaneous` без reader-provenance. |
+| [Overview index and timeline](specs/2026-07-22-overview-index-timeline-api.md) | `PARTIAL` | §23.1 calibration, §23.2 deployment limits, §23.3 maintenance/topology; §23.4 UI развивается под спекой `web-ui-api`; doc-долг: flat-scan текст (§10.1, §12.6) противоречит production UTC-layout. |
+| [PGM size reduction](specs/2026-07-26-pgm-size-reduction-research.md) | `PARTIAL` | Smoke-paths section/diff/anomaly/incident внутри producer→restart→web→OVF сценария (остов уже закрыт `timeline_web_lifecycle` BDD), ext4/XFS crash/fsync/strace, natural-corpus gates. |
+| [Segment directory layout](specs/2026-07-26-segment-directory-layout-research.md) | `PARTIAL` | ext4/XFS power-loss evidence, PG15-18 layout/GC/demo матрица, multi-process (частично закрыт lifecycle-BDD), resource matrices 1d…5y; doc-долг: quarantine grammar reconciliation (strict-stop текст против tolerant bounded quarantine в коде). |
+| [`pg_kronika-dump`](specs/2026-07-27-dump-design.md) | `PARTIAL` | PG15-18 torn-journal lifecycle: collector readiness, сохранение улики, следующее окно, web refresh с quarantine evidence + quarantine-specific web-тест. |
+| [Diagnostics metric gaps](specs/2026-07-27-metrics-gap-design.md) | `PARTIAL` | 26 active IDs; typed deadlock extraction (`T1-5`) и auto_explain (`T3-3`) — partial, остальные открыты. |
+| [Retention](specs/2026-07-27-retention-design.md) | `PARTIAL` | Orphan OVF bytes в fixed-mode счётчике, синхронизация текста спеки с реальным hourly rescan, dump whole-tree/statvfs totals, fixed/auto/concurrent-reader live BDD. |
+| [Entity-series OVF blocks](specs/2026-07-28-entity-series-block-design.md) | `PARTIAL` | Cross-segment predecessor, multi-input projections (builder гейтует `requires.len() != 1`), per-view `resource_limited` budgets (сейчас лимит валит всю сборку), полная resource/ranking qualification. |
+| [Diagnostics roadmap](specs/2026-07-28-diagnostics-roadmap-design.md) | `PARTIAL` | Десять dependency bands целиком: score/services, coverage, frontend, core facts, catalogs, progress/inspector, product actions, Tier 3 и external access. |
+| [Health Score diagnostics](specs/2026-07-28-health-score-diagnostics-design.md) | `PARTIAL` | Все 24 target IDs: 0-100 scoring/honesty, Health services, universal coverage, catalog/progress/inspector/compare/settings/log/client work и qualification/RBAC/audit. |
+| [Full UI Web API](specs/2026-07-28-web-ui-api-design.md) | `PARTIAL` | `GET /v1/ui/context`, `GET /v1/entity/{view}/{entity}` (point+history), `GET /v1/storage`, три byte-accounted cache (metadata/EntitySeries/PGM projection), N=96/1 440 qualification для оставшихся consumers (frame покрыт). |
 
 ## Активные планы
 
