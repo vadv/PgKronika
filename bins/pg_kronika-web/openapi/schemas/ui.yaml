@@ -1,5 +1,5 @@
 Availability:
-  description: Availability of one input, metric, or column for a source.
+  description: Availability of one input, metric, or column in the served store.
   enum:
   - available
   - gated
@@ -28,13 +28,19 @@ CapabilityDto:
       - string
       - 'null'
     status:
-      type: string
+      $ref: '#/CapabilityStatus'
   required:
   - kind
   - code
   - status
   - reason
   type: object
+CapabilityStatus:
+  enum:
+  - available
+  - unavailable
+  - partial
+  type: string
 CategoricalClassificationDto:
   properties:
     code:
@@ -387,6 +393,67 @@ CoverageDto:
   - observed_snapshots
   - complete_snapshots
   type: object
+DataQualityFreshnessDto:
+  properties:
+    age_us:
+      type:
+      - string
+      - 'null'
+    data_through_us:
+      type:
+      - string
+      - 'null'
+    expected_period_us:
+      type:
+      - string
+      - 'null'
+    state:
+      $ref: '#/FreshnessState'
+  required:
+  - data_through_us
+  - age_us
+  - expected_period_us
+  - state
+  type: object
+DataQualityIntegrityDto:
+  properties:
+    corrupt_segments:
+      minimum: 0
+      type: integer
+    last_catalog_refresh_us:
+      type:
+      - string
+      - 'null'
+    quarantined_entries:
+      minimum: 0
+      type: integer
+    readable_segments:
+      minimum: 0
+      type: integer
+    status:
+      $ref: '#/IntegrityStatus'
+  required:
+  - status
+  - readable_segments
+  - corrupt_segments
+  - quarantined_entries
+  - last_catalog_refresh_us
+  type: object
+DataQualityMetaDto:
+  properties:
+    active_tail:
+      type: boolean
+    resource_limited:
+      items:
+        type: string
+      type: array
+    status:
+      type: string
+  required:
+  - status
+  - resource_limited
+  - active_tail
+  type: object
 DataQualityResponse:
   properties:
     capabilities:
@@ -396,19 +463,19 @@ DataQualityResponse:
     coverage:
       $ref: '#/CoverageDto'
     freshness:
-      $ref: common.yaml#/FreshnessDto
+      $ref: '#/DataQualityFreshnessDto'
     gaps:
       items:
         $ref: '#/QualityGap'
       type: array
     integrity:
-      $ref: '#/IntegrityDto'
+      $ref: '#/DataQualityIntegrityDto'
     producer:
       $ref: '#/ProducerDto'
     quality:
-      $ref: '#/QualityDto'
+      $ref: '#/DataQualityMetaDto'
     status:
-      type: string
+      $ref: '#/DataQualityStatus'
   required:
   - status
   - freshness
@@ -419,6 +486,14 @@ DataQualityResponse:
   - integrity
   - quality
   type: object
+DataQualityStatus:
+  enum:
+  - fresh
+  - late
+  - stale
+  - unavailable
+  - partial
+  type: string
 EntityFieldDto:
   properties:
     code:
@@ -881,6 +956,13 @@ FrameValue:
   - type: boolean
   - type: string
   description: A finite frame scalar; wide integers and timestamps use decimal strings.
+FreshnessState:
+  enum:
+  - fresh
+  - late
+  - stale
+  - unknown
+  type: string
 HeatmapGrid:
   properties:
     bucket_count:
@@ -1008,22 +1090,12 @@ InputSpec:
   - type_ids
   - availability
   type: object
-IntegrityDto:
-  properties:
-    orphan_overviews:
-      minimum: 0
-      type: integer
-    quarantined_entries:
-      minimum: 0
-      type: integer
-    readable_segments:
-      minimum: 0
-      type: integer
-  required:
-  - readable_segments
-  - orphan_overviews
-  - quarantined_entries
-  type: object
+IntegrityStatus:
+  enum:
+  - complete
+  - degraded
+  - unknown
+  type: string
 JoinSpec:
   description: A proven or conditional relationship between two inputs.
   properties:
@@ -1103,6 +1175,13 @@ NotClassifiedResultDto:
   - status
   - reason
   type: object
+NotableLevelDto:
+  enum:
+  - none
+  - info
+  - warning
+  - critical
+  type: string
 PresetSpec:
   description: Named ordered subset of view columns.
   properties:
@@ -1139,15 +1218,21 @@ ProducerDto:
       - string
       - 'null'
     state:
-      type: string
+      $ref: '#/ProducerStateDto'
   required:
   - state
   - collector_pid
   - collector_started_at_us
   - last_status_at_us
   type: object
+ProducerStateDto:
+  enum:
+  - running
+  - stopped
+  - unknown
+  type: string
 ProjectionCatalog:
-  description: Complete source-aware catalog response.
+  description: Complete availability-aware catalog response.
   properties:
     revision:
       description: Catalog schema revision.
@@ -1161,18 +1246,6 @@ ProjectionCatalog:
   required:
   - revision
   - views
-  type: object
-QualityDto:
-  properties:
-    gated:
-      items:
-        type: string
-      type: array
-    status:
-      type: string
-  required:
-  - status
-  - gated
   type: object
 QualityGap:
   properties:
@@ -1422,6 +1495,34 @@ SpineValueStatus:
   required:
   - status
   type: object
+StorageIntegrityDto:
+  properties:
+    orphan_overviews:
+      minimum: 0
+      type: integer
+    quarantined_entries:
+      minimum: 0
+      type: integer
+    readable_segments:
+      minimum: 0
+      type: integer
+  required:
+  - readable_segments
+  - orphan_overviews
+  - quarantined_entries
+  type: object
+StorageQualityDto:
+  properties:
+    gated:
+      items:
+        type: string
+      type: array
+    status:
+      type: string
+  required:
+  - status
+  - gated
+  type: object
 StorageResponse:
   properties:
     filesystem:
@@ -1429,9 +1530,9 @@ StorageResponse:
     forecast:
       $ref: '#/ForecastDto'
     integrity:
-      $ref: '#/IntegrityDto'
+      $ref: '#/StorageIntegrityDto'
     quality:
-      $ref: '#/QualityDto'
+      $ref: '#/StorageQualityDto'
     retention:
       $ref: '#/RetentionDto'
     used_bytes:
@@ -1620,7 +1721,7 @@ ViewSummaryItem:
       minimum: 0
       type: integer
     notable_level:
-      type: string
+      $ref: '#/NotableLevelDto'
     population:
       format: int64
       minimum: 0

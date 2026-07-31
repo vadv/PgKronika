@@ -32,6 +32,8 @@ components:
       $ref: schemas/ui.yaml#/BoundaryDto
     CapabilityDto:
       $ref: schemas/ui.yaml#/CapabilityDto
+    CapabilityStatus:
+      $ref: schemas/ui.yaml#/CapabilityStatus
     CapacityPayload:
       $ref: schemas/timeline.yaml#/CapacityPayload
     CategoricalClassificationDto:
@@ -72,8 +74,16 @@ components:
       $ref: schemas/ui.yaml#/CoverageDto
     CoverageSpanDto:
       $ref: schemas/timeline.yaml#/CoverageSpanDto
+    DataQualityFreshnessDto:
+      $ref: schemas/ui.yaml#/DataQualityFreshnessDto
+    DataQualityIntegrityDto:
+      $ref: schemas/ui.yaml#/DataQualityIntegrityDto
+    DataQualityMetaDto:
+      $ref: schemas/ui.yaml#/DataQualityMetaDto
     DataQualityResponse:
       $ref: schemas/ui.yaml#/DataQualityResponse
+    DataQualityStatus:
+      $ref: schemas/ui.yaml#/DataQualityStatus
     DiffNoDataPoint:
       $ref: schemas/sections.yaml#/DiffNoDataPoint
     DiffPointResponse:
@@ -137,7 +147,9 @@ components:
     FrameValue:
       $ref: schemas/ui.yaml#/FrameValue
     FreshnessDto:
-      $ref: schemas/common.yaml#/FreshnessDto
+      $ref: schemas/timeline.yaml#/FreshnessDto
+    FreshnessState:
+      $ref: schemas/ui.yaml#/FreshnessState
     GapResponse:
       $ref: schemas/sections.yaml#/GapResponse
     HealthDomainResponse:
@@ -170,6 +182,8 @@ components:
       $ref: schemas/analytics.yaml#/IncidentFindingScopeResponse
     IncidentIntervalResponse:
       $ref: schemas/analytics.yaml#/IncidentIntervalResponse
+    IncidentLevel:
+      $ref: schemas/analytics.yaml#/IncidentLevel
     IncidentMemberResponse:
       $ref: schemas/analytics.yaml#/IncidentMemberResponse
     IncidentRelationProvenanceResponse:
@@ -182,8 +196,8 @@ components:
       $ref: schemas/analytics.yaml#/IncidentsResponse
     InputSpec:
       $ref: schemas/ui.yaml#/InputSpec
-    IntegrityDto:
-      $ref: schemas/ui.yaml#/IntegrityDto
+    IntegrityStatus:
+      $ref: schemas/ui.yaml#/IntegrityStatus
     JoinSpec:
       $ref: schemas/ui.yaml#/JoinSpec
     JointCountDto:
@@ -202,6 +216,8 @@ components:
       $ref: schemas/sections.yaml#/NoDataReason
     NotClassifiedResultDto:
       $ref: schemas/ui.yaml#/NotClassifiedResultDto
+    NotableLevelDto:
+      $ref: schemas/ui.yaml#/NotableLevelDto
     NotablePreviewDto:
       $ref: schemas/timeline.yaml#/NotablePreviewDto
     OverviewResponseDto:
@@ -210,10 +226,10 @@ components:
       $ref: schemas/ui.yaml#/PresetSpec
     ProducerDto:
       $ref: schemas/ui.yaml#/ProducerDto
+    ProducerStateDto:
+      $ref: schemas/ui.yaml#/ProducerStateDto
     ProjectionCatalog:
       $ref: schemas/ui.yaml#/ProjectionCatalog
-    QualityDto:
-      $ref: schemas/ui.yaml#/QualityDto
     QualityGap:
       $ref: schemas/ui.yaml#/QualityGap
     RangeGap:
@@ -272,6 +288,10 @@ components:
       $ref: schemas/timeline.yaml#/SqlstateCountDto
     StateTransitionPayload:
       $ref: schemas/timeline.yaml#/StateTransitionPayload
+    StorageIntegrityDto:
+      $ref: schemas/ui.yaml#/StorageIntegrityDto
+    StorageQualityDto:
+      $ref: schemas/ui.yaml#/StorageQualityDto
     StorageResponse:
       $ref: schemas/ui.yaml#/StorageResponse
     SuccessReasonResponse:

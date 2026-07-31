@@ -284,6 +284,16 @@ async fn entity_point_returns_lazy_fields_and_only_proven_related_links() {
 }
 
 #[tokio::test]
+async fn entity_point_for_absent_identity_returns_entity_not_found() {
+    let directory = entity_fixture();
+    let uri = format!("/v1/entity/statements/{}?at=2000", token(1));
+
+    let (status, body) = serve(directory.path(), &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "entity_not_found");
+}
+
+#[tokio::test]
 async fn entity_history_tiles_snapshots_without_duplicates_and_preserves_null_reasons() {
     let directory = entity_fixture();
     let entity = frame_entity_token(directory.path()).await;

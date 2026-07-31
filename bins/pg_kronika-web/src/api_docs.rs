@@ -132,6 +132,93 @@ mod tests {
     }
 
     #[test]
+    fn renamed_dtos_keep_distinct_schema_shapes_and_closed_enums() {
+        let document = serde_json::to_value(document()).expect("serialize OpenAPI");
+        let schemas = document["components"]["schemas"]
+            .as_object()
+            .expect("schemas object");
+        let sorted = |name: &str, key: &str| {
+            let mut fields = schemas[name][key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} must carry {key}"))
+                .iter()
+                .map(|value| value.as_str().expect("string value").to_owned())
+                .collect::<Vec<_>>();
+            fields.sort_unstable();
+            fields
+        };
+        let required = |name: &str| sorted(name, "required");
+        let enumeration = |name: &str| sorted(name, "enum");
+
+        assert_eq!(
+            required("DataQualityIntegrityDto"),
+            [
+                "corrupt_segments",
+                "last_catalog_refresh_us",
+                "quarantined_entries",
+                "readable_segments",
+                "status",
+            ]
+        );
+        assert_eq!(
+            required("StorageIntegrityDto"),
+            [
+                "orphan_overviews",
+                "quarantined_entries",
+                "readable_segments"
+            ]
+        );
+        assert_eq!(
+            required("DataQualityMetaDto"),
+            ["active_tail", "resource_limited", "status"]
+        );
+        assert_eq!(required("StorageQualityDto"), ["gated", "status"]);
+        assert_eq!(
+            required("FreshnessDto"),
+            [
+                "completeness",
+                "data_through_us",
+                "physical_count_semantics",
+                "retained_exactness",
+                "status",
+            ]
+        );
+        assert_eq!(
+            required("DataQualityFreshnessDto"),
+            ["age_us", "data_through_us", "expected_period_us", "state"]
+        );
+
+        assert_eq!(
+            enumeration("DataQualityStatus"),
+            ["fresh", "late", "partial", "stale", "unavailable"]
+        );
+        assert_eq!(
+            enumeration("FreshnessState"),
+            ["fresh", "late", "stale", "unknown"]
+        );
+        assert_eq!(
+            enumeration("ProducerStateDto"),
+            ["running", "stopped", "unknown"]
+        );
+        assert_eq!(
+            enumeration("CapabilityStatus"),
+            ["available", "partial", "unavailable"]
+        );
+        assert_eq!(
+            enumeration("IntegrityStatus"),
+            ["complete", "degraded", "unknown"]
+        );
+        assert_eq!(
+            enumeration("NotableLevelDto"),
+            ["critical", "info", "none", "warning"]
+        );
+        assert_eq!(
+            enumeration("IncidentLevel"),
+            ["critical", "info", "warning"]
+        );
+    }
+
+    #[test]
     fn every_operation_has_a_json_success_schema() {
         let document = serde_json::to_value(document()).expect("serialize OpenAPI");
         let paths = document["paths"].as_object().expect("paths object");

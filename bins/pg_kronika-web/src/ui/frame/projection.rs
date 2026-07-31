@@ -1928,8 +1928,9 @@ fn event_severity_code(row: &OutRow) -> FrameValue {
         Some(1) => "fatal",
         Some(2) => "panic",
         Some(3) => "warning",
-        Some(4) | None => "log",
-        Some(_) => return FrameValue::Null,
+        Some(4) => "log",
+        // An unobserved severity stays unclassified, never a fabricated "log".
+        Some(_) | None => return FrameValue::Null,
     };
     FrameValue::String(code.to_owned())
 }

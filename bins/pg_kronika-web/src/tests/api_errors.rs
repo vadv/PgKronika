@@ -34,6 +34,10 @@ fn v5_query_names_and_constraints_are_closed_wire_values() {
         serde_json::to_value(QueryConstraint::PresetOrColumns).expect("constraint JSON"),
         "preset_or_columns"
     );
+    assert_eq!(
+        serde_json::to_value(crate::api_error::ErrorCode::EntityNotFound).expect("error code JSON"),
+        "entity_not_found"
+    );
 }
 
 #[tokio::test]

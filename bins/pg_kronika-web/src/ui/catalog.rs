@@ -12,7 +12,7 @@ use super::thresholds::binding_for;
 /// Catalog schema revision.
 const CATALOG_REVISION: u16 = 2;
 
-/// Availability of one input, metric, or column for a source.
+/// Availability of one input, metric, or column in the served store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Availability {
@@ -206,7 +206,7 @@ pub(crate) struct ViewSpec {
     pub canonical_metric: &'static str,
 }
 
-/// Complete source-aware catalog response.
+/// Complete availability-aware catalog response.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct ProjectionCatalog {
     /// Catalog schema revision.

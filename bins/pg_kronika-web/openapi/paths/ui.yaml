@@ -94,7 +94,8 @@
       name: limit
       required: false
       schema:
-        minimum: 0
+        maximum: 2000
+        minimum: 1
         type: integer
     - in: query
       name: cursor
@@ -120,12 +121,12 @@
             schema:
               $ref: ../schemas/common.yaml#/ApiError
         description: Authentication required
-      '410':
+      '404':
         content:
           application/json:
             schema:
               $ref: ../schemas/common.yaml#/ApiError
-        description: Entity no longer exists at the selected snapshot
+        description: Entity is absent from the selected snapshot
       '413':
         content:
           application/json:
@@ -373,7 +374,8 @@
       name: buckets
       required: false
       schema:
-        minimum: 0
+        maximum: 512
+        minimum: 1
         type: integer
     responses:
       '200':
@@ -426,7 +428,7 @@
           application/json:
             schema:
               $ref: ../schemas/ui.yaml#/ProjectionCatalog
-        description: Source-aware UI projection catalog
+        description: Availability-aware UI projection catalog
       '304':
         description: Catalog ETag matches If-None-Match
       '400':

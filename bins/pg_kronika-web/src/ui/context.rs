@@ -199,9 +199,11 @@ pub(crate) fn build_context(
         page_rows(&pages, "pg_stat_replication"),
         snapshot_ts_us,
     )?;
+    // Zero walsenders is a fact about a standalone primary, not missing data.
     let mut gated = CONTEXT_SECTIONS
         .iter()
         .copied()
+        .filter(|section| *section != "pg_stat_replication")
         .filter(|section| page_rows(&pages, section).is_empty())
         .collect::<Vec<_>>();
     gated.sort_unstable();

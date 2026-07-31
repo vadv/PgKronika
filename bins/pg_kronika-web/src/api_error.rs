@@ -24,6 +24,7 @@ closed_string_enum! {
         CursorQueryMismatch => "cursor_query_mismatch",
         CursorExpired => "cursor_expired",
         ViewGone => "view_gone",
+        EntityNotFound => "entity_not_found",
         QueryLimitExceeded => "query_limit_exceeded",
         CursorCapacityUnavailable => "cursor_capacity_unavailable",
         AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
@@ -37,7 +38,9 @@ impl ErrorCode {
     pub(crate) const fn status(self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::RouteNotFound | Self::UnknownSection => StatusCode::NOT_FOUND,
+            Self::RouteNotFound | Self::UnknownSection | Self::EntityNotFound => {
+                StatusCode::NOT_FOUND
+            }
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::MissingQueryParameter
             | Self::InvalidQueryParameter
@@ -322,6 +325,10 @@ impl ApiError {
 
     pub(crate) fn view_gone() -> Self {
         Self::empty(ErrorCode::ViewGone)
+    }
+
+    pub(crate) fn entity_not_found() -> Self {
+        Self::empty(ErrorCode::EntityNotFound)
     }
 
     pub(crate) fn query_limit_exceeded(

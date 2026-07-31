@@ -745,6 +745,19 @@ pub(crate) struct IncidentRelationResponse {
     pub(crate) provenance: IncidentRelationProvenanceResponse,
 }
 
+/// Closed incident levels assigned by the deterministic level policy.
+#[allow(
+    dead_code,
+    reason = "schema projection for JSON assembled by the incident response builder"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IncidentLevel {
+    Info,
+    Warning,
+    Critical,
+}
+
 /// One cluster of related anomaly episodes.
 #[allow(
     dead_code,
@@ -755,7 +768,7 @@ pub(crate) struct IncidentResponse {
     pub(crate) interval: IncidentIntervalResponse,
     pub(crate) incident_key: String,
     pub(crate) peak_ts_us: String,
-    pub(crate) level: String,
+    pub(crate) level: IncidentLevel,
     pub(crate) level_policy_revision: u16,
     pub(crate) category_code: String,
     pub(crate) summary_code: String,

@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kronika_analytics::web_projection::web_views;
 use kronika_layout::{ProducerState, ProducerStatus};
-use kronika_reader::{CollectionReadState, IndexStatus, LIMIT, LocalDirSnapshot};
+use kronika_reader::{
+    CollectionReadState, IndexStatus, LIMIT, LiveState, LiveView, LocalDirSnapshot, UiSummaryBlock,
+};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -21,36 +23,54 @@ pub(crate) struct DataQualityRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct DataQualityResponse {
-    status: &'static str,
-    freshness: FreshnessDto,
+    status: DataQualityStatus,
+    freshness: DataQualityFreshnessDto,
     producer: ProducerDto,
     coverage: CoverageDto,
     gaps: Vec<QualityGap>,
     capabilities: Vec<CapabilityDto>,
-    integrity: IntegrityDto,
-    quality: QualityDto,
+    integrity: DataQualityIntegrityDto,
+    quality: DataQualityMetaDto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum DataQualityStatus {
+    Fresh,
+    Late,
+    Stale,
+    Unavailable,
+    Partial,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-struct FreshnessDto {
+struct DataQualityFreshnessDto {
     #[schema(required = true)]
     data_through_us: Option<String>,
     #[schema(required = true)]
     age_us: Option<String>,
     #[schema(required = true)]
     expected_period_us: Option<String>,
-    state: &'static str,
+    state: FreshnessState,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 struct ProducerDto {
-    state: &'static str,
+    state: ProducerStateDto,
     #[schema(required = true)]
     collector_pid: Option<u32>,
     #[schema(required = true)]
     collector_started_at_us: Option<String>,
     #[schema(required = true)]
     last_status_at_us: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ProducerStateDto {
+    Running,
+    Stopped,
+    Unknown,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -76,14 +96,22 @@ struct QualityGap {
 struct CapabilityDto {
     kind: &'static str,
     code: &'static str,
-    status: &'static str,
+    status: CapabilityStatus,
     #[schema(required = true)]
     reason: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum CapabilityStatus {
+    Available,
+    Unavailable,
+    Partial,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
-struct IntegrityDto {
-    status: &'static str,
+struct DataQualityIntegrityDto {
+    status: IntegrityStatus,
     readable_segments: usize,
     corrupt_segments: usize,
     quarantined_entries: usize,
@@ -91,30 +119,28 @@ struct IntegrityDto {
     last_catalog_refresh_us: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum IntegrityStatus {
+    Complete,
+    Degraded,
+    Unknown,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
-struct QualityDto {
+struct DataQualityMetaDto {
     status: &'static str,
     resource_limited: Vec<&'static str>,
     active_tail: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 enum FreshnessState {
     Fresh,
     Late,
     Stale,
     Unknown,
-}
-
-impl FreshnessState {
-    const fn wire(self) -> &'static str {
-        match self {
-            Self::Fresh => "fresh",
-            Self::Late => "late",
-            Self::Stale => "stale",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -129,12 +155,61 @@ struct CapabilityState {
     resource_limited: bool,
 }
 
+#[derive(Default)]
+struct ScanState {
+    observed: BTreeSet<i64>,
+    complete: BTreeSet<i64>,
+    capability_states: BTreeMap<u16, CapabilityState>,
+    resource_limited: BTreeSet<&'static str>,
+}
+
+impl ScanState {
+    fn scan(&mut self, summary: &UiSummaryBlock, request: &DataQualityRequest) {
+        for timestamp in summary
+            .snapshot_times()
+            .iter()
+            .copied()
+            .filter(|timestamp| *timestamp >= request.from_us && *timestamp < request.to_us)
+        {
+            self.observed.insert(timestamp);
+            if summary.views().iter().all(|view| {
+                summary
+                    .collection_state_at(view.view_code(), timestamp)
+                    .is_some_and(|(collected_at, collection)| {
+                        collected_at == timestamp
+                            && collection.read_state() == CollectionReadState::Complete
+                    })
+            }) {
+                self.complete.insert(timestamp);
+            }
+        }
+        for view in summary.views() {
+            let state = self.capability_states.entry(view.view_code()).or_default();
+            match view.status() {
+                IndexStatus::Complete | IndexStatus::Empty => state.available = true,
+                IndexStatus::Gated => state.partial = true,
+                IndexStatus::UnsupportedType => state.unsupported = true,
+                IndexStatus::ResourceLimited => {
+                    state.resource_limited = true;
+                    if let Some(web_view) = web_views()
+                        .iter()
+                        .find(|candidate| candidate.code == view.view_code())
+                    {
+                        self.resource_limited.insert(web_view.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the bounded assembly keeps the single-pass summary inventory and response derivation together"
 )]
 pub(crate) fn build_data_quality(
     snapshot: &LocalDirSnapshot,
+    live: &LiveView,
     producer_status: Option<ProducerStatus>,
     request: DataQualityRequest,
 ) -> DataQualityResponse {
@@ -146,58 +221,50 @@ pub(crate) fn build_data_quality(
         .collect::<Vec<_>>();
     descriptors
         .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
-    let coverage_spans = descriptors
+    let live_chunks = if live.state() == LiveState::Current {
+        live.chunks()
+            .iter()
+            .filter(|facts| {
+                let identity = facts.identity();
+                identity.source_max_ts_us >= request.from_us
+                    && identity.source_min_ts_us < request.to_us
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let active_tail = !live_chunks.is_empty();
+    let mut coverage_spans = descriptors
         .iter()
         .map(|descriptor| (descriptor.min_ts, descriptor.max_ts))
         .collect::<Vec<_>>();
-    let mut observed = BTreeSet::new();
-    let mut complete = BTreeSet::new();
-    let mut capability_states = BTreeMap::<u16, CapabilityState>::new();
+    coverage_spans.extend(live_chunks.iter().map(|facts| {
+        let identity = facts.identity();
+        (identity.source_min_ts_us, identity.source_max_ts_us)
+    }));
+    let mut inventory = ScanState::default();
     let mut readable_segments = 0_usize;
     let mut corrupt_segments = 0_usize;
-    let mut resource_limited = BTreeSet::new();
     for descriptor in &descriptors {
         let Ok((summary, _stats)) = snapshot.read_ui_summary(descriptor, &LIMIT) else {
             corrupt_segments = corrupt_segments.saturating_add(1);
             continue;
         };
         readable_segments = readable_segments.saturating_add(1);
-        for timestamp in summary
-            .snapshot_times()
-            .iter()
-            .copied()
-            .filter(|timestamp| *timestamp >= request.from_us && *timestamp < request.to_us)
-        {
-            observed.insert(timestamp);
-            if summary.views().iter().all(|view| {
-                summary
-                    .collection_state_at(view.view_code(), timestamp)
-                    .is_some_and(|(collected_at, collection)| {
-                        collected_at == timestamp
-                            && collection.read_state() == CollectionReadState::Complete
-                    })
-            }) {
-                complete.insert(timestamp);
-            }
-        }
-        for view in summary.views() {
-            let state = capability_states.entry(view.view_code()).or_default();
-            match view.status() {
-                IndexStatus::Complete | IndexStatus::Empty => state.available = true,
-                IndexStatus::Gated => state.partial = true,
-                IndexStatus::UnsupportedType => state.unsupported = true,
-                IndexStatus::ResourceLimited => {
-                    state.resource_limited = true;
-                    if let Some(web_view) = web_views()
-                        .iter()
-                        .find(|candidate| candidate.code == view.view_code())
-                    {
-                        resource_limited.insert(web_view.name);
-                    }
-                }
-            }
-        }
+        inventory.scan(&summary, &request);
     }
+    for facts in &live_chunks {
+        inventory.scan(facts.ui_summary(), &request);
+    }
+    if !matches!(live.state(), LiveState::Empty | LiveState::Current) {
+        inventory.resource_limited.insert("active_tail");
+    }
+    let ScanState {
+        observed,
+        complete,
+        capability_states,
+        resource_limited,
+    } = inventory;
 
     let data_through_us = observed.iter().next_back().copied().or_else(|| {
         descriptors
@@ -219,7 +286,7 @@ pub(crate) fn build_data_quality(
         let rounded = quotient.checked_add(i64::from(span % period != 0))?;
         u64::try_from(rounded).ok()
     });
-    let gaps = coverage_gaps(&coverage_spans, request);
+    let gaps = coverage_gaps(&coverage_spans, request, expected_period_us);
     let coverage_partial = expected_snapshots
         .is_some_and(|expected| u64::try_from(observed.len()).unwrap_or(u64::MAX) < expected);
     let integrity_degraded = corrupt_segments != 0;
@@ -238,10 +305,10 @@ pub(crate) fn build_data_quality(
                 .copied()
                 .unwrap_or_default();
             let (status, reason) = if state.available && !state.partial && !state.resource_limited {
-                ("available", None)
+                (CapabilityStatus::Available, None)
             } else if state.available || state.partial || state.resource_limited {
                 (
-                    "partial",
+                    CapabilityStatus::Partial,
                     Some(if state.resource_limited {
                         "resource_limited"
                     } else {
@@ -250,7 +317,7 @@ pub(crate) fn build_data_quality(
                 )
             } else {
                 (
-                    "unavailable",
+                    CapabilityStatus::Unavailable,
                     Some(if state.unsupported {
                         "unsupported_type"
                     } else {
@@ -266,7 +333,7 @@ pub(crate) fn build_data_quality(
             }
         })
         .collect();
-    let producer = producer_dto(producer_status);
+    let producer = producer_dto(producer_status, request.to_us, request.stale_after_us);
     let last_catalog_refresh_us = descriptors
         .iter()
         .map(|descriptor| descriptor.max_ts)
@@ -274,11 +341,11 @@ pub(crate) fn build_data_quality(
         .map(|timestamp| timestamp.to_string());
     DataQualityResponse {
         status,
-        freshness: FreshnessDto {
+        freshness: DataQualityFreshnessDto {
             data_through_us: data_through_us.map(|timestamp| timestamp.to_string()),
             age_us: age_us.map(|age| age.to_string()),
             expected_period_us: expected_period_us.map(|period| period.to_string()),
-            state: freshness_state.wire(),
+            state: freshness_state,
         },
         producer,
         coverage: CoverageDto {
@@ -288,27 +355,27 @@ pub(crate) fn build_data_quality(
         },
         gaps,
         capabilities,
-        integrity: IntegrityDto {
+        integrity: DataQualityIntegrityDto {
             status: if descriptors.is_empty() {
-                "unknown"
+                IntegrityStatus::Unknown
             } else if integrity_degraded {
-                "degraded"
+                IntegrityStatus::Degraded
             } else {
-                "complete"
+                IntegrityStatus::Complete
             },
             readable_segments,
             corrupt_segments,
             quarantined_entries: 0,
             last_catalog_refresh_us,
         },
-        quality: QualityDto {
+        quality: DataQualityMetaDto {
             status: if resource_limited.is_empty() {
                 "complete"
             } else {
                 "partial"
             },
             resource_limited: resource_limited.into_iter().collect(),
-            active_tail: false,
+            active_tail,
         },
     }
 }
@@ -328,7 +395,11 @@ fn observed_period(observed: &BTreeSet<i64>) -> Option<i64> {
     periods.get(periods.len() / 2).copied()
 }
 
-fn coverage_gaps(spans: &[(i64, i64)], request: DataQualityRequest) -> Vec<QualityGap> {
+fn coverage_gaps(
+    spans: &[(i64, i64)],
+    request: DataQualityRequest,
+    expected_period_us: Option<i64>,
+) -> Vec<QualityGap> {
     let mut gaps = Vec::new();
     let mut covered_to = request.from_us;
     let mut ordered = spans.to_vec();
@@ -345,7 +416,10 @@ fn coverage_gaps(spans: &[(i64, i64)], request: DataQualityRequest) -> Vec<Quali
         }
         covered_to = covered_to.max(end);
     }
-    if covered_to < request.to_us {
+    // A trailing sliver narrower than one collection period is the snapshot
+    // being written right now, not missing data.
+    let trailing = request.to_us.saturating_sub(covered_to);
+    if trailing > 0 && expected_period_us.is_none_or(|period| trailing > period) {
         gaps.push(QualityGap {
             from_us: covered_to.to_string(),
             to_us: request.to_us.to_string(),
@@ -355,22 +429,37 @@ fn coverage_gaps(spans: &[(i64, i64)], request: DataQualityRequest) -> Vec<Quali
     gaps
 }
 
-fn producer_dto(status: Option<ProducerStatus>) -> ProducerDto {
+fn producer_dto(
+    status: Option<ProducerStatus>,
+    evaluated_at_us: i64,
+    stale_after_us: i64,
+) -> ProducerDto {
     status.map_or(
         ProducerDto {
-            state: "unknown",
+            state: ProducerStateDto::Unknown,
             collector_pid: None,
             collector_started_at_us: None,
             last_status_at_us: None,
         },
-        |status| ProducerDto {
-            state: match status.state {
-                ProducerState::Running => "running",
-                ProducerState::Stopped => "stopped",
-            },
-            collector_pid: Some(status.collector_pid),
-            collector_started_at_us: Some(status.collector_started_at_us.to_string()),
-            last_status_at_us: Some(status.last_status_at_us.to_string()),
+        |status| {
+            // A heartbeat is evidence only while fresh: a crashed collector
+            // leaves a stale `running` marker behind.
+            let state = match status.state {
+                ProducerState::Stopped => ProducerStateDto::Stopped,
+                ProducerState::Running
+                    if evaluated_at_us.saturating_sub(status.last_status_at_us)
+                        > stale_after_us =>
+                {
+                    ProducerStateDto::Unknown
+                }
+                ProducerState::Running => ProducerStateDto::Running,
+            };
+            ProducerDto {
+                state,
+                collector_pid: Some(status.collector_pid),
+                collector_started_at_us: Some(status.collector_started_at_us.to_string()),
+                last_status_at_us: Some(status.last_status_at_us.to_string()),
+            }
         },
     )
 }
@@ -385,33 +474,33 @@ const fn aggregate_status(
     has_gap: bool,
     coverage_partial: bool,
     integrity_degraded: bool,
-) -> &'static str {
+) -> DataQualityStatus {
     if !readable {
-        "unavailable"
+        DataQualityStatus::Unavailable
     } else if matches!(freshness, FreshnessState::Stale) {
-        "stale"
+        DataQualityStatus::Stale
     } else if has_gap
         || coverage_partial
         || integrity_degraded
         || matches!(freshness, FreshnessState::Unknown)
     {
-        "partial"
+        DataQualityStatus::Partial
     } else if matches!(freshness, FreshnessState::Late) {
-        "late"
+        DataQualityStatus::Late
     } else {
-        "fresh"
+        DataQualityStatus::Fresh
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FreshnessState, aggregate_status};
+    use super::{DataQualityStatus, FreshnessState, aggregate_status};
 
     #[test]
     fn unknown_freshness_cannot_be_reported_as_fresh() {
         assert_eq!(
             aggregate_status(true, FreshnessState::Unknown, false, false, false),
-            "partial"
+            DataQualityStatus::Partial
         );
     }
 }

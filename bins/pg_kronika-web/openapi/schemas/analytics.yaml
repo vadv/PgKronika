@@ -385,6 +385,13 @@ IncidentIntervalResponse:
   - from
   - to
   type: object
+IncidentLevel:
+  description: Closed incident levels assigned by the deterministic level policy.
+  enum:
+  - info
+  - warning
+  - critical
+  type: string
 IncidentMemberResponse:
   description: One anomaly episode referenced by a clustered incident.
   properties:
@@ -465,7 +472,7 @@ IncidentResponse:
     interval:
       $ref: '#/IncidentIntervalResponse'
     level:
-      type: string
+      $ref: '#/IncidentLevel'
     level_policy_revision:
       format: int32
       minimum: 0

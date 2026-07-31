@@ -35,8 +35,8 @@ pub(crate) struct StorageResponse {
     filesystem: FilesystemDto,
     retention: RetentionDto,
     forecast: ForecastDto,
-    integrity: IntegrityDto,
-    quality: QualityDto,
+    integrity: StorageIntegrityDto,
+    quality: StorageQualityDto,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -90,14 +90,14 @@ struct ForecastDto {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-struct IntegrityDto {
+struct StorageIntegrityDto {
     readable_segments: usize,
     orphan_overviews: usize,
     quarantined_entries: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-struct QualityDto {
+struct StorageQualityDto {
     status: &'static str,
     gated: Vec<&'static str>,
 }
@@ -244,12 +244,12 @@ pub(crate) fn build_storage(
             full_in_days,
             full_in_days_reason,
         },
-        integrity: IntegrityDto {
+        integrity: StorageIntegrityDto {
             readable_segments: inventory.segments.len(),
             orphan_overviews: inventory.orphan_overviews.len(),
             quarantined_entries: quarantine.len(),
         },
-        quality: QualityDto {
+        quality: StorageQualityDto {
             status: "complete",
             gated: Vec::new(),
         },

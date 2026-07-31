@@ -26,10 +26,19 @@ struct ViewSummaryItem {
     population: Option<u64>,
     status: &'static str,
     notable: bool,
-    notable_level: &'static str,
+    notable_level: NotableLevelDto,
     notable_count: u64,
     #[schema(required = true)]
     collection: Option<CollectionStatusDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum NotableLevelDto {
+    None,
+    Info,
+    Warning,
+    Critical,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -125,9 +134,10 @@ pub(crate) fn view_summary(
                 notable: exact.is_some_and(|(_timestamp, _population, notability)| {
                     notability.level() != NotableLevel::None
                 }),
-                notable_level: exact.map_or("none", |(_timestamp, _population, notability)| {
-                    notable_level(notability.level())
-                }),
+                notable_level: exact.map_or(
+                    NotableLevelDto::None,
+                    |(_timestamp, _population, notability)| notable_level(notability.level()),
+                ),
                 notable_count: exact.map_or(0, |(_timestamp, _population, notability)| {
                     notability.count()
                 }),
@@ -187,12 +197,12 @@ fn resolve_summary(summary: &UiSummaryBlock, at_us: i64, resolved: &mut [Option<
     }
 }
 
-const fn notable_level(level: NotableLevel) -> &'static str {
+const fn notable_level(level: NotableLevel) -> NotableLevelDto {
     match level {
-        NotableLevel::None => "none",
-        NotableLevel::Info => "info",
-        NotableLevel::Warning => "warning",
-        NotableLevel::Critical => "critical",
+        NotableLevel::None => NotableLevelDto::None,
+        NotableLevel::Info => NotableLevelDto::Info,
+        NotableLevel::Warning => NotableLevelDto::Warning,
+        NotableLevel::Critical => NotableLevelDto::Critical,
     }
 }
 

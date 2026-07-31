@@ -80,14 +80,14 @@ const STORAGE_PARAMS: &[QueryParameter] = &[];
         ("from" = Option<i64>, Query),
         ("to" = Option<i64>, Query),
         ("columns" = Option<String>, Query),
-        ("limit" = Option<usize>, Query),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 2000),
         ("cursor" = Option<String>, Query),
     ),
     responses(
         (status = 200, description = "Entity detail or history page", body = EntityResponse),
         (status = 400, description = "Invalid entity token or query mode", body = ApiError),
         (status = 401, description = "Authentication required", body = ApiError),
-        (status = 410, description = "Entity no longer exists at the selected snapshot", body = ApiError),
+        (status = 404, description = "Entity is absent from the selected snapshot", body = ApiError),
         (status = 413, description = "Entity history or response limit exceeded", body = ApiError),
         (status = 500, description = "Entity projection or storage read failed", body = ApiError),
     )
@@ -138,7 +138,7 @@ pub(crate) async fn entity(
 
 fn entity_error(error: EntityError) -> ApiError {
     match error {
-        EntityError::Gone => ApiError::view_gone(),
+        EntityError::Gone => ApiError::entity_not_found(),
         EntityError::SelectedSegments { observed } => ApiError::query_limit_exceeded(
             LimitResource::SelectedSegments,
             count_u64(super::entity::MAX_HISTORY_SEGMENTS),
@@ -183,15 +183,7 @@ pub(crate) async fn storage(
     QueryParams::parse(raw.as_deref(), STORAGE_PARAMS)?;
     let snapshot = state.snapshot();
     let response = tokio::task::spawn_blocking(move || {
-        let producer_status =
-            kronika_layout::read_producer_status(snapshot.data_dir()).map_err(|error| {
-                tracing::error!(
-                    event = "api_ui_storage_status_read_failed",
-                    error = %error,
-                    "producer status read failed"
-                );
-                ApiError::store_read_failed()
-            })?;
+        let producer_status = producer_status_or_unknown(&snapshot);
         build_storage(
             snapshot.data_dir(),
             producer_status.as_ref(),
@@ -274,19 +266,13 @@ pub(crate) async fn data_quality(
         ));
     }
     let stale_after_us = i64::try_from(state.stale_after.as_micros()).unwrap_or(i64::MAX);
-    let snapshot = state.snapshot();
+    let (snapshot, descriptor_view) = state.overview_request_view();
+    let live = Arc::clone(descriptor_view.live());
     let response = tokio::task::spawn_blocking(move || {
-        let producer_status =
-            kronika_layout::read_producer_status(snapshot.data_dir()).map_err(|error| {
-                tracing::error!(
-                    event = "api_ui_quality_status_read_failed",
-                    error = %error,
-                    "producer status read failed"
-                );
-                ApiError::store_read_failed()
-            })?;
+        let producer_status = producer_status_or_unknown(&snapshot);
         Ok::<_, ApiError>(build_data_quality(
             &snapshot,
+            &live,
             producer_status,
             DataQualityRequest {
                 from_us,
@@ -401,6 +387,24 @@ fn context_error(error: ContextError) -> ApiError {
     }
 }
 
+/// An unreadable status contract degrades the producer to `unknown`; it never
+/// fails the endpoint that merely reports it.
+fn producer_status_or_unknown(
+    snapshot: &kronika_reader::LocalDirSnapshot,
+) -> Option<kronika_layout::ProducerStatus> {
+    match kronika_layout::read_producer_status(snapshot.data_dir()) {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::warn!(
+                event = "api_ui_producer_status_unreadable",
+                error = %error,
+                "producer status unreadable; reporting producer as unknown"
+            );
+            None
+        }
+    }
+}
+
 /// `GET /v1/timeline/spine` - aligned host load and IO PSI series.
 #[utoipa::path(
     get,
@@ -409,7 +413,7 @@ fn context_error(error: ContextError) -> ApiError {
     params(
         ("from" = i64, Query),
         ("to" = i64, Query),
-        ("buckets" = Option<usize>, Query),
+        ("buckets" = Option<usize>, Query, minimum = 1, maximum = 512),
     ),
     responses(
         (status = 200, description = "Aligned indexed host signals", body = SpineResponse),
@@ -910,7 +914,7 @@ fn heatmap_error(error: &HeatmapError) -> ApiError {
         ("If-None-Match" = Option<String>, Header),
     ),
     responses(
-        (status = 200, description = "Source-aware UI projection catalog", body = ProjectionCatalog),
+        (status = 200, description = "Availability-aware UI projection catalog", body = ProjectionCatalog),
         (status = 304, description = "Catalog ETag matches If-None-Match"),
         (status = 400, description = "Invalid query", body = ApiError),
         (status = 401, description = "Authentication required", body = ApiError),

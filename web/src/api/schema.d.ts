@@ -549,7 +549,7 @@ export interface components {
         /** @description Every scalar shape a registry column can expose on the JSON wire. */
         ApiValue: null | number | boolean | string | components["schemas"]["BlobValue"] | number[];
         /**
-         * @description Availability of one input, metric, or column for a source.
+         * @description Availability of one input, metric, or column in the served store.
          * @enum {string}
          */
         Availability: "available" | "gated" | "not_collected" | "unsupported_type";
@@ -569,8 +569,10 @@ export interface components {
             code: string;
             kind: string;
             reason: string | null;
-            status: string;
+            status: components["schemas"]["CapabilityStatus"];
         };
+        /** @enum {string} */
+        CapabilityStatus: "available" | "unavailable" | "partial";
         /** @description Published filesystem capacity evidence. */
         CapacityPayload: {
             /** Format: int64 */
@@ -724,16 +726,36 @@ export interface components {
             /** Format: int64 */
             to_us: number;
         };
+        DataQualityFreshnessDto: {
+            age_us: string | null;
+            data_through_us: string | null;
+            expected_period_us: string | null;
+            state: components["schemas"]["FreshnessState"];
+        };
+        DataQualityIntegrityDto: {
+            corrupt_segments: number;
+            last_catalog_refresh_us: string | null;
+            quarantined_entries: number;
+            readable_segments: number;
+            status: components["schemas"]["IntegrityStatus"];
+        };
+        DataQualityMetaDto: {
+            active_tail: boolean;
+            resource_limited: string[];
+            status: string;
+        };
         DataQualityResponse: {
             capabilities: components["schemas"]["CapabilityDto"][];
             coverage: components["schemas"]["CoverageDto"];
-            freshness: components["schemas"]["FreshnessDto"];
+            freshness: components["schemas"]["DataQualityFreshnessDto"];
             gaps: components["schemas"]["QualityGap"][];
-            integrity: components["schemas"]["IntegrityDto"];
+            integrity: components["schemas"]["DataQualityIntegrityDto"];
             producer: components["schemas"]["ProducerDto"];
-            quality: components["schemas"]["QualityDto"];
-            status: string;
+            quality: components["schemas"]["DataQualityMetaDto"];
+            status: components["schemas"]["DataQualityStatus"];
         };
+        /** @enum {string} */
+        DataQualityStatus: "fresh" | "late" | "stale" | "unavailable" | "partial";
         /** @description An observation where no valid delta can be derived. */
         DiffNoDataPoint: {
             nodata: components["schemas"]["NoDataReason"];
@@ -1003,12 +1025,17 @@ export interface components {
         };
         /** @description A finite frame scalar; wide integers and timestamps use decimal strings. */
         FrameValue: null | number | boolean | string;
+        /** @description Publication freshness and independent quality axes. */
         FreshnessDto: {
-            age_us: string | null;
-            data_through_us: string | null;
-            expected_period_us: string | null;
-            state: string;
+            completeness: string;
+            /** Format: int64 */
+            data_through_us: number | null;
+            physical_count_semantics: string;
+            retained_exactness: string;
+            status: string;
         };
+        /** @enum {string} */
+        FreshnessState: "fresh" | "late" | "stale" | "unknown";
         /** @description Half-open range where section data is unavailable. */
         GapResponse: {
             /** Format: int64 */
@@ -1143,6 +1170,11 @@ export interface components {
             /** Format: int64 */
             to: number;
         };
+        /**
+         * @description Closed incident levels assigned by the deterministic level policy.
+         * @enum {string}
+         */
+        IncidentLevel: "info" | "warning" | "critical";
         /** @description One anomaly episode referenced by a clustered incident. */
         IncidentMemberResponse: {
             column: string;
@@ -1175,7 +1207,7 @@ export interface components {
             findings: components["schemas"]["IncidentFindingResponse"][];
             incident_key: string;
             interval: components["schemas"]["IncidentIntervalResponse"];
-            level: string;
+            level: components["schemas"]["IncidentLevel"];
             /** Format: int32 */
             level_policy_revision: number;
             members: components["schemas"]["IncidentMemberResponse"][];
@@ -1214,11 +1246,8 @@ export interface components {
             /** @description Machine reason when the input is not available. */
             unavailable_reason?: string | null;
         };
-        IntegrityDto: {
-            orphan_overviews: number;
-            quarantined_entries: number;
-            readable_segments: number;
-        };
+        /** @enum {string} */
+        IntegrityStatus: "complete" | "degraded" | "unknown";
         /** @description A proven or conditional relationship between two inputs. */
         JoinSpec: {
             /** @description Declared join cardinality. */
@@ -1301,6 +1330,8 @@ export interface components {
             reason: string;
             status: string;
         };
+        /** @enum {string} */
+        NotableLevelDto: "none" | "info" | "warning" | "critical";
         /** @description Bounded overview preview. */
         NotablePreviewDto: {
             events_query_hash: string;
@@ -1335,9 +1366,11 @@ export interface components {
             collector_pid: number | null;
             collector_started_at_us: string | null;
             last_status_at_us: string | null;
-            state: string;
+            state: components["schemas"]["ProducerStateDto"];
         };
-        /** @description Complete source-aware catalog response. */
+        /** @enum {string} */
+        ProducerStateDto: "running" | "stopped" | "unknown";
+        /** @description Complete availability-aware catalog response. */
         ProjectionCatalog: {
             /**
              * Format: int32
@@ -1345,10 +1378,6 @@ export interface components {
              */
             revision: number;
             views: components["schemas"]["ViewSpec"][];
-        };
-        QualityDto: {
-            gated: string[];
-            status: string;
         };
         QualityGap: {
             from_us: string;
@@ -1521,11 +1550,20 @@ export interface components {
             /** Format: int32 */
             previous_state: number;
         };
+        StorageIntegrityDto: {
+            orphan_overviews: number;
+            quarantined_entries: number;
+            readable_segments: number;
+        };
+        StorageQualityDto: {
+            gated: string[];
+            status: string;
+        };
         StorageResponse: {
             filesystem: components["schemas"]["FilesystemDto"];
             forecast: components["schemas"]["ForecastDto"];
-            integrity: components["schemas"]["IntegrityDto"];
-            quality: components["schemas"]["QualityDto"];
+            integrity: components["schemas"]["StorageIntegrityDto"];
+            quality: components["schemas"]["StorageQualityDto"];
             retention: components["schemas"]["RetentionDto"];
             used_bytes: components["schemas"]["UsedBytesDto"];
         };
@@ -1655,7 +1693,7 @@ export interface components {
             notable: boolean;
             /** Format: int64 */
             notable_count: number;
-            notable_level: string;
+            notable_level: components["schemas"]["NotableLevelDto"];
             /** Format: int64 */
             population: number | null;
             snapshot_ts_us: string | null;
@@ -1866,8 +1904,8 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
-            /** @description Entity no longer exists at the selected snapshot */
-            410: {
+            /** @description Entity is absent from the selected snapshot */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2852,7 +2890,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Source-aware UI projection catalog */
+            /** @description Availability-aware UI projection catalog */
             200: {
                 headers: {
                     [name: string]: unknown;
