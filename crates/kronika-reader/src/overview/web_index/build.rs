@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kronika_analytics::overview::{EventObservation, NotableClass, NotablePolicy};
 use kronika_analytics::web_projection::{
-    WebAggregation, WebFormula, WebInput, WebMetric, WebView, web_views,
+    WebAggregation, WebFormula, WebInput, WebMetric, WebUnit, WebView, web_views,
 };
 use kronika_format::ReadAt;
 use kronika_registry::{Cell, Row, registry};
@@ -37,8 +37,6 @@ const SNAPSHOT_COVERAGE: &str = "snapshot_coverage";
 const OS_LOADAVG: &str = "os_loadavg";
 const OS_PSI: &str = "os_psi";
 const OS_TOPOLOGY: &str = "os_topology";
-const RATIO_UNIT_CODE: u16 = 4;
-const PERCENT_UNIT_CODE: u16 = 7;
 
 /// Populated web-index blocks derived from one PGM unit.
 pub(crate) struct WebIndexBlocks {
@@ -252,6 +250,12 @@ fn build_host_series(
     grid: TimeGrid,
     bounds: &Bounds,
 ) -> Result<Option<EntitySeriesBlock>, BuildError> {
+    debug_assert!(
+        web_views()
+            .iter()
+            .all(|view| view.code != HOST_SIGNALS_VIEW_CODE),
+        "the reserved host-signal view code must stay outside the public view space"
+    );
     let mut cpu_ids = BTreeMap::<usize, BTreeSet<i32>>::new();
     for section in decoded.iter().filter(|section| section.name == OS_TOPOLOGY) {
         for row in &section.rows {
@@ -329,7 +333,7 @@ fn build_host_series(
     let load = host_metric(
         LOAD_PER_CPU_METRIC_CODE,
         METRIC_FLAG_CANONICAL,
-        RATIO_UNIT_CODE,
+        WebUnit::Ratio.code(),
         available_sections.contains(OS_LOADAVG) && available_sections.contains(OS_TOPOLOGY),
         host_key.clone(),
         load_buckets,
@@ -338,7 +342,7 @@ fn build_host_series(
     let psi = host_metric(
         PSI_IO_SOME_METRIC_CODE,
         0,
-        PERCENT_UNIT_CODE,
+        WebUnit::Percent.code(),
         available_sections.contains(OS_PSI),
         host_key.clone(),
         psi_buckets,

@@ -799,11 +799,17 @@ pub struct LayoutSnapshot {
 /// classic "how full is the filesystem" figure (`total − free`), the basis for
 /// the `auto:P` retention target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the shared `_bytes` suffix is the documented unit of every counter"
+)]
 pub struct FilesystemUsage {
     /// Total addressable bytes of the partition.
     pub total_bytes: u64,
     /// Bytes occupied by all data on the partition.
     pub used_bytes: u64,
+    /// Bytes a non-privileged writer may still allocate (`f_bavail`).
+    pub available_bytes: u64,
 }
 
 /// Open, stable descriptor for one `PgKronika` data root.
@@ -1410,6 +1416,7 @@ impl DataRoot {
         Ok(FilesystemUsage {
             total_bytes,
             used_bytes: total_bytes.saturating_sub(free_bytes),
+            available_bytes: stat.f_bavail.saturating_mul(block_bytes),
         })
     }
 

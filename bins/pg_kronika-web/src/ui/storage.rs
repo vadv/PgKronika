@@ -218,7 +218,7 @@ pub(crate) fn build_storage(
             .saturating_add(control_bytes),
     };
 
-    let available_bytes = filesystem.total_bytes.saturating_sub(filesystem.used_bytes);
+    let available_bytes = filesystem.available_bytes;
     let used_fraction = fraction(filesystem.used_bytes, filesystem.total_bytes);
     let retention = retention_dto(producer_status, filesystem.total_bytes);
     let write_rate = sealed_write_rate(&inventory, limits.forecast_window_us);
@@ -441,6 +441,20 @@ mod tests {
         assert_eq!(
             sealed_write_rate(&inventory, StorageLimits::default().forecast_window_us),
             Some(17_280_000)
+        );
+    }
+
+    #[test]
+    fn forecast_is_absent_for_zero_or_unproven_rate() {
+        let unknown_retention = retention_dto(None, 10_000);
+
+        assert_eq!(
+            full_forecast(None, 1_000, 0, 0, &unknown_retention),
+            (None, Some("insufficient_history"))
+        );
+        assert_eq!(
+            full_forecast(Some(0), 1_000, 0, 0, &unknown_retention),
+            (None, Some("non_positive_rate"))
         );
     }
 

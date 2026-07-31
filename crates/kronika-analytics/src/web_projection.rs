@@ -38,6 +38,8 @@ pub enum WebUnit {
     Ratio,
     /// Bytes per second.
     BytesPerSecond,
+    /// Percent.
+    Percent,
 }
 
 impl WebUnit {
@@ -51,6 +53,7 @@ impl WebUnit {
             Self::Blocks => 3,
             Self::Ratio => 4,
             Self::BytesPerSecond => 5,
+            Self::Percent => 7,
         }
     }
 
@@ -64,6 +67,7 @@ impl WebUnit {
             Self::Blocks => "blocks",
             Self::Ratio => "ratio",
             Self::BytesPerSecond => "bytes_per_second",
+            Self::Percent => "percent",
         }
     }
 }
@@ -119,7 +123,7 @@ pub enum WebFormula {
 }
 
 impl WebFormula {
-    /// Normative formula exposed by the source-aware catalog.
+    /// Normative formula exposed by the projection catalog.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

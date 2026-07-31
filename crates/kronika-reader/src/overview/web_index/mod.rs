@@ -21,9 +21,9 @@ const BASE_BUCKET_US: i64 = 60_000_000;
 
 /// Internal OVF logical view reserved for host signals consumed by the UI spine.
 pub const HOST_SIGNALS_VIEW_CODE: u16 = 10;
-/// Host-signal view projection revision.
+/// Host-signal block revision; a mismatch rejects the block.
 pub const HOST_SIGNALS_VIEW_REVISION: u16 = 1;
-/// Host identity encoding revision.
+/// Host identity encoding revision; a mismatch rejects the block.
 pub const HOST_SIGNALS_IDENTITY_REVISION: u16 = 1;
 /// `load1 / observed logical CPUs` metric code.
 pub const LOAD_PER_CPU_METRIC_CODE: u16 = 1;
