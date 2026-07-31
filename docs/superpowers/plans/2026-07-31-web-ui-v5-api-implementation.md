@@ -324,7 +324,7 @@ git commit -m "feat(web): add indexed timeline spine API"
   `instance_metadata`, `pg_stat_database`, `replication_instance`,
   `replication_replicas`, `os_topology`.
 
-- [ ] **Step 1: Write failing context contract tests**
+- [x] **Step 1: Write failing context contract tests**
 
 ```rust
 #[tokio::test]
@@ -338,7 +338,7 @@ async fn context_returns_instance_databases_replication_and_cpu_from_one_snapsho
 }
 ```
 
-- [ ] **Step 2: Run RED test**
+- [x] **Step 2: Run RED test**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -347,7 +347,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 
 Expected: route is absent.
 
-- [ ] **Step 3: Implement typed database identity and context projection**
+- [x] **Step 3: Implement typed database identity and context projection**
 
 ```rust
 fn database_entity(system_identifier: Option<i64>, oid: u32) -> String {
@@ -367,7 +367,7 @@ pub(crate) fn build_context(
 Use `role_reason`, `pg_system_identifier_reason` and `replay_lag_reason` for
 nullable facts. Cap response at 256 KiB.
 
-- [ ] **Step 4: Add admission/error tests**
+- [x] **Step 4: Add admission/error tests**
 
 ```rust
 #[tokio::test]
@@ -378,7 +378,7 @@ async fn context_rejects_unknown_duplicate_and_missing_at_before_io() {
 }
 ```
 
-- [ ] **Step 5: Run GREEN suite and commit**
+- [x] **Step 5: Run GREEN suite and commit**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \

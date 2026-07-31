@@ -39,6 +39,7 @@ fn configured() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::ui::handlers::spine))
         .routes(routes!(crate::ui::handlers::frame))
         .routes(routes!(crate::ui::handlers::catalog))
+        .routes(routes!(crate::ui::handlers::context))
         .routes(routes!(crate::ui::handlers::summary))
         .routes(routes!(crate::handlers::anomalies::anomalies))
         .routes(routes!(crate::handlers::incidents::incidents))
@@ -74,6 +75,7 @@ mod tests {
         ("GET", "/v1/timeline/spine", "spine"),
         ("GET", "/v1/frame/{view}", "frame"),
         ("GET", "/v1/ui/catalog", "catalog"),
+        ("GET", "/v1/ui/context", "context"),
         ("GET", "/v1/views/summary", "summary"),
         ("GET", "/v1/anomalies", "anomalies"),
         ("GET", "/v1/incidents", "incidents"),
@@ -130,6 +132,7 @@ mod tests {
             ("spine", "ui"),
             ("frame", "ui"),
             ("catalog", "ui"),
+            ("context", "ui"),
             ("summary", "ui"),
             ("anomalies", "analytics"),
             ("incidents", "analytics"),

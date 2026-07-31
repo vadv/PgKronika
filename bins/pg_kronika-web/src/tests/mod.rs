@@ -31,6 +31,7 @@ mod overview_timeline;
 mod probes_metrics;
 mod sections;
 mod ui_catalog;
+mod ui_context;
 mod ui_data;
 mod ui_frame;
 mod ui_spine;

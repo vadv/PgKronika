@@ -54,12 +54,10 @@ pub(crate) fn resolve_snapshot_at(
         let upper = summary
             .snapshot_times()
             .partition_point(|timestamp| *timestamp <= at_us);
-        let Some(timestamp_us) = upper
+        let timestamp_us = upper
             .checked_sub(1)
             .map(|index| summary.snapshot_times()[index])
-        else {
-            continue;
-        };
+            .unwrap_or_else(|| descriptor.max_ts.min(at_us));
         if resolved
             .as_ref()
             .is_none_or(|current: &ResolvedSnapshotAt| timestamp_us > current.timestamp_us)

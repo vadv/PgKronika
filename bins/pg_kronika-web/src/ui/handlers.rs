@@ -11,6 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
 
 use super::catalog::ProjectionCatalog;
+use super::context::{ContextError, ContextLimits, ContextResponse, build_context};
 use super::data::{ViewSummaryResponse, view_summary};
 use super::frame::FrameRequest;
 use super::frame::MAX_FRAME_RESPONSE_BYTES;
@@ -29,6 +30,7 @@ use crate::params::{QueryParams, parse_i64};
 
 /// Maximum serialized projection catalog response.
 const MAX_CATALOG_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_CONTEXT_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_HEATMAP_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_SPINE_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_HEATMAP_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
@@ -40,6 +42,7 @@ const MAX_HEATMAP_TOP: usize = 64;
 const DEFAULT_SPINE_BUCKETS: usize = 288;
 const MAX_SPINE_BUCKETS: usize = 512;
 const CATALOG_PARAMS: &[QueryParameter] = &[];
+const CONTEXT_PARAMS: &[QueryParameter] = &[QueryParameter::At];
 const SUMMARY_PARAMS: &[QueryParameter] = &[QueryParameter::At];
 const HEATMAP_PARAMS: &[QueryParameter] = &[
     QueryParameter::View,
@@ -54,6 +57,80 @@ const SPINE_PARAMS: &[QueryParameter] = &[
     QueryParameter::To,
     QueryParameter::Buckets,
 ];
+
+/// `GET /v1/ui/context` - one exact instance, host, database and replication snapshot.
+#[utoipa::path(
+    get,
+    path = "/v1/ui/context",
+    tag = "ui",
+    params(
+        ("at" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "Exact UI context snapshot", body = ContextResponse),
+        (status = 400, description = "Invalid context query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Serialized response limit exceeded", body = ApiError),
+        (status = 500, description = "Context storage or render failed", body = ApiError),
+    )
+)]
+pub(crate) async fn context(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    let params = QueryParams::parse(raw.as_deref(), CONTEXT_PARAMS)?;
+    let at_us = parse_i64(&params, QueryParameter::At)?;
+    let snapshot = state.snapshot();
+    let response = tokio::task::spawn_blocking(move || {
+        build_context(&snapshot, at_us, ContextLimits::default())
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_context_worker_failed",
+            error = ?join,
+            "UI context worker failed"
+        );
+        ApiError::internal_error()
+    })?
+    .map_err(context_error)?;
+    let body = serde_json::to_vec(&response).map_err(|cause| {
+        tracing::error!(
+            event = "api_ui_context_serialize_failed",
+            error = %cause,
+            "UI context serialization failed"
+        );
+        ApiError::internal_error()
+    })?;
+    if body.len() > MAX_CONTEXT_RESPONSE_BYTES {
+        return Err(ApiError::query_limit_exceeded(
+            LimitResource::Bytes,
+            count_u64(MAX_CONTEXT_RESPONSE_BYTES),
+            Some(count_u64(body.len())),
+        ));
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+fn context_error(error: ContextError) -> ApiError {
+    match error {
+        ContextError::Query(error) => frame_query_error(error),
+        ContextError::WebIndex(read) => {
+            tracing::error!(
+                event = "api_ui_context_index_read_failed",
+                error = %read,
+                "UI context index read failed"
+            );
+            ApiError::store_read_failed()
+        }
+        ContextError::Arithmetic => ApiError::internal_error(),
+    }
+}
 
 /// `GET /v1/timeline/spine` - aligned host load and IO PSI series.
 #[utoipa::path(

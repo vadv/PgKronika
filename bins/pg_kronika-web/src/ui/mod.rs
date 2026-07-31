@@ -1,6 +1,7 @@
 //! Stable UI projections and their HTTP adapters.
 
 pub(crate) mod catalog;
+pub(crate) mod context;
 pub(crate) mod data;
 pub(crate) mod frame;
 pub(crate) mod handlers;
