@@ -22,7 +22,13 @@ EXPECTED = {
     "GET /v1/timeline/events",
     "GET /v1/timeline/health",
     "GET /v1/timeline/heatmap",
+    "GET /v1/timeline/spine",
+    "GET /v1/frame/{view}",
     "GET /v1/ui/catalog",
+    "GET /v1/ui/context",
+    "GET /v1/data/quality",
+    "GET /v1/entity/{view}/{entity}",
+    "GET /v1/storage",
     "GET /v1/views/summary",
     "GET /v1/anomalies",
     "GET /v1/incidents",
@@ -53,7 +59,21 @@ def _queries(label: str) -> dict[str, Any]:
             "buckets": 8,
             "top": 8,
         },
+        "GET /v1/timeline/spine": {**ranged, "buckets": 8},
+        "GET /v1/frame/{view}": {
+            "at": CONTEXT["at"],
+            "limit": 1,
+            **(
+                {"preset": CONTEXT["frame_preset"]}
+                if CONTEXT["frame_preset"] is not None
+                else {}
+            ),
+        },
         "GET /v1/ui/catalog": {},
+        "GET /v1/ui/context": {"at": CONTEXT["at"]},
+        "GET /v1/data/quality": ranged,
+        "GET /v1/entity/{view}/{entity}": {"at": CONTEXT["at"]},
+        "GET /v1/storage": {},
         "GET /v1/views/summary": {"at": CONTEXT["at"]},
         "GET /v1/anomalies": {
             **ranged,
@@ -79,6 +99,13 @@ def before_call(ctx, case, **kwargs):
     case.headers = {}
     if "{name}" in label:
         case.path_parameters = {"name": CONTEXT["section"]}
+    elif label == "GET /v1/frame/{view}":
+        case.path_parameters = {"view": CONTEXT["frame_view"]}
+    elif label == "GET /v1/entity/{view}/{entity}":
+        case.path_parameters = {
+            "view": CONTEXT["frame_view"],
+            "entity": CONTEXT["entity"],
+        }
 
 
 def _has_batch_rows(body: dict[str, Any]) -> bool:
@@ -112,7 +139,22 @@ EVIDENCE: dict[str, Callable[[dict[str, Any]], bool]] = {
     "GET /v1/timeline/health": lambda body: bool(body.get("points")),
     "GET /v1/timeline/heatmap": lambda body: bool(body.get("rows"))
     and int(body.get("quality", {}).get("snapshots", 0)) > 0,
+    "GET /v1/timeline/spine": lambda body: body.get("grid", {}).get(
+        "bucket_count"
+    )
+    == 8
+    and len(body.get("series", [])) == 2,
+    "GET /v1/frame/{view}": lambda body: bool(body.get("rows"))
+    and body.get("view") == CONTEXT["frame_view"],
     "GET /v1/ui/catalog": lambda body: bool(body.get("views")),
+    "GET /v1/ui/context": lambda body: body.get("snapshot_ts_us") is not None
+    and isinstance(body.get("databases"), list),
+    "GET /v1/data/quality": lambda body: bool(body.get("capabilities"))
+    and body.get("status") in {"fresh", "late", "stale", "partial"},
+    "GET /v1/entity/{view}/{entity}": lambda body: body.get("mode") == "point"
+    and body.get("entity") == CONTEXT["entity"],
+    "GET /v1/storage": lambda body: isinstance(body.get("used_bytes"), dict)
+    and isinstance(body.get("integrity"), dict),
     "GET /v1/views/summary": lambda body: bool(body.get("views"))
     and int(body.get("quality", {}).get("snapshots", 0)) > 0,
     "GET /v1/anomalies": lambda body: int(
@@ -162,8 +204,30 @@ def _evidence_summary(label: str, body: dict[str, Any]) -> str:
             f"rows={len(value.get('rows', []))}, "
             f"snapshots={value.get('quality', {}).get('snapshots', 0)}"
         ),
+        "GET /v1/timeline/spine": lambda value: (
+            f"buckets={value.get('grid', {}).get('bucket_count')}, "
+            f"series={len(value.get('series', []))}"
+        ),
+        "GET /v1/frame/{view}": lambda value: (
+            f"view={value.get('view')}, rows={len(value.get('rows', []))}"
+        ),
         "GET /v1/ui/catalog": lambda value: (
             f"views={len(value.get('views', []))}"
+        ),
+        "GET /v1/ui/context": lambda value: (
+            f"snapshot={value.get('snapshot_ts_us')}, "
+            f"databases={len(value.get('databases', []))}"
+        ),
+        "GET /v1/data/quality": lambda value: (
+            f"status={value.get('status')}, "
+            f"capabilities={len(value.get('capabilities', []))}"
+        ),
+        "GET /v1/entity/{view}/{entity}": lambda value: (
+            f"view={value.get('view')}, fields={len(value.get('fields', []))}"
+        ),
+        "GET /v1/storage": lambda value: (
+            f"pgm_bytes={value.get('used_bytes', {}).get('pgm')}, "
+            f"readable_segments={value.get('integrity', {}).get('readable_segments')}"
         ),
         "GET /v1/views/summary": lambda value: (
             f"views={len(value.get('views', []))}, "

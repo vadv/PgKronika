@@ -8,6 +8,10 @@ use kronika_writer::{Interner, dict};
 
 use super::*;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture keeps one exact multi-section context snapshot visible in one place"
+)]
 fn context_fixture() -> tempfile::TempDir {
     const TS_US: i64 = 1_500;
     let mut interner = Interner::new(DictLimits::new(128, 64 * 1024).expect("dictionary limits"));

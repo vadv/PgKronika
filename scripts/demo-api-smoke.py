@@ -19,6 +19,7 @@ from typing import Any
 
 DEFAULT_BASE_URL = "http://127.0.0.1:18081"
 DEFAULT_SCHEMATHESIS_VERSION = "4.24.3"
+EXPECTED_OPERATION_COUNT = 21
 ANALYTIC_CAPACITY_CODE = "analytic_capacity_unavailable"
 ANALYTIC_CAPACITY_MAX_ATTEMPTS = 3
 ANALYTIC_CAPACITY_RETRY_SECONDS = 1
@@ -177,9 +178,10 @@ def prepare_context(base_url: str, authorization: str | None) -> dict[str, Any]:
         for operation in path_item.values()
         if isinstance(operation, dict) and operation.get("operationId")
     )
-    if operation_count != 15:
+    if operation_count != EXPECTED_OPERATION_COUNT:
         raise PreflightError(
-            f"runtime OpenAPI exposes {operation_count} operations, expected 15"
+            "runtime OpenAPI exposes "
+            f"{operation_count} operations, expected {EXPECTED_OPERATION_COUNT}"
         )
 
     segments_body = request_json(
@@ -239,6 +241,72 @@ def prepare_context(base_url: str, authorization: str | None) -> dict[str, Any]:
     if projection is None:
         raise PreflightError("demo catalog has no available heatmap metric")
 
+    frame_fixture = None
+    for view in catalog.get("views", []):
+        if (
+            view.get("availability") != "available"
+            or not view.get("capabilities", {}).get("history", False)
+        ):
+            continue
+        view_code = str(view["code"])
+        preset = next(
+            (str(candidate["code"]) for candidate in view.get("presets", [])),
+            None,
+        )
+        frame_query: dict[str, Any] = {"at": to_us - 1, "limit": 1}
+        if preset is not None:
+            frame_query["preset"] = preset
+        frame = request_json(
+            base_url,
+            f"/v1/frame/{urllib.parse.quote(view_code, safe='')}",
+            query=frame_query,
+            authorization=authorization,
+        )
+        rows = frame.get("rows", [])
+        columns = [
+            str(column["code"])
+            for column in view.get("columns", [])
+            if not column.get("lazy", False)
+        ][:2]
+        if not rows or not columns:
+            continue
+        entity = str(rows[0]["entity"])
+        entity_path = (
+            f"/v1/entity/{urllib.parse.quote(view_code, safe='')}/"
+            f"{urllib.parse.quote(entity, safe='')}"
+        )
+        point = request_json(
+            base_url,
+            entity_path,
+            query={"at": to_us - 1},
+            authorization=authorization,
+        )
+        history = request_json(
+            base_url,
+            entity_path,
+            query={
+                "from": from_us,
+                "to": to_us,
+                "columns": ",".join(columns),
+                "limit": 10,
+            },
+            authorization=authorization,
+        )
+        if point.get("mode") != "point" or history.get("mode") != "history":
+            continue
+        frame_fixture = {
+            "frame_view": view_code,
+            "frame_preset": preset,
+            "entity": entity,
+            "entity_columns": ",".join(columns),
+            "entity_history_snapshots": len(history.get("snapshots", [])),
+        }
+        break
+    if frame_fixture is None:
+        raise PreflightError(
+            "demo has no history-capable frame row for entity point/history smoke"
+        )
+
     span_seconds = max(1, (to_us - from_us) // 1_000_000)
     window_seconds = max(1, min(300, span_seconds // 2))
     step_seconds = max(1, window_seconds // 4)
@@ -253,6 +321,7 @@ def prepare_context(base_url: str, authorization: str | None) -> dict[str, Any]:
         "names": ",".join(names),
         "view": projection[0],
         "metric": projection[1],
+        **frame_fixture,
     }
 
 
@@ -307,7 +376,9 @@ def run() -> int:
         "demo API smoke fixture: "
         f"range=[{context['from']}, {context['to']}), "
         f"section={context['section']}, names={context['names']}, "
-        f"heatmap={context['view']}/{context['metric']}",
+        f"heatmap={context['view']}/{context['metric']}, "
+        f"frame={context['frame_view']}, "
+        f"entity_history_snapshots={context['entity_history_snapshots']}",
         flush=True,
     )
 

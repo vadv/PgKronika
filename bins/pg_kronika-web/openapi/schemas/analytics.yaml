@@ -333,6 +333,8 @@ IncidentFindingResponse:
   properties:
     confidence:
       type: string
+    confidence_cap:
+      type: string
     evidence:
       items:
         $ref: '#/IncidentEvidenceResponse'
@@ -343,10 +345,14 @@ IncidentFindingResponse:
       type: string
     scope:
       $ref: '#/IncidentFindingScopeResponse'
+    slug:
+      type: string
   required:
   - lens_id
+  - slug
   - role
   - confidence
+  - confidence_cap
   - scope
   - evidence
   type: object
@@ -403,11 +409,51 @@ IncidentMemberResponse:
   - from
   - to
   type: object
+IncidentRelationProvenanceResponse:
+  description: Stored provenance for one proven relationship between incident findings.
+  properties:
+    contract:
+      type: string
+    fields:
+      items:
+        type: string
+      type: array
+  required:
+  - contract
+  - fields
+  type: object
+IncidentRelationResponse:
+  description: One relationship backed by typed join evidence retained by the evaluator.
+  properties:
+    from_finding:
+      minimum: 0
+      type: integer
+    kind:
+      type: string
+    provenance:
+      $ref: '#/IncidentRelationProvenanceResponse'
+    to_finding:
+      minimum: 0
+      type: integer
+  required:
+  - from_finding
+  - to_finding
+  - kind
+  - provenance
+  type: object
 IncidentResponse:
   description: One cluster of related anomaly episodes.
   properties:
+    category_code:
+      type: string
+    coincident_count:
+      minimum: 0
+      type: integer
     evaluation_complete:
       type: boolean
+    finding_count:
+      minimum: 0
+      type: integer
     finding_evaluation_status:
       type: string
     findings:
@@ -418,15 +464,37 @@ IncidentResponse:
       type: string
     interval:
       $ref: '#/IncidentIntervalResponse'
+    level:
+      type: string
+    level_policy_revision:
+      format: int32
+      minimum: 0
+      type: integer
     members:
       items:
         $ref: '#/IncidentMemberResponse'
       type: array
+    peak_ts_us:
+      type: string
+    relations:
+      items:
+        $ref: '#/IncidentRelationResponse'
+      type: array
+    summary_code:
+      type: string
   required:
   - interval
   - incident_key
+  - peak_ts_us
+  - level
+  - level_policy_revision
+  - category_code
+  - summary_code
+  - finding_count
+  - coincident_count
   - members
   - findings
+  - relations
   - evaluation_complete
   - finding_evaluation_status
   type: object

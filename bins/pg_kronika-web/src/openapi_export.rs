@@ -160,10 +160,21 @@ fn export_into(original: &Value, destination: &Path) -> Result<(), DynError> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exporter validates one complete OpenAPI operation and reachability contract"
+)]
 fn validate_source_contract(document: &Value) -> Result<(), DynError> {
     let paths = object_at(document, &["paths"])?;
     let schemas = object_at(document, &["components", "schemas"])?;
     let mut operation_ids = BTreeSet::new();
+
+    if paths.contains_key("/v1/sources") {
+        return Err(invalid_data("removed HTTP source route is present: /v1/sources").into());
+    }
+    if document.to_string().contains("unknown_source") {
+        return Err(invalid_data("removed HTTP source error is present: unknown_source").into());
+    }
 
     for (path, path_item) in paths {
         let operations = path_item
@@ -192,6 +203,21 @@ fn validate_source_contract(document: &Value) -> Result<(), DynError> {
                 return Err(
                     invalid_data(format!("duplicate OpenAPI operationId: {operation_id}")).into(),
                 );
+            }
+            if operation
+                .get("parameters")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|parameter| {
+                    parameter.get("in").and_then(Value::as_str) == Some("query")
+                        && parameter.get("name").and_then(Value::as_str) == Some("source")
+                })
+            {
+                return Err(invalid_data(format!(
+                    "removed HTTP source query parameter is present: {operation_id}"
+                ))
+                .into());
             }
 
             let tags = operation
@@ -622,6 +648,39 @@ mod tests {
                 .expect_err("unused schema must fail")
                 .to_string()
                 .contains("unreachable component schema")
+        );
+
+        let mut document = minimal_document();
+        document["paths"]["/v1/sources"] = document["paths"]["/v1/example"].clone();
+        document["paths"]["/v1/sources"]["get"]["operationId"] = serde_json::json!("sources");
+        assert!(
+            validate_source_contract(&document)
+                .expect_err("removed source route must fail")
+                .to_string()
+                .contains("removed HTTP source route")
+        );
+
+        let mut document = minimal_document();
+        document["paths"]["/v1/example"]["get"]["parameters"] = serde_json::json!([{
+            "name": "source",
+            "in": "query",
+            "schema": { "type": "string" }
+        }]);
+        assert!(
+            validate_source_contract(&document)
+                .expect_err("removed source parameter must fail")
+                .to_string()
+                .contains("removed HTTP source query parameter")
+        );
+
+        let mut document = minimal_document();
+        document["components"]["schemas"]["Example"]["description"] =
+            serde_json::json!("unknown_source");
+        assert!(
+            validate_source_contract(&document)
+                .expect_err("removed source error must fail")
+                .to_string()
+                .contains("removed HTTP source error")
         );
     }
 

@@ -26,6 +26,7 @@ fn token(revision: u16) -> String {
 }
 
 fn statement_row(ts: i64, calls: i64, query: StrId) -> PgStatStatementsV2 {
+    let calls_f64 = f64::from(i32::try_from(calls).expect("fixture calls fit i32"));
     PgStatStatementsV2 {
         ts: Ts(ts),
         queryid: Some(7),
@@ -37,8 +38,8 @@ fn statement_row(ts: i64, calls: i64, query: StrId) -> PgStatStatementsV2 {
         calls,
         rows: calls * 2,
         plans: calls,
-        total_exec_time: calls as f64 * 10.0,
-        total_plan_time: calls as f64,
+        total_exec_time: calls_f64 * 10.0,
+        total_plan_time: calls_f64,
         min_exec_time: 0.0,
         max_exec_time: 0.0,
         mean_exec_time: 0.0,
@@ -66,6 +67,7 @@ fn statement_row(ts: i64, calls: i64, query: StrId) -> PgStatStatementsV2 {
 }
 
 fn plan_row(ts: i64, calls: i64, plan: StrId) -> PgStorePlansOsscV1 {
+    let calls_f64 = f64::from(i32::try_from(calls).expect("fixture calls fit i32"));
     PgStorePlansOsscV1 {
         ts: Ts(ts),
         queryid: 7,
@@ -76,7 +78,7 @@ fn plan_row(ts: i64, calls: i64, plan: StrId) -> PgStorePlansOsscV1 {
         usename: None,
         plan: Some(plan),
         calls,
-        total_time: calls as f64 * 5.0,
+        total_time: calls_f64 * 5.0,
         min_time: 0.0,
         max_time: 0.0,
         mean_time: 0.0,

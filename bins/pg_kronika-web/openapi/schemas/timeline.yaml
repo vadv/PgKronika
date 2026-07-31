@@ -298,29 +298,6 @@ EventsResponseDto:
   - physical_count_semantics
   - coverage
   type: object
-FreshnessDto:
-  description: Publication freshness and independent quality axes.
-  properties:
-    completeness:
-      type: string
-    data_through_us:
-      format: int64
-      type:
-      - integer
-      - 'null'
-    physical_count_semantics:
-      type: string
-    retained_exactness:
-      type: string
-    status:
-      type: string
-  required:
-  - data_through_us
-  - status
-  - completeness
-  - retained_exactness
-  - physical_count_semantics
-  type: object
 HealthDomainResponse:
   description: Contribution of one health domain to a timeline point.
   properties:
@@ -798,7 +775,7 @@ TimelineMetaDto:
     fact_set_id:
       type: string
     freshness:
-      $ref: '#/FreshnessDto'
+      $ref: common.yaml#/FreshnessDto
     loss:
       $ref: '#/LossDto'
     requested_range:

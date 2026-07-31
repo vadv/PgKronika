@@ -9,7 +9,7 @@ concurrency:
 
 jobs:
   smoke:
-    name: ordinary rollover + all API operations
+    name: ordinary rollover + 21 API operations
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -39,6 +39,7 @@ jobs:
             echo "- exact builder: \`${builder}\`"
             echo '- retained-data deadline: 1200 seconds'
             echo '- collector rollover: ordinary defaults'
+            echo '- contract: 21 source-free operations'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Resolve exact dependency builder
@@ -81,7 +82,7 @@ jobs:
       - name: Start demo
         run: make demo-up
 
-      - name: Run API smoke
+      - name: Run all 21 API operation smokes
         env:
           DEMO_API_URL: http://127.0.0.1:18081
           DEMO_API_WAIT_SECONDS: "1200"

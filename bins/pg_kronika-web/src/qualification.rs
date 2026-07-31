@@ -2697,15 +2697,32 @@ mod tests {
 
     use super::*;
     use crate::ui::catalog::ProjectionCatalog;
+    use crate::ui::entity::{EntityRequest, entity as build_entity};
     use crate::ui::frame::FrameRequest;
     use crate::ui::frame::dto::FrameResponse;
     use crate::ui::frame::projection::{FrameLimits, project_frame};
     use crate::ui::frame::spark::attach_sparks;
+    use crate::ui::handlers::{
+        MAX_DATA_QUALITY_RESPONSE_BYTES, MAX_ENTITY_RESPONSE_BYTES, MAX_SPINE_RESPONSE_BYTES,
+        MAX_STORAGE_RESPONSE_BYTES,
+    };
+    use crate::ui::spine::{SpineRequest, spine as build_spine};
+    use crate::ui::storage::StorageLimits;
 
     const FRAME_NORMAL_SEGMENTS: usize = 96;
     const FRAME_EARLY_SEALED_SEGMENTS: usize = 1_440;
     const FRAME_MATCHING_ROWS: usize = 201;
     const FRAME_RESPONSE_MAX_BYTES: usize = 1_048_576;
+
+    #[test]
+    fn v5_ui_resource_ceilings_and_storage_inventory_are_structural() {
+        assert_eq!(MAX_SPINE_RESPONSE_BYTES, 256 * 1024);
+        assert_eq!(MAX_DATA_QUALITY_RESPONSE_BYTES, 512 * 1024);
+        assert_eq!(MAX_ENTITY_RESPONSE_BYTES, 2 * 1024 * 1024);
+        assert_eq!(MAX_STORAGE_RESPONSE_BYTES, 64 * 1024);
+        assert_eq!(StorageLimits::default().layout, LayoutLimits::default());
+        assert_eq!(crate::ui::entity::MAX_HISTORY_SEGMENTS, 32);
+    }
 
     fn structural_bgwriter_part(ts_us: i64) -> Vec<u8> {
         let body = BgwriterCheckpointer::encode(&[BgwriterCheckpointer {
@@ -2869,6 +2886,105 @@ mod tests {
             FrameResponse::from_projected(&request, &catalog, &frame).expect("frame response");
         let bytes = serde_json::to_vec(&response).expect("serialize frame response");
         assert!(bytes.len() <= FRAME_RESPONSE_MAX_BYTES, "{}", bytes.len());
+    }
+
+    #[test]
+    #[ignore = "creates 1,536 PGM/OVF pairs for the structural spine read-budget gate"]
+    fn spine_structural_read_budget_is_zero_at_normal_plus_early_sealed_scale() {
+        const FIRST_TS_US: i64 = 1_721_865_600_000_000;
+        let directory = tempfile::tempdir().expect("structural spine fixture");
+        let segment_count = FRAME_NORMAL_SEGMENTS + FRAME_EARLY_SEALED_SEGMENTS;
+        for index in 0..segment_count {
+            let ts_us = FIRST_TS_US + i64::try_from(index).expect("segment offset");
+            crate::test_layout::write_segment_pgm(
+                directory.path(),
+                ts_us,
+                &structural_bgwriter_part(ts_us),
+            );
+        }
+        let snapshot = LocalDirSnapshot::open(directory.path()).expect("open structural fixture");
+        let store = FactStore::new(directory.path());
+        for descriptor in snapshot.sealed_descriptors() {
+            snapshot
+                .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+                .expect("publish structural OVF");
+        }
+        let state = AppState::new(snapshot).expect("build structural spine state");
+        let request_snapshot = (*state.snapshot()).clone();
+        let live = Arc::clone(state.overview_view().live());
+
+        kronika_reader::qualification_reset_open_unit_calls();
+        let response = build_spine(
+            &request_snapshot,
+            &live,
+            SpineRequest {
+                from_us: FIRST_TS_US,
+                to_us: FIRST_TS_US + i64::try_from(segment_count).expect("segment count"),
+                bucket_count: 512,
+            },
+        )
+        .expect("build structural spine");
+        assert_eq!(kronika_reader::qualification_open_unit_calls(), 0);
+        let bytes = serde_json::to_vec(&response).expect("serialize spine response");
+        assert!(bytes.len() <= MAX_SPINE_RESPONSE_BYTES, "{}", bytes.len());
+    }
+
+    #[test]
+    #[ignore = "creates 32 PGM/OVF pairs for the structural entity history gate"]
+    fn entity_history_stays_within_thirty_two_pgm_and_two_mib() {
+        const FIRST_TS_US: i64 = 1_721_865_600_000_000;
+        const SEGMENTS: usize = 32;
+        let directory = tempfile::tempdir().expect("structural entity fixture");
+        for index in 0..SEGMENTS {
+            let ts_us = FIRST_TS_US + i64::try_from(index).expect("segment offset");
+            crate::test_layout::write_segment_pgm(
+                directory.path(),
+                ts_us,
+                &structural_process_part(ts_us, 1),
+            );
+        }
+        let snapshot = LocalDirSnapshot::open(directory.path()).expect("open structural fixture");
+        let store = FactStore::new(directory.path());
+        for descriptor in snapshot.sealed_descriptors() {
+            snapshot
+                .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+                .expect("publish structural OVF");
+        }
+        let catalog = ProjectionCatalog::for_materialization();
+        let frame_request = FrameRequest::parse(
+            "processes",
+            Some(&format!(
+                "at={}&preset=cpu&limit=1",
+                FIRST_TS_US + i64::try_from(SEGMENTS - 1).expect("last segment")
+            )),
+            &catalog,
+        )
+        .expect("frame request");
+        let projected = project_frame(&snapshot, &frame_request, &catalog, FrameLimits::default())
+            .expect("project entity source frame");
+        let frame =
+            FrameResponse::from_projected(&frame_request, &catalog, &projected).expect("frame DTO");
+        let frame_json = serde_json::to_value(frame).expect("serialize frame DTO");
+        let entity = frame_json["rows"][0]["entity"]
+            .as_str()
+            .expect("entity token");
+        let entity_request = EntityRequest::parse(
+            "processes",
+            entity,
+            Some(&format!(
+                "from={FIRST_TS_US}&to={}&columns=pid,rss&limit={SEGMENTS}",
+                FIRST_TS_US + i64::try_from(SEGMENTS).expect("segment count")
+            )),
+            &catalog,
+        )
+        .expect("entity history request");
+
+        kronika_reader::qualification_reset_open_unit_calls();
+        let response =
+            build_entity(&snapshot, &entity_request, &catalog).expect("build entity history");
+        assert!(kronika_reader::qualification_open_unit_calls() <= SEGMENTS);
+        let bytes = serde_json::to_vec(&response).expect("serialize entity response");
+        assert!(bytes.len() <= MAX_ENTITY_RESPONSE_BYTES, "{}", bytes.len());
     }
 
     #[cfg(target_os = "linux")]

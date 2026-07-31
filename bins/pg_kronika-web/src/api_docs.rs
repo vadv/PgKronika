@@ -88,6 +88,50 @@ mod tests {
     ];
 
     #[test]
+    fn v5_document_has_twenty_one_source_free_operations() {
+        let document = serde_json::to_value(document()).expect("serialize OpenAPI");
+        let paths = document["paths"].as_object().expect("paths object");
+        let observed = paths
+            .values()
+            .flat_map(|item| {
+                item.as_object()
+                    .expect("path item")
+                    .iter()
+                    .filter(|(method, _)| {
+                        matches!(
+                            method.as_str(),
+                            "get"
+                                | "put"
+                                | "post"
+                                | "delete"
+                                | "options"
+                                | "head"
+                                | "patch"
+                                | "trace"
+                        )
+                    })
+            })
+            .count();
+        assert_eq!(observed, 21);
+        assert_eq!(observed, OPERATIONS.len());
+        assert!(paths.get("/v1/sources").is_none());
+        assert!(!document.to_string().contains("unknown_source"));
+
+        for (_, path, _) in OPERATIONS {
+            let parameters = document["paths"][path]["get"]["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten();
+            assert!(
+                parameters
+                    .filter(|parameter| parameter["in"] == "query")
+                    .all(|parameter| parameter["name"] != "source"),
+                "{path} must not expose the removed source query parameter"
+            );
+        }
+    }
+
+    #[test]
     fn every_operation_has_a_json_success_schema() {
         let document = serde_json::to_value(document()).expect("serialize OpenAPI");
         let paths = document["paths"].as_object().expect("paths object");

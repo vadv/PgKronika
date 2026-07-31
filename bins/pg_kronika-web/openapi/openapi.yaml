@@ -30,10 +30,16 @@ components:
       $ref: schemas/common.yaml#/BlobValue
     BoundaryDto:
       $ref: schemas/ui.yaml#/BoundaryDto
+    CapabilityDto:
+      $ref: schemas/ui.yaml#/CapabilityDto
     CapacityPayload:
       $ref: schemas/timeline.yaml#/CapacityPayload
+    CategoricalClassificationDto:
+      $ref: schemas/ui.yaml#/CategoricalClassificationDto
     CellClassificationDto:
       $ref: schemas/ui.yaml#/CellClassificationDto
+    CellStatusDto:
+      $ref: schemas/ui.yaml#/CellStatusDto
     ClassificationResultDto:
       $ref: schemas/ui.yaml#/ClassificationResultDto
     ClassifiedResultDto:
@@ -42,10 +48,32 @@ components:
       $ref: schemas/ui.yaml#/CollectionStatusDto
     ColumnSpec:
       $ref: schemas/ui.yaml#/ColumnSpec
+    ContextDatabase:
+      $ref: schemas/ui.yaml#/ContextDatabase
+    ContextGap:
+      $ref: schemas/ui.yaml#/ContextGap
+    ContextHost:
+      $ref: schemas/ui.yaml#/ContextHost
+    ContextInstance:
+      $ref: schemas/ui.yaml#/ContextInstance
+    ContextQuality:
+      $ref: schemas/ui.yaml#/ContextQuality
+    ContextReplica:
+      $ref: schemas/ui.yaml#/ContextReplica
+    ContextReplication:
+      $ref: schemas/ui.yaml#/ContextReplication
+    ContextReplicationInstance:
+      $ref: schemas/ui.yaml#/ContextReplicationInstance
+    ContextResponse:
+      $ref: schemas/ui.yaml#/ContextResponse
     CounterDeltaPayload:
       $ref: schemas/timeline.yaml#/CounterDeltaPayload
+    CoverageDto:
+      $ref: schemas/ui.yaml#/CoverageDto
     CoverageSpanDto:
       $ref: schemas/timeline.yaml#/CoverageSpanDto
+    DataQualityResponse:
+      $ref: schemas/ui.yaml#/DataQualityResponse
     DiffNoDataPoint:
       $ref: schemas/sections.yaml#/DiffNoDataPoint
     DiffPointResponse:
@@ -58,6 +86,22 @@ components:
       $ref: schemas/sections.yaml#/DiffValuePoint
     EntityDto:
       $ref: schemas/timeline.yaml#/EntityDto
+    EntityFieldDto:
+      $ref: schemas/ui.yaml#/EntityFieldDto
+    EntityGapDto:
+      $ref: schemas/ui.yaml#/EntityGapDto
+    EntityHistoryResponse:
+      $ref: schemas/ui.yaml#/EntityHistoryResponse
+    EntityPageDto:
+      $ref: schemas/ui.yaml#/EntityPageDto
+    EntityPointResponse:
+      $ref: schemas/ui.yaml#/EntityPointResponse
+    EntityQualityDto:
+      $ref: schemas/ui.yaml#/EntityQualityDto
+    EntityResponse:
+      $ref: schemas/ui.yaml#/EntityResponse
+    EntitySnapshotDto:
+      $ref: schemas/ui.yaml#/EntitySnapshotDto
     ErrorPayload:
       $ref: schemas/timeline.yaml#/ErrorPayload
     EventDigestDto:
@@ -72,6 +116,10 @@ components:
       $ref: schemas/timeline.yaml#/EventsResponseDto
     EvidenceDto:
       $ref: schemas/ui.yaml#/EvidenceDto
+    FilesystemDto:
+      $ref: schemas/ui.yaml#/FilesystemDto
+    ForecastDto:
+      $ref: schemas/ui.yaml#/ForecastDto
     FrameColumnDto:
       $ref: schemas/ui.yaml#/FrameColumnDto
     FrameGapDto:
@@ -89,7 +137,7 @@ components:
     FrameValue:
       $ref: schemas/ui.yaml#/FrameValue
     FreshnessDto:
-      $ref: schemas/timeline.yaml#/FreshnessDto
+      $ref: schemas/common.yaml#/FreshnessDto
     GapResponse:
       $ref: schemas/sections.yaml#/GapResponse
     HealthDomainResponse:
@@ -124,12 +172,18 @@ components:
       $ref: schemas/analytics.yaml#/IncidentIntervalResponse
     IncidentMemberResponse:
       $ref: schemas/analytics.yaml#/IncidentMemberResponse
+    IncidentRelationProvenanceResponse:
+      $ref: schemas/analytics.yaml#/IncidentRelationProvenanceResponse
+    IncidentRelationResponse:
+      $ref: schemas/analytics.yaml#/IncidentRelationResponse
     IncidentResponse:
       $ref: schemas/analytics.yaml#/IncidentResponse
     IncidentsResponse:
       $ref: schemas/analytics.yaml#/IncidentsResponse
     InputSpec:
       $ref: schemas/ui.yaml#/InputSpec
+    IntegrityDto:
+      $ref: schemas/ui.yaml#/IntegrityDto
     JoinSpec:
       $ref: schemas/ui.yaml#/JoinSpec
     JointCountDto:
@@ -154,12 +208,24 @@ components:
       $ref: schemas/timeline.yaml#/OverviewResponseDto
     PresetSpec:
       $ref: schemas/ui.yaml#/PresetSpec
+    ProducerDto:
+      $ref: schemas/ui.yaml#/ProducerDto
     ProjectionCatalog:
       $ref: schemas/ui.yaml#/ProjectionCatalog
+    QualityDto:
+      $ref: schemas/ui.yaml#/QualityDto
+    QualityGap:
+      $ref: schemas/ui.yaml#/QualityGap
     RangeGap:
       $ref: schemas/ui.yaml#/RangeGap
     Ranking:
       $ref: schemas/ui.yaml#/Ranking
+    RelatedEntityDto:
+      $ref: schemas/ui.yaml#/RelatedEntityDto
+    RelationProvenanceDto:
+      $ref: schemas/ui.yaml#/RelationProvenanceDto
+    RetentionDto:
+      $ref: schemas/ui.yaml#/RetentionDto
     Scope:
       $ref: schemas/ui.yaml#/Scope
     ScoreBounds:
@@ -190,10 +256,24 @@ components:
       $ref: schemas/ui.yaml#/SortSpec
     SparkDto:
       $ref: schemas/ui.yaml#/SparkDto
+    SpineGap:
+      $ref: schemas/ui.yaml#/SpineGap
+    SpineGrid:
+      $ref: schemas/ui.yaml#/SpineGrid
+    SpineQuality:
+      $ref: schemas/ui.yaml#/SpineQuality
+    SpineResponse:
+      $ref: schemas/ui.yaml#/SpineResponse
+    SpineSeries:
+      $ref: schemas/ui.yaml#/SpineSeries
+    SpineValueStatus:
+      $ref: schemas/ui.yaml#/SpineValueStatus
     SqlstateCountDto:
       $ref: schemas/timeline.yaml#/SqlstateCountDto
     StateTransitionPayload:
       $ref: schemas/timeline.yaml#/StateTransitionPayload
+    StorageResponse:
+      $ref: schemas/ui.yaml#/StorageResponse
     SuccessReasonResponse:
       $ref: schemas/analytics.yaml#/SuccessReasonResponse
     SummaryQuality:
@@ -204,10 +284,14 @@ components:
       $ref: schemas/timeline.yaml#/TailPendingDto
     TimelineMetaDto:
       $ref: schemas/timeline.yaml#/TimelineMetaDto
+    UsedBytesDto:
+      $ref: schemas/ui.yaml#/UsedBytesDto
     ValueType:
       $ref: schemas/ui.yaml#/ValueType
     VersionResponse:
       $ref: schemas/core.yaml#/VersionResponse
+    ViewCapabilities:
+      $ref: schemas/ui.yaml#/ViewCapabilities
     ViewSpec:
       $ref: schemas/ui.yaml#/ViewSpec
     ViewSummaryItem:
@@ -225,6 +309,10 @@ openapi: 3.1.0
 paths:
   /v1/anomalies:
     $ref: paths/analytics.yaml#/~1v1~1anomalies
+  /v1/data/quality:
+    $ref: paths/ui.yaml#/~1v1~1data~1quality
+  /v1/entity/{view}/{entity}:
+    $ref: paths/ui.yaml#/~1v1~1entity~1{view}~1{entity}
   /v1/frame/{view}:
     $ref: paths/ui.yaml#/~1v1~1frame~1{view}
   /v1/incidents:
@@ -241,6 +329,8 @@ paths:
     $ref: paths/sections.yaml#/~1v1~1sections~1batch~1diff
   /v1/segments:
     $ref: paths/sections.yaml#/~1v1~1segments
+  /v1/storage:
+    $ref: paths/ui.yaml#/~1v1~1storage
   /v1/timeline/events:
     $ref: paths/timeline.yaml#/~1v1~1timeline~1events
   /v1/timeline/health:
@@ -249,8 +339,12 @@ paths:
     $ref: paths/ui.yaml#/~1v1~1timeline~1heatmap
   /v1/timeline/overview:
     $ref: paths/timeline.yaml#/~1v1~1timeline~1overview
+  /v1/timeline/spine:
+    $ref: paths/ui.yaml#/~1v1~1timeline~1spine
   /v1/ui/catalog:
     $ref: paths/ui.yaml#/~1v1~1ui~1catalog
+  /v1/ui/context:
+    $ref: paths/ui.yaml#/~1v1~1ui~1context
   /v1/version:
     $ref: paths/core.yaml#/~1v1~1version
   /v1/views/summary:

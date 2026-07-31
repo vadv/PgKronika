@@ -927,7 +927,7 @@ git commit -m "feat(web): extend incident focus metadata"
   21 operations.
 - Demo smoke calls each new route against a populated stand.
 
-- [ ] **Step 1: Write failing exact-operation OpenAPI tests**
+- [x] **Step 1: Write failing exact-operation OpenAPI tests**
 
 ```rust
 const OPERATIONS: &[(&str, &str, &str)] = &[
@@ -948,7 +948,7 @@ fn v5_document_has_twenty_one_source_free_operations() {
 }
 ```
 
-- [ ] **Step 2: Run RED OpenAPI test**
+- [x] **Step 2: Run RED OpenAPI test**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -958,7 +958,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 Expected: count/schema/tag/response assertions identify any remaining route
 registration or DTO gaps.
 
-- [ ] **Step 3: Complete utoipa registration and regenerate**
+- [x] **Step 3: Complete utoipa registration and regenerate**
 
 ```sh
 CARGO_BUILD_TARGET=aarch64-apple-darwin make openapi
@@ -969,7 +969,7 @@ git diff --exit-code -- bins/pg_kronika-web/openapi
 The first run updates the committed tree; after staging that output, a repeated
 generation must be deterministic.
 
-- [ ] **Step 4: Extend smoke and structural qualification**
+- [x] **Step 4: Extend smoke and structural qualification**
 
 ```yaml
 - name: Smoke v5 UI API
@@ -984,7 +984,7 @@ Entity smoke first takes one token from frame and calls both point and bounded
 history. Qualification asserts spine 0 raw PGM at N=96/N=1440, entity history
 at 32 PGM/2 MiB, data quality at 512 KiB and storage at layout bounds.
 
-- [ ] **Step 5: Run full verification**
+- [x] **Step 5: Run full verification**
 
 ```sh
 cargo fmt --all -- --check
@@ -999,7 +999,7 @@ git diff --check
 
 Expected: every command exits 0.
 
-- [ ] **Step 6: Update docs and commit generated contract**
+- [x] **Step 6: Update docs and commit generated contract**
 
 ```sh
 git add bins/pg_kronika-web/openapi \

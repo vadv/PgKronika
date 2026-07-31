@@ -6,10 +6,13 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
+import os
 import re
+import sys
 import unittest
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 
@@ -62,6 +65,65 @@ class DemoStandDefaultsTests(unittest.TestCase):
         self.assertEqual(
             SMOKE.DEFAULT_BASE_URL,
             f"http://127.0.0.1:{match.group(1)}",
+        )
+
+    def test_smoke_contract_covers_all_twenty_one_v5_operations(self) -> None:
+        self.assertEqual(SMOKE.EXPECTED_OPERATION_COUNT, 21)
+        hooks = (
+            Path(__file__).resolve().parent / "demo_api_smoke_hooks.py"
+        ).read_text(encoding="utf-8")
+        for route in (
+            "GET /v1/frame/{view}",
+            "GET /v1/ui/context",
+            "GET /v1/timeline/spine",
+            "GET /v1/data/quality",
+            "GET /v1/entity/{view}/{entity}",
+            "GET /v1/storage",
+        ):
+            self.assertIn(route, hooks)
+
+
+class EvidenceContractTests(unittest.TestCase):
+    def test_data_quality_accepts_every_readable_wire_status(self) -> None:
+        context = {
+            "from": 0,
+            "to": 1,
+            "at": 0,
+            "names": "pg_stat_database",
+            "section": "pg_stat_database",
+            "view": "databases",
+            "metric": "connections",
+            "frame_view": "databases",
+            "frame_preset": None,
+            "entity": "entity",
+            "health_step_us": 1,
+            "window": 1,
+            "step": 1,
+        }
+        schemathesis = SimpleNamespace(
+            hook=lambda decorated: decorated,
+            check=lambda decorated: decorated,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"PG_KRONIKA_SMOKE_CONTEXT": json.dumps(context)},
+            ),
+            mock.patch.dict(sys.modules, {"schemathesis": schemathesis}),
+        ):
+            hooks = load_script(
+                "demo_api_smoke_hooks.py",
+                "demo_api_smoke_hooks_test",
+            )
+
+        predicate = hooks.EVIDENCE["GET /v1/data/quality"]
+        for status in ("fresh", "late", "stale", "partial"):
+            self.assertTrue(
+                predicate({"status": status, "capabilities": [{}]}),
+                status,
+            )
+        self.assertFalse(
+            predicate({"status": "unavailable", "capabilities": [{}]})
         )
 
 

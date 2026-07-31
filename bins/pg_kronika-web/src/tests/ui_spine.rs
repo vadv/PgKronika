@@ -108,6 +108,7 @@ fn host_spine_fixture() -> tempfile::TempDir {
 #[tokio::test]
 async fn spine_returns_aligned_host_series_from_the_hidden_ovf_view() {
     let directory = host_spine_fixture();
+    kronika_reader::qualification_reset_open_unit_calls();
     let (status, body) = serve(
         directory.path(),
         "/v1/timeline/spine?from=60000000&to=180000000&buckets=2",
@@ -115,6 +116,11 @@ async fn spine_returns_aligned_host_series_from_the_hidden_ovf_view() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        kronika_reader::qualification_open_unit_calls(),
+        0,
+        "spine must read only indexed OVF blocks"
+    );
     assert_eq!(body["grid"]["bucket_count"], 2);
     assert_eq!(body["series"][0]["code"], "load_per_cpu");
     let load = body["series"][0]["values"].as_array().expect("load values");

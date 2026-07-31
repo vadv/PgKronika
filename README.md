@@ -6,7 +6,7 @@ PgKronika records diagnostic history for a PostgreSQL instance in local,
 immutable PGM segment files. A collector reads PostgreSQL statistics, Linux
 `/proc` and cgroup data, and PostgreSQL stderr logs by default when they are
 discoverable and readable. A separate web process serves the recorded rows,
-counter diffs, source-scoped timeline digests, health lines, notable events,
+counter diffs, retained-data timeline digests, health lines, notable events,
 anomaly episodes, and incident clusters through a local UI and JSON API.
 
 The project is under active development. The collector, local segment store,
@@ -125,7 +125,7 @@ make openapi
 
 CI runs the same command and rejects a diff in the committed tree. Rust
 contract tests also require one named success schema and one domain tag for
-all 15 operations. `make openapi-bundle` writes an uncommitted single-file
+all 21 operations. `make openapi-bundle` writes an uncommitted single-file
 bundle to `target/pg-kronika-openapi.yaml` when a downstream tool needs one.
 
 With the demo already running, execute one deterministic, schema-validated
@@ -158,7 +158,7 @@ crates.io.
 | [`kronika-source-os`](crates/kronika-source-os/) | Bounded Linux `/proc`, `/sys`, filesystem, process, and cgroup readers. |
 | [`kronika-source-log`](crates/kronika-source-log/) | Bounded stderr tailing, normalization, typed events, and gap reporting. |
 | [`pg_kronika-collector`](bins/pg_kronika-collector/) | Collection lifecycle, pacing, budgets, coverage, journaling, and rotation. |
-| [`pg_kronika-web`](bins/pg_kronika-web/) | Local UI, JSON API, auth, readiness, bounded source-scoped timelines, anomalies, incident clustering, and diagnostic findings. |
+| [`pg_kronika-web`](bins/pg_kronika-web/) | Local UI, JSON API, auth, readiness, bounded retained-data timelines, anomalies, incident clustering, and diagnostic findings. |
 | [`pg_kronika-dump`](bins/pg_kronika-dump/) | Read-only JSON inventory of a data root, exact PGM size/row inspection, and bounded damaged-journal forensics. |
 | [`kronika-bdd`](crates/kronika-bdd/) | Docker/Nix integration runner for the PostgreSQL 15–18 matrix. |
 | [`xtask`](xtask/) | Dependency-boundary check used by CI. |

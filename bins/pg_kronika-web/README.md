@@ -5,7 +5,7 @@
 `pg_kronika-web` serves a local PgKronika data root through an embedded UI,
 JSON API, and Prometheus endpoint. It opens sealed segments from the
 `YYYY/MM/DD` tree and valid root-level `active.parts` frames through
-`LocalDirSnapshot`, maintains a source-scoped timeline index, refreshes the
+`LocalDirSnapshot`, maintains a retained-data timeline index, refreshes the
 published store view every second, and never connects to PostgreSQL. One
 retained writer folds journal deltas, promotes exactly matched
 sealed segments, and atomically publishes immutable descriptor and live
@@ -159,10 +159,15 @@ request rows or run an analysis.
 | `GET /readyz` | none | Tells a health checker whether the directory snapshot was refreshed recently and reports its age. |
 | `GET /metrics` | none | Exposes Prometheus metrics for reader errors, data age, HTTP requests, RSS, and open file descriptors. |
 | `GET /v1/version` | none | Identifies the JSON API version and the PGM format version served by this build. |
-| `GET /v1/ui/catalog` | optional `If-None-Match` header | Returns the nine stable UI views with inputs, joins, metric formulas, columns, presets, and availability. It reads PGM catalog metadata only, returns a strong ETag, and answers a matching validator with `304`. |
-| `GET /v1/views/summary` | `at` | Returns the latest exact population, status, and notable state at or before the cursor for all nine UI views. Sealed data reads only the shared `UiSummary` OVF block; a current active tail is merged from memory. |
+| `GET /v1/ui/context` | `at` | Returns one exact instance, host, database, and replication context snapshot. |
+| `GET /v1/ui/catalog` | optional `If-None-Match` header | Returns the nine stable UI views with inputs, joins, metric formulas, columns, presets, capabilities, availability, and machine-readable unavailability reasons. It reads PGM catalog metadata only, returns a strong ETag, and answers a matching validator with `304`. |
+| `GET /v1/views/summary` | `at` | Returns the latest exact population, status, `notable_level`, and `notable_count` at or before the cursor for all nine UI views. Sealed data reads only the shared `UiSummary` OVF block; a current active tail is merged from memory. |
+| `GET /v1/timeline/spine` | `from`, `to`; optional `buckets` | Returns aligned host load-per-CPU and I/O PSI series from indexed OVF blocks without opening PGM bodies. The half-open range is limited to 24 hours and the response to 256 KiB. |
 | `GET /v1/timeline/heatmap` | `view`, `metric`, `from`, `to`; optional `buckets`, `top` | Merges the selected view's local top-K series into a bounded heatmap with score bounds and an exact-ranking proof. The half-open range is limited to 24 hours, `buckets` to `1..=256`, `top` to `1..=64`, and the serialized response to 512 KiB. Sealed requests read only `EntitySeries(view)` and never a PGM body. |
-| `GET /v1/frame/{view}` | required `at`; optional `span`, `preset`, `database`, `q`, `sort`, `order`, `limit`, `cursor` | Returns one exact, server-filtered page for any of the nine UI views. Bound numeric cells carry the ready `Classified` verdict, exact boundary, and evidence. |
+| `GET /v1/frame/{view}` | required `at`; optional `span`, `preset` or `columns`, `database`, `q`, `sort`, `order`, `limit`, `cursor` | Returns one exact, server-filtered page for any of the nine UI views. Cells carry aligned status/reason values; numeric and categorical classifications are server-owned. |
+| `GET /v1/entity/{view}/{entity}` | point: `at`, optional `include=related`; history: `from`, `to`, `columns`, optional `limit`, `cursor` | Resolves the opaque entity token returned by frame. Point mode returns exact fields and proven related entities; history mode returns a bounded page from at most 32 selected segments. |
+| `GET /v1/data/quality` | `from`, `to` | Returns retained coverage, gaps, freshness, producer state, capabilities, integrity, and quality facts without reading section bodies. The range is limited to 24 hours and the response to 512 KiB. |
+| `GET /v1/storage` | none | Returns bounded PGM/OVF/journal/quarantine accounting, filesystem capacity, retention status, forecast, and integrity counters. |
 | `GET /v1/sections` | none | Shows which logical datasets can be queried and gives each dataset's semantics, sort key, and union of registered columns. |
 | `GET /v1/segments` | `from`, `to` | Shows which segments overlap the requested period and how many rows each section contains. It reads catalog metadata, not section bodies. |
 | `GET /v1/section/{name}` | `from`, `to`; optional `limit`, `cursor` | Returns the selected dataset as time-ordered rows. The response also names unreadable or missing intervals in `gaps` and supplies `next_cursor` when more rows remain. |
@@ -173,13 +178,16 @@ request rows or run an analysis.
 | `GET /v1/timeline/events` | `from`, `to`; optional `limit`, `cursor`, `min_severity`, `kind` | Returns a stable page of typed notable event facts and an opaque cursor when more events remain. |
 | `GET /v1/timeline/health` | `from`, `to`; optional integer-microsecond `step` | Returns at most 2,000 policy-evaluated health points plus coverage and the effective step. |
 | `GET /v1/anomalies` | `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `limit`, `section` | Finds unusual rate or gauge intervals and, for stored plans, call-normalized plan-mixture changes and same-plan buffer-work increases. It returns ranked `episodes`, ranked `plan_signals`, per-section evaluation counts, plan applicability and quality, coverage, truncation, and skipped work. |
-| `GET /v1/incidents` | `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Groups anomaly episodes that are close in time into incident candidates. It returns findings and machine-readable evidence where the inputs support them, plus coverage, data quality, catalog state, and skipped work. |
+| `GET /v1/incidents` | `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Groups anomaly episodes that are close in time into incident candidates. Each incident includes stable focus codes, peak time, policy level, finding/coincident counts, confidence caps, and only proven entity relations, plus coverage, data quality, catalog state, and skipped work. |
 | `GET /` | none | Opens the embedded browser UI over the same local snapshot. |
 
 `from` and `to` are signed Unix timestamps in microseconds. Duration parameters
 accept `250ms`, `90s`, `15m`, `2h`, or bare seconds. Row endpoints return 1,000
 rows by default and clamp `limit` to 10,000. Treat a cursor as opaque and pass
 it back unchanged on the next request.
+
+The server reads one local PgKronika data root. There is no `/v1/sources`
+operation, `source` query parameter, or source-aware cursor in this contract.
 
 Every item in the `views` array returned by `/v1/views/summary` includes the
 required, nullable `collection` field. It is `null` when no collection marker
@@ -232,8 +240,7 @@ numbers, operators, zero semantics, boundaries, and evidence come from
 not evaluated.
 
 Config-bound autovacuum rules remain deferred until relation reloptions are
-durably collected. Categorical rules and the production frontend are not part
-of this frame slice; the embedded HTML layout is unchanged.
+durably collected. The embedded HTML layout is unchanged.
 
 Timeline `from`/`to` ranges are half-open and limited to 31 days. Timeline
 health `step` is an integer number of microseconds and is raised when necessary
@@ -281,7 +288,7 @@ make openapi
 ```
 
 CI rejects a diff in the committed tree. The library contract tests require
-named JSON success schemas, explicit statuses, and domain tags for all 16
+named JSON success schemas, explicit statuses, and domain tags for all 21
 operations. `make openapi-bundle` creates an uncommitted single-file bundle
 under `target/` on demand.
 

@@ -34,11 +34,11 @@ use crate::params::{QueryParams, parse_i64};
 /// Maximum serialized projection catalog response.
 const MAX_CATALOG_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_CONTEXT_RESPONSE_BYTES: usize = 256 * 1024;
-const MAX_DATA_QUALITY_RESPONSE_BYTES: usize = 512 * 1024;
-const MAX_ENTITY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_DATA_QUALITY_RESPONSE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_ENTITY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HEATMAP_RESPONSE_BYTES: usize = 512 * 1024;
-const MAX_SPINE_RESPONSE_BYTES: usize = 256 * 1024;
-const MAX_STORAGE_RESPONSE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SPINE_RESPONSE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_STORAGE_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_HEATMAP_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
 const MAX_SPINE_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
 const MAX_DATA_QUALITY_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;

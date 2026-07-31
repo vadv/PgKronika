@@ -21,7 +21,7 @@ fn producer_status_round_trips_running_and_stopped_states_atomically() {
     write_producer_status(directory.path(), &running).expect("write running");
     assert_eq!(
         read_producer_status(directory.path()).expect("read running"),
-        Some(running.clone())
+        Some(running)
     );
     assert!(
         !directory.path().join(PRODUCER_STATUS_TEMP_NAME).exists(),

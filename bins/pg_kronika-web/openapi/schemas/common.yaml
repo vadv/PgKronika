@@ -43,3 +43,25 @@ BlobValue:
   - full_len
   - truncated
   type: object
+FreshnessDto:
+  properties:
+    age_us:
+      type:
+      - string
+      - 'null'
+    data_through_us:
+      type:
+      - string
+      - 'null'
+    expected_period_us:
+      type:
+      - string
+      - 'null'
+    state:
+      type: string
+  required:
+  - data_through_us
+  - age_us
+  - expected_period_us
+  - state
+  type: object
