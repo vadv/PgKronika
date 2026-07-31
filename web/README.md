@@ -70,9 +70,13 @@ Response shapes come from `bins/pg_kronika-web/openapi/`, which is generated
 from the Rust handlers and gated against drift in CI. The UI reads that
 contract; it does not invent fields.
 
-`src/api/types.ts` currently restates those schemas by hand, which has already
-produced one divergence. Treat every hand-maintained DTO as a defect awaiting
-generation from the OpenAPI tree, not as a pattern to copy.
+`src/api/schema.d.ts` is generated from the OpenAPI tree by
+`openapi-typescript` (`npm run codegen`, or `make web-codegen` from the
+repo root); the committed file is gated against drift in CI, like the
+tree itself. `src/api/types.ts` only re-exports the generated schemas
+under stable aliases — add an alias there instead of hand-writing a DTO
+or importing `schema.d.ts` from components. Calls go through `apiGet`,
+whose path and query parameters are type-checked against the schema.
 
 Errors carry a stable `code` plus `params`; there is no human-readable message
 on the wire, and the UI renders the code through the i18n catalog.

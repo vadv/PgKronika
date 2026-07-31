@@ -500,6 +500,14 @@ export interface components {
             level: string;
             status: string;
         };
+        CollectionStatusDto: {
+            /** Format: int64 */
+            collected: number;
+            read_state: string;
+            /** Format: int64 */
+            source_total: number | null;
+            visibility: string;
+        };
         /** @description One table or detail projection column. */
         ColumnSpec: {
             /** @description Source-specific availability. */
@@ -1265,6 +1273,7 @@ export interface components {
             view_revision: number;
         };
         ViewSummaryItem: {
+            collection: null | components["schemas"]["CollectionStatusDto"];
             notable: boolean;
             /** Format: int64 */
             population: number | null;

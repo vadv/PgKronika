@@ -13,7 +13,7 @@
     "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc --noEmit",
     "codegen": "openapi-typescript ../bins/pg_kronika-web/openapi/openapi.yaml -o src/api/schema.d.ts",
-    "spec:lint": "spectral lint ../bins/pg_kronika-web/openapi/openapi.yaml --ruleset ../.spectral.yaml",
+    "spec:lint": "spectral lint ../target/pg-kronika-openapi.yaml --ruleset ../.spectral.yaml",
     "demo:stub": "node scripts/demo-stub.mjs",
     "demo:shot": "node scripts/demo-shot.mjs"
   },

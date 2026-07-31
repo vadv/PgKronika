@@ -11,7 +11,12 @@ export default defineConfig({
       include: ["src/**/*.{ts,tsx}"],
       // Bootstrap and type-only modules have no behaviour to assert. Leaving
       // them in the denominator would buy the threshold with fake tests.
-      exclude: ["src/main.tsx", "src/i18n/index.ts", "src/api/types.ts"],
+      exclude: [
+        "src/main.tsx",
+        "src/i18n/index.ts",
+        "src/api/types.ts",
+        "src/api/schema.d.ts",
+      ],
       thresholds: {
         statements: 90,
         branches: 85,

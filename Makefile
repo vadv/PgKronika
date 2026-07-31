@@ -6,7 +6,7 @@ SCHEMATHESIS_VERSION ?= 4.24.3
 # what macOS ships as `tar`. `brew install gnu-tar` provides gtar.
 TAR ?= $(shell command -v gtar 2>/dev/null || echo tar)
 
-.PHONY: build collector web web-frontend web-frontend-check dump openapi openapi-bundle test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
+.PHONY: build collector web web-frontend web-frontend-check web-codegen dump openapi openapi-bundle openapi-lint test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
 
 build: ## Build collector, web, and dump for the selected target.
 	@$(CARGO_BUILD) -p pg_kronika-collector -p pg_kronika-web -p pg_kronika-dump
@@ -38,6 +38,14 @@ openapi-bundle: ## Export an on-demand single-file OpenAPI bundle under target/.
 	@cargo +$(RUST_TOOLCHAIN) run --locked --target $(TARGET) \
 		-p pg_kronika-web --example export_openapi -- \
 		--bundle target/pg-kronika-openapi.yaml
+
+openapi-lint: ## Bundle the spec and lint it with Spectral (needs node/npx).
+	@$(MAKE) --no-print-directory openapi-bundle
+	cd web && npx --yes @stoplight/spectral-cli@6.16.2 lint \
+		../target/pg-kronika-openapi.yaml --ruleset ../.spectral.yaml
+
+web-codegen: ## Regenerate SPA TypeScript types from the committed OpenAPI tree.
+	cd web && npm ci && npm run codegen
 
 test-bdd: ## Run BDD through Docker/Nix. Optional: DEBUG=1 make test-bdd TAGS=@pg_log
 	@TAGS="$(TAGS)" DEBUG="$(DEBUG)" scripts/test-bdd-local.sh

@@ -44,19 +44,22 @@ Rust DTO на честном слове; query-параметры собираю
    typecheck. MSW не вводится (YAGNI на текущем объёме).
 5. **Линтер спеки.** Spectral (`@stoplight/spectral-cli`, devDep web/),
    ruleset `.spectral.yaml` в корне (extends `spectral:oas`,
-   стилистические шумные правила приглушены). Таргет
-   `make openapi-lint`.
+   стилистические шумные правила приглушены). Линтуется **бандл**
+   (`make openapi-bundle` → `target/pg-kronika-openapi.yaml`), а не
+   дерево: многофайловые `$ref` вида `paths/ui.yaml#/~1v1~1...` Spectral
+   разрешает криво (ложные `oas3-schema` errors и `unused-component`
+   warnings). Таргет `make openapi-lint` = бандл + spectral.
 
 ## CI
 
-В job `frontend` (Node уже настроен) добавляются шаги:
-
-- `make openapi-lint` — линт спеки;
-- freshness-check типов: `npm run codegen` + `git diff --exit-code --
+- В job `lint` (cargo уже есть, экспортёр для `make openapi` там же
+  собирается) добавляется шаг `make openapi-lint`.
+- В job `frontend` (Node запинен через `web/.nvmrc`) добавляется
+  freshness-check типов: `make web-codegen` + `git diff --exit-code --
   web/src/api/schema.d.ts` (дрейф спека→типы = красный CI).
 
 Существующий drift-check «код→спека» в job `lint` не меняется. Цепочка
-становится полной: Rust DTO → спека (drift-check) → TS-типы
+становится полной: Rust DTO → спека (drift-check + spectral) → TS-типы
 (freshness-check) → typecheck фронтенда.
 
 ## Границы
