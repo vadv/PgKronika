@@ -734,7 +734,7 @@ git commit -m "feat(web): add entity detail and history API"
 - Adds custom `columns`, opaque database token, parsed `q`,
   `cell_statuses` and categorical classifications to frame.
 
-- [ ] **Step 1: Write failing catalog and summary tests**
+- [x] **Step 1: Write failing catalog and summary tests**
 
 ```rust
 #[test]
@@ -754,7 +754,7 @@ async fn summary_returns_notable_level_and_count() {
 }
 ```
 
-- [ ] **Step 2: Run RED catalog/summary tests**
+- [x] **Step 2: Run RED catalog/summary tests**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -763,7 +763,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
   summary_returns_notable_level_and_count
 ```
 
-- [ ] **Step 3: Extend catalog and summary without scanning extra PGM**
+- [x] **Step 3: Extend catalog and summary without scanning extra PGM**
 
 ```rust
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
@@ -779,7 +779,7 @@ from existing notable evidence in the indexed summary; if the OVF format needs
 count/level, revise `UiSummaryBlock` and its build/codec tests before changing
 the HTTP DTO.
 
-- [ ] **Step 4: Write failing frame parser/DTO tests**
+- [x] **Step 4: Write failing frame parser/DTO tests**
 
 ```rust
 #[test]
@@ -800,7 +800,7 @@ async fn frame_null_cells_have_aligned_machine_reasons() {
 }
 ```
 
-- [ ] **Step 5: Run frame RED tests**
+- [x] **Step 5: Run frame RED tests**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -809,7 +809,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
   frame_null_cells_have_aligned_machine_reasons
 ```
 
-- [ ] **Step 6: Implement columns, database token, q AST and statuses**
+- [x] **Step 6: Implement columns, database token, q AST and statuses**
 
 ```rust
 pub(crate) struct FrameFilter {
@@ -828,7 +828,7 @@ Canonicalize the AST for cursor fingerprints. Filter database-scoped views by
 decoded context token, not display name. Emit one `CellStatusDto` per cell and
 keep observed zero `available`.
 
-- [ ] **Step 7: Run GREEN tests and commit**
+- [x] **Step 7: Run GREEN tests and commit**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \

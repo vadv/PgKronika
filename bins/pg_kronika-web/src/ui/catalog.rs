@@ -1,4 +1,4 @@
-//! Source-aware catalog for the stable web UI projections.
+//! Availability-aware catalog for the stable web UI projections.
 
 use std::collections::BTreeSet;
 
@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use super::thresholds::binding_for;
 
 /// Catalog schema revision.
-const CATALOG_REVISION: u16 = 1;
+const CATALOG_REVISION: u16 = 2;
 
 /// Availability of one input, metric, or column for a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -71,6 +71,9 @@ pub(crate) struct InputSpec {
     pub type_ids: Vec<u32>,
     /// Source-specific availability.
     pub availability: Availability,
+    /// Machine reason when the input is not available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<&'static str>,
 }
 
 /// A proven or conditional relationship between two inputs.
@@ -105,6 +108,9 @@ pub(crate) struct MetricSpec {
     pub requires: Vec<&'static str>,
     /// Source-specific availability.
     pub availability: Availability,
+    /// Machine reason when the metric is not available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<&'static str>,
 }
 
 /// One table or detail projection column.
@@ -133,6 +139,9 @@ pub(crate) struct ColumnSpec {
     pub requires: Vec<&'static str>,
     /// Source-specific availability.
     pub availability: Availability,
+    /// Machine reason when the column is not available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<&'static str>,
 }
 
 /// Default ordering of one preset.
@@ -155,6 +164,17 @@ pub(crate) struct PresetSpec {
     pub sort: SortSpec,
 }
 
+/// UI operations supported by one projection identity.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+pub(crate) struct ViewCapabilities {
+    /// Point detail can resolve the typed entity identity.
+    pub detail: bool,
+    /// History can follow the identity across snapshots.
+    pub history: bool,
+    /// At least one proven relation can be returned.
+    pub related: bool,
+}
+
 /// One stable UI projection.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct ViewSpec {
@@ -170,6 +190,8 @@ pub(crate) struct ViewSpec {
     pub identity_revision: u16,
     /// Source-specific view availability.
     pub availability: Availability,
+    /// Supported detail API operations.
+    pub capabilities: ViewCapabilities,
     /// Physical input families.
     pub inputs: Vec<InputSpec>,
     /// Proven joins between inputs.
@@ -216,6 +238,19 @@ impl ProjectionCatalog {
         }
     }
 
+    /// Build the projection contract used while materializing frame and entity rows.
+    ///
+    /// Per-request absence is reported from the projected value itself; this
+    /// catalog only keeps intrinsically unavailable columns gated.
+    #[must_use]
+    pub(crate) fn for_materialization() -> Self {
+        let known = registry()
+            .iter()
+            .map(|contract| contract.type_id.get())
+            .collect();
+        Self::for_type_ids(&known)
+    }
+
     /// Stable view list in ascending `view_code` order.
     #[allow(
         dead_code,
@@ -241,15 +276,17 @@ impl ProjectionCatalog {
 
 fn apply_availability(view: &mut ViewSpec, observed: &BTreeSet<u32>) {
     for input in &mut view.inputs {
-        input.availability = if input
+        let available = input
             .type_ids
             .iter()
-            .any(|type_id| observed.contains(type_id))
-        {
-            Availability::Available
+            .any(|type_id| observed.contains(type_id));
+        if available {
+            input.availability = Availability::Available;
+            input.unavailable_reason = None;
         } else {
-            Availability::Gated
-        };
+            input.availability = Availability::Gated;
+            input.unavailable_reason = Some("missing_extension");
+        }
     }
     let input_available = |code: &str| {
         view.inputs
@@ -258,10 +295,16 @@ fn apply_availability(view: &mut ViewSpec, observed: &BTreeSet<u32>) {
     };
     for metric in &mut view.metrics {
         metric.availability = availability_for(&metric.requires, &input_available);
+        metric.unavailable_reason =
+            (metric.availability != Availability::Available).then_some("missing_extension");
     }
     for column in &mut view.columns {
-        if column.availability != Availability::NotCollected {
+        if column.availability != Availability::NotCollected
+            && column.unavailable_reason != Some("missing_provenance")
+        {
             column.availability = availability_for(&column.requires, &input_available);
+            column.unavailable_reason =
+                (column.availability != Availability::Available).then_some("missing_extension");
         }
     }
     view.availability = view
@@ -293,6 +336,7 @@ fn input(code: &'static str, logical_sections: &[&'static str]) -> InputSpec {
         logical_sections,
         type_ids,
         availability: Availability::Gated,
+        unavailable_reason: Some("missing_extension"),
     }
 }
 
@@ -318,6 +362,7 @@ fn projection_metrics(view: &WebView) -> Vec<MetricSpec> {
             formula: metric.formula.as_str(),
             requires: metric.requires.to_vec(),
             availability: Availability::Gated,
+            unavailable_reason: Some("missing_extension"),
         })
         .collect()
 }
@@ -340,6 +385,7 @@ fn raw_column(
         lazy,
         requires: requires.to_vec(),
         availability: Availability::Gated,
+        unavailable_reason: Some("missing_extension"),
     }
 }
 
@@ -360,6 +406,7 @@ fn derived_column(
         lazy: false,
         requires: requires.to_vec(),
         availability: Availability::Gated,
+        unavailable_reason: Some("missing_extension"),
     }
 }
 
@@ -379,6 +426,27 @@ const fn unavailable_column(
         lazy: false,
         requires: Vec::new(),
         availability: Availability::NotCollected,
+        unavailable_reason: Some("not_collected"),
+    }
+}
+
+const fn unavailable_column_with_reason(
+    code: &'static str,
+    value_type: ValueType,
+    formula: &'static str,
+    reason: &'static str,
+) -> ColumnSpec {
+    ColumnSpec {
+        code,
+        value_type,
+        source: None,
+        formula: Some(formula),
+        unit: None,
+        threshold_metric: None,
+        lazy: false,
+        requires: Vec::new(),
+        availability: Availability::Gated,
+        unavailable_reason: Some(reason),
     }
 }
 
@@ -422,6 +490,14 @@ fn view(
         scope,
         identity_revision: projection.identity_revision,
         availability: Availability::Gated,
+        capabilities: ViewCapabilities {
+            detail: true,
+            history: matches!(
+                projection.name.as_bytes(),
+                b"activity" | b"statements" | b"plans" | b"tables" | b"indexes" | b"processes"
+            ),
+            related: projection.name.as_bytes() == b"statements",
+        },
         inputs: projection_inputs(projection),
         joins,
         metrics: projection_metrics(projection),
@@ -437,13 +513,22 @@ fn view(
 )]
 fn activity_view() -> ViewSpec {
     let projection = projection("activity");
-    let joins = vec![JoinSpec {
-        left: "activity",
-        right: "process",
-        fields: vec!["pid", "backend_start=starttime"],
-        cardinality: "zero_or_one",
-        provenance: "pid_and_process_start_match",
-    }];
+    let joins = vec![
+        JoinSpec {
+            left: "activity",
+            right: "process",
+            fields: vec!["pid", "backend_start=starttime"],
+            cardinality: "zero_or_one",
+            provenance: "pid_and_process_start_match",
+        },
+        JoinSpec {
+            left: "activity",
+            right: "replication_replicas",
+            fields: vec!["pid", "ts"],
+            cardinality: "zero_or_one",
+            provenance: "same_snapshot_walsender_pid",
+        },
+    ];
     let columns = vec![
         raw_column(
             "pid",
@@ -473,6 +558,14 @@ fn activity_view() -> ViewSpec {
             "application",
             ValueType::Text,
             "activity.application_name",
+            false,
+            &["activity"],
+            None,
+        ),
+        raw_column(
+            "backend_type",
+            ValueType::Text,
+            "activity.backend_type",
             false,
             &["activity"],
             None,
@@ -521,6 +614,30 @@ fn activity_view() -> ViewSpec {
             &["activity", "process"],
             None,
         ),
+        raw_column(
+            "replication_state",
+            ValueType::Text,
+            "replication_replicas.state",
+            false,
+            &["activity", "replication_replicas"],
+            None,
+        ),
+        raw_column(
+            "sync_state",
+            ValueType::Text,
+            "replication_replicas.sync_state",
+            false,
+            &["activity", "replication_replicas"],
+            None,
+        ),
+        raw_column(
+            "replay_lag_us",
+            ValueType::I64,
+            "replication_replicas.replay_lag_us",
+            false,
+            &["activity", "replication_replicas"],
+            Some("us"),
+        ),
     ];
     let presets = vec![
         preset(
@@ -566,6 +683,20 @@ fn activity_view() -> ViewSpec {
                 "transaction_duration_us",
             ],
             "transaction_duration_us",
+            "desc",
+        ),
+        preset(
+            "replication",
+            &[
+                "pid",
+                "user",
+                "application",
+                "backend_type",
+                "replication_state",
+                "sync_state",
+                "replay_lag_us",
+            ],
+            "replay_lag_us",
             "desc",
         ),
     ];
@@ -712,6 +843,10 @@ fn statements_view() -> ViewSpec {
     view(projection, Scope::Database, Vec::new(), columns, presets)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the view is a declarative projection registry kept together for review"
+)]
 fn plans_view() -> ViewSpec {
     view(
         projection("plans"),
@@ -762,6 +897,36 @@ fn plans_view() -> ViewSpec {
                 &["plans"],
                 None,
             ),
+            derived_column(
+                "shared_hit",
+                ValueType::F64,
+                "positive_delta(shared_blks_hit)",
+                &["plans"],
+                Some("blocks"),
+            ),
+            derived_column(
+                "shared_read",
+                ValueType::F64,
+                "positive_delta(shared_blks_read)",
+                &["plans"],
+                Some("blocks"),
+            ),
+            raw_column(
+                "first_seen",
+                ValueType::Timestamp,
+                "plans.first_call",
+                false,
+                &["plans"],
+                None,
+            ),
+            raw_column(
+                "last_seen",
+                ValueType::Timestamp,
+                "plans.last_call",
+                false,
+                &["plans"],
+                None,
+            ),
         ],
         vec![
             preset(
@@ -772,8 +937,15 @@ fn plans_view() -> ViewSpec {
             ),
             preset(
                 "io",
-                &["planid", "plan", "queryid", "calls"],
-                "calls",
+                &[
+                    "planid",
+                    "plan",
+                    "queryid",
+                    "calls",
+                    "shared_hit",
+                    "shared_read",
+                ],
+                "shared_read",
                 "desc",
             ),
             preset(
@@ -810,6 +982,14 @@ fn tables_view() -> ViewSpec {
                 None,
             ),
             raw_column(
+                "size",
+                ValueType::I64,
+                "tables.main_fork_bytes",
+                false,
+                &["tables"],
+                Some("bytes"),
+            ),
+            raw_column(
                 "seq_scan",
                 ValueType::I64,
                 "tables.seq_scan",
@@ -831,6 +1011,29 @@ fn tables_view() -> ViewSpec {
                 "100 * n_dead_tup / max(n_live_tup + n_dead_tup, 1)",
                 &["tables"],
                 Some("percent"),
+            ),
+            derived_column(
+                "io_hit_pct",
+                ValueType::F64,
+                "100 * positive_delta(heap_blks_hit + idx_blks_hit) / max(positive_delta(heap_blks_hit + idx_blks_hit + heap_blks_read + idx_blks_read), 1)",
+                &["tables"],
+                Some("percent"),
+            ),
+            raw_column(
+                "xid_age",
+                ValueType::I64,
+                "tables.xid_age",
+                false,
+                &["tables"],
+                Some("transactions"),
+            ),
+            raw_column(
+                "mxid_age",
+                ValueType::I64,
+                "tables.mxid_age",
+                false,
+                &["tables"],
+                Some("multixacts"),
             ),
             raw_column(
                 "dead_tuples",
@@ -928,8 +1131,20 @@ fn tables_view() -> ViewSpec {
             ),
             preset(
                 "io",
-                &["relation", "seq_scan", "idx_scan", "seq_scan_pct"],
-                "seq_scan_pct",
+                &[
+                    "relation",
+                    "seq_scan",
+                    "idx_scan",
+                    "seq_scan_pct",
+                    "io_hit_pct",
+                ],
+                "io_hit_pct",
+                "desc",
+            ),
+            preset(
+                "size",
+                &["relation", "size", "dead_pct", "xid_age", "mxid_age"],
+                "size",
                 "desc",
             ),
         ],
@@ -958,6 +1173,14 @@ fn indexes_view() -> ViewSpec {
                 &["indexes"],
                 None,
             ),
+            raw_column(
+                "size",
+                ValueType::I64,
+                "indexes.main_fork_bytes",
+                false,
+                &["indexes"],
+                Some("bytes"),
+            ),
             derived_column(
                 "scans",
                 ValueType::F64,
@@ -972,6 +1195,21 @@ fn indexes_view() -> ViewSpec {
                 &["indexes"],
                 None,
             ),
+            derived_column(
+                "io_hit_pct",
+                ValueType::F64,
+                "100 * positive_delta(idx_blks_hit) / max(positive_delta(idx_blks_hit + idx_blks_read), 1)",
+                &["indexes"],
+                Some("percent"),
+            ),
+            raw_column(
+                "last_idx_scan",
+                ValueType::Timestamp,
+                "indexes.last_idx_scan",
+                false,
+                &["indexes"],
+                None,
+            ),
         ],
         vec![
             preset(
@@ -981,7 +1219,18 @@ fn indexes_view() -> ViewSpec {
                 "desc",
             ),
             preset("unused", &["index", "table", "scans"], "scans", "asc"),
-            preset("io", &["index", "table", "scans"], "scans", "desc"),
+            preset(
+                "size",
+                &["index", "table", "size", "scans", "last_idx_scan"],
+                "size",
+                "desc",
+            ),
+            preset(
+                "io",
+                &["index", "table", "scans", "io_hit_pct"],
+                "io_hit_pct",
+                "desc",
+            ),
         ],
     )
 }
@@ -990,7 +1239,13 @@ fn vacuum_view() -> ViewSpec {
     view(
         projection("vacuum"),
         Scope::Database,
-        Vec::new(),
+        vec![JoinSpec {
+            left: "vacuum",
+            right: "tables",
+            fields: vec!["datid", "relid", "ts"],
+            cardinality: "zero_or_one",
+            provenance: "same_snapshot_database_relation_oid",
+        }],
         vec![
             raw_column(
                 "pid",
@@ -1006,6 +1261,13 @@ fn vacuum_view() -> ViewSpec {
                 "vacuum.relid",
                 false,
                 &["vacuum"],
+                None,
+            ),
+            derived_column(
+                "relation",
+                ValueType::Text,
+                "qualify(tables.schemaname, tables.relname) by same (datid, relid, ts)",
+                &["vacuum", "tables"],
                 None,
             ),
             raw_column(
@@ -1038,23 +1300,36 @@ fn vacuum_view() -> ViewSpec {
                 &["vacuum"],
                 None,
             ),
+            unavailable_column_with_reason(
+                "elapsed",
+                ValueType::F64,
+                "snapshot_ts - proven_vacuum_start",
+                "missing_provenance",
+            ),
         ],
         vec![
             preset(
                 "progress",
-                &["pid", "table", "phase", "progress", "dead_tuples"],
+                &[
+                    "pid",
+                    "relation",
+                    "phase",
+                    "progress",
+                    "dead_tuples",
+                    "elapsed",
+                ],
                 "progress",
                 "desc",
             ),
             preset(
                 "phase",
-                &["pid", "table", "phase", "progress"],
+                &["pid", "relation", "phase", "progress", "elapsed"],
                 "phase",
                 "asc",
             ),
             preset(
                 "dead_tuples",
-                &["pid", "table", "dead_tuples", "progress"],
+                &["pid", "relation", "dead_tuples", "progress", "elapsed"],
                 "dead_tuples",
                 "desc",
             ),
@@ -1062,6 +1337,10 @@ fn vacuum_view() -> ViewSpec {
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the view is a declarative projection registry kept together for review"
+)]
 fn processes_view() -> ViewSpec {
     let mut columns = vec![
         raw_column(
@@ -1095,6 +1374,14 @@ fn processes_view() -> ViewSpec {
             &["process"],
             Some("kib"),
         ),
+        raw_column(
+            "threads",
+            ValueType::U64,
+            "process.num_threads",
+            false,
+            &["process"],
+            Some("count"),
+        ),
         unavailable_column("pss", ValueType::I64, "smaps_rollup.pss_kb", None),
         derived_column(
             "read_bytes_per_second",
@@ -1125,12 +1412,26 @@ fn processes_view() -> ViewSpec {
             &["process"],
             None,
         ),
+        raw_column(
+            "cgroup",
+            ValueType::Text,
+            "cgroup_mapping.cgroup_path",
+            false,
+            &["process", "cgroup_mapping"],
+            None,
+        ),
     ];
     columns.shrink_to_fit();
     view(
         projection("processes"),
         Scope::Host,
-        Vec::new(),
+        vec![JoinSpec {
+            left: "process",
+            right: "cgroup_mapping",
+            fields: vec!["pid", "starttime", "ts"],
+            cardinality: "zero_or_one",
+            provenance: "same_snapshot_pid_and_process_start",
+        }],
         columns,
         vec![
             preset(
@@ -1158,10 +1459,26 @@ fn processes_view() -> ViewSpec {
                 "read_bytes_per_second",
                 "desc",
             ),
+            preset(
+                "cgroup",
+                &["pid", "type", "cgroup", "cpu", "rss", "command"],
+                "cpu",
+                "desc",
+            ),
+            preset(
+                "threads",
+                &["pid", "type", "threads", "cpu", "rss", "command"],
+                "threads",
+                "desc",
+            ),
         ],
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the view is a declarative projection registry kept together for review"
+)]
 fn locks_view() -> ViewSpec {
     view(
         projection("locks"),
@@ -1169,6 +1486,30 @@ fn locks_view() -> ViewSpec {
         Vec::new(),
         vec![
             raw_column("pid", ValueType::I64, "locks.pid", false, &["locks"], None),
+            raw_column(
+                "depth",
+                ValueType::I64,
+                "locks.depth",
+                false,
+                &["locks"],
+                None,
+            ),
+            raw_column(
+                "root_pid",
+                ValueType::I64,
+                "locks.root_pid",
+                false,
+                &["locks"],
+                None,
+            ),
+            raw_column(
+                "blocked_by",
+                ValueType::Text,
+                "locks.blocked_by",
+                false,
+                &["locks"],
+                None,
+            ),
             derived_column(
                 "user_application",
                 ValueType::Text,
@@ -1180,6 +1521,30 @@ fn locks_view() -> ViewSpec {
                 "lock",
                 ValueType::Text,
                 "join_non_null(wait_event_type, ':', wait_event)",
+                &["locks"],
+                None,
+            ),
+            raw_column(
+                "granted",
+                ValueType::Bool,
+                "locks.lock_granted",
+                false,
+                &["locks"],
+                None,
+            ),
+            raw_column(
+                "lock_mode",
+                ValueType::Text,
+                "locks.lock_mode",
+                false,
+                &["locks"],
+                None,
+            ),
+            raw_column(
+                "lock_type",
+                ValueType::Text,
+                "locks.lock_locktype",
+                false,
                 &["locks"],
                 None,
             ),
@@ -1212,8 +1577,14 @@ fn locks_view() -> ViewSpec {
                 "tree",
                 &[
                     "pid",
+                    "depth",
+                    "root_pid",
+                    "blocked_by",
                     "user_application",
                     "lock",
+                    "granted",
+                    "lock_mode",
+                    "lock_type",
                     "target",
                     "wait_or_hold_us",
                     "query",
@@ -1223,7 +1594,17 @@ fn locks_view() -> ViewSpec {
             ),
             preset(
                 "blockers",
-                &["pid", "user_application", "target", "wait_or_hold_us"],
+                &[
+                    "pid",
+                    "root_pid",
+                    "blocked_by",
+                    "user_application",
+                    "granted",
+                    "lock_mode",
+                    "lock_type",
+                    "target",
+                    "wait_or_hold_us",
+                ],
                 "wait_or_hold_us",
                 "desc",
             ),
@@ -1231,8 +1612,14 @@ fn locks_view() -> ViewSpec {
                 "waiters",
                 &[
                     "pid",
+                    "depth",
+                    "root_pid",
+                    "blocked_by",
                     "user_application",
                     "lock",
+                    "granted",
+                    "lock_mode",
+                    "lock_type",
                     "target",
                     "query",
                     "wait_or_hold_us",
@@ -1267,9 +1654,25 @@ fn events_view() -> ViewSpec {
                 None,
             ),
             raw_column(
+                "severity_code",
+                ValueType::Text,
+                "stable_severity_code(events.severity)",
+                false,
+                &["events"],
+                None,
+            ),
+            raw_column(
                 "type",
                 ValueType::U64,
                 "events.category",
+                false,
+                &["events"],
+                None,
+            ),
+            raw_column(
+                "category_code",
+                ValueType::Text,
+                "stable_category_code(events.category, events.kind)",
                 false,
                 &["events"],
                 None,
@@ -1286,6 +1689,14 @@ fn events_view() -> ViewSpec {
                 "message",
                 ValueType::Text,
                 "events.message",
+                true,
+                &["events"],
+                None,
+            ),
+            raw_column(
+                "detail",
+                ValueType::Text,
+                "events.typed_detail",
                 true,
                 &["events"],
                 None,

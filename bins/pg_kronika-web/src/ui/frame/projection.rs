@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -78,8 +78,7 @@ pub(crate) struct ProjectedRow {
     pub classifications: Vec<CellClassification>,
     pub spark: SparkDto,
     pub(crate) values: Vec<(&'static str, FrameValue)>,
-    pub(crate) database: Option<String>,
-    pub(crate) searchable: String,
+    pub(crate) database: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -468,7 +467,6 @@ pub(crate) fn project_entity_at(
         replace_value(row, "time_pct", replacement);
     }
     if let Some(row) = &mut projected {
-        row.searchable = public_searchable(&row.label, &row.values);
         row.classifications = classify_row(view.name, columns, row, &FrameThresholdContext);
     }
     let relations = match (
@@ -697,20 +695,9 @@ fn preset_requires_predecessor(
     request: &FrameRequest,
     catalog: &ProjectionCatalog,
 ) -> Result<bool, ProjectionError> {
-    let view = catalog
-        .views()
+    Ok(selected_columns(request, catalog)?
         .iter()
-        .find(|view| view.code == request.view.name)
-        .ok_or(ProjectionError::MissingCatalogView)?;
-    let preset = view
-        .presets
-        .iter()
-        .find(|preset| preset.code == request.preset)
-        .ok_or(ProjectionError::MissingPreset)?;
-    Ok(preset
-        .columns
-        .iter()
-        .any(|column| column_requires_predecessor(request.view.name, column)))
+        .any(|column| column_requires_predecessor(request.view.name, column.code)))
 }
 
 fn columns_require_predecessor(view: &WebView, columns: &[&ColumnSpec]) -> bool {
@@ -737,9 +724,12 @@ fn column_requires_predecessor(view: &str, column: &str) -> bool {
                     | "temp_written"
                     | "wal_bytes"
             )
-            | ("plans", "calls" | "mean" | "rows")
-            | ("tables", "seq_scan_pct")
-            | ("indexes", "scans" | "rows_per_scan")
+            | (
+                "plans",
+                "calls" | "mean" | "rows" | "shared_hit" | "shared_read"
+            )
+            | ("tables", "seq_scan_pct" | "io_hit_pct")
+            | ("indexes", "scans" | "rows_per_scan" | "io_hit_pct")
             | (
                 "processes",
                 "cpu" | "read_bytes_per_second" | "write_bytes_per_second" | "block_delay"
@@ -788,21 +778,7 @@ pub(crate) fn project_input(
         .iter()
         .find(|view| view.code == request.view.name)
         .ok_or(ProjectionError::MissingCatalogView)?;
-    let preset = view_spec
-        .presets
-        .iter()
-        .find(|preset| preset.code == request.preset)
-        .ok_or(ProjectionError::MissingPreset)?;
-    let columns = preset
-        .columns
-        .iter()
-        .filter_map(|code| {
-            view_spec
-                .columns
-                .iter()
-                .find(|column| column.code == *code && !column.lazy)
-        })
-        .collect::<Vec<_>>();
+    let columns = selected_columns(request, catalog)?;
     let primary_sections = request.view.inputs[0].sections;
     let mut previous = BTreeMap::new();
     for section in primary_sections {
@@ -868,7 +844,7 @@ pub(crate) fn project_input(
                 request
                     .database
                     .as_ref()
-                    .is_none_or(|database| row.database.as_ref() == Some(database))
+                    .is_none_or(|database| row.database == Some(database.oid))
             })
             .try_fold(0.0, |sum, row| {
                 let operands = row.operands.statements.as_ref()?;
@@ -893,7 +869,6 @@ pub(crate) fn project_input(
     }
     let threshold_context = FrameThresholdContext;
     for row in &mut rows {
-        row.searchable = public_searchable(&row.label, &row.values);
         row.classifications = classify_row(request.view.name, &columns, row, &threshold_context);
     }
 
@@ -995,8 +970,7 @@ fn row_shell(
             complete: false,
         },
         values: Vec::new(),
-        database: text(row, "datname").map(str::to_owned),
-        searchable: String::new(),
+        database: database_oid(row),
     })
 }
 
@@ -1019,6 +993,7 @@ fn project_activity(
             "user" => raw_frame(row, "usename", column.value_type),
             "database" => raw_frame(row, "datname", column.value_type),
             "application" => raw_frame(row, "application_name", column.value_type),
+            "backend_type" => raw_frame(row, "backend_type", column.value_type),
             "state" => raw_frame(row, "state", column.value_type),
             "wait_event" => joined(row, "wait_event_type", ":", "wait_event"),
             "query" => raw_frame(row, "query", column.value_type),
@@ -1039,11 +1014,35 @@ fn project_activity(
                     )
                 })
             }
+            "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                .map_or(FrameValue::Null, |replica| {
+                    raw_frame(replica, "state", column.value_type)
+                }),
+            "sync_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                .map_or(FrameValue::Null, |replica| {
+                    raw_frame(replica, "sync_state", column.value_type)
+                }),
+            "replay_lag_us" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                .map_or(FrameValue::Null, |replica| {
+                    raw_frame(replica, "replay_lag_us", column.value_type)
+                }),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
     }
     Ok(out)
+}
+
+fn activity_replica<'a>(
+    activity: &OutRow,
+    sections: &'a BTreeMap<String, Vec<OutRow>>,
+    timestamp_us: i64,
+) -> Option<&'a OutRow> {
+    let pid = value(activity, "pid")?;
+    sections.get("pg_stat_replication")?.iter().find(|replica| {
+        timestamp(replica, "ts").ok().flatten() == Some(timestamp_us)
+            && value(replica, "pid") == Some(pid)
+    })
 }
 
 fn activity_process<'a>(
@@ -1150,6 +1149,10 @@ fn project_plans(
             "calls" => delta_frame(calls),
             "mean" => divide_delta(total, calls),
             "rows" => delta_frame(rows),
+            "shared_hit" => delta_frame(delta(row, previous, "shared_blks_hit", has_gap)),
+            "shared_read" => delta_frame(delta(row, previous, "shared_blks_read", has_gap)),
+            "first_seen" => raw_frame(row, "first_call", column.value_type),
+            "last_seen" => raw_frame(row, "last_call", column.value_type),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1186,9 +1189,27 @@ fn project_tables(
     for column in columns {
         let value = match column.code {
             "relation" => joined(row, "schemaname", ".", "relname"),
+            "size" => raw_frame(row, "main_fork_bytes", column.value_type),
             "seq_scan" => raw_frame(row, "seq_scan", column.value_type),
             "idx_scan" => raw_frame(row, "idx_scan", column.value_type),
             "dead_pct" => ratio(dead, live, 100.0),
+            "io_hit_pct" => ratio_delta(
+                delta_sum_nullable(row, previous, &["heap_blks_hit", "idx_blks_hit"], has_gap),
+                delta_sum_nullable(
+                    row,
+                    previous,
+                    &[
+                        "heap_blks_hit",
+                        "idx_blks_hit",
+                        "heap_blks_read",
+                        "idx_blks_read",
+                    ],
+                    has_gap,
+                ),
+                100.0,
+            ),
+            "xid_age" => raw_frame(row, "xid_age", column.value_type),
+            "mxid_age" => raw_frame(row, "mxid_age", column.value_type),
             "dead_tuples" => raw_frame(row, "n_dead_tup", column.value_type),
             "seq_scan_pct" => percent_of_sum(seq, idx),
             "modified_since_analyze" => raw_frame(row, "n_mod_since_analyze", column.value_type),
@@ -1221,8 +1242,15 @@ fn project_indexes(
         let value = match column.code {
             "index" => raw_frame(row, "indexrelname", column.value_type),
             "table" => raw_frame(row, "relname", column.value_type),
+            "size" => raw_frame(row, "main_fork_bytes", column.value_type),
             "scans" => delta_frame(scans),
             "rows_per_scan" => divide_delta(read, scans),
+            "io_hit_pct" => ratio_delta(
+                delta(row, previous, "idx_blks_hit", has_gap),
+                delta_sum(row, previous, &["idx_blks_hit", "idx_blks_read"], has_gap),
+                100.0,
+            ),
+            "last_idx_scan" => raw_frame(row, "last_idx_scan", column.value_type),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1242,6 +1270,7 @@ fn project_vacuum(
         let value = match column.code {
             "pid" => raw_frame(row, "pid", column.value_type),
             "table" => raw_frame(row, "relid", column.value_type),
+            "relation" => vacuum_relation(row, &input.current, input.snapshot_ts_us),
             "phase" => raw_frame(row, "phase", column.value_type),
             "is_autovacuum" => raw_frame(row, "is_autovacuum", column.value_type),
             "progress" => ratio(
@@ -1257,6 +1286,25 @@ fn project_vacuum(
         out.values.push((column.code, value));
     }
     Ok(out)
+}
+
+fn vacuum_relation(
+    vacuum: &OutRow,
+    sections: &BTreeMap<String, Vec<OutRow>>,
+    timestamp_us: i64,
+) -> FrameValue {
+    sections
+        .get("pg_stat_user_tables")
+        .into_iter()
+        .flatten()
+        .find(|table| {
+            timestamp(table, "ts").ok().flatten() == Some(timestamp_us)
+                && value(table, "datid") == value(vacuum, "datid")
+                && value(table, "relid") == value(vacuum, "relid")
+        })
+        .map_or(FrameValue::Null, |table| {
+            joined(table, "schemaname", ".", "relname")
+        })
 }
 
 fn project_processes(
@@ -1276,15 +1324,32 @@ fn project_processes(
             "type" => raw_frame(row, "comm", column.value_type),
             "cpu" => rate_sum(row, previous, &["utime", "stime"], input, has_gap),
             "rss" => raw_frame(row, "rmem_kb", column.value_type),
+            "threads" => raw_frame(row, "num_threads", column.value_type),
             "read_bytes_per_second" => rate_sum(row, previous, &["read_bytes"], input, has_gap),
             "write_bytes_per_second" => rate_sum(row, previous, &["write_bytes"], input, has_gap),
             "block_delay" => rate_sum(row, previous, &["blkdelay_ticks"], input, has_gap),
             "command" => raw_frame(row, "cmdline", column.value_type),
+            "cgroup" => process_cgroup(row, &input.current, input.snapshot_ts_us)
+                .map_or(FrameValue::Null, |mapping| {
+                    raw_frame(mapping, "cgroup_path", column.value_type)
+                }),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
     }
     Ok(out)
+}
+
+fn process_cgroup<'a>(
+    process: &OutRow,
+    sections: &'a BTreeMap<String, Vec<OutRow>>,
+    timestamp_us: i64,
+) -> Option<&'a OutRow> {
+    sections.get("os_cgroup_mapping")?.iter().find(|mapping| {
+        timestamp(mapping, "ts").ok().flatten() == Some(timestamp_us)
+            && value(mapping, "pid") == value(process, "pid")
+            && value(mapping, "starttime") == value(process, "starttime")
+    })
 }
 
 #[allow(
@@ -1302,8 +1367,14 @@ fn project_locks(
     for column in columns {
         let value = match column.code {
             "pid" => raw_frame(row, "pid", column.value_type),
+            "depth" => raw_frame(row, "depth", column.value_type),
+            "root_pid" => raw_frame(row, "root_pid", column.value_type),
+            "blocked_by" => raw_frame(row, "blocked_by", column.value_type),
             "user_application" => joined(row, "usename", " / ", "application_name"),
             "lock" => joined(row, "wait_event_type", ":", "wait_event"),
+            "granted" => raw_frame(row, "lock_granted", column.value_type),
+            "lock_mode" => raw_frame(row, "lock_mode", column.value_type),
+            "lock_type" => raw_frame(row, "lock_locktype", column.value_type),
             "target" => raw_frame(row, "lock_relname", column.value_type),
             "wait_or_hold_us" => ["waitstart", "xact_start", "query_start"]
                 .iter()
@@ -1332,9 +1403,12 @@ fn project_events(
         let value = match column.code {
             "time" => raw_frame(row, "ts", column.value_type),
             "severity" => raw_frame(row, "severity", column.value_type),
+            "severity_code" => event_severity_code(row),
             "type" => event_type(row, section),
+            "category_code" => FrameValue::String(event_kind_code(section, row)),
             "duration" => event_duration(row),
             "message" => raw_frame(row, "message", column.value_type),
+            "detail" => event_detail(row),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1551,24 +1625,6 @@ fn fallback_label(entity: &[u8]) -> String {
         })
 }
 
-fn public_searchable(label: &str, values: &[(&str, FrameValue)]) -> String {
-    let mut searchable = label.to_owned();
-    for (_, value) in values {
-        searchable.push('\0');
-        match value {
-            FrameValue::Null => {}
-            FrameValue::Number(value) => {
-                write!(searchable, "{value}").expect("writing to String cannot fail");
-            }
-            FrameValue::Boolean(value) => {
-                searchable.push_str(if *value { "true" } else { "false" });
-            }
-            FrameValue::String(value) => searchable.push_str(value),
-        }
-    }
-    searchable
-}
-
 fn value<'a>(row: &'a OutRow, name: &str) -> Option<&'a Value> {
     row.iter()
         .find(|(column, _)| column == name)
@@ -1747,6 +1803,31 @@ fn delta_sum(
     })
 }
 
+fn delta_sum_nullable(
+    current: &OutRow,
+    previous: Option<&OutRow>,
+    fields: &[&'static str],
+    has_gap: bool,
+) -> DeltaOperand {
+    fields.iter().fold(DeltaOperand::Value(0.0), |sum, field| {
+        let operand = match (
+            value(current, field),
+            previous.and_then(|row| value(row, field)),
+        ) {
+            (Some(Value::Null), Some(Value::Null)) => DeltaOperand::Value(0.0),
+            _ => delta(current, previous, field, has_gap),
+        };
+        match (sum, operand) {
+            (DeltaOperand::Value(left), DeltaOperand::Value(right)) => {
+                DeltaOperand::Value(left + right)
+            }
+            (_, DeltaOperand::Reset) => DeltaOperand::Reset,
+            (_, DeltaOperand::Gap) => DeltaOperand::Gap,
+            _ => DeltaOperand::Missing,
+        }
+    })
+}
+
 const fn delta_frame(delta: DeltaOperand) -> FrameValue {
     match delta {
         DeltaOperand::Value(value) => finite_frame(value),
@@ -1841,6 +1922,36 @@ fn event_type(row: &OutRow, section: &str) -> FrameValue {
         )
 }
 
+fn event_severity_code(row: &OutRow) -> FrameValue {
+    let code = match unsigned_integer(row, "severity") {
+        Some(0) => "error",
+        Some(1) => "fatal",
+        Some(2) => "panic",
+        Some(3) => "warning",
+        Some(4) | None => "log",
+        Some(_) => return FrameValue::Null,
+    };
+    FrameValue::String(code.to_owned())
+}
+
+fn event_detail(row: &OutRow) -> FrameValue {
+    for field in [
+        "detail",
+        "query_detail",
+        "statement",
+        "sample",
+        "lock_target",
+        "message",
+    ] {
+        if let Some(value) = value(row, field)
+            && *value != Value::Null
+        {
+            return frame_value(value, ValueType::Text);
+        }
+    }
+    FrameValue::Null
+}
+
 fn event_duration(row: &OutRow) -> FrameValue {
     for field in ["duration_us", "total_ms", "elapsed_ms", "duration_ms"] {
         if let Ok(Some(value)) = finite_number(row, field) {
@@ -1925,15 +2036,34 @@ pub(crate) fn selected_columns<'a>(
         .iter()
         .find(|view| view.code == request.view.name)
         .ok_or(ProjectionError::MissingCatalogView)?;
-    let preset = view
-        .presets
+    let mut selected = request.columns.clone();
+    if !selected.contains(&request.sort) {
+        selected.push(request.sort);
+    }
+    if let Some(filter) = &request.filter {
+        for column in filter.field_columns() {
+            if !selected.contains(&column) {
+                selected.push(column);
+            }
+        }
+    }
+    selected
+        .into_iter()
+        .map(|code| {
+            view.columns
+                .iter()
+                .find(|column| column.code == code && !column.lazy)
+                .ok_or(ProjectionError::MissingPreset)
+        })
+        .collect()
+}
+
+fn database_oid(row: &OutRow) -> Option<u32> {
+    ["datid", "dbid"]
         .iter()
-        .find(|preset| preset.code == request.preset)
-        .ok_or(ProjectionError::MissingPreset)?;
-    let selected = preset.columns.iter().copied().collect::<BTreeSet<_>>();
-    Ok(view
-        .columns
-        .iter()
-        .filter(|column| selected.contains(column.code) && !column.lazy)
-        .collect())
+        .find_map(|field| match value(row, field) {
+            Some(Value::U64(value)) => u32::try_from(*value).ok(),
+            Some(Value::I64(value)) => u32::try_from(*value).ok(),
+            _ => None,
+        })
 }

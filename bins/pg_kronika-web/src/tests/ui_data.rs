@@ -191,6 +191,24 @@ async fn ui_summary_returns_exact_event_population_and_all_views() {
 }
 
 #[tokio::test]
+async fn summary_returns_notable_level_and_count() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    write_event_segment(directory.path());
+    publish_web_index(directory.path());
+
+    let (status, body) = serve(directory.path(), "/v1/views/summary?at=1500").await;
+    assert_eq!(status, StatusCode::OK);
+    let events = body["views"]
+        .as_array()
+        .expect("views")
+        .iter()
+        .find(|view| view["view"] == "events")
+        .expect("events");
+    assert_eq!(events["notable_level"], "warning");
+    assert_eq!(events["notable_count"], 2);
+}
+
+#[tokio::test]
 async fn ui_summary_returns_factual_collection_states() {
     let directory = tempfile::tempdir().expect("tempdir");
     write_collection_segment(directory.path());

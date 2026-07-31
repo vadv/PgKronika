@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use kronika_analytics::web_projection::web_views;
 use kronika_reader::{
     CollectionReadState, CollectionStatus, CollectionVisibility, IndexStatus, LIMIT, LiveState,
-    LiveView, LocalDirSnapshot, UiSummaryBlock, WebIndexReadError,
+    LiveView, LocalDirSnapshot, Notability, NotableLevel, UiSummaryBlock, WebIndexReadError,
 };
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -26,6 +26,8 @@ struct ViewSummaryItem {
     population: Option<u64>,
     status: &'static str,
     notable: bool,
+    notable_level: &'static str,
+    notable_count: u64,
     #[schema(required = true)]
     collection: Option<CollectionStatusDto>,
 }
@@ -52,7 +54,7 @@ struct SummaryQuality {
 
 #[derive(Clone, Copy)]
 struct ResolvedView {
-    snapshot: Option<(i64, u64, bool)>,
+    snapshot: Option<(i64, u64, Notability)>,
     collection: Option<CollectionStatus>,
     status: IndexStatus,
 }
@@ -105,7 +107,7 @@ pub(crate) fn view_summary(
             let resolved = resolved[index].as_ref();
             let status = resolved.map_or("unavailable", |resolved| status_code(resolved.status));
             let exact = resolved.and_then(|resolved| resolved.snapshot);
-            if let Some((timestamp, _population, _notable)) = exact {
+            if let Some((timestamp, _population, _notability)) = exact {
                 snapshots.insert(timestamp);
             }
             match resolved.map(|resolved| resolved.status) {
@@ -117,10 +119,18 @@ pub(crate) fn view_summary(
             ViewSummaryItem {
                 view: view.name,
                 snapshot_ts_us: exact
-                    .map(|(timestamp, _population, _notable)| timestamp.to_string()),
-                population: exact.map(|(_timestamp, population, _notable)| population),
+                    .map(|(timestamp, _population, _notability)| timestamp.to_string()),
+                population: exact.map(|(_timestamp, population, _notability)| population),
                 status,
-                notable: exact.is_some_and(|(_timestamp, _population, notable)| notable),
+                notable: exact.is_some_and(|(_timestamp, _population, notability)| {
+                    notability.level() != NotableLevel::None
+                }),
+                notable_level: exact.map_or("none", |(_timestamp, _population, notability)| {
+                    notable_level(notability.level())
+                }),
+                notable_count: exact.map_or(0, |(_timestamp, _population, notability)| {
+                    notability.count()
+                }),
                 collection: resolved
                     .and_then(|resolved| resolved.collection)
                     .map(collection_status_dto),
@@ -160,8 +170,8 @@ fn resolve_summary(summary: &UiSummaryBlock, at_us: i64, resolved: &mut [Option<
         else {
             continue;
         };
-        let exact = summary.snapshot_state_at(view.code, at_us);
-        let collection = exact.and_then(|(timestamp, _population, _notable)| {
+        let exact = summary.snapshot_notability_at(view.code, at_us);
+        let collection = exact.and_then(|(timestamp, _population, _notability)| {
             summary
                 .collection_state_at(view.code, timestamp)
                 .filter(|(collection_ts, _status)| *collection_ts == timestamp)
@@ -174,6 +184,15 @@ fn resolve_summary(summary: &UiSummaryBlock, at_us: i64, resolved: &mut [Option<
                 status: block_view.status(),
             });
         }
+    }
+}
+
+const fn notable_level(level: NotableLevel) -> &'static str {
+    match level {
+        NotableLevel::None => "none",
+        NotableLevel::Info => "info",
+        NotableLevel::Warning => "warning",
+        NotableLevel::Critical => "critical",
     }
 }
 

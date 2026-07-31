@@ -177,6 +177,7 @@ closed_string_enum! {
         Severity => "severity",
         ProjectionCode => "projection_code",
         SortOrder => "sort_order",
+        FilterExpression => "filter_expression",
         EntityToken => "entity_token",
         ProjectionColumnList => "projection_column_list",
     }

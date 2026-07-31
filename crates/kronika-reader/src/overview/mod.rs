@@ -78,8 +78,8 @@ pub use web_index::{
     CollectionReadState, CollectionStatus, CollectionVisibility, EntityDictionaryEntry,
     EntityMetric, EntitySeries, EntitySeriesBlock, HOST_SIGNALS_IDENTITY_REVISION,
     HOST_SIGNALS_VIEW_CODE, HOST_SIGNALS_VIEW_REVISION, IndexStatus, LOAD_PER_CPU_METRIC_CODE,
-    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, PSI_IO_SOME_METRIC_CODE,
-    SnapshotNeighbors, TimeGrid, UiSummaryBlock, ViewSummary,
+    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, Notability, NotableLevel,
+    PSI_IO_SOME_METRIC_CODE, SnapshotNeighbors, TimeGrid, UiSummaryBlock, ViewSummary,
 };
 pub(crate) use web_index::{read_entity_series, read_ui_summary};
 

@@ -23,6 +23,44 @@ fn first_type_id(section: &str) -> u32 {
         )
 }
 
+fn all_type_ids() -> BTreeSet<u32> {
+    registry()
+        .iter()
+        .map(|contract| contract.type_id.get())
+        .collect()
+}
+
+fn serialized_view<'a>(catalog: &'a serde_json::Value, code: &str) -> &'a serde_json::Value {
+    catalog["views"]
+        .as_array()
+        .expect("catalog views")
+        .iter()
+        .find(|view| view["code"] == code)
+        .unwrap_or_else(|| panic!("catalog view {code}"))
+}
+
+fn assert_serialized_column(catalog: &serde_json::Value, view: &str, column: &str) {
+    assert!(
+        serialized_view(catalog, view)["columns"]
+            .as_array()
+            .expect("catalog columns")
+            .iter()
+            .any(|candidate| candidate["code"] == column),
+        "missing catalog column {view}.{column}"
+    );
+}
+
+fn assert_serialized_preset(catalog: &serde_json::Value, view: &str, preset: &str) {
+    assert!(
+        serialized_view(catalog, view)["presets"]
+            .as_array()
+            .expect("catalog presets")
+            .iter()
+            .any(|candidate| candidate["code"] == preset),
+        "missing catalog preset {view}.{preset}"
+    );
+}
+
 #[test]
 fn catalog_exposes_all_nine_views_in_stable_code_order() {
     let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
@@ -44,6 +82,62 @@ fn catalog_exposes_all_nine_views_in_stable_code_order() {
             (9, "events"),
         ]
     );
+}
+
+#[test]
+fn catalog_contains_every_v5_column_preset_capability_and_reason() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+
+    for (view, columns) in [
+        ("activity", &["backend_type"][..]),
+        (
+            "plans",
+            &["shared_hit", "shared_read", "first_seen", "last_seen"],
+        ),
+        ("tables", &["size", "io_hit_pct", "xid_age", "mxid_age"]),
+        ("indexes", &["size", "io_hit_pct", "last_idx_scan"]),
+        ("vacuum", &["relation", "elapsed"]),
+        ("processes", &["threads"]),
+        (
+            "locks",
+            &[
+                "depth",
+                "root_pid",
+                "blocked_by",
+                "granted",
+                "lock_mode",
+                "lock_type",
+                "wait_or_hold_us",
+            ],
+        ),
+        ("events", &["severity_code", "category_code", "detail"]),
+    ] {
+        for column in columns {
+            assert_serialized_column(&catalog, view, column);
+        }
+    }
+    for (view, preset) in [
+        ("activity", "replication"),
+        ("tables", "size"),
+        ("indexes", "size"),
+    ] {
+        assert_serialized_preset(&catalog, view, preset);
+    }
+
+    for view in catalog["views"].as_array().expect("catalog views") {
+        assert_eq!(view["capabilities"]["detail"], true, "{view}");
+        assert!(view["capabilities"]["history"].is_boolean(), "{view}");
+        assert!(view["capabilities"]["related"].is_boolean(), "{view}");
+    }
+
+    let pss = serialized_view(&catalog, "processes")["columns"]
+        .as_array()
+        .expect("process columns")
+        .iter()
+        .find(|column| column["code"] == "pss")
+        .expect("processes.pss");
+    assert_eq!(pss["unavailable_reason"], "not_collected");
 }
 
 #[test]
@@ -321,6 +415,30 @@ fn process_pss_is_not_collected_even_when_process_input_exists() {
     assert_eq!(pss.availability, Availability::NotCollected);
 }
 
+#[test]
+fn materialization_catalog_enables_known_inputs_but_not_intrinsic_gaps() {
+    let catalog = ProjectionCatalog::for_materialization();
+    let processes = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "processes")
+        .expect("processes view");
+
+    assert!(
+        processes
+            .inputs
+            .iter()
+            .all(|input| input.availability == Availability::Available)
+    );
+    let pss = processes
+        .columns
+        .iter()
+        .find(|column| column.code == "pss")
+        .expect("pss column");
+    assert_eq!(pss.availability, Availability::NotCollected);
+    assert_eq!(pss.unavailable_reason, Some("not_collected"));
+}
+
 #[tokio::test]
 async fn ui_catalog_returns_nine_views_for_the_root() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -328,7 +446,7 @@ async fn ui_catalog_returns_nine_views_for_the_root() {
 
     let response = serve_captured(dir.path(), "/v1/ui/catalog", &[]).await;
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body["revision"], 1);
+    assert_eq!(response.body["revision"], 2);
     assert_eq!(
         response.body["views"].as_array().map(Vec::len),
         Some(9),
@@ -356,6 +474,7 @@ async fn ui_catalog_keeps_pss_not_collected() {
         .and_then(|columns| columns.iter().find(|column| column["code"] == "pss"))
         .expect("processes.pss");
     assert_eq!(pss["availability"], "not_collected");
+    assert_eq!(pss["unavailable_reason"], "not_collected");
 }
 
 #[tokio::test]

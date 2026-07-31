@@ -3,7 +3,7 @@ use super::super::bytes::{ByteReader, ByteWriter};
 use super::super::limits::Bounds;
 use super::{IndexStatus, TimeGrid, bit_is_set, mask_len, validate_mask};
 
-const SUMMARY_REVISION: u16 = 1;
+const SUMMARY_REVISION: u16 = 2;
 
 #[cfg(test)]
 std::thread_local! {
@@ -155,6 +155,81 @@ impl CollectionStatus {
     }
 }
 
+/// Highest server-classified notable level for one exact view snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NotableLevel {
+    /// No notable observations in the snapshot bucket.
+    None,
+    /// Informational evidence that does not require urgent action.
+    Info,
+    /// Actionable degradation or contention evidence.
+    Warning,
+    /// Critical availability, integrity, or capacity evidence.
+    Critical,
+}
+
+impl NotableLevel {
+    const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Info => 1,
+            Self::Warning => 2,
+            Self::Critical => 3,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, BlockError> {
+        match code {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Info),
+            2 => Ok(Self::Warning),
+            3 => Ok(Self::Critical),
+            _ => Err(BlockError::InvalidEnum),
+        }
+    }
+}
+
+/// Stored notable classification for one exact view snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Notability {
+    level: NotableLevel,
+    count: u64,
+}
+
+impl Notability {
+    /// Creates a validated notability pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockError::Malformed`] when `none` has a non-zero count or a
+    /// non-`none` level has a zero count.
+    pub const fn new(level: NotableLevel, count: u64) -> Result<Self, BlockError> {
+        if matches!(
+            (level, count),
+            (NotableLevel::None, 1..)
+                | (
+                    NotableLevel::Info | NotableLevel::Warning | NotableLevel::Critical,
+                    0
+                )
+        ) {
+            return Err(BlockError::Malformed);
+        }
+        Ok(Self { level, count })
+    }
+
+    /// Highest stored notable level.
+    #[must_use]
+    pub const fn level(self) -> NotableLevel {
+        self.level
+    }
+
+    /// Number of notable observations in the snapshot bucket.
+    #[must_use]
+    pub const fn count(self) -> u64 {
+        self.count
+    }
+}
+
 /// Per-snapshot population and collection status of one UI view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewSummary {
@@ -164,6 +239,7 @@ pub struct ViewSummary {
     snapshot_presence: Vec<u8>,
     notable_presence: Vec<u8>,
     populations: Vec<u64>,
+    notability: Vec<Notability>,
     collection_presence: Vec<u8>,
     collections: Vec<CollectionStatus>,
     coverage_mask: Vec<u8>,
@@ -250,6 +326,44 @@ impl ViewSummary {
         collections: Vec<CollectionStatus>,
         bounds: &Bounds,
     ) -> Result<Self, BlockError> {
+        let notability =
+            notability_from_presence(&snapshot_presence, &notable_presence, populations.len())?;
+        Self::new_with_collection_and_notability(
+            view_code,
+            view_revision,
+            status,
+            snapshot_presence,
+            notable_presence,
+            populations,
+            notability,
+            collection_presence,
+            collections,
+            bounds,
+        )
+    }
+
+    /// Creates one view with exact per-snapshot notability and collection status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockError`] for invalid identities, masks, aligned counts, or
+    /// collection state invariants.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments are the complete bounded wire representation of one view"
+    )]
+    pub fn new_with_collection_and_notability(
+        view_code: u16,
+        view_revision: u16,
+        status: IndexStatus,
+        snapshot_presence: Vec<u8>,
+        notable_presence: Vec<u8>,
+        populations: Vec<u64>,
+        notability: Vec<Notability>,
+        collection_presence: Vec<u8>,
+        collections: Vec<CollectionStatus>,
+        bounds: &Bounds,
+    ) -> Result<Self, BlockError> {
         if view_code == 0 || view_revision == 0 {
             return Err(BlockError::Malformed);
         }
@@ -280,7 +394,7 @@ impl ViewSummary {
             .iter()
             .map(|byte| byte.count_ones() as usize)
             .sum::<usize>();
-        if populations.len() != set_bits {
+        if populations.len() != set_bits || notability.len() != set_bits {
             return Err(BlockError::Malformed);
         }
         let collection_bits = collection_presence
@@ -302,6 +416,13 @@ impl ViewSummary {
                     .get(population_index)
                     .copied()
                     .ok_or(BlockError::Malformed)?;
+                let notable = notability
+                    .get(population_index)
+                    .copied()
+                    .ok_or(BlockError::Malformed)?;
+                if bit_is_set(&notable_presence, index) != (notable.level() != NotableLevel::None) {
+                    return Err(BlockError::Malformed);
+                }
                 population_index += 1;
                 Some(value)
             } else {
@@ -325,6 +446,7 @@ impl ViewSummary {
             snapshot_presence,
             notable_presence,
             populations,
+            notability,
             collection_presence,
             collections,
             coverage_mask: Vec::new(),
@@ -367,6 +489,12 @@ impl ViewSummary {
         &self.populations
     }
 
+    /// Notable classifications aligned with `populations`.
+    #[must_use]
+    pub fn notability(&self) -> &[Notability] {
+        &self.notability
+    }
+
     /// Collection-status presence bits over the shared timestamp table.
     #[must_use]
     pub fn collection_presence(&self) -> &[u8] {
@@ -404,6 +532,41 @@ impl ViewSummary {
             .count();
         self.collections.get(collection_index).copied()
     }
+
+    fn notability_at_index(&self, index: usize) -> Option<Notability> {
+        if !bit_is_set(&self.snapshot_presence, index) {
+            return None;
+        }
+        let population_index = (0..index)
+            .filter(|candidate| bit_is_set(&self.snapshot_presence, *candidate))
+            .count();
+        self.notability.get(population_index).copied()
+    }
+}
+
+fn notability_from_presence(
+    snapshot_presence: &[u8],
+    notable_presence: &[u8],
+    population_count: usize,
+) -> Result<Vec<Notability>, BlockError> {
+    let mut result = Vec::with_capacity(population_count);
+    let mask_bits = snapshot_presence
+        .len()
+        .checked_mul(8)
+        .ok_or(BlockError::AboveBound)?;
+    for index in 0..mask_bits {
+        if bit_is_set(snapshot_presence, index) {
+            result.push(if bit_is_set(notable_presence, index) {
+                Notability::new(NotableLevel::Warning, 1)?
+            } else {
+                Notability::new(NotableLevel::None, 0)?
+            });
+        }
+    }
+    if result.len() != population_count {
+        return Err(BlockError::Malformed);
+    }
+    Ok(result)
 }
 
 /// Shared snapshot-time index and exact populations for all UI views.
@@ -590,20 +753,23 @@ impl UiSummaryBlock {
             let population_capacity =
                 usize::try_from(population_count).map_err(|_error| BlockError::AboveBound)?;
             let mut populations = Vec::with_capacity(population_capacity);
+            let mut notability = Vec::with_capacity(population_capacity);
             for _ in 0..population_count {
                 populations.push(reader.uvarint(u64::MAX)?);
+                notability.push(decode_notability(&mut reader)?);
             }
             let (collection_presence, collections) =
                 decode_collections(&mut reader, presence_len, snapshot_times.len())?;
             let coverage = reader.take(coverage_len)?.to_vec();
             validate_mask(&coverage, usize::from(grid.bucket_count()))?;
-            views.push(ViewSummary::new_with_collection(
+            views.push(ViewSummary::new_with_collection_and_notability(
                 view_code,
                 view_revision,
                 status,
                 presence,
                 notable,
                 populations,
+                notability,
                 collection_presence,
                 collections,
                 bounds,
@@ -687,6 +853,23 @@ impl UiSummaryBlock {
     /// Last exact snapshot timestamp, population, and notable state.
     #[must_use]
     pub fn snapshot_state_at(&self, view_code: u16, at_us: i64) -> Option<(i64, u64, bool)> {
+        self.snapshot_notability_at(view_code, at_us)
+            .map(|(timestamp, population, notability)| {
+                (
+                    timestamp,
+                    population,
+                    notability.level() != NotableLevel::None,
+                )
+            })
+    }
+
+    /// Last exact snapshot timestamp, population, and stored notability.
+    #[must_use]
+    pub fn snapshot_notability_at(
+        &self,
+        view_code: u16,
+        at_us: i64,
+    ) -> Option<(i64, u64, Notability)> {
         let view = self
             .views
             .binary_search_by_key(&view_code, ViewSummary::view_code)
@@ -696,12 +879,9 @@ impl UiSummaryBlock {
             .snapshot_times
             .partition_point(|timestamp| *timestamp <= at_us);
         (0..upper).rev().find_map(|index| {
-            view.population_at_index(index).map(|population| {
-                (
-                    self.snapshot_times[index],
-                    population,
-                    bit_is_set(&view.notable_presence, index),
-                )
+            view.population_at_index(index).and_then(|population| {
+                view.notability_at_index(index)
+                    .map(|notability| (self.snapshot_times[index], population, notability))
             })
         })
     }
@@ -754,6 +934,11 @@ impl UiSummaryBlock {
                 .checked_add(view.snapshot_presence.capacity())?
                 .checked_add(view.notable_presence.capacity())?
                 .checked_add(view.populations.capacity().checked_mul(size_of::<u64>())?)?
+                .checked_add(
+                    view.notability
+                        .capacity()
+                        .checked_mul(size_of::<Notability>())?,
+                )?
                 .checked_add(view.collection_presence.capacity())?
                 .checked_add(
                     view.collections
@@ -797,8 +982,10 @@ impl UiSummaryBlock {
             writer.bytes(&view.snapshot_presence);
             writer.bytes(&view.notable_presence);
             writer.u32_le(len_u32(view.populations.len()));
-            for population in &view.populations {
+            for (population, notability) in view.populations.iter().zip(&view.notability) {
                 writer.uvarint(*population);
+                writer.u8(notability.level().code());
+                writer.uvarint(notability.count());
             }
             writer.bytes(&view.collection_presence);
             for collection in &view.collections {
@@ -852,6 +1039,13 @@ fn read_optional_uvarint(reader: &mut ByteReader<'_>) -> Result<Option<u64>, Blo
     }
 }
 
+fn decode_notability(reader: &mut ByteReader<'_>) -> Result<Notability, BlockError> {
+    Notability::new(
+        NotableLevel::from_code(reader.u8()?)?,
+        reader.uvarint(u64::MAX)?,
+    )
+}
+
 fn decode_collections(
     reader: &mut ByteReader<'_>,
     presence_len: usize,
@@ -879,8 +1073,8 @@ fn decode_collections(
 mod tests {
     use super::super::{IndexStatus, TimeGrid};
     use super::{
-        CollectionReadState, CollectionStatus, CollectionVisibility, ENCODE_BODY_CALLS,
-        SnapshotNeighbors, UiSummaryBlock, ViewSummary,
+        CollectionReadState, CollectionStatus, CollectionVisibility, ENCODE_BODY_CALLS, Notability,
+        NotableLevel, SnapshotNeighbors, UiSummaryBlock, ViewSummary,
     };
     use crate::overview::block::BlockError;
     use crate::overview::bytes::ByteWriter;
@@ -908,7 +1102,7 @@ mod tests {
 
     fn raw_summary_body(collection_mask: u8, read_state: u8, visibility: u8) -> Vec<u8> {
         let mut writer = ByteWriter::new();
-        writer.u16_le(1);
+        writer.u16_le(2);
         writer.i64_le(0);
         writer.u32_le(60);
         writer.u16_le(1);
@@ -922,6 +1116,8 @@ mod tests {
         writer.u8(0);
         writer.u32_le(1);
         writer.uvarint(500);
+        writer.u8(NotableLevel::None.code());
+        writer.uvarint(0);
         writer.u8(collection_mask);
         writer.uvarint(500);
         writer.u8(1);
@@ -1002,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_summary_revision_one_round_trips_collection_and_rejects_old_layout() {
+    fn ui_summary_revision_two_round_trips_collection_and_notability() {
         let status = CollectionStatus::new(
             500,
             Some(4_800),
@@ -1035,9 +1231,17 @@ mod tests {
         .expect("summary");
         let body = block.encode_body();
 
-        assert_eq!(u16::from_le_bytes([body[0], body[1]]), 1);
-        let decoded = UiSummaryBlock::decode(&body, &LIMIT).expect("revision one");
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), 2);
+        let decoded = UiSummaryBlock::decode(&body, &LIMIT).expect("revision two");
         assert_eq!(decoded.collection_state_at(1, 100), Some((100, status)));
+        assert_eq!(
+            decoded.snapshot_notability_at(1, 100),
+            Some((
+                100,
+                500,
+                Notability::new(NotableLevel::None, 0).expect("notability"),
+            ))
+        );
 
         assert!(
             UiSummaryBlock::decode(&old_summary_body_without_collection(), &LIMIT).is_err(),
@@ -1179,7 +1383,7 @@ mod tests {
             CollectionReadState::SourceLimit.code(),
             CollectionVisibility::Full.code(),
         );
-        unknown_revision[..2].copy_from_slice(&2_u16.to_le_bytes());
+        unknown_revision[..2].copy_from_slice(&3_u16.to_le_bytes());
         assert_eq!(
             UiSummaryBlock::decode(&unknown_revision, &LIMIT),
             Err(BlockError::InvalidEnum)
@@ -1361,6 +1565,7 @@ mod tests {
                     view.snapshot_presence.capacity()
                         + view.notable_presence.capacity()
                         + view.populations.capacity() * size_of::<u64>()
+                        + view.notability.capacity() * size_of::<Notability>()
                         + view.collection_presence.capacity()
                         + view.collections.capacity() * size_of::<CollectionStatus>()
                         + view.coverage_mask.capacity()

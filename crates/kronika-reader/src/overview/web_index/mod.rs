@@ -10,8 +10,8 @@ pub use series::{
     MetricAggregation, MetricStatus,
 };
 pub use summary::{
-    CollectionReadState, CollectionStatus, CollectionVisibility, SnapshotNeighbors, UiSummaryBlock,
-    ViewSummary,
+    CollectionReadState, CollectionStatus, CollectionVisibility, Notability, NotableLevel,
+    SnapshotNeighbors, UiSummaryBlock, ViewSummary,
 };
 
 use super::block::BlockError;

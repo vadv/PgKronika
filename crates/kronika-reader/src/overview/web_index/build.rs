@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kronika_analytics::overview::{EventObservation, NotablePolicy};
+use kronika_analytics::overview::{EventObservation, NotableClass, NotablePolicy};
 use kronika_analytics::web_projection::{
     WebAggregation, WebFormula, WebInput, WebMetric, WebView, web_views,
 };
@@ -22,8 +22,8 @@ use super::{
     CollectionReadState, CollectionStatus, CollectionVisibility, EntityDictionaryEntry,
     EntityMetric, EntitySeries, EntitySeriesBlock, HOST_SIGNALS_IDENTITY_REVISION,
     HOST_SIGNALS_VIEW_CODE, HOST_SIGNALS_VIEW_REVISION, IndexStatus, LOAD_PER_CPU_METRIC_CODE,
-    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, PSI_IO_SOME_METRIC_CODE, TimeGrid,
-    UiSummaryBlock, ViewSummary, mask_len,
+    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, Notability, NotableLevel,
+    PSI_IO_SOME_METRIC_CODE, TimeGrid, UiSummaryBlock, ViewSummary, mask_len,
 };
 use crate::{Dictionary, PgmBodyReadStats, PgmUnit, Resolved};
 
@@ -636,11 +636,20 @@ fn build_summary(
     let mut all_times = BTreeSet::new();
     let mut inputs = Vec::with_capacity(web_views().len());
     let notable_policy = NotablePolicy::v1();
-    let notable_buckets = observations
-        .iter()
-        .filter(|observation| notable_policy.classify(observation).is_some())
-        .filter_map(|observation| grid.bucket_index(observation.time().sort_ts_us))
-        .collect::<BTreeSet<_>>();
+    let mut notable_buckets = BTreeMap::<usize, (NotableLevel, u64)>::new();
+    for observation in observations {
+        let Some(class) = notable_policy.classify(observation) else {
+            continue;
+        };
+        let Some(bucket) = grid.bucket_index(observation.time().sort_ts_us) else {
+            continue;
+        };
+        let entry = notable_buckets
+            .entry(bucket)
+            .or_insert((NotableLevel::None, 0));
+        entry.0 = entry.0.max(notable_level(class));
+        entry.1 = entry.1.checked_add(1).ok_or(BuildError::Overflow)?;
+    }
     for view in web_views() {
         let mut populations = BTreeMap::<i64, u64>::new();
         let mut population_types = BTreeMap::<i64, u32>::new();
@@ -720,17 +729,23 @@ fn build_summary(
         let mut notable = vec![0_u8; presence.len()];
         let mut collection_presence = vec![0_u8; presence.len()];
         let mut populations = Vec::with_capacity(input.populations.len());
+        let mut notability = Vec::with_capacity(input.populations.len());
         let mut collections = Vec::with_capacity(input.collections.len());
         for (index, ts) in snapshot_times.iter().enumerate() {
             if let Some(population) = input.populations.get(ts) {
                 presence[index / 8] |= 1 << (index % 8);
-                if grid
+                let state = grid
                     .bucket_index(*ts)
-                    .is_some_and(|bucket| notable_buckets.contains(&bucket))
-                {
+                    .and_then(|bucket| notable_buckets.get(&bucket).copied())
+                    .map_or(Notability::new(NotableLevel::None, 0), |(level, count)| {
+                        Notability::new(level, count)
+                    })
+                    .map_err(block_build_error)?;
+                if state.level() != NotableLevel::None {
                     notable[index / 8] |= 1 << (index % 8);
                 }
                 populations.push(*population);
+                notability.push(state);
             }
             if let Some(collection) = input.collections.get(ts) {
                 collection_presence[index / 8] |= 1 << (index % 8);
@@ -738,13 +753,14 @@ fn build_summary(
             }
         }
         views.push(
-            ViewSummary::new_with_collection(
+            ViewSummary::new_with_collection_and_notability(
                 input.view_code,
                 input.view_revision,
                 input.status,
                 presence,
                 notable,
                 populations,
+                notability,
                 collection_presence,
                 collections,
                 bounds,
@@ -755,6 +771,27 @@ fn build_summary(
     let summary =
         UiSummaryBlock::new(grid, snapshot_times, views, bounds).map_err(block_build_error)?;
     Ok((summary, inputs))
+}
+
+const fn notable_level(class: NotableClass) -> NotableLevel {
+    match class {
+        NotableClass::Panic
+        | NotableClass::DiskFull
+        | NotableClass::OutOfMemory
+        | NotableClass::IntegrityError
+        | NotableClass::OomKill
+        | NotableClass::FilesystemCapacityZero => NotableLevel::Critical,
+        NotableClass::ChildSigkill
+        | NotableClass::ChildSignalTermination
+        | NotableClass::ConnectionSlotsExhausted
+        | NotableClass::Deadlock
+        | NotableClass::LockNotAvailable
+        | NotableClass::SerializationFailure => NotableLevel::Warning,
+        NotableClass::QueryCancelled
+        | NotableClass::AuthenticationFailure
+        | NotableClass::AuthorizationFailure
+        | NotableClass::PermissionDenied => NotableLevel::Info,
+    }
 }
 
 fn build_view_series(

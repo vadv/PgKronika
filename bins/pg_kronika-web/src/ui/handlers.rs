@@ -97,7 +97,7 @@ pub(crate) async fn entity(
     Path((view, encoded_entity)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response<Body>, ApiError> {
-    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let catalog = ProjectionCatalog::for_materialization();
     let request = EntityRequest::parse(&view, &encoded_entity, raw.as_deref(), &catalog)?;
     let snapshot = state.snapshot();
     let result = tokio::task::spawn_blocking(move || {
@@ -518,6 +518,7 @@ fn spine_error(error: SpineError) -> ApiError {
         ("at" = i64, Query),
         ("span" = Option<String>, Query),
         ("preset" = Option<String>, Query),
+        ("columns" = Option<String>, Query),
         ("database" = Option<String>, Query),
         ("q" = Option<String>, Query),
         ("sort" = Option<String>, Query),
@@ -539,7 +540,7 @@ pub(crate) async fn frame(
     Path(view): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response<Body>, ApiError> {
-    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let catalog = ProjectionCatalog::for_materialization();
     let request = FrameRequest::parse(&view, raw.as_deref(), &catalog)?;
     let (snapshot, descriptor_view) = state.overview_request_view();
     let live = Arc::clone(descriptor_view.live());

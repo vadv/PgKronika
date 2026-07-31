@@ -194,6 +194,10 @@ const ACTIVITY_INPUTS: &[WebInput] = &[
         code: "process",
         sections: &["os_process"],
     },
+    WebInput {
+        code: "replication_replicas",
+        sections: &["pg_stat_replication"],
+    },
 ];
 const STATEMENTS_INPUTS: &[WebInput] = &[
     WebInput {
@@ -217,14 +221,26 @@ const INDEXES_INPUTS: &[WebInput] = &[WebInput {
     code: "indexes",
     sections: &["pg_stat_user_indexes"],
 }];
-const VACUUM_INPUTS: &[WebInput] = &[WebInput {
-    code: "vacuum",
-    sections: &["pg_stat_progress_vacuum"],
-}];
-const PROCESS_INPUTS: &[WebInput] = &[WebInput {
-    code: "process",
-    sections: &["os_process"],
-}];
+const VACUUM_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "vacuum",
+        sections: &["pg_stat_progress_vacuum"],
+    },
+    WebInput {
+        code: "tables",
+        sections: &["pg_stat_user_tables"],
+    },
+];
+const PROCESS_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "process",
+        sections: &["os_process"],
+    },
+    WebInput {
+        code: "cgroup_mapping",
+        sections: &["os_cgroup_mapping"],
+    },
+];
 const LOCK_INPUTS: &[WebInput] = &[WebInput {
     code: "locks",
     sections: &["pg_locks"],
