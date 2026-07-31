@@ -102,6 +102,12 @@
 }
 
 /* Base rhythm: sans chrome, comfortable line height, focus ring, skeleton. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
 body {
   font-family: var(--ui-font);
   font-size: var(--text-md);

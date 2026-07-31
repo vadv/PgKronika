@@ -95,6 +95,7 @@ const dockStyle = {
   color: "var(--fg)",
   fontFamily: "var(--ui-font)",
   overflowY: "auto",
+  overflowX: "hidden",
   zIndex: 10,
   padding: "12px",
 } as const;
@@ -165,6 +166,8 @@ function FindingCard(props: {
                 borderRadius: "4px",
                 padding: "0 4px",
                 color: "var(--fg-dim)",
+                overflowWrap: "anywhere",
+                maxWidth: "100%",
               }}
             >
               {e}
@@ -218,7 +221,13 @@ function IncidentDetail(props: {
       >
         {t("dock.incidents.back")}
       </button>
-      <div style={{ fontFamily: "var(--mono-font)", marginBlockEnd: "4px" }}>
+      <div
+        style={{
+          fontFamily: "var(--mono-font)",
+          marginBlockEnd: "4px",
+          overflowWrap: "anywhere",
+        }}
+      >
         {incident.incident_key}
       </div>
       <div
@@ -572,8 +581,7 @@ function RowDock(props: {
         style={{
           fontFamily: "var(--mono-font)",
           marginBlockEnd: "8px",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
+          overflowWrap: "anywhere",
         }}
       >
         {viewCode} · {props.state.entity ?? "—"}
