@@ -2,8 +2,11 @@ RUST_TOOLCHAIN ?= 1.96.0
 TARGET ?= $(shell rustc +$(RUST_TOOLCHAIN) -vV | sed -n 's/^host: //p')
 CARGO_BUILD = cargo +$(RUST_TOOLCHAIN) build --locked --target $(TARGET)
 SCHEMATHESIS_VERSION ?= 4.24.3
+# The reproducible tarball needs GNU tar: --sort=name is not in bsdtar, which is
+# what macOS ships as `tar`. `brew install gnu-tar` provides gtar.
+TAR ?= $(shell command -v gtar 2>/dev/null || echo tar)
 
-.PHONY: build collector web dump openapi openapi-bundle test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
+.PHONY: build collector web web-frontend web-frontend-check web-bundle-budget web-codegen dump openapi openapi-bundle openapi-lint test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
 
 build: ## Build collector, web, and dump for the selected target.
 	@$(CARGO_BUILD) -p pg_kronika-collector -p pg_kronika-web -p pg_kronika-dump
@@ -13,6 +16,26 @@ collector: ## Build pg_kronika-collector.
 
 web: ## Build pg_kronika-web.
 	@$(CARGO_BUILD) -p pg_kronika-web
+
+web-frontend: ## Install, build the SPA and pack deterministic static.tar.gz for rust-embed.
+	cd web && npm ci && npm run build
+	$(TAR) --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --exclude='*.map' \
+		-czf bins/pg_kronika-web/static.tar.gz -C bins/pg_kronika-web/static .
+
+web-frontend-check: ## Typecheck, lint, format-check and test the SPA without building.
+	cd web && npm ci && npm run typecheck && npm run lint && npm run format:check && npm run test
+
+# The SPA tarball is embedded into the web binary shipped to DB hosts, so its
+# size is a contract, not a coincidence. Bump deliberately, with the PR.
+WEB_BUNDLE_BUDGET_BYTES ?= 262144
+
+web-bundle-budget: ## Fail if the committed static.tar.gz exceeds the size budget.
+	@size=$$(wc -c < bins/pg_kronika-web/static.tar.gz | tr -d ' '); \
+	if [ "$$size" -gt "$(WEB_BUNDLE_BUDGET_BYTES)" ]; then \
+		echo "static.tar.gz is $$size bytes, over the $(WEB_BUNDLE_BUDGET_BYTES) budget"; \
+		exit 1; \
+	fi; \
+	echo "static.tar.gz is $$size bytes (budget $(WEB_BUNDLE_BUDGET_BYTES))"
 
 dump: ## Build pg_kronika-dump.
 	@$(CARGO_BUILD) -p pg_kronika-dump
@@ -27,6 +50,14 @@ openapi-bundle: ## Export an on-demand single-file OpenAPI bundle under target/.
 	@cargo +$(RUST_TOOLCHAIN) run --locked --target $(TARGET) \
 		-p pg_kronika-web --example export_openapi -- \
 		--bundle target/pg-kronika-openapi.yaml
+
+openapi-lint: ## Bundle the spec and lint it with Spectral (needs node/npx).
+	@$(MAKE) --no-print-directory openapi-bundle
+	cd web && npx --yes @stoplight/spectral-cli@6.16.2 lint \
+		../target/pg-kronika-openapi.yaml --ruleset ../.spectral.yaml
+
+web-codegen: ## Regenerate SPA TypeScript types from the committed OpenAPI tree.
+	cd web && npm ci && npm run codegen
 
 test-bdd: ## Run BDD through Docker/Nix. Optional: DEBUG=1 make test-bdd TAGS=@pg_log
 	@TAGS="$(TAGS)" DEBUG="$(DEBUG)" scripts/test-bdd-local.sh

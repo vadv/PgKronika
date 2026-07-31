@@ -95,9 +95,9 @@
 
         commonArgs = {
           # Cargo-source filtering keeps only .rs files and manifests, which
-          # drops the web UI assets rust-embed compiles into the binary; the
-          # declared target directories are pinned too so a filter change
-          # cannot make a workspace manifest invalid.
+          # drops the web UI asset tarball rust-embed compiles into the
+          # binary; the declared target directories are pinned too so a
+          # filter change cannot make a workspace manifest invalid.
           src = pkgs.lib.fileset.toSource {
             root = ./.;
             # maybeMissing: the BDD builder context carries only manifests and
@@ -107,7 +107,7 @@
               (pkgs.lib.fileset.maybeMissing ./crates/kronika-reader/benches)
               (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/benches)
               (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/examples)
-              (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/static)
+              (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/static.tar.gz)
             ];
           };
           strictDeps = true;

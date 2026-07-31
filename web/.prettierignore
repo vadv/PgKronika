@@ -1,0 +1,7 @@
+# Generated from the OpenAPI tree by `npm run codegen`; hand-formatting is
+# overwritten on regeneration and the CI freshness gate compares verbatim.
+src/api/schema.d.ts
+package-lock.json
+# Build and test artifacts.
+coverage
+dist

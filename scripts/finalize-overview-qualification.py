@@ -16,6 +16,7 @@ CI_JOBS = (
     "coverage",
     "overview-qualification",
     "bdd-matrix",
+    "frontend",
 )
 
 BDD_SCENARIOS = [
