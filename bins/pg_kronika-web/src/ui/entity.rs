@@ -8,7 +8,7 @@ use std::fmt;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::web_projection::{WebView, web_view_by_name};
-use kronika_reader::{Gap, LIMIT, LocalDirSnapshot, WebIndexReadError};
+use kronika_reader::{Gap, LocalDirSnapshot, WebIndexReadError};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
@@ -17,6 +17,7 @@ use self::cursor::EntityHistoryCursor;
 use super::catalog::{Availability, ColumnSpec, ProjectionCatalog};
 use super::frame::dto::FrameValue;
 use super::frame::projection::{FrameError, FrameLimits, FrameQuality, project_entity_at};
+use super::snapshot::read_summary_tolerant;
 use crate::api_error::{
     ApiError, ExpectedValue, InvalidParameterLocation, LimitResource, QueryConstraint,
     QueryParameter, count_u64,
@@ -451,26 +452,59 @@ fn entity_history(
                 .expect("admission validated history columns")
         })
         .collect::<Vec<_>>();
+    // The predecessor of the first in-window snapshot may live one segment
+    // earlier; the expansion keeps it inside the 32-segment admission.
+    let expanded_from = args
+        .from_us
+        .saturating_sub(request.view.max_rate_gap_us.unwrap_or(0));
     let descriptors = snapshot
         .sealed_descriptors()
-        .filter(|descriptor| descriptor.max_ts >= args.from_us && descriptor.min_ts < args.to_us)
+        .filter(|descriptor| descriptor.max_ts >= expanded_from && descriptor.min_ts < args.to_us)
         .collect::<Vec<_>>();
     if descriptors.len() > MAX_HISTORY_SEGMENTS {
         return Err(EntityError::SelectedSegments {
             observed: descriptors.len(),
         });
     }
+    // The grid is the view's own presence bitmap: a scheduled miss of the
+    // view's collection interval never becomes a row, let alone a gap.
     let mut timestamps = BTreeSet::new();
-    for descriptor in descriptors {
-        let (summary, _stats) = snapshot.read_ui_summary(&descriptor, &LIMIT)?;
+    let mut combined_quality = FrameQuality::default();
+    for descriptor in &descriptors {
+        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
+            continue;
+        };
+        let Some(view_summary) = summary
+            .views()
+            .iter()
+            .find(|candidate| candidate.view_code() == request.view.code)
+        else {
+            continue;
+        };
         timestamps.extend(
             summary
                 .snapshot_times()
                 .iter()
                 .copied()
-                .filter(|timestamp| *timestamp >= args.from_us && *timestamp < args.to_us),
+                .enumerate()
+                .filter(|(index, timestamp)| {
+                    *timestamp >= args.from_us
+                        && *timestamp < args.to_us
+                        && view_summary
+                            .snapshot_presence()
+                            .get(index / 8)
+                            .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
+                })
+                .map(|(_index, timestamp)| timestamp),
         );
     }
+    // True producer gaps are coverage holes in the admitted sealed span.
+    combined_quality.gaps.extend(coverage_gaps(
+        &descriptors,
+        args.from_us,
+        args.to_us,
+        request.view.max_rate_gap_us,
+    ));
     if let Some(cursor) = args.cursor {
         timestamps.retain(|timestamp| *timestamp > cursor.last_ts_us());
     }
@@ -480,7 +514,6 @@ fn entity_history(
         .collect::<Vec<_>>();
     let has_more = selected.len() > args.limit;
     let mut snapshots = Vec::with_capacity(selected.len().min(args.limit));
-    let mut combined_quality = FrameQuality::default();
     for timestamp in selected.iter().take(args.limit).copied() {
         let projected = project_entity_at(
             snapshot,
@@ -493,7 +526,8 @@ fn entity_history(
             FrameLimits::default(),
         )?;
         merge_quality(&mut combined_quality, &projected.quality);
-        if projected.snapshot_ts_us != projected.requested_ts_us || projected.row.is_none() {
+        if projected.snapshot_ts_us != projected.requested_ts_us {
+            // Defensive: the presence grid resolves exactly by construction.
             combined_quality.gaps.push(Gap {
                 from: timestamp,
                 to: timestamp,
@@ -506,7 +540,17 @@ fn entity_history(
             });
             continue;
         }
-        let row = projected.row.expect("checked entity row");
+        let Some(row) = projected.row else {
+            // The view was collected at this snapshot; the entity itself is
+            // absent (top-N eviction, exited process) — not a producer gap.
+            snapshots.push(EntitySnapshotDto {
+                ts_us: timestamp.to_string(),
+                values: vec![FrameValue::Null; columns.len()],
+                statuses: vec!["unavailable"; columns.len()],
+                reasons: vec![Some("not_observed"); columns.len()],
+            });
+            continue;
+        };
         let mut values = Vec::with_capacity(columns.len());
         let mut statuses = Vec::with_capacity(columns.len());
         let mut reasons = Vec::with_capacity(columns.len());
@@ -546,12 +590,6 @@ fn entity_history(
     } else {
         None
     };
-    if snapshots.is_empty() {
-        combined_quality.gaps.push(Gap {
-            from: args.from_us,
-            to: args.to_us,
-        });
-    }
     Ok(EntityHistoryResponse {
         mode: "history",
         view: request.view.name,
@@ -561,6 +599,42 @@ fn entity_history(
         page: EntityPageDto { next },
         quality: quality_dto(&combined_quality),
     })
+}
+
+/// Producer gaps are coverage holes in the admitted sealed span, wider than
+/// the view's rate tolerance; rollover seams and a still-open tail are not gaps.
+fn coverage_gaps(
+    descriptors: &[kronika_reader::SegmentDescriptor],
+    from_us: i64,
+    to_us: i64,
+    max_rate_gap_us: Option<i64>,
+) -> Vec<Gap> {
+    let tolerance = max_rate_gap_us.unwrap_or(0);
+    let mut spans = descriptors
+        .iter()
+        .map(|descriptor| (descriptor.min_ts, descriptor.max_ts))
+        .collect::<Vec<_>>();
+    spans.sort_unstable();
+    let mut gaps = Vec::new();
+    let mut covered_to = from_us;
+    for (minimum, maximum) in spans {
+        let start = minimum.max(from_us);
+        let end = maximum.saturating_add(1).min(to_us);
+        if start > covered_to && start - covered_to > tolerance {
+            gaps.push(Gap {
+                from: covered_to,
+                to: start,
+            });
+        }
+        covered_to = covered_to.max(end);
+    }
+    if to_us - covered_to > tolerance {
+        gaps.push(Gap {
+            from: covered_to,
+            to: to_us,
+        });
+    }
+    gaps
 }
 
 fn catalog_view<'a>(

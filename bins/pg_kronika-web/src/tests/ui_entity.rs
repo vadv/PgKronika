@@ -317,11 +317,11 @@ async fn entity_point_for_absent_identity_returns_entity_not_found() {
 }
 
 #[tokio::test]
-async fn entity_history_tiles_snapshots_without_duplicates_and_preserves_null_reasons() {
+async fn entity_history_tiles_view_snapshots_without_duplicates() {
     let directory = entity_fixture();
     let entity = frame_entity_token(directory.path()).await;
     let uri =
-        format!("/v1/entity/statements/{entity}?from=1000&to=2001&columns=queryid,calls&limit=2");
+        format!("/v1/entity/statements/{entity}?from=1000&to=2001&columns=queryid,calls&limit=1");
 
     let (status, first) = serve(directory.path(), &uri).await;
     assert_eq!(status, StatusCode::OK);
@@ -332,10 +332,8 @@ async fn entity_history_tiles_snapshots_without_duplicates_and_preserves_null_re
             .iter()
             .map(|snapshot| snapshot["ts_us"].as_str().expect("timestamp"))
             .collect::<Vec<_>>(),
-        ["1000", "1500"]
+        ["1000"]
     );
-    assert_eq!(first["snapshots"][1]["statuses"][0], "unavailable");
-    assert_eq!(first["snapshots"][1]["reasons"][0], "producer_gap");
     let cursor = first["page"]["next"].as_str().expect("history cursor");
 
     let second_uri = format!("{uri}&cursor={cursor}");
@@ -345,11 +343,34 @@ async fn entity_history_tiles_snapshots_without_duplicates_and_preserves_null_re
     assert_eq!(second["page"]["next"], serde_json::Value::Null);
 
     let mismatch = format!(
-        "/v1/entity/statements/{entity}?from=1000&to=2001&columns=queryid&limit=2&cursor={cursor}"
+        "/v1/entity/statements/{entity}?from=1000&to=2001&columns=queryid&limit=1&cursor={cursor}"
     );
     let (status, body) = serve(directory.path(), &mismatch).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "cursor_query_mismatch");
+}
+
+#[tokio::test]
+async fn entity_history_marks_absent_entity_not_observed_without_producer_gap() {
+    let directory = entity_fixture();
+    let uri = format!(
+        "/v1/entity/statements/{}?from=1000&to=2001&columns=queryid&limit=10",
+        token(1)
+    );
+    let (status, body) = serve(directory.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["snapshots"]
+            .as_array()
+            .expect("snapshots")
+            .iter()
+            .map(|snapshot| snapshot["ts_us"].as_str().expect("timestamp"))
+            .collect::<Vec<_>>(),
+        ["1000", "2000"]
+    );
+    assert_eq!(body["snapshots"][0]["statuses"][0], "unavailable");
+    assert_eq!(body["snapshots"][0]["reasons"][0], "not_observed");
+    assert_eq!(body["quality"]["gaps"], serde_json::json!([]));
 }
 
 #[tokio::test]

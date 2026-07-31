@@ -379,7 +379,7 @@ pub(crate) fn project_entity_at(
         snapshot,
         view,
         columns_require_predecessor(view, columns),
-        true,
+        false,
         limits,
         &resolved,
         neighbors,
