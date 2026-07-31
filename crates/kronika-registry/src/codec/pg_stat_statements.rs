@@ -18,19 +18,21 @@
 //!   `jit_deform_time`, and the `stats_since`/`minmax_stats_since` timestamps;
 //! - 1.12 (PG18) added `wal_buffers_full` and the parallel-worker counters.
 //!
-//! `queryid` and `query` are nullable: `queryid` is `NULL` when
-//! `compute_query_id` is off, and `query` is `NULL` for a caller without the
-//! privilege to read another role's statement text. Timing columns are `f64`, so
-//! the layouts derive `PartialEq` but not `Eq`.
+//! `queryid` and `query` are nullable. `queryid` is `NULL` when `PostgreSQL`
+//! masks another role's identity. The numeric production collector calls
+//! `pg_stat_statements(false)` and always writes `query` as `NULL`; the
+//! nullable field remains part of the section schema. Timing columns are
+//! `f64`, so the layouts derive `PartialEq` but not `Eq`.
 
 use crate::{Section, StrId, Ts};
 
 /// Type `1_002_006`: `pg_stat_statements` on extension 1.12 (PG18).
 ///
 /// One row per `(userid, dbid, queryid, toplevel)`. Adds `wal_buffers_full` and
-/// the parallel-worker counters over [`PgStatStatementsV5`]. `queryid` and
-/// `query` are `None` when unavailable (see the module docs). The planning and
-/// JIT columns are `0` when `track_planning` or JIT is off, not `NULL`.
+/// the parallel-worker counters over [`PgStatStatementsV5`]. `queryid` can be
+/// `None`; the production collector always writes `query` as `None` (see the
+/// module docs). The planning and JIT columns are `0` when `track_planning` or
+/// JIT is off, not `NULL`.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_002_006,
@@ -43,7 +45,7 @@ pub struct PgStatStatementsV6 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
     #[column(t)]
     pub ts: Ts,
-    /// Query id; `None` when `compute_query_id` is off.
+    /// Query id; `None` when unavailable or privilege-masked.
     #[column(l)]
     pub queryid: Option<i64>,
     /// Role oid the statement ran as.
@@ -61,7 +63,7 @@ pub struct PgStatStatementsV6 {
     /// Role name resolved from `userid`; `None` when `userid` has no `pg_roles` row.
     #[column(l)]
     pub usename: Option<StrId>,
-    /// Statement text, truncated to 5000 bytes; `None` on insufficient privilege.
+    /// Statement text; the production collector writes `None`.
     #[column(l)]
     pub query: Option<StrId>,
     /// Times the statement was executed.
@@ -223,7 +225,7 @@ pub struct PgStatStatementsV5 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
     #[column(t)]
     pub ts: Ts,
-    /// Query id; `None` when `compute_query_id` is off.
+    /// Query id; `None` when unavailable or privilege-masked.
     #[column(l)]
     pub queryid: Option<i64>,
     /// Role oid the statement ran as.
@@ -241,7 +243,7 @@ pub struct PgStatStatementsV5 {
     /// Role name resolved from `userid`; `None` when `userid` has no `pg_roles` row.
     #[column(l)]
     pub usename: Option<StrId>,
-    /// Statement text, truncated to 5000 bytes; `None` on insufficient privilege.
+    /// Statement text; the production collector writes `None`.
     #[column(l)]
     pub query: Option<StrId>,
     /// Times the statement was executed.
@@ -396,7 +398,7 @@ pub struct PgStatStatementsV4 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
     #[column(t)]
     pub ts: Ts,
-    /// Query id; `None` when `compute_query_id` is off.
+    /// Query id; `None` when unavailable or privilege-masked.
     #[column(l)]
     pub queryid: Option<i64>,
     /// Role oid the statement ran as.
@@ -414,7 +416,7 @@ pub struct PgStatStatementsV4 {
     /// Role name resolved from `userid`; `None` when `userid` has no `pg_roles` row.
     #[column(l)]
     pub usename: Option<StrId>,
-    /// Statement text, truncated to 5000 bytes; `None` on insufficient privilege.
+    /// Statement text; the production collector writes `None`.
     #[column(l)]
     pub query: Option<StrId>,
     /// Times the statement was executed.
@@ -549,7 +551,7 @@ pub struct PgStatStatementsV3 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
     #[column(t)]
     pub ts: Ts,
-    /// Query id; `None` when `compute_query_id` is off.
+    /// Query id; `None` when unavailable or privilege-masked.
     #[column(l)]
     pub queryid: Option<i64>,
     /// Role oid the statement ran as.
@@ -567,7 +569,7 @@ pub struct PgStatStatementsV3 {
     /// Role name resolved from `userid`; `None` when `userid` has no `pg_roles` row.
     #[column(l)]
     pub usename: Option<StrId>,
-    /// Statement text, truncated to 5000 bytes; `None` on insufficient privilege.
+    /// Statement text; the production collector writes `None`.
     #[column(l)]
     pub query: Option<StrId>,
     /// Times the statement was executed.
@@ -672,7 +674,7 @@ pub struct PgStatStatementsV2 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
     #[column(t)]
     pub ts: Ts,
-    /// Query id; `None` when `compute_query_id` is off.
+    /// Query id; `None` when unavailable or privilege-masked.
     #[column(l)]
     pub queryid: Option<i64>,
     /// Role oid the statement ran as.
@@ -687,7 +689,7 @@ pub struct PgStatStatementsV2 {
     /// Role name resolved from `userid`; `None` when `userid` has no `pg_roles` row.
     #[column(l)]
     pub usename: Option<StrId>,
-    /// Statement text, truncated to 5000 bytes; `None` on insufficient privilege.
+    /// Statement text; the production collector writes `None`.
     #[column(l)]
     pub query: Option<StrId>,
     /// Times the statement was executed.
@@ -794,7 +796,7 @@ pub struct PgStatStatementsV1 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
     #[column(t)]
     pub ts: Ts,
-    /// Query id; `None` when the extension does not expose one.
+    /// Query id; `None` when unavailable or privilege-masked.
     #[column(l)]
     pub queryid: Option<i64>,
     /// Role oid the statement ran as.
@@ -809,7 +811,7 @@ pub struct PgStatStatementsV1 {
     /// Role name resolved from `userid`; `None` when `userid` has no `pg_roles` row.
     #[column(l)]
     pub usename: Option<StrId>,
-    /// Statement text, truncated to 5000 bytes; `None` on insufficient privilege.
+    /// Statement text; the production collector writes `None`.
     #[column(l)]
     pub query: Option<StrId>,
     /// Times the statement was executed.
@@ -966,8 +968,8 @@ mod tests {
 
     #[test]
     fn v6_roundtrip_and_null_preservation() {
-        // A row with a resolved queryid/query and one without (compute_query_id
-        // off, or insufficient privilege for the text).
+        // A row with a resolved queryid/query and one with nullable identity
+        // and text, as produced under restricted visibility.
         crate::assert_roundtrips(&[v6_row(1_000, 5, 10, Some(777)), v6_row(1_000, 5, 11, None)]);
         let bytes = PgStatStatementsV6::encode(&[v6_row(1_000, 5, 11, None)]).expect("encode");
         let decoded =

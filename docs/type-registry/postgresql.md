@@ -141,20 +141,27 @@ instance-wide строки одним запросом из базы, где у�
 
 ### Сбор
 
-Top-N объединяет две оси: `total_exec_time` (в раскладке `1_002_001` —
-`total_time`) и `calls`. Лимит на ось — `KRONIKA_PG_MAX_STATEMENTS`, по умолчанию
-500. SQL не применяет пороги и не присваивает уровни важности: коллектор
-фиксирует строки с наибольшими значениями по каждой оси и ограничивает объём
-вывода.
+Числовой путь сбора вызывает `pg_stat_statements(false)` ровно один раз.
+`WITH ORDINALITY` присваивает каждой строке уникальный `source_ordinal`, а
+`count(*) OVER ()` возвращает точный `source_total` для того же набора. Текст
+запроса не входит в материализованный источник; поле `query` публикуется как
+`NULL`.
 
-Текст запроса берётся прямо в `SELECT` как `LEFT(query, 5000)` (фиксированное
-усечение, без отдельного дозапроса) и интернируется в словарь сегмента.
+Top-N объединяет две оси: `total_exec_time` (в раскладке `1_002_001` —
+`total_time`) и `calls`. Каждая ось выбирает только `source_ordinal` под
+детерминированным `ORDER BY ... LIMIT N`; `UNION` и итоговое соединение по
+`source_ordinal` дают не более `2N` строк без повторного чтения источника.
+Порядок при равных значениях учитывает `userid`, `dbid`, допускающий `NULL`
+`queryid`, `toplevel` в раскладках `1_002_003` и новее, а затем
+`source_ordinal`. Поэтому несколько строк с `queryid = NULL` не размножаются
+при соединении. Лимит на ось — `KRONIKA_PG_MAX_STATEMENTS`, по умолчанию 500.
+SQL не применяет пороги и не присваивает уровни важности.
 
 ### NULL против нуля
 
-- `queryid` — `None`, когда `compute_query_id` выключен; `query` — `None`, когда у
-  вызывающего нет прав читать текст чужой роли. Обе колонки nullable по
-  контракту.
+- `queryid` — `None`, когда PostgreSQL скрывает идентификатор чужой роли.
+  Текущий коллектор всегда пишет `query = None`; поле остаётся nullable в
+  контракте секции.
 - planning-столбцы равны `0` (не `NULL`) при выключенном `track_planning`;
   `*_blk_*_time` равны `0` при выключенном `track_io_timing`; JIT-столбцы равны
   `0` без JIT — так их отдаёт PostgreSQL.
@@ -169,13 +176,13 @@ Top-N объединяет две оси: `total_exec_time` (в раскладк
 
 ```text
 ts                          ts    T
-queryid                     i64?  L   // NULL при выключенном compute_query_id
+queryid                     i64?  L   // NULL, если identity скрыта правами
 userid                      u32   L
 dbid                        u32   L
 toplevel                    bool  L   // с ext 1.9
 datname                     str?  L   // через словарь; LEFT JOIN pg_database
 usename                     str?  L   // через словарь; LEFT JOIN pg_roles
-query                       str?  L   // через словарь; LEFT(query, 5000)
+query                       str?  L   // текущий collector всегда пишет NULL
 calls                       i64   C
 rows                        i64   C
 plans                       i64   C
@@ -232,7 +239,9 @@ minmax_stats_since          ts?   G   // с ext 1.11; unix-микросекун�
 - `1_003_001` — `ossc-db/pg_store_plans` 1.10: идентичность
   `(dbid, userid, queryid, planid)` с настоящим core query id, прямой мост к
   `1_002`, раздельные тайминги по классам блоков, текст плана из view одним
-  запросом;
+  запросом. Внешние top-N и `NULL` ограничивают передачу и память коллектора,
+  но SRF всё равно читает полный файл планов и материализует результат в
+  серверном процессе PostgreSQL;
 - `1_004_001` — vadv-форк 2.x: идентичность `(dbid, userid, planid)`
   (агрегация по форме плана), best-effort атрибуция
   `queryid_stat_statements`, двухшаговое чтение без текстов + точечный
@@ -726,7 +735,7 @@ PG17 заменил `max_dead_tuples` / `num_dead_tuples` на
 `double precision`, миллисекунды) — в PG18 (V4).
 
 Отбор кандидатов — чисто механический: объединение top-N таблиц по сырым
-колонкам (N по умолчанию 500, env `KRONIKA_PG_MAX_TABLES`):
+колонкам (N по умолчанию 500, env `KRONIKA_PG_MAX_TABLES`, допустимо 1–546):
 
 - активность: `seq_scan + idx_scan + n_tup_ins/upd/del` (PG16+ — `GREATEST(last_seq_scan, last_idx_scan)`);
 - запись: `n_tup_ins + n_tup_upd + n_tup_del` DESC — на PG16+ ось активности это давность чтения, и таблица только под запись иначе теряется;
@@ -825,8 +834,9 @@ SQLSTATE 57014 — расширить и повторить базу, иначе
 колонок тайминга.
 
 Отбор кандидатов — чисто механический: объединение top-N индексов по сырым
-колонкам (N по умолчанию 500, свой env `KRONIKA_PG_MAX_INDEXES` — отдельно от
-`KRONIKA_PG_MAX_TABLES`). Каждая ось добавляет `indexrelid` последним ключом
+колонкам (N по умолчанию 500, свой env `KRONIKA_PG_MAX_INDEXES`, допустимо
+1–819 — отдельно от `KRONIKA_PG_MAX_TABLES`). Каждая ось добавляет
+`indexrelid` последним ключом
 `ORDER BY`, чтобы top-N был детерминированным при равных значениях:
 
 - `idx_scan` DESC, `indexrelid`;

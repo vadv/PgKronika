@@ -9,7 +9,10 @@ pub use series::{
     EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, METRIC_FLAG_CANONICAL,
     MetricAggregation, MetricStatus,
 };
-pub use summary::{SnapshotNeighbors, UiSummaryBlock, ViewSummary};
+pub use summary::{
+    CollectionReadState, CollectionStatus, CollectionVisibility, SnapshotNeighbors, UiSummaryBlock,
+    ViewSummary,
+};
 
 use super::block::BlockError;
 use super::limits::Bounds;

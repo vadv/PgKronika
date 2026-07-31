@@ -48,7 +48,7 @@ use buffering::{
     push_statements, push_user_indexes, push_user_tables,
 };
 use config::Config;
-use coverage::{CoverageInputs, collect_coverage_records, push_coverage, snapshot_coverage};
+use coverage::{CoverageInputs, collect_coverage_records, push_coverage};
 use kronika_layout::{DataRoot, LayoutLimits, QuarantineStatus, TemporaryKind, WriterOwner};
 use kronika_source_log::LogCollector;
 use kronika_source_os::{OsScope, ProcFs, detect_container};
@@ -62,7 +62,7 @@ use os_sources::{collect_os_sources, collect_pg_os_joins, push_os_sources};
 use pg_log_source::{
     collect_log_batch, commit_log_collection, push_log_collection, run_log_only_cycle,
 };
-use plans_source::{PlansSourceCache, collect_store_plans_cached};
+use plans_source::{PlansCollection, PlansSourceCache, collect_store_plans_cached};
 use pool_sources::{PoolReads, read_pool_sources};
 use rotation::Rotation;
 use scheduler::{DueSet, Scheduler, SourceKind};
@@ -532,16 +532,18 @@ async fn snapshot_and_seal(
             });
     let PoolReads {
         statements,
+        statements_attempt,
         user_tables,
         freeze_horizons,
-        tables_cov,
+        tables_attempt,
         user_indexes,
-        indexes_cov,
+        indexes_attempt,
         deferred,
     } = read_pool_sources(
         pool,
         major,
         config,
+        main_src.ts.0,
         statements_cache,
         due,
         pool_budget,
@@ -549,24 +551,28 @@ async fn snapshot_and_seal(
     )
     .await;
     let instance = collect_due_instance(pool, due).await?;
-    let store_plans_rows = collect_store_plans_cached(
+    let PlansCollection {
+        snapshot: store_plans_rows,
+        attempt: plans_attempt,
+    } = collect_store_plans_cached(
         pool,
         major,
         config,
         statements_cache,
         plans_cache,
         due.forced(),
+        main_src.ts.0,
     )
     .await;
     let coverage = collect_coverage_records(
         major,
         config,
         &CoverageInputs {
-            default_ts: main_src.ts.0,
-            tables: tables_cov,
-            indexes: indexes_cov,
-            statements: &statements,
-            plans: &store_plans_rows,
+            tables: tables_attempt,
+            indexes: indexes_attempt,
+            statements: statements_attempt,
+            plans: plans_attempt,
+            plans_read: &store_plans_rows,
         },
     );
     // The extension caches stay warm across ticks: reset metadata reads the
@@ -621,28 +627,22 @@ async fn snapshot_and_seal(
     push_os_sources(&mut buffers, &os)?;
     push_coverage(&mut buffers, &mut interner, &coverage)?;
     let mut completeness = Vec::new();
-    if let Some((version, rows, source_total)) = &statements {
-        completeness.push(snapshot_coverage(
-            rows.first().map_or(main_src.ts.0, |row| row.ts),
-            statements_source::statements_type_id(*version),
-            u8::from(*source_total != u64::try_from(rows.len()).unwrap_or(u64::MAX)),
-            0,
-            *source_total,
-            rows.len(),
-        ));
-    }
-    if let Some(snapshot) = &store_plans_rows {
-        completeness.push(snapshot_coverage(
-            snapshot.snapshot_ts,
-            snapshot.read.type_id(),
-            u8::from(
-                snapshot.source_total
-                    != u64::try_from(snapshot.read.rows_len()).unwrap_or(u64::MAX),
-            ),
-            0,
-            snapshot.source_total,
-            snapshot.read.rows_len(),
-        ));
+    for attempt in [
+        Some(tables_attempt),
+        Some(indexes_attempt),
+        statements_attempt,
+        plans_attempt,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if attempt.coverage.attempted {
+            completeness.push(
+                attempt
+                    .coverage
+                    .snapshot_marker(attempt.ts, attempt.section_type_id),
+            );
+        }
     }
     push_snapshot_coverages(&mut buffers, &completeness)?;
     if let Some(collection) = log_collection.as_mut() {

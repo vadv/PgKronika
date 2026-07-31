@@ -14,10 +14,12 @@
 //! strings into the segment dictionary. The typed layout is defined in
 //! `kronika-registry` (`PgStatUserTablesV1`..`V4`).
 
+use crate::materialized_cte_query;
 use kronika_registry::pg_stat_user_tables::{
     PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3, PgStatUserTablesV4,
 };
 use kronika_registry::{StrId, Ts};
+use std::borrow::Cow;
 use tokio_postgres::Client;
 
 /// Prefix a query literal with the kronika marker (SQL-transparency rule).
@@ -80,33 +82,35 @@ pub const TABLE_TOPN_AXES: i64 = 6;
 /// even on PG16+, where the activity axis is `GREATEST(last_seq_scan,
 /// last_idx_scan)` (read recency). The collector records the highest-ranked
 /// rows per axis and bounds its own output; threshold decisions belong to the
-/// analyzer. `ts` is one `statement_timestamp()` for the snapshot; the `last_*`
-/// columns come back as unix microseconds.
+/// analyzer. `$1` is the per-axis row limit and `$2` is the collector's
+/// cycle timestamp; the `last_*` columns come back as unix microseconds.
 #[allow(
     clippy::too_many_lines,
     reason = "four full per-version SQL literals; splitting the match hurts readability"
 )]
 #[must_use]
-pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
-    match version {
+pub fn user_tables_query(version: UserTablesVersion, server_major: u32) -> Cow<'static, str> {
+    let query = match version {
         UserTablesVersion::V1 => marked!(
-            "WITH candidates AS ( \
-               (SELECT relid FROM pg_stat_user_tables \
+            "WITH source AS MATERIALIZED ( \
+               SELECT s.*, count(*) OVER ()::int8 AS source_total FROM pg_stat_user_tables s \
+             ), candidates AS ( \
+               (SELECT relid FROM source \
                   ORDER BY COALESCE(seq_scan,0) + COALESCE(idx_scan,0) + COALESCE(n_tup_ins,0) \
                          + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC LIMIT $1) \
                UNION \
-               (SELECT relid FROM pg_stat_user_tables \
+               (SELECT relid FROM source \
                   ORDER BY COALESCE(n_tup_ins,0) + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY c.relpages DESC LIMIT $1) \
                UNION \
-               (SELECT relid FROM pg_stat_user_tables ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
+               (SELECT relid FROM source ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY age(c.relfrozenxid) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY mxid_age(c.relminmxid) DESC LIMIT $1) \
              ) \
              SELECT \
@@ -130,32 +134,34 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                age(cl.relfrozenxid)::int8 AS xid_age, mxid_age(cl.relminmxid)::int8 AS mxid_age, cl.reltuples::int8 AS reltuples, \
                io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, \
                io.toast_blks_read, io.toast_blks_hit, io.tidx_blks_read, io.tidx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
-               (SELECT count(*) FROM pg_stat_user_tables) AS source_total \
-             FROM pg_stat_user_tables t \
+               $2::int8 AS ts_us, \
+               t.source_total \
+             FROM source t \
              JOIN candidates cand ON cand.relid = t.relid \
              LEFT JOIN pg_class cl ON cl.oid = t.relid \
              LEFT JOIN pg_tablespace ts ON ts.oid = cl.reltablespace \
              LEFT JOIN pg_statio_user_tables io ON io.relid = t.relid"
         ),
         UserTablesVersion::V2 => marked!(
-            "WITH candidates AS ( \
-               (SELECT relid FROM pg_stat_user_tables \
+            "WITH source AS MATERIALIZED ( \
+               SELECT s.*, count(*) OVER ()::int8 AS source_total FROM pg_stat_user_tables s \
+             ), candidates AS ( \
+               (SELECT relid FROM source \
                   ORDER BY COALESCE(seq_scan,0) + COALESCE(idx_scan,0) + COALESCE(n_tup_ins,0) \
                          + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC LIMIT $1) \
                UNION \
-               (SELECT relid FROM pg_stat_user_tables \
+               (SELECT relid FROM source \
                   ORDER BY COALESCE(n_tup_ins,0) + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY c.relpages DESC LIMIT $1) \
                UNION \
-               (SELECT relid FROM pg_stat_user_tables ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
+               (SELECT relid FROM source ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY age(c.relfrozenxid) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY mxid_age(c.relminmxid) DESC LIMIT $1) \
              ) \
              SELECT \
@@ -179,31 +185,33 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                age(cl.relfrozenxid)::int8 AS xid_age, mxid_age(cl.relminmxid)::int8 AS mxid_age, cl.reltuples::int8 AS reltuples, \
                io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, \
                io.toast_blks_read, io.toast_blks_hit, io.tidx_blks_read, io.tidx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
-               (SELECT count(*) FROM pg_stat_user_tables) AS source_total \
-             FROM pg_stat_user_tables t \
+               $2::int8 AS ts_us, \
+               t.source_total \
+             FROM source t \
              JOIN candidates cand ON cand.relid = t.relid \
              LEFT JOIN pg_class cl ON cl.oid = t.relid \
              LEFT JOIN pg_tablespace ts ON ts.oid = cl.reltablespace \
              LEFT JOIN pg_statio_user_tables io ON io.relid = t.relid"
         ),
         UserTablesVersion::V3 => marked!(
-            "WITH candidates AS ( \
-               (SELECT relid FROM pg_stat_user_tables \
+            "WITH source AS MATERIALIZED ( \
+               SELECT s.*, count(*) OVER ()::int8 AS source_total FROM pg_stat_user_tables s \
+             ), candidates AS ( \
+               (SELECT relid FROM source \
                   ORDER BY GREATEST(last_seq_scan, last_idx_scan) DESC NULLS LAST LIMIT $1) \
                UNION \
-               (SELECT relid FROM pg_stat_user_tables \
+               (SELECT relid FROM source \
                   ORDER BY COALESCE(n_tup_ins,0) + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY c.relpages DESC LIMIT $1) \
                UNION \
-               (SELECT relid FROM pg_stat_user_tables ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
+               (SELECT relid FROM source ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY age(c.relfrozenxid) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY mxid_age(c.relminmxid) DESC LIMIT $1) \
              ) \
              SELECT \
@@ -229,31 +237,33 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                age(cl.relfrozenxid)::int8 AS xid_age, mxid_age(cl.relminmxid)::int8 AS mxid_age, cl.reltuples::int8 AS reltuples, \
                io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, \
                io.toast_blks_read, io.toast_blks_hit, io.tidx_blks_read, io.tidx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
-               (SELECT count(*) FROM pg_stat_user_tables) AS source_total \
-             FROM pg_stat_user_tables t \
+               $2::int8 AS ts_us, \
+               t.source_total \
+             FROM source t \
              JOIN candidates cand ON cand.relid = t.relid \
              LEFT JOIN pg_class cl ON cl.oid = t.relid \
              LEFT JOIN pg_tablespace ts ON ts.oid = cl.reltablespace \
              LEFT JOIN pg_statio_user_tables io ON io.relid = t.relid"
         ),
         UserTablesVersion::V4 => marked!(
-            "WITH candidates AS ( \
-               (SELECT relid FROM pg_stat_user_tables \
+            "WITH source AS MATERIALIZED ( \
+               SELECT s.*, count(*) OVER ()::int8 AS source_total FROM pg_stat_user_tables s \
+             ), candidates AS ( \
+               (SELECT relid FROM source \
                   ORDER BY GREATEST(last_seq_scan, last_idx_scan) DESC NULLS LAST LIMIT $1) \
                UNION \
-               (SELECT relid FROM pg_stat_user_tables \
+               (SELECT relid FROM source \
                   ORDER BY COALESCE(n_tup_ins,0) + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY c.relpages DESC LIMIT $1) \
                UNION \
-               (SELECT relid FROM pg_stat_user_tables ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
+               (SELECT relid FROM source ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY age(c.relfrozenxid) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               (SELECT t.relid FROM source t JOIN pg_class c ON c.oid = t.relid \
                   ORDER BY mxid_age(c.relminmxid) DESC LIMIT $1) \
              ) \
              SELECT \
@@ -280,15 +290,16 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                age(cl.relfrozenxid)::int8 AS xid_age, mxid_age(cl.relminmxid)::int8 AS mxid_age, cl.reltuples::int8 AS reltuples, \
                io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, \
                io.toast_blks_read, io.toast_blks_hit, io.tidx_blks_read, io.tidx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
-               (SELECT count(*) FROM pg_stat_user_tables) AS source_total \
-             FROM pg_stat_user_tables t \
+               $2::int8 AS ts_us, \
+               t.source_total \
+             FROM source t \
              JOIN candidates cand ON cand.relid = t.relid \
              LEFT JOIN pg_class cl ON cl.oid = t.relid \
              LEFT JOIN pg_tablespace ts ON ts.oid = cl.reltablespace \
              LEFT JOIN pg_statio_user_tables io ON io.relid = t.relid"
         ),
-    }
+    };
+    materialized_cte_query(query, server_major)
 }
 
 /// One raw `pg_stat_user_tables` row, a version-agnostic superset.
@@ -703,10 +714,12 @@ pub async fn collect_user_tables(
     client: &Client,
     major: u32,
     max_tables: i64,
+    cycle_ts_us: i64,
 ) -> Result<(UserTablesVersion, Vec<UserTablesRow>, u64), tokio_postgres::Error> {
     let version = user_tables_version(major);
+    let query = user_tables_query(version, major);
     let rows = client
-        .query(user_tables_query(version), &[&max_tables])
+        .query(query.as_ref(), &[&max_tables, &cycle_ts_us])
         .await?;
     let source_total = rows
         .first()
@@ -803,21 +816,21 @@ mod tests {
 
     #[test]
     fn query_has_version_specific_columns_and_marker() {
-        assert!(!user_tables_query(UserTablesVersion::V1).contains("n_ins_since_vacuum"));
-        assert!(user_tables_query(UserTablesVersion::V2).contains("n_ins_since_vacuum"));
-        assert!(!user_tables_query(UserTablesVersion::V2).contains("n_tup_newpage_upd"));
-        assert!(user_tables_query(UserTablesVersion::V3).contains("n_tup_newpage_upd"));
-        assert!(user_tables_query(UserTablesVersion::V3).contains("last_seq_scan"));
-        assert!(!user_tables_query(UserTablesVersion::V3).contains("total_vacuum_time"));
-        assert!(user_tables_query(UserTablesVersion::V4).contains("total_vacuum_time"));
-        assert!(user_tables_query(UserTablesVersion::V4).contains("total_autoanalyze_time"));
+        assert!(!user_tables_query(UserTablesVersion::V1, 18).contains("n_ins_since_vacuum"));
+        assert!(user_tables_query(UserTablesVersion::V2, 18).contains("n_ins_since_vacuum"));
+        assert!(!user_tables_query(UserTablesVersion::V2, 18).contains("n_tup_newpage_upd"));
+        assert!(user_tables_query(UserTablesVersion::V3, 18).contains("n_tup_newpage_upd"));
+        assert!(user_tables_query(UserTablesVersion::V3, 18).contains("last_seq_scan"));
+        assert!(!user_tables_query(UserTablesVersion::V3, 18).contains("total_vacuum_time"));
+        assert!(user_tables_query(UserTablesVersion::V4, 18).contains("total_vacuum_time"));
+        assert!(user_tables_query(UserTablesVersion::V4, 18).contains("total_autoanalyze_time"));
         for v in [
             UserTablesVersion::V1,
             UserTablesVersion::V2,
             UserTablesVersion::V3,
             UserTablesVersion::V4,
         ] {
-            let q = user_tables_query(v);
+            let q = user_tables_query(v, 18);
             assert!(q.contains("pg_kronika"));
             assert!(q.contains("pg_stat_user_tables"));
             assert!(q.contains("LEFT JOIN pg_statio_user_tables"));
@@ -832,8 +845,30 @@ mod tests {
             assert!(q.contains(
                 "ORDER BY COALESCE(n_tup_ins,0) + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC"
             ));
+            assert!(q.contains("source AS MATERIALIZED"), "{q}");
+            assert!(q.contains("count(*) OVER ()::int8 AS source_total"), "{q}");
+            assert_eq!(
+                q.match_indices("FROM pg_stat_user_tables").count(),
+                1,
+                "the PostgreSQL source must be read once: {q}"
+            );
+            assert!(
+                !q.contains("(SELECT count(*) FROM pg_stat_user_tables)"),
+                "{q}"
+            );
+            assert!(q.contains("$2::int8 AS ts_us"), "{q}");
             assert!(!q.contains("current_setting"));
         }
+    }
+
+    #[test]
+    fn collection_cte_uses_only_server_supported_materialization_syntax() {
+        let legacy = user_tables_query(UserTablesVersion::V1, 11);
+        assert!(legacy.contains("source AS ("), "{legacy}");
+        assert!(!legacy.contains("AS MATERIALIZED"), "{legacy}");
+
+        let modern = user_tables_query(UserTablesVersion::V1, 12);
+        assert!(modern.contains("source AS MATERIALIZED ("), "{modern}");
     }
 
     #[test]

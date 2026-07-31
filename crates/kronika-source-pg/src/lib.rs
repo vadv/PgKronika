@@ -23,6 +23,7 @@
 )]
 
 use kronika_registry::{Ts, bgwriter_checkpointer::BgwriterCheckpointer};
+use std::borrow::Cow;
 use tokio_postgres::Client;
 
 /// Prefix a query literal with the kronika marker (SQL-transparency rule): the
@@ -37,6 +38,23 @@ macro_rules! marked {
             $sql,
         )
     };
+}
+
+/// Keep explicit CTE materialization where the server syntax supports it.
+///
+/// `PostgreSQL` 10 and 11 always materialize CTEs but do not accept the
+/// `AS MATERIALIZED` spelling added in `PostgreSQL` 12.
+fn materialized_cte_query(query: &'static str, major: u32) -> Cow<'static, str> {
+    if major >= 12 {
+        Cow::Borrowed(query)
+    } else {
+        let query = query.replacen(" AS MATERIALIZED (", " AS (", 1);
+        debug_assert!(
+            !query.contains(" AS MATERIALIZED ("),
+            "query template must have one materialized source CTE"
+        );
+        Cow::Owned(query)
+    }
 }
 
 mod activity;
