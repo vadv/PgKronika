@@ -1012,7 +1012,7 @@ git add bins/pg_kronika-web/openapi \
 git commit -m "docs(web): publish complete v5 OpenAPI"
 ```
 
-- [ ] **Step 7: Push and create the review PR**
+- [x] **Step 7: Push and create the review PR**
 
 Before creation, read the repository PR template and use its sections. Then:
 
