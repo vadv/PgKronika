@@ -63,9 +63,10 @@ jobs:
           # working tree, so extracting afterwards would diff build vs build.
           tmp=$(mktemp -d)
           git show HEAD:bins/pg_kronika-web/static.tar.gz > "$tmp/committed.tar.gz"
-          tar -xzf "$tmp/committed.tar.gz" -C "$tmp"
+          mkdir "$tmp/extracted"
+          tar -xzf "$tmp/committed.tar.gz" -C "$tmp/extracted"
           make web-frontend
-          diff -r --exclude='*.map' "$tmp" bins/pg_kronika-web/static
+          diff -r --exclude='*.map' "$tmp/extracted" bins/pg_kronika-web/static
       - name: Verify the UI bundle stays within the size budget
         run: make web-bundle-budget
 
