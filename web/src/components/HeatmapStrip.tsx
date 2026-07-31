@@ -63,11 +63,14 @@ export function HeatmapStrip(props: {
             {m.code}
           </button>
         ))}
-        {heatmap.data && heatmap.data.quality.status !== "complete" && (
-          <span style={{ color: "var(--sev-warn)" }}>
-            {t("heatmap.partial")}
-          </span>
-        )}
+        {heatmap.data &&
+          (heatmap.data.quality.gaps.length > 0 ||
+            (heatmap.data.quality.status !== "complete" &&
+              !heatmap.data.quality.active_tail)) && (
+            <span style={{ color: "var(--sev-warn)" }}>
+              {t("heatmap.partial")}
+            </span>
+          )}
       </div>
       {heatmap.isSuccess && rows.length === 0 && (
         <div style={{ color: "var(--fg-dim)" }}>{t("heatmap.empty")}</div>
