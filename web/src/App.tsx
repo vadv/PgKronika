@@ -12,7 +12,8 @@ import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
 import { Spine } from "./components/Spine";
 import { StatusBar } from "./components/StatusBar";
-import { TabBar } from "./components/TabBar";
+import { PageHeader } from "./components/PageHeader";
+import { Sidebar } from "./components/Sidebar";
 import { TableView } from "./components/TableView";
 import { Toolbar } from "./components/Toolbar";
 import { parseHash, toHash, type UiState } from "./state/url";
@@ -274,30 +275,9 @@ function Shell() {
           ))}
         </main>
       ) : (
-        <main
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: "var(--space-2)",
-            padding: "var(--space-2) var(--space-3)",
-          }}
-        >
-          <Spine
-            at={state.at}
-            span={state.span}
-            baseline={state.baseline}
-            onSelectAt={(nextAt) => patch({ at: nextAt })}
-            onSelectSpan={(span) => patch({ span })}
-            onSelectBaseline={(baseline) => patch({ baseline })}
-          />
-          {focusedIncident !== undefined && (
-            <FocusBar
-              incident={focusedIncident}
-              onExit={() => patch({ focus: null })}
-            />
-          )}
+        <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
           {catalog.isSuccess && (
-            <TabBar
+            <Sidebar
               views={views}
               active={state.view}
               onSelect={(view) => patch({ view })}
@@ -306,46 +286,78 @@ function Shell() {
               }
             />
           )}
-          {heatmapReady && (
-            <HeatmapStrip
-              view={activeView}
-              metric={
-                metricByView[activeView.code] ?? activeView.canonical_metric
-              }
-              from={heatmapRange.from}
-              to={heatmapRange.to}
-              onMetricChange={(m) =>
-                setMetricByView((prev) => ({ ...prev, [activeView.code]: m }))
-              }
-              onSelectEntity={(entity) => patch({ entity, dock: "row" })}
-            />
-          )}
-          {tableReady && (
-            <Toolbar
-              view={activeView}
-              preset={state.preset}
-              q={state.q}
-              matched={matched}
-              onSelectPreset={(preset) => patch({ preset })}
-              onFilter={(q) => patch({ q })}
-            />
-          )}
-          {tableReady && (
-            <TableView
-              view={activeView}
-              at={at}
+          <main
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "var(--space-2)",
+              padding: "var(--space-2) var(--space-3)",
+              flex: 1,
+              minWidth: 0,
+            }}
+          >
+            <Spine
+              at={state.at}
               span={state.span}
-              preset={state.preset}
-              q={state.q}
-              sort={state.sort}
-              order={state.order}
-              entity={state.entity}
-              onSort={(sort, order) => patch({ sort, order })}
-              onSelectRow={(entity) => patch({ entity, dock: "row" })}
-              onMatched={setMatched}
+              baseline={state.baseline}
+              onSelectAt={(nextAt) => patch({ at: nextAt })}
+              onSelectSpan={(span) => patch({ span })}
+              onSelectBaseline={(baseline) => patch({ baseline })}
             />
-          )}
-        </main>
+            {focusedIncident !== undefined && (
+              <FocusBar
+                incident={focusedIncident}
+                onExit={() => patch({ focus: null })}
+              />
+            )}
+            {tableReady && (
+              <PageHeader
+                view={activeView}
+                summary={summary.data?.views.find((v) => v.view === state.view)}
+                matched={matched}
+              />
+            )}
+            {heatmapReady && (
+              <HeatmapStrip
+                view={activeView}
+                metric={
+                  metricByView[activeView.code] ?? activeView.canonical_metric
+                }
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                onMetricChange={(m) =>
+                  setMetricByView((prev) => ({ ...prev, [activeView.code]: m }))
+                }
+                onSelectEntity={(entity) => patch({ entity, dock: "row" })}
+              />
+            )}
+            {tableReady && (
+              <Toolbar
+                view={activeView}
+                preset={state.preset}
+                q={state.q}
+                matched={matched}
+                onSelectPreset={(preset) => patch({ preset })}
+                onFilter={(q) => patch({ q })}
+              />
+            )}
+            {tableReady && (
+              <TableView
+                view={activeView}
+                at={at}
+                span={state.span}
+                preset={state.preset}
+                q={state.q}
+                sort={state.sort}
+                order={state.order}
+                entity={state.entity}
+                onSort={(sort, order) => patch({ sort, order })}
+                onSelectRow={(entity) => patch({ entity, dock: "row" })}
+                onMatched={setMatched}
+              />
+            )}
+          </main>
+        </div>
       )}
       <div style={{ flex: 1 }} />
       <StatusBar state={state} summary={summary.data} />

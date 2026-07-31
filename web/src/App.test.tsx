@@ -104,7 +104,9 @@ function renderApp() {
 test("renders the shell regions from fixtures", async () => {
   renderApp();
   expect(screen.getByTestId("app-shell")).toBeDefined();
-  await waitFor(() => expect(screen.getByText("tabs.activity")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
   expect(screen.getByTestId("instance-chip")).toBeDefined();
   expect(screen.getByLabelText("spine.caption")).toBeDefined();
   expect(screen.getByText(/statusbar\.hints/)).toBeDefined();
@@ -112,14 +114,18 @@ test("renders the shell regions from fixtures", async () => {
 
 test("digit key selects the nth catalog view", async () => {
   renderApp();
-  await waitFor(() => expect(screen.getByText("tabs.locks")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+  );
   fireEvent.keyDown(window, { key: "3" });
   expect(location.hash).toContain("view=locks");
 });
 
 test("space toggles LIVE: the hash gains and then loses the cursor", async () => {
   renderApp();
-  await waitFor(() => expect(screen.getByText("tabs.activity")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
   expect(location.hash).not.toContain("at=");
   fireEvent.keyDown(window, { key: " " });
   expect(location.hash).toContain("at=");
@@ -140,13 +146,15 @@ test("Escape closes an open dock", async () => {
 
 test("hashchange re-parses the state", async () => {
   renderApp();
-  await waitFor(() => expect(screen.getByText("tabs.locks")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+  );
   act(() => {
     location.hash = "#view=locks";
     window.dispatchEvent(new Event("hashchange"));
   });
   await waitFor(() => {
-    const tab = screen.getByText("tabs.locks").closest("[role=tab]");
+    const tab = screen.getAllByText("tabs.locks")[0]?.closest("[role=tab]");
     expect(tab?.getAttribute("aria-selected")).toBe("true");
   });
 });
@@ -158,7 +166,9 @@ test("arrow keys step the cursor; shift+arrow jumps an hour", async () => {
     `${location.pathname}#view=activity&at=1722400000000000`,
   );
   renderApp();
-  await waitFor(() => expect(screen.getByText("tabs.activity")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
   const before = new URLSearchParams(location.hash.slice(1)).get("at");
   fireEvent.keyDown(window, { key: "ArrowRight" });
   const stepped = new URLSearchParams(location.hash.slice(1)).get("at");
@@ -187,7 +197,9 @@ test("arrow keys on the spine slider step by its own delta, not the global one",
 
 test("Enter on a focused button belongs to the button, not global shortcuts", async () => {
   renderApp();
-  await waitFor(() => expect(screen.getByText("tabs.activity")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
   const hashBefore = location.hash;
   const button = screen.getByRole("button", { name: /header.copyLink/ });
   button.focus();

@@ -98,5 +98,17 @@
   "heatmap.legend.normal": "normal",
   "heatmap.legend.warning": "warn",
   "heatmap.legend.critical": "crit",
-  "toolbar.presets": "presets"
+  "toolbar.presets": "presets",
+  "sidebar.nav": "navigation",
+  "sidebar.views": "views",
+  "pageheader.snapshot": "snapshot {at}",
+  "pageheader.noSnapshot": "no snapshot",
+  "pageheader.population": "population",
+  "pageheader.populationHint": "View entities in the selected snapshot",
+  "pageheader.notable": "notable",
+  "pageheader.notableHint": "Server notable classification",
+  "pageheader.collection": "collection",
+  "pageheader.collectionHint": "Collected N of M from the source",
+  "pageheader.matched": "matched",
+  "pageheader.matchedHint": "Rows in the retained snapshot for the current filter"
 }
