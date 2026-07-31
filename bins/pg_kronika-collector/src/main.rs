@@ -242,9 +242,7 @@ async fn main() -> Result<()> {
                 // rotation's; collection stays strictly signal-driven.
                 if config.tick_secs == 0 {
                     run_rotation(&mut rotation, &writer_owner, &journal, &[]);
-                    producer_status
-                        .heartbeat(unix_now_us()?)
-                        .context("publish collector rotation heartbeat")?;
+                    heartbeat_best_effort(&mut producer_status);
                     continue;
                 }
                 false
@@ -276,9 +274,7 @@ async fn main() -> Result<()> {
         // plans read due still runs.
         if due.is_empty() && !plans_cache.is_due(Instant::now()) {
             run_rotation(&mut rotation, &writer_owner, &journal, &sealed_this_tick);
-            producer_status
-                .heartbeat(unix_now_us()?)
-                .context("publish collector idle heartbeat")?;
+            heartbeat_best_effort(&mut producer_status);
             continue;
         }
         sealed_this_tick.extend(
@@ -299,14 +295,38 @@ async fn main() -> Result<()> {
         );
         stop_if_persistence_unhealthy(&journal, &segment)?;
         run_rotation(&mut rotation, &writer_owner, &journal, &sealed_this_tick);
-        producer_status
-            .heartbeat(unix_now_us()?)
-            .context("publish collector cycle heartbeat")?;
+        heartbeat_best_effort(&mut producer_status);
     }
-    producer_status
-        .stop(unix_now_us()?)
-        .context("publish collector terminal status")?;
+    if let Err(err) = unix_now_us().and_then(|at_us| {
+        producer_status
+            .stop(at_us)
+            .context("publish collector terminal status")
+    }) {
+        // A missing terminal marker degrades the status file to a stale
+        // heartbeat, which consumers already treat as an unhealthy producer.
+        log_event(
+            LogLevel::Warn,
+            "producer_status_stop_failure",
+            &[field("error", format!("{err:#}"))],
+        );
+    }
     Ok(())
+}
+
+/// Auxiliary status publication never gates collection: a stale status file is
+/// itself the designed "producer unhealthy" signal.
+fn heartbeat_best_effort(producer_status: &mut ProducerStatusPublisher) {
+    if let Err(err) = unix_now_us().and_then(|at_us| {
+        producer_status
+            .heartbeat(at_us)
+            .context("publish collector heartbeat")
+    }) {
+        log_event(
+            LogLevel::Warn,
+            "producer_status_heartbeat_failure",
+            &[field("error", format!("{err:#}"))],
+        );
+    }
 }
 
 fn unix_now_us() -> Result<i64> {
