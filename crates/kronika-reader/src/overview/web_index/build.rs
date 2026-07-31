@@ -20,8 +20,10 @@ use kronika_registry::{Cell, Row, registry};
 
 use super::{
     CollectionReadState, CollectionStatus, CollectionVisibility, EntityDictionaryEntry,
-    EntityMetric, EntitySeries, EntitySeriesBlock, IndexStatus, METRIC_FLAG_CANONICAL,
-    MetricAggregation, MetricStatus, TimeGrid, UiSummaryBlock, ViewSummary, mask_len,
+    EntityMetric, EntitySeries, EntitySeriesBlock, HOST_SIGNALS_IDENTITY_REVISION,
+    HOST_SIGNALS_VIEW_CODE, HOST_SIGNALS_VIEW_REVISION, IndexStatus, LOAD_PER_CPU_METRIC_CODE,
+    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, PSI_IO_SOME_METRIC_CODE, TimeGrid,
+    UiSummaryBlock, ViewSummary, mask_len,
 };
 use crate::{Dictionary, PgmBodyReadStats, PgmUnit, Resolved};
 
@@ -32,6 +34,11 @@ use super::super::limits::Bounds;
 const TOP_K: usize = 64;
 const COLLECTION_COVERAGE: &str = "collection_coverage";
 const SNAPSHOT_COVERAGE: &str = "snapshot_coverage";
+const OS_LOADAVG: &str = "os_loadavg";
+const OS_PSI: &str = "os_psi";
+const OS_TOPOLOGY: &str = "os_topology";
+const RATIO_UNIT_CODE: u16 = 4;
+const PERCENT_UNIT_CODE: u16 = 7;
 
 /// Populated web-index blocks derived from one PGM unit.
 pub(crate) struct WebIndexBlocks {
@@ -146,6 +153,7 @@ pub(crate) fn build_web_index<R: ReadAt>(
         .copied()
         .collect::<BTreeSet<_>>();
     needed_sections.extend([COLLECTION_COVERAGE, SNAPSHOT_COVERAGE]);
+    needed_sections.extend([OS_LOADAVG, OS_PSI, OS_TOPOLOGY]);
     let mut decoded = Vec::new();
     let mut decoded_rows = 0_u64;
     for (ordinal, entry) in unit.catalog().entries.iter().enumerate() {
@@ -212,6 +220,9 @@ pub(crate) fn build_web_index<R: ReadAt>(
             bounds,
         )?);
     }
+    if let Some(host) = build_host_series(&decoded, &available_sections, grid, bounds)? {
+        series.push(host);
+    }
     debug_assert_eq!(
         summary_inputs.len(),
         web_views().len(),
@@ -233,6 +244,185 @@ pub(crate) fn build_web_index<R: ReadAt>(
         series,
         pgm_body_read_stats,
     })
+}
+
+fn build_host_series(
+    decoded: &[DecodedSection],
+    available_sections: &BTreeSet<&'static str>,
+    grid: TimeGrid,
+    bounds: &Bounds,
+) -> Result<Option<EntitySeriesBlock>, BuildError> {
+    let mut cpu_ids = BTreeMap::<usize, BTreeSet<i32>>::new();
+    for section in decoded.iter().filter(|section| section.name == OS_TOPOLOGY) {
+        for row in &section.rows {
+            if cell_number(row.get("scope")) != Some(0.0) {
+                continue;
+            }
+            let Some(Cell::I32(cpu_id)) = row.get("cpu_id") else {
+                continue;
+            };
+            if *cpu_id < 0 {
+                continue;
+            }
+            let bucket = grid
+                .bucket_index(row_ts(row)?)
+                .ok_or(BuildError::Internal)?;
+            cpu_ids.entry(bucket).or_default().insert(*cpu_id);
+        }
+    }
+
+    let mut load_buckets = empty_buckets(grid);
+    let mut load_timestamps = Vec::new();
+    for section in decoded.iter().filter(|section| section.name == OS_LOADAVG) {
+        for row in &section.rows {
+            if cell_number(row.get("scope")) != Some(0.0) {
+                continue;
+            }
+            let timestamp = row_ts(row)?;
+            let bucket = grid.bucket_index(timestamp).ok_or(BuildError::Internal)?;
+            let Some(cpu_count) = cpu_ids
+                .get(&bucket)
+                .map(BTreeSet::len)
+                .filter(|count| *count > 0)
+            else {
+                continue;
+            };
+            let Some(load1) = cell_number(row.get("load1")) else {
+                continue;
+            };
+            insert_bucket(
+                &mut load_buckets,
+                grid,
+                timestamp,
+                load1 / cpu_count as f64,
+                WebAggregation::Max,
+            )?;
+            load_timestamps.push(timestamp);
+        }
+    }
+
+    let mut psi_buckets = empty_buckets(grid);
+    let mut psi_timestamps = Vec::new();
+    for section in decoded.iter().filter(|section| section.name == OS_PSI) {
+        for row in &section.rows {
+            if cell_number(row.get("scope")) != Some(0.0)
+                || cell_number(row.get("resource")) != Some(2.0)
+            {
+                continue;
+            }
+            let timestamp = row_ts(row)?;
+            let Some(value) = cell_number(row.get("some_avg10")) else {
+                continue;
+            };
+            insert_bucket(
+                &mut psi_buckets,
+                grid,
+                timestamp,
+                value,
+                WebAggregation::Max,
+            )?;
+            psi_timestamps.push(timestamp);
+        }
+    }
+
+    let host_key = host_identity();
+    let load = host_metric(
+        LOAD_PER_CPU_METRIC_CODE,
+        METRIC_FLAG_CANONICAL,
+        RATIO_UNIT_CODE,
+        available_sections.contains(OS_LOADAVG) && available_sections.contains(OS_TOPOLOGY),
+        host_key.clone(),
+        load_buckets,
+        bounds,
+    )?;
+    let psi = host_metric(
+        PSI_IO_SOME_METRIC_CODE,
+        0,
+        PERCENT_UNIT_CODE,
+        available_sections.contains(OS_PSI),
+        host_key.clone(),
+        psi_buckets,
+        bounds,
+    )?;
+    if load.series().is_empty() && psi.series().is_empty() {
+        return Ok(None);
+    }
+
+    let observed_range = load_timestamps
+        .into_iter()
+        .chain(psi_timestamps)
+        .fold((i64::MAX, i64::MIN), |(first, last), timestamp| {
+            (first.min(timestamp), last.max(timestamp))
+        });
+    let mut coverage_mask = vec![0_u8; mask_len(usize::from(grid.bucket_count()))];
+    for series in load.series().iter().chain(psi.series()) {
+        for (target, source) in coverage_mask.iter_mut().zip(series.present_mask()) {
+            *target |= *source;
+        }
+    }
+    let dictionary = vec![
+        EntityDictionaryEntry::new(host_key, "host".to_owned(), bounds)
+            .map_err(block_build_error)?,
+    ];
+    EntitySeriesBlock::new(
+        HOST_SIGNALS_VIEW_CODE,
+        HOST_SIGNALS_VIEW_REVISION,
+        HOST_SIGNALS_IDENTITY_REVISION,
+        IndexStatus::Complete,
+        observed_range,
+        grid,
+        coverage_mask,
+        dictionary,
+        vec![load, psi],
+        bounds,
+    )
+    .map(Some)
+    .map_err(block_build_error)
+}
+
+fn host_metric(
+    metric_code: u16,
+    flags: u16,
+    unit_code: u16,
+    input_available: bool,
+    host_key: Vec<u8>,
+    buckets: Vec<Option<f64>>,
+    bounds: &Bounds,
+) -> Result<EntityMetric, BuildError> {
+    let status = if input_available {
+        MetricStatus::Complete
+    } else {
+        MetricStatus::Gated
+    };
+    let series = if input_available && buckets.iter().any(Option::is_some) {
+        vec![encode_candidate(
+            0,
+            candidate(host_key, "host".to_owned(), buckets, WebAggregation::Max)?,
+            bounds,
+        )?]
+    } else {
+        Vec::new()
+    };
+    EntityMetric::new(
+        metric_code,
+        1,
+        flags,
+        unit_code,
+        MetricAggregation::Max,
+        status,
+        0.0,
+        series,
+        bounds,
+    )
+    .map_err(block_build_error)
+}
+
+fn host_identity() -> Vec<u8> {
+    let mut key = Vec::with_capacity(8);
+    key.extend_from_slice(&HOST_SIGNALS_IDENTITY_REVISION.to_le_bytes());
+    key.extend_from_slice(&4_u16.to_le_bytes());
+    key.extend_from_slice(b"host");
+    key
 }
 
 fn canonical_collections(decoded: &[DecodedSection]) -> Result<CollectionTimeline, BuildError> {
@@ -1507,19 +1697,109 @@ mod tests {
     use kronika_analytics::web_projection::{WebAggregation, web_view_by_name};
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::collection_coverage::CollectionCoverageV1;
+    use kronika_registry::os_loadavg::OsLoadavg;
+    use kronika_registry::os_psi::OsPsi;
+    use kronika_registry::os_topology::OsTopology;
     use kronika_registry::pg_stat_statements::PgStatStatementsV2;
     use kronika_registry::pg_stat_user_indexes::PgStatUserIndexesV1;
     use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
     use kronika_registry::{Cell, Row, Section, StrId, Ts, registry};
     use kronika_writer::{Interner, dict};
 
-    use super::{build_web_index, candidate, encode_candidate};
+    use super::{
+        HOST_SIGNALS_VIEW_CODE, LOAD_PER_CPU_METRIC_CODE, PSI_IO_SOME_METRIC_CODE, build_web_index,
+        candidate, encode_candidate,
+    };
     use crate::PgmUnit;
     use crate::overview::facts::{BuildError, SourceError};
     use crate::overview::limits::LIMIT;
     use crate::overview::web_index::{CollectionReadState, CollectionVisibility, UiSummaryBlock};
 
     const COVERAGE_TS: i64 = 100;
+
+    #[test]
+    fn web_index_projects_load_per_cpu_and_io_psi_into_hidden_host_series() {
+        let load = OsLoadavg {
+            ts: Ts(COVERAGE_TS),
+            load1: 2.0,
+            load5: 1.0,
+            load15: 0.5,
+            running: 2,
+            total: 10,
+            scope: 0,
+        };
+        let psi = OsPsi {
+            ts: Ts(COVERAGE_TS),
+            resource: 2,
+            some_avg10: 34.0,
+            some_avg60: 12.0,
+            some_avg300: 3.0,
+            some_total: 100,
+            full_avg10: Some(1.0),
+            full_avg60: Some(0.5),
+            full_avg300: Some(0.1),
+            full_total: Some(10),
+            scope: 0,
+        };
+        let topology = (0..4)
+            .map(|cpu_id| OsTopology {
+                ts: Ts(COVERAGE_TS),
+                cpu_id,
+                model_name: StrId(1),
+                mhz_max: Some(3_600.0),
+                core_id: cpu_id / 2,
+                socket_id: 0,
+                scope: 0,
+            })
+            .collect::<Vec<_>>();
+        let inputs = [
+            SectionInput {
+                type_id: 1_105_001,
+                rows: 1,
+                body: &OsLoadavg::encode(&[load]).expect("encode load"),
+            },
+            SectionInput {
+                type_id: 1_107_001,
+                rows: 1,
+                body: &OsPsi::encode(&[psi]).expect("encode PSI"),
+            },
+            SectionInput {
+                type_id: 1_113_001,
+                rows: 4,
+                body: &OsTopology::encode(&topology).expect("encode topology"),
+            },
+        ];
+        let bytes = build_part(
+            &inputs,
+            PartMeta {
+                min_ts: COVERAGE_TS,
+                max_ts: COVERAGE_TS,
+            },
+        );
+        let unit = PgmUnit::open(bytes).expect("open host fixture");
+        let blocks = build_web_index(&unit, &[], COVERAGE_TS, COVERAGE_TS, &LIMIT)
+            .expect("build host index");
+        let host = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == HOST_SIGNALS_VIEW_CODE)
+            .expect("hidden host series");
+        assert_eq!(host.dictionary().len(), 1);
+        assert_eq!(host.dictionary()[0].label(), "host");
+
+        let load = host
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == LOAD_PER_CPU_METRIC_CODE)
+            .expect("load metric");
+        assert_eq!(load.series()[0].value_at(0), Some(0.5));
+        let psi = host
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == PSI_IO_SOME_METRIC_CODE)
+            .expect("PSI metric");
+        assert_eq!(psi.series()[0].value_at(0), Some(34.0));
+    }
 
     fn snapshot_coverage(
         section_type_id: u32,

@@ -19,6 +19,17 @@ use super::limits::Bounds;
 
 const BASE_BUCKET_US: i64 = 60_000_000;
 
+/// Internal OVF logical view reserved for host signals consumed by the UI spine.
+pub const HOST_SIGNALS_VIEW_CODE: u16 = 10;
+/// Host-signal view projection revision.
+pub const HOST_SIGNALS_VIEW_REVISION: u16 = 1;
+/// Host identity encoding revision.
+pub const HOST_SIGNALS_IDENTITY_REVISION: u16 = 1;
+/// `load1 / observed logical CPUs` metric code.
+pub const LOAD_PER_CPU_METRIC_CODE: u16 = 1;
+/// Host IO `some_avg10` PSI metric code.
+pub const PSI_IO_SOME_METRIC_CODE: u16 = 2;
+
 /// Final collection state of one web-index view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexStatus {

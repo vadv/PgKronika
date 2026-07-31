@@ -36,6 +36,7 @@ fn configured() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::overview::handlers::events))
         .routes(routes!(crate::overview::handlers::health))
         .routes(routes!(crate::ui::handlers::heatmap))
+        .routes(routes!(crate::ui::handlers::spine))
         .routes(routes!(crate::ui::handlers::frame))
         .routes(routes!(crate::ui::handlers::catalog))
         .routes(routes!(crate::ui::handlers::summary))
@@ -70,6 +71,7 @@ mod tests {
         ("GET", "/v1/timeline/events", "events"),
         ("GET", "/v1/timeline/health", "health"),
         ("GET", "/v1/timeline/heatmap", "heatmap"),
+        ("GET", "/v1/timeline/spine", "spine"),
         ("GET", "/v1/frame/{view}", "frame"),
         ("GET", "/v1/ui/catalog", "catalog"),
         ("GET", "/v1/views/summary", "summary"),
@@ -125,6 +127,7 @@ mod tests {
             ("events", "timeline"),
             ("health", "timeline"),
             ("heatmap", "ui"),
+            ("spine", "ui"),
             ("frame", "ui"),
             ("catalog", "ui"),
             ("summary", "ui"),

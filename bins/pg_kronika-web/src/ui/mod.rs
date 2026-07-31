@@ -6,4 +6,5 @@ pub(crate) mod frame;
 pub(crate) mod handlers;
 pub(crate) mod heatmap;
 pub(crate) mod snapshot;
+pub(crate) mod spine;
 pub(crate) mod thresholds;

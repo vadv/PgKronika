@@ -33,6 +33,7 @@ mod sections;
 mod ui_catalog;
 mod ui_data;
 mod ui_frame;
+mod ui_spine;
 mod version_diff;
 
 /// Process-global Prometheus recorder installed once for all tests.

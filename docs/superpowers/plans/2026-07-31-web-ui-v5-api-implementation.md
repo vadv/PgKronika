@@ -187,7 +187,7 @@ git commit -m "refactor(web): share v5 query and snapshot contracts"
 - Uses existing `EntitySeriesBlock` addressing; the host projection is internal
   and never appears as a tenth catalog view.
 
-- [ ] **Step 1: Write failing reader projection tests**
+- [x] **Step 1: Write failing reader projection tests**
 
 ```rust
 #[test]
@@ -203,7 +203,7 @@ fn web_index_projects_load_per_cpu_and_io_psi_into_hidden_host_series() {
 }
 ```
 
-- [ ] **Step 2: Run reader RED test**
+- [x] **Step 2: Run reader RED test**
 
 ```sh
 cargo test -p kronika-reader --lib --target aarch64-apple-darwin \
@@ -212,7 +212,7 @@ cargo test -p kronika-reader --lib --target aarch64-apple-darwin \
 
 Expected: compilation fails because the host constants/projection do not exist.
 
-- [ ] **Step 3: Build the bounded hidden host block**
+- [x] **Step 3: Build the bounded hidden host block**
 
 ```rust
 pub const HOST_SIGNALS_VIEW_CODE: u16 = 10;
@@ -234,7 +234,7 @@ fn build_host_series(
 
 Append the block to `WebIndexBlocks.series`; keep `UiSummary` at nine views.
 
-- [ ] **Step 4: Run reader GREEN tests**
+- [x] **Step 4: Run reader GREEN tests**
 
 ```sh
 cargo test -p kronika-reader --lib --target aarch64-apple-darwin \
@@ -245,7 +245,7 @@ cargo test -p kronika-reader --lib --target aarch64-apple-darwin \
 
 Expected: host projection and all existing web-index tests pass.
 
-- [ ] **Step 5: Write failing HTTP spine tests**
+- [x] **Step 5: Write failing HTTP spine tests**
 
 ```rust
 #[tokio::test]
@@ -260,7 +260,7 @@ async fn spine_returns_aligned_host_series_without_raw_pgm_reads() {
 }
 ```
 
-- [ ] **Step 6: Run HTTP RED test**
+- [x] **Step 6: Run HTTP RED test**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -269,7 +269,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 
 Expected: route returns `404 route_not_found`.
 
-- [ ] **Step 7: Implement spine request, merge, DTO and handler**
+- [x] **Step 7: Implement spine request, merge, DTO and handler**
 
 ```rust
 pub(crate) struct SpineRequest {
@@ -292,7 +292,7 @@ Enforce `1..=512`, 24 hours and 256 KiB before publishing. Merge sealed and
 live host blocks onto one half-open grid and register the handler through
 `OpenApiRouter`.
 
-- [ ] **Step 8: Run GREEN tests and commit**
+- [x] **Step 8: Run GREEN tests and commit**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
