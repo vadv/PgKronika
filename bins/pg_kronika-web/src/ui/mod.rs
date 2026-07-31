@@ -9,4 +9,5 @@ pub(crate) mod heatmap;
 pub(crate) mod quality;
 pub(crate) mod snapshot;
 pub(crate) mod spine;
+pub(crate) mod storage;
 pub(crate) mod thresholds;

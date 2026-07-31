@@ -23,6 +23,7 @@ use super::frame::spark::{SparkError, attach_sparks};
 use super::heatmap::{HeatmapError, HeatmapRequest, HeatmapResponse, heatmap as build_heatmap};
 use super::quality::{DataQualityRequest, DataQualityResponse, build_data_quality};
 use super::spine::{SpineError, SpineRequest, SpineResponse, spine as build_spine};
+use super::storage::{StorageLimits, StorageResponse, build_storage};
 use crate::AppState;
 use crate::api_error::{
     ApiError, ExpectedValue, LimitResource, QueryConstraint, QueryParameter, count_u64,
@@ -35,6 +36,7 @@ const MAX_CONTEXT_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_DATA_QUALITY_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_HEATMAP_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_SPINE_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_STORAGE_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_HEATMAP_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
 const MAX_SPINE_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
 const MAX_DATA_QUALITY_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
@@ -61,6 +63,82 @@ const SPINE_PARAMS: &[QueryParameter] = &[
     QueryParameter::To,
     QueryParameter::Buckets,
 ];
+const STORAGE_PARAMS: &[QueryParameter] = &[];
+
+/// `GET /v1/storage` - bounded root accounting, retention and capacity forecast.
+#[utoipa::path(
+    get,
+    path = "/v1/storage",
+    tag = "ui",
+    responses(
+        (status = 200, description = "Storage accounting and capacity facts", body = StorageResponse),
+        (status = 400, description = "Unexpected query parameter", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Serialized response limit exceeded", body = ApiError),
+        (status = 500, description = "Storage inventory or status read failed", body = ApiError),
+    )
+)]
+pub(crate) async fn storage(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    QueryParams::parse(raw.as_deref(), STORAGE_PARAMS)?;
+    let snapshot = state.snapshot();
+    let response = tokio::task::spawn_blocking(move || {
+        let producer_status =
+            kronika_layout::read_producer_status(snapshot.data_dir()).map_err(|error| {
+                tracing::error!(
+                    event = "api_ui_storage_status_read_failed",
+                    error = %error,
+                    "producer status read failed"
+                );
+                ApiError::store_read_failed()
+            })?;
+        build_storage(
+            snapshot.data_dir(),
+            producer_status.as_ref(),
+            StorageLimits::default(),
+        )
+        .map_err(|error| {
+            tracing::error!(
+                event = "api_ui_storage_inventory_failed",
+                error = %error,
+                "storage inventory failed"
+            );
+            ApiError::store_read_failed()
+        })
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_storage_worker_failed",
+            error = ?join,
+            "storage worker failed"
+        );
+        ApiError::internal_error()
+    })??;
+    let body = serde_json::to_vec(&response).map_err(|cause| {
+        tracing::error!(
+            event = "api_ui_storage_serialize_failed",
+            error = %cause,
+            "storage serialization failed"
+        );
+        ApiError::internal_error()
+    })?;
+    if body.len() > MAX_STORAGE_RESPONSE_BYTES {
+        return Err(ApiError::query_limit_exceeded(
+            LimitResource::Bytes,
+            count_u64(MAX_STORAGE_RESPONSE_BYTES),
+            Some(count_u64(body.len())),
+        ));
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
 
 /// `GET /v1/data/quality` - freshness, coverage, producer and integrity facts.
 #[utoipa::path(

@@ -9,6 +9,10 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the `_us` suffix is part of the explicit timestamp wire contract"
+)]
 pub(crate) struct DataQualityRequest {
     pub(crate) from_us: i64,
     pub(crate) to_us: i64,
@@ -50,6 +54,10 @@ struct ProducerDto {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the repeated suffix preserves the approved coverage wire names"
+)]
 struct CoverageDto {
     #[schema(required = true)]
     expected_snapshots: Option<u64>,
@@ -109,7 +117,11 @@ impl FreshnessState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the independent flags merge evidence observed across multiple segments"
+)]
 struct CapabilityState {
     available: bool,
     partial: bool,
@@ -117,17 +129,10 @@ struct CapabilityState {
     resource_limited: bool,
 }
 
-impl Default for CapabilityState {
-    fn default() -> Self {
-        Self {
-            available: false,
-            partial: false,
-            unsupported: false,
-            resource_limited: false,
-        }
-    }
-}
-
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded assembly keeps the single-pass summary inventory and response derivation together"
+)]
 pub(crate) fn build_data_quality(
     snapshot: &LocalDirSnapshot,
     producer_status: Option<ProducerStatus>,
@@ -370,6 +375,10 @@ fn producer_dto(status: Option<ProducerStatus>) -> ProducerDto {
     )
 }
 
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "the status priority combines four independent factual degradation signals"
+)]
 const fn aggregate_status(
     readable: bool,
     freshness: FreshnessState,

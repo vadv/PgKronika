@@ -14,7 +14,6 @@ repository.workspace = true
 qualification = [
   "dep:http-body-util",
   "dep:kronika-format",
-  "dep:kronika-layout",
   "dep:rustix",
   "dep:tower",
   "kronika-reader/qualification",
@@ -25,7 +24,7 @@ kronika-analytics = { path = "../../crates/kronika-analytics" }
 kronika-reader = { path = "../../crates/kronika-reader" }
 kronika-registry = { path = "../../crates/kronika-registry" }
 kronika-format = { path = "../../crates/kronika-format", optional = true }
-kronika-layout = { path = "../../crates/kronika-layout", optional = true }
+kronika-layout = { path = "../../crates/kronika-layout" }
 axum = "0.8"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
@@ -53,7 +52,6 @@ tower = { version = "0.5", features = ["util"], optional = true }
 
 [dev-dependencies]
 kronika-format = { path = "../../crates/kronika-format" }
-kronika-layout = { path = "../../crates/kronika-layout" }
 kronika-reader = { path = "../../crates/kronika-reader", features = ["qualification"] }
 kronika-store = { path = "../../crates/kronika-store" }
 kronika-writer = { path = "../../crates/kronika-writer" }

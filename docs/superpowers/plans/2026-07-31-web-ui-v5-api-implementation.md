@@ -530,7 +530,7 @@ git commit -m "feat(web): expose retained data quality"
   `build_storage(root, producer_status, StorageLimits) -> Result<StorageResponse, StorageError>`.
 - Consumes: `DataRoot::scan`, `DataRoot::filesystem_usage`, producer retention.
 
-- [ ] **Step 1: Write failing accounting and HTTP tests**
+- [x] **Step 1: Write failing accounting and HTTP tests**
 
 ```rust
 #[tokio::test]
@@ -543,7 +543,7 @@ async fn storage_counts_each_layout_file_once_and_reports_filesystem_headroom() 
 }
 ```
 
-- [ ] **Step 2: Run RED test**
+- [x] **Step 2: Run RED test**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -552,7 +552,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 
 Expected: route is absent.
 
-- [ ] **Step 3: Implement bounded inventory and forecast**
+- [x] **Step 3: Implement bounded inventory and forecast**
 
 ```rust
 pub(crate) fn build_storage(
@@ -568,7 +568,7 @@ pub(crate) fn build_storage(
 Return `full_in_days=null` with `full_in_days_reason` when the rate is missing,
 non-positive or retention precedes exhaustion. Cap at 64 KiB.
 
-- [ ] **Step 4: Run GREEN tests and commit**
+- [x] **Step 4: Run GREEN tests and commit**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
