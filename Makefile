@@ -3,7 +3,7 @@ TARGET ?= $(shell rustc +$(RUST_TOOLCHAIN) -vV | sed -n 's/^host: //p')
 CARGO_BUILD = cargo +$(RUST_TOOLCHAIN) build --locked --target $(TARGET)
 SCHEMATHESIS_VERSION ?= 4.24.3
 
-.PHONY: build collector web dump openapi openapi-bundle test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
+.PHONY: build collector web web-frontend web-frontend-check dump openapi openapi-bundle test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
 
 build: ## Build collector, web, and dump for the selected target.
 	@$(CARGO_BUILD) -p pg_kronika-collector -p pg_kronika-web -p pg_kronika-dump
@@ -13,6 +13,14 @@ collector: ## Build pg_kronika-collector.
 
 web: ## Build pg_kronika-web.
 	@$(CARGO_BUILD) -p pg_kronika-web
+
+web-frontend: ## Install, build the SPA and pack deterministic static.tar.gz for rust-embed.
+	cd web && npm ci && npm run build
+	tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --exclude='*.map' \
+		-czf bins/pg_kronika-web/static.tar.gz -C bins/pg_kronika-web/static .
+
+web-frontend-check: ## Typecheck, lint and test the SPA without building.
+	cd web && npm ci && npm run typecheck && npm run lint && npm run test
 
 dump: ## Build pg_kronika-dump.
 	@$(CARGO_BUILD) -p pg_kronika-dump

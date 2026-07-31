@@ -1,4 +1,6 @@
 /target
+web/node_modules/
+web/dist/
 __pycache__/
 .schemathesis/
 .DS_Store
@@ -9,3 +11,7 @@ __pycache__/
 # Demo-stand artifacts
 /demo-data/
 /demo-image.tar
+
+# Web demo harness output
+web/demo/
+bins/pg_kronika-web/static/

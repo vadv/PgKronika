@@ -1,9 +1,10 @@
 //! Embedded static assets with a single-page-app fallback.
 //!
-//! Files under `static/` are compiled into the release binary (debug reads them
-//! from disk, so UI edits need no rebuild). A request that names an embedded
-//! file gets it with its content type; any other path that is not an API path
-//! falls back to `index.html` so the UI can route client-side.
+//! `build.rs` extracts the committed `static.tar.gz` into `OUT_DIR` and the
+//! assets are embedded from there (debug reads them from that directory, so
+//! UI edits need no rebuild). A request that names an embedded file gets it
+//! with its content type; any other path that is not an API path falls back
+//! to `index.html` so the UI can route client-side.
 #![allow(
     clippy::same_name_method,
     reason = "rust-embed's derive generates an inherent get alongside the RustEmbed trait method"
@@ -16,7 +17,7 @@ use rust_embed::{EmbeddedFile, RustEmbed};
 use crate::api_error::ApiError;
 
 #[derive(RustEmbed)]
-#[folder = "static/"]
+#[folder = "$OUT_DIR/static"]
 struct Assets;
 
 /// Serve the embedded asset for `uri`, or the SPA shell.

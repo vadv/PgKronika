@@ -1,0 +1,1713 @@
+{
+  "revision": 1,
+  "views": [
+    {
+      "view_code": 1,
+      "code": "activity",
+      "view_revision": 1,
+      "scope": "database",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "activity",
+          "logical_sections": [
+            "pg_stat_activity"
+          ],
+          "type_ids": [
+            1001001,
+            1001002,
+            1001003
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "process",
+          "logical_sections": [
+            "os_process"
+          ],
+          "type_ids": [
+            1100001
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [
+        {
+          "left": "activity",
+          "right": "process",
+          "fields": [
+            "pid",
+            "backend_start=starttime"
+          ],
+          "cardinality": "zero_or_one",
+          "provenance": "pid_and_process_start_match"
+        }
+      ],
+      "metrics": [
+        {
+          "code": "wait",
+          "revision": 1,
+          "unit": "us",
+          "aggregation": "sum",
+          "formula": "sum(observed_wait_duration_us)",
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "cpu",
+          "revision": 1,
+          "unit": "ratio",
+          "aggregation": "max",
+          "formula": "positive_delta(utime + stime) / elapsed",
+          "requires": [
+            "activity",
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "io",
+          "revision": 1,
+          "unit": "bytes_per_second",
+          "aggregation": "max",
+          "formula": "positive_delta(read_bytes + write_bytes) / elapsed",
+          "requires": [
+            "activity",
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "active_fraction",
+          "revision": 1,
+          "unit": "ratio",
+          "aggregation": "max",
+          "formula": "active_samples / observed_samples",
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "pid",
+          "type": "i64",
+          "source": "activity.pid",
+          "lazy": false,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "user",
+          "type": "text",
+          "source": "activity.usename",
+          "lazy": false,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "database",
+          "type": "text",
+          "source": "activity.datname",
+          "lazy": false,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "application",
+          "type": "text",
+          "source": "activity.application_name",
+          "lazy": false,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "state",
+          "type": "text",
+          "source": "activity.state",
+          "lazy": false,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "wait_event",
+          "type": "text",
+          "formula": "join_non_null(wait_event_type, ':', wait_event)",
+          "lazy": false,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "query",
+          "type": "text",
+          "source": "activity.query",
+          "lazy": true,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "query_duration_us",
+          "type": "f64",
+          "formula": "snapshot_ts - query_start",
+          "unit": "us",
+          "threshold_metric": "pg.activity.query_duration_seconds",
+          "lazy": false,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "transaction_duration_us",
+          "type": "f64",
+          "formula": "snapshot_ts - xact_start",
+          "unit": "us",
+          "threshold_metric": "pg.activity.transaction_duration_seconds",
+          "lazy": false,
+          "requires": [
+            "activity"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "cpu",
+          "type": "f64",
+          "formula": "positive_delta(utime + stime) / elapsed",
+          "lazy": false,
+          "requires": [
+            "activity",
+            "process"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "sessions",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "application",
+            "state",
+            "query",
+            "query_duration_us"
+          ],
+          "sort": {
+            "column": "query_duration_us",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "waits",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "wait_event",
+            "query",
+            "query_duration_us"
+          ],
+          "sort": {
+            "column": "query_duration_us",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "resources",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "cpu",
+            "query"
+          ],
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "transaction_age",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "state",
+            "transaction_duration_us"
+          ],
+          "sort": {
+            "column": "transaction_duration_us",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "active_fraction"
+    },
+    {
+      "view_code": 2,
+      "code": "statements",
+      "view_revision": 2,
+      "scope": "database",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "statements",
+          "logical_sections": [
+            "pg_stat_statements"
+          ],
+          "type_ids": [
+            1002001,
+            1002002,
+            1002003,
+            1002004,
+            1002005,
+            1002006
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "settings",
+          "logical_sections": [
+            "pg_settings"
+          ],
+          "type_ids": [
+            1019001
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [],
+      "metrics": [
+        {
+          "code": "time",
+          "revision": 2,
+          "unit": "ms",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(total_exec_time))",
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "calls",
+          "revision": 1,
+          "unit": "count",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(calls))",
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "io",
+          "revision": 1,
+          "unit": "blocks",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(shared_blks_read + local_blks_read))",
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "temp",
+          "revision": 1,
+          "unit": "blocks",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(temp_blks_written))",
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "queryid",
+          "type": "i64",
+          "source": "statements.queryid",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "query",
+          "type": "text",
+          "source": "statements.query",
+          "lazy": true,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "calls",
+          "type": "f64",
+          "formula": "positive_delta(calls)",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "total",
+          "type": "f64",
+          "formula": "positive_delta(total_exec_time)",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "ms_per_row",
+          "type": "f64",
+          "formula": "positive_delta(total_exec_time) / positive_delta(rows)",
+          "unit": "ms",
+          "threshold_metric": "pg.statements.milliseconds_per_row",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "mean",
+          "type": "f64",
+          "formula": "positive_delta(total_exec_time) / positive_delta(calls)",
+          "unit": "ms",
+          "threshold_metric": "pg.statements.mean_time_ms",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "time_pct",
+          "type": "f64",
+          "formula": "100 * positive_delta(total_exec_time) / sum_after_database_filter(positive_delta(total_exec_time))",
+          "unit": "percent",
+          "threshold_metric": "pg.statements.time_pct",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "plan_time_pct",
+          "type": "f64",
+          "formula": "100 * positive_delta(total_plan_time) / (positive_delta(total_plan_time) + positive_delta(total_exec_time)) when pg_stat_statements.track_planning = 'on'",
+          "unit": "percent",
+          "threshold_metric": "pg.statements.plan_time_pct",
+          "lazy": false,
+          "requires": [
+            "statements",
+            "settings"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "rows",
+          "type": "f64",
+          "formula": "positive_delta(rows)",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "hit_pct",
+          "type": "f64",
+          "formula": "100 * positive_delta(shared_blks_hit) / max(positive_delta(shared_blks_hit + shared_blks_read), 1)",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "blks_read",
+          "type": "f64",
+          "formula": "positive_delta(shared_blks_read + local_blks_read)",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "temp_written",
+          "type": "f64",
+          "formula": "positive_delta(temp_blks_written)",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "wal_bytes",
+          "type": "f64",
+          "formula": "positive_delta(wal_bytes)",
+          "lazy": false,
+          "requires": [
+            "statements"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "time",
+          "columns": [
+            "queryid",
+            "query",
+            "calls",
+            "total",
+            "mean",
+            "ms_per_row",
+            "time_pct",
+            "plan_time_pct",
+            "rows"
+          ],
+          "sort": {
+            "column": "total",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "io",
+          "columns": [
+            "queryid",
+            "query",
+            "calls",
+            "hit_pct",
+            "blks_read"
+          ],
+          "sort": {
+            "column": "blks_read",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "temp",
+          "columns": [
+            "queryid",
+            "query",
+            "calls",
+            "temp_written"
+          ],
+          "sort": {
+            "column": "temp_written",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "wal",
+          "columns": [
+            "queryid",
+            "query",
+            "calls",
+            "wal_bytes",
+            "total"
+          ],
+          "sort": {
+            "column": "wal_bytes",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "time"
+    },
+    {
+      "view_code": 3,
+      "code": "plans",
+      "view_revision": 1,
+      "scope": "database",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "plans",
+          "logical_sections": [
+            "pg_store_plans_ossc",
+            "pg_store_plans_vadv"
+          ],
+          "type_ids": [
+            1003001,
+            1004001
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [],
+      "metrics": [
+        {
+          "code": "time",
+          "revision": 1,
+          "unit": "us",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(total_time)) * 1000",
+          "requires": [
+            "plans"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "calls",
+          "revision": 1,
+          "unit": "count",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(calls))",
+          "requires": [
+            "plans"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "planid",
+          "type": "i64",
+          "source": "plans.planid",
+          "lazy": false,
+          "requires": [
+            "plans"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "plan",
+          "type": "text",
+          "source": "plans.plan",
+          "lazy": true,
+          "requires": [
+            "plans"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "queryid",
+          "type": "i64",
+          "formula": "coalesce(queryid, queryid_stat_statements)",
+          "lazy": false,
+          "requires": [
+            "plans"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "calls",
+          "type": "f64",
+          "formula": "positive_delta(calls)",
+          "lazy": false,
+          "requires": [
+            "plans"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "mean",
+          "type": "f64",
+          "formula": "positive_delta(total_time) / max(positive_delta(calls), 1)",
+          "lazy": false,
+          "requires": [
+            "plans"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "rows",
+          "type": "f64",
+          "formula": "positive_delta(rows)",
+          "lazy": false,
+          "requires": [
+            "plans"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "time",
+          "columns": [
+            "planid",
+            "plan",
+            "queryid",
+            "calls",
+            "mean",
+            "rows"
+          ],
+          "sort": {
+            "column": "mean",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "io",
+          "columns": [
+            "planid",
+            "plan",
+            "queryid",
+            "calls"
+          ],
+          "sort": {
+            "column": "calls",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "rows",
+          "columns": [
+            "planid",
+            "plan",
+            "queryid",
+            "rows"
+          ],
+          "sort": {
+            "column": "rows",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "regression",
+          "columns": [
+            "planid",
+            "plan",
+            "queryid",
+            "mean"
+          ],
+          "sort": {
+            "column": "mean",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "time"
+    },
+    {
+      "view_code": 4,
+      "code": "tables",
+      "view_revision": 1,
+      "scope": "database",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "tables",
+          "logical_sections": [
+            "pg_stat_user_tables"
+          ],
+          "type_ids": [
+            1013001,
+            1013002,
+            1013003,
+            1013004
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [],
+      "metrics": [
+        {
+          "code": "io",
+          "revision": 1,
+          "unit": "blocks",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(heap_blks_read + idx_blks_read + toast_blks_read + tidx_blks_read))",
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "writes",
+          "revision": 1,
+          "unit": "count",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(n_tup_ins + n_tup_upd + n_tup_del))",
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "dead",
+          "revision": 1,
+          "unit": "ratio",
+          "aggregation": "max",
+          "formula": "max(n_dead_tup / max(n_live_tup + n_dead_tup, 1))",
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "relation",
+          "type": "text",
+          "formula": "qualify(schemaname, relname)",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "seq_scan",
+          "type": "i64",
+          "source": "tables.seq_scan",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "idx_scan",
+          "type": "i64",
+          "source": "tables.idx_scan",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "dead_pct",
+          "type": "f64",
+          "formula": "100 * n_dead_tup / max(n_live_tup + n_dead_tup, 1)",
+          "unit": "percent",
+          "threshold_metric": "pg.tables.dead_tuple_pct",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "dead_tuples",
+          "type": "i64",
+          "source": "tables.n_dead_tup",
+          "unit": "count",
+          "threshold_metric": "pg.tables.dead_tuples",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "seq_scan_pct",
+          "type": "f64",
+          "formula": "100 * positive_delta(seq_scan) / (positive_delta(seq_scan) + positive_delta(idx_scan))",
+          "unit": "percent",
+          "threshold_metric": "pg.tables.sequential_scan_pct",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "modified_since_analyze",
+          "type": "i64",
+          "source": "tables.n_mod_since_analyze",
+          "unit": "count",
+          "threshold_metric": "pg.tables.modified_since_analyze",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "inserted_since_vacuum",
+          "type": "i64",
+          "source": "tables.n_ins_since_vacuum",
+          "unit": "count",
+          "threshold_metric": "pg.tables.inserted_since_vacuum",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "last_autovacuum",
+          "type": "timestamp",
+          "source": "tables.last_autovacuum",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "autovacuum_age_seconds",
+          "type": "f64",
+          "formula": "(snapshot_ts - last_autovacuum) / 1000000",
+          "unit": "seconds",
+          "threshold_metric": "pg.tables.autovacuum_age_seconds",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "autoanalyze_age_seconds",
+          "type": "f64",
+          "formula": "(snapshot_ts - last_autoanalyze) / 1000000",
+          "unit": "seconds",
+          "threshold_metric": "pg.tables.autoanalyze_age_seconds",
+          "lazy": false,
+          "requires": [
+            "tables"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "activity",
+          "columns": [
+            "relation",
+            "seq_scan",
+            "idx_scan",
+            "seq_scan_pct",
+            "dead_pct",
+            "dead_tuples"
+          ],
+          "sort": {
+            "column": "dead_pct",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "writes",
+          "columns": [
+            "relation",
+            "modified_since_analyze",
+            "inserted_since_vacuum",
+            "dead_pct"
+          ],
+          "sort": {
+            "column": "inserted_since_vacuum",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "maintenance",
+          "columns": [
+            "relation",
+            "dead_pct",
+            "dead_tuples",
+            "modified_since_analyze",
+            "inserted_since_vacuum",
+            "last_autovacuum",
+            "autovacuum_age_seconds",
+            "autoanalyze_age_seconds"
+          ],
+          "sort": {
+            "column": "autovacuum_age_seconds",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "io",
+          "columns": [
+            "relation",
+            "seq_scan",
+            "idx_scan",
+            "seq_scan_pct"
+          ],
+          "sort": {
+            "column": "seq_scan_pct",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "writes"
+    },
+    {
+      "view_code": 5,
+      "code": "indexes",
+      "view_revision": 1,
+      "scope": "database",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "indexes",
+          "logical_sections": [
+            "pg_stat_user_indexes"
+          ],
+          "type_ids": [
+            1014001,
+            1014002
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [],
+      "metrics": [
+        {
+          "code": "io",
+          "revision": 1,
+          "unit": "blocks",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(idx_blks_read))",
+          "requires": [
+            "indexes"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "scans",
+          "revision": 1,
+          "unit": "count",
+          "aggregation": "sum",
+          "formula": "sum(positive_delta(idx_scan))",
+          "requires": [
+            "indexes"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "index",
+          "type": "text",
+          "source": "indexes.indexrelname",
+          "lazy": false,
+          "requires": [
+            "indexes"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "table",
+          "type": "text",
+          "source": "indexes.relname",
+          "lazy": false,
+          "requires": [
+            "indexes"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "scans",
+          "type": "f64",
+          "formula": "positive_delta(idx_scan)",
+          "lazy": false,
+          "requires": [
+            "indexes"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "rows_per_scan",
+          "type": "f64",
+          "formula": "positive_delta(idx_tup_read) / max(positive_delta(idx_scan), 1)",
+          "lazy": false,
+          "requires": [
+            "indexes"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "usage",
+          "columns": [
+            "index",
+            "table",
+            "scans",
+            "rows_per_scan"
+          ],
+          "sort": {
+            "column": "scans",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "unused",
+          "columns": [
+            "index",
+            "table",
+            "scans"
+          ],
+          "sort": {
+            "column": "scans",
+            "order": "asc"
+          }
+        },
+        {
+          "code": "io",
+          "columns": [
+            "index",
+            "table",
+            "scans"
+          ],
+          "sort": {
+            "column": "scans",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "scans"
+    },
+    {
+      "view_code": 6,
+      "code": "vacuum",
+      "view_revision": 1,
+      "scope": "database",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "vacuum",
+          "logical_sections": [
+            "pg_stat_progress_vacuum"
+          ],
+          "type_ids": [
+            1012001
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [],
+      "metrics": [
+        {
+          "code": "progress",
+          "revision": 1,
+          "unit": "ratio",
+          "aggregation": "max",
+          "formula": "max(heap_blks_scanned / max(heap_blks_total, 1))",
+          "requires": [
+            "vacuum"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "pid",
+          "type": "i64",
+          "source": "vacuum.pid",
+          "lazy": false,
+          "requires": [
+            "vacuum"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "table",
+          "type": "u64",
+          "source": "vacuum.relid",
+          "lazy": false,
+          "requires": [
+            "vacuum"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "phase",
+          "type": "text",
+          "source": "vacuum.phase",
+          "lazy": false,
+          "requires": [
+            "vacuum"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "is_autovacuum",
+          "type": "bool",
+          "source": "vacuum.is_autovacuum",
+          "lazy": false,
+          "requires": [
+            "vacuum"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "progress",
+          "type": "f64",
+          "formula": "heap_blks_scanned / max(heap_blks_total, 1)",
+          "lazy": false,
+          "requires": [
+            "vacuum"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "dead_tuples",
+          "type": "f64",
+          "formula": "coalesce(num_dead_tuples, num_dead_item_ids)",
+          "lazy": false,
+          "requires": [
+            "vacuum"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "progress",
+          "columns": [
+            "pid",
+            "table",
+            "phase",
+            "progress",
+            "dead_tuples"
+          ],
+          "sort": {
+            "column": "progress",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "phase",
+          "columns": [
+            "pid",
+            "table",
+            "phase",
+            "progress"
+          ],
+          "sort": {
+            "column": "phase",
+            "order": "asc"
+          }
+        },
+        {
+          "code": "dead_tuples",
+          "columns": [
+            "pid",
+            "table",
+            "dead_tuples",
+            "progress"
+          ],
+          "sort": {
+            "column": "dead_tuples",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "progress"
+    },
+    {
+      "view_code": 7,
+      "code": "processes",
+      "view_revision": 1,
+      "scope": "host",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "process",
+          "logical_sections": [
+            "os_process"
+          ],
+          "type_ids": [
+            1100001
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [],
+      "metrics": [
+        {
+          "code": "cpu",
+          "revision": 1,
+          "unit": "ratio",
+          "aggregation": "max",
+          "formula": "positive_delta(utime + stime) / elapsed",
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "io",
+          "revision": 1,
+          "unit": "bytes_per_second",
+          "aggregation": "max",
+          "formula": "positive_delta(read_bytes + write_bytes) / elapsed",
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "pid",
+          "type": "i64",
+          "source": "process.pid",
+          "lazy": false,
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "type",
+          "type": "text",
+          "source": "process.comm",
+          "lazy": false,
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "cpu",
+          "type": "f64",
+          "formula": "positive_delta(utime + stime) / elapsed",
+          "lazy": false,
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "rss",
+          "type": "i64",
+          "source": "process.rmem_kb",
+          "unit": "kib",
+          "threshold_metric": "os.process.rss_kib",
+          "lazy": false,
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "pss",
+          "type": "i64",
+          "source": "smaps_rollup.pss_kb",
+          "lazy": false,
+          "requires": [],
+          "availability": "not_collected"
+        },
+        {
+          "code": "read_bytes_per_second",
+          "type": "f64",
+          "formula": "positive_delta(read_bytes) / elapsed",
+          "lazy": false,
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "write_bytes_per_second",
+          "type": "f64",
+          "formula": "positive_delta(write_bytes) / elapsed",
+          "lazy": false,
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "block_delay",
+          "type": "f64",
+          "formula": "positive_delta(blkdelay_ticks) / elapsed",
+          "lazy": false,
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "command",
+          "type": "text",
+          "source": "process.cmdline",
+          "lazy": true,
+          "requires": [
+            "process"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "cpu",
+          "columns": [
+            "pid",
+            "type",
+            "cpu",
+            "rss",
+            "command"
+          ],
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "memory",
+          "columns": [
+            "pid",
+            "type",
+            "rss",
+            "pss",
+            "command"
+          ],
+          "sort": {
+            "column": "rss",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "disk_io",
+          "columns": [
+            "pid",
+            "type",
+            "read_bytes_per_second",
+            "write_bytes_per_second",
+            "block_delay",
+            "command"
+          ],
+          "sort": {
+            "column": "read_bytes_per_second",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "cpu"
+    },
+    {
+      "view_code": 8,
+      "code": "locks",
+      "view_revision": 1,
+      "scope": "database",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "locks",
+          "logical_sections": [
+            "pg_locks"
+          ],
+          "type_ids": [
+            1011001,
+            1011002
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [],
+      "metrics": [
+        {
+          "code": "wait",
+          "revision": 1,
+          "unit": "us",
+          "aggregation": "max",
+          "formula": "max(proven_wait_or_hold_duration_us)",
+          "requires": [
+            "locks"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "pid",
+          "type": "i64",
+          "source": "locks.pid",
+          "lazy": false,
+          "requires": [
+            "locks"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "user_application",
+          "type": "text",
+          "formula": "join_non_null(usename, ' / ', application_name)",
+          "lazy": false,
+          "requires": [
+            "locks"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "lock",
+          "type": "text",
+          "formula": "join_non_null(wait_event_type, ':', wait_event)",
+          "lazy": false,
+          "requires": [
+            "locks"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "target",
+          "type": "text",
+          "source": "locks.lock_relname",
+          "lazy": false,
+          "requires": [
+            "locks"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "wait_or_hold_us",
+          "type": "f64",
+          "formula": "proven_wait_or_hold_duration_us",
+          "lazy": false,
+          "requires": [
+            "locks"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "query",
+          "type": "text",
+          "source": "locks.query",
+          "lazy": true,
+          "requires": [
+            "locks"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "tree",
+          "columns": [
+            "pid",
+            "user_application",
+            "lock",
+            "target",
+            "wait_or_hold_us",
+            "query"
+          ],
+          "sort": {
+            "column": "wait_or_hold_us",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "blockers",
+          "columns": [
+            "pid",
+            "user_application",
+            "target",
+            "wait_or_hold_us"
+          ],
+          "sort": {
+            "column": "wait_or_hold_us",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "waiters",
+          "columns": [
+            "pid",
+            "user_application",
+            "lock",
+            "target",
+            "query",
+            "wait_or_hold_us"
+          ],
+          "sort": {
+            "column": "wait_or_hold_us",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "wait"
+    },
+    {
+      "view_code": 9,
+      "code": "events",
+      "view_revision": 1,
+      "scope": "instance",
+      "identity_revision": 1,
+      "availability": "gated",
+      "inputs": [
+        {
+          "code": "events",
+          "logical_sections": [
+            "pg_log_errors",
+            "pg_log_checkpoints",
+            "pg_log_autovacuum",
+            "pg_log_slow_queries",
+            "pg_log_lock_waits",
+            "pg_log_lifecycle",
+            "pg_log_gap",
+            "pg_log_temp_files",
+            "pg_log_source_status"
+          ],
+          "type_ids": [
+            1022001,
+            1024001,
+            1025001,
+            1026001,
+            1027001,
+            1028001,
+            1029001,
+            1030001,
+            1039001
+          ],
+          "availability": "gated"
+        }
+      ],
+      "joins": [],
+      "metrics": [
+        {
+          "code": "count",
+          "revision": 1,
+          "unit": "count",
+          "aggregation": "sum",
+          "formula": "count(events)",
+          "requires": [
+            "events"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "columns": [
+        {
+          "code": "time",
+          "type": "timestamp",
+          "source": "events.ts",
+          "lazy": false,
+          "requires": [
+            "events"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "severity",
+          "type": "u64",
+          "source": "events.severity",
+          "lazy": false,
+          "requires": [
+            "events"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "type",
+          "type": "u64",
+          "source": "events.category",
+          "lazy": false,
+          "requires": [
+            "events"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "duration",
+          "type": "f64",
+          "source": "events.duration_us",
+          "lazy": false,
+          "requires": [
+            "events"
+          ],
+          "availability": "gated"
+        },
+        {
+          "code": "message",
+          "type": "text",
+          "source": "events.message",
+          "lazy": true,
+          "requires": [
+            "events"
+          ],
+          "availability": "gated"
+        }
+      ],
+      "presets": [
+        {
+          "code": "errors",
+          "columns": [
+            "time",
+            "severity",
+            "type",
+            "message"
+          ],
+          "sort": {
+            "column": "time",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "checkpoints",
+          "columns": [
+            "time",
+            "type",
+            "duration",
+            "message"
+          ],
+          "sort": {
+            "column": "time",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "vacuum",
+          "columns": [
+            "time",
+            "type",
+            "duration",
+            "message"
+          ],
+          "sort": {
+            "column": "time",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "slow",
+          "columns": [
+            "time",
+            "type",
+            "duration",
+            "message"
+          ],
+          "sort": {
+            "column": "duration",
+            "order": "desc"
+          }
+        }
+      ],
+      "canonical_metric": "count"
+    }
+  ]
+}
