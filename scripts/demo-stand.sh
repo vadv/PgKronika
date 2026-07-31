@@ -9,6 +9,9 @@ CONTAINER=${DEMO_CONTAINER:-pgkronika-demo-stand}
 DATA_DIR=${DEMO_DATA_DIR:-$ROOT/demo-data}
 PG_PORT=${DEMO_PG_PORT:-15432}
 WEB_PORT=${DEMO_WEB_PORT:-18081}
+# Address the published ports bind to; 127.0.0.1 keeps the stand loopback-only,
+# set 0.0.0.0 to expose the viewer on the LAN.
+BIND_ADDR=${DEMO_BIND_ADDR:-127.0.0.1}
 STOP_TIMEOUT=${DEMO_STOP_TIMEOUT:-300}
 READY_TIMEOUT=${DEMO_READY_TIMEOUT:-300}
 
@@ -38,6 +41,8 @@ Environment:
   DEMO_DATA_DIR      Host directory mounted at /data, default ./demo-data.
   DEMO_PG_PORT       Host port published to PostgreSQL, default 15432.
   DEMO_WEB_PORT      Host port published to the web viewer, default 18081.
+  DEMO_BIND_ADDR     Bind address for published ports, default 127.0.0.1
+                     (set 0.0.0.0 to expose the stand on the LAN).
   DEMO_STOP_TIMEOUT  Seconds `down` waits for seal+measure, default 300.
   DEMO_READY_TIMEOUT Seconds `up` waits for the ready marker, default 300.
   DEMO_BACKENDS, DEMO_TPS, DEMO_TABLES, DEMO_INDEXES, DEMO_LARGE_SCAN_ROWS,
@@ -138,16 +143,16 @@ up() {
   collect_run_args DEMO_DURATION_MIN
   "$DOCKER" run -d --name "$CONTAINER" \
     --stop-timeout "$STOP_TIMEOUT" \
-    -p "127.0.0.1:$PG_PORT:5432" \
-    -p "127.0.0.1:$WEB_PORT:8080" \
+    -p "$BIND_ADDR:$PG_PORT:5432" \
+    -p "$BIND_ADDR:$WEB_PORT:8080" \
     "${RUN_ARGS[@]}" \
     -e DEMO_DURATION_MIN=0 \
     "$IMAGE_TAG" stand >/dev/null
   echo "waiting for the stand to boot and seed (up to ${READY_TIMEOUT}s)..."
   wait_ready
   echo "stand is up:"
-  echo "  postgres  host=127.0.0.1 port=$PG_PORT user=postgres (trust)"
-  echo "  web       http://127.0.0.1:$WEB_PORT"
+  echo "  postgres  host=$BIND_ADDR port=$PG_PORT user=postgres (trust)"
+  echo "  web       http://$BIND_ADDR:$WEB_PORT"
   echo "  data      $DATA_DIR"
   echo "stop with: make demo-down (seals segments, writes report.json)"
 }
