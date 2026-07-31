@@ -1,12 +1,13 @@
 import { render, screen } from "@testing-library/react";
 import { expect, test } from "vitest";
 import { TabBar } from "./TabBar";
-import type { ViewSpec, ViewSummaryItem } from "../api/types";
+import type { ViewSummaryItem } from "../api/types";
+import { makeViewSpec } from "../testkit/apiFixtures";
 
 const views = [
-  { code: "activity", availability: "available" },
-  { code: "statements", availability: "gated" },
-] as unknown as ViewSpec[];
+  makeViewSpec({ code: "activity", availability: "available" }),
+  makeViewSpec({ code: "statements", availability: "gated" }),
+];
 
 const summaries = new Map<string, ViewSummaryItem>([
   [

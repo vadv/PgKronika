@@ -1,6 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { apiFetch } from "./client";
-import type { HeatmapResponse } from "./types";
+import { apiGet } from "./client";
 
 export interface HeatmapArgs {
   view: string;
@@ -12,15 +11,6 @@ export interface HeatmapArgs {
 }
 
 export function useHeatmap(args: HeatmapArgs) {
-  const params = new URLSearchParams({
-    view: args.view,
-    metric: args.metric,
-    from: args.from,
-    to: args.to,
-  });
-  if (args.buckets !== undefined) params.set("buckets", String(args.buckets));
-  if (args.top !== undefined) params.set("top", String(args.top));
-  const qs = params.toString();
   return useQuery({
     queryKey: [
       "heatmap",
@@ -31,6 +21,20 @@ export function useHeatmap(args: HeatmapArgs) {
       args.buckets ?? null,
       args.top ?? null,
     ],
-    queryFn: () => apiFetch<HeatmapResponse>(`/v1/timeline/heatmap?${qs}`),
+    // `from`/`to` travel through component state as decimal strings; the
+    // wire parameters are int64 µs.
+    queryFn: () =>
+      apiGet("/v1/timeline/heatmap", {
+        params: {
+          query: {
+            view: args.view,
+            metric: args.metric,
+            from: Number(args.from),
+            to: Number(args.to),
+            ...(args.buckets !== undefined ? { buckets: args.buckets } : {}),
+            ...(args.top !== undefined ? { top: args.top } : {}),
+          },
+        },
+      }),
   });
 }

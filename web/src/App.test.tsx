@@ -6,7 +6,10 @@ afterEach(() => vi.unstubAllGlobals());
 
 test("renders app shell placeholder", () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-    new Response('{"revision":1,"views":[]}', { status: 200 }),
+    new Response('{"revision":1,"views":[]}', {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
   ));
   render(<App />);
   expect(screen.getByTestId("app-shell")).toBeDefined();

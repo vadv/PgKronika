@@ -1,11 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { apiFetch } from "./client";
-import type { ProjectionCatalog } from "./types";
+import { apiGet } from "./client";
 
 export function useCatalog() {
   return useQuery({
     queryKey: ["catalog"],
-    queryFn: () => apiFetch<ProjectionCatalog>("/v1/ui/catalog"),
+    queryFn: () => apiGet("/v1/ui/catalog"),
     staleTime: Infinity,
   });
 }

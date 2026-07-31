@@ -2,23 +2,28 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
-import type { ViewSpec } from "../api/types";
+import type { HeatmapResponse } from "../api/types";
+import {
+  makeHeatmapQuality,
+  makeMetricSpec,
+  makeViewSpec,
+} from "../testkit/apiFixtures";
 import { HeatmapStrip } from "./HeatmapStrip";
 
 afterEach(() => vi.unstubAllGlobals());
 
-const view = {
+const view = makeViewSpec({
   code: "statements",
   canonical_metric: "time",
   availability: "available",
   metrics: [
-    { code: "time", availability: "available" },
-    { code: "calls", availability: "available" },
-    { code: "io", availability: "gated" },
+    makeMetricSpec({ code: "time", availability: "available" }),
+    makeMetricSpec({ code: "calls", availability: "available" }),
+    makeMetricSpec({ code: "io", availability: "gated" }),
   ],
-} as unknown as ViewSpec;
+});
 
-const fixture = {
+const fixture: HeatmapResponse = {
   grid: { from_us: "0", to_us: "4", bucket_count: 4 },
   ranking: { exact: true, unseen_upper: 0 },
   rows: [
@@ -37,14 +42,7 @@ const fixture = {
       values: [2, 2, 2, 2],
     },
   ],
-  quality: {
-    status: "partial",
-    snapshots: 3,
-    gaps: [],
-    gated: [],
-    unavailable_revision: [],
-    resource_limited: [],
-  },
+  quality: makeHeatmapQuality({ status: "partial", snapshots: 3 }),
 };
 
 function renderStrip(
@@ -57,7 +55,10 @@ function renderStrip(
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue(
-      new Response(JSON.stringify(fixture), { status: 200 }),
+      new Response(JSON.stringify(fixture), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
     ),
   );
   const client = new QueryClient();

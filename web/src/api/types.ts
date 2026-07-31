@@ -1,127 +1,22 @@
-export type Availability =
-  | "available"
-  | "gated"
-  | "not_collected"
-  | "unsupported_type";
-export type Scope = "database" | "host" | "instance";
-export type ValueType =
-  | "i64" | "u64" | "f64" | "bool" | "text" | "timestamp";
+// Hand-written aliases over the generated OpenAPI schema. This module is
+// the single import point for API types; add an alias here instead of
+// importing `schema.d.ts` from components. Names follow the spec, not
+// legacy local names (`ViewSummaryResponse`, not `SummaryResponse`).
+import type { components } from "./schema";
 
-export interface MetricSpec {
-  code: string;
-  revision: number;
-  unit: string;
-  aggregation: string;
-  formula: string;
-  requires: string[];
-  availability: Availability;
-}
-
-export interface ColumnSpec {
-  code: string;
-  type: ValueType;
-  source?: string;
-  formula?: string;
-  unit?: string;
-  threshold_metric?: string;
-  lazy: boolean;
-  requires: string[];
-  availability: Availability;
-}
-
-export interface PresetSpec {
-  code: string;
-  columns: string[];
-  sort: { column: string; order: "asc" | "desc" };
-}
-
-export interface ViewSpec {
-  view_code: number;
-  code: string;
-  view_revision: number;
-  scope: Scope;
-  identity_revision: number;
-  availability: Availability;
-  inputs: unknown[];
-  joins: unknown[];
-  metrics: MetricSpec[];
-  columns: ColumnSpec[];
-  presets: PresetSpec[];
-  canonical_metric: string;
-}
-
-export interface ProjectionCatalog {
-  revision: number;
-  views: ViewSpec[];
-}
-
-export interface RangeGap {
-  from_us: string;
-  to_us: string;
-}
-
-export type QualityStatus = "complete" | "partial";
-
-/**
- * Summary and heatmap quality look alike but are not interchangeable: summary
- * reports `gaps` as opaque tokens, heatmap as time ranges, and only heatmap
- * carries `unbounded_segments`. Sharing one type here hid the difference until
- * a non-empty response exposed it.
- */
-export interface SummaryQuality {
-  status: QualityStatus;
-  snapshots: number;
-  gaps: string[];
-  gated: string[];
-  unavailable_revision: string[];
-  resource_limited: string[];
-  active_tail: boolean;
-}
-
-export interface HeatmapQuality {
-  status: QualityStatus;
-  snapshots: number;
-  gaps: RangeGap[];
-  gated: string[];
-  unavailable_revision: string[];
-  resource_limited: string[];
-  unbounded_segments: string[];
-  active_tail: boolean;
-}
-
-export interface CollectionStatusDto {
-  collected: number;
-  source_total: number | null;
-  read_state: string;
-  visibility: string;
-}
-
-export interface ViewSummaryItem {
-  view: string;
-  snapshot_ts_us: string | null;
-  population: number | null;
-  status: string;
-  notable: boolean;
-  collection: CollectionStatusDto | null;
-}
-
-export interface SummaryResponse {
-  at_us: string;
-  views: ViewSummaryItem[];
-  quality: SummaryQuality;
-}
-
-export interface HeatmapRow {
-  entity: string;
-  label: string;
-  unit: string;
-  score: { lower: number; upper: number };
-  values: (number | null)[];
-}
-
-export interface HeatmapResponse {
-  grid: { from_us: string; to_us: string; bucket_count: number };
-  ranking: { exact: boolean; unseen_upper: number };
-  rows: HeatmapRow[];
-  quality: HeatmapQuality;
-}
+export type Availability = components["schemas"]["Availability"];
+export type Scope = components["schemas"]["Scope"];
+export type ValueType = components["schemas"]["ValueType"];
+export type MetricSpec = components["schemas"]["MetricSpec"];
+export type ColumnSpec = components["schemas"]["ColumnSpec"];
+export type PresetSpec = components["schemas"]["PresetSpec"];
+export type ViewSpec = components["schemas"]["ViewSpec"];
+export type ProjectionCatalog = components["schemas"]["ProjectionCatalog"];
+export type SummaryQuality = components["schemas"]["SummaryQuality"];
+export type HeatmapQuality = components["schemas"]["HeatmapQuality"];
+export type ViewSummaryItem = components["schemas"]["ViewSummaryItem"];
+export type ViewSummaryResponse =
+  components["schemas"]["ViewSummaryResponse"];
+export type HeatmapRow = components["schemas"]["HeatmapRow"];
+export type HeatmapResponse = components["schemas"]["HeatmapResponse"];
+export type VersionResponse = components["schemas"]["VersionResponse"];
