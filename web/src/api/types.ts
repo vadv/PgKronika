@@ -54,3 +54,42 @@ export interface ProjectionCatalog {
   revision: number;
   views: ViewSpec[];
 }
+
+export interface QualityMeta {
+  status: "complete" | "partial" | "unavailable";
+  snapshots: number;
+  gaps: { from_us: string; to_us: string }[];
+  gated: string[];
+  unavailable_revision: string[];
+  resource_limited: string[];
+  active_tail?: boolean;
+}
+
+export interface ViewSummaryItem {
+  view: string;
+  snapshot_ts_us: string | null;
+  population: number | null;
+  status: string;
+  notable: boolean;
+}
+
+export interface SummaryResponse {
+  at_us: string;
+  views: ViewSummaryItem[];
+  quality: QualityMeta;
+}
+
+export interface HeatmapRow {
+  entity: string;
+  label: string;
+  unit: string;
+  score: { lower: number; upper: number };
+  values: (number | null)[];
+}
+
+export interface HeatmapResponse {
+  grid: { from_us: string; to_us: string; bucket_count: number };
+  ranking: { exact: boolean; unseen_upper: number };
+  rows: HeatmapRow[];
+  quality: QualityMeta & { unbounded_segments?: string[] };
+}

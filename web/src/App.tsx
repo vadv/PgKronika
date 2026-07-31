@@ -10,7 +10,7 @@ const queryClient = new QueryClient();
 function Shell() {
   const { t } = useTranslation();
   const [state, setState] = useState(() => parseHash(location.hash));
-  const catalog = useCatalog(state.source);
+  const catalog = useCatalog();
 
   const patch = (p: Partial<typeof state>) => {
     const next = { ...state, ...p };
