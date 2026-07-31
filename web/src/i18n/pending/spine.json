@@ -1,0 +1,11 @@
+[
+  ["spine.caption", "Запись", "Recording"],
+  ["spine.live", "Эфир", "LIVE"],
+  ["spine.replay", "Повтор", "REPLAY"],
+  ["spine.zoom", "Масштаб", "Zoom"],
+  ["spine.timeline", "Лента записи", "Recording timeline"],
+  ["spine.span.900", "15м", "15m"],
+  ["spine.span.3600", "1ч", "1h"],
+  ["spine.span.21600", "6ч", "6h"],
+  ["spine.span.86400", "24ч", "24h"]
+]
