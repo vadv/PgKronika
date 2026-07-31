@@ -3,7 +3,7 @@ import type { ViewSpec, ViewSummaryItem } from "../api/types";
 import { sectionTitle, verdictTint } from "../design/ui";
 import { TipRow, Tooltip } from "./Tooltip";
 
-function KpiCard(props: {
+function KpiStat(props: {
   label: string;
   value: string;
   hint?: string;
@@ -16,27 +16,23 @@ function KpiCard(props: {
         ? verdictTint("warning")
         : undefined;
   return (
-    <div
+    <span
       title={props.hint}
       style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: "2px",
-        minWidth: "110px",
-        padding: "6px 10px",
-        background: "var(--bg-raised)",
+        display: "inline-flex",
+        alignItems: "baseline",
+        gap: "5px",
+        padding: "1px 8px",
+        background: tint !== undefined ? tint.background : "var(--bg-raised)",
         border: "1px solid var(--border)",
-        borderRadius: "var(--radius-md)",
-        ...(tint ?? {}),
+        borderRadius: "var(--radius-sm)",
+        whiteSpace: "nowrap",
       }}
     >
       <span
         style={{
           fontFamily: "var(--ui-font)",
           fontSize: "var(--text-xs)",
-          fontWeight: 600,
-          textTransform: "uppercase",
-          letterSpacing: "var(--tracking-caps)",
           color: "var(--fg-dim)",
         }}
       >
@@ -45,14 +41,14 @@ function KpiCard(props: {
       <span
         style={{
           fontFamily: "var(--mono-font)",
-          fontSize: "var(--text-lg)",
+          fontSize: "var(--text-md)",
           fontWeight: 600,
           color: tint !== undefined ? tint.color : "var(--fg-strong)",
         }}
       >
         {props.value}
       </span>
-    </div>
+    </span>
   );
 }
 
@@ -60,6 +56,7 @@ export function PageHeader(props: {
   view: ViewSpec;
   summary: ViewSummaryItem | undefined;
   matched: number | null;
+  onOpenIncidents?: () => void;
 }) {
   const { t } = useTranslation();
   const s = props.summary;
@@ -104,29 +101,47 @@ export function PageHeader(props: {
             : t("pageheader.noSnapshot")}
         </span>
       </div>
-      <div style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
-        <KpiCard
+      <div
+        style={{
+          display: "flex",
+          gap: "6px",
+          flexWrap: "wrap",
+          alignItems: "center",
+        }}
+      >
+        <KpiStat
           label={t("pageheader.population")}
           value={s?.population != null ? String(s.population) : "—"}
           hint={t("pageheader.populationHint")}
         />
         {s?.notable === true && (
-          <KpiCard
-            label={t("pageheader.notable")}
-            value={`${s.notable_level} ×${s.notable_count}`}
-            tone={s.notable_level === "critical" ? "critical" : "warning"}
-            hint={t("pageheader.notableHint")}
-          />
+          <button
+            type="button"
+            onClick={props.onOpenIncidents}
+            title={t("pageheader.notableHint")}
+            style={{
+              background: "none",
+              border: "none",
+              padding: 0,
+              cursor: "pointer",
+            }}
+          >
+            <KpiStat
+              label={t("pageheader.notable")}
+              value={`${s.notable_level} ×${s.notable_count}`}
+              tone={s.notable_level === "critical" ? "critical" : "warning"}
+            />
+          </button>
         )}
         {collection != null && (
-          <KpiCard
+          <KpiStat
             label={t("pageheader.collection")}
             value={`${collection.collected}/${collection.source_total ?? "?"}`}
             hint={t("pageheader.collectionHint")}
           />
         )}
         {props.matched !== null && (
-          <KpiCard
+          <KpiStat
             label={t("pageheader.matched")}
             value={String(props.matched)}
             hint={t("pageheader.matchedHint")}
