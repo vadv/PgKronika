@@ -2,6 +2,9 @@ RUST_TOOLCHAIN ?= 1.96.0
 TARGET ?= $(shell rustc +$(RUST_TOOLCHAIN) -vV | sed -n 's/^host: //p')
 CARGO_BUILD = cargo +$(RUST_TOOLCHAIN) build --locked --target $(TARGET)
 SCHEMATHESIS_VERSION ?= 4.24.3
+# The reproducible tarball needs GNU tar: --sort=name is not in bsdtar, which is
+# what macOS ships as `tar`. `brew install gnu-tar` provides gtar.
+TAR ?= $(shell command -v gtar 2>/dev/null || echo tar)
 
 .PHONY: build collector web web-frontend web-frontend-check dump openapi openapi-bundle test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
 
@@ -16,7 +19,7 @@ web: ## Build pg_kronika-web.
 
 web-frontend: ## Install, build the SPA and pack deterministic static.tar.gz for rust-embed.
 	cd web && npm ci && npm run build
-	tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --exclude='*.map' \
+	$(TAR) --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --exclude='*.map' \
 		-czf bins/pg_kronika-web/static.tar.gz -C bins/pg_kronika-web/static .
 
 web-frontend-check: ## Typecheck, lint and test the SPA without building.
