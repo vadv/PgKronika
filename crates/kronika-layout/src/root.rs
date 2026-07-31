@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 use rustix::fs::RenameFlags;
 use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags};
 
-use crate::{LayoutError, LimitKind, OwnerKind, SegmentAddress, SegmentId, UtcDay};
+use crate::{
+    LayoutError, LimitKind, OwnerKind, PRODUCER_STATUS_NAME, PRODUCER_STATUS_TEMP_NAME,
+    SegmentAddress, SegmentId, UtcDay,
+};
 
 /// Root-level active segment journal.
 pub const ACTIVE_JOURNAL_NAME: &str = "active.parts";
@@ -3023,7 +3026,11 @@ const fn validate_limit(kind: LimitKind, value: usize, hard_max: usize) -> Resul
 fn is_control_name(name: &str) -> bool {
     matches!(
         name,
-        ACTIVE_JOURNAL_NAME | WRITER_OWNER_LOCK_NAME | OVERVIEW_OWNER_LOCK_NAME
+        ACTIVE_JOURNAL_NAME
+            | WRITER_OWNER_LOCK_NAME
+            | OVERVIEW_OWNER_LOCK_NAME
+            | PRODUCER_STATUS_NAME
+            | PRODUCER_STATUS_TEMP_NAME
     )
 }
 

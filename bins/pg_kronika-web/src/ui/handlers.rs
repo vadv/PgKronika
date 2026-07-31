@@ -21,6 +21,7 @@ use super::frame::projection::{
 };
 use super::frame::spark::{SparkError, attach_sparks};
 use super::heatmap::{HeatmapError, HeatmapRequest, HeatmapResponse, heatmap as build_heatmap};
+use super::quality::{DataQualityRequest, DataQualityResponse, build_data_quality};
 use super::spine::{SpineError, SpineRequest, SpineResponse, spine as build_spine};
 use crate::AppState;
 use crate::api_error::{
@@ -31,10 +32,12 @@ use crate::params::{QueryParams, parse_i64};
 /// Maximum serialized projection catalog response.
 const MAX_CATALOG_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_CONTEXT_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_DATA_QUALITY_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_HEATMAP_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_SPINE_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_HEATMAP_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
 const MAX_SPINE_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
+const MAX_DATA_QUALITY_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
 const DEFAULT_HEATMAP_BUCKETS: usize = 56;
 const MAX_HEATMAP_BUCKETS: usize = 256;
 const DEFAULT_HEATMAP_TOP: usize = 8;
@@ -43,6 +46,7 @@ const DEFAULT_SPINE_BUCKETS: usize = 288;
 const MAX_SPINE_BUCKETS: usize = 512;
 const CATALOG_PARAMS: &[QueryParameter] = &[];
 const CONTEXT_PARAMS: &[QueryParameter] = &[QueryParameter::At];
+const DATA_QUALITY_PARAMS: &[QueryParameter] = &[QueryParameter::From, QueryParameter::To];
 const SUMMARY_PARAMS: &[QueryParameter] = &[QueryParameter::At];
 const HEATMAP_PARAMS: &[QueryParameter] = &[
     QueryParameter::View,
@@ -57,6 +61,95 @@ const SPINE_PARAMS: &[QueryParameter] = &[
     QueryParameter::To,
     QueryParameter::Buckets,
 ];
+
+/// `GET /v1/data/quality` - freshness, coverage, producer and integrity facts.
+#[utoipa::path(
+    get,
+    path = "/v1/data/quality",
+    tag = "ui",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "Retained data quality facts", body = DataQualityResponse),
+        (status = 400, description = "Invalid or oversized quality query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Serialized response limit exceeded", body = ApiError),
+        (status = 500, description = "Quality status or index read failed", body = ApiError),
+    )
+)]
+pub(crate) async fn data_quality(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    let params = QueryParams::parse(raw.as_deref(), DATA_QUALITY_PARAMS)?;
+    let from_us = parse_i64(&params, QueryParameter::From)?;
+    let to_us = parse_i64(&params, QueryParameter::To)?;
+    let span = to_us
+        .checked_sub(from_us)
+        .filter(|span| *span > 0)
+        .ok_or_else(|| ApiError::invalid_query_constraint(QueryConstraint::FromBeforeTo))?;
+    if span > MAX_DATA_QUALITY_SPAN_US {
+        return Err(ApiError::query_shape_limit_exceeded(
+            LimitResource::QuerySpanUs,
+            u64::try_from(MAX_DATA_QUALITY_SPAN_US).expect("positive constant"),
+            u64::try_from(span).ok(),
+        ));
+    }
+    let stale_after_us = i64::try_from(state.stale_after.as_micros()).unwrap_or(i64::MAX);
+    let snapshot = state.snapshot();
+    let response = tokio::task::spawn_blocking(move || {
+        let producer_status =
+            kronika_layout::read_producer_status(snapshot.data_dir()).map_err(|error| {
+                tracing::error!(
+                    event = "api_ui_quality_status_read_failed",
+                    error = %error,
+                    "producer status read failed"
+                );
+                ApiError::store_read_failed()
+            })?;
+        Ok::<_, ApiError>(build_data_quality(
+            &snapshot,
+            producer_status,
+            DataQualityRequest {
+                from_us,
+                to_us,
+                stale_after_us,
+            },
+        ))
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_quality_worker_failed",
+            error = ?join,
+            "data quality worker failed"
+        );
+        ApiError::internal_error()
+    })??;
+    let body = serde_json::to_vec(&response).map_err(|cause| {
+        tracing::error!(
+            event = "api_ui_quality_serialize_failed",
+            error = %cause,
+            "data quality serialization failed"
+        );
+        ApiError::internal_error()
+    })?;
+    if body.len() > MAX_DATA_QUALITY_RESPONSE_BYTES {
+        return Err(ApiError::query_limit_exceeded(
+            LimitResource::Bytes,
+            count_u64(MAX_DATA_QUALITY_RESPONSE_BYTES),
+            Some(count_u64(body.len())),
+        ));
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
 
 /// `GET /v1/ui/context` - one exact instance, host, database and replication snapshot.
 #[utoipa::path(

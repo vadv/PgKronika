@@ -1,5 +1,6 @@
 use crate::buffering::push_activity;
 use crate::plans_source::PlansSourceCache;
+use crate::producer_status::{ProducerStatusPublisher, retention_status};
 use crate::scheduler::{Intervals, Scheduler, SourceKind};
 use crate::segments::{
     SegmentState, open_collector_journal, quarantine_invalid_segments,
@@ -13,6 +14,33 @@ use crate::{
 use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId};
 use kronika_source_pg::{ActivityRow, ActivityVersion};
 use kronika_writer::{Interner, JournalError, SectionBuffers, dict};
+
+#[test]
+fn producer_status_publisher_records_running_heartbeat_and_terminal_state() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let retention =
+        retention_status(Some(crate::config::RetentionConfig::Auto(80))).expect("valid retention");
+    let mut publisher = ProducerStatusPublisher::start(directory.path(), 42, 1_000, retention)
+        .expect("publish startup");
+    let running = kronika_layout::read_producer_status(directory.path())
+        .expect("read startup")
+        .expect("startup status");
+    assert_eq!(running.state, kronika_layout::ProducerState::Running);
+    assert_eq!(running.last_status_at_us, 1_000);
+
+    publisher.heartbeat(2_000).expect("publish heartbeat");
+    let heartbeat = kronika_layout::read_producer_status(directory.path())
+        .expect("read heartbeat")
+        .expect("heartbeat status");
+    assert_eq!(heartbeat.last_status_at_us, 2_000);
+
+    publisher.stop(3_000).expect("publish stop");
+    let stopped = kronika_layout::read_producer_status(directory.path())
+        .expect("read stop")
+        .expect("stop status");
+    assert_eq!(stopped.state, kronika_layout::ProducerState::Stopped);
+    assert_eq!(stopped.last_status_at_us, 3_000);
+}
 
 fn quarantine_payloads(root: &std::path::Path) -> Vec<Vec<u8>> {
     let quarantine = root.join(".pgkronika-quarantine-v1");

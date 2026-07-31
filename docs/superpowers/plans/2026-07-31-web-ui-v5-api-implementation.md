@@ -414,7 +414,7 @@ git commit -m "feat(web): add UI context API"
 - Produces:
   `build_data_quality(snapshot, status, from_us, to_us) -> DataQualityResponse`.
 
-- [ ] **Step 1: Write failing producer status codec/atomicity tests**
+- [x] **Step 1: Write failing producer status codec/atomicity tests**
 
 ```rust
 #[test]
@@ -425,7 +425,7 @@ fn producer_status_round_trips_running_and_stopped_states() {
 }
 ```
 
-- [ ] **Step 2: Run RED layout/collector tests**
+- [x] **Step 2: Run RED layout/collector tests**
 
 ```sh
 cargo test -p kronika-layout --lib --target aarch64-apple-darwin producer_status
@@ -434,7 +434,7 @@ cargo test -p pg_kronika-collector --lib --target aarch64-apple-darwin producer_
 
 Expected: producer status module and constructors are absent.
 
-- [ ] **Step 3: Implement bounded status file and collector lifecycle writes**
+- [x] **Step 3: Implement bounded status file and collector lifecycle writes**
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,14 +453,14 @@ sync. Update heartbeat after a completed cycle and write `stopped` on a
 graceful signal. Reserve the file in bounded root scan so it is not foreign
 data.
 
-- [ ] **Step 4: Run producer GREEN tests**
+- [x] **Step 4: Run producer GREEN tests**
 
 ```sh
 cargo test -p kronika-layout --lib --target aarch64-apple-darwin producer_status
 cargo test -p pg_kronika-collector --lib --target aarch64-apple-darwin producer_status
 ```
 
-- [ ] **Step 5: Write failing data-quality HTTP tests**
+- [x] **Step 5: Write failing data-quality HTTP tests**
 
 ```rust
 #[tokio::test]
@@ -475,7 +475,7 @@ async fn data_quality_distinguishes_late_data_gaps_and_proven_stopped_producer()
 }
 ```
 
-- [ ] **Step 6: Run HTTP RED test**
+- [x] **Step 6: Run HTTP RED test**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
@@ -484,7 +484,7 @@ cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
 
 Expected: route is absent.
 
-- [ ] **Step 7: Implement descriptor/summary-only quality assembly**
+- [x] **Step 7: Implement descriptor/summary-only quality assembly**
 
 ```rust
 fn aggregate_status(
@@ -502,7 +502,7 @@ Read only descriptors, `UiSummary` and producer status. Compute
 `age_us=max(0,to-data_through_us)`, never infer `stopped` from age, publish
 unknown gap reasons without causal guesses, and cap the response at 512 KiB.
 
-- [ ] **Step 8: Run GREEN tests and commit**
+- [x] **Step 8: Run GREEN tests and commit**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
