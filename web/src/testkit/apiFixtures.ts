@@ -1,4 +1,8 @@
 import type {
+  ContextResponse,
+  DataQualityResponse,
+  EntityHistoryResponse,
+  EntityPointResponse,
   EventFact,
   EventsResponseDto,
   FrameColumnDto,
@@ -11,6 +15,8 @@ import type {
   IncidentResponse,
   IncidentsResponse,
   MetricSpec,
+  SpineResponse,
+  StorageResponse,
   SummaryQuality,
   TimelineMetaDto,
   ViewSpec,
@@ -87,6 +93,8 @@ export function makeViewSummaryItem(
     population: 0,
     status: "complete",
     notable: false,
+    notable_count: 0,
+    notable_level: "none",
     collection: null,
     ...overrides,
   };
@@ -125,6 +133,7 @@ export function makeFrameColumn(
   return {
     code: "column",
     type: "i64",
+    hidden: false,
     ...overrides,
   };
 }
@@ -137,6 +146,8 @@ export function makeFrameRow(
     label: "postgres",
     cells: [],
     classifications: [],
+    categorical_classifications: [],
+    cell_statuses: [],
     spark: { complete: true, values: [] },
     ...overrides,
   };
@@ -179,11 +190,10 @@ export function makeTimelineMeta(
     data_through_us: null,
     store_data_through_us: null,
     freshness: {
-      status: "complete",
-      completeness: "complete",
+      state: "fresh",
+      age_us: null,
       data_through_us: null,
-      physical_count_semantics: "exact",
-      retained_exactness: "exact",
+      expected_period_us: null,
     },
     loss: { dropped_count_lower_bound: null, known_gaps: [] },
     tail_pending: null,
@@ -267,6 +277,8 @@ export function makeIncidentFinding(
     lens_id: "lens-1",
     role: "cause",
     confidence: "high",
+    confidence_cap: "high",
+    slug: "finding-1",
     scope: {
       logical_section: "pg_stat_database",
       identity: [],
@@ -285,8 +297,16 @@ export function makeIncident(
     interval: { from: 0, to: 3_600_000_000 },
     members: [],
     findings: [],
+    relations: [],
     evaluation_complete: true,
     finding_evaluation_status: "complete",
+    category_code: "uncategorized",
+    coincident_count: 0,
+    finding_count: 0,
+    level: "info",
+    level_policy_revision: 1,
+    peak_ts_us: "1722400000000000",
+    summary_code: "summary",
     ...overrides,
   };
 }
@@ -307,6 +327,131 @@ export function makeIncidentsResponse(
     data_quality: {},
     log: {},
     skipped: {},
+    ...overrides,
+  };
+}
+
+export function makeContextResponse(
+  overrides: Partial<ContextResponse> = {},
+): ContextResponse {
+  return {
+    snapshot_ts_us: "1722400000000000",
+    host: {},
+    instance: {},
+    databases: [],
+    replication: { replicas: [] },
+    quality: { status: "complete", gaps: [], gated: [], active_tail: false },
+    ...overrides,
+  };
+}
+
+export function makeSpineResponse(
+  overrides: Partial<SpineResponse> = {},
+): SpineResponse {
+  return {
+    grid: { from_us: "0", to_us: "3600000000", bucket_count: 60 },
+    series: [],
+    quality: {
+      status: "complete",
+      snapshots: 0,
+      gaps: [],
+      gated: [],
+      resource_limited: [],
+      active_tail: false,
+    },
+    ...overrides,
+  };
+}
+
+export function makeDataQualityResponse(
+  overrides: Partial<DataQualityResponse> = {},
+): DataQualityResponse {
+  return {
+    status: "complete",
+    freshness: {
+      state: "fresh",
+      age_us: null,
+      data_through_us: null,
+      expected_period_us: null,
+    },
+    coverage: {
+      complete_snapshots: 0,
+      expected_snapshots: null,
+      observed_snapshots: 0,
+    },
+    gaps: [],
+    capabilities: [],
+    integrity: {
+      orphan_overviews: 0,
+      quarantined_entries: 0,
+      readable_segments: 0,
+    },
+    producer: {
+      state: "running",
+      collector_pid: null,
+      collector_started_at_us: null,
+      last_status_at_us: null,
+    },
+    quality: { status: "complete", gated: [] },
+    ...overrides,
+  };
+}
+
+export function makeStorageResponse(
+  overrides: Partial<StorageResponse> = {},
+): StorageResponse {
+  return {
+    filesystem: { available_bytes: 0, total_bytes: 0, used_fraction: 0 },
+    forecast: {
+      full_in_days: null,
+      full_in_days_reason: null,
+      window_us: "0",
+      write_rate_bytes_per_day: null,
+    },
+    integrity: {
+      orphan_overviews: 0,
+      quarantined_entries: 0,
+      readable_segments: 0,
+    },
+    quality: { status: "complete", gated: [] },
+    retention: {
+      status: "ok",
+      configured_limit: null,
+      effective_limit_bytes: null,
+      mode: null,
+      reason: null,
+    },
+    used_bytes: { journal: 0, other: 0, ovf: 0, pgm: 0, quarantine: 0 },
+    ...overrides,
+  };
+}
+
+export function makeEntityPointResponse(
+  overrides: Partial<EntityPointResponse> = {},
+): EntityPointResponse {
+  return {
+    view: "activity",
+    entity: "db:1",
+    mode: "point",
+    snapshot_ts_us: "1722400000000000",
+    fields: [],
+    related: [],
+    quality: { status: "complete", gaps: [], gated: [] },
+    ...overrides,
+  };
+}
+
+export function makeEntityHistoryResponse(
+  overrides: Partial<EntityHistoryResponse> = {},
+): EntityHistoryResponse {
+  return {
+    view: "activity",
+    entity: "db:1",
+    mode: "history",
+    columns: [],
+    snapshots: [],
+    page: { next: null },
+    quality: { status: "complete", gaps: [], gated: [] },
     ...overrides,
   };
 }

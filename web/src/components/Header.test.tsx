@@ -1,13 +1,15 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { act } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { UiState } from "../state/url";
 import {
+  makeContextResponse,
+  makeDataQualityResponse,
   makeIncident,
   makeIncidentFinding,
   makeIncidentsResponse,
-  makeSummaryQuality,
-  makeViewSummaryResponse,
+  makeStorageResponse,
 } from "../testkit/apiFixtures";
 import { Header, type HeaderProps } from "./Header";
 
@@ -26,40 +28,124 @@ const state: UiState = {
   entity: null,
 };
 
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function stubFetch() {
+  return vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    const body = url.includes("/v1/storage")
+      ? makeStorageResponse()
+      : makeDataQualityResponse();
+    return Promise.resolve(jsonResponse(body));
+  });
+}
+
 function renderHeader(overrides: Partial<HeaderProps> = {}) {
+  vi.stubGlobal("fetch", stubFetch());
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
   const props: HeaderProps = {
     state,
-    summary: undefined,
+    context: undefined,
     incidents: undefined,
     dataHealthOpen: false,
     onToggleDataHealth: () => {},
     onOpenIncidents: () => {},
     ...overrides,
   };
-  return render(<Header {...props} />);
+  return render(<Header {...props} />, { wrapper });
 }
 
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
-test("renders instance chip with the source name", () => {
-  renderHeader();
+test("instance chip falls back to local, shows the context hostname", () => {
+  const { unmount } = renderHeader();
+  expect(screen.getByTestId("instance-chip").textContent).toContain("local");
+  unmount();
+  renderHeader({
+    context: makeContextResponse({ instance: { hostname: "prod-1" } }),
+  });
   expect(screen.getByTestId("instance-chip").textContent).toContain("prod-1");
 });
 
-test("data chip shows unknown state without summary, ok when complete", () => {
+test("role chip shows an honest dash with the reason in the title", () => {
+  const { unmount } = renderHeader();
+  expect(screen.getByTestId("role-chip").textContent).toBe("—");
+  unmount();
+  renderHeader({
+    context: makeContextResponse({
+      instance: { role: null, role_reason: "pg_control unavailable" },
+    }),
+  });
+  const chip = screen.getByTestId("role-chip");
+  expect(chip.textContent).toBe("—");
+  expect(chip.getAttribute("title")).toBe("pg_control unavailable");
+});
+
+test("role chip shows the role and replica lag when replication is present", () => {
+  renderHeader({
+    context: makeContextResponse({
+      instance: { role: "primary" },
+      replication: {
+        instance: {
+          streaming_replicas: 2,
+          replay_lag_us: 3_000_000,
+          replay_lag_reason: null,
+          timeline_id: 1,
+        },
+        replicas: [],
+      },
+    }),
+  });
+  const chip = screen.getByTestId("role-chip");
+  expect(chip.textContent).toContain("primary");
+  expect(chip.textContent).toContain("2 header.replicas");
+  expect(chip.textContent).toContain("header.lag 3s");
+});
+
+test("role chip shows an honest dash for a null replay lag", () => {
+  renderHeader({
+    context: makeContextResponse({
+      replication: {
+        instance: {
+          streaming_replicas: 1,
+          replay_lag_us: null,
+          replay_lag_reason: "no replay in progress",
+          timeline_id: 1,
+        },
+        replicas: [],
+      },
+    }),
+  });
+  const chip = screen.getByTestId("role-chip");
+  expect(chip.textContent).toContain("header.lag —");
+  expect(chip.innerHTML).toContain("no replay in progress");
+});
+
+test("data chip shows unknown state without context, ok when complete", () => {
   const { unmount } = renderHeader();
   expect(screen.getByTestId("data-health-chip").textContent).toContain(
     "header.dataUnknown",
   );
   unmount();
-  renderHeader({
-    summary: makeViewSummaryResponse({
-      quality: makeSummaryQuality({ status: "complete" }),
-    }),
-  });
+  renderHeader({ context: makeContextResponse() });
   expect(screen.getByTestId("data-health-chip").textContent).toContain(
     "header.dataOk",
   );
@@ -69,8 +155,13 @@ test("data chip shows partial when gaps or gated present, click toggles", () => 
   const onToggleDataHealth = vi.fn();
   renderHeader({
     onToggleDataHealth,
-    summary: makeViewSummaryResponse({
-      quality: makeSummaryQuality({ gaps: ["gap-1"], gated: ["lock_timeout"] }),
+    context: makeContextResponse({
+      quality: {
+        status: "partial",
+        gaps: [{ from_us: "1", to_us: "2" }],
+        gated: ["lock_timeout"],
+        active_tail: false,
+      },
     }),
   });
   const chip = screen.getByTestId("data-health-chip");
@@ -79,14 +170,9 @@ test("data chip shows partial when gaps or gated present, click toggles", () => 
   expect(onToggleDataHealth).toHaveBeenCalledTimes(1);
 });
 
-test("opens the data health popover when dataHealthOpen", () => {
-  renderHeader({
-    dataHealthOpen: true,
-    summary: makeViewSummaryResponse({
-      quality: makeSummaryQuality({ snapshots: 7 }),
-    }),
-  });
-  expect(screen.getByRole("dialog")).toBeDefined();
+test("opens the data health popover when dataHealthOpen", async () => {
+  renderHeader({ dataHealthOpen: true });
+  await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
 });
 
 test("counts critical incidents by high-confidence findings", () => {

@@ -7,5 +7,7 @@
   ["spine.span.900", "15м", "15m"],
   ["spine.span.3600", "1ч", "1h"],
   ["spine.span.21600", "6ч", "6h"],
-  ["spine.span.86400", "24ч", "24h"]
+  ["spine.span.86400", "24ч", "24h"],
+  ["spine.load", "Нагрузка: {{code}} ({{unit}})", "Load: {{code}} ({{unit}})"],
+  ["spine.missing", "Нет данных", "No data"]
 ]

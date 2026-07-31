@@ -1,0 +1,15 @@
+[
+  ["dock.title", "Панель", "Dock"],
+  ["dock.tabs.row", "строка", "row"],
+  ["dock.tabs.incidents", "инциденты", "incidents"],
+  ["dock.close", "Закрыть панель", "Close dock"],
+  ["dock.row.missing", "Сущность не найдена", "Entity not found"],
+  ["dock.row.partial", "данные неполные", "partial data"],
+  [
+    "dock.row.morePages",
+    "доступны ещё страницы истории",
+    "more history pages available"
+  ],
+  ["dock.row.drill", "→ {{view}}", "→ {{view}}"],
+  ["dock.row.clear", "очистить", "clear"]
+]

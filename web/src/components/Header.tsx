@@ -1,31 +1,26 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { IncidentsResponse, ViewSummaryResponse } from "../api/types";
+import type { ContextResponse, IncidentsResponse } from "../api/types";
 import type { UiState } from "../state/url";
 import { DataHealthPopover } from "./DataHealthPopover";
 
 export interface HeaderProps {
   state: UiState;
-  summary: ViewSummaryResponse | undefined;
+  context: ContextResponse | undefined;
   incidents: IncidentsResponse | undefined;
   dataHealthOpen: boolean;
   onToggleDataHealth: () => void;
   onOpenIncidents: () => void;
 }
 
+type ContextQuality = ContextResponse["quality"];
+
 type DataHealth = "ok" | "partial" | "unknown";
 
-function dataHealth(summary: ViewSummaryResponse | undefined): DataHealth {
-  if (!summary) return "unknown";
-  const q = summary.quality;
-  if (q.status === "complete" && q.gaps.length === 0) return "ok";
-  if (
-    q.gaps.length > 0 ||
-    q.gated.length > 0 ||
-    q.resource_limited.length > 0
-  ) {
-    return "partial";
-  }
+function dataHealth(quality: ContextQuality | undefined): DataHealth {
+  if (!quality) return "unknown";
+  if (quality.status === "complete" && quality.gaps.length === 0) return "ok";
+  if (quality.gaps.length > 0 || quality.gated.length > 0) return "partial";
   return "unknown";
 }
 
@@ -143,9 +138,48 @@ function Dot(props: { color: string; square?: boolean }) {
   );
 }
 
+function RoleChip(props: { context: ContextResponse | undefined }) {
+  const { t } = useTranslation();
+  const instance = props.context?.instance;
+  const role = instance?.role ?? "—";
+  const repl = props.context?.replication.instance;
+  const lag =
+    repl?.replay_lag_us == null
+      ? "—"
+      : `${Math.round(repl.replay_lag_us / 1_000_000)}s`;
+  return (
+    <span
+      style={chipStyle}
+      data-testid="role-chip"
+      title={
+        instance?.role == null
+          ? (instance?.role_reason ?? undefined)
+          : undefined
+      }
+    >
+      {role}
+      {repl && (
+        <span
+          title={
+            repl.replay_lag_us == null
+              ? (repl.replay_lag_reason ?? undefined)
+              : undefined
+          }
+        >
+          {` · ${repl.streaming_replicas} ${t("header.replicas")} · ${t("header.lag")} ${lag}`}
+        </span>
+      )}
+    </span>
+  );
+}
+
 export function Header(props: HeaderProps) {
   const { t } = useTranslation();
-  const health = dataHealth(props.summary);
+  const health = dataHealth(props.context?.quality);
+
+  // Window for the data-health popover queries (int64 µs decimal strings).
+  const to = props.state.at ?? String(Date.now() * 1000);
+  const from = String(Number(to) - props.state.span * 1_000_000);
 
   // IncidentFindingResponse has no severity field — only role/confidence
   // (see web/src/api/schema.d.ts). Approximation: an incident counts as
@@ -174,8 +208,10 @@ export function Header(props: HeaderProps) {
     >
       <span style={chipStyle} data-testid="instance-chip">
         <Dot color="var(--sev-ok)" />
-        {props.state.source}
+        {props.context?.instance.hostname ?? "local"}
       </span>
+
+      <RoleChip context={props.context} />
 
       <span style={{ position: "relative" }}>
         <button
@@ -188,12 +224,7 @@ export function Header(props: HeaderProps) {
           <Dot square color={healthColor[health]} />
           {t("header.data")}: {t(healthLabelKey[health])}
         </button>
-        {props.dataHealthOpen && props.summary && (
-          <DataHealthPopover
-            quality={props.summary.quality}
-            views={props.summary.views}
-          />
-        )}
+        {props.dataHealthOpen && <DataHealthPopover from={from} to={to} />}
       </span>
 
       {critical > 0 && (
