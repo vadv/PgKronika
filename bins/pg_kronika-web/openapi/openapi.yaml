@@ -38,6 +38,8 @@ components:
       $ref: schemas/ui.yaml#/ClassificationResultDto
     ClassifiedResultDto:
       $ref: schemas/ui.yaml#/ClassifiedResultDto
+    CollectionStatusDto:
+      $ref: schemas/ui.yaml#/CollectionStatusDto
     ColumnSpec:
       $ref: schemas/ui.yaml#/ColumnSpec
     CounterDeltaPayload:

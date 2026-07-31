@@ -181,6 +181,18 @@ accept `250ms`, `90s`, `15m`, `2h`, or bare seconds. Row endpoints return 1,000
 rows by default and clamp `limit` to 10,000. Treat a cursor as opaque and pass
 it back unchanged on the next request.
 
+Every item in the `views` array returned by `/v1/views/summary` includes the
+required, nullable `collection` field. It is `null` when no collection marker
+applies to the resolved snapshot. Otherwise, the object contains four required
+fields:
+
+- `collected`: the number of rows durably retained for the view snapshot;
+- `source_total`: the exact source row count, or `null` when the read could not
+  prove it;
+- `read_state`: one of `complete`, `source_limit`, `permission`,
+  `read_failure`, and `collector_limit_or_loss`;
+- `visibility`: one of `full`, `restricted`, and `unknown`.
+
 The UI catalog uses the closed availability set `available`, `gated`,
 `not_collected`, and `unsupported_type`. `processes.pss` remains
 `not_collected` until the collector writes bounded `smaps_rollup`; Activity

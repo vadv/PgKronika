@@ -271,6 +271,7 @@ impl Config {
         let intervals = intervals_from_env()?;
         let log = log_config_from_env(&out_dir)?;
         validate_cardinality(max_tables, max_indexes)?;
+        validate_max_statements(max_statements)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
         validate_max_plans(max_plans)?;
@@ -508,15 +509,18 @@ fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Reject per-axis top-N counts that could overflow a single section.
+/// Reject non-positive per-axis top-N counts and counts that could overflow a
+/// single section.
 ///
 /// Worst case, every covered database contributes `axes * top_n` rows to one
 /// section. That product must stay under [`MAX_SECTION_ROWS`], or the sealed
 /// section is rejected at encode time and the whole segment is lost. Bounding the
-/// env here turns a mid-run failure into a clear startup error.
+/// env here turns a false complete `0/0` marker or mid-run failure into a clear
+/// startup error.
 ///
 /// # Errors
-/// Returns an error naming the env and the limit when either product overflows.
+/// Returns an error naming the env when a count is non-positive or either
+/// product overflows.
 pub(crate) fn validate_cardinality(max_tables: i64, max_indexes: i64) -> Result<()> {
     let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
     let databases =
@@ -537,11 +541,12 @@ pub(crate) fn validate_cardinality(max_tables: i64, max_indexes: i64) -> Result<
     )
 }
 
-/// Fail unless `databases * axes * top_n <= cap`.
+/// Fail unless `top_n > 0` and `databases * axes * top_n <= cap`.
 ///
 /// # Errors
-/// Returns an error naming `env`, the worst-case row count, and `cap`.
+/// Returns an error naming `env` and the invalid lower or upper bound.
 fn check_section_bound(env: &str, databases: i64, axes: i64, top_n: i64, cap: i64) -> Result<()> {
+    anyhow::ensure!(top_n > 0, "{env} must be greater than 0, got {top_n}");
     let worst_case = databases
         .checked_mul(axes)
         .and_then(|rows| rows.checked_mul(top_n))
@@ -599,6 +604,22 @@ pub(crate) fn validate_max_plans(max_plans: i64) -> Result<()> {
     anyhow::ensure!(
         max_plans > 0 && max_plans <= cap,
         "KRONIKA_PG_MAX_PLANS must be in 1..={cap}, got {max_plans}"
+    );
+    Ok(())
+}
+
+/// Reject a statements per-axis top-N that can overflow a single section.
+///
+/// The two candidate axes can be disjoint, so the encoded section may contain
+/// up to `2 * max_statements` rows.
+///
+/// # Errors
+/// Returns an error naming the env and its per-axis bound when out of range.
+pub(crate) fn validate_max_statements(max_statements: i64) -> Result<()> {
+    let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")? / 2;
+    anyhow::ensure!(
+        max_statements > 0 && max_statements <= cap,
+        "KRONIKA_PG_MAX_STATEMENTS must be in 1..={cap}, got {max_statements}"
     );
     Ok(())
 }

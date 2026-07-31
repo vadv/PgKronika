@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use arrow_array::RecordBatch;
 use kronika_format::{PartMeta, SectionInput, build_part, crc32c};
+use kronika_registry::collection_coverage::CollectionCoverageV1;
 use kronika_registry::incident_gauges::{
     PgProcessCgroupMemoryV1, PgReplicationPhysicalV1, PgReplicationSlotRetentionV3,
     PgStorageMountV2,
@@ -27,7 +28,7 @@ use kronika_registry::{
 
 /// Schema version for [`all_family_fixture`].
 #[cfg(test)]
-pub(super) const ALL_FAMILY_SCHEMA_VERSION: u16 = 2;
+pub(super) const ALL_FAMILY_SCHEMA_VERSION: u16 = 3;
 
 /// One encoded registry section retained by a fixture part.
 #[derive(Debug, Clone)]
@@ -162,12 +163,14 @@ fn fixture_part(ts_us: i64, snapshot: u8) -> FixturePart {
         (snapshot == 1).then_some(9),
     )];
     let coverage = coverage_rows(ts_us, snapshot);
+    let collection_coverage = collection_coverage_rows(ts_us);
 
     let mut sections = vec![
         encoded_section(1_005_004, &database),
         encoded_section(1_015_001, &replication),
         encoded_section(1_020_001, &resets),
         encoded_section(1_021_001, &instance),
+        encoded_section(1_023_001, &collection_coverage),
         encoded_section(1_028_001, &lifecycle),
         encoded_section(1_036_002, &storage),
         encoded_section(1_037_001, &process_cgroup),
@@ -497,12 +500,14 @@ const fn sender_row(ts_us: i64, state_code: u8) -> PgReplicationPhysicalV1 {
 
 fn coverage_rows(ts_us: i64, snapshot: u8) -> Vec<SnapshotCoverageV1> {
     [
-        1_005_004, 1_015_001, 1_020_001, 1_033_001, 1_034_003, 1_036_002, 1_037_001, 1_106_001,
-        1_202_001,
+        1_005_004, 1_014_001, 1_015_001, 1_020_001, 1_033_001, 1_034_003, 1_036_002, 1_037_001,
+        1_106_001, 1_202_001,
     ]
     .into_iter()
     .map(|section_type_id| {
-        if snapshot == 2 && section_type_id == 1_005_004 {
+        if section_type_id == 1_014_001 {
+            coverage_row(section_type_id, ts_us, 1, 2, 1)
+        } else if snapshot == 2 && section_type_id == 1_005_004 {
             coverage_row(section_type_id, ts_us, 3, 1, 0)
         } else if snapshot >= 2 && section_type_id == 1_033_001 {
             coverage_row(section_type_id, ts_us, 0, 0, 0)
@@ -511,6 +516,20 @@ fn coverage_rows(ts_us: i64, snapshot: u8) -> Vec<SnapshotCoverageV1> {
         }
     })
     .collect()
+}
+
+const fn collection_coverage_rows(ts_us: i64) -> [CollectionCoverageV1; 1] {
+    [CollectionCoverageV1 {
+        ts: Ts(ts_us),
+        section_type_id: 1_014_001,
+        total: 2,
+        unknown_total: false,
+        collected: 1,
+        max_n: 1,
+        order_by: StrId(40),
+        cutoff_value: None,
+        reason: 0,
+    }]
 }
 
 const fn coverage_row(

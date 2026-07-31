@@ -15,8 +15,10 @@
 //! interns the strings into the segment dictionary. The typed layout lives in
 //! `kronika-registry` (`PgStorePlansVadvV1`).
 
+use crate::materialized_cte_query;
 use kronika_registry::pg_store_plans::{PgStorePlansOsscV1, PgStorePlansVadvV1};
 use kronika_registry::{StrId, Ts};
+use std::borrow::Cow;
 use tokio_postgres::Client;
 
 /// Prefix a query literal with the collector marker.
@@ -149,11 +151,16 @@ pub async fn store_plans_is_vadv(client: &Client) -> Result<bool, tokio_postgres
 }
 
 /// The enumeration query: top-N plan entries without plan texts.
-const fn store_plans_query() -> &'static str {
-    marked!(
-        "SELECT \
+fn store_plans_query(server_major: u32) -> Cow<'static, str> {
+    materialized_cte_query(
+        marked!(
+            "WITH source AS MATERIALIZED ( \
+             SELECT s.*, count(*) OVER ()::int8 AS source_total \
+             FROM pg_store_plans(false) s \
+         ) \
+         SELECT \
              $2::int8 AS ts_us, \
-             (SELECT count(*) FROM pg_store_plans(false)) AS source_total, \
+             s.source_total, \
              s.queryid, \
              s.queryid_stat_statements, \
              s.planid, \
@@ -187,11 +194,13 @@ const fn store_plans_query() -> &'static str {
              s.min_plan_time, \
              s.max_plan_time, \
              s.mean_plan_time \
-         FROM pg_store_plans(false) s \
+         FROM source s \
          LEFT JOIN pg_database d ON d.oid = s.dbid \
          LEFT JOIN pg_roles r ON r.oid = s.userid \
          ORDER BY s.total_time DESC \
          LIMIT $1"
+        ),
+        server_major,
     )
 }
 
@@ -205,11 +214,13 @@ const fn store_plans_query() -> &'static str {
 /// Returns the [`tokio_postgres::Error`] if the query fails.
 pub async fn collect_store_plans(
     client: &Client,
+    server_major: u32,
     max_plans: i64,
     snapshot_ts: i64,
 ) -> Result<(Vec<StorePlansRow>, u64), tokio_postgres::Error> {
+    let query = store_plans_query(server_major);
     let rows = client
-        .query(store_plans_query(), &[&max_plans, &snapshot_ts])
+        .query(query.as_ref(), &[&max_plans, &snapshot_ts])
         .await?;
     let source_total = rows
         .first()
@@ -260,8 +271,10 @@ fn row_from_pg(row: &tokio_postgres::Row) -> StorePlansRow {
     }
 }
 
-/// Fetch one plan text through `pg_store_plans_get_plan`, truncated to
-/// `max_len` bytes.
+/// Fetch one plan text through `pg_store_plans_get_plan`.
+///
+/// `PostgreSQL` applies `max_len` as a character limit through `left()`. The
+/// caller enforces the byte contract after this function returns.
 ///
 /// Returns `None` when the entry vanished between enumeration and this call
 /// (deallocated under memory pressure or reset).
@@ -399,8 +412,18 @@ mod tests {
 
     #[test]
     fn enumeration_query_reads_without_texts_and_caps_by_total_time() {
-        let q = store_plans_query();
-        assert!(q.contains("FROM pg_store_plans(false) s"), "{q}");
+        let q = store_plans_query(18);
+        assert!(q.contains("source AS MATERIALIZED"), "{q}");
+        assert!(q.contains("count(*) OVER ()::int8 AS source_total"), "{q}");
+        assert_eq!(
+            q.match_indices("FROM pg_store_plans(false)").count(),
+            1,
+            "the PostgreSQL source must be read once: {q}"
+        );
+        assert!(
+            !q.contains("(SELECT count(*) FROM pg_store_plans(false))"),
+            "{q}"
+        );
         assert!(
             q.contains("$2::int8 AS ts_us"),
             "the collector supplies the coordinated reset timestamp: {q}"
@@ -412,6 +435,16 @@ mod tests {
             !q.contains("s.plan,") && !q.contains("s.plan "),
             "enumeration must not fetch plan texts: {q}"
         );
+    }
+
+    #[test]
+    fn enumeration_cte_uses_only_server_supported_materialization_syntax() {
+        let legacy = store_plans_query(11);
+        assert!(legacy.contains("source AS ("), "{legacy}");
+        assert!(!legacy.contains("AS MATERIALIZED"), "{legacy}");
+
+        let modern = store_plans_query(12);
+        assert!(modern.contains("source AS MATERIALIZED ("), "{modern}");
     }
 
     #[test]
@@ -533,11 +566,16 @@ pub struct StorePlansOsscRow {
 /// The upstream SRF still copies its stored plan texts into the server-side
 /// tuplestore regardless of the projection; selecting `left(...)` bounds what
 /// crosses the network and what the collector allocates.
-const fn store_plans_ossc_query() -> &'static str {
-    marked!(
-        "SELECT \
+fn store_plans_ossc_query(server_major: u32) -> Cow<'static, str> {
+    materialized_cte_query(
+        marked!(
+            "WITH source AS MATERIALIZED ( \
+             SELECT s.*, count(*) OVER ()::int8 AS source_total \
+             FROM pg_store_plans s \
+         ) \
+         SELECT \
              $3::int8 AS ts_us, \
-             (SELECT count(*) FROM pg_store_plans) AS source_total, \
+             s.source_total, \
              s.queryid, \
              s.planid, \
              s.userid, \
@@ -570,23 +608,31 @@ const fn store_plans_ossc_query() -> &'static str {
              s.temp_blk_write_time, \
              (extract(epoch from s.first_call) * 1e6)::int8 AS first_call_us, \
              (extract(epoch from s.last_call) * 1e6)::int8 AS last_call_us \
-         FROM pg_store_plans s \
+         FROM source s \
          LEFT JOIN pg_database d ON d.oid = s.dbid \
          LEFT JOIN pg_roles r ON r.oid = s.userid \
          ORDER BY s.total_time DESC \
          LIMIT $1"
+        ),
+        server_major,
     )
 }
 
 /// The numeric-only ossc query: plan texts never cross the network.
 ///
 /// Used when the plan-text budget is zero; the `plan` column is projected as
-/// `NULL` so no text is transferred or allocated by the collector.
-const fn store_plans_ossc_numeric_query() -> &'static str {
-    marked!(
-        "SELECT \
+/// `NULL` so no text is transferred or allocated by the collector. The
+/// upstream SRF still materializes its plan data in the server backend.
+fn store_plans_ossc_numeric_query(server_major: u32) -> Cow<'static, str> {
+    materialized_cte_query(
+        marked!(
+            "WITH source AS MATERIALIZED ( \
+             SELECT s.*, count(*) OVER ()::int8 AS source_total \
+             FROM pg_store_plans s \
+         ) \
+         SELECT \
              $2::int8 AS ts_us, \
-             (SELECT count(*) FROM pg_store_plans) AS source_total, \
+             s.source_total, \
              s.queryid, \
              s.planid, \
              s.userid, \
@@ -619,11 +665,13 @@ const fn store_plans_ossc_numeric_query() -> &'static str {
              s.temp_blk_write_time, \
              (extract(epoch from s.first_call) * 1e6)::int8 AS first_call_us, \
              (extract(epoch from s.last_call) * 1e6)::int8 AS last_call_us \
-         FROM pg_store_plans s \
+         FROM source s \
          LEFT JOIN pg_database d ON d.oid = s.dbid \
          LEFT JOIN pg_roles r ON r.oid = s.userid \
          ORDER BY s.total_time DESC \
          LIMIT $1"
+        ),
+        server_major,
     )
 }
 
@@ -642,24 +690,21 @@ const fn store_plans_ossc_numeric_query() -> &'static str {
 /// Returns the [`tokio_postgres::Error`] if the query fails.
 pub async fn collect_store_plans_ossc(
     client: &Client,
+    server_major: u32,
     max_plans: i64,
     text_cap: Option<i32>,
     snapshot_ts: i64,
 ) -> Result<(Vec<StorePlansOsscRow>, usize, u64), tokio_postgres::Error> {
-    let rows = match text_cap {
-        Some(cap) => {
-            client
-                .query(store_plans_ossc_query(), &[&max_plans, &cap, &snapshot_ts])
-                .await?
-        }
-        None => {
-            client
-                .query(
-                    store_plans_ossc_numeric_query(),
-                    &[&max_plans, &snapshot_ts],
-                )
-                .await?
-        }
+    let rows = if let Some(cap) = text_cap {
+        let query = store_plans_ossc_query(server_major);
+        client
+            .query(query.as_ref(), &[&max_plans, &cap, &snapshot_ts])
+            .await?
+    } else {
+        let query = store_plans_ossc_numeric_query(server_major);
+        client
+            .query(query.as_ref(), &[&max_plans, &snapshot_ts])
+            .await?
     };
     let source_total = rows
         .first()
@@ -763,7 +808,9 @@ pub fn to_ossc_v1<E>(
 
 #[cfg(test)]
 mod ossc_tests {
-    use super::{StorePlansOsscRow, store_plans_ossc_query, to_ossc_v1};
+    use super::{
+        StorePlansOsscRow, store_plans_ossc_numeric_query, store_plans_ossc_query, to_ossc_v1,
+    };
     use kronika_registry::StrId;
     use std::convert::Infallible;
 
@@ -820,19 +867,48 @@ mod ossc_tests {
 
     #[test]
     fn ossc_query_truncates_on_the_server_and_caps_by_total_time() {
-        let q = store_plans_ossc_query();
-        assert!(q.contains("FROM pg_store_plans s"), "{q}");
-        assert!(
-            q.contains("$3::int8 AS ts_us"),
-            "the collector supplies the coordinated reset timestamp: {q}"
-        );
-        assert!(q.contains("left(s.plan, $2::int4) AS plan"), "{q}");
-        assert!(q.contains("ORDER BY s.total_time DESC"), "{q}");
-        assert!(q.contains("LIMIT $1"), "{q}");
-        assert!(
-            !q.contains("pg_store_plans(false)"),
-            "the upstream view has no showtext argument: {q}"
-        );
+        for (q, timestamp) in [
+            (store_plans_ossc_query(18), "$3::int8 AS ts_us"),
+            (store_plans_ossc_numeric_query(18), "$2::int8 AS ts_us"),
+        ] {
+            assert!(q.contains("source AS MATERIALIZED"), "{q}");
+            assert!(q.contains("count(*) OVER ()::int8 AS source_total"), "{q}");
+            assert_eq!(
+                q.match_indices("FROM pg_store_plans").count(),
+                1,
+                "the PostgreSQL source must be read once: {q}"
+            );
+            assert!(!q.contains("(SELECT count(*) FROM pg_store_plans)"), "{q}");
+            assert!(
+                q.contains(timestamp),
+                "the collector supplies the coordinated reset timestamp: {q}"
+            );
+            assert!(q.contains("ORDER BY s.total_time DESC"), "{q}");
+            assert!(q.contains("LIMIT $1"), "{q}");
+            assert!(
+                !q.contains("pg_store_plans(false)"),
+                "the upstream view has no showtext argument: {q}"
+            );
+        }
+        assert!(store_plans_ossc_query(18).contains("left(s.plan, $2::int4) AS plan"));
+        assert!(store_plans_ossc_numeric_query(18).contains("NULL::text AS plan"));
+    }
+
+    #[test]
+    fn ossc_cte_uses_only_server_supported_materialization_syntax() {
+        for legacy in [
+            store_plans_ossc_query(11),
+            store_plans_ossc_numeric_query(11),
+        ] {
+            assert!(legacy.contains("source AS ("), "{legacy}");
+            assert!(!legacy.contains("AS MATERIALIZED"), "{legacy}");
+        }
+        for modern in [
+            store_plans_ossc_query(12),
+            store_plans_ossc_numeric_query(12),
+        ] {
+            assert!(modern.contains("source AS MATERIALIZED ("), "{modern}");
+        }
     }
 
     #[test]

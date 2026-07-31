@@ -2,8 +2,10 @@ use axum::http::StatusCode;
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_layout::SegmentId;
 use kronika_reader::{FactStore, LIMIT, LocalDirSnapshot};
+use kronika_registry::collection_coverage::CollectionCoverageV1;
 use kronika_registry::pg_log::PgLogLifecycleV1;
-use kronika_registry::{Section, Ts};
+use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
+use kronika_registry::{Section, StrId, Ts};
 
 use super::{AppState, assert_api_error, serve, serve_state};
 
@@ -48,6 +50,110 @@ fn write_event_segment(directory: &std::path::Path) {
     crate::test_layout::write_named_pgm(directory, "events.pgm", &event_segment_bytes());
 }
 
+fn collection_segment_bytes() -> Vec<u8> {
+    let snapshot = SnapshotCoverageV1::encode(&[
+        SnapshotCoverageV1 {
+            ts: Ts(100),
+            section_type_id: 1_002_001,
+            collector_pid: 42,
+            collector_started_at: Ts(1),
+            read_state: 0,
+            visibility: 0,
+            source_total: 5,
+            collected: 5,
+        },
+        SnapshotCoverageV1 {
+            ts: Ts(200),
+            section_type_id: 1_002_001,
+            collector_pid: 42,
+            collector_started_at: Ts(1),
+            read_state: 1,
+            visibility: 0,
+            source_total: 4_800,
+            collected: 500,
+        },
+        SnapshotCoverageV1 {
+            ts: Ts(300),
+            section_type_id: 1_002_001,
+            collector_pid: 42,
+            collector_started_at: Ts(1),
+            read_state: 2,
+            visibility: 1,
+            source_total: 10,
+            collected: 5,
+        },
+        SnapshotCoverageV1 {
+            ts: Ts(400),
+            section_type_id: 1_002_001,
+            collector_pid: 42,
+            collector_started_at: Ts(1),
+            read_state: 3,
+            visibility: 2,
+            source_total: 0,
+            collected: 0,
+        },
+    ])
+    .expect("encode snapshot coverage");
+    let collection = CollectionCoverageV1::encode(&[
+        CollectionCoverageV1 {
+            ts: Ts(200),
+            section_type_id: 1_002_001,
+            total: 4_800,
+            unknown_total: false,
+            collected: 500,
+            max_n: 500,
+            order_by: StrId(1),
+            cutoff_value: Some(1.0),
+            reason: 0,
+        },
+        CollectionCoverageV1 {
+            ts: Ts(300),
+            section_type_id: 1_002_001,
+            total: 10,
+            unknown_total: false,
+            collected: 5,
+            max_n: 500,
+            order_by: StrId(1),
+            cutoff_value: None,
+            reason: 2,
+        },
+        CollectionCoverageV1 {
+            ts: Ts(400),
+            section_type_id: 1_002_001,
+            total: 0,
+            unknown_total: true,
+            collected: 0,
+            max_n: 500,
+            order_by: StrId(1),
+            cutoff_value: None,
+            reason: 1,
+        },
+    ])
+    .expect("encode collection coverage");
+    build_part(
+        &[
+            SectionInput {
+                type_id: 1_023_001,
+                rows: 3,
+                body: &collection,
+            },
+            SectionInput {
+                type_id: 1_038_001,
+                rows: 4,
+                body: &snapshot,
+            },
+        ],
+        PartMeta {
+            min_ts: 100,
+            max_ts: 400,
+        },
+    )
+}
+
+fn write_collection_segment(directory: &std::path::Path) {
+    crate::test_layout::write_named_pgm(directory, "collection.pgm", &collection_segment_bytes());
+}
+
 fn publish_web_index(directory: &std::path::Path) {
     let snapshot = LocalDirSnapshot::open(directory).expect("open snapshot");
     let store = FactStore::new(directory);
@@ -79,8 +185,73 @@ async fn ui_summary_returns_exact_event_population_and_all_views() {
     assert_eq!(events["population"], 1);
     assert_eq!(events["status"], "complete");
     assert_eq!(events["notable"], true);
+    assert!(events["collection"].is_null());
     assert_eq!(body["quality"]["status"], "partial");
     assert_eq!(body["quality"]["snapshots"], 1);
+}
+
+#[tokio::test]
+async fn ui_summary_returns_factual_collection_states() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    write_collection_segment(directory.path());
+    publish_web_index(directory.path());
+
+    for (at, population, collection) in [
+        (
+            100,
+            5,
+            serde_json::json!({
+                "collected": 5,
+                "source_total": 5,
+                "read_state": "complete",
+                "visibility": "full",
+            }),
+        ),
+        (
+            200,
+            500,
+            serde_json::json!({
+                "collected": 500,
+                "source_total": 4_800,
+                "read_state": "source_limit",
+                "visibility": "full",
+            }),
+        ),
+        (
+            300,
+            5,
+            serde_json::json!({
+                "collected": 5,
+                "source_total": 10,
+                "read_state": "permission",
+                "visibility": "restricted",
+            }),
+        ),
+        (
+            400,
+            0,
+            serde_json::json!({
+                "collected": 0,
+                "source_total": null,
+                "read_state": "read_failure",
+                "visibility": "unknown",
+            }),
+        ),
+    ] {
+        let (status, body) = serve(directory.path(), &format!("/v1/views/summary?at={at}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let statements = body["views"]
+            .as_array()
+            .expect("views")
+            .iter()
+            .find(|view| view["view"] == "statements")
+            .expect("statements");
+        assert_eq!(statements["snapshot_ts_us"], at.to_string());
+        assert_eq!(statements["population"], population);
+        assert_eq!(statements["status"], "complete");
+        assert_eq!(statements["notable"], false);
+        assert_eq!(statements["collection"], collection);
+    }
 }
 
 #[tokio::test]

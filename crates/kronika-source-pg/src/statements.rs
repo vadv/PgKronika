@@ -7,17 +7,16 @@
 //! *extension* version reported by `pg_extension`, not the server major, because
 //! the extension can be pinned independently of the server.
 //!
-//! Candidate selection unions top-N statements by `total_exec_time` and by
-//! `calls`. This keeps rows that dominate execution time and rows that dominate
-//! call count without assigning severity in SQL.
+//! Candidate selection keeps top-N statements by `total_exec_time` and by
+//! `calls`. `WITH ORDINALITY` identifies each materialized row, including
+//! otherwise indistinguishable rows whose `queryid` is masked.
 //!
-//! `queryid` and `query` are nullable: `queryid` is `NULL` when
-//! `compute_query_id` is off, and `query` is `NULL` for a caller without the
-//! privilege to read another role's statement text. `datname` and `usename` are
-//! resolved through `LEFT JOIN`, so they are `None` for an oid with no catalog
-//! row. Collection returns owned rows; the caller interns the strings into the
-//! segment dictionary. The typed layout lives in `kronika-registry`
-//! (`PgStatStatementsV1`..`V6`).
+//! `queryid` is nullable when `PostgreSQL` masks another role's identity. The
+//! numeric core calls `pg_stat_statements(false)`, so `query` is always `NULL`.
+//! `datname` and `usename` are resolved through `LEFT JOIN`, so they are `None`
+//! for an oid with no catalog row. Collection returns owned rows; the caller
+//! interns the names into the segment dictionary. The typed layout lives in
+//! `kronika-registry` (`PgStatStatementsV1`..`V6`).
 
 use kronika_registry::pg_stat_statements::{
     PgStatStatementsV1, PgStatStatementsV2, PgStatStatementsV3, PgStatStatementsV4,
@@ -37,9 +36,6 @@ macro_rules! marked {
         )
     };
 }
-
-/// Statement text truncation, in bytes, applied inline in the SELECT.
-const QUERY_TRUNCATE: usize = 5000;
 
 /// The `pg_stat_statements` layout selected by the extension version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,10 +92,13 @@ fn parse_ext_version(extversion: &str) -> Option<(u32, u32)> {
 
 /// The SQL for one layout.
 ///
-/// `$1` is the per-axis top-N row count. Candidate selection unions top-N
+/// `$1` is the per-axis top-N row count. Candidate selection keeps top-N
 /// statements by `total_exec_time` (or, on the legacy layout, `total_time`) and
-/// by `calls`. `query` is truncated inline to the crate's fixed query-text
-/// limit and interned; `datname`/`usename` are resolved with a `LEFT JOIN`.
+/// by `calls`. The source calls `pg_stat_statements(false)` once and does not
+/// materialize query text; the nullable `query` field is returned as `NULL`.
+/// `datname`/`usename` are resolved with a `LEFT JOIN`.
+/// `server_major` controls only the CTE materialization spelling: `PostgreSQL`
+/// 10/11 materialize CTEs implicitly, while 12+ supports the explicit keyword.
 /// `ts` is one `statement_timestamp()` for the whole snapshot; the
 /// `*_stats_since` columns come back as unix microseconds. SQL applies no
 /// thresholds or severity labels.
@@ -108,35 +107,136 @@ fn parse_ext_version(extversion: &str) -> Option<(u32, u32)> {
     reason = "six full per-version SQL literals; splitting the match hurts readability"
 )]
 #[must_use]
-pub fn statements_query(version: StatementsVersion) -> String {
+pub fn statements_query(version: StatementsVersion, server_major: u32) -> String {
     // The legacy layout orders its time axis by `total_time`; every later layout
     // renamed it to `total_exec_time`.
     let time_axis = match version {
         StatementsVersion::V1 => "total_time",
         _ => "total_exec_time",
     };
+    let materialized = if server_major >= 12 {
+        "MATERIALIZED "
+    } else {
+        ""
+    };
+    let source_columns = match version {
+        StatementsVersion::V1 => {
+            "s.userid, s.dbid, s.queryid, s.calls, s.rows, \
+             s.total_time, s.min_time, s.max_time, s.mean_time, s.stddev_time, \
+             s.shared_blks_hit, s.shared_blks_read, s.shared_blks_dirtied, \
+             s.shared_blks_written, s.local_blks_hit, s.local_blks_read, \
+             s.local_blks_dirtied, s.local_blks_written, s.temp_blks_read, \
+             s.temp_blks_written, s.blk_read_time, s.blk_write_time"
+        }
+        StatementsVersion::V2 => {
+            "s.userid, s.dbid, s.queryid, s.calls, s.rows, s.plans, \
+             s.total_exec_time, s.total_plan_time, s.min_exec_time, \
+             s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
+             s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
+             s.stddev_plan_time, s.shared_blks_hit, s.shared_blks_read, \
+             s.shared_blks_dirtied, s.shared_blks_written, s.local_blks_hit, \
+             s.local_blks_read, s.local_blks_dirtied, s.local_blks_written, \
+             s.temp_blks_read, s.temp_blks_written, s.blk_read_time, \
+             s.blk_write_time, s.wal_records, s.wal_fpi, s.wal_bytes"
+        }
+        StatementsVersion::V3 => {
+            "s.userid, s.dbid, s.queryid, s.toplevel, s.calls, s.rows, s.plans, \
+             s.total_exec_time, s.total_plan_time, s.min_exec_time, \
+             s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
+             s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
+             s.stddev_plan_time, s.shared_blks_hit, s.shared_blks_read, \
+             s.shared_blks_dirtied, s.shared_blks_written, s.local_blks_hit, \
+             s.local_blks_read, s.local_blks_dirtied, s.local_blks_written, \
+             s.temp_blks_read, s.temp_blks_written, s.blk_read_time, \
+             s.blk_write_time, s.wal_records, s.wal_fpi, s.wal_bytes"
+        }
+        StatementsVersion::V4 => {
+            "s.userid, s.dbid, s.queryid, s.toplevel, s.calls, s.rows, s.plans, \
+             s.total_exec_time, s.total_plan_time, s.min_exec_time, \
+             s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
+             s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
+             s.stddev_plan_time, s.shared_blks_hit, s.shared_blks_read, \
+             s.shared_blks_dirtied, s.shared_blks_written, s.local_blks_hit, \
+             s.local_blks_read, s.local_blks_dirtied, s.local_blks_written, \
+             s.temp_blks_read, s.temp_blks_written, s.blk_read_time, \
+             s.blk_write_time, s.temp_blk_read_time, s.temp_blk_write_time, \
+             s.wal_records, s.wal_fpi, s.wal_bytes, s.jit_functions, \
+             s.jit_generation_time, s.jit_inlining_count, s.jit_inlining_time, \
+             s.jit_optimization_count, s.jit_optimization_time, \
+             s.jit_emission_count, s.jit_emission_time"
+        }
+        StatementsVersion::V5 => {
+            "s.userid, s.dbid, s.queryid, s.toplevel, s.calls, s.rows, s.plans, \
+             s.total_exec_time, s.total_plan_time, s.min_exec_time, \
+             s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
+             s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
+             s.stddev_plan_time, s.shared_blks_hit, s.shared_blks_read, \
+             s.shared_blks_dirtied, s.shared_blks_written, s.local_blks_hit, \
+             s.local_blks_read, s.local_blks_dirtied, s.local_blks_written, \
+             s.temp_blks_read, s.temp_blks_written, s.shared_blk_read_time, \
+             s.shared_blk_write_time, s.local_blk_read_time, \
+             s.local_blk_write_time, s.temp_blk_read_time, \
+             s.temp_blk_write_time, s.wal_records, s.wal_fpi, s.wal_bytes, \
+             s.jit_functions, s.jit_generation_time, s.jit_inlining_count, \
+             s.jit_inlining_time, s.jit_optimization_count, \
+             s.jit_optimization_time, s.jit_emission_count, \
+             s.jit_emission_time, s.jit_deform_count, s.jit_deform_time, \
+             s.stats_since, s.minmax_stats_since"
+        }
+        StatementsVersion::V6 => {
+            "s.userid, s.dbid, s.queryid, s.toplevel, s.calls, s.rows, s.plans, \
+             s.total_exec_time, s.total_plan_time, s.min_exec_time, \
+             s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
+             s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
+             s.stddev_plan_time, s.shared_blks_hit, s.shared_blks_read, \
+             s.shared_blks_dirtied, s.shared_blks_written, s.local_blks_hit, \
+             s.local_blks_read, s.local_blks_dirtied, s.local_blks_written, \
+             s.temp_blks_read, s.temp_blks_written, s.shared_blk_read_time, \
+             s.shared_blk_write_time, s.local_blk_read_time, \
+             s.local_blk_write_time, s.temp_blk_read_time, \
+             s.temp_blk_write_time, s.wal_records, s.wal_fpi, s.wal_bytes, \
+             s.wal_buffers_full, s.jit_functions, s.jit_generation_time, \
+             s.jit_inlining_count, s.jit_inlining_time, \
+             s.jit_optimization_count, s.jit_optimization_time, \
+             s.jit_emission_count, s.jit_emission_time, s.jit_deform_count, \
+             s.jit_deform_time, s.parallel_workers_to_launch, \
+             s.parallel_workers_launched, s.stats_since, s.minmax_stats_since"
+        }
+    };
+    let tie_breakers = match version {
+        StatementsVersion::V1 | StatementsVersion::V2 => {
+            "userid, dbid, queryid ASC NULLS LAST, source_ordinal"
+        }
+        StatementsVersion::V3
+        | StatementsVersion::V4
+        | StatementsVersion::V5
+        | StatementsVersion::V6 => "userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal",
+    };
     let candidates = format!(
-        "WITH candidates AS ( \
-           (SELECT userid, dbid, queryid FROM pg_stat_statements ORDER BY {time_axis} DESC NULLS LAST LIMIT $1) \
+        "WITH source AS {materialized}( \
+           SELECT s.ordinality AS source_ordinal, {source_columns}, \
+                  count(*) OVER ()::int8 AS source_total \
+           FROM pg_stat_statements(false) WITH ORDINALITY AS s \
+         ), candidates AS ( \
+           (SELECT source_ordinal FROM source \
+            ORDER BY {time_axis} DESC NULLS LAST, calls DESC NULLS LAST, {tie_breakers} \
+            LIMIT GREATEST($1, 0::int8)) \
            UNION \
-           (SELECT userid, dbid, queryid FROM pg_stat_statements ORDER BY calls DESC NULLS LAST LIMIT $1) \
+           (SELECT source_ordinal FROM source \
+            ORDER BY calls DESC NULLS LAST, {time_axis} DESC NULLS LAST, {tie_breakers} \
+            LIMIT GREATEST($1, 0::int8)) \
          ) "
     );
-    // The join back to pg_stat_statements uses IS NOT DISTINCT FROM so a NULL
-    // queryid (compute_query_id off) still matches its own candidate row.
-    let join = "s JOIN candidates c \
-         ON c.userid = s.userid AND c.dbid = s.dbid \
-         AND c.queryid IS NOT DISTINCT FROM s.queryid \
+    let join = "s JOIN candidates c ON c.source_ordinal = s.source_ordinal \
          LEFT JOIN pg_database d ON d.oid = s.dbid \
          LEFT JOIN pg_roles r ON r.oid = s.userid";
-    let text = format!("LEFT(s.query, {QUERY_TRUNCATE}) AS query");
     // `source_total` rides in the same statement as the candidate read, so
     // the coverage total describes exactly the row population it was cut from.
     let ts = "(extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
-              (SELECT count(*) FROM pg_stat_statements) AS source_total";
-    let ident = format!(
-        "s.queryid, s.userid, s.dbid, d.datname::text AS datname, r.rolname::text AS usename, {text}"
-    );
+              s.source_total";
+    let ident = "s.queryid, s.userid, s.dbid, d.datname::text AS datname, \
+                 r.rolname::text AS usename, NULL::text AS query";
+    let order = " ORDER BY c.source_ordinal";
     let body = match version {
         StatementsVersion::V1 => format!(
             "{candidates}SELECT {ident}, \
@@ -147,7 +247,7 @@ pub fn statements_query(version: StatementsVersion) -> String {
                s.temp_blks_read, s.temp_blks_written, \
                s.blk_read_time, s.blk_write_time, \
                {ts} \
-             FROM pg_stat_statements {join}"
+             FROM source {join}{order}"
         ),
         StatementsVersion::V2 => format!(
             "{candidates}SELECT {ident}, \
@@ -161,7 +261,7 @@ pub fn statements_query(version: StatementsVersion) -> String {
                s.blk_read_time, s.blk_write_time, \
                s.wal_records, s.wal_fpi, s.wal_bytes::int8 AS wal_bytes, \
                {ts} \
-             FROM pg_stat_statements {join}"
+             FROM source {join}{order}"
         ),
         StatementsVersion::V3 => format!(
             "{candidates}SELECT {ident}, s.toplevel, \
@@ -175,7 +275,7 @@ pub fn statements_query(version: StatementsVersion) -> String {
                s.blk_read_time, s.blk_write_time, \
                s.wal_records, s.wal_fpi, s.wal_bytes::int8 AS wal_bytes, \
                {ts} \
-             FROM pg_stat_statements {join}"
+             FROM source {join}{order}"
         ),
         StatementsVersion::V4 => format!(
             "{candidates}SELECT {ident}, s.toplevel, \
@@ -192,7 +292,7 @@ pub fn statements_query(version: StatementsVersion) -> String {
                s.jit_optimization_count, s.jit_optimization_time, \
                s.jit_emission_count, s.jit_emission_time, \
                {ts} \
-             FROM pg_stat_statements {join}"
+             FROM source {join}{order}"
         ),
         StatementsVersion::V5 => format!(
             "{candidates}SELECT {ident}, s.toplevel, \
@@ -214,7 +314,7 @@ pub fn statements_query(version: StatementsVersion) -> String {
                (extract(epoch from s.stats_since) * 1e6)::int8 AS stats_since_us, \
                (extract(epoch from s.minmax_stats_since) * 1e6)::int8 AS minmax_stats_since_us, \
                {ts} \
-             FROM pg_stat_statements {join}"
+             FROM source {join}{order}"
         ),
         StatementsVersion::V6 => format!(
             "{candidates}SELECT {ident}, s.toplevel, \
@@ -237,7 +337,7 @@ pub fn statements_query(version: StatementsVersion) -> String {
                (extract(epoch from s.stats_since) * 1e6)::int8 AS stats_since_us, \
                (extract(epoch from s.minmax_stats_since) * 1e6)::int8 AS minmax_stats_since_us, \
                {ts} \
-             FROM pg_stat_statements {join}"
+             FROM source {join}{order}"
         ),
     };
     format!("{}{body}", marked!(""))
@@ -254,7 +354,7 @@ pub fn statements_query(version: StatementsVersion) -> String {
 pub struct StatementsRow {
     /// Snapshot time, unix microseconds.
     pub ts: i64,
-    /// Query id; `None` when `compute_query_id` is off.
+    /// Query id; `None` when unavailable or privilege-masked.
     pub queryid: Option<i64>,
     /// Role oid the statement ran as.
     pub userid: u32,
@@ -266,7 +366,7 @@ pub struct StatementsRow {
     pub datname: Option<String>,
     /// Role name resolved from `userid`; `None` when unresolved.
     pub usename: Option<String>,
-    /// Statement text (truncated); `None` on insufficient privilege.
+    /// Statement text; the numeric core leaves it `None`.
     pub query: Option<String>,
     /// Times the statement was executed.
     pub calls: i64,
@@ -832,11 +932,12 @@ pub async fn statements_extversion(
 /// Returns the [`tokio_postgres::Error`] if the query fails.
 pub async fn collect_statements(
     client: &Client,
+    server_major: u32,
     version: StatementsVersion,
     max_statements: i64,
 ) -> Result<(Vec<StatementsRow>, u64), tokio_postgres::Error> {
     let rows = client
-        .query(&statements_query(version), &[&max_statements])
+        .query(&statements_query(version, server_major), &[&max_statements])
         .await?;
     let source_total = rows
         .first()
@@ -954,25 +1055,27 @@ mod tests {
     #[test]
     fn query_has_version_specific_columns_and_marker() {
         // The time axis uses the legacy name only on V1.
-        assert!(statements_query(StatementsVersion::V1).contains("ORDER BY total_time DESC"));
-        assert!(!statements_query(StatementsVersion::V1).contains("total_exec_time"));
-        assert!(statements_query(StatementsVersion::V2).contains("ORDER BY total_exec_time DESC"));
+        assert!(statements_query(StatementsVersion::V1, 18).contains("ORDER BY total_time DESC"));
+        assert!(!statements_query(StatementsVersion::V1, 18).contains("total_exec_time"));
+        assert!(
+            statements_query(StatementsVersion::V2, 18).contains("ORDER BY total_exec_time DESC")
+        );
 
-        assert!(!statements_query(StatementsVersion::V2).contains("s.toplevel"));
-        assert!(statements_query(StatementsVersion::V3).contains("s.toplevel"));
+        assert!(!statements_query(StatementsVersion::V2, 18).contains("s.toplevel"));
+        assert!(statements_query(StatementsVersion::V3, 18).contains("s.toplevel"));
 
-        assert!(!statements_query(StatementsVersion::V3).contains("temp_blk_read_time"));
-        assert!(statements_query(StatementsVersion::V4).contains("temp_blk_read_time"));
-        assert!(statements_query(StatementsVersion::V4).contains("jit_emission_time"));
+        assert!(!statements_query(StatementsVersion::V3, 18).contains("temp_blk_read_time"));
+        assert!(statements_query(StatementsVersion::V4, 18).contains("temp_blk_read_time"));
+        assert!(statements_query(StatementsVersion::V4, 18).contains("jit_emission_time"));
 
-        assert!(!statements_query(StatementsVersion::V4).contains("shared_blk_read_time"));
-        assert!(statements_query(StatementsVersion::V5).contains("shared_blk_read_time"));
-        assert!(statements_query(StatementsVersion::V5).contains("jit_deform_count"));
-        assert!(statements_query(StatementsVersion::V5).contains("stats_since"));
+        assert!(!statements_query(StatementsVersion::V4, 18).contains("shared_blk_read_time"));
+        assert!(statements_query(StatementsVersion::V5, 18).contains("shared_blk_read_time"));
+        assert!(statements_query(StatementsVersion::V5, 18).contains("jit_deform_count"));
+        assert!(statements_query(StatementsVersion::V5, 18).contains("stats_since"));
 
-        assert!(!statements_query(StatementsVersion::V5).contains("wal_buffers_full"));
-        assert!(statements_query(StatementsVersion::V6).contains("wal_buffers_full"));
-        assert!(statements_query(StatementsVersion::V6).contains("parallel_workers_launched"));
+        assert!(!statements_query(StatementsVersion::V5, 18).contains("wal_buffers_full"));
+        assert!(statements_query(StatementsVersion::V6, 18).contains("wal_buffers_full"));
+        assert!(statements_query(StatementsVersion::V6, 18).contains("parallel_workers_launched"));
 
         for v in [
             StatementsVersion::V1,
@@ -982,19 +1085,82 @@ mod tests {
             StatementsVersion::V5,
             StatementsVersion::V6,
         ] {
-            let q = statements_query(v);
+            let q = statements_query(v, 18);
             assert!(q.contains("pg_kronika"));
-            assert!(q.contains("pg_stat_statements"));
-            assert!(q.contains("LEFT(s.query, 5000)"));
+            assert!(q.contains("NULL::text AS query"));
             assert!(q.contains("LEFT JOIN pg_database"));
             assert!(q.contains("LEFT JOIN pg_roles"));
-            // Candidate selection is mechanical top-N by raw columns, two axes.
-            assert!(q.contains("ORDER BY calls DESC"));
-            // A NULL queryid still matches its candidate row.
-            assert!(q.contains("IS NOT DISTINCT FROM"));
+            assert!(q.contains("ORDER BY calls DESC NULLS LAST"));
+            assert!(q.contains("source AS MATERIALIZED"), "{q}");
+            assert!(q.contains("count(*) OVER ()::int8 AS source_total"), "{q}");
+            assert_eq!(
+                q.match_indices("FROM pg_stat_statements(false) WITH ORDINALITY")
+                    .count(),
+                1,
+                "the PostgreSQL source must be read once: {q}"
+            );
+            assert_eq!(
+                q.match_indices("LIMIT GREATEST($1, 0::int8)").count(),
+                2,
+                "each candidate axis must have the configured bound: {q}"
+            );
+            assert!(!q.contains("FROM pg_stat_statements s"), "{q}");
+            assert!(!q.contains("FROM pg_stat_statements "), "{q}");
+            assert!(!q.contains("pg_stat_statements(true)"), "{q}");
+            assert!(!q.contains("s.query,"), "{q}");
+            assert!(!q.contains("LEFT(s.query"), "{q}");
+            assert!(!q.contains("s.*"), "{q}");
+            assert!(
+                !q.contains("(SELECT count(*) FROM pg_stat_statements)"),
+                "{q}"
+            );
+            assert!(q.contains("s.ordinality AS source_ordinal"), "{q}");
+            assert!(q.contains("candidates AS"), "{q}");
+            assert!(q.contains("UNION"), "{q}");
+            assert!(
+                q.contains("JOIN candidates c ON c.source_ordinal = s.source_ordinal"),
+                "{q}"
+            );
+            assert!(!q.contains("IS NOT DISTINCT FROM"), "{q}");
+            assert!(!q.contains("row_number()"), "{q}");
+            assert!(!q.contains("time_rank"), "{q}");
+            assert!(!q.contains("calls_rank"), "{q}");
+            assert!(q.contains("ORDER BY c.source_ordinal"), "{q}");
             // No threshold verdict, no GUC-based branch in the SQL.
             assert!(!q.contains("current_setting"));
         }
+
+        for v in [StatementsVersion::V1, StatementsVersion::V2] {
+            let q = statements_query(v, 18);
+            assert!(
+                q.contains("userid, dbid, queryid ASC NULLS LAST, source_ordinal"),
+                "{q}"
+            );
+            assert!(!q.contains("queryid ASC NULLS LAST, toplevel"), "{q}");
+        }
+
+        for v in [
+            StatementsVersion::V3,
+            StatementsVersion::V4,
+            StatementsVersion::V5,
+            StatementsVersion::V6,
+        ] {
+            let q = statements_query(v, 18);
+            assert!(
+                q.contains("userid, dbid, queryid ASC NULLS LAST, toplevel, source_ordinal"),
+                "{q}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_cte_uses_only_server_supported_materialization_syntax() {
+        let legacy = statements_query(StatementsVersion::V1, 11);
+        assert!(legacy.contains("source AS ("), "{legacy}");
+        assert!(!legacy.contains("AS MATERIALIZED"), "{legacy}");
+
+        let modern = statements_query(StatementsVersion::V1, 12);
+        assert!(modern.contains("source AS MATERIALIZED ("), "{modern}");
     }
 
     #[test]

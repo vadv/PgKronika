@@ -19,10 +19,11 @@ use kronika_layout::{
     DataRoot, LayoutLimits, QUARANTINE_DIRECTORY_NAME, SegmentAddress, SegmentId,
 };
 use kronika_reader::{
-    BlockContent, CatalogEntryDescriptor, EntityDictionaryEntry, EntityMetric, EntitySeries,
-    EntitySeriesBlock, FactFile, HeaderIdentity, IndexStatus, LIMIT, METRIC_FLAG_CANONICAL,
-    ManifestEntryDescriptor, MetricAggregation, MetricStatus, SourceDescriptor,
-    SourceManifestBlock, TimeGrid, UiSummaryBlock, ViewSummary,
+    BlockContent, CatalogEntryDescriptor, CollectionReadState, CollectionStatus,
+    CollectionVisibility, EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock,
+    FactFile, HeaderIdentity, IndexStatus, LIMIT, METRIC_FLAG_CANONICAL, ManifestEntryDescriptor,
+    MetricAggregation, MetricStatus, SourceDescriptor, SourceManifestBlock, TimeGrid,
+    UiSummaryBlock, ViewSummary,
 };
 use kronika_registry::os_loadavg::OsLoadavg;
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
@@ -75,6 +76,16 @@ fn part_with_loadavg(min_ts: i64, max_ts: i64, rows: &[i64]) -> (Vec<u8>, Vec<u8
     (part, body)
 }
 
+fn truncated_collection(source_total: u64) -> CollectionStatus {
+    CollectionStatus::new(
+        2,
+        Some(source_total),
+        CollectionReadState::SourceLimit,
+        CollectionVisibility::Full,
+    )
+    .expect("valid collection status")
+}
+
 fn ovf_fixture() -> Vec<u8> {
     const BUCKET_US: i64 = 60_000_000;
 
@@ -111,13 +122,15 @@ fn ovf_fixture() -> Vec<u8> {
         grid,
         vec![0, BUCKET_US],
         vec![
-            ViewSummary::new(
+            ViewSummary::new_with_collection(
                 1,
                 1,
                 IndexStatus::Complete,
                 vec![0b11],
                 vec![0b10],
                 vec![2, 2],
+                vec![0b11],
+                vec![truncated_collection(20), truncated_collection(21)],
                 &LIMIT,
             )
             .expect("summary view"),

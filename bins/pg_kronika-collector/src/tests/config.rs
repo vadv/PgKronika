@@ -1,8 +1,9 @@
 use crate::config::{
     RetentionConfig, parse_retention, resolve_log_enabled, resolve_log_status_interval,
     validate_cardinality, validate_heavy_cap, validate_journal_max_bytes, validate_max_lock_rows,
-    validate_max_plans, validate_plan_text_limits, validate_replication_detail_bounds,
-    validate_retention, validate_settings_row_count, validate_state_target,
+    validate_max_plans, validate_max_statements, validate_plan_text_limits,
+    validate_replication_detail_bounds, validate_retention, validate_settings_row_count,
+    validate_state_target,
 };
 use crate::plans_source::{plans_reread_delay, truncate_to_boundary};
 use kronika_format::{JOURNAL_HEADER_LEN, MAX_JOURNAL_LEN};
@@ -71,8 +72,18 @@ fn log_state_runtime_check_rejects_direct_and_symlinked_paths_inside_data_root()
 }
 
 #[test]
-fn cardinality_validation_passes_at_defaults() {
+fn cardinality_validation_accepts_defaults_and_upper_boundaries() {
     assert!(validate_cardinality(500, 500).is_ok());
+    assert!(validate_cardinality(546, 819).is_ok());
+}
+
+#[test]
+fn cardinality_validation_rejects_zero_limits() {
+    let tables = validate_cardinality(0, 500).expect_err("zero tables must fail");
+    assert!(tables.to_string().contains("KRONIKA_PG_MAX_TABLES"));
+
+    let indexes = validate_cardinality(500, 0).expect_err("zero indexes must fail");
+    assert!(indexes.to_string().contains("KRONIKA_PG_MAX_INDEXES"));
 }
 
 #[test]
@@ -143,6 +154,19 @@ fn max_plans_guard_accepts_range_and_rejects_extremes() {
     assert!(
         validate_max_plans(cap + 1).is_err(),
         "a value above MAX_SECTION_ROWS is rejected"
+    );
+}
+
+#[test]
+fn max_statements_guard_accounts_for_both_candidate_axes() {
+    let per_axis_cap = i64::try_from(MAX_SECTION_ROWS).expect("cap fits i64") / 2;
+    assert!(validate_max_statements(1).is_ok());
+    assert!(validate_max_statements(500).is_ok());
+    assert!(validate_max_statements(per_axis_cap).is_ok());
+    assert!(validate_max_statements(0).is_err(), "zero is rejected");
+    assert!(
+        validate_max_statements(per_axis_cap + 1).is_err(),
+        "two disjoint axes must fit the section cap"
     );
 }
 

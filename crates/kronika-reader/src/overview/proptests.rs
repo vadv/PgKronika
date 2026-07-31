@@ -17,7 +17,10 @@ use super::container::{BlockContent, FactFile, HeaderIdentity};
 use super::descriptors::{ManifestEntryDescriptor, SourceDescriptor};
 use super::limits::LIMIT;
 use super::observations::EventObservationsBlock;
-use super::web_index::{EntitySeriesBlock, UiSummaryBlock};
+use super::web_index::{
+    CollectionReadState, CollectionStatus, CollectionVisibility, EntitySeriesBlock, IndexStatus,
+    TimeGrid, UiSummaryBlock, ViewSummary,
+};
 
 fn identity() -> HeaderIdentity {
     let lineage = lineage();
@@ -78,6 +81,47 @@ fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..4_096)
 }
 
+fn arb_collection_status() -> impl Strategy<Value = CollectionStatus> {
+    prop_oneof![
+        any::<u32>().prop_map(|collected| {
+            CollectionStatus::new(
+                u64::from(collected),
+                Some(u64::from(collected)),
+                CollectionReadState::Complete,
+                CollectionVisibility::Full,
+            )
+            .expect("generated complete status")
+        }),
+        (any::<u32>(), 1_u32..=u32::MAX).prop_map(|(collected, missing)| {
+            CollectionStatus::new(
+                u64::from(collected),
+                Some(u64::from(collected) + u64::from(missing)),
+                CollectionReadState::SourceLimit,
+                CollectionVisibility::Full,
+            )
+            .expect("generated source-limit status")
+        }),
+        (any::<u32>(), any::<bool>()).prop_map(|(collected, exact)| {
+            CollectionStatus::new(
+                u64::from(collected),
+                exact.then_some(u64::from(collected)),
+                CollectionReadState::Permission,
+                CollectionVisibility::Restricted,
+            )
+            .expect("generated permission status")
+        }),
+        any::<u32>().prop_map(|collected| {
+            CollectionStatus::new(
+                u64::from(collected),
+                None,
+                CollectionReadState::ReadFailure,
+                CollectionVisibility::Unknown,
+            )
+            .expect("generated read-failure status")
+        }),
+    ]
+}
+
 proptest! {
     #[test]
     fn admit_never_panics_on_arbitrary_bytes(bytes in arb_bytes()) {
@@ -120,6 +164,31 @@ proptest! {
                 .expect("re-decode of own output");
             prop_assert_eq!(decoded, block);
         }
+    }
+
+    #[test]
+    fn ui_summary_collection_status_round_trips(status in arb_collection_status()) {
+        let view = ViewSummary::new_with_collection(
+            1,
+            1,
+            IndexStatus::Complete,
+            vec![1],
+            vec![0],
+            vec![status.collected()],
+            vec![1],
+            vec![status],
+            &LIMIT,
+        )
+        .expect("generated view");
+        let block = UiSummaryBlock::new(
+            TimeGrid::for_range(100, 100).expect("grid"),
+            vec![100],
+            vec![view],
+            &LIMIT,
+        )
+        .expect("generated summary");
+        let decoded = UiSummaryBlock::decode(&block.encode(), &LIMIT).expect("decode own summary");
+        prop_assert_eq!(decoded.collection_state_at(1, 100), Some((100, status)));
     }
 
     #[test]

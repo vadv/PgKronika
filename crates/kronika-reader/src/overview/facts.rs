@@ -3207,6 +3207,11 @@ mod tests {
         .expect("decode UI summary");
         assert_eq!(summary.snapshot_times(), &[10, 20, 30, 40]);
         assert_eq!(summary.population_at(9, 40), Some(1));
+        let (_, collection) = summary
+            .collection_state_at(5, 40)
+            .expect("indexes collection status");
+        assert_eq!(collection.collected(), 1);
+        assert_eq!(collection.source_total(), Some(2));
 
         let series_entry = admitted
             .directory()
@@ -3233,6 +3238,18 @@ mod tests {
             vec![2.0, 1.0, 1.0],
             "event rows are grouped by stable category before top-K ranking"
         );
+
+        let pgm_before = unit.body_read_stats();
+        let mut reader =
+            FactFileReader::inspect(encoded.as_slice(), &LIMIT).expect("inspect encoded OVF");
+        let before = reader.stats();
+        let selective = reader.read_ui_summary(&LIMIT).expect("read only summary");
+        let after = reader.stats();
+        assert_eq!(selective.collection_state_at(5, 40), Some((40, collection)));
+        assert_eq!(after.read_calls, before.read_calls + 1);
+        assert!(after.stored_bytes_read > before.stored_bytes_read);
+        assert!(after.decoded_bytes > before.decoded_bytes);
+        assert_eq!(unit.body_read_stats(), pgm_before);
     }
 
     #[test]

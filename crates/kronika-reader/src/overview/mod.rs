@@ -75,9 +75,9 @@ pub use publish::{
     QUALIFICATION_PUBLISH_BARRIER_RELEASE, QUALIFICATION_PUBLISH_FAULT_ENV,
 };
 pub use web_index::{
-    EntityDictionaryEntry, EntityMetric, EntitySeries, EntitySeriesBlock, IndexStatus,
-    METRIC_FLAG_CANONICAL, MetricAggregation, MetricStatus, SnapshotNeighbors, TimeGrid,
-    UiSummaryBlock, ViewSummary,
+    CollectionReadState, CollectionStatus, CollectionVisibility, EntityDictionaryEntry,
+    EntityMetric, EntitySeries, EntitySeriesBlock, IndexStatus, METRIC_FLAG_CANONICAL,
+    MetricAggregation, MetricStatus, SnapshotNeighbors, TimeGrid, UiSummaryBlock, ViewSummary,
 };
 pub(crate) use web_index::{read_entity_series, read_ui_summary};
 

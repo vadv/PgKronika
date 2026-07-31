@@ -51,6 +51,28 @@ ClassifiedResultDto:
   - level
   - evidence
   type: object
+CollectionStatusDto:
+  properties:
+    collected:
+      format: int64
+      minimum: 0
+      type: integer
+    read_state:
+      type: string
+    source_total:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    visibility:
+      type: string
+  required:
+  - collected
+  - source_total
+  - read_state
+  - visibility
+  type: object
 ColumnSpec:
   description: One table or detail projection column.
   properties:
@@ -777,6 +799,10 @@ ViewSpec:
   type: object
 ViewSummaryItem:
   properties:
+    collection:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/CollectionStatusDto'
     notable:
       type: boolean
     population:
@@ -799,6 +825,7 @@ ViewSummaryItem:
   - population
   - status
   - notable
+  - collection
   type: object
 ViewSummaryResponse:
   properties:
