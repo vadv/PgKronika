@@ -190,10 +190,11 @@ export function makeTimelineMeta(
     data_through_us: null,
     store_data_through_us: null,
     freshness: {
-      state: "fresh",
-      age_us: null,
+      status: "fresh",
+      completeness: "complete",
       data_through_us: null,
-      expected_period_us: null,
+      physical_count_semantics: "exact",
+      retained_exactness: "exact",
     },
     loss: { dropped_count_lower_bound: null, known_gaps: [] },
     tail_pending: null,
@@ -367,7 +368,7 @@ export function makeDataQualityResponse(
   overrides: Partial<DataQualityResponse> = {},
 ): DataQualityResponse {
   return {
-    status: "complete",
+    status: "fresh",
     freshness: {
       state: "fresh",
       age_us: null,
@@ -382,7 +383,9 @@ export function makeDataQualityResponse(
     gaps: [],
     capabilities: [],
     integrity: {
-      orphan_overviews: 0,
+      status: "complete",
+      corrupt_segments: 0,
+      last_catalog_refresh_us: null,
       quarantined_entries: 0,
       readable_segments: 0,
     },
@@ -392,7 +395,7 @@ export function makeDataQualityResponse(
       collector_started_at_us: null,
       last_status_at_us: null,
     },
-    quality: { status: "complete", gated: [] },
+    quality: { status: "complete", resource_limited: [], active_tail: false },
     ...overrides,
   };
 }

@@ -1168,7 +1168,9 @@ function dataQualityResponse(params) {
       },
     ],
     integrity: {
-      orphan_overviews: 0,
+      status: "complete",
+      corrupt_segments: 0,
+      last_catalog_refresh_us: String(to - 60 * US),
       quarantined_entries: 0,
       readable_segments: 36,
     },
@@ -1178,7 +1180,7 @@ function dataQualityResponse(params) {
       collector_started_at_us: String(to - 14 * 3600 * US),
       last_status_at_us: String(to - 30 * US),
     },
-    quality: { status: "partial", gated: [] },
+    quality: { status: "partial", resource_limited: [], active_tail: true },
   };
 }
 
