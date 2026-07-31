@@ -9,6 +9,7 @@ use super::gauge::GaugeEvidence;
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Evidence {
     Direct(DirectEvidence),
+    EntityJoin(EntityJoinEvidence),
     Ratio,
     GaugeObservation(GaugeEvidence),
     CounterAggregate(CounterEvidence),
@@ -29,11 +30,57 @@ impl Evidence {
     pub(crate) const fn label(&self) -> &'static str {
         match self {
             Self::Direct(_) => "direct",
+            Self::EntityJoin(_) => "entity_join",
             Self::Ratio => "ratio",
             Self::GaugeObservation(_) | Self::Gauge => "gauge",
             Self::CounterAggregate(_) | Self::Counter => "counter",
             Self::Event => "event",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct EntityJoinEvidence {
+    contract: &'static str,
+    fields: &'static [&'static str],
+    target_section: &'static str,
+    target_identity: Arc<[IdentityValue]>,
+}
+
+impl EntityJoinEvidence {
+    pub(crate) const fn new(
+        contract: &'static str,
+        fields: &'static [&'static str],
+        target_section: &'static str,
+        target_identity: Arc<[IdentityValue]>,
+    ) -> Self {
+        Self {
+            contract,
+            fields,
+            target_section,
+            target_identity,
+        }
+    }
+
+    pub(crate) const fn contract(&self) -> &'static str {
+        self.contract
+    }
+
+    pub(crate) const fn fields(&self) -> &'static [&'static str] {
+        self.fields
+    }
+
+    pub(crate) const fn target_section(&self) -> &'static str {
+        self.target_section
+    }
+
+    pub(crate) fn target_identity(&self) -> &[IdentityValue] {
+        &self.target_identity
+    }
+
+    pub(crate) fn matches(&self, scope: &FindingScope) -> bool {
+        scope.logical_section() == self.target_section
+            && scope.identity().starts_with(&self.target_identity)
     }
 }
 
@@ -141,6 +188,10 @@ impl FindingDraft {
                         u64::try_from(counter.entity().section().len()).unwrap_or(u64::MAX),
                     )
                     .saturating_add(identity_json_upper_bound(counter.entity().identity())),
+                Evidence::EntityJoin(join) => 256_u64
+                    .saturating_add(u64::try_from(join.contract().len()).unwrap_or(u64::MAX))
+                    .saturating_add(u64::try_from(join.target_section().len()).unwrap_or(u64::MAX))
+                    .saturating_add(identity_json_upper_bound(join.target_identity())),
                 Evidence::Direct(_) => 512,
                 Evidence::Ratio | Evidence::Gauge | Evidence::Counter | Evidence::Event => 32,
             };

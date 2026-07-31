@@ -713,10 +713,36 @@ impl ToSchema for IncidentEvidenceResponse {}
 #[derive(Debug, ToSchema)]
 pub(crate) struct IncidentFindingResponse {
     pub(crate) lens_id: String,
+    pub(crate) slug: String,
     pub(crate) role: String,
     pub(crate) confidence: String,
+    pub(crate) confidence_cap: String,
     pub(crate) scope: IncidentFindingScopeResponse,
     pub(crate) evidence: Vec<IncidentEvidenceResponse>,
+}
+
+/// Stored provenance for one proven relationship between incident findings.
+#[allow(
+    dead_code,
+    reason = "schema projection for JSON assembled by the incident response builder"
+)]
+#[derive(Debug, ToSchema)]
+pub(crate) struct IncidentRelationProvenanceResponse {
+    pub(crate) contract: String,
+    pub(crate) fields: Vec<String>,
+}
+
+/// One relationship backed by typed join evidence retained by the evaluator.
+#[allow(
+    dead_code,
+    reason = "schema projection for JSON assembled by the incident response builder"
+)]
+#[derive(Debug, ToSchema)]
+pub(crate) struct IncidentRelationResponse {
+    pub(crate) from_finding: usize,
+    pub(crate) to_finding: usize,
+    pub(crate) kind: String,
+    pub(crate) provenance: IncidentRelationProvenanceResponse,
 }
 
 /// One cluster of related anomaly episodes.
@@ -728,8 +754,16 @@ pub(crate) struct IncidentFindingResponse {
 pub(crate) struct IncidentResponse {
     pub(crate) interval: IncidentIntervalResponse,
     pub(crate) incident_key: String,
+    pub(crate) peak_ts_us: String,
+    pub(crate) level: String,
+    pub(crate) level_policy_revision: u16,
+    pub(crate) category_code: String,
+    pub(crate) summary_code: String,
+    pub(crate) finding_count: usize,
+    pub(crate) coincident_count: usize,
     pub(crate) members: Vec<IncidentMemberResponse>,
     pub(crate) findings: Vec<IncidentFindingResponse>,
+    pub(crate) relations: Vec<IncidentRelationResponse>,
     pub(crate) evaluation_complete: bool,
     pub(crate) finding_evaluation_status: String,
 }

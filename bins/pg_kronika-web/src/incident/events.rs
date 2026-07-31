@@ -41,64 +41,79 @@ const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 pub(crate) struct EventCatalogEntry {
     pub lens_id: &'static str,
     pub slug: &'static str,
+    pub confidence_cap: ConfidenceCap,
 }
 
 const EVENT_CATALOG_METADATA: &[EventCatalogEntry] = &[
     EventCatalogEntry {
         lens_id: "PG-EVT-001",
         slug: "server_child_sigkill",
+        confidence_cap: ConfidenceCap::High,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-002",
         slug: "server_child_signal_termination",
+        confidence_cap: ConfidenceCap::High,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-003",
         slug: "panic_severity_observation",
+        confidence_cap: ConfidenceCap::High,
     },
     EventCatalogEntry {
         lens_id: "OS-FS-027",
         slug: "filesystem_space",
+        confidence_cap: ConfidenceCap::High,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-005",
         slug: "postgres_out_of_memory_observation",
+        confidence_cap: ConfidenceCap::High,
     },
     EventCatalogEntry {
         lens_id: "PG-CONN-014",
         slug: "connection_saturation",
+        confidence_cap: ConfidenceCap::High,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-007",
         slug: "deadlock_observation",
+        confidence_cap: ConfidenceCap::High,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-008",
         slug: "corruption_sqlstate_observation",
+        confidence_cap: ConfidenceCap::High,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-009",
         slug: "lock_not_available_observation",
+        confidence_cap: ConfidenceCap::Medium,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-010",
         slug: "query_canceled_observation",
+        confidence_cap: ConfidenceCap::Medium,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-011",
         slug: "serialization_failure_observation",
+        confidence_cap: ConfidenceCap::Medium,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-012",
         slug: "auth_failure_observation",
+        confidence_cap: ConfidenceCap::Medium,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-013",
         slug: "authorization_failure_observation",
+        confidence_cap: ConfidenceCap::Medium,
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-014",
         slug: "permission_denied_observation",
+        confidence_cap: ConfidenceCap::Medium,
     },
 ];
 

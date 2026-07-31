@@ -26,7 +26,7 @@ pub(crate) use coverage::{
     observed_period_from_timestamps,
 };
 pub(crate) use direct::{DirectEvidence, LockParticipant, SampledLockEdge};
-pub(crate) use finding::{Evidence, Finding, FindingDraft, FindingScope};
+pub(crate) use finding::{EntityJoinEvidence, Evidence, Finding, FindingDraft, FindingScope};
 pub(crate) use gauge::{
     GaugeEntity, GaugeEvidence, GaugeMeasurement, GaugeRatio, GaugeTrendInput, GaugeValueInput,
 };

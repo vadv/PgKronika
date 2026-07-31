@@ -855,7 +855,7 @@ git commit -m "feat(web): complete v5 catalog summary and frame"
 - Adds finding `confidence_cap`, `slug`.
 - Relation kind `proven` always includes stored join provenance.
 
-- [ ] **Step 1: Write failing incident response test**
+- [x] **Step 1: Write failing incident response test**
 
 ```rust
 #[tokio::test]
@@ -873,14 +873,14 @@ async fn incidents_publish_focus_metadata_and_only_proven_relations() {
 }
 ```
 
-- [ ] **Step 2: Run RED test**
+- [x] **Step 2: Run RED test**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
   incidents_publish_focus_metadata_and_only_proven_relations
 ```
 
-- [ ] **Step 3: Extend typed response assembly**
+- [x] **Step 3: Extend typed response assembly**
 
 ```rust
 #[derive(Debug, ToSchema)]
@@ -897,7 +897,7 @@ server policy, counts from emitted findings, and relations only from
 `entity_join` evidence. Do not infer severity from confidence or links from
 time coincidence.
 
-- [ ] **Step 4: Run GREEN tests and commit**
+- [x] **Step 4: Run GREEN tests and commit**
 
 ```sh
 cargo test -p pg_kronika-web --lib --target aarch64-apple-darwin \
