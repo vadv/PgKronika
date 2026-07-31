@@ -12,18 +12,23 @@ OVF, reader, writer и API реализуются как один текущий
   OpenAPI и integration tests. Frame включает 14 числовых threshold bindings,
   доказанного predecessor, server filter/sort/page и sparks только из OVF.
 - **Осталось:** `/v1/ui/context`, `/v1/entity/{view}/{entity}` для
-  point/history и `/v1/storage`; lazy detail, bounded history,
+  point/history, `/v1/timeline/spine`, `/v1/data/quality` и `/v1/storage`;
+  lazy detail, bounded history, host signal series,
   whole-storage/statvfs/write-rate data; три
   byte-accounted cache с reservation/singleflight/cancellation и N=96/N=1 440
   qualification для оставшихся consumer. Frame отдельно прошёл структурную
   qualification на 96 обычных и 1 440 early-sealed сегментах. Это оставшаяся
   часть delivery steps 4-6.
 
+Полный gap-анализ, HTTP-контракт без выбора storage root и расширения
+существующих DTO зафиксированы в
+`2026-07-31-web-ui-v5-api-gap-design.md`.
+
 Первый отдельный vertical slice для `/v1/frame/{view}` и числовых verdicts
 Класса 1 уточнён в
 `2026-07-30-threshold-frame-integration-design.md`. Он не возвращает
-устаревший параметр `source`, потому что runtime обслуживает один storage root
-и не поддерживает выбор другого root в HTTP API.
+устаревший параметр выбора root, потому что runtime обслуживает один storage
+root и не поддерживает выбор другого root в HTTP API.
 
 ## Задача
 
@@ -33,10 +38,10 @@ OVF, reader, writer и API реализуются как один текущий
 - heatmap top-сущностей выбранного view с переключением метрики;
 - точный frame под курсором: сортировка, presets, rate и spark;
 - detail выбранной строки, связи и точную историю;
-- состояние источника, базы, репликации и диска.
+- состояние инстанса, базы, репликации и диска.
 
-Основной сценарий — диапазон 24 часа, один выбранный source и один
-активный view. Timeline обслуживается только из OVF и активного
+Основной сценарий — диапазон 24 часа и один активный view над единственным
+storage root. Timeline обслуживается только из OVF и активного
 представления. PGM декодируется только для точного frame или detail.
 
 ## Нормативные бюджеты
@@ -46,7 +51,7 @@ OVF, reader, writer и API реализуются как один текущий
 | heatmap до 24 часов | 0 | один `EntitySeries` выбранного view на сегмент |
 | смена метрики heatmap | 0 | 0 после попадания view в кеш |
 | summary вкладок в точке | 0 | один `UiSummary` нужного сегмента |
-| source context в точке | 1 сегмент | metadata |
+| instance context в точке | 1 сегмент | metadata |
 | frame в точке | 1 сегмент | summary и series выбранного view |
 | frame с counter predecessor | не более 2 сегментов | то же |
 | выбор строки | 0 | данные frame |
@@ -60,7 +65,7 @@ OVF, reader, writer и API реализуются как один текущий
 `N=1440`.
 
 Горячий путь не сканирует directory целиком при каждом запросе.
-Индекс `(source, time range) -> OVF descriptors` и directory entries
+Индекс `time range -> OVF descriptors` и directory entries
 кешируются отдельно от тел блоков.
 
 ## Публичная модель
@@ -186,13 +191,14 @@ bounded approximation: OVF хранит exact score победителей и
 
 - Wire-параметры времени: `from`, `to`, `at`, signed decimal
   microseconds UTC.
-- Все data endpoints требуют `source`.
+- Runtime обслуживает один storage root; HTTP-параметра `source` и маршрута
+  `/v1/sources` нет.
 - `from` включительно, `to` исключительно.
 - `limit` имеет endpoint-specific default и hard maximum.
-- Pagination cursor непрозрачен и связывает source, view, snapshot,
+- Pagination cursor непрозрачен и связывает view, snapshot,
   projection revision, sort и последний key.
 - Неизвестные query parameters отклоняются.
-- Ошибки используют `application/problem+json` и стабильный `code`.
+- Ошибки используют существующий JSON-контракт `ApiError` и стабильный `code`.
 - Числа вне диапазона JSON integer передаются строкой согласно
   machine API contract.
 - Null означает отсутствие значения; числовой ноль всегда является
@@ -216,15 +222,15 @@ bounded approximation: OVF хранит exact score победителей и
 
 `quality.status` принимает `complete`, `partial` и `unavailable`.
 Partial-ответ не превращается в HTTP error, если его границы явно
-описаны. Повреждённый OVF, неверный source и превышение request bound
+описаны. Повреждённый OVF и превышение request bound
 являются ошибками.
 
 ## GET /v1/ui/catalog
 
-Параметр: `source`.
+Query-параметров нет.
 
-Ответ содержит каталог, его ETag и фактическую availability по
-source. Клиент кеширует его и отправляет `If-None-Match`.
+Ответ содержит каталог, его ETag и фактическую availability для текущего
+storage root. Клиент кеширует его и отправляет `If-None-Match`.
 
 ```json
 {
@@ -267,7 +273,6 @@ source. Клиент кеширует его и отправляет `If-None-Ma
 
 Параметры:
 
-- `source`;
 - `view`, `metric`;
 - `from`, `to`, диапазон не больше 24 часов;
 - `buckets` — `1..=256`, default 56;
@@ -316,13 +321,12 @@ source. Клиент кеширует его и отправляет `If-None-Ma
 сегмента не complete, finite upper bound для него не выдумывается:
 сегмент попадает в `unbounded_segments`, а ranking exact равен false.
 
-Δ-режим не меняет контракт. Клиент запрашивает тот же диапазон
-baseline вторым вызовом и сопоставляет строки по `entity`. Оба
-ответа остаются кешируемыми независимо.
+Δ-режим не меняет контракт. Клиент сравнивает bucket выбранного baseline с
+остальными buckets того же ответа и сопоставляет строки по `entity`.
 
 ## GET /v1/views/summary
 
-Параметры: `source`, `at`.
+Параметр: `at`.
 
 Сервер находит последний snapshot каждого view с `ts <= at` по
 `UiSummary`. Population равен числу строк именно этого snapshot.
@@ -358,9 +362,9 @@ population вкладки.
 
 ## GET /v1/ui/context
 
-Параметры: `source`, `at`.
+Параметр: `at`.
 
-Endpoint закрывает source-level элементы шапки, которые не принадлежат
+Endpoint закрывает instance-level элементы шапки, которые не принадлежат
 табличному view:
 
 ```json
@@ -403,10 +407,10 @@ projections одного PGM. Запрос выполняется при отк�
 
 Параметры:
 
-- `source`, `at`;
+- `at`;
 - `span` для spark, не больше 24 часов;
 - `preset`;
-- optional `database`;
+- необязательный `database`;
 - `q` для server-side текстового filter;
 - `sort`, `order`;
 - `limit` — `1..=200`, default 100;
@@ -494,8 +498,8 @@ Endpoint имеет два взаимоисключающих режима.
 
 Точка:
 
-- `source`, `at`;
-- optional `include=related`.
+- `at`;
+- необязательный `include=related`.
 
 Возвращает все доступные поля точной строки выбранного snapshot,
 availability каждого недоступного поля и связанные сущности только
@@ -503,7 +507,7 @@ availability каждого недоступного поля и связанн�
 
 История:
 
-- `source`, `from`, `to`;
+- `from`, `to`;
 - `columns` — allowlist кодов каталога;
 - `limit` — число snapshots, `1..=2000`;
 - `cursor`.
@@ -543,7 +547,7 @@ Entity ищется сравнением typed identity либо её canonical 
 
 ## GET /v1/storage
 
-Параметр: `source`.
+Query-параметров нет.
 
 ```json
 {
@@ -569,25 +573,26 @@ web её не получает.
 
 | Поверхность v5 | Источник |
 | --- | --- |
-| source chip | `/v1/sources` |
+| instance chip | `/v1/ui/context` |
 | database filter | `/v1/ui/context` |
 | role и replication | `/v1/ui/context` |
-| data health, stale/down, gaps | `/v1/timeline/health` |
+| data quality, stale/down, gaps | `/v1/data/quality` |
 | disk popup | `/v1/storage` |
-| critical/warning counters | `/v1/timeline/events` |
-| timeline curve и markers | существующие timeline endpoints |
+| critical/warning counters | `/v1/incidents` |
+| load/PSI curve | `/v1/timeline/spine` |
+| event markers | `/v1/timeline/events` |
 | tab counts и status | `/v1/views/summary` |
 | heatmap и metric switch | `/v1/timeline/heatmap` |
 | таблица, presets, sort, filter | `/v1/frame/{view}` |
 | row dock | `/v1/entity/{view}/{entity}?at=...` |
 | entity history | `/v1/entity/{view}/{entity}?from=...&to=...` |
 | incident findings | `/v1/incidents` |
-| baseline/Δ | второй timeline/heatmap range, client merge |
+| baseline/Δ | client comparison внутри heatmap buckets |
 | replay/live, cursor, zoom | client state поверх timestamps API |
 
 Меню «dump snapshot JSON» может использовать frame/detail response.
-Ссылка Grafana и share-link собираются клиентом из source, view,
-entity и времени. API не встраивает vendor URL.
+Ссылка Grafana и share-link собираются клиентом из view, entity и времени.
+API не встраивает vendor URL.
 
 ## Кеши и память web
 
@@ -595,7 +600,7 @@ entity и времени. API не встраивает vendor URL.
 
 | Кеш | Default cap | Единица |
 | --- | ---: | --- |
-| source/OVF metadata | 16 МиБ | descriptors и directory |
+| OVF metadata | 16 МиБ | descriptors и directory |
 | decoded `EntitySeries` | 64 МиБ | `(content descriptor, view_code)` |
 | decoded PGM projection | 128 МиБ | `(content descriptor, projection inputs)` |
 
@@ -621,7 +626,7 @@ History scan обрабатывает PGM последовательно и уд
 
 ## Бюджеты ответа и чтения
 
-| Ответ | Default target | Hard maximum |
+| Ответ | Целевой размер по умолчанию | Жёсткий максимум |
 | --- | ---: | ---: |
 | heatmap, top 8 × 56 | 64 КиБ | 512 КиБ |
 | frame, 100 строк | 256 КиБ | 1 МиБ |
@@ -647,19 +652,18 @@ wall time вместе с bytes/read calls, но успешность опред
 
 ## Ошибки и деградация
 
-Стабильные problem codes:
+Стабильные коды `ApiError`:
 
 | Code | Когда |
 | --- | --- |
-| `unknown_source` | source отсутствует |
-| `unknown_view` | view не найден в catalog |
-| `unknown_metric` | metric не принадлежит view |
-| `invalid_entity` | token malformed или имеет другую identity revision |
-| `range_too_wide` | endpoint range превышен |
-| `page_stale` | cursor не соответствует snapshot/revision |
-| `resource_limited` | hard bound reader/writer |
-| `response_too_large` | непагинируемый ответ превысил предел |
-| `corrupt_ovf` | framing, CRC или block invariant нарушен |
+| `invalid_query_parameter` | view, metric, column или entity token не соответствует ожидаемому типу |
+| `invalid_query_constraint` | параметры образуют недопустимый режим |
+| `entity_not_found` | корректная identity отсутствует в выбранном snapshot |
+| `invalid_cursor` | cursor malformed |
+| `cursor_query_mismatch` | cursor не соответствует нормализованному запросу |
+| `cursor_expired` | cursor больше не разрешается в снимок |
+| `query_limit_exceeded` | диапазон, reader/writer или размер ответа превысил hard bound |
+| `store_read_failed` | framing, CRC, block invariant или storage read нарушен |
 
 Gated metric, неполный spark и approximate ranking являются
 состоянием данных в успешном ответе, а не transport error.
@@ -673,7 +677,8 @@ Gated metric, неполный spark и approximate ranking являются
 4. `/v1/frame/{view}` с projection decode, pagination и sparks реализован;
    `/v1/ui/context` остаётся последующей работой.
 5. `/v1/entity/{view}/{entity}` и lazy row dock.
-6. `/v1/storage`, кеши и end-to-end budget qualification.
+6. `/v1/timeline/spine`, `/v1/data/quality`, `/v1/storage`, кеши и end-to-end
+   budget qualification.
 
 Каждый шаг обязан иметь работающий consumer-тест. Endpoint не
 добавляется раньше блока или projection, который обеспечивает его
