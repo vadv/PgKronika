@@ -4,6 +4,7 @@ import type { ContextResponse, IncidentsResponse } from "../api/types";
 import { button, chip, chipInteractive, text, verdictTint } from "../design/ui";
 import type { UiState } from "../state/url";
 import { DataHealthPopover } from "./DataHealthPopover";
+import { TipRow, Tooltip } from "./Tooltip";
 
 export interface HeaderProps {
   state: UiState;
@@ -26,6 +27,15 @@ function dataHealth(quality: ContextQuality | undefined): DataHealth {
   if (quality.status === "complete") return "ok";
   if (quality.status === "partial") return "partial";
   return "unknown";
+}
+
+/** 170003 → "17.3". */
+function formatPgVersion(versionNum: number): string {
+  const major = Math.floor(versionNum / 10000);
+  const minor = versionNum % 100;
+  return major >= 10
+    ? `${major}.${minor}`
+    : `${major}.${Math.floor((versionNum % 10000) / 100)}.${minor}`;
 }
 
 const healthColor: Record<DataHealth, string> = {
@@ -199,12 +209,38 @@ export function Header(props: HeaderProps) {
         fontFamily: "var(--ui-font)",
       }}
     >
-      <span style={chip} data-testid="instance-chip">
-        <Dot color="var(--sev-ok)" />
-        <span style={{ color: "var(--fg-strong)", fontWeight: 600 }}>
-          {props.context?.instance.hostname ?? "local"}
+      <Tooltip
+        content={
+          <span style={{ display: "grid", gap: "2px" }}>
+            <TipRow
+              label="host"
+              value={props.context?.instance.hostname ?? "local"}
+              mono
+            />
+            {props.context?.instance.pg_version_num != null && (
+              <TipRow
+                label="pg"
+                value={formatPgVersion(props.context.instance.pg_version_num)}
+                mono
+              />
+            )}
+            {props.context?.host.logical_cpu_count != null && (
+              <TipRow
+                label="cpu"
+                value={props.context.host.logical_cpu_count}
+                mono
+              />
+            )}
+          </span>
+        }
+      >
+        <span style={chip} data-testid="instance-chip">
+          <Dot color="var(--sev-ok)" />
+          <span style={{ color: "var(--fg-strong)", fontWeight: 600 }}>
+            {props.context?.instance.hostname ?? "local"}
+          </span>
         </span>
-      </span>
+      </Tooltip>
 
       <RoleChip context={props.context} />
 

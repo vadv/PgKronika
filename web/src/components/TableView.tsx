@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../api/client";
+import { TipRow, Tooltip } from "./Tooltip";
 import { useFrame } from "../api/frame";
 import type {
   ClassificationResultDto,
@@ -269,6 +270,7 @@ export function TableView(props: TableViewProps) {
       { availability: c.availability, reason: c.unavailable_reason ?? null },
     ]),
   );
+  const columnSpec = new Map(props.view.columns.map((c) => [c.code, c]));
 
   const columns: DisplayColumn[] = [];
   if (frame.data !== undefined) {
@@ -353,14 +355,41 @@ export function TableView(props: TableViewProps) {
               const meta = columnMeta.get(column.code);
               const unavailable =
                 meta !== undefined && meta.availability !== "available";
+              const spec = columnSpec.get(column.code);
+              const tip = (
+                <span style={{ display: "grid", gap: "2px" }}>
+                  <span style={{ fontFamily: "var(--mono-font)" }}>
+                    {column.code}
+                    {column.unit != null ? ` · ${column.unit}` : ""}
+                    {` · ${column.type}`}
+                  </span>
+                  {spec?.formula != null && (
+                    <TipRow label="formula" value={spec.formula} mono />
+                  )}
+                  {spec?.source != null && (
+                    <TipRow label="source" value={spec.source} mono />
+                  )}
+                  {spec?.threshold_metric != null && (
+                    <TipRow
+                      label="threshold"
+                      value={spec.threshold_metric}
+                      mono
+                    />
+                  )}
+                  {spec?.lazy === true && (
+                    <TipRow label="lazy" value="detail only" />
+                  )}
+                  {unavailable && (
+                    <TipRow
+                      label={meta.availability}
+                      value={meta.reason ?? "—"}
+                    />
+                  )}
+                </span>
+              );
               return (
                 <th
                   key={column.code}
-                  title={
-                    unavailable
-                      ? `${meta.availability}${meta.reason !== null ? `: ${meta.reason}` : ""}`
-                      : undefined
-                  }
                   style={{
                     ...headerCellStyle(column.code),
                     color: unavailable
@@ -368,26 +397,28 @@ export function TableView(props: TableViewProps) {
                       : headerCellStyle(column.code).color,
                   }}
                 >
-                  {SORTABLE_TYPES.has(column.type) ? (
-                    <button
-                      type="button"
-                      onClick={() => cycleSort(column.code)}
-                      style={{
-                        fontFamily: "var(--mono-font)",
-                        textTransform: "uppercase",
-                        color: "inherit",
-                        background: "none",
-                        border: "none",
-                        padding: 0,
-                        cursor: "pointer",
-                      }}
-                    >
-                      {column.code}
-                      {sortArrow(column.code)}
-                    </button>
-                  ) : (
-                    `${column.code}`
-                  )}
+                  <Tooltip content={tip}>
+                    {SORTABLE_TYPES.has(column.type) ? (
+                      <button
+                        type="button"
+                        onClick={() => cycleSort(column.code)}
+                        style={{
+                          fontFamily: "var(--mono-font)",
+                          textTransform: "uppercase",
+                          color: "inherit",
+                          background: "none",
+                          border: "none",
+                          padding: 0,
+                          cursor: "pointer",
+                        }}
+                      >
+                        {column.code}
+                        {sortArrow(column.code)}
+                      </button>
+                    ) : (
+                      <span>{column.code}</span>
+                    )}
+                  </Tooltip>
                 </th>
               );
             })}

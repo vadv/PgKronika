@@ -111,6 +111,7 @@ export function Spine(props: SpineProps) {
     return () => clearInterval(id);
   }, [live]);
 
+  const [hoverUs, setHoverUs] = useState<number | null>(null);
   const toUs = props.at !== null ? Number(props.at) : nowUs;
   // Wire range follows the zoom span (exact BigInt math); the 24 h bound is
   // enforced by the span whitelist in the URL codec.
@@ -176,6 +177,23 @@ export function Spine(props: SpineProps) {
       props.onSelectAt(String(toUs + delta));
     }
   };
+
+  const hoverBucket =
+    hoverUs !== null && geom !== null
+      ? Math.floor((hoverUs - geom.gridFromUs) / geom.bucketSpanUs)
+      : -1;
+  const hoverValue =
+    primary !== null && hoverBucket >= 0 && hoverBucket < primary.values.length
+      ? (primary.values[hoverBucket] ?? null)
+      : null;
+  const hoverLabel =
+    hoverUs !== null
+      ? new Intl.DateTimeFormat(undefined, {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }).format(new Date(hoverUs / 1000))
+      : null;
 
   const cursorDate = new Date(toUs / 1000);
   const cursorLabel = new Intl.DateTimeFormat(undefined, {
@@ -314,6 +332,12 @@ export function Spine(props: SpineProps) {
           preserveAspectRatio="none"
           onClick={onStripClick}
           onKeyDown={onStripKeyDown}
+          onMouseMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const fraction = (e.clientX - rect.left) / rect.width;
+            setHoverUs(Math.round(fromUs + fraction * windowNum));
+          }}
+          onMouseLeave={() => setHoverUs(null)}
           style={{
             flex: 1,
             height: `${SVG_HEIGHT}px`,
@@ -406,6 +430,30 @@ export function Spine(props: SpineProps) {
               y2={SVG_HEIGHT}
               stroke="var(--fg)"
               strokeWidth="1"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+          {hoverUs !== null && hoverLabel !== null && (
+            <text
+              data-testid="spine-hover-readout"
+              x={Math.min(Math.max(cursorX(hoverUs) + 6, 4), SVG_WIDTH - 150)}
+              y={12}
+              fontSize="10"
+              fill="var(--fg)"
+              style={{ fontFamily: "var(--mono-font)" }}
+            >
+              {`${hoverLabel} · ${hoverValue === null ? "—" : hoverValue.toFixed(2)}`}
+            </text>
+          )}
+          {hoverUs !== null && (
+            <line
+              x1={cursorX(hoverUs)}
+              x2={cursorX(hoverUs)}
+              y1={0}
+              y2={SVG_HEIGHT}
+              stroke="var(--fg-dim)"
+              strokeWidth="1"
+              strokeDasharray="3 3"
               vectorEffect="non-scaling-stroke"
             />
           )}

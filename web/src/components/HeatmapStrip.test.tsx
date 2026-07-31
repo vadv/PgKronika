@@ -84,7 +84,13 @@ test("renders row labels and one cell per bucket, null cell marked empty", async
   expect(container.querySelectorAll("[data-cell]")).toHaveLength(8);
   const empty = container.querySelector("[data-empty='true']");
   expect(empty).not.toBeNull();
-  expect(empty?.getAttribute("title")).toContain("—");
+  // The structured tooltip shows the honest null marker on hover.
+  fireEvent.mouseEnter(empty as Element);
+  await waitFor(() =>
+    expect(container.querySelector("[role='tooltip']")?.textContent).toContain(
+      "—",
+    ),
+  );
 });
 
 test("partial quality renders a warning badge", async () => {

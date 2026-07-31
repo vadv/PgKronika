@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { useHeatmap } from "../api/heatmap";
 import type { HeatmapQuality, ViewSpec } from "../api/types";
 import { heatColor } from "./heatmapColor";
+import { TipRow, Tooltip } from "./Tooltip";
 
 function formatValue(v: number): string {
   return String(Number(v.toFixed(v < 10 ? 2 : 0)));
@@ -52,6 +53,12 @@ export function HeatmapStrip(props: {
     0,
     ...rows.flatMap((r) => r.values.filter((v): v is number => v !== null)),
   );
+  const gridFromUs = heatmap.data ? Number(heatmap.data.grid.from_us) : null;
+  const bucketWidthUs =
+    heatmap.data && heatmap.data.grid.bucket_count > 0
+      ? (Number(heatmap.data.grid.to_us) - Number(heatmap.data.grid.from_us)) /
+        heatmap.data.grid.bucket_count
+      : 0;
 
   return (
     <section
@@ -197,41 +204,83 @@ export function HeatmapStrip(props: {
         >
           {rows.map((r) => (
             <Fragment key={r.entity}>
-              <button
-                onClick={() => props.onSelectEntity(r.entity)}
-                title={r.entity}
-                style={{
-                  fontFamily: "var(--mono-font)",
-                  color: "var(--fg)",
-                  background: "none",
-                  border: "none",
-                  padding: 0,
-                  textAlign: "start",
-                  cursor: "pointer",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
+              <Tooltip
+                content={
+                  <span style={{ display: "grid", gap: "2px" }}>
+                    <span style={{ overflowWrap: "anywhere" }}>{r.label}</span>
+                    <TipRow label="entity" value={r.entity} mono />
+                  </span>
+                }
               >
-                {r.label}
-              </button>
-              {r.values.map((v, i) => (
-                <div
-                  key={i}
-                  data-cell
-                  data-empty={v === null ? "true" : undefined}
-                  title={`${r.label}: ${v === null ? "—" : formatValue(v)}`}
+                <button
+                  onClick={() => props.onSelectEntity(r.entity)}
                   style={{
-                    width: "11px",
-                    height: "13px",
-                    margin: "0.5px",
-                    borderRadius: "2px",
-                    background: heatColor(
-                      v === null ? null : max > 0 ? v / max : 0,
-                    ),
+                    fontFamily: "var(--mono-font)",
+                    color: "var(--fg)",
+                    background: "none",
+                    border: "none",
+                    padding: 0,
+                    textAlign: "start",
+                    cursor: "pointer",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
                   }}
-                />
-              ))}
+                >
+                  {r.label}
+                </button>
+              </Tooltip>
+              {r.values.map((v, i) => {
+                const bucketStart =
+                  gridFromUs !== null ? gridFromUs + i * bucketWidthUs : null;
+                const when =
+                  bucketStart !== null
+                    ? new Intl.DateTimeFormat(undefined, {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      }).format(new Date(bucketStart / 1000))
+                    : null;
+                return (
+                  <Tooltip
+                    key={i}
+                    preferAbove
+                    content={
+                      <span style={{ display: "grid", gap: "2px" }}>
+                        <span
+                          style={{
+                            overflowWrap: "anywhere",
+                            color: "var(--fg-strong)",
+                          }}
+                        >
+                          {r.label}
+                        </span>
+                        <TipRow
+                          label={props.metric}
+                          value={v === null ? "—" : formatValue(v)}
+                          mono
+                        />
+                        {when !== null && (
+                          <TipRow label="bucket" value={when} mono />
+                        )}
+                      </span>
+                    }
+                  >
+                    <div
+                      data-cell
+                      data-empty={v === null ? "true" : undefined}
+                      style={{
+                        width: "11px",
+                        height: "13px",
+                        margin: "0.5px",
+                        borderRadius: "2px",
+                        background: heatColor(
+                          v === null ? null : max > 0 ? v / max : 0,
+                        ),
+                      }}
+                    />
+                  </Tooltip>
+                );
+              })}
             </Fragment>
           ))}
         </div>
