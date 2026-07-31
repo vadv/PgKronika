@@ -1,6 +1,13 @@
 # Web UI v6 — дизайн флагманского интерфейса
 
-Дата: 2026-07-30. Статус: DESIGN (после брейншторма, до implementation plan).
+Дата: 2026-07-30. Статус: PARTIAL (actionable remainder consolidated).
+
+PR #150 реализовал SPA/catalog/minimal summary+heatmap, OpenAPI-generated
+client, deterministic static assets и gates. Этот документ сохранён как
+архитектурный контекст; единственный checklist owner незавершённого web/UI scope
+и исправлений single-root/time/truth semantics —
+[`2026-07-31-web-ui-remaining-contract.md`](2026-07-31-web-ui-remaining-contract.md).
+Требования ниже не образуют независимый повторный backlog.
 
 Документ фиксирует решение о реализации веб-интерфейса PgKronika как
 полноценного фронтенд-приложения. Входные артефакты: макет
