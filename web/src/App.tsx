@@ -39,7 +39,7 @@ function Shell() {
       }}
     >
       <header style={{ fontFamily: "var(--mono-font)", padding: "4px 8px" }}>
-        {t("app.title")} · {state.source}
+        {t("app.title")}
       </header>
       {catalog.isSuccess && (
         <TabBar
