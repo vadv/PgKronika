@@ -1,16 +1,19 @@
 import { useTranslation } from "react-i18next";
-import type { ViewSpec } from "../api/types";
+import type { ViewSpec, ViewSummaryItem } from "../api/types";
+import { TabBadge } from "./TabBadge";
 
 export function TabBar(props: {
   views: ViewSpec[];
   active: string;
   onSelect: (code: string) => void;
+  summaries: Map<string, ViewSummaryItem>;
 }) {
   const { t } = useTranslation();
   return (
     <div role="tablist" style={{ display: "flex", gap: "var(--gap, 4px)" }}>
       {props.views.map((v) => {
         const gated = v.availability !== "available";
+        const summary = props.summaries.get(v.code);
         return (
           <button
             key={v.code}
@@ -35,6 +38,13 @@ export function TabBar(props: {
             onClick={() => !gated && props.onSelect(v.code)}
           >
             {t(`tabs.${v.code}`)}
+            {!gated && summary && (
+              <TabBadge
+                population={summary.population}
+                status={summary.status}
+                notable={summary.notable}
+              />
+            )}
           </button>
         );
       })}
