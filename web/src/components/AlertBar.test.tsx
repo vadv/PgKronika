@@ -58,3 +58,19 @@ test("renders nothing when live but summary is undefined", () => {
   const { container } = render(<AlertBar live={true} summary={undefined} />);
   expect(container.firstChild).toBeNull();
 });
+
+test("renders nothing when the only incompleteness is the active tail", () => {
+  const { container } = render(
+    <AlertBar
+      live={true}
+      summary={makeViewSummaryResponse({
+        quality: makeSummaryQuality({
+          status: "partial",
+          gaps: [],
+          active_tail: true,
+        }),
+      })}
+    />,
+  );
+  expect(container.firstChild).toBeNull();
+});

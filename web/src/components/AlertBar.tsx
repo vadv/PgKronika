@@ -8,11 +8,15 @@ export interface AlertBarProps {
 
 export function AlertBar(props: AlertBarProps) {
   const { t } = useTranslation();
+  const q = props.summary?.quality;
+  // The active tail (current, still-open snapshot window) is the normal LIVE
+  // state, not a defect — warning on it would make the banner permanent.
+  // Alert only on what the operator can act on: gaps or degradation NOT
+  // explained by the open tail.
   const stale =
     props.live &&
-    props.summary !== undefined &&
-    (props.summary.quality.status !== "complete" ||
-      props.summary.quality.gaps.length > 0);
+    q !== undefined &&
+    (q.gaps.length > 0 || (q.status !== "complete" && !q.active_tail));
   if (!stale) return null;
   return (
     <div
