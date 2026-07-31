@@ -30,7 +30,7 @@ BDD_RUNTIME_SOURCE_PATHS=(
   'bins/*/src/**'
   'bins/*/benches/**'
   'bins/*/examples/**'
-  'bins/*/static/**'
+  'bins/*/static.tar.gz'
   'crates/kronika-bdd/features/**'
   xtask/build.rs
   'xtask/src/**'
