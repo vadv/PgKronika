@@ -46,8 +46,9 @@ pub(crate) use evidence::{
 #[cfg(test)]
 pub(crate) use evidence::{
     CounterEvidenceInput, CounterEvidenceWindow, CounterEvidenceWindowInput,
-    CounterMeasurementKind, CounterOperand, CounterOperandPurpose, DirectEvidence, EntityJoinEvidence,
-    FindingScope, GaugeEntity, GaugeUnit, GaugeValueInput, LockParticipant, ThresholdKind,
+    CounterMeasurementKind, CounterOperand, CounterOperandPurpose, DirectEvidence,
+    EntityJoinEvidence, FindingScope, GaugeEntity, GaugeUnit, GaugeValueInput, LockParticipant,
+    ThresholdKind,
 };
 #[allow(
     unused_imports,
