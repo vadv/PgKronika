@@ -68,6 +68,8 @@ pub(crate) struct EpisodeRefV1 {
     pub identity: Arc<[IdentityValue]>,
     pub start_us: i64,
     pub end_us: i64,
+    /// Measured episode peak; carried as metadata, never part of the canonical key.
+    pub peak_ts_us: i64,
 }
 
 impl EpisodeRefV1 {
@@ -180,6 +182,7 @@ mod tests {
             identity: Arc::from(ids.to_vec()),
             start_us: start,
             end_us: end,
+            peak_ts_us: start,
         }
     }
 

@@ -228,11 +228,18 @@ fn incident_focus(incident: &Incident) -> IncidentFocus {
         },
         |metadata| metadata.slug.to_owned(),
     );
-    let peak_ts_us = i64::try_from(i128::midpoint(
-        i128::from(incident.start_us),
-        i128::from(incident.end_us),
-    ))
-    .expect("the midpoint of two i64 timestamps fits i64");
+    // The focus timestamp is the measured peak of the primary member; the
+    // midpoint survives only for a member-less cluster.
+    let peak_ts_us = incident.members.first().map_or_else(
+        || {
+            i64::try_from(i128::midpoint(
+                i128::from(incident.start_us),
+                i128::from(incident.end_us),
+            ))
+            .expect("the midpoint of two i64 timestamps fits i64")
+        },
+        |member| member.peak_ts_us,
+    );
     IncidentFocus {
         peak_ts_us,
         level,
@@ -1784,6 +1791,7 @@ mod tests {
                 identity: Arc::from(vec![IdentityValue::I64(42)]),
                 start_us: 0,
                 end_us: 10,
+                peak_ts_us: 0,
             },
         };
         let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);
@@ -1907,6 +1915,7 @@ mod tests {
                 identity: Arc::clone(&identity),
                 start_us: 0,
                 end_us: 10,
+                peak_ts_us: 0,
             },
         };
         let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);

@@ -34,6 +34,7 @@ fn episode_window(start_us: i64, end_us: i64) -> EnrichedEpisode {
             identity: id(),
             start_us,
             end_us,
+            peak_ts_us: start_us,
         },
     }
 }
@@ -226,6 +227,7 @@ fn window_episode(section: &'static str, column: &'static str) -> EnrichedEpisod
             identity: id(),
             start_us: 0,
             end_us: 10,
+            peak_ts_us: 0,
         },
     }
 }

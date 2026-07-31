@@ -753,6 +753,7 @@ mod tests {
                 identity,
                 start_us: 0,
                 end_us: 4_000_000,
+                peak_ts_us: 0,
             },
         }
     }
