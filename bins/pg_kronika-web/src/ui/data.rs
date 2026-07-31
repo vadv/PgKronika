@@ -4,11 +4,13 @@ use std::collections::BTreeSet;
 
 use kronika_analytics::web_projection::web_views;
 use kronika_reader::{
-    CollectionReadState, CollectionStatus, CollectionVisibility, IndexStatus, LIMIT, LiveState,
-    LiveView, LocalDirSnapshot, UiSummaryBlock, WebIndexReadError,
+    CollectionReadState, CollectionStatus, CollectionVisibility, IndexStatus, LiveState, LiveView,
+    LocalDirSnapshot, Notability, NotableLevel, UiSummaryBlock, WebIndexReadError,
 };
 use serde::Serialize;
 use utoipa::ToSchema;
+
+use super::snapshot::read_summary_tolerant;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ViewSummaryResponse {
@@ -26,8 +28,19 @@ struct ViewSummaryItem {
     population: Option<u64>,
     status: &'static str,
     notable: bool,
+    notable_level: NotableLevelDto,
+    notable_count: u64,
     #[schema(required = true)]
     collection: Option<CollectionStatusDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum NotableLevelDto {
+    None,
+    Info,
+    Warning,
+    Critical,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -52,7 +65,7 @@ struct SummaryQuality {
 
 #[derive(Clone, Copy)]
 struct ResolvedView {
-    snapshot: Option<(i64, u64, bool)>,
+    snapshot: Option<(i64, u64, Notability)>,
     collection: Option<CollectionStatus>,
     status: IndexStatus,
 }
@@ -82,12 +95,16 @@ pub(crate) fn view_summary(
             }
         }
     }
+    let mut incompatible_seen = false;
     for descriptor in descriptors
         .iter()
         .rev()
         .filter(|descriptor| descriptor.min_ts <= at_us)
     {
-        let (summary, _stats) = snapshot.read_ui_summary(descriptor, &LIMIT)?;
+        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
+            incompatible_seen = true;
+            continue;
+        };
         resolve_summary(&summary, at_us, &mut resolved);
         if resolved.iter().all(Option::is_some) {
             break;
@@ -105,22 +122,32 @@ pub(crate) fn view_summary(
             let resolved = resolved[index].as_ref();
             let status = resolved.map_or("unavailable", |resolved| status_code(resolved.status));
             let exact = resolved.and_then(|resolved| resolved.snapshot);
-            if let Some((timestamp, _population, _notable)) = exact {
+            if let Some((timestamp, _population, _notability)) = exact {
                 snapshots.insert(timestamp);
             }
             match resolved.map(|resolved| resolved.status) {
                 Some(IndexStatus::Gated) => gated.push(view.name),
                 Some(IndexStatus::UnsupportedType) => unavailable_revision.push(view.name),
                 Some(IndexStatus::ResourceLimited) => resource_limited.push(view.name),
+                None if incompatible_seen => unavailable_revision.push(view.name),
                 _ => {}
             }
             ViewSummaryItem {
                 view: view.name,
                 snapshot_ts_us: exact
-                    .map(|(timestamp, _population, _notable)| timestamp.to_string()),
-                population: exact.map(|(_timestamp, population, _notable)| population),
+                    .map(|(timestamp, _population, _notability)| timestamp.to_string()),
+                population: exact.map(|(_timestamp, population, _notability)| population),
                 status,
-                notable: exact.is_some_and(|(_timestamp, _population, notable)| notable),
+                notable: exact.is_some_and(|(_timestamp, _population, notability)| {
+                    notability.level() != NotableLevel::None
+                }),
+                notable_level: exact.map_or(
+                    NotableLevelDto::None,
+                    |(_timestamp, _population, notability)| notable_level(notability.level()),
+                ),
+                notable_count: exact.map_or(0, |(_timestamp, _population, notability)| {
+                    notability.count()
+                }),
                 collection: resolved
                     .and_then(|resolved| resolved.collection)
                     .map(collection_status_dto),
@@ -160,8 +187,8 @@ fn resolve_summary(summary: &UiSummaryBlock, at_us: i64, resolved: &mut [Option<
         else {
             continue;
         };
-        let exact = summary.snapshot_state_at(view.code, at_us);
-        let collection = exact.and_then(|(timestamp, _population, _notable)| {
+        let exact = summary.snapshot_notability_at(view.code, at_us);
+        let collection = exact.and_then(|(timestamp, _population, _notability)| {
             summary
                 .collection_state_at(view.code, timestamp)
                 .filter(|(collection_ts, _status)| *collection_ts == timestamp)
@@ -174,6 +201,15 @@ fn resolve_summary(summary: &UiSummaryBlock, at_us: i64, resolved: &mut [Option<
                 status: block_view.status(),
             });
         }
+    }
+}
+
+const fn notable_level(level: NotableLevel) -> NotableLevelDto {
+    match level {
+        NotableLevel::None => NotableLevelDto::None,
+        NotableLevel::Info => NotableLevelDto::Info,
+        NotableLevel::Warning => NotableLevelDto::Warning,
+        NotableLevel::Critical => NotableLevelDto::Critical,
     }
 }
 

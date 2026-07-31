@@ -1,6 +1,6 @@
 //! JSON contract for incident clustering responses.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kronika_reader::Gap;
 use serde_json::{Value, json};
@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::anomaly::ScanParams;
 use crate::incident::{
     CounterEvidence, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence, Finding,
-    GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
+    GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage, Role,
     SampledLockEdge, SourceWindow, SourceWindowGapReason,
 };
 use crate::incident_input::{
@@ -97,11 +97,27 @@ pub(crate) fn build_response(
 fn incident_to_json(incident: &Incident) -> Value {
     let members: Vec<Value> = incident.members.iter().map(member_to_json).collect();
     let findings: Vec<Value> = incident.findings.iter().map(finding_to_json).collect();
+    let relations = incident_relations_to_json(incident);
+    let finding_count = incident.findings.len();
+    let coincident_count = incident
+        .findings
+        .iter()
+        .filter(|finding| matches!(finding.role(), Role::Coincident))
+        .count();
+    let focus = incident_focus(incident);
     json!({
         "interval": { "from": incident.start_us, "to": incident.end_us },
         "incident_key": hex(incident.key.canonical_bytes()),
+        "peak_ts_us": focus.peak_ts_us.to_string(),
+        "level": focus.level,
+        "level_policy_revision": INCIDENT_LEVEL_POLICY_REVISION,
+        "category_code": focus.category_code,
+        "summary_code": focus.summary_code,
+        "finding_count": finding_count,
+        "coincident_count": coincident_count,
         "members": members,
         "findings": findings,
+        "relations": relations,
         "evaluation_complete": incident.evaluation_complete,
         "finding_evaluation_status": if incident.evaluation_complete {
             "complete"
@@ -115,10 +131,13 @@ fn finding_to_json(finding: &Finding) -> Value {
     let scope = finding.scope();
     let identity: Vec<Value> = scope.identity().iter().map(identity_to_json).collect();
     let evidence: Vec<Value> = finding.evidence().iter().map(evidence_to_json).collect();
+    let metadata = finding_metadata(finding.lens_id());
     json!({
         "lens_id": finding.lens_id(),
+        "slug": metadata.slug,
         "role": finding.role().label(),
         "confidence": finding.confidence().label(),
+        "confidence_cap": metadata.confidence_cap,
         "scope": {
             "logical_section": scope.logical_section(),
             "column": scope.column(),
@@ -128,10 +147,138 @@ fn finding_to_json(finding: &Finding) -> Value {
     })
 }
 
+const INCIDENT_LEVEL_POLICY_REVISION: u16 = 1;
+const CRITICAL_INCIDENT_SLUGS: &[&str] = &[
+    "cgroup_memory_limit",
+    "filesystem_space",
+    "xid_wraparound_risk",
+];
+
+struct FindingMetadata {
+    slug: &'static str,
+    confidence_cap: &'static str,
+    category_code: &'static str,
+}
+
+struct IncidentFocus {
+    peak_ts_us: i64,
+    level: &'static str,
+    category_code: &'static str,
+    summary_code: String,
+}
+
+fn finding_metadata(lens_id: &str) -> FindingMetadata {
+    if let Some(entry) = crate::incident::core_catalog()
+        .iter()
+        .find(|entry| entry.lens_id() == lens_id)
+    {
+        return FindingMetadata {
+            slug: entry.slug(),
+            confidence_cap: entry.confidence().as_str(),
+            category_code: match entry.domain().as_str() {
+                "os" => "host",
+                _ => "postgres",
+            },
+        };
+    }
+    if let Some(entry) = crate::incident::event_catalog_metadata()
+        .iter()
+        .find(|entry| entry.lens_id == lens_id)
+    {
+        return FindingMetadata {
+            slug: entry.slug,
+            confidence_cap: entry.confidence_cap.as_str(),
+            category_code: if entry.lens_id.starts_with("OS-") {
+                "host"
+            } else {
+                "postgres"
+            },
+        };
+    }
+    FindingMetadata {
+        slug: "unregistered_lens",
+        confidence_cap: "low",
+        category_code: "postgres",
+    }
+}
+
+fn incident_focus(incident: &Incident) -> IncidentFocus {
+    let metadata = incident
+        .findings
+        .first()
+        .map(|finding| finding_metadata(finding.lens_id()));
+    let level =
+        if incident.findings.iter().any(|finding| {
+            CRITICAL_INCIDENT_SLUGS.contains(&finding_metadata(finding.lens_id()).slug)
+        }) {
+            "critical"
+        } else {
+            "warning"
+        };
+    let category_code = metadata.as_ref().map_or_else(
+        || member_category(incident),
+        |metadata| metadata.category_code,
+    );
+    let summary_code = metadata.map_or_else(
+        || {
+            incident.members.first().map_or_else(
+                || "anomaly_cluster".to_owned(),
+                |member| format!("anomaly.{}.{}", member.logical_section, member.column),
+            )
+        },
+        |metadata| metadata.slug.to_owned(),
+    );
+    // The focus timestamp is the measured peak of the primary member; the
+    // midpoint survives only for a member-less cluster.
+    let peak_ts_us = incident.members.first().map_or_else(
+        || {
+            i64::try_from(i128::midpoint(
+                i128::from(incident.start_us),
+                i128::from(incident.end_us),
+            ))
+            .expect("the midpoint of two i64 timestamps fits i64")
+        },
+        |member| member.peak_ts_us,
+    );
+    IncidentFocus {
+        peak_ts_us,
+        level,
+        category_code,
+        summary_code,
+    }
+}
+
+fn member_category(incident: &Incident) -> &'static str {
+    if incident
+        .members
+        .iter()
+        .all(|member| member.logical_section.starts_with("os_"))
+    {
+        "host"
+    } else {
+        "postgres"
+    }
+}
+
 fn evidence_to_json(evidence: &Evidence) -> Value {
     match evidence {
         Evidence::GaugeObservation(gauge) => gauge_evidence_to_json(gauge),
         Evidence::CounterAggregate(counter) => counter_evidence_to_json(counter),
+        Evidence::EntityJoin(join) => json!({
+            "schema_version": 1,
+            "type": "entity_join",
+            "claim": "stored_typed_identity_join",
+            "contract": join.contract(),
+            "fields": join.fields(),
+            "target": {
+                "logical_section": join.target_section(),
+                "identity": join
+                    .target_identity()
+                    .iter()
+                    .map(identity_to_json)
+                    .collect::<Vec<_>>(),
+            },
+        }),
         Evidence::Direct(direct) => direct
             .lock_edge()
             .map_or_else(|| Value::from(evidence.label()), lock_edge_evidence_to_json),
@@ -139,6 +286,47 @@ fn evidence_to_json(evidence: &Evidence) -> Value {
             Value::from(evidence.label())
         }
     }
+}
+
+fn incident_relations_to_json(incident: &Incident) -> Vec<Value> {
+    // Section-bucketed candidates keep the join scan linear in findings.
+    let mut by_section: HashMap<&'static str, Vec<usize>> = HashMap::new();
+    for (index, finding) in incident.findings.iter().enumerate() {
+        by_section
+            .entry(finding.scope().logical_section())
+            .or_default()
+            .push(index);
+    }
+    let mut emitted = BTreeSet::new();
+    let mut relations = Vec::new();
+    for (from_finding, finding) in incident.findings.iter().enumerate() {
+        for evidence in finding.evidence() {
+            let Evidence::EntityJoin(join) = evidence else {
+                continue;
+            };
+            let Some(candidates) = by_section.get(join.target_section()) else {
+                continue;
+            };
+            for to_finding in candidates.iter().copied() {
+                if from_finding == to_finding
+                    || !join.matches(incident.findings[to_finding].scope())
+                    || !emitted.insert((from_finding, to_finding, join.contract()))
+                {
+                    continue;
+                }
+                relations.push(json!({
+                    "from_finding": from_finding,
+                    "to_finding": to_finding,
+                    "kind": "proven",
+                    "provenance": {
+                        "contract": join.contract(),
+                        "fields": join.fields(),
+                    },
+                }));
+            }
+        }
+    }
+    relations
 }
 
 fn gauge_evidence_to_json(gauge: &GaugeEvidence) -> Value {
@@ -378,6 +566,7 @@ fn event_catalog_to_json() -> Vec<Value> {
             json!({
                 "lens_id": entry.lens_id,
                 "slug": entry.slug,
+                "confidence_cap": entry.confidence_cap.as_str(),
                 "source_format": "stderr",
                 "evidence_quality": "heuristic_positive_observation",
             })
@@ -830,6 +1019,38 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn entity_join_matches_only_the_proven_scope() {
+        use crate::incident::{EntityJoinEvidence, FindingScope};
+        use std::sync::Arc;
+
+        let join = EntityJoinEvidence::new(
+            "statement_plan",
+            &["queryid", "dbid", "userid"],
+            "pg_store_plans_ossc",
+            Arc::from(vec![IdentityValue::I64(7)]),
+        );
+        let prefixed = FindingScope::from_parts(
+            "pg_store_plans_ossc",
+            "total_time",
+            Arc::from(vec![IdentityValue::I64(7), IdentityValue::I64(20)]),
+        );
+        let other_identity = FindingScope::from_parts(
+            "pg_store_plans_ossc",
+            "total_time",
+            Arc::from(vec![IdentityValue::I64(8)]),
+        );
+        let other_section = FindingScope::from_parts(
+            "pg_stat_statements",
+            "c",
+            Arc::from(vec![IdentityValue::I64(7)]),
+        );
+
+        assert!(join.matches(&prefixed));
+        assert!(!join.matches(&other_identity), "coincidence is not a link");
+        assert!(!join.matches(&other_section), "cross-section is not a link");
+    }
+
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
     const APPLIED_IDS: &[&str] = &[
         "PG-CACHE-010",
@@ -1239,7 +1460,13 @@ mod tests {
             keys.sort_unstable();
             assert_eq!(
                 keys,
-                ["evidence_quality", "lens_id", "slug", "source_format"]
+                [
+                    "confidence_cap",
+                    "evidence_quality",
+                    "lens_id",
+                    "slug",
+                    "source_format",
+                ]
             );
         }
 
@@ -1607,6 +1834,7 @@ mod tests {
                 identity: Arc::from(vec![IdentityValue::I64(42)]),
                 start_us: 0,
                 end_us: 10,
+                peak_ts_us: 0,
             },
         };
         let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);
@@ -1730,6 +1958,7 @@ mod tests {
                 identity: Arc::clone(&identity),
                 start_us: 0,
                 end_us: 10,
+                peak_ts_us: 0,
             },
         };
         let config = IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown);

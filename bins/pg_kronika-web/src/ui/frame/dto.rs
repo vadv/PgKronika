@@ -10,8 +10,8 @@ use serde::Serialize;
 use utoipa::{PartialSchema, ToSchema};
 
 use super::FrameRequest;
-use super::projection::{ProjectedFrame, selected_columns};
-use crate::ui::catalog::{ProjectionCatalog, ValueType};
+use super::projection::{DeltaOperand, ProjectedFrame, ProjectedRow, selected_columns};
+use crate::ui::catalog::{Availability, ColumnSpec, ProjectionCatalog, ValueType};
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct FrameResponse {
@@ -41,6 +41,8 @@ pub(crate) struct FrameColumnDto {
     pub unit: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold_metric: Option<&'static str>,
+    /// Whether the column is materialized only for sort or field filtering.
+    pub hidden: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -48,8 +50,29 @@ pub(crate) struct FrameRowDto {
     pub entity: String,
     pub label: String,
     pub cells: Vec<FrameValue>,
+    pub cell_statuses: Vec<CellStatusDto>,
     pub classifications: Vec<CellClassificationDto>,
+    pub categorical_classifications: Vec<CategoricalClassificationDto>,
     pub spark: SparkDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub(crate) struct CellStatusDto {
+    status: &'static str,
+    #[schema(required = true)]
+    reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub(crate) struct CategoricalClassificationDto {
+    column: &'static str,
+    status: &'static str,
+    #[schema(required = true)]
+    code: Option<String>,
+    #[schema(required = true)]
+    level: Option<&'static str>,
+    #[schema(required = true)]
+    reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -190,8 +213,10 @@ impl FrameResponse {
                 value_type: value_type_spelling(column.value_type),
                 unit: column.unit,
                 threshold_metric: column.threshold_metric,
+                hidden: !request.columns.contains(&column.code),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let selected = selected_columns(request, catalog)?;
         let rows = frame
             .rows
             .iter()
@@ -199,6 +224,12 @@ impl FrameResponse {
                 entity: URL_SAFE_NO_PAD.encode(&row.entity),
                 label: row.label.clone(),
                 cells: row.cells.clone(),
+                cell_statuses: row
+                    .cells
+                    .iter()
+                    .zip(&selected)
+                    .map(|(value, column)| cell_status(row, value, column, frame))
+                    .collect(),
                 classifications: row
                     .classifications
                     .iter()
@@ -206,6 +237,14 @@ impl FrameResponse {
                         column: classification.column,
                         metric: classification.metric_id.as_str(),
                         result: classification.result.into(),
+                    })
+                    .collect(),
+                categorical_classifications: row
+                    .cells
+                    .iter()
+                    .zip(&selected)
+                    .filter_map(|(value, column)| {
+                        categorical_classification(column.code, value, column)
                     })
                     .collect(),
                 spark: row.spark.clone(),
@@ -256,6 +295,153 @@ impl FrameResponse {
                 active_tail: frame.quality.active_tail,
             },
         })
+    }
+}
+
+fn categorical_classification(
+    column: &'static str,
+    value: &FrameValue,
+    spec: &ColumnSpec,
+) -> Option<CategoricalClassificationDto> {
+    if !matches!(
+        column,
+        "state"
+            | "wait_event"
+            | "replication_state"
+            | "granted"
+            | "lock_mode"
+            | "lock_type"
+            | "severity_code"
+            | "category_code"
+    ) {
+        return None;
+    }
+    let code = match value {
+        FrameValue::String(value) => value.clone(),
+        FrameValue::Boolean(true) => "granted".to_owned(),
+        FrameValue::Boolean(false) => "waiting".to_owned(),
+        FrameValue::Null | FrameValue::Number(_) => {
+            return Some(CategoricalClassificationDto {
+                column,
+                status: "not_classified",
+                code: None,
+                level: None,
+                reason: spec.unavailable_reason.or(Some("not_observed")),
+            });
+        }
+    };
+    Some(CategoricalClassificationDto {
+        column,
+        status: "classified",
+        level: Some(categorical_level(column, &code)),
+        code: Some(code),
+        reason: None,
+    })
+}
+
+fn categorical_level(column: &str, code: &str) -> &'static str {
+    match column {
+        "severity_code" => match code {
+            "panic" | "fatal" => "critical",
+            "error" | "warning" => "warning",
+            _ => "info",
+        },
+        "category_code" => {
+            if code.contains("error")
+                || code.contains("deadlock")
+                || code.contains("lock")
+                || code.contains("gap")
+            {
+                "warning"
+            } else {
+                "info"
+            }
+        }
+        "state" => match code {
+            "idle in transaction" | "idle in transaction (aborted)" => "warning",
+            "disabled" => "critical",
+            _ => "info",
+        },
+        "wait_event" => {
+            if code.starts_with("Lock:") || code.starts_with("IO:") {
+                "warning"
+            } else {
+                "info"
+            }
+        }
+        "replication_state" => match code {
+            "stopped" => "critical",
+            "catchup" | "startup" | "backup" => "warning",
+            _ => "info",
+        },
+        "granted" if code == "waiting" => "warning",
+        _ => "info",
+    }
+}
+
+fn cell_status(
+    row: &ProjectedRow,
+    value: &FrameValue,
+    column: &ColumnSpec,
+    frame: &ProjectedFrame,
+) -> CellStatusDto {
+    if !matches!(value, FrameValue::Null) {
+        return CellStatusDto {
+            status: "available",
+            reason: None,
+        };
+    }
+    if column.availability != Availability::Available {
+        return CellStatusDto {
+            status: "unavailable",
+            reason: column.unavailable_reason,
+        };
+    }
+    // Stored delta operands give exact per-cell evidence where the projection
+    // keeps them; the frame-level fallback never blames raw columns for a gap.
+    let reason = match delta_operand_for(row, column.code) {
+        Some(DeltaOperand::Reset) => Some("reset"),
+        Some(DeltaOperand::Gap) => Some("producer_gap"),
+        Some(DeltaOperand::Missing | DeltaOperand::Value(_)) | None => {
+            if frame.predecessor_ts_us.is_none() && column.formula.is_some() {
+                Some("missing_predecessor")
+            } else if !frame.quality.gaps.is_empty() && column.formula.is_some() {
+                Some("producer_gap")
+            } else {
+                Some("not_observed")
+            }
+        }
+    };
+    CellStatusDto {
+        status: "unavailable",
+        reason,
+    }
+}
+
+/// Unproven delta evidence behind a null cell, where the projection stores it.
+/// ponytail: only statements and table counters carry operands today; other
+/// delta columns fall back to the frame-level reason chain.
+fn delta_operand_for(row: &ProjectedRow, code: &str) -> Option<DeltaOperand> {
+    fn unproven(operand: DeltaOperand) -> Option<DeltaOperand> {
+        (!matches!(operand, DeltaOperand::Value(_))).then_some(operand)
+    }
+    let statements = row.operands.statements.as_ref();
+    match code {
+        "calls" => statements.and_then(|operands| unproven(operands.calls)),
+        "total" | "mean" | "ms_per_row" => {
+            statements.and_then(|operands| unproven(operands.exec_ms))
+        }
+        "plan_time_pct" => statements.and_then(|operands| unproven(operands.plan_ms)),
+        "rows" => statements.and_then(|operands| unproven(operands.rows)),
+        "seq_scan_pct" => row.operands.table.as_ref().and_then(|operands| {
+            match (operands.seq_scan, operands.idx_scan) {
+                (DeltaOperand::Value(_), DeltaOperand::Value(_)) => None,
+                (DeltaOperand::Gap, _) | (_, DeltaOperand::Gap) => Some(DeltaOperand::Gap),
+                (DeltaOperand::Reset, _) | (_, DeltaOperand::Reset) => Some(DeltaOperand::Reset),
+                _ => Some(DeltaOperand::Missing),
+            }
+        }),
+        _ => None,
     }
 }
 

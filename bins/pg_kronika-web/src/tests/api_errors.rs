@@ -1,8 +1,44 @@
 use axum::response::IntoResponse as _;
 
 use super::*;
-use crate::api_error::{ApiError, LimitResource};
+use crate::api_error::{ApiError, ExpectedValue, LimitResource, QueryConstraint, QueryParameter};
 use crate::reason::{ApiReason, MaterializationResource, ReasonKind};
+
+#[test]
+fn v5_query_names_and_constraints_are_closed_wire_values() {
+    assert_eq!(
+        serde_json::to_value(QueryParameter::Columns).expect("query parameter JSON"),
+        "columns"
+    );
+    assert_eq!(
+        serde_json::to_value(QueryParameter::Include).expect("query parameter JSON"),
+        "include"
+    );
+    assert_eq!(
+        serde_json::to_value(ExpectedValue::EntityToken).expect("expected value JSON"),
+        "entity_token"
+    );
+    assert_eq!(
+        serde_json::to_value(ExpectedValue::ProjectionColumnList).expect("expected value JSON"),
+        "projection_column_list"
+    );
+    assert_eq!(
+        serde_json::to_value(QueryConstraint::PointOrHistory).expect("constraint JSON"),
+        "point_or_history"
+    );
+    assert_eq!(
+        serde_json::to_value(QueryConstraint::HistorySupported).expect("constraint JSON"),
+        "history_supported"
+    );
+    assert_eq!(
+        serde_json::to_value(QueryConstraint::PresetOrColumns).expect("constraint JSON"),
+        "preset_or_columns"
+    );
+    assert_eq!(
+        serde_json::to_value(crate::api_error::ErrorCode::EntityNotFound).expect("error code JSON"),
+        "entity_not_found"
+    );
+}
 
 #[tokio::test]
 async fn selected_segment_shape_limit_is_400_without_changing_other_limit_statuses() {

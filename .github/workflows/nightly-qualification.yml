@@ -1,0 +1,23 @@
+name: Nightly qualification
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # See ci.yml: cargo jobs build for host gnu, not the pinned musl target.
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  ignored-qualification:
+    name: ignored structural qualification tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run cost-bearing qualification tests
+        run: cargo test -p pg_kronika-web --locked -- --ignored --test-threads=1

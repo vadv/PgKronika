@@ -38,6 +38,8 @@ pub enum WebUnit {
     Ratio,
     /// Bytes per second.
     BytesPerSecond,
+    /// Percent.
+    Percent,
 }
 
 impl WebUnit {
@@ -51,6 +53,7 @@ impl WebUnit {
             Self::Blocks => 3,
             Self::Ratio => 4,
             Self::BytesPerSecond => 5,
+            Self::Percent => 7,
         }
     }
 
@@ -64,6 +67,7 @@ impl WebUnit {
             Self::Blocks => "blocks",
             Self::Ratio => "ratio",
             Self::BytesPerSecond => "bytes_per_second",
+            Self::Percent => "percent",
         }
     }
 }
@@ -119,7 +123,7 @@ pub enum WebFormula {
 }
 
 impl WebFormula {
-    /// Normative formula exposed by the source-aware catalog.
+    /// Normative formula exposed by the projection catalog.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -194,6 +198,10 @@ const ACTIVITY_INPUTS: &[WebInput] = &[
         code: "process",
         sections: &["os_process"],
     },
+    WebInput {
+        code: "replication_replicas",
+        sections: &["pg_stat_replication"],
+    },
 ];
 const STATEMENTS_INPUTS: &[WebInput] = &[
     WebInput {
@@ -217,14 +225,26 @@ const INDEXES_INPUTS: &[WebInput] = &[WebInput {
     code: "indexes",
     sections: &["pg_stat_user_indexes"],
 }];
-const VACUUM_INPUTS: &[WebInput] = &[WebInput {
-    code: "vacuum",
-    sections: &["pg_stat_progress_vacuum"],
-}];
-const PROCESS_INPUTS: &[WebInput] = &[WebInput {
-    code: "process",
-    sections: &["os_process"],
-}];
+const VACUUM_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "vacuum",
+        sections: &["pg_stat_progress_vacuum"],
+    },
+    WebInput {
+        code: "tables",
+        sections: &["pg_stat_user_tables"],
+    },
+];
+const PROCESS_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "process",
+        sections: &["os_process"],
+    },
+    WebInput {
+        code: "cgroup_mapping",
+        sections: &["os_cgroup_mapping"],
+    },
+];
 const LOCK_INPUTS: &[WebInput] = &[WebInput {
     code: "locks",
     sections: &["pg_locks"],

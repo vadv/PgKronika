@@ -11,7 +11,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
 
 use super::catalog::ProjectionCatalog;
+use super::context::{ContextError, ContextLimits, ContextResponse, build_context};
 use super::data::{ViewSummaryResponse, view_summary};
+use super::entity::{EntityError, EntityRequest, EntityResponse, entity as build_entity};
 use super::frame::FrameRequest;
 use super::frame::MAX_FRAME_RESPONSE_BYTES;
 use super::frame::dto::FrameResponse;
@@ -20,6 +22,9 @@ use super::frame::projection::{
 };
 use super::frame::spark::{SparkError, attach_sparks};
 use super::heatmap::{HeatmapError, HeatmapRequest, HeatmapResponse, heatmap as build_heatmap};
+use super::quality::{DataQualityRequest, DataQualityResponse, build_data_quality};
+use super::spine::{SpineError, SpineRequest, SpineResponse, spine as build_spine};
+use super::storage::{StorageLimits, StorageResponse, build_storage};
 use crate::AppState;
 use crate::api_error::{
     ApiError, ExpectedValue, LimitResource, QueryConstraint, QueryParameter, count_u64,
@@ -28,13 +33,24 @@ use crate::params::{QueryParams, parse_i64};
 
 /// Maximum serialized projection catalog response.
 const MAX_CATALOG_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_CONTEXT_RESPONSE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_DATA_QUALITY_RESPONSE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_ENTITY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HEATMAP_RESPONSE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_SPINE_RESPONSE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_STORAGE_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_HEATMAP_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
+const MAX_SPINE_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
+const MAX_DATA_QUALITY_SPAN_US: i64 = 24 * 60 * 60 * 1_000_000;
 const DEFAULT_HEATMAP_BUCKETS: usize = 56;
 const MAX_HEATMAP_BUCKETS: usize = 256;
 const DEFAULT_HEATMAP_TOP: usize = 8;
 const MAX_HEATMAP_TOP: usize = 64;
+const DEFAULT_SPINE_BUCKETS: usize = 288;
+const MAX_SPINE_BUCKETS: usize = 512;
 const CATALOG_PARAMS: &[QueryParameter] = &[];
+const CONTEXT_PARAMS: &[QueryParameter] = &[QueryParameter::At];
+const DATA_QUALITY_PARAMS: &[QueryParameter] = &[QueryParameter::From, QueryParameter::To];
 const SUMMARY_PARAMS: &[QueryParameter] = &[QueryParameter::At];
 const HEATMAP_PARAMS: &[QueryParameter] = &[
     QueryParameter::View,
@@ -44,6 +60,477 @@ const HEATMAP_PARAMS: &[QueryParameter] = &[
     QueryParameter::Buckets,
     QueryParameter::Top,
 ];
+const SPINE_PARAMS: &[QueryParameter] = &[
+    QueryParameter::From,
+    QueryParameter::To,
+    QueryParameter::Buckets,
+];
+const STORAGE_PARAMS: &[QueryParameter] = &[];
+
+/// `GET /v1/entity/{view}/{entity}` - one entity detail or bounded history.
+#[utoipa::path(
+    get,
+    path = "/v1/entity/{view}/{entity}",
+    tag = "ui",
+    params(
+        ("view" = String, Path),
+        ("entity" = String, Path),
+        ("at" = Option<i64>, Query),
+        ("include" = Option<String>, Query),
+        ("from" = Option<i64>, Query),
+        ("to" = Option<i64>, Query),
+        ("columns" = Option<String>, Query),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 2000),
+        ("cursor" = Option<String>, Query),
+    ),
+    responses(
+        (status = 200, description = "Entity detail or history page", body = EntityResponse),
+        (status = 400, description = "Invalid entity token or query mode", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 404, description = "Entity is absent from the selected snapshot", body = ApiError),
+        (status = 413, description = "Entity history or response limit exceeded", body = ApiError),
+        (status = 500, description = "Entity projection or storage read failed", body = ApiError),
+    )
+)]
+pub(crate) async fn entity(
+    State(state): State<AppState>,
+    Path((view, encoded_entity)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    let catalog = ProjectionCatalog::for_materialization();
+    let request = EntityRequest::parse(&view, &encoded_entity, raw.as_deref(), &catalog)?;
+    let snapshot = state.snapshot();
+    let result = tokio::task::spawn_blocking(move || {
+        let response = build_entity(&snapshot, &request, &catalog).map_err(entity_error)?;
+        let body = serde_json::to_vec(&response).map_err(|cause| {
+            tracing::error!(
+                event = "api_ui_entity_serialize_failed",
+                error = %cause,
+                "entity serialization failed"
+            );
+            ApiError::internal_error()
+        })?;
+        if body.len() > MAX_ENTITY_RESPONSE_BYTES {
+            return Err(ApiError::query_limit_exceeded(
+                LimitResource::Bytes,
+                count_u64(MAX_ENTITY_RESPONSE_BYTES),
+                Some(count_u64(body.len())),
+            ));
+        }
+        Ok::<_, ApiError>(body)
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_entity_worker_failed",
+            error = ?join,
+            "entity worker failed"
+        );
+        ApiError::internal_error()
+    })??;
+    let mut response = Response::new(Body::from(result));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+fn entity_error(error: EntityError) -> ApiError {
+    match error {
+        EntityError::Gone => ApiError::entity_not_found(),
+        EntityError::SelectedSegments { observed } => ApiError::query_limit_exceeded(
+            LimitResource::SelectedSegments,
+            count_u64(super::entity::MAX_HISTORY_SEGMENTS),
+            Some(count_u64(observed)),
+        ),
+        EntityError::Frame(FrameError::Query(error)) => frame_query_error(error),
+        EntityError::Frame(FrameError::WebIndex(_)) | EntityError::WebIndex(_) => {
+            tracing::error!(
+                event = "api_ui_entity_store_read_failed",
+                "entity storage read failed"
+            );
+            ApiError::store_read_failed()
+        }
+        EntityError::Frame(FrameError::CursorExpired) => ApiError::cursor_expired(),
+        EntityError::Frame(FrameError::Projection(_)) | EntityError::Cursor => {
+            tracing::error!(
+                event = "api_ui_entity_projection_failed",
+                "entity projection failed"
+            );
+            ApiError::internal_error()
+        }
+    }
+}
+
+/// `GET /v1/storage` - bounded root accounting, retention and capacity forecast.
+#[utoipa::path(
+    get,
+    path = "/v1/storage",
+    tag = "ui",
+    responses(
+        (status = 200, description = "Storage accounting and capacity facts", body = StorageResponse),
+        (status = 400, description = "Unexpected query parameter", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Serialized response limit exceeded", body = ApiError),
+        (status = 500, description = "Storage inventory or status read failed", body = ApiError),
+    )
+)]
+pub(crate) async fn storage(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    QueryParams::parse(raw.as_deref(), STORAGE_PARAMS)?;
+    let snapshot = state.snapshot();
+    let response = tokio::task::spawn_blocking(move || {
+        let producer_status = producer_status_or_unknown(&snapshot);
+        build_storage(
+            snapshot.data_dir(),
+            producer_status.as_ref(),
+            StorageLimits::default(),
+        )
+        .map_err(|error| {
+            tracing::error!(
+                event = "api_ui_storage_inventory_failed",
+                error = %error,
+                "storage inventory failed"
+            );
+            ApiError::store_read_failed()
+        })
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_storage_worker_failed",
+            error = ?join,
+            "storage worker failed"
+        );
+        ApiError::internal_error()
+    })??;
+    let body = serde_json::to_vec(&response).map_err(|cause| {
+        tracing::error!(
+            event = "api_ui_storage_serialize_failed",
+            error = %cause,
+            "storage serialization failed"
+        );
+        ApiError::internal_error()
+    })?;
+    if body.len() > MAX_STORAGE_RESPONSE_BYTES {
+        return Err(ApiError::query_limit_exceeded(
+            LimitResource::Bytes,
+            count_u64(MAX_STORAGE_RESPONSE_BYTES),
+            Some(count_u64(body.len())),
+        ));
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+/// `GET /v1/data/quality` - freshness, coverage, producer and integrity facts.
+#[utoipa::path(
+    get,
+    path = "/v1/data/quality",
+    tag = "ui",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "Retained data quality facts", body = DataQualityResponse),
+        (status = 400, description = "Invalid or oversized quality query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Serialized response limit exceeded", body = ApiError),
+        (status = 500, description = "Quality status or index read failed", body = ApiError),
+    )
+)]
+pub(crate) async fn data_quality(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    let params = QueryParams::parse(raw.as_deref(), DATA_QUALITY_PARAMS)?;
+    let from_us = parse_i64(&params, QueryParameter::From)?;
+    let to_us = parse_i64(&params, QueryParameter::To)?;
+    let span = to_us
+        .checked_sub(from_us)
+        .filter(|span| *span > 0)
+        .ok_or_else(|| ApiError::invalid_query_constraint(QueryConstraint::FromBeforeTo))?;
+    if span > MAX_DATA_QUALITY_SPAN_US {
+        return Err(ApiError::query_shape_limit_exceeded(
+            LimitResource::QuerySpanUs,
+            u64::try_from(MAX_DATA_QUALITY_SPAN_US).expect("positive constant"),
+            u64::try_from(span).ok(),
+        ));
+    }
+    let stale_after_us = i64::try_from(state.stale_after.as_micros()).unwrap_or(i64::MAX);
+    let (snapshot, descriptor_view) = state.overview_request_view();
+    let live = Arc::clone(descriptor_view.live());
+    let response = tokio::task::spawn_blocking(move || {
+        let producer_status = producer_status_or_unknown(&snapshot);
+        let quarantined = kronika_layout::DataRoot::open(snapshot.data_dir())
+            .and_then(|root| root.scan_quarantine(kronika_layout::LayoutLimits::default()))
+            .map(|entries| entries.len())
+            .map_err(|error| {
+                tracing::warn!(
+                    event = "api_ui_quality_quarantine_scan_failed",
+                    error = %error,
+                    "quarantine scan failed; integrity reports degraded"
+                );
+            })
+            .ok();
+        let observed = observed_type_ids(&snapshot).map_err(|read| {
+            tracing::error!(
+                event = "api_ui_quality_catalog_read_failed",
+                error = %read,
+                "data quality catalog read failed"
+            );
+            ApiError::store_read_failed()
+        })?;
+        Ok::<_, ApiError>(build_data_quality(
+            &snapshot,
+            &live,
+            producer_status,
+            quarantined,
+            &observed,
+            DataQualityRequest {
+                from_us,
+                to_us,
+                stale_after_us,
+            },
+        ))
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_quality_worker_failed",
+            error = ?join,
+            "data quality worker failed"
+        );
+        ApiError::internal_error()
+    })??;
+    let body = serde_json::to_vec(&response).map_err(|cause| {
+        tracing::error!(
+            event = "api_ui_quality_serialize_failed",
+            error = %cause,
+            "data quality serialization failed"
+        );
+        ApiError::internal_error()
+    })?;
+    if body.len() > MAX_DATA_QUALITY_RESPONSE_BYTES {
+        return Err(ApiError::query_limit_exceeded(
+            LimitResource::Bytes,
+            count_u64(MAX_DATA_QUALITY_RESPONSE_BYTES),
+            Some(count_u64(body.len())),
+        ));
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+/// `GET /v1/ui/context` - one exact instance, host, database and replication snapshot.
+#[utoipa::path(
+    get,
+    path = "/v1/ui/context",
+    tag = "ui",
+    params(
+        ("at" = i64, Query),
+    ),
+    responses(
+        (status = 200, description = "Exact UI context snapshot", body = ContextResponse),
+        (status = 400, description = "Invalid context query", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Serialized response limit exceeded", body = ApiError),
+        (status = 500, description = "Context storage or render failed", body = ApiError),
+    )
+)]
+pub(crate) async fn context(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    let params = QueryParams::parse(raw.as_deref(), CONTEXT_PARAMS)?;
+    let at_us = parse_i64(&params, QueryParameter::At)?;
+    let snapshot = state.snapshot();
+    let response = tokio::task::spawn_blocking(move || {
+        build_context(&snapshot, at_us, ContextLimits::default())
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_context_worker_failed",
+            error = ?join,
+            "UI context worker failed"
+        );
+        ApiError::internal_error()
+    })?
+    .map_err(context_error)?;
+    let body = serde_json::to_vec(&response).map_err(|cause| {
+        tracing::error!(
+            event = "api_ui_context_serialize_failed",
+            error = %cause,
+            "UI context serialization failed"
+        );
+        ApiError::internal_error()
+    })?;
+    if body.len() > MAX_CONTEXT_RESPONSE_BYTES {
+        return Err(ApiError::response_too_large(
+            count_u64(MAX_CONTEXT_RESPONSE_BYTES),
+            count_u64(body.len()),
+        ));
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+fn context_error(error: ContextError) -> ApiError {
+    match error {
+        ContextError::Query(error) => frame_query_error(error),
+        ContextError::WebIndex(read) => {
+            tracing::error!(
+                event = "api_ui_context_index_read_failed",
+                error = %read,
+                "UI context index read failed"
+            );
+            ApiError::store_read_failed()
+        }
+        ContextError::Arithmetic => ApiError::internal_error(),
+    }
+}
+
+/// An unreadable status contract degrades the producer to `unknown`; it never
+/// fails the endpoint that merely reports it.
+fn producer_status_or_unknown(
+    snapshot: &kronika_reader::LocalDirSnapshot,
+) -> Option<kronika_layout::ProducerStatus> {
+    match kronika_layout::read_producer_status(snapshot.data_dir()) {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::warn!(
+                event = "api_ui_producer_status_unreadable",
+                error = %error,
+                "producer status unreadable; reporting producer as unknown"
+            );
+            None
+        }
+    }
+}
+
+/// `GET /v1/timeline/spine` - aligned host load and IO PSI series.
+#[utoipa::path(
+    get,
+    path = "/v1/timeline/spine",
+    tag = "ui",
+    params(
+        ("from" = i64, Query),
+        ("to" = i64, Query),
+        ("buckets" = Option<usize>, Query, minimum = 1, maximum = 512),
+    ),
+    responses(
+        (status = 200, description = "Aligned indexed host signals", body = SpineResponse),
+        (status = 400, description = "Invalid or oversized query shape", body = ApiError),
+        (status = 401, description = "Authentication required", body = ApiError),
+        (status = 413, description = "Serialized response limit exceeded", body = ApiError),
+        (status = 500, description = "UI index read or render failed", body = ApiError),
+    )
+)]
+pub(crate) async fn spine(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response<Body>, ApiError> {
+    let params = QueryParams::parse(raw.as_deref(), SPINE_PARAMS)?;
+    let from_us = parse_i64(&params, QueryParameter::From)?;
+    let to_us = parse_i64(&params, QueryParameter::To)?;
+    let span = to_us
+        .checked_sub(from_us)
+        .filter(|span| *span > 0)
+        .ok_or_else(|| ApiError::invalid_query_constraint(QueryConstraint::FromBeforeTo))?;
+    if span > MAX_SPINE_SPAN_US {
+        return Err(ApiError::query_shape_limit_exceeded(
+            LimitResource::QuerySpanUs,
+            u64::try_from(MAX_SPINE_SPAN_US).expect("positive constant"),
+            u64::try_from(span).ok(),
+        ));
+    }
+    let bucket_count = bounded_count(
+        &params,
+        QueryParameter::Buckets,
+        DEFAULT_SPINE_BUCKETS,
+        MAX_SPINE_BUCKETS,
+    )?;
+    let (snapshot, descriptor_view) = state.overview_request_view();
+    let live = Arc::clone(descriptor_view.live());
+    let response = tokio::task::spawn_blocking(move || {
+        build_spine(
+            &snapshot,
+            &live,
+            SpineRequest {
+                from_us,
+                to_us,
+                bucket_count,
+            },
+        )
+    })
+    .await
+    .map_err(|join| {
+        tracing::error!(
+            event = "api_ui_spine_worker_failed",
+            error = ?join,
+            "UI spine worker failed"
+        );
+        ApiError::internal_error()
+    })?
+    .map_err(spine_error)?;
+    let body = serde_json::to_vec(&response).map_err(|cause| {
+        tracing::error!(
+            event = "api_ui_spine_serialize_failed",
+            error = %cause,
+            "UI spine serialization failed"
+        );
+        ApiError::internal_error()
+    })?;
+    if body.len() > MAX_SPINE_RESPONSE_BYTES {
+        return Err(ApiError::query_limit_exceeded(
+            LimitResource::Bytes,
+            count_u64(MAX_SPINE_RESPONSE_BYTES),
+            Some(count_u64(body.len())),
+        ));
+    }
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+fn spine_error(error: SpineError) -> ApiError {
+    match error {
+        SpineError::Read(read) => {
+            tracing::error!(
+                event = "api_ui_spine_read_failed",
+                error = %read,
+                "UI spine OVF read failed"
+            );
+            ApiError::store_read_failed()
+        }
+        SpineError::TooManySegments { observed } => ApiError::query_limit_exceeded(
+            LimitResource::SelectedSegments,
+            count_u64(crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS),
+            Some(count_u64(observed)),
+        ),
+        SpineError::Arithmetic => ApiError::internal_error(),
+    }
+}
 
 /// `GET /v1/frame/{view}` - bounded exact UI rows with server-owned verdicts.
 #[utoipa::path(
@@ -55,6 +542,7 @@ const HEATMAP_PARAMS: &[QueryParameter] = &[
         ("at" = i64, Query),
         ("span" = Option<String>, Query),
         ("preset" = Option<String>, Query),
+        ("columns" = Option<String>, Query),
         ("database" = Option<String>, Query),
         ("q" = Option<String>, Query),
         ("sort" = Option<String>, Query),
@@ -76,7 +564,7 @@ pub(crate) async fn frame(
     Path(view): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response<Body>, ApiError> {
-    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let catalog = ProjectionCatalog::for_materialization();
     let request = FrameRequest::parse(&view, raw.as_deref(), &catalog)?;
     let (snapshot, descriptor_view) = state.overview_request_view();
     let live = Arc::clone(descriptor_view.live());
@@ -446,7 +934,7 @@ fn heatmap_error(error: &HeatmapError) -> ApiError {
         ("If-None-Match" = Option<String>, Header),
     ),
     responses(
-        (status = 200, description = "Source-aware UI projection catalog", body = ProjectionCatalog),
+        (status = 200, description = "Availability-aware UI projection catalog", body = ProjectionCatalog),
         (status = 304, description = "Catalog ETag matches If-None-Match"),
         (status = 400, description = "Invalid query", body = ApiError),
         (status = 401, description = "Authentication required", body = ApiError),

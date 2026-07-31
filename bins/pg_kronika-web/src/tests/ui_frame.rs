@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::threshold::{Policy, catalog_entry, classify};
+use kronika_analytics::web_projection::web_view_by_name;
 use kronika_analytics::{
     Boundary, Classified, Comparison, Evidence, Level, MetricId, MetricInput, NotClassifiedReason,
     Verdict,
@@ -18,7 +19,7 @@ use crate::api_error::ErrorCode;
 use crate::ui::catalog::ProjectionCatalog;
 use crate::ui::frame::FrameRequest;
 use crate::ui::frame::cursor::{FrameCursor, SortKey};
-use crate::ui::frame::dto::ClassificationResultDto;
+use crate::ui::frame::dto::{ClassificationResultDto, FrameResponse};
 use crate::ui::frame::projection::{
     DeltaOperand, FrameLimits, ProjectedRow, RowOperands, StatementOperands, TableOperands,
     project_frame,
@@ -26,10 +27,26 @@ use crate::ui::frame::projection::{
 use crate::ui::frame::projection::{ProjectionInput, project_input};
 use crate::ui::frame::spark::attach_sparks;
 use crate::ui::frame::threshold::{FrameThresholdContext, prepare_input};
+use crate::ui::snapshot::{resolve_snapshot_at, resolve_view_snapshot};
 use crate::ui::thresholds::OperandKind;
 
 fn catalog() -> ProjectionCatalog {
     ProjectionCatalog::for_type_ids(&BTreeSet::new())
+}
+
+#[test]
+fn snapshot_resolvers_select_the_latest_snapshot_at_or_before_at() {
+    let directory = frame_event_fixture();
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let events = web_view_by_name("events").expect("events view");
+
+    let resolved = resolve_view_snapshot(&snapshot, events, 1_550).expect("view snapshot");
+    assert_eq!(resolved.neighbors.expect("view neighbors").current, 1_500);
+
+    let resolved = resolve_snapshot_at(&snapshot, 1_550)
+        .expect("snapshot lookup")
+        .expect("snapshot");
+    assert_eq!(resolved.timestamp_us, 1_500);
 }
 
 #[test]
@@ -38,13 +55,101 @@ fn frame_query_defaults_are_bounded_and_come_from_the_first_preset() {
 
     assert_eq!(request.at_us, 123);
     assert_eq!(request.span_us, 3_600_000_000);
-    assert_eq!(request.preset, "sessions");
+    assert_eq!(request.preset, Some("sessions"));
+    assert_eq!(
+        request.columns,
+        vec![
+            "pid",
+            "user",
+            "database",
+            "application",
+            "state",
+            "query_duration_us",
+        ]
+    );
     assert_eq!(request.sort, "query_duration_us");
     assert!(request.descending);
     assert_eq!(request.limit, 100);
     assert!(request.database.is_none());
     assert!(request.filter.is_none());
     assert!(request.cursor.is_none());
+}
+
+#[test]
+fn frame_accepts_custom_columns_and_canonical_fielded_globs() {
+    let catalog = catalog();
+    let request = FrameRequest::parse(
+        "activity",
+        Some("at=1&columns=pid,state&q=state=act*%20postgres*"),
+        &catalog,
+    )
+    .expect("custom frame request");
+    assert_eq!(request.preset, None);
+    assert_eq!(request.columns, vec!["pid", "state"]);
+    assert!(request.filter.is_some());
+
+    let equivalent = FrameRequest::parse(
+        "activity",
+        Some("at=1&columns=pid,state&q=%20state=act*%20%20postgres*%20"),
+        &catalog,
+    )
+    .expect("equivalent custom frame request");
+    assert_eq!(request.query_fingerprint(), equivalent.query_fingerprint());
+}
+
+#[test]
+fn frame_rejects_invalid_custom_columns_filter_and_database_shapes() {
+    let catalog = catalog();
+    let invalid = [
+        "at=1&preset=sessions&columns=pid",
+        "at=1&columns=",
+        "at=1&columns=pid,pid",
+        "at=1&columns=query",
+        "at=1&q=",
+        "at=1&q=query=secret",
+        "at=1&database=orders",
+    ];
+    for raw in invalid {
+        assert!(
+            FrameRequest::parse("activity", Some(raw), &catalog).is_err(),
+            "{raw}"
+        );
+    }
+    assert!(
+        FrameRequest::parse("processes", Some("at=1&database=AQAAAAAAAQAAAA"), &catalog,).is_err(),
+        "database tokens are valid only for database-scoped views"
+    );
+}
+
+#[test]
+fn frame_database_filter_uses_the_opaque_context_identity() {
+    let mut identity = Vec::new();
+    identity.extend_from_slice(&1_u16.to_le_bytes());
+    identity.push(0);
+    identity.extend_from_slice(&3_u32.to_le_bytes());
+    let token = URL_SAFE_NO_PAD.encode(identity);
+    let raw = format!("at=20&columns=queryid&database={token}");
+    let catalog = catalog();
+    let request = FrameRequest::parse("statements", Some(&raw), &catalog).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    for (queryid, dbid) in [(1, 3), (2, 4)] {
+        input.push(
+            "pg_stat_statements",
+            out_row(&[
+                ("ts", Value::Ts(20)),
+                ("queryid", Value::I64(queryid)),
+                ("userid", Value::U64(2)),
+                ("dbid", Value::U64(dbid)),
+                ("calls", Value::I64(1)),
+                ("rows", Value::I64(1)),
+                ("total_exec_time", Value::F64(1.0)),
+            ]),
+        );
+    }
+
+    let frame = project_input(&request, &catalog, input).expect("projection");
+    assert_eq!(frame.matched, 1);
+    assert_eq!(frame.rows[0].label, "1");
 }
 
 #[test]
@@ -438,7 +543,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
                 ("heap_blks_scanned", Value::U64(25)),
                 ("num_dead_tuples", Value::U64(5)),
             ]),
-            5,
+            6,
         ),
         (
             "processes",
@@ -465,7 +570,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
                 ("lock_relname", Value::Str("orders".to_owned())),
                 ("query", Value::Str("secret".to_owned())),
             ]),
-            5,
+            11,
         ),
         (
             "events",
@@ -505,7 +610,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
 fn frame_pagination_filters_then_sorts_by_value_and_entity() {
     let request = FrameRequest::parse(
         "processes",
-        Some("at=20&preset=memory&q=post&sort=rss&order=desc&limit=1"),
+        Some("at=20&preset=memory&q=*post*&sort=rss&order=desc&limit=1"),
         &catalog(),
     )
     .expect("request");
@@ -605,6 +710,82 @@ fn frame_filter_does_not_search_hidden_lazy_values() {
     let frame = project_input(&request, &catalog(), input).expect("projection");
     assert_eq!(frame.matched, 0);
     assert!(frame.rows.is_empty());
+}
+
+#[test]
+fn frame_null_cells_have_aligned_machine_reasons() {
+    let catalog = catalog();
+    let request = FrameRequest::parse("processes", Some("at=20&columns=pss&sort=pss"), &catalog)
+        .expect("request");
+    let input = ProjectionInput::single(
+        20,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(1)),
+            ("starttime", Value::Ts(1)),
+            ("comm", Value::Str("postgres".to_owned())),
+        ]),
+    );
+    let frame = project_input(&request, &catalog, input).expect("projection");
+    let body = serde_json::to_value(
+        FrameResponse::from_projected(&request, &catalog, &frame).expect("response"),
+    )
+    .expect("serialize");
+
+    assert_eq!(body["rows"][0]["cells"][0], serde_json::Value::Null);
+    assert_eq!(
+        body["rows"][0]["cell_statuses"][0],
+        serde_json::json!({
+            "status": "unavailable",
+            "reason": "not_collected",
+        })
+    );
+}
+
+#[test]
+fn frame_returns_server_owned_categorical_classifications() {
+    let catalog = catalog();
+    let request = FrameRequest::parse(
+        "events",
+        Some("at=20&columns=severity_code,category_code"),
+        &catalog,
+    )
+    .expect("request");
+    let input = ProjectionInput::single(
+        20,
+        "pg_log_errors",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("severity", Value::U64(3)),
+            ("category", Value::U64(4)),
+        ]),
+    );
+    let frame = project_input(&request, &catalog, input).expect("projection");
+    let body = serde_json::to_value(
+        FrameResponse::from_projected(&request, &catalog, &frame).expect("response"),
+    )
+    .expect("serialize");
+
+    assert_eq!(
+        body["rows"][0]["categorical_classifications"],
+        serde_json::json!([
+            {
+                "column": "severity_code",
+                "status": "classified",
+                "code": "warning",
+                "level": "warning",
+                "reason": null,
+            },
+            {
+                "column": "category_code",
+                "status": "classified",
+                "code": "pg.log.error_group_observed",
+                "level": "warning",
+                "reason": null,
+            }
+        ])
+    );
 }
 
 #[test]
@@ -1144,6 +1325,19 @@ async fn frame_http_returns_bounded_classified_shape_and_rejects_before_io() {
         body["rows"][0]["spark"]["values"].as_array().map(Vec::len),
         Some(60)
     );
+    let event_entity = URL_SAFE_NO_PAD
+        .decode(
+            body["rows"][0]["entity"]
+                .as_str()
+                .expect("event entity token"),
+        )
+        .expect("decode event entity");
+    assert_eq!(event_entity.len(), 42);
+    assert_eq!(u16::from_le_bytes(event_entity[..2].try_into().unwrap()), 1);
+    assert_eq!(
+        i64::from_le_bytes(event_entity[2..10].try_into().unwrap()),
+        1_600
+    );
     assert!(serde_json::to_vec(&body).expect("serialize").len() <= 1_048_576);
 
     for uri in [
@@ -1196,6 +1390,10 @@ async fn frame_event_cursor_tiles_every_matching_row() {
         }
         let (status, body) = super::serve(directory.path(), &uri).await;
         assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body["page"]["matched"], 201,
+            "matched must stay stable across cursor pages"
+        );
         returned += body["page"]["returned"]
             .as_u64()
             .and_then(|value| usize::try_from(value).ok())
@@ -1250,7 +1448,6 @@ fn operand_row(operands: RowOperands) -> ProjectedRow {
         },
         values: Vec::new(),
         database: None,
-        searchable: String::new(),
     }
 }
 

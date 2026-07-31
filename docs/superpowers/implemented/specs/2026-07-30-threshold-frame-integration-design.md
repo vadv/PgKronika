@@ -23,7 +23,7 @@ registry type IDs, HTTP routes и UI columns.
 
 В web уже реализованы:
 
-- source-aware `GET /v1/ui/catalog`;
+- root-local `GET /v1/ui/catalog`;
 - `GET /v1/views/summary` поверх `UiSummary`;
 - `GET /v1/timeline/heatmap` поверх `EntitySeries`;
 - девять стабильных `WebView`;
@@ -35,8 +35,8 @@ registry type IDs, HTTP routes и UI columns.
 клиентская подсветка.
 
 Текущий runtime обслуживает один storage root и не поддерживает выбор другого
-root в HTTP API. Новый endpoint не принимает устаревший параметр `source` из
-ранней версии web UI design.
+root в HTTP API. Новый endpoint не принимает устаревший параметр выбора root
+из ранней версии web UI design.
 
 ## Цели
 

@@ -95,7 +95,9 @@ pub const FACT_SCHEMA_VERSION: u32 = 4;
 ///
 /// Version 6 materializes the canonical web projection registry into indexed
 /// summary and entity-series blocks.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 7;
+/// Version 8 adds join inputs to the activity, vacuum, and processes web
+/// projections; older sidecars are rejected and rebuilt.
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 8;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///

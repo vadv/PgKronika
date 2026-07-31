@@ -735,6 +735,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn plan_from_a_real_scan_orders_all_victim_kinds_and_skips_foreign_temporaries() {
         let directory = tempfile::tempdir().expect("create a tempdir");
         let root = kronika_layout::DataRoot::open(directory.path()).expect("open the root");

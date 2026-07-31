@@ -1,19 +1,48 @@
 use crate::buffering::push_activity;
 use crate::plans_source::PlansSourceCache;
+use crate::producer_status::{ProducerStatusPublisher, retention_status};
 use crate::scheduler::{Intervals, Scheduler, SourceKind};
+#[cfg(target_os = "linux")]
+use crate::segments::quarantine_invalid_segments;
 use crate::segments::{
-    SegmentState, open_collector_journal, quarantine_invalid_segments,
-    seal_open_segment_with_reset, seal_reason,
+    SegmentState, open_collector_journal, seal_open_segment_with_reset, seal_reason,
 };
 use crate::source_contracts::activity_dict_limits;
-use crate::{
-    acquire_collector_writer, cleanup_writer_temporaries, prepare_collector_storage,
-    stop_if_persistence_unhealthy, timer_sleep_delay,
-};
+#[cfg(target_os = "linux")]
+use crate::{acquire_collector_writer, cleanup_writer_temporaries, prepare_collector_storage};
+use crate::{stop_if_persistence_unhealthy, timer_sleep_delay};
 use kronika_layout::{DataRoot, LayoutLimits, SegmentAddress, SegmentId};
 use kronika_source_pg::{ActivityRow, ActivityVersion};
 use kronika_writer::{Interner, JournalError, SectionBuffers, dict};
 
+#[test]
+fn producer_status_publisher_records_running_heartbeat_and_terminal_state() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let retention =
+        retention_status(Some(crate::config::RetentionConfig::Auto(80))).expect("valid retention");
+    let mut publisher = ProducerStatusPublisher::start(directory.path(), 42, 1_000, retention)
+        .expect("publish startup");
+    let running = kronika_layout::read_producer_status(directory.path())
+        .expect("read startup")
+        .expect("startup status");
+    assert_eq!(running.state, kronika_layout::ProducerState::Running);
+    assert_eq!(running.last_status_at_us, 1_000);
+
+    publisher.heartbeat(2_000).expect("publish heartbeat");
+    let heartbeat = kronika_layout::read_producer_status(directory.path())
+        .expect("read heartbeat")
+        .expect("heartbeat status");
+    assert_eq!(heartbeat.last_status_at_us, 2_000);
+
+    publisher.stop(3_000).expect("publish stop");
+    let stopped = kronika_layout::read_producer_status(directory.path())
+        .expect("read stop")
+        .expect("stop status");
+    assert_eq!(stopped.state, kronika_layout::ProducerState::Stopped);
+    assert_eq!(stopped.last_status_at_us, 3_000);
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_payloads(root: &std::path::Path) -> Vec<Vec<u8>> {
     let quarantine = root.join(".pgkronika-quarantine-v1");
     let mut payloads = std::fs::read_dir(quarantine)
@@ -366,6 +395,7 @@ fn startup_with_an_empty_journal_recovers_nothing() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn startup_quarantines_a_torn_header_and_accepts_future_windows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = DataRoot::open(dir.path()).expect("open data root");
@@ -387,6 +417,7 @@ fn startup_quarantines_a_torn_header_and_accepts_future_windows() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn startup_recovers_complete_frames_despite_a_wrong_recorded_body_length() {
     use kronika_format::{JOURNAL_HEADER_LEN, JournalHeader, JournalState};
     use kronika_writer::{Journal, JournalConfig};
@@ -427,6 +458,7 @@ fn startup_recovers_complete_frames_despite_a_wrong_recorded_body_length() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn startup_finishes_recovery_pending_evidence_after_activation() {
     use kronika_writer::{Journal, JournalConfig};
 
@@ -460,6 +492,7 @@ fn startup_finishes_recovery_pending_evidence_after_activation() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn startup_recovers_a_pending_alternate_generation() {
     use kronika_writer::{Journal, JournalConfig};
 
@@ -491,6 +524,7 @@ fn startup_recovers_a_pending_alternate_generation() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn failed_recovery_seal_preserves_evidence_and_continues_empty() {
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_writer::{Journal, JournalConfig};
@@ -537,6 +571,7 @@ fn failed_recovery_seal_preserves_evidence_and_continues_empty() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn startup_quarantines_only_stale_writer_temporaries() {
     let dir = tempfile::tempdir().expect("tempdir");
     let day = dir.path().join("1970/01/01");
@@ -616,6 +651,7 @@ fn published_pgm_with_failed_reset_requires_restart_before_another_append() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn startup_validation_quarantines_body_and_catalog_corruption() {
     use kronika_format::{MAGIC, TAIL_INDEX_LEN, TailIndex};
 
@@ -661,6 +697,7 @@ fn startup_validation_quarantines_body_and_catalog_corruption() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn corrupt_existing_pgm_does_not_block_active_journal_recovery() {
     use kronika_writer::{Journal, JournalConfig};
 
@@ -702,6 +739,7 @@ fn corrupt_existing_pgm_does_not_block_active_journal_recovery() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn corrupt_existing_pgm_does_not_block_writer_ownership() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = DataRoot::open(dir.path()).expect("open data root");

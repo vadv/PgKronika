@@ -208,6 +208,7 @@ mod tests {
             identity: Arc::from(vec![IdentityValue::I64(id)]),
             start_us: 0,
             end_us: 1,
+            peak_ts_us: 0,
         }
     }
 

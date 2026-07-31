@@ -7,10 +7,15 @@
 //! following symbolic links.
 
 mod error;
+mod producer_status;
 mod root;
 mod time;
 
 pub use error::{LayoutError, LimitKind, OwnerKind};
+pub use producer_status::{
+    PRODUCER_STATUS_NAME, PRODUCER_STATUS_TEMP_NAME, ProducerState, ProducerStatus,
+    ProducerStatusError, RetentionStatus, read_producer_status, write_producer_status,
+};
 pub use root::{
     ACTIVE_JOURNAL_NAME, DataRoot, EntryDiagnostic, EntryFileType, EntryScope, EvidenceFile,
     EvidenceLocation, FileIdentity, FileKind, FilesystemUsage, ForeignEntry, ForeignEntryReason,

@@ -36,8 +36,13 @@ fn configured() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::overview::handlers::events))
         .routes(routes!(crate::overview::handlers::health))
         .routes(routes!(crate::ui::handlers::heatmap))
+        .routes(routes!(crate::ui::handlers::spine))
         .routes(routes!(crate::ui::handlers::frame))
         .routes(routes!(crate::ui::handlers::catalog))
+        .routes(routes!(crate::ui::handlers::context))
+        .routes(routes!(crate::ui::handlers::data_quality))
+        .routes(routes!(crate::ui::handlers::entity))
+        .routes(routes!(crate::ui::handlers::storage))
         .routes(routes!(crate::ui::handlers::summary))
         .routes(routes!(crate::handlers::anomalies::anomalies))
         .routes(routes!(crate::handlers::incidents::incidents))
@@ -70,12 +75,148 @@ mod tests {
         ("GET", "/v1/timeline/events", "events"),
         ("GET", "/v1/timeline/health", "health"),
         ("GET", "/v1/timeline/heatmap", "heatmap"),
+        ("GET", "/v1/timeline/spine", "spine"),
         ("GET", "/v1/frame/{view}", "frame"),
         ("GET", "/v1/ui/catalog", "catalog"),
+        ("GET", "/v1/ui/context", "context"),
+        ("GET", "/v1/data/quality", "data_quality"),
+        ("GET", "/v1/entity/{view}/{entity}", "entity"),
+        ("GET", "/v1/storage", "storage"),
         ("GET", "/v1/views/summary", "summary"),
         ("GET", "/v1/anomalies", "anomalies"),
         ("GET", "/v1/incidents", "incidents"),
     ];
+
+    #[test]
+    fn v5_document_has_twenty_one_source_free_operations() {
+        let document = serde_json::to_value(document()).expect("serialize OpenAPI");
+        let paths = document["paths"].as_object().expect("paths object");
+        let observed = paths
+            .values()
+            .flat_map(|item| {
+                item.as_object()
+                    .expect("path item")
+                    .iter()
+                    .filter(|(method, _)| {
+                        matches!(
+                            method.as_str(),
+                            "get"
+                                | "put"
+                                | "post"
+                                | "delete"
+                                | "options"
+                                | "head"
+                                | "patch"
+                                | "trace"
+                        )
+                    })
+            })
+            .count();
+        assert_eq!(observed, 21);
+        assert_eq!(observed, OPERATIONS.len());
+        assert!(paths.get("/v1/sources").is_none());
+        assert!(!document.to_string().contains("unknown_source"));
+
+        for (_, path, _) in OPERATIONS {
+            let parameters = document["paths"][path]["get"]["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten();
+            assert!(
+                parameters
+                    .filter(|parameter| parameter["in"] == "query")
+                    .all(|parameter| parameter["name"] != "source"),
+                "{path} must not expose the removed source query parameter"
+            );
+        }
+    }
+
+    #[test]
+    fn renamed_dtos_keep_distinct_schema_shapes_and_closed_enums() {
+        let document = serde_json::to_value(document()).expect("serialize OpenAPI");
+        let schemas = document["components"]["schemas"]
+            .as_object()
+            .expect("schemas object");
+        let sorted = |name: &str, key: &str| {
+            let mut fields = schemas[name][key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} must carry {key}"))
+                .iter()
+                .map(|value| value.as_str().expect("string value").to_owned())
+                .collect::<Vec<_>>();
+            fields.sort_unstable();
+            fields
+        };
+        let required = |name: &str| sorted(name, "required");
+        let enumeration = |name: &str| sorted(name, "enum");
+
+        assert_eq!(
+            required("DataQualityIntegrityDto"),
+            [
+                "corrupt_segments",
+                "last_catalog_refresh_us",
+                "quarantined_entries",
+                "readable_segments",
+                "status",
+            ]
+        );
+        assert_eq!(
+            required("StorageIntegrityDto"),
+            [
+                "orphan_overviews",
+                "quarantined_entries",
+                "readable_segments"
+            ]
+        );
+        assert_eq!(
+            required("DataQualityMetaDto"),
+            ["active_tail", "resource_limited", "status"]
+        );
+        assert_eq!(required("StorageQualityDto"), ["gated", "status"]);
+        assert_eq!(
+            required("FreshnessDto"),
+            [
+                "completeness",
+                "data_through_us",
+                "physical_count_semantics",
+                "retained_exactness",
+                "status",
+            ]
+        );
+        assert_eq!(
+            required("DataQualityFreshnessDto"),
+            ["age_us", "data_through_us", "expected_period_us", "state"]
+        );
+
+        assert_eq!(
+            enumeration("DataQualityStatus"),
+            ["fresh", "late", "partial", "stale", "unavailable"]
+        );
+        assert_eq!(
+            enumeration("FreshnessState"),
+            ["fresh", "late", "stale", "unknown"]
+        );
+        assert_eq!(
+            enumeration("ProducerStateDto"),
+            ["running", "stopped", "unknown"]
+        );
+        assert_eq!(
+            enumeration("CapabilityStatus"),
+            ["available", "partial", "unavailable"]
+        );
+        assert_eq!(
+            enumeration("IntegrityStatus"),
+            ["complete", "degraded", "unknown"]
+        );
+        assert_eq!(
+            enumeration("NotableLevelDto"),
+            ["critical", "info", "none", "warning"]
+        );
+        assert_eq!(
+            enumeration("IncidentLevel"),
+            ["critical", "info", "warning"]
+        );
+    }
 
     #[test]
     fn every_operation_has_a_json_success_schema() {
@@ -125,8 +266,13 @@ mod tests {
             ("events", "timeline"),
             ("health", "timeline"),
             ("heatmap", "ui"),
+            ("spine", "ui"),
             ("frame", "ui"),
             ("catalog", "ui"),
+            ("context", "ui"),
+            ("data_quality", "ui"),
+            ("entity", "ui"),
+            ("storage", "ui"),
             ("summary", "ui"),
             ("anomalies", "analytics"),
             ("incidents", "analytics"),

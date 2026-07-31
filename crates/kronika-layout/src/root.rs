@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 use rustix::fs::RenameFlags;
 use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags};
 
-use crate::{LayoutError, LimitKind, OwnerKind, SegmentAddress, SegmentId, UtcDay};
+use crate::{
+    LayoutError, LimitKind, OwnerKind, PRODUCER_STATUS_NAME, PRODUCER_STATUS_TEMP_NAME,
+    SegmentAddress, SegmentId, UtcDay,
+};
 
 /// Root-level active segment journal.
 pub const ACTIVE_JOURNAL_NAME: &str = "active.parts";
@@ -796,11 +799,17 @@ pub struct LayoutSnapshot {
 /// classic "how full is the filesystem" figure (`total − free`), the basis for
 /// the `auto:P` retention target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the shared `_bytes` suffix is the documented unit of every counter"
+)]
 pub struct FilesystemUsage {
     /// Total addressable bytes of the partition.
     pub total_bytes: u64,
     /// Bytes occupied by all data on the partition.
     pub used_bytes: u64,
+    /// Bytes a non-privileged writer may still allocate (`f_bavail`).
+    pub available_bytes: u64,
 }
 
 /// Open, stable descriptor for one `PgKronika` data root.
@@ -1407,6 +1416,7 @@ impl DataRoot {
         Ok(FilesystemUsage {
             total_bytes,
             used_bytes: total_bytes.saturating_sub(free_bytes),
+            available_bytes: stat.f_bavail.saturating_mul(block_bytes),
         })
     }
 
@@ -3023,7 +3033,11 @@ const fn validate_limit(kind: LimitKind, value: usize, hard_max: usize) -> Resul
 fn is_control_name(name: &str) -> bool {
     matches!(
         name,
-        ACTIVE_JOURNAL_NAME | WRITER_OWNER_LOCK_NAME | OVERVIEW_OWNER_LOCK_NAME
+        ACTIVE_JOURNAL_NAME
+            | WRITER_OWNER_LOCK_NAME
+            | OVERVIEW_OWNER_LOCK_NAME
+            | PRODUCER_STATUS_NAME
+            | PRODUCER_STATUS_TEMP_NAME
     )
 }
 
@@ -4160,6 +4174,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn remove_quarantine_entry_frees_bytes_once_and_rechecks_identity() {
         let directory = tempfile::tempdir().unwrap();
         let root = DataRoot::open(directory.path()).unwrap();

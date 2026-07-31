@@ -22,17 +22,20 @@ test("maps error body to ApiError", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue(
-      new Response('{"code":"unknown_source","params":{"source":"x"}}', {
-        status: 404,
-        headers: { "content-type": "application/json" },
-      }),
+      new Response(
+        '{"code":"invalid_query_parameter","params":{"parameter":"at"}}',
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
     ),
   );
   const err: unknown = await apiGet("/v1/version").catch((e: unknown) => e);
   expect(err).toBeInstanceOf(ApiError);
-  expect((err as ApiError).code).toBe("unknown_source");
-  expect((err as ApiError).status).toBe(404);
-  expect((err as ApiError).params).toEqual({ source: "x" });
+  expect((err as ApiError).code).toBe("invalid_query_parameter");
+  expect((err as ApiError).status).toBe(400);
+  expect((err as ApiError).params).toEqual({ parameter: "at" });
 });
 
 test("error without a wire code falls back to http_error", async () => {

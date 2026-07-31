@@ -1,5 +1,5 @@
 Availability:
-  description: Availability of one input, metric, or column for a source.
+  description: Availability of one input, metric, or column in the served store.
   enum:
   - available
   - gated
@@ -17,6 +17,55 @@ BoundaryDto:
   - operator
   - value
   type: object
+CapabilityDto:
+  properties:
+    code:
+      type: string
+    kind:
+      type: string
+    reason:
+      type:
+      - string
+      - 'null'
+    status:
+      $ref: '#/CapabilityStatus'
+  required:
+  - kind
+  - code
+  - status
+  - reason
+  type: object
+CapabilityStatus:
+  enum:
+  - available
+  - unavailable
+  - partial
+  type: string
+CategoricalClassificationDto:
+  properties:
+    code:
+      type:
+      - string
+      - 'null'
+    column:
+      type: string
+    level:
+      type:
+      - string
+      - 'null'
+    reason:
+      type:
+      - string
+      - 'null'
+    status:
+      type: string
+  required:
+  - column
+  - status
+  - code
+  - level
+  - reason
+  type: object
 CellClassificationDto:
   properties:
     column:
@@ -29,6 +78,18 @@ CellClassificationDto:
   - column
   - metric
   - result
+  type: object
+CellStatusDto:
+  properties:
+    reason:
+      type:
+      - string
+      - 'null'
+    status:
+      type: string
+  required:
+  - status
+  - reason
   type: object
 ClassificationResultDto:
   oneOf:
@@ -78,7 +139,7 @@ ColumnSpec:
   properties:
     availability:
       $ref: '#/Availability'
-      description: Source-specific availability.
+      description: Store-observed availability.
     code:
       description: Stable column code.
       type: string
@@ -108,6 +169,11 @@ ColumnSpec:
     type:
       $ref: '#/ValueType'
       description: Public value shape.
+    unavailable_reason:
+      description: Machine reason when the column is not available.
+      type:
+      - string
+      - 'null'
     unit:
       description: Public unit code when the value has a stable numeric unit.
       type:
@@ -119,6 +185,464 @@ ColumnSpec:
   - lazy
   - requires
   - availability
+  type: object
+ContextDatabase:
+  properties:
+    entity:
+      type: string
+    name:
+      type: string
+    oid:
+      format: int32
+      minimum: 0
+      type: integer
+    visibility:
+      type: string
+  required:
+  - entity
+  - oid
+  - name
+  - visibility
+  type: object
+ContextGap:
+  properties:
+    from_us:
+      type: string
+    to_us:
+      type: string
+  required:
+  - from_us
+  - to_us
+  type: object
+ContextHost:
+  properties:
+    boot_id:
+      type:
+      - string
+      - 'null'
+    kernel_version:
+      type:
+      - string
+      - 'null'
+    logical_cpu_count:
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    logical_cpu_count_reason:
+      type:
+      - string
+      - 'null'
+  type: object
+ContextInstance:
+  properties:
+    hostname:
+      type:
+      - string
+      - 'null'
+    pg_system_identifier:
+      type:
+      - string
+      - 'null'
+    pg_system_identifier_reason:
+      type:
+      - string
+      - 'null'
+    pg_version_num:
+      format: int64
+      type:
+      - integer
+      - 'null'
+    role:
+      type:
+      - string
+      - 'null'
+    role_reason:
+      type:
+      - string
+      - 'null'
+  type: object
+ContextQuality:
+  properties:
+    active_tail:
+      type: boolean
+    gaps:
+      items:
+        $ref: '#/ContextGap'
+      type: array
+    gated:
+      items:
+        type: string
+      type: array
+    status:
+      type: string
+  required:
+  - status
+  - gaps
+  - gated
+  - active_tail
+  type: object
+ContextReplica:
+  properties:
+    application_name:
+      type:
+      - string
+      - 'null'
+    entity:
+      type: string
+    pid:
+      format: int64
+      type: integer
+    replay_lag_reason:
+      type:
+      - string
+      - 'null'
+    replay_lag_us:
+      format: int64
+      type:
+      - integer
+      - 'null'
+    state:
+      type:
+      - string
+      - 'null'
+    sync_state:
+      type:
+      - string
+      - 'null'
+  required:
+  - entity
+  - pid
+  type: object
+ContextReplication:
+  properties:
+    instance:
+      oneOf:
+      - type: 'null'
+      - $ref: '#/ContextReplicationInstance'
+    replicas:
+      items:
+        $ref: '#/ContextReplica'
+      type: array
+  required:
+  - replicas
+  type: object
+ContextReplicationInstance:
+  properties:
+    replay_lag_reason:
+      type:
+      - string
+      - 'null'
+    replay_lag_us:
+      format: int64
+      type:
+      - integer
+      - 'null'
+    streaming_replicas:
+      format: int64
+      type:
+      - integer
+      - 'null'
+    timeline_id:
+      format: int64
+      type:
+      - integer
+      - 'null'
+  required:
+  - timeline_id
+  - streaming_replicas
+  - replay_lag_us
+  - replay_lag_reason
+  type: object
+ContextResponse:
+  properties:
+    databases:
+      items:
+        $ref: '#/ContextDatabase'
+      type: array
+    host:
+      $ref: '#/ContextHost'
+    instance:
+      $ref: '#/ContextInstance'
+    quality:
+      $ref: '#/ContextQuality'
+    replication:
+      $ref: '#/ContextReplication'
+    snapshot_ts_us:
+      type:
+      - string
+      - 'null'
+  required:
+  - snapshot_ts_us
+  - instance
+  - host
+  - databases
+  - replication
+  - quality
+  type: object
+CoverageDto:
+  properties:
+    complete_snapshots:
+      format: int64
+      minimum: 0
+      type: integer
+    expected_snapshots:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    observed_snapshots:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - expected_snapshots
+  - observed_snapshots
+  - complete_snapshots
+  type: object
+DataQualityFreshnessDto:
+  properties:
+    age_us:
+      type:
+      - string
+      - 'null'
+    data_through_us:
+      type:
+      - string
+      - 'null'
+    expected_period_us:
+      type:
+      - string
+      - 'null'
+    state:
+      $ref: '#/FreshnessState'
+  required:
+  - data_through_us
+  - age_us
+  - expected_period_us
+  - state
+  type: object
+DataQualityIntegrityDto:
+  properties:
+    corrupt_segments:
+      minimum: 0
+      type: integer
+    last_catalog_refresh_us:
+      type:
+      - string
+      - 'null'
+    quarantined_entries:
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    readable_segments:
+      minimum: 0
+      type: integer
+    status:
+      $ref: '#/IntegrityStatus'
+  required:
+  - status
+  - readable_segments
+  - corrupt_segments
+  - quarantined_entries
+  - last_catalog_refresh_us
+  type: object
+DataQualityMetaDto:
+  properties:
+    active_tail:
+      type: boolean
+    resource_limited:
+      items:
+        type: string
+      type: array
+    status:
+      type: string
+  required:
+  - status
+  - resource_limited
+  - active_tail
+  type: object
+DataQualityResponse:
+  properties:
+    capabilities:
+      items:
+        $ref: '#/CapabilityDto'
+      type: array
+    coverage:
+      $ref: '#/CoverageDto'
+    freshness:
+      $ref: '#/DataQualityFreshnessDto'
+    gaps:
+      items:
+        $ref: '#/QualityGap'
+      type: array
+    integrity:
+      $ref: '#/DataQualityIntegrityDto'
+    producer:
+      $ref: '#/ProducerDto'
+    quality:
+      $ref: '#/DataQualityMetaDto'
+    status:
+      $ref: '#/DataQualityStatus'
+  required:
+  - status
+  - freshness
+  - producer
+  - coverage
+  - gaps
+  - capabilities
+  - integrity
+  - quality
+  type: object
+DataQualityStatus:
+  enum:
+  - fresh
+  - late
+  - stale
+  - unavailable
+  - partial
+  type: string
+EntityFieldDto:
+  properties:
+    code:
+      type: string
+    reason:
+      type:
+      - string
+      - 'null'
+    status:
+      type: string
+    value:
+      $ref: '#/FrameValue'
+  required:
+  - code
+  - value
+  - status
+  - reason
+  type: object
+EntityGapDto:
+  properties:
+    from_us:
+      type: string
+    to_us:
+      type: string
+  required:
+  - from_us
+  - to_us
+  type: object
+EntityHistoryResponse:
+  properties:
+    columns:
+      items:
+        type: string
+      type: array
+    entity:
+      type: string
+    mode:
+      type: string
+    page:
+      $ref: '#/EntityPageDto'
+    quality:
+      $ref: '#/EntityQualityDto'
+    snapshots:
+      items:
+        $ref: '#/EntitySnapshotDto'
+      type: array
+    view:
+      type: string
+  required:
+  - mode
+  - view
+  - entity
+  - columns
+  - snapshots
+  - page
+  - quality
+  type: object
+EntityPageDto:
+  properties:
+    next:
+      type:
+      - string
+      - 'null'
+  required:
+  - next
+  type: object
+EntityPointResponse:
+  properties:
+    entity:
+      type: string
+    fields:
+      items:
+        $ref: '#/EntityFieldDto'
+      type: array
+    mode:
+      type: string
+    quality:
+      $ref: '#/EntityQualityDto'
+    related:
+      items:
+        $ref: '#/RelatedEntityDto'
+      type: array
+    snapshot_ts_us:
+      type: string
+    view:
+      type: string
+  required:
+  - mode
+  - view
+  - entity
+  - snapshot_ts_us
+  - fields
+  - related
+  - quality
+  type: object
+EntityQualityDto:
+  properties:
+    gaps:
+      items:
+        $ref: '#/EntityGapDto'
+      type: array
+    gated:
+      items:
+        type: string
+      type: array
+    status:
+      type: string
+  required:
+  - status
+  - gaps
+  - gated
+  type: object
+EntityResponse:
+  oneOf:
+  - $ref: '#/EntityPointResponse'
+  - $ref: '#/EntityHistoryResponse'
+EntitySnapshotDto:
+  properties:
+    reasons:
+      items:
+        type:
+        - string
+        - 'null'
+      type: array
+    statuses:
+      items:
+        type: string
+      type: array
+    ts_us:
+      type: string
+    values:
+      items:
+        $ref: '#/FrameValue'
+      type: array
+  required:
+  - ts_us
+  - values
+  - statuses
+  - reasons
   type: object
 EvidenceDto:
   oneOf:
@@ -232,10 +756,56 @@ EvidenceDto:
     - absolute_ceiling_bytes
     - kind
     type: object
+FilesystemDto:
+  properties:
+    available_bytes:
+      format: int64
+      minimum: 0
+      type: integer
+    total_bytes:
+      format: int64
+      minimum: 0
+      type: integer
+    used_fraction:
+      format: double
+      type: number
+  required:
+  - total_bytes
+  - available_bytes
+  - used_fraction
+  type: object
+ForecastDto:
+  properties:
+    full_in_days:
+      format: double
+      type:
+      - number
+      - 'null'
+    full_in_days_reason:
+      type:
+      - string
+      - 'null'
+    window_us:
+      type: string
+    write_rate_bytes_per_day:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+  required:
+  - write_rate_bytes_per_day
+  - window_us
+  - full_in_days
+  - full_in_days_reason
+  type: object
 FrameColumnDto:
   properties:
     code:
       type: string
+    hidden:
+      description: Whether the column is materialized only for sort or field filtering.
+      type: boolean
     threshold_metric:
       type:
       - string
@@ -249,6 +819,7 @@ FrameColumnDto:
   required:
   - code
   - type
+  - hidden
   type: object
 FrameGapDto:
   properties:
@@ -356,6 +927,14 @@ FrameResponse:
   type: object
 FrameRowDto:
   properties:
+    categorical_classifications:
+      items:
+        $ref: '#/CategoricalClassificationDto'
+      type: array
+    cell_statuses:
+      items:
+        $ref: '#/CellStatusDto'
+      type: array
     cells:
       items:
         $ref: '#/FrameValue'
@@ -374,7 +953,9 @@ FrameRowDto:
   - entity
   - label
   - cells
+  - cell_statuses
   - classifications
+  - categorical_classifications
   - spark
   type: object
 FrameValue:
@@ -385,6 +966,13 @@ FrameValue:
   - type: boolean
   - type: string
   description: A finite frame scalar; wide integers and timestamps use decimal strings.
+FreshnessState:
+  enum:
+  - fresh
+  - late
+  - stale
+  - unknown
+  type: string
 HeatmapGrid:
   properties:
     bucket_count:
@@ -485,7 +1073,7 @@ InputSpec:
   properties:
     availability:
       $ref: '#/Availability'
-      description: Source-specific availability.
+      description: Store-observed availability.
     code:
       description: Stable input code referenced by metrics and columns.
       type: string
@@ -501,12 +1089,23 @@ InputSpec:
         minimum: 0
         type: integer
       type: array
+    unavailable_reason:
+      description: Machine reason when the input is not available.
+      type:
+      - string
+      - 'null'
   required:
   - code
   - logical_sections
   - type_ids
   - availability
   type: object
+IntegrityStatus:
+  enum:
+  - complete
+  - degraded
+  - unknown
+  type: string
 JoinSpec:
   description: A proven or conditional relationship between two inputs.
   properties:
@@ -542,7 +1141,7 @@ MetricSpec:
       type: string
     availability:
       $ref: '#/Availability'
-      description: Source-specific availability.
+      description: Store-observed availability.
     code:
       description: Stable metric code inside its view.
       type: string
@@ -559,6 +1158,11 @@ MetricSpec:
       format: int32
       minimum: 0
       type: integer
+    unavailable_reason:
+      description: Machine reason when the metric is not available.
+      type:
+      - string
+      - 'null'
     unit:
       description: Public unit code.
       type: string
@@ -581,6 +1185,13 @@ NotClassifiedResultDto:
   - status
   - reason
   type: object
+NotableLevelDto:
+  enum:
+  - none
+  - info
+  - warning
+  - critical
+  type: string
 PresetSpec:
   description: Named ordered subset of view columns.
   properties:
@@ -600,8 +1211,38 @@ PresetSpec:
   - columns
   - sort
   type: object
+ProducerDto:
+  properties:
+    collector_pid:
+      format: int32
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    collector_started_at_us:
+      type:
+      - string
+      - 'null'
+    last_status_at_us:
+      type:
+      - string
+      - 'null'
+    state:
+      $ref: '#/ProducerStateDto'
+  required:
+  - state
+  - collector_pid
+  - collector_started_at_us
+  - last_status_at_us
+  type: object
+ProducerStateDto:
+  enum:
+  - running
+  - stopped
+  - unknown
+  type: string
 ProjectionCatalog:
-  description: Complete source-aware catalog response.
+  description: Complete availability-aware catalog response.
   properties:
     revision:
       description: Catalog schema revision.
@@ -615,6 +1256,19 @@ ProjectionCatalog:
   required:
   - revision
   - views
+  type: object
+QualityGap:
+  properties:
+    from_us:
+      type: string
+    reason:
+      type: string
+    to_us:
+      type: string
+  required:
+  - from_us
+  - to_us
+  - reason
   type: object
 RangeGap:
   properties:
@@ -636,6 +1290,65 @@ Ranking:
   required:
   - exact
   - unseen_upper
+  type: object
+RelatedEntityDto:
+  properties:
+    entity:
+      type: string
+    provenance:
+      $ref: '#/RelationProvenanceDto'
+    relation:
+      type: string
+    view:
+      type: string
+  required:
+  - relation
+  - view
+  - entity
+  - provenance
+  type: object
+RelationProvenanceDto:
+  properties:
+    fields:
+      items:
+        type: string
+      type: array
+    kind:
+      type: string
+  required:
+  - kind
+  - fields
+  type: object
+RetentionDto:
+  properties:
+    configured_limit:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    effective_limit_bytes:
+      format: int64
+      minimum: 0
+      type:
+      - integer
+      - 'null'
+    mode:
+      type:
+      - string
+      - 'null'
+    reason:
+      type:
+      - string
+      - 'null'
+    status:
+      type: string
+  required:
+  - mode
+  - configured_limit
+  - effective_limit_bytes
+  - status
+  - reason
   type: object
 Scope:
   description: UI ownership scope of one view.
@@ -684,6 +1397,164 @@ SparkDto:
   - values
   - complete
   type: object
+SpineGap:
+  properties:
+    from_us:
+      type: string
+    reason:
+      type: string
+    to_us:
+      type: string
+  required:
+  - from_us
+  - to_us
+  - reason
+  type: object
+SpineGrid:
+  properties:
+    bucket_count:
+      minimum: 0
+      type: integer
+    from_us:
+      type: string
+    to_us:
+      type: string
+  required:
+  - from_us
+  - to_us
+  - bucket_count
+  type: object
+SpineQuality:
+  properties:
+    active_tail:
+      type: boolean
+    gaps:
+      items:
+        $ref: '#/SpineGap'
+      type: array
+    gated:
+      items:
+        type: string
+      type: array
+    resource_limited:
+      items:
+        type: string
+      type: array
+    snapshots:
+      minimum: 0
+      type: integer
+    status:
+      type: string
+  required:
+  - status
+  - snapshots
+  - gaps
+  - gated
+  - resource_limited
+  - active_tail
+  type: object
+SpineResponse:
+  properties:
+    grid:
+      $ref: '#/SpineGrid'
+    quality:
+      $ref: '#/SpineQuality'
+    series:
+      items:
+        $ref: '#/SpineSeries'
+      type: array
+  required:
+  - grid
+  - series
+  - quality
+  type: object
+SpineSeries:
+  properties:
+    aggregation:
+      type: string
+    code:
+      type: string
+    unit:
+      type: string
+    value_statuses:
+      items:
+        $ref: '#/SpineValueStatus'
+      type: array
+    values:
+      items:
+        format: double
+        type:
+        - number
+        - 'null'
+      type: array
+  required:
+  - code
+  - unit
+  - aggregation
+  - values
+  - value_statuses
+  type: object
+SpineValueStatus:
+  properties:
+    reason:
+      type:
+      - string
+      - 'null'
+    status:
+      type: string
+  required:
+  - status
+  type: object
+StorageIntegrityDto:
+  properties:
+    orphan_overviews:
+      minimum: 0
+      type: integer
+    quarantined_entries:
+      minimum: 0
+      type: integer
+    readable_segments:
+      minimum: 0
+      type: integer
+  required:
+  - readable_segments
+  - orphan_overviews
+  - quarantined_entries
+  type: object
+StorageQualityDto:
+  properties:
+    gated:
+      items:
+        type: string
+      type: array
+    status:
+      type: string
+  required:
+  - status
+  - gated
+  type: object
+StorageResponse:
+  properties:
+    filesystem:
+      $ref: '#/FilesystemDto'
+    forecast:
+      $ref: '#/ForecastDto'
+    integrity:
+      $ref: '#/StorageIntegrityDto'
+    quality:
+      $ref: '#/StorageQualityDto'
+    retention:
+      $ref: '#/RetentionDto'
+    used_bytes:
+      $ref: '#/UsedBytesDto'
+  required:
+  - used_bytes
+  - filesystem
+  - retention
+  - forecast
+  - integrity
+  - quality
+  type: object
 SummaryQuality:
   properties:
     active_tail:
@@ -718,6 +1589,35 @@ SummaryQuality:
   - resource_limited
   - active_tail
   type: object
+UsedBytesDto:
+  properties:
+    journal:
+      format: int64
+      minimum: 0
+      type: integer
+    other:
+      format: int64
+      minimum: 0
+      type: integer
+    ovf:
+      format: int64
+      minimum: 0
+      type: integer
+    pgm:
+      format: int64
+      minimum: 0
+      type: integer
+    quarantine:
+      format: int64
+      minimum: 0
+      type: integer
+  required:
+  - pgm
+  - ovf
+  - journal
+  - quarantine
+  - other
+  type: object
 ValueType:
   description: Public scalar shape of one projected column.
   enum:
@@ -728,15 +1628,34 @@ ValueType:
   - text
   - timestamp
   type: string
+ViewCapabilities:
+  description: UI operations supported by one projection identity.
+  properties:
+    detail:
+      description: Point detail can resolve the typed entity identity.
+      type: boolean
+    history:
+      description: History can follow the identity across snapshots.
+      type: boolean
+    related:
+      description: At least one proven relation can be returned.
+      type: boolean
+  required:
+  - detail
+  - history
+  - related
+  type: object
 ViewSpec:
   description: One stable UI projection.
   properties:
     availability:
       $ref: '#/Availability'
-      description: Source-specific view availability.
+      description: Store-observed view availability.
     canonical_metric:
       description: Metric used by the canonical row spark.
       type: string
+    capabilities:
+      $ref: '#/ViewCapabilities'
     code:
       description: Public URL and JSON code.
       type: string
@@ -790,6 +1709,7 @@ ViewSpec:
   - scope
   - identity_revision
   - availability
+  - capabilities
   - inputs
   - joins
   - metrics
@@ -805,6 +1725,12 @@ ViewSummaryItem:
       - $ref: '#/CollectionStatusDto'
     notable:
       type: boolean
+    notable_count:
+      format: int64
+      minimum: 0
+      type: integer
+    notable_level:
+      $ref: '#/NotableLevelDto'
     population:
       format: int64
       minimum: 0
@@ -825,6 +1751,8 @@ ViewSummaryItem:
   - population
   - status
   - notable
+  - notable_level
+  - notable_count
   - collection
   type: object
 ViewSummaryResponse:

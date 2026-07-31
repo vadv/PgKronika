@@ -31,6 +31,7 @@ mod os_sources;
 mod pg_log_source;
 mod plans_source;
 mod pool_sources;
+mod producer_status;
 mod reset_source;
 mod rotation;
 mod scheduler;
@@ -64,6 +65,7 @@ use pg_log_source::{
 };
 use plans_source::{PlansCollection, PlansSourceCache, collect_store_plans_cached};
 use pool_sources::{PoolReads, read_pool_sources};
+use producer_status::{ProducerStatusPublisher, retention_status};
 use rotation::Rotation;
 use scheduler::{DueSet, Scheduler, SourceKind};
 use segments::{
@@ -75,7 +77,7 @@ use source_contracts::activity_dict_limits;
 use statements_source::StatementsSourceCache;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::signal::unix::{SignalKind, signal};
 
 fn timer_sleep_delay(
@@ -163,6 +165,14 @@ async fn main() -> Result<()> {
         .context("dictionary limits admit a value above the sealed page budget")?;
     let data_root = DataRoot::open(&config.out_dir).context("open the data root")?;
     let writer_owner = acquire_collector_writer(&data_root, LayoutLimits::default())?;
+    let started_at_us = unix_now_us()?;
+    let mut producer_status = ProducerStatusPublisher::start(
+        &config.out_dir,
+        std::process::id(),
+        started_at_us,
+        retention_status(config.retention).context("map retention status")?,
+    )
+    .context("publish collector startup status")?;
 
     // The journal lives next to sealed segments so windows survive restarts.
     // Recovered windows are sealed before connecting to PostgreSQL.
@@ -232,6 +242,7 @@ async fn main() -> Result<()> {
                 // rotation's; collection stays strictly signal-driven.
                 if config.tick_secs == 0 {
                     run_rotation(&mut rotation, &writer_owner, &journal, &[]);
+                    heartbeat_best_effort(&mut producer_status);
                     continue;
                 }
                 false
@@ -263,6 +274,7 @@ async fn main() -> Result<()> {
         // plans read due still runs.
         if due.is_empty() && !plans_cache.is_due(Instant::now()) {
             run_rotation(&mut rotation, &writer_owner, &journal, &sealed_this_tick);
+            heartbeat_best_effort(&mut producer_status);
             continue;
         }
         sealed_this_tick.extend(
@@ -283,8 +295,45 @@ async fn main() -> Result<()> {
         );
         stop_if_persistence_unhealthy(&journal, &segment)?;
         run_rotation(&mut rotation, &writer_owner, &journal, &sealed_this_tick);
+        heartbeat_best_effort(&mut producer_status);
+    }
+    if let Err(err) = unix_now_us().and_then(|at_us| {
+        producer_status
+            .stop(at_us)
+            .context("publish collector terminal status")
+    }) {
+        // A missing terminal marker degrades the status file to a stale
+        // heartbeat, which consumers already treat as an unhealthy producer.
+        log_event(
+            LogLevel::Warn,
+            "producer_status_stop_failure",
+            &[field("error", format!("{err:#}"))],
+        );
     }
     Ok(())
+}
+
+/// Auxiliary status publication never gates collection: a stale status file is
+/// itself the designed "producer unhealthy" signal.
+fn heartbeat_best_effort(producer_status: &mut ProducerStatusPublisher) {
+    if let Err(err) = unix_now_us().and_then(|at_us| {
+        producer_status
+            .heartbeat(at_us)
+            .context("publish collector heartbeat")
+    }) {
+        log_event(
+            LogLevel::Warn,
+            "producer_status_heartbeat_failure",
+            &[field("error", format!("{err:#}"))],
+        );
+    }
+}
+
+fn unix_now_us() -> Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?;
+    i64::try_from(duration.as_micros()).context("system time exceeds i64 microseconds")
 }
 
 /// Feeds the tick's publications to rotation and lets it enforce the target.

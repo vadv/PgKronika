@@ -208,6 +208,8 @@ async fn six_sqlstate_conditions_reach_the_http_log_projection() {
             .find(|finding| finding["lens_id"] == lens_id)
             .unwrap_or_else(|| panic!("missing {lens_id}: {response}"));
         assert_eq!(finding["confidence"], "medium");
+        assert_eq!(finding["confidence_cap"], "medium");
+        assert_eq!(finding["slug"], slug);
         assert_eq!(finding["role"], "coincident");
         assert_eq!(finding["scope"]["identity"][0], sqlstate);
 
@@ -265,6 +267,26 @@ async fn identical_payloads_produce_the_same_incident_key_without_metadata() {
         .as_str()
         .expect("second storage-backed incident key");
     assert_eq!(first_key, second_key);
+}
+
+#[tokio::test]
+async fn incidents_publish_focus_metadata_counters_and_no_inferred_relations() {
+    let body = spiking_incident().await;
+    let incident = &body["incidents"][0];
+
+    assert!(incident["peak_ts_us"].is_string());
+    assert_eq!(incident["level"], "warning");
+    assert_eq!(incident["level_policy_revision"], 1);
+    assert_eq!(incident["category_code"], "postgres");
+    assert!(incident["summary_code"].is_string());
+    assert_eq!(
+        incident["finding_count"].as_u64(),
+        incident["findings"]
+            .as_array()
+            .map(|findings| findings.len() as u64)
+    );
+    assert_eq!(incident["coincident_count"], 0);
+    assert_eq!(incident["relations"], serde_json::json!([]));
 }
 
 fn assert_active_incident_catalog(body: &serde_json::Value) {
@@ -442,6 +464,8 @@ async fn incidents_publish_numeric_gauge_evidence_from_reader_input() {
         .expect("low MemAvailable finding");
     assert_eq!(finding["role"], "coincident");
     assert_eq!(finding["confidence"], "low");
+    assert_eq!(finding["confidence_cap"], "low");
+    assert_eq!(finding["slug"], "memory_reclaim");
     assert_eq!(finding["scope"]["identity"], serde_json::json!([]));
     let evidence = &finding["evidence"][0];
     assert_eq!(evidence["type"], "gauge");

@@ -707,6 +707,7 @@ mod tests {
                 identity: identity(),
                 start_us: 0,
                 end_us: 10,
+                peak_ts_us: 0,
             },
         };
         let lenses: [&dyn Lens; 1] = [lens];

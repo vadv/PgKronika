@@ -24,6 +24,8 @@ closed_string_enum! {
         CursorQueryMismatch => "cursor_query_mismatch",
         CursorExpired => "cursor_expired",
         ViewGone => "view_gone",
+        EntityNotFound => "entity_not_found",
+        ResponseTooLarge => "response_too_large",
         QueryLimitExceeded => "query_limit_exceeded",
         CursorCapacityUnavailable => "cursor_capacity_unavailable",
         AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
@@ -37,7 +39,9 @@ impl ErrorCode {
     pub(crate) const fn status(self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::RouteNotFound | Self::UnknownSection => StatusCode::NOT_FOUND,
+            Self::RouteNotFound | Self::UnknownSection | Self::EntityNotFound => {
+                StatusCode::NOT_FOUND
+            }
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::MissingQueryParameter
             | Self::InvalidQueryParameter
@@ -47,7 +51,7 @@ impl ErrorCode {
             | Self::InvalidCursor
             | Self::CursorQueryMismatch => StatusCode::BAD_REQUEST,
             Self::CursorExpired | Self::ViewGone => StatusCode::GONE,
-            Self::QueryLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::QueryLimitExceeded | Self::ResponseTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::CursorCapacityUnavailable
             | Self::AnalyticCapacityUnavailable
             | Self::ColdBuildOverloaded => StatusCode::SERVICE_UNAVAILABLE,
@@ -86,6 +90,8 @@ closed_string_enum! {
         Q => "q",
         Sort => "sort",
         Order => "order",
+        Columns => "columns",
+        Include => "include",
     }
 }
 
@@ -117,6 +123,8 @@ impl QueryParameter {
             b"q" => Some(Self::Q),
             b"sort" => Some(Self::Sort),
             b"order" => Some(Self::Order),
+            b"columns" => Some(Self::Columns),
+            b"include" => Some(Self::Include),
             _ => None,
         }
     }
@@ -131,6 +139,7 @@ impl QueryParameter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidParameterLocation {
     Query,
+    Entity,
     Parameter(QueryParameter),
 }
 
@@ -147,6 +156,7 @@ impl Serialize for InvalidParameterLocation {
     {
         match self {
             Self::Query => serializer.serialize_str("query"),
+            Self::Entity => serializer.serialize_str("entity"),
             Self::Parameter(parameter) => parameter.serialize(serializer),
         }
     }
@@ -171,6 +181,9 @@ closed_string_enum! {
         Severity => "severity",
         ProjectionCode => "projection_code",
         SortOrder => "sort_order",
+        FilterExpression => "filter_expression",
+        EntityToken => "entity_token",
+        ProjectionColumnList => "projection_column_list",
     }
 }
 
@@ -183,6 +196,9 @@ closed_string_enum! {
         EpsilonNotGreaterThanMaxClusterSpan => "epsilon_not_greater_than_max_cluster_span",
         MaxClusterSpanWithinInterval => "max_cluster_span_within_interval",
         FiniteScan => "finite_scan",
+        PointOrHistory => "point_or_history",
+        HistorySupported => "history_supported",
+        PresetOrColumns => "preset_or_columns",
     }
 }
 
@@ -310,6 +326,21 @@ impl ApiError {
 
     pub(crate) fn view_gone() -> Self {
         Self::empty(ErrorCode::ViewGone)
+    }
+
+    pub(crate) fn entity_not_found() -> Self {
+        Self::empty(ErrorCode::EntityNotFound)
+    }
+
+    pub(crate) fn response_too_large(limit: u64, observed: u64) -> Self {
+        Self::new(
+            ErrorCode::ResponseTooLarge,
+            serde_json::json!({
+                "resource": "response_bytes",
+                "limit": limit,
+                "observed": observed,
+            }),
+        )
     }
 
     pub(crate) fn query_limit_exceeded(

@@ -8,8 +8,8 @@ use super::dispatch::{LimitHit, SectionColumn};
 use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
-    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
+    ConfidenceCap, EntityJoinEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity,
+    GaugeEvidence, GaugeRatio, GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
 };
 use super::lens::Lens;
 use super::model::IdentityValue;
@@ -449,13 +449,26 @@ impl Lens for PlanChurnLens {
         let Some(evidence) = evidence else {
             return Ok(());
         };
+        let mut evidence: Vec<_> = evidence
+            .into_iter()
+            .map(Evidence::GaugeObservation)
+            .collect();
+        if candidate.bridge.fork == PlanFork::Ossc && candidate.bridge.queryid != 0 {
+            evidence.push(Evidence::EntityJoin(EntityJoinEvidence::new(
+                "statement_plan",
+                &["queryid", "dbid", "userid"],
+                STATEMENTS,
+                Arc::from(vec![
+                    IdentityValue::I64(candidate.bridge.queryid),
+                    IdentityValue::U64(candidate.bridge.userid),
+                    IdentityValue::U64(candidate.bridge.dbid),
+                ]),
+            )));
+        }
         sink.emit(FindingDraft::new(
             Role::Coincident,
             FindingScope::from_episode(member),
-            evidence
-                .into_iter()
-                .map(Evidence::GaugeObservation)
-                .collect(),
+            evidence,
         ))?;
         Ok(())
     }
@@ -500,6 +513,7 @@ mod tests {
                 identity: identity(),
                 start_us: 0,
                 end_us: 10,
+                peak_ts_us: 0,
             },
         }
     }
@@ -648,14 +662,85 @@ mod tests {
             plan_for_query(3, PlanFork::Vadv, 13, 1, 25.0, 250.0),
             plan_for_query(3, PlanFork::Vadv, 14, 2, 11.0, 510.0),
         ]);
+        let vadv = outcome(
+            &PlanChurnLens,
+            episode(PLANS_VADV, "planid"),
+            &changing_attribution,
+        );
         assert_eq!(
-            findings(
-                &PlanChurnLens,
-                episode(PLANS_VADV, "planid"),
-                &changing_attribution,
-            ),
+            vadv.incidents[0].findings.len(),
             1,
             "best-effort query attribution does not gate plan identity churn"
+        );
+        assert!(
+            vadv.incidents[0].findings[0]
+                .evidence()
+                .iter()
+                .all(|evidence| !matches!(evidence, Evidence::EntityJoin(_))),
+            "best-effort VADV attribution cannot publish proven join evidence"
+        );
+    }
+
+    #[test]
+    fn exact_statement_plan_join_publishes_one_proven_relation() {
+        use crate::anomaly::ScanParams;
+        use crate::incident::{EventOutcome, Lens, LogCoverage};
+        use crate::incident_input::InputQuality;
+        use crate::incident_response::{ResponseInput, build_response};
+
+        let mut typed = query_input(false);
+        typed.insert_plan_samples(vec![
+            plan(1, PlanFork::Ossc, 1, 10.0, 100.0),
+            plan(2, PlanFork::Ossc, 1, 20.0, 200.0),
+            plan(2, PlanFork::Ossc, 2, 1.0, 10.0),
+            plan(3, PlanFork::Ossc, 1, 25.0, 250.0),
+            plan(3, PlanFork::Ossc, 2, 11.0, 510.0),
+        ]);
+        let lenses: [&dyn Lens; 2] = [&QueryWorkLens, &PlanChurnLens];
+        let outcome = analyze(
+            vec![episode(STATEMENTS, "calls"), episode(PLANS_OSSC, "planid")],
+            &SeriesSet::for_test(0),
+            &typed,
+            &lenses,
+            &IncidentConfig::for_test(5, 1_000, ClockRelation::Unknown),
+        )
+        .expect("analysis");
+        let log = EventOutcome {
+            findings: Vec::new(),
+            coverage: BTreeMap::<&'static str, LogCoverage>::new(),
+            complete: true,
+            skipped: Vec::new(),
+            evaluated_lens_ids: Vec::new(),
+        };
+        let quality = InputQuality {
+            evaluated_positions: 1,
+            ..InputQuality::default()
+        };
+        let response = build_response(
+            &ScanParams {
+                from: 0,
+                to: 10,
+                window: 5,
+                step: 1,
+                threshold: 3.5,
+                eps_rel: 0.05,
+            },
+            None,
+            &outcome,
+            &log,
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &quality,
+                skipped: &[],
+                capability_by_section: &BTreeMap::new(),
+            },
+        );
+        let relation = &response["incidents"][0]["relations"][0];
+        assert_eq!(relation["kind"], "proven");
+        assert_eq!(relation["provenance"]["contract"], "statement_plan");
+        assert_eq!(
+            relation["provenance"]["fields"],
+            serde_json::json!(["queryid", "dbid", "userid"])
         );
     }
 }

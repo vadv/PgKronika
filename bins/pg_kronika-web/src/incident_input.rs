@@ -1691,6 +1691,7 @@ fn ingest_section(
             identity: identity.clone().into(),
             start_us: hit.episode.start,
             end_us: hit.episode.end,
+            peak_ts_us: hit.episode.peak_ts,
         };
 
         let key = (column, identity.clone());
