@@ -5,6 +5,13 @@ use kronika_registry::pg_log::PgLogLifecycleV1;
 use super::*;
 
 fn quality_fixture() -> tempfile::TempDir {
+    quality_fixture_with(Some(
+        ProducerStatus::running(42, 500, 1_600, Some(RetentionStatus::fixed(1 << 30)))
+            .stopped(1_700),
+    ))
+}
+
+fn quality_fixture_with(status: Option<ProducerStatus>) -> tempfile::TempDir {
     let rows = [
         PgLogLifecycleV1 {
             ts: Ts(1_200),
@@ -48,12 +55,9 @@ fn quality_fixture() -> tempfile::TempDir {
             .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
             .expect("publish quality web index");
     }
-    write_producer_status(
-        directory.path(),
-        &ProducerStatus::running(42, 500, 1_600, Some(RetentionStatus::fixed(1 << 30)))
-            .stopped(1_700),
-    )
-    .expect("publish stopped producer");
+    if let Some(status) = status {
+        write_producer_status(directory.path(), &status).expect("publish producer status");
+    }
     directory
 }
 
@@ -67,7 +71,18 @@ async fn data_quality_distinguishes_gaps_and_proven_stopped_producer() {
     assert_eq!(body["coverage"]["observed_snapshots"], 2);
     assert_eq!(body["gaps"][0]["reason"], "unknown");
     assert_eq!(body["freshness"]["data_through_us"], "1600");
-    assert_ne!(body["status"], "fresh");
+    assert_eq!(body["status"], "partial");
+}
+
+#[tokio::test]
+async fn data_quality_reports_stale_data_with_running_producer() {
+    let directory = quality_fixture_with(Some(ProducerStatus::running(42, 500, 99_900_000, None)));
+    let (status, body) = serve(directory.path(), "/v1/data/quality?from=1000&to=100000000").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["producer"]["state"], "running");
+    assert_eq!(body["freshness"]["state"], "stale");
+    assert_eq!(body["status"], "stale");
 }
 
 #[tokio::test]

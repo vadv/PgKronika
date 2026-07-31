@@ -119,7 +119,13 @@ fn entity_fixture() -> tempfile::TempDir {
         statement_row(1_000, 10, query),
         statement_row(2_000, 25, query),
     ];
-    let plans = [plan_row(1_500, 2, plan), plan_row(2_000, 3, plan)];
+    let mut coincident_plan = plan_row(2_000, 5, plan);
+    coincident_plan.queryid = 8;
+    let plans = [
+        plan_row(1_500, 2, plan),
+        plan_row(2_000, 3, plan),
+        coincident_plan,
+    ];
     let statements = PgStatStatementsV2::encode(&rows).expect("encode statements");
     let plans_body = PgStorePlansOsscV1::encode(&plans).expect("encode plans");
     let dictionary = dict::encode(interner.window()).expect("encode dictionary");
@@ -272,8 +278,11 @@ async fn entity_point_returns_lazy_fields_and_only_proven_related_links() {
         .expect("lazy query field");
     assert_eq!(query["value"], "select * from orders");
     assert_eq!(query["status"], "available");
-    assert_eq!(body["related"][0]["relation"], "statement_plan");
-    assert_eq!(body["related"][0]["view"], "plans");
+    let related = body["related"].as_array().expect("related links");
+    // The time-coincident plan with a different queryid must not link.
+    assert_eq!(related.len(), 1);
+    assert_eq!(related[0]["relation"], "statement_plan");
+    assert_eq!(related[0]["view"], "plans");
     assert_eq!(
         body["related"][0]["provenance"],
         serde_json::json!({
@@ -281,6 +290,20 @@ async fn entity_point_returns_lazy_fields_and_only_proven_related_links() {
             "fields": ["queryid", "dbid", "userid"]
         })
     );
+}
+
+#[test]
+fn entity_request_rejects_unknown_and_duplicate_parameters_before_io() {
+    let catalog = catalog();
+    let token = token(1);
+
+    let unknown = EntityRequest::parse("statements", &token, Some("at=1&bogus=1"), &catalog)
+        .expect_err("unknown parameter");
+    assert_eq!(unknown.code(), ErrorCode::UnknownQueryParameter);
+
+    let duplicate = EntityRequest::parse("statements", &token, Some("at=1&at=2"), &catalog)
+        .expect_err("duplicate parameter");
+    assert_eq!(duplicate.code(), ErrorCode::DuplicateQueryParameter);
 }
 
 #[tokio::test]

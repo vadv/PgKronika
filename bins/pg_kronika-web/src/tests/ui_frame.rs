@@ -1390,6 +1390,10 @@ async fn frame_event_cursor_tiles_every_matching_row() {
         }
         let (status, body) = super::serve(directory.path(), &uri).await;
         assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body["page"]["matched"], 201,
+            "matched must stay stable across cursor pages"
+        );
         returned += body["page"]["returned"]
             .as_u64()
             .and_then(|value| usize::try_from(value).ok())

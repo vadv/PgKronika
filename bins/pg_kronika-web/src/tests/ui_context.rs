@@ -8,11 +8,23 @@ use kronika_writer::{Interner, dict};
 
 use super::*;
 
+fn context_fixture() -> tempfile::TempDir {
+    context_fixture_impl(false, true, None)
+}
+
+fn standby_fixture() -> tempfile::TempDir {
+    context_fixture_impl(true, false, Some(5))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the fixture keeps one exact multi-section context snapshot visible in one place"
 )]
-fn context_fixture() -> tempfile::TempDir {
+fn context_fixture_impl(
+    is_in_recovery: bool,
+    include_replicas: bool,
+    replay_lag_s: Option<i64>,
+) -> tempfile::TempDir {
     const TS_US: i64 = 1_500;
     let mut interner = Interner::new(DictLimits::new(128, 64 * 1024).expect("dictionary limits"));
     let mut intern = |value: &str| {
@@ -74,7 +86,7 @@ fn context_fixture() -> tempfile::TempDir {
     };
     let replication = ReplicationInstance {
         ts: Ts(TS_US),
-        is_in_recovery: false,
+        is_in_recovery,
         timeline_id: 1,
         synchronous_standby_names,
         synchronous_commit,
@@ -82,8 +94,8 @@ fn context_fixture() -> tempfile::TempDir {
         sender_host: None,
         sender_port: None,
         slot_name: None,
-        streaming_replicas: 1,
-        replay_lag_s: None,
+        streaming_replicas: i32::from(!is_in_recovery),
+        replay_lag_s,
         standby_receive_lsn: None,
         standby_replay_lsn: None,
         standby_last_replay_at: None,
@@ -139,11 +151,6 @@ fn context_fixture() -> tempfile::TempDir {
             body: &replication_body,
         },
         SectionInput {
-            type_id: 1_016_001,
-            rows: 1,
-            body: &replicas_body,
-        },
-        SectionInput {
             type_id: 1_021_001,
             rows: 1,
             body: &instance_body,
@@ -154,6 +161,13 @@ fn context_fixture() -> tempfile::TempDir {
             body: &topology_body,
         },
     ];
+    if include_replicas {
+        sections.push(SectionInput {
+            type_id: 1_016_001,
+            rows: 1,
+            body: &replicas_body,
+        });
+    }
     sections.extend(dictionary.iter().map(|section| SectionInput {
         type_id: section.type_id,
         rows: section.rows,
@@ -194,6 +208,30 @@ async fn context_returns_instance_databases_replication_and_cpu_from_one_snapsho
     assert!(body["databases"][0]["entity"].as_str().is_some());
     assert_eq!(body["replication"]["instance"]["streaming_replicas"], 1);
     assert_eq!(body["replication"]["replicas"][0]["replay_lag_us"], 400_000);
+    assert_eq!(
+        body["instance"]["pg_system_identifier_reason"],
+        serde_json::Value::Null
+    );
+    assert_eq!(body["quality"]["status"], "complete");
+    assert_eq!(body["quality"]["gated"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn context_on_standby_reports_role_without_invented_replication() {
+    let directory = standby_fixture();
+    let (status, body) = serve(directory.path(), "/v1/ui/context?at=1600").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["instance"]["role"], "standby");
+    assert_eq!(body["instance"]["role_reason"], serde_json::Value::Null);
+    assert_eq!(body["replication"]["instance"]["replay_lag_us"], 5_000_000);
+    assert_eq!(
+        body["replication"]["instance"]["replay_lag_reason"],
+        serde_json::Value::Null
+    );
+    assert_eq!(body["replication"]["replicas"], serde_json::json!([]));
+    assert_eq!(body["quality"]["status"], "complete");
+    assert_eq!(body["quality"]["gated"], serde_json::json!([]));
 }
 
 #[tokio::test]

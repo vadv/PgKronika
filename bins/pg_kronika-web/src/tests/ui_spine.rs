@@ -135,6 +135,32 @@ async fn spine_returns_aligned_host_series_from_the_hidden_ovf_view() {
 }
 
 #[tokio::test]
+async fn spine_distinguishes_observed_value_missing_sample_and_producer_gap() {
+    let directory = host_spine_fixture();
+    let (status, body) = serve(
+        directory.path(),
+        "/v1/timeline/spine?from=60000000&to=240000000&buckets=6",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let psi = &body["series"][1];
+    let values = psi["values"].as_array().expect("psi values");
+    let statuses = psi["value_statuses"]
+        .as_array()
+        .expect("psi value statuses");
+    assert_eq!(values[0], 12.0);
+    assert_eq!(statuses[0]["status"], "available");
+    assert_eq!(statuses[0]["reason"], serde_json::Value::Null);
+    assert_eq!(values[1], serde_json::Value::Null);
+    assert_eq!(statuses[1]["status"], "unavailable");
+    assert_eq!(statuses[1]["reason"], "no_sample");
+    assert_eq!(values[5], serde_json::Value::Null);
+    assert_eq!(statuses[5]["status"], "unavailable");
+    assert_eq!(statuses[5]["reason"], "producer_gap");
+}
+
+#[tokio::test]
 async fn spine_rejects_invalid_query_shapes_before_index_reads() {
     for uri in [
         "/v1/timeline/spine?to=10",
