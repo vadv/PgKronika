@@ -4167,6 +4167,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn remove_quarantine_entry_frees_bytes_once_and_rechecks_identity() {
         let directory = tempfile::tempdir().unwrap();
         let root = DataRoot::open(directory.path()).unwrap();
