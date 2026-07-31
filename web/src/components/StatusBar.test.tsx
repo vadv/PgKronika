@@ -8,7 +8,6 @@ import {
 import { StatusBar } from "./StatusBar";
 
 const state: UiState = {
-  source: "local",
   view: "activity",
   at: null,
   span: 3600,

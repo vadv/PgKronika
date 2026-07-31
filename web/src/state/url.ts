@@ -10,7 +10,7 @@ export interface UiState {
   baseline: string | null;
   /** Active column preset code of the view. */
   preset: string | null;
-  /** Server-side filter query. */
+  /** Server-side filter query (transient: never serialized into the hash). */
   q: string | null;
   /** Sort column code and direction (server-side). */
   sort: string | null;
@@ -53,7 +53,8 @@ export function toHash(state: UiState): string {
   if (state.span !== DEFAULT_SPAN) params.set("span", String(state.span));
   if (state.baseline !== null) params.set("baseline", state.baseline);
   if (state.preset !== null) params.set("preset", state.preset);
-  if (state.q !== null) params.set("q", state.q);
+  // `q` is transient on purpose: share URLs must not carry a free-text
+  // filter, so it is parsed from the hash but never written back.
   if (state.sort !== null) params.set("sort", state.sort);
   if (state.order !== null) params.set("order", state.order);
   if (state.focus !== null) params.set("focus", state.focus);

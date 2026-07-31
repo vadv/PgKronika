@@ -14,7 +14,6 @@ import {
 import { Header, type HeaderProps } from "./Header";
 
 const state: UiState = {
-  source: "prod-1",
   view: "activity",
   at: null,
   span: 3600,

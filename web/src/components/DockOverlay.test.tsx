@@ -38,7 +38,6 @@ function stubFetch(body: unknown) {
 }
 
 const baseState: UiState = {
-  source: "prod-1",
   view: "activity",
   at: "1722400000000000",
   span: 3600,

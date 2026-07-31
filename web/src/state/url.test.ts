@@ -3,7 +3,6 @@ import { parseHash, toHash, type UiState } from "./url";
 
 function fullState(overrides: Partial<UiState> = {}): UiState {
   return {
-    source: "local",
     view: "statements",
     at: "1722400000000000",
     span: 3600,
@@ -29,7 +28,6 @@ test("roundtrips fully populated state", () => {
     span: 900,
     baseline: "1722390000000000",
     preset: "io",
-    q: "calls>100",
     sort: "total_time",
     order: "desc",
     focus: "inc-1",
@@ -37,6 +35,20 @@ test("roundtrips fully populated state", () => {
     entity: "77de",
   });
   expect(parseHash(toHash(state))).toEqual(state);
+});
+
+test("q is parsed from the hash but never serialized", () => {
+  expect(parseHash("#q=calls%3E100").q).toBe("calls>100");
+  const state = fullState({ q: "calls>100" });
+  expect(toHash(state)).not.toContain("q=");
+  // Explicit roundtrip: the free-text filter is lost after toHash→parseHash.
+  expect(parseHash(toHash(state))).toEqual(fullState({ q: null }));
+});
+
+test("source is not part of the URL contract", () => {
+  const parsed = parseHash("#source=prod-1&view=locks");
+  expect("source" in parsed).toBe(false);
+  expect(parsed.view).toBe("locks");
 });
 
 test("defaults when hash empty", () => {
