@@ -57,11 +57,14 @@ jobs:
           git diff --exit-code -- web/src/api/schema.d.ts
       - name: Verify the committed UI asset tarball is current
         run: |
-          make web-frontend
           # Compare content, not bytes: gzip streams vary across zlib builds,
-          # so two identical builds can produce different tarballs.
+          # so two identical builds can produce different tarballs. Extract the
+          # COMMITTED tarball first — `make web-frontend` overwrites it in the
+          # working tree, so extracting afterwards would diff build vs build.
           tmp=$(mktemp -d)
-          tar -xzf bins/pg_kronika-web/static.tar.gz -C "$tmp"
+          git show HEAD:bins/pg_kronika-web/static.tar.gz > "$tmp/committed.tar.gz"
+          tar -xzf "$tmp/committed.tar.gz" -C "$tmp"
+          make web-frontend
           diff -r --exclude='*.map' "$tmp" bins/pg_kronika-web/static
       - name: Verify the UI bundle stays within the size budget
         run: make web-bundle-budget

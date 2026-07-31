@@ -8,6 +8,8 @@ export interface HeaderProps {
   state: UiState;
   context: ContextResponse | undefined;
   incidents: IncidentsResponse | undefined;
+  /** Canonical share URL with the absolute cursor time fixed (LIVE-safe). */
+  shareUrl: string;
   dataHealthOpen: boolean;
   onToggleDataHealth: () => void;
   onOpenIncidents: () => void;
@@ -19,8 +21,9 @@ type DataHealth = "ok" | "partial" | "unknown";
 
 function dataHealth(quality: ContextQuality | undefined): DataHealth {
   if (!quality) return "unknown";
-  if (quality.status === "complete" && quality.gaps.length === 0) return "ok";
-  if (quality.gaps.length > 0 || quality.gated.length > 0) return "partial";
+  // Show the API status as it is — no client-side re-classification.
+  if (quality.status === "complete") return "ok";
+  if (quality.status === "partial") return "partial";
   return "unknown";
 }
 
@@ -56,7 +59,7 @@ function Clock() {
   );
 }
 
-function CopyLinkButton() {
+function CopyLinkButton(props: { url: string }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -67,7 +70,7 @@ function CopyLinkButton() {
     [],
   );
   const copy = () => {
-    void navigator.clipboard.writeText(window.location.href);
+    void navigator.clipboard.writeText(props.url);
     setCopied(true);
     if (timer.current !== null) clearTimeout(timer.current);
     timer.current = setTimeout(() => setCopied(false), 1700);
@@ -181,16 +184,14 @@ export function Header(props: HeaderProps) {
   const to = props.state.at ?? String(Date.now() * 1000);
   const from = String(Number(to) - props.state.span * 1_000_000);
 
-  // IncidentFindingResponse has no severity field — only role/confidence
-  // (see web/src/api/schema.d.ts). Approximation: an incident counts as
-  // critical when any of its findings has confidence "high", otherwise it
-  // counts as a warning. Incidents without findings are not counted.
+  // Incident severity is the server's typed verdict (`level` with
+  // `level_policy_revision`), never a client-side approximation from finding
+  // confidence — confidence and severity are different axes.
   let critical = 0;
   let warning = 0;
   for (const inc of props.incidents?.incidents ?? []) {
-    if (inc.findings.length === 0) continue;
-    if (inc.findings.some((f) => f.confidence === "high")) critical += 1;
-    else warning += 1;
+    if (inc.level === "critical") critical += 1;
+    else if (inc.level === "warning") warning += 1;
   }
 
   return (
@@ -252,7 +253,7 @@ export function Header(props: HeaderProps) {
 
       <span style={{ flex: 1 }} />
       <Clock />
-      <CopyLinkButton />
+      <CopyLinkButton url={props.shareUrl} />
     </header>
   );
 }

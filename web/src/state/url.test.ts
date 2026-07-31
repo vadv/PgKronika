@@ -37,12 +37,22 @@ test("roundtrips fully populated state", () => {
   expect(parseHash(toHash(state))).toEqual(state);
 });
 
-test("q is parsed from the hash but never serialized", () => {
-  expect(parseHash("#q=calls%3E100").q).toBe("calls>100");
+test("q is transient: neither parsed nor serialized", () => {
+  expect(parseHash("#q=calls%3E100").q).toBeNull();
   const state = fullState({ q: "calls>100" });
   expect(toHash(state)).not.toContain("q=");
-  // Explicit roundtrip: the free-text filter is lost after toHash→parseHash.
   expect(parseHash(toHash(state))).toEqual(fullState({ q: null }));
+});
+
+test("invalid at/baseline fall back to null instead of crashing BigInt", () => {
+  for (const bad of ["abc", "1e15", "12.5", "2024-01-01", "", " "]) {
+    expect(parseHash(`#at=${encodeURIComponent(bad)}`).at).toBeNull();
+    expect(
+      parseHash(`#baseline=${encodeURIComponent(bad)}`).baseline,
+    ).toBeNull();
+  }
+  expect(parseHash("#at=1722400000000000").at).toBe("1722400000000000");
+  expect(parseHash("#baseline=-3600000000").baseline).toBe("-3600000000");
 });
 
 test("source is not part of the URL contract", () => {

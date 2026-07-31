@@ -60,6 +60,7 @@ function renderHeader(overrides: Partial<HeaderProps> = {}) {
     state,
     context: undefined,
     incidents: undefined,
+    shareUrl: "https://pgkronika.local/#view=activity&at=1722400000000000",
     dataHealthOpen: false,
     onToggleDataHealth: () => {},
     onOpenIncidents: () => {},
@@ -174,7 +175,7 @@ test("opens the data health popover when dataHealthOpen", async () => {
   await waitFor(() => expect(screen.getByRole("dialog")).toBeDefined());
 });
 
-test("counts critical incidents by high-confidence findings", () => {
+test("counts incidents by the server level verdict, not confidence", () => {
   const onOpenIncidents = vi.fn();
   renderHeader({
     onOpenIncidents,
@@ -182,20 +183,20 @@ test("counts critical incidents by high-confidence findings", () => {
       incidents: [
         makeIncident({
           incident_key: "i1",
-          findings: [makeIncidentFinding({ confidence: "high" })],
-        }),
-        makeIncident({
-          incident_key: "i2",
+          level: "critical",
           findings: [makeIncidentFinding({ confidence: "low" })],
         }),
         makeIncident({
-          incident_key: "i3",
-          findings: [
-            makeIncidentFinding({ confidence: "medium" }),
-            makeIncidentFinding({ confidence: "high" }),
-          ],
+          incident_key: "i2",
+          level: "warning",
+          findings: [makeIncidentFinding({ confidence: "high" })],
         }),
-        makeIncident({ incident_key: "i4", findings: [] }),
+        makeIncident({
+          incident_key: "i3",
+          level: "critical",
+          findings: [makeIncidentFinding({ confidence: "medium" })],
+        }),
+        makeIncident({ incident_key: "i4", level: "info", findings: [] }),
       ],
     }),
   });
@@ -206,6 +207,16 @@ test("counts critical incidents by high-confidence findings", () => {
   fireEvent.click(crit);
   fireEvent.click(warn);
   expect(onOpenIncidents).toHaveBeenCalledTimes(2);
+});
+
+test("no incident chips when all incidents are info-level", () => {
+  renderHeader({
+    incidents: makeIncidentsResponse({
+      incidents: [makeIncident({ level: "info" })],
+    }),
+  });
+  expect(screen.queryByTestId("incidents-critical")).toBeNull();
+  expect(screen.queryByTestId("incidents-warning")).toBeNull();
 });
 
 test("no incident chips when there are no incidents with findings", () => {
@@ -227,7 +238,7 @@ test("clock ticks every second", () => {
   expect(before).not.toBe(after);
 });
 
-test("copy link writes the location and shows a toast for 1.7s", () => {
+test("copy link writes the canonical share URL and shows a toast for 1.7s", () => {
   vi.useFakeTimers();
   const writeText = vi.fn().mockResolvedValue(undefined);
   Object.defineProperty(navigator, "clipboard", {
@@ -236,7 +247,9 @@ test("copy link writes the location and shows a toast for 1.7s", () => {
   });
   renderHeader();
   fireEvent.click(screen.getByRole("button", { name: /copyLink/ }));
-  expect(writeText).toHaveBeenCalledWith(window.location.href);
+  expect(writeText).toHaveBeenCalledWith(
+    "https://pgkronika.local/#view=activity&at=1722400000000000",
+  );
   expect(screen.getByTestId("toast").textContent).toContain("linkCopied");
   act(() => {
     vi.advanceTimersByTime(1700);

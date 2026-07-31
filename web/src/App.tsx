@@ -26,6 +26,10 @@ const HOUR_US = 3_600_000_000n;
 /** Arrow keys step through 1/48 of the active span. */
 const STEP_DIVISOR = 48n;
 const MOBILE_QUERY = "(max-width: 760px)";
+/** LIVE cursor tick: the shared `at` advances on this interval, not per
+ * render — query keys stay stable between ticks and all panels read the
+ * same snapshot time. */
+const LIVE_TICK_MS = 15_000;
 
 function useMobile(): boolean {
   return useSyncExternalStore(
@@ -80,9 +84,25 @@ function Shell() {
   }, []);
 
   // int64 µs cursors travel as decimal strings; all math goes through BigInt.
-  const at = state.at ?? String(Date.now() * 1000);
+  // LIVE `at` is pinned to a tick: recomputing Date.now() per render would
+  // give summary and heatmap different times and storm refetches on any
+  // unrelated setState.
+  const [liveAt, setLiveAt] = useState(() => String(Date.now() * 1000));
+  useEffect(() => {
+    const id = setInterval(
+      () => setLiveAt(String(Date.now() * 1000)),
+      LIVE_TICK_MS,
+    );
+    return () => clearInterval(id);
+  }, []);
+  const at = state.at ?? liveAt;
   const incidentsRange = {
     from: (BigInt(at) - INCIDENTS_WINDOW_US).toString(),
+    to: at,
+  };
+  // Heatmap/spine window follows the zoom span (capped at the 24 h API bound).
+  const heatmapRange = {
+    from: (BigInt(at) - BigInt(state.span) * 1_000_000n).toString(),
     to: at,
   };
 
@@ -99,7 +119,13 @@ function Shell() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // A component that already handled the key (slider, button) owns it.
+      if (e.defaultPrevented) return;
       if (isEditableTarget(e.target)) return;
+      // Enter/Space on a focused button belong to the button, not to
+      // global shortcuts.
+      const onButton =
+        e.target instanceof HTMLElement && e.target.tagName === "BUTTON";
       if (e.key >= "1" && e.key <= "9") {
         const view = views[Number(e.key) - 1];
         if (view !== undefined && view.availability === "available") {
@@ -108,6 +134,7 @@ function Shell() {
         return;
       }
       if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        if (onButton) return;
         e.preventDefault();
         const step = e.shiftKey
           ? HOUR_US
@@ -117,11 +144,13 @@ function Shell() {
         return;
       }
       if (e.key === " ") {
+        if (onButton) return;
         e.preventDefault();
-        patch({ at: state.at === null ? String(Date.now() * 1000) : null });
+        patch({ at: state.at === null ? at : null });
         return;
       }
       if (e.key === "Enter") {
+        if (onButton) return;
         if (state.entity !== null) patch({ dock: "row" });
         return;
       }
@@ -153,6 +182,9 @@ function Shell() {
         state={state}
         context={context.data}
         incidents={incidents.data}
+        // Share always carries the absolute cursor time: a LIVE link must
+        // reproduce this exact screen for the recipient.
+        shareUrl={`${location.origin}${location.pathname}${toHash({ ...state, at })}`}
         dataHealthOpen={dataHealthOpen}
         onToggleDataHealth={() => setDataHealthOpen((open) => !open)}
         onOpenIncidents={() => patch({ dock: "incidents" })}
@@ -201,8 +233,8 @@ function Shell() {
               metric={
                 metricByView[activeView.code] ?? activeView.canonical_metric
               }
-              from={incidentsRange.from}
-              to={incidentsRange.to}
+              from={heatmapRange.from}
+              to={heatmapRange.to}
               onMetricChange={(m) =>
                 setMetricByView((prev) => ({ ...prev, [activeView.code]: m }))
               }
@@ -241,6 +273,7 @@ function Shell() {
       <DockOverlay
         state={state}
         view={activeView}
+        at={at}
         onClose={() => patch({ dock: null })}
         onSelectIncident={(focus) => patch({ focus })}
         onPatch={patch}

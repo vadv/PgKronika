@@ -1,11 +1,30 @@
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
 import { useHeatmap } from "../api/heatmap";
-import type { ViewSpec } from "../api/types";
+import type { HeatmapQuality, ViewSpec } from "../api/types";
 import { heatColor } from "./heatmapColor";
 
 function formatValue(v: number): string {
   return String(Number(v.toFixed(v < 10 ? 2 : 0)));
+}
+
+/** Localized breakdown of heatmap quality reasons for the partial chip:
+ * a bare "partial data" gives the operator nothing to act on. */
+function qualityReasons(
+  quality: HeatmapQuality,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  const parts: string[] = [];
+  const push = (code: string, count: number) => {
+    if (count > 0) parts.push(t(`heatmap.quality.${code}`, { count }));
+  };
+  push("gaps", quality.gaps.length);
+  push("gated", quality.gated.length);
+  push("unavailable_revision", quality.unavailable_revision.length);
+  push("resource_limited", quality.resource_limited.length);
+  push("unbounded_segments", quality.unbounded_segments.length);
+  if (quality.active_tail) parts.push(t("heatmap.quality.active_tail"));
+  return parts.join("\n");
 }
 
 export function HeatmapStrip(props: {
@@ -67,7 +86,10 @@ export function HeatmapStrip(props: {
           (heatmap.data.quality.gaps.length > 0 ||
             (heatmap.data.quality.status !== "complete" &&
               !heatmap.data.quality.active_tail)) && (
-            <span style={{ color: "var(--sev-warn)" }}>
+            <span
+              title={qualityReasons(heatmap.data.quality, t)}
+              style={{ color: "var(--sev-warn)", whiteSpace: "pre-line" }}
+            >
               {t("heatmap.partial")}
             </span>
           )}

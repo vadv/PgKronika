@@ -22,6 +22,7 @@ export type VersionResponse = components["schemas"]["VersionResponse"];
 export type FrameValue = components["schemas"]["FrameValue"];
 export type ClassificationResultDto =
   components["schemas"]["ClassificationResultDto"];
+export type EvidenceDto = components["schemas"]["EvidenceDto"];
 export type CellClassificationDto =
   components["schemas"]["CellClassificationDto"];
 export type FrameColumnDto = components["schemas"]["FrameColumnDto"];

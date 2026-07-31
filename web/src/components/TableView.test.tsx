@@ -154,3 +154,107 @@ test("shows the empty state when the frame has no rows", async () => {
   renderTable();
   await waitFor(() => expect(screen.getByText("table.empty")).toBeDefined());
 });
+
+test("verdict cell carries level color and the mechanical why in the title", async () => {
+  stubFrame(
+    makeFrameResponse({
+      columns: [makeFrameColumn({ code: "xact", type: "i64" })],
+      rows: [
+        makeFrameRow({
+          cells: [42],
+          classifications: [
+            {
+              column: "xact",
+              metric: "xact_age",
+              result: {
+                level: "critical",
+                status: "classified",
+                boundary: { operator: ">", value: 10 },
+                evidence: { kind: "scalar", observed: 42 },
+              },
+            },
+          ],
+          cell_statuses: [{ status: "available", reason: null }],
+        }),
+      ],
+      page: { matched: 1, returned: 1 },
+    }),
+  );
+  renderTable();
+  const cell = await screen.findByText("42");
+  expect(cell.style.color).toBe("var(--sev-crit)");
+  expect(cell.getAttribute("title")).toBe("critical: > 10 · observed 42");
+});
+
+test("410 cursor expiry refetches the first page automatically", async () => {
+  const page1 = () =>
+    makeFrameResponse({
+      columns: [makeFrameColumn({ code: "xact", type: "i64" })],
+      rows: [makeFrameRow({ entity: "db:1", cells: [5] })],
+      page: { matched: 2, returned: 1, next: "cursor-1" },
+    });
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    if (url.includes("cursor=cursor-1")) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ code: "cursor_expired" }), {
+          status: 410,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return Promise.resolve(
+      new Response(JSON.stringify(page1()), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  // No retries: the expiry must surface immediately, not after backoff.
+  const noRetryWrapper = ({ children }: { children: ReactNode }) =>
+    createElement(
+      QueryClientProvider,
+      {
+        client: new QueryClient({
+          defaultOptions: { queries: { retry: false } },
+        }),
+      },
+      children,
+    );
+  const props: TableViewProps = {
+    view: makeViewSpec({ code: "activity", columns }),
+    at: "1722400000000000",
+    span: 3600,
+    preset: null,
+    q: null,
+    sort: null,
+    order: null,
+    entity: null,
+    onSort: () => {},
+    onSelectRow: () => {},
+  };
+  render(<TableView {...props} />, { wrapper: noRetryWrapper });
+  await waitFor(() => expect(screen.getByText("5")).toBeDefined());
+  fireEvent.click(screen.getByRole("button", { name: "table.more" }));
+  // The expiry notice appears while the fresh first page is requested…
+  await waitFor(() =>
+    expect(screen.getByText("table.cursor_expired")).toBeDefined(),
+  );
+  // …and is replaced by the restored first page of the same intent.
+  await waitFor(() =>
+    expect(screen.queryByText("table.cursor_expired")).toBeNull(),
+  );
+  expect(screen.getByText("5")).toBeDefined();
+  const cursorCalls = fetchMock.mock.calls.filter(([u]) => {
+    const url =
+      typeof u === "string" ? u : u instanceof Request ? u.url : u.href;
+    return url.includes("cursor=cursor-1");
+  }).length;
+  expect(cursorCalls).toBe(1);
+});

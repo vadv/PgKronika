@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ApiError } from "../api/client";
 import { useEntity } from "../api/entity";
 import { useIncidents } from "../api/incidents";
 import type {
+  EntitySnapshotDto,
   EntityHistoryResponse,
   EntityPointResponse,
   FrameValue,
@@ -16,27 +18,23 @@ import { formatIntervalTime } from "./FocusBar";
 export interface DockOverlayProps {
   state: UiState;
   view: ViewSpec | undefined;
+  /** Shared cursor time (pinned LIVE tick from App) — never a local Date.now(). */
+  at: string;
   onClose: () => void;
   onSelectIncident: (key: string | null) => void;
   onPatch: (patch: Partial<UiState>) => void;
 }
 
-/** Finding confidence → accent color used for borders and labels. */
-function confidenceColor(confidence: string): string {
-  if (confidence === "high") return "var(--sev-crit)";
-  if (confidence === "medium") return "var(--sev-warn)";
+/** Server incident level → color: the only severity source for incidents. */
+function levelColor(level: string): string {
+  if (level === "critical") return "var(--sev-crit)";
+  if (level === "warning") return "var(--sev-warn)";
   return "var(--border)";
 }
 
 /** Entity field status → color: honest null/missing fields stay dim. */
 function fieldStatusColor(status: string): string {
   return status === "available" ? "var(--fg)" : "var(--fg-dim)";
-}
-
-function maxConfidence(incident: IncidentResponse): string {
-  if (incident.findings.some((f) => f.confidence === "high")) return "high";
-  if (incident.findings.some((f) => f.confidence === "medium")) return "medium";
-  return "low";
 }
 
 function formatCell(value: FrameValue): string {
@@ -76,18 +74,21 @@ function scopeViewCode(
     : undefined;
 }
 
-/** µs window derived from the cursor state: [at - span, at], at = now when LIVE. */
-function stateWindow(state: UiState): { from: string; to: string } {
-  const to = state.at ?? String(Date.now() * 1000);
-  const from = String(Number(to) - state.span * 1e6);
-  return { from, to };
+/** µs window [at - span, at] over the shared cursor time (exact BigInt math). */
+function stateWindow(at: string, span: number): { from: string; to: string } {
+  return {
+    from: (BigInt(at) - BigInt(span) * 1_000_000n).toString(),
+    to: at,
+  };
 }
 
 const dockStyle = {
   position: "fixed",
   insetBlock: 0,
   insetInlineEnd: 0,
-  width: "clamp(400px, 32vw, 560px)",
+  // min() keeps the dock inside narrow viewports: on mobile triage
+  // (<760px) the dock is the only path to incidents/findings.
+  width: "min(100vw, clamp(400px, 32vw, 560px))",
   background: "var(--bg-raised)",
   borderInlineStart: "1px solid var(--border)",
   color: "var(--fg)",
@@ -120,7 +121,6 @@ function FindingCard(props: {
       data-finding
       style={{
         border: "1px solid var(--border)",
-        borderInlineStart: `3px solid ${confidenceColor(finding.confidence)}`,
         borderRadius: "4px",
         padding: "6px 8px",
         marginBlockEnd: "6px",
@@ -131,13 +131,14 @@ function FindingCard(props: {
           {finding.lens_id}
         </span>
         <span style={{ color: "var(--fg-dim)" }}>{finding.role}</span>
+        {/* Confidence is shown as a neutral localized label — it is an
+            evidence attribute, not a severity verdict. */}
         <span
-          style={{
-            fontFamily: "var(--mono-font)",
-            color: confidenceColor(finding.confidence),
-          }}
+          style={{ fontFamily: "var(--mono-font)", color: "var(--fg-dim)" }}
         >
-          {finding.confidence}
+          {t(`dock.finding.confidence.${finding.confidence}`, {
+            defaultValue: finding.confidence,
+          })}
         </span>
       </div>
       <div style={{ fontFamily: "var(--mono-font)", color: "var(--fg-dim)" }}>
@@ -244,13 +245,14 @@ function IncidentDetail(props: {
 
 function IncidentsDock(props: {
   state: UiState;
+  at: string;
   viewCode: string | undefined;
   onSelectIncident: (key: string | null) => void;
   onPatch: (patch: Partial<UiState>) => void;
 }) {
   const { t } = useTranslation();
   const [selected, setSelected] = useState<string | null>(null);
-  const { from, to } = stateWindow(props.state);
+  const { from, to } = stateWindow(props.at, props.state.span);
   const incidents = useIncidents({ from, to });
   const list = incidents.data?.incidents ?? [];
   const detail = selected
@@ -275,6 +277,32 @@ function IncidentsDock(props: {
 
   return (
     <div>
+      {incidents.isError && (
+        <div style={{ color: "var(--sev-warn)" }} role="alert">
+          {t("dock.incidents.error")}
+        </div>
+      )}
+      {incidents.isLoading && (
+        <div style={{ color: "var(--fg-dim)" }}>
+          {t("dock.incidents.loading")}
+        </div>
+      )}
+      {/* Analysis status comes first: findings are hypotheses until the
+          server completes evaluation. */}
+      {incidents.data !== undefined &&
+        incidents.data.analysis_status !== "complete" && (
+          <div
+            style={{
+              color: "var(--fg-dim)",
+              fontFamily: "var(--mono-font)",
+              marginBlockEnd: "6px",
+            }}
+          >
+            {t("dock.incidents.analysis", {
+              status: incidents.data.analysis_status,
+            })}
+          </div>
+        )}
       {incidents.isSuccess && list.length === 0 && (
         <div style={{ color: "var(--fg-dim)" }}>
           {t("dock.incidents.empty")}
@@ -292,7 +320,7 @@ function IncidentsDock(props: {
             textAlign: "start",
             background: "none",
             border: "1px solid var(--border)",
-            borderInlineStart: `3px solid ${confidenceColor(maxConfidence(incident))}`,
+            borderInlineStart: `3px solid ${levelColor(incident.level)}`,
             borderRadius: "4px",
             padding: "6px 8px",
             marginBlockEnd: "6px",
@@ -407,7 +435,11 @@ const historyCellStyle = {
   overflowWrap: "break-word",
 } as const;
 
-function EntityHistoryView(props: { data: EntityHistoryResponse }) {
+function EntityHistoryView(props: {
+  data: EntityHistoryResponse;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
+}) {
   const { t } = useTranslation();
   const { data } = props;
   return (
@@ -457,15 +489,24 @@ function EntityHistoryView(props: { data: EntityHistoryResponse }) {
         </tbody>
       </table>
       {data.page.next !== null && (
-        <div
+        <button
+          type="button"
+          disabled={props.loadingMore === true}
+          onClick={props.onLoadMore}
           style={{
-            color: "var(--fg-dim)",
+            color: "var(--accent)",
             fontFamily: "var(--mono-font)",
+            background: "none",
+            border: "none",
+            padding: "4px 0",
+            cursor: "pointer",
             marginBlockStart: "4px",
           }}
         >
-          {t("dock.row.morePages")}
-        </div>
+          {props.loadingMore === true
+            ? t("table.loading")
+            : t("dock.row.loadMore")}
+        </button>
       )}
     </div>
   );
@@ -477,14 +518,51 @@ function RowDock(props: {
   onPatch: (patch: Partial<UiState>) => void;
 }) {
   const { t } = useTranslation();
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [historyBase, setHistoryBase] = useState<string | null>(null);
+  const [extraSnapshots, setExtraSnapshots] = useState<EntitySnapshotDto[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const entityKey = `${props.state.view}:${props.state.entity ?? ""}`;
   const entity = useEntity({
     view: props.state.view,
     entity: props.state.entity ?? "",
     at: props.state.at ?? undefined,
+    includeRelated: true,
+    cursor: historyCursor,
   });
+  // History continuation: adopt the arrived page and fall back to the base
+  // query; accumulated snapshots reset when the entity changes.
+  useEffect(() => {
+    setHistoryCursor(null);
+    setExtraSnapshots([]);
+    setNextCursor(null);
+    setHistoryBase(entityKey);
+  }, [entityKey]);
+  useEffect(() => {
+    const data = entity.data;
+    if (data === undefined || !("snapshots" in data)) return;
+    if (historyCursor !== null) {
+      setExtraSnapshots((prev) => [...prev, ...data.snapshots]);
+      setNextCursor(data.page.next ?? null);
+      setHistoryCursor(null);
+    } else if (historyBase === entityKey && extraSnapshots.length === 0) {
+      setNextCursor(data.page.next ?? null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entity.data, historyCursor, entityKey, historyBase]);
   const viewCode = props.view?.code ?? props.state.view;
   const data = props.state.entity === null ? undefined : entity.data;
-  const missing = props.state.entity === null || entity.isError;
+  const apiError = entity.error instanceof ApiError ? entity.error : null;
+  // Only a typed not-found means "no such entity"; any other failure is an
+  // error state, not absence.
+  const notFound =
+    apiError !== null &&
+    (apiError.code === "entity_not_found" ||
+      apiError.code === "view_gone" ||
+      apiError.status === 404 ||
+      apiError.status === 410);
+  const failed = entity.isError && !notFound;
+  const missing = props.state.entity === null || notFound;
 
   return (
     <div>
@@ -501,6 +579,11 @@ function RowDock(props: {
       {missing && (
         <div style={{ color: "var(--fg-dim)" }}>{t("dock.row.missing")}</div>
       )}
+      {failed && (
+        <div style={{ color: "var(--sev-warn)" }} role="alert">
+          {t("dock.row.error")}
+        </div>
+      )}
       {data && data.quality.status !== "complete" && (
         <div
           style={{
@@ -513,40 +596,48 @@ function RowDock(props: {
         </div>
       )}
       {data && "fields" in data && <EntityPointView data={data} />}
-      {data && "snapshots" in data && <EntityHistoryView data={data} />}
-      <div style={{ display: "flex", gap: "8px", marginBlockStart: "8px" }}>
-        {viewCode === "statements" && (
-          <button
-            type="button"
-            onClick={() =>
-              props.onPatch({
-                view: "plans",
-                q: props.state.entity,
-                dock: "row",
-                entity: null,
-              })
-            }
-            style={drillButtonStyle}
-          >
-            {t("dock.row.drill", { view: "plans" })}
-          </button>
-        )}
-        {viewCode === "tables" && (
-          <button
-            type="button"
-            onClick={() =>
-              props.onPatch({
-                view: "indexes",
-                q: props.state.entity,
-                dock: "row",
-                entity: null,
-              })
-            }
-            style={drillButtonStyle}
-          >
-            {t("dock.row.drill", { view: "indexes" })}
-          </button>
-        )}
+      {data && "snapshots" in data && (
+        <EntityHistoryView
+          data={{
+            ...data,
+            snapshots: [...data.snapshots, ...extraSnapshots],
+            page: { next: nextCursor },
+          }}
+          loadingMore={historyCursor !== null && entity.isLoading}
+          onLoadMore={
+            nextCursor !== null ? () => setHistoryCursor(nextCursor) : undefined
+          }
+        />
+      )}
+      <div
+        style={{
+          display: "flex",
+          gap: "8px",
+          marginBlockStart: "8px",
+          flexWrap: "wrap",
+        }}
+      >
+        {/* Drill-down follows only the server's provenance-backed `related`
+            list — never a client-side join by name/queryid via free text. */}
+        {data &&
+          "fields" in data &&
+          data.related.map((rel) => (
+            <button
+              key={`${rel.view}:${rel.entity}`}
+              type="button"
+              title={`${rel.relation} (${rel.provenance.kind}: ${rel.provenance.fields.join(", ")})`}
+              onClick={() =>
+                props.onPatch({
+                  view: rel.view,
+                  entity: rel.entity,
+                  dock: "row",
+                })
+              }
+              style={drillButtonStyle}
+            >
+              {t("dock.row.drill", { view: rel.view })}
+            </button>
+          ))}
         <button
           type="button"
           onClick={() => props.onPatch({ entity: null, dock: null })}
@@ -617,6 +708,7 @@ export function DockOverlay(props: DockOverlayProps) {
       {active === "incidents" ? (
         <IncidentsDock
           state={props.state}
+          at={props.at}
           viewCode={props.view?.code ?? props.state.view}
           onSelectIncident={props.onSelectIncident}
           onPatch={props.onPatch}
