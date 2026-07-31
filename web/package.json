@@ -8,7 +8,9 @@
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
     "lint": "eslint . --max-warnings 0",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "demo:stub": "node scripts/demo-stub.mjs",
+    "demo:shot": "node scripts/demo-shot.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
@@ -27,6 +29,7 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "globals": "^15.15.0",
     "jsdom": "^26.1.0",
+    "puppeteer-core": "^25.4.0",
     "typescript": "~5.9.2",
     "typescript-eslint": "^8.65.0",
     "vite": "^7.1.0",

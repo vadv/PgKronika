@@ -11,3 +11,6 @@ __pycache__/
 # Demo-stand artifacts
 /demo-data/
 /demo-image.tar
+
+# Web demo harness output
+web/demo/
