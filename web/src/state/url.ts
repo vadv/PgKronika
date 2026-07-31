@@ -1,7 +1,6 @@
 export type DockKind = "incidents" | "row";
 
 export interface UiState {
-  source: string;
   view: string;
   /** Cursor timestamp (int64 µs, decimal string); null = LIVE. */
   at: string | null;
@@ -11,7 +10,7 @@ export interface UiState {
   baseline: string | null;
   /** Active column preset code of the view. */
   preset: string | null;
-  /** Server-side filter query. */
+  /** Server-side filter query (transient: never serialized into the hash). */
   q: string | null;
   /** Sort column code and direction (server-side). */
   sort: string | null;
@@ -33,7 +32,6 @@ export function parseHash(hash: string): UiState {
   const order = params.get("order");
   const dock = params.get("dock");
   return {
-    source: params.get("source") ?? "local",
     view: params.get("view") ?? "activity",
     at: params.get("at"),
     span: SPANS.includes(span as (typeof SPANS)[number]) ? span : DEFAULT_SPAN,
@@ -50,13 +48,13 @@ export function parseHash(hash: string): UiState {
 
 export function toHash(state: UiState): string {
   const params = new URLSearchParams();
-  params.set("source", state.source);
   params.set("view", state.view);
   if (state.at !== null) params.set("at", state.at);
   if (state.span !== DEFAULT_SPAN) params.set("span", String(state.span));
   if (state.baseline !== null) params.set("baseline", state.baseline);
   if (state.preset !== null) params.set("preset", state.preset);
-  if (state.q !== null) params.set("q", state.q);
+  // `q` is transient on purpose: share URLs must not carry a free-text
+  // filter, so it is parsed from the hash but never written back.
   if (state.sort !== null) params.set("sort", state.sort);
   if (state.order !== null) params.set("order", state.order);
   if (state.focus !== null) params.set("focus", state.focus);
