@@ -46,11 +46,19 @@ pub(crate) fn resolve_snapshot_at(
     let mut descriptors = snapshot.sealed_descriptors().collect::<Vec<_>>();
     descriptors
         .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
-    for descriptor in descriptors {
+    // Newest-first: a descriptor whose coverage ends at or before the current
+    // best cannot improve it, and neither can anything older.
+    for descriptor in descriptors.iter().rev() {
         if descriptor.min_ts > at_us {
             continue;
         }
-        let (summary, _stats) = snapshot.read_ui_summary(&descriptor, &LIMIT)?;
+        if resolved
+            .as_ref()
+            .is_some_and(|current: &ResolvedSnapshotAt| descriptor.max_ts <= current.timestamp_us)
+        {
+            break;
+        }
+        let (summary, _stats) = snapshot.read_ui_summary(descriptor, &LIMIT)?;
         let upper = summary
             .snapshot_times()
             .partition_point(|timestamp| *timestamp <= at_us);
@@ -64,7 +72,7 @@ pub(crate) fn resolve_snapshot_at(
         {
             resolved = Some(ResolvedSnapshotAt {
                 timestamp_us,
-                descriptor,
+                descriptor: *descriptor,
             });
         }
     }
@@ -82,8 +90,19 @@ pub(crate) fn resolve_view_snapshot(
     let mut descriptors = snapshot.sealed_descriptors().collect::<Vec<_>>();
     descriptors
         .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
-    for descriptor in descriptors {
-        let (summary, _stats) = snapshot.read_ui_summary(&descriptor, &LIMIT)?;
+    // Newest-first with first-wins inserts (equivalent to the old ascending
+    // last-wins): once a runner-up exists, a descriptor ending at or before it
+    // — and anything older — cannot displace either neighbor candidate.
+    for descriptor in descriptors.iter().rev() {
+        let settled = snapshots
+            .iter()
+            .rev()
+            .nth(1)
+            .is_some_and(|(runner_up, _)| descriptor.max_ts <= *runner_up);
+        if settled {
+            break;
+        }
+        let (summary, _stats) = snapshot.read_ui_summary(descriptor, &LIMIT)?;
         let Some(view_summary) = summary
             .views()
             .iter()
@@ -96,22 +115,24 @@ pub(crate) fn resolve_view_snapshot(
             view.revision,
             view_summary.status(),
         );
-        if descriptor.min_ts <= at_us {
+        // The fallback belongs to the newest descriptor holding the view, which
+        // the reverse order visits first.
+        if fallback_quality.is_none() && descriptor.min_ts <= at_us {
             fallback_quality = Some(quality);
         }
         if view_summary.view_revision() != view.revision {
             continue;
         }
         let evidence = SnapshotEvidence {
-            descriptor,
+            descriptor: *descriptor,
             quality,
         };
         let local_neighbors = summary.snapshot_neighbors(view.code, at_us);
         if let Some(local_neighbors) = local_neighbors {
             if let Some(previous) = local_neighbors.previous {
-                snapshots.insert(previous, evidence);
+                snapshots.entry(previous).or_insert(evidence);
             }
-            snapshots.insert(local_neighbors.current, evidence);
+            snapshots.entry(local_neighbors.current).or_insert(evidence);
         }
         let local_next = local_neighbors.map_or_else(
             || {
