@@ -74,3 +74,39 @@ test("renders nothing when the only incompleteness is the active tail", () => {
   );
   expect(container.firstChild).toBeNull();
 });
+
+test("renders nothing when incompleteness is purely capability (gated)", () => {
+  const { container } = render(
+    <AlertBar
+      live={true}
+      summary={makeViewSummaryResponse({
+        quality: makeSummaryQuality({
+          status: "partial",
+          gaps: [],
+          gated: ["pg_store_plans"],
+          active_tail: false,
+        }),
+      })}
+    />,
+  );
+  expect(container.firstChild).toBeNull();
+});
+
+test("degradation alert spells out the reasons", () => {
+  render(
+    <AlertBar
+      live={true}
+      summary={makeViewSummaryResponse({
+        quality: makeSummaryQuality({
+          status: "partial",
+          gaps: [],
+          resource_limited: ["statements", "plans"],
+          active_tail: false,
+        }),
+      })}
+    />,
+  );
+  const alert = screen.getByRole("alert");
+  expect(alert.textContent).toContain("alertbar.stale");
+  expect(alert.textContent).toContain("alertbar.reasons.resource_limited");
+});

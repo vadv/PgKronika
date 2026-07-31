@@ -210,7 +210,12 @@
           }
         }
       ],
-      "canonical_metric": "active_fraction"
+      "canonical_metric": "active_fraction",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      }
     },
     {
       "view_code": 2,
@@ -430,7 +435,12 @@
           }
         }
       ],
-      "canonical_metric": "time"
+      "canonical_metric": "time",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      }
     },
     {
       "view_code": 3,
@@ -552,7 +562,12 @@
           }
         }
       ],
-      "canonical_metric": "time"
+      "canonical_metric": "time",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      }
     },
     {
       "view_code": 4,
@@ -758,7 +773,12 @@
           }
         }
       ],
-      "canonical_metric": "writes"
+      "canonical_metric": "writes",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      }
     },
     {
       "view_code": 5,
@@ -856,7 +876,12 @@
           }
         }
       ],
-      "canonical_metric": "scans"
+      "canonical_metric": "scans",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      }
     },
     {
       "view_code": 6,
@@ -961,7 +986,12 @@
           }
         }
       ],
-      "canonical_metric": "progress"
+      "canonical_metric": "progress",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      }
     },
     {
       "view_code": 7,
@@ -1108,7 +1138,12 @@
           }
         }
       ],
-      "canonical_metric": "cpu"
+      "canonical_metric": "cpu",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      }
     },
     {
       "view_code": 8,
@@ -1227,7 +1262,12 @@
           }
         }
       ],
-      "canonical_metric": "wait"
+      "canonical_metric": "wait",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      }
     },
     {
       "view_code": 9,
@@ -1345,7 +1385,12 @@
           }
         }
       ],
-      "canonical_metric": "count"
+      "canonical_metric": "count",
+      "capabilities": {
+        "detail": true,
+        "history": false,
+        "related": false
+      }
     }
   ]
 }

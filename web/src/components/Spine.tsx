@@ -18,7 +18,6 @@ export interface SpineProps {
 }
 
 /** The spine always shows the trailing 24 h of recording. */
-const WINDOW_US = 24 * 3600 * 1_000_000;
 /** Left gutter in px; aligns the axis with the heatmap rows below. */
 export const SPINE_GUTTER_PX = 158;
 const SVG_HEIGHT = 60;
@@ -31,16 +30,6 @@ const SPINE_BUCKETS = 96;
 /** Repeat shift-click within this share of the window clears the baseline. */
 const BASELINE_CLEAR_FRACTION = 0.02;
 
-const CRIT_CLASSES = [
-  "panic",
-  "sigkill",
-  "crash",
-  "disk_full",
-  "out_of_memory",
-  "deadlock",
-  "termination",
-];
-
 function eventSymbol(event: EventFact): string {
   const kind = event.event_kind.toLowerCase();
   if (kind.includes("checkpoint")) return "▲";
@@ -48,13 +37,6 @@ function eventSymbol(event: EventFact): string {
   if (kind.includes("autovacuum")) return "⚑";
   if (kind.includes("marker") || kind.includes("annotation")) return "◆";
   return "●";
-}
-
-function severityColor(event: EventFact): string {
-  const cls = event.notable_class.toLowerCase();
-  if (CRIT_CLASSES.some((c) => cls.includes(c))) return "var(--sev-crit)";
-  if (cls === "info" || cls === "ok") return "var(--sev-ok)";
-  return "var(--sev-warn)";
 }
 
 function pointY(fraction: number): number {
@@ -76,9 +58,14 @@ interface BucketGeometry {
   bucketSpanUs: number;
 }
 
-function bucketX(geom: BucketGeometry, index: number, fromUs: number): number {
+function bucketX(
+  geom: BucketGeometry,
+  index: number,
+  fromUs: number,
+  windowUs: number,
+): number {
   const mid = geom.gridFromUs + (index + 0.5) * geom.bucketSpanUs;
-  return ((mid - fromUs) / WINDOW_US) * SVG_WIDTH;
+  return ((mid - fromUs) / windowUs) * SVG_WIDTH;
 }
 
 /** Contiguous non-null runs of the series, as SVG `points` strings. */
@@ -86,6 +73,7 @@ function seriesSegments(
   series: SpineSeries,
   geom: BucketGeometry,
   fromUs: number,
+  windowUs: number,
 ): string[] {
   const n = series.values.length;
   if (n === 0) return [];
@@ -104,7 +92,7 @@ function seriesSegments(
       current = [];
       return;
     }
-    const x = bucketX(geom, i, fromUs);
+    const x = bucketX(geom, i, fromUs, windowUs);
     const y = pointY(v / scale);
     current.push(`${x.toFixed(1)},${y.toFixed(1)}`);
   });
@@ -124,14 +112,19 @@ export function Spine(props: SpineProps) {
   }, [live]);
 
   const toUs = props.at !== null ? Number(props.at) : nowUs;
-  const fromUs = toUs - WINDOW_US;
-  const from = String(fromUs);
-  const to = String(toUs);
+  // Wire range follows the zoom span (exact BigInt math); the 24 h bound is
+  // enforced by the span whitelist in the URL codec.
+  const windowUs = BigInt(props.span) * 1_000_000n;
+  const toBig = props.at !== null ? BigInt(props.at) : BigInt(nowUs);
+  const from = (toBig - windowUs).toString();
+  const to = toBig.toString();
+  const windowNum = props.span * 1_000_000;
+  const fromUs = toUs - windowNum;
 
   const spine = useTimelineSpine({ from, to, buckets: SPINE_BUCKETS });
   const events = useTimelineEvents({ from, to, limit: 50 });
 
-  const cursorX = (us: number) => ((us - fromUs) / WINDOW_US) * SVG_WIDTH;
+  const cursorX = (us: number) => ((us - fromUs) / windowNum) * SVG_WIDTH;
   const primary = spine.data ? pickPrimarySeries(spine.data.series) : null;
   const geom: BucketGeometry | null = spine.data
     ? {
@@ -143,7 +136,7 @@ export function Spine(props: SpineProps) {
     : null;
   const segments =
     primary !== null && geom !== null
-      ? seriesSegments(primary, geom, fromUs)
+      ? seriesSegments(primary, geom, fromUs, windowNum)
       : [];
   const baselineUs = props.baseline !== null ? Number(props.baseline) : null;
   const visibleEvents = (events.data?.events ?? []).filter((e) => {
@@ -154,7 +147,7 @@ export function Spine(props: SpineProps) {
   const pickUs = (e: React.MouseEvent<SVGSVGElement>): number => {
     const rect = e.currentTarget.getBoundingClientRect();
     const fraction = (e.clientX - rect.left) / rect.width;
-    return Math.round(fromUs + fraction * WINDOW_US);
+    return Math.round(fromUs + fraction * windowNum);
   };
 
   const onStripClick = (e: React.MouseEvent<SVGSVGElement>) => {
@@ -162,7 +155,7 @@ export function Spine(props: SpineProps) {
     if (e.shiftKey) {
       if (
         baselineUs !== null &&
-        Math.abs(us - baselineUs) <= BASELINE_CLEAR_FRACTION * WINDOW_US
+        Math.abs(us - baselineUs) <= BASELINE_CLEAR_FRACTION * windowNum
       ) {
         props.onSelectBaseline(null);
       } else {
@@ -175,7 +168,9 @@ export function Spine(props: SpineProps) {
 
   const onStripKeyDown = (e: React.KeyboardEvent<SVGSVGElement>) => {
     if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      // Own the key fully: the global handler must not also apply its step.
       e.preventDefault();
+      e.stopPropagation();
       const delta =
         e.key === "ArrowLeft" ? -KEYBOARD_STEP_US : KEYBOARD_STEP_US;
       props.onSelectAt(String(toUs + delta));
@@ -315,7 +310,7 @@ export function Spine(props: SpineProps) {
                 <circle
                   key={i}
                   data-testid="spine-missing-point"
-                  cx={bucketX(geom, i, fromUs)}
+                  cx={bucketX(geom, i, fromUs, windowNum)}
                   cy={SVG_HEIGHT - 8}
                   r={2}
                   fill="var(--sev-warn)"
@@ -365,8 +360,11 @@ export function Spine(props: SpineProps) {
                 y={SVG_HEIGHT - 10}
                 fontSize="10"
                 textAnchor="middle"
-                fill={severityColor(e)}
+                fill="var(--accent)"
               >
+                {/* Event markers are neutral: the API carries no event
+                    severity; verdicts belong to incidents. */}
+                <title>{`${e.event_kind} · ${new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "medium" }).format(new Date(ts / 1000))}`}</title>
                 {eventSymbol(e)}
               </text>
             );

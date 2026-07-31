@@ -9,7 +9,7 @@
 // wire int64 µs that the schema declares as decimal strings stay
 // strings, schema int64 JSON numbers stay numbers.
 //
-// The catalog fixture is the verbatim `GET /v1/ui/catalog` response of a live
+// The catalog fixture mirrors the `GET /v1/ui/catalog` response of a live
 // pg_kronika-web binary against an empty store (everything `gated`); the stub
 // flips every availability to "available" at load so all tabs render.
 
@@ -195,14 +195,14 @@ function spineSeries(code, unit, aggregation, base, spike, buckets, rand) {
   for (let b = 0; b < buckets; b++) {
     if (SPINE_GAP.includes(b)) {
       values.push(null);
-      value_statuses.push({ status: "missing", reason: "collector_restart" });
+      value_statuses.push({ status: "unavailable", reason: "producer_gap" });
       continue;
     }
     const wave = 0.5 + 0.3 * Math.sin((b / buckets) * Math.PI * 4 + phase);
     const peak = 1.8 * Math.exp(-((b - SPINE_PEAK) ** 2) / (2 * 2.5 ** 2));
     const noise = rand() * 0.12;
     values.push(Math.round(base * (wave + noise) + spike * peak));
-    value_statuses.push({ status: "ok", reason: null });
+    value_statuses.push({ status: "available", reason: null });
   }
   return { code, unit, aggregation, values, value_statuses };
 }
@@ -214,8 +214,8 @@ function spineResponse(params) {
   const rand = mulberry32(42);
 
   const series = [
-    spineSeries("host.load1", "loadavg", "max", 4.5, 14, buckets, rand),
-    spineSeries("pg.tps", "tps", "avg", 900, 3600, buckets, rand),
+    spineSeries("load_per_cpu", "ratio", "max", 0.28, 0.9, buckets, rand),
+    spineSeries("psi_io_some", "percent", "max", 1.5, 38, buckets, rand),
   ];
 
   const bucketUs = (to - from) / BigInt(buckets);
@@ -236,7 +236,7 @@ function spineResponse(params) {
             from +
             bucketUs * BigInt(SPINE_GAP[SPINE_GAP.length - 1] + 1)
           ).toString(),
-          reason: "collector_restart",
+          reason: "producer_gap",
         },
       ],
       gated: [],
@@ -1038,8 +1038,8 @@ function frameResponse(viewCode, params) {
       categorical_classifications: r.cat ?? [],
       cell_statuses: view.columns.map((c) =>
         (r.data[c.code] ?? null) === null
-          ? { status: "absent", reason: "no_value_at_snapshot" }
-          : { status: "ok", reason: null },
+          ? { status: "unavailable", reason: "not_observed" }
+          : { status: "available", reason: null },
       ),
       spark: sparkFor(r.entity, SPARK_SCALES[viewCode] ?? 100),
     })),
@@ -1078,8 +1078,8 @@ function entityResponse(viewCode, entity, params) {
         return {
           code: c.code,
           value,
-          status: value === null ? "absent" : "available",
-          reason: value === null ? "no_value_at_snapshot" : null,
+          status: value === null ? "not_collected" : "available",
+          reason: value === null ? "not_collected" : null,
         };
       }),
       related: [],
@@ -1104,10 +1104,10 @@ function entityResponse(viewCode, entity, params) {
         return value;
       }),
       statuses: columns.map((code) =>
-        (row.data[code] ?? null) === null ? "absent" : "ok",
+        (row.data[code] ?? null) === null ? "unavailable" : "available",
       ),
       reasons: columns.map((code) =>
-        (row.data[code] ?? null) === null ? "no_value_at_snapshot" : null,
+        (row.data[code] ?? null) === null ? "not_observed" : null,
       ),
     });
   }
@@ -1143,10 +1143,16 @@ function dataQualityResponse(params) {
       {
         from_us: String(to - 6 * 3600 * US),
         to_us: String(to - 6 * 3600 * US + 600 * US),
-        reason: "collector_restart",
+        reason: "producer_restart",
       },
     ],
     capabilities: [
+      ...catalog.views.map((view) => ({
+        code: view.code,
+        kind: "projection",
+        status: view.availability === "available" ? "available" : "unavailable",
+        reason: view.availability === "available" ? null : "not_collected",
+      })),
       { code: "lock_chain", kind: "lens", status: "available", reason: null },
       {
         code: "autovacuum_backlog",
@@ -1157,8 +1163,8 @@ function dataQualityResponse(params) {
       {
         code: "plan_regression",
         kind: "lens",
-        status: "skipped",
-        reason: "pg_store_plans extension not installed",
+        status: "unavailable",
+        reason: "not_collected",
       },
     ],
     integrity: {
@@ -1202,10 +1208,10 @@ function storageResponse() {
     },
     quality: { status: "complete", gated: [] },
     retention: {
-      status: "ok",
+      status: "known",
       configured_limit: 40 * GIB,
       effective_limit_bytes: 40 * GIB,
-      mode: "size",
+      mode: "fixed_bytes",
       reason: null,
     },
     used_bytes: {
@@ -1220,31 +1226,15 @@ function storageResponse() {
 
 // --- heatmap ---------------------------------------------------------------
 
-const ENTITIES = {
-  statements: [
-    ["stmt:7101", "UPDATE orders SET status=$1 WHERE id=$2"],
-    ["stmt:7102", "SELECT * FROM sessions WHERE user_id=$1"],
-    ["stmt:7103", "INSERT INTO events (ts,kind,payload) VALUES ($1,$2,$3)"],
-    ["stmt:7104", "SELECT count(*) FROM ledger WHERE account_id=$1"],
-    ["stmt:7105", "DELETE FROM cart_items WHERE expires_at < $1"],
-    [
-      "stmt:7106",
-      "SELECT o.id, o.total FROM orders o JOIN users u ON u.id=o.user_id",
-    ],
-    ["stmt:7107", "UPDATE inventory SET qty=qty-$1 WHERE sku=$2"],
-    ["stmt:7108", "VACUUM ANALYZE public.audit_log"],
-  ],
-  activity: [
-    ["pid:12041", "app/api-worker (active)"],
-    ["pid:12042", "app/api-worker (idle in transaction)"],
-    ["pid:12077", "app/reports (active)"],
-    ["pid:12105", "etl/loader (active)"],
-    ["pid:12130", "pgbouncer (idle)"],
-    ["pid:12131", "app/api-worker (active)"],
-    ["pid:12188", "autovacuum worker"],
-    ["pid:12201", "walwriter"],
-  ],
-};
+// Heatmap entities are derived from the same row generators the entity
+// endpoint resolves through — every heatmap row is drillable by construction
+// (no hand-maintained pid/token lists to drift apart).
+const ENTITIES = Object.fromEntries(
+  Object.entries(ROW_GENERATORS).map(([view, generate]) => [
+    view,
+    generate().map((row) => [row.entity, row.label]),
+  ]),
+);
 
 const METRIC_STYLE = {
   time: { unit: "ms", scale: 1200 },
@@ -1259,13 +1249,6 @@ const GAP_START = 20; // buckets 20..22 are null in every row
 const GAP_END = 22;
 const PEAK_BUCKET = 40; // hot peak
 
-function genericEntities(view) {
-  return Array.from({ length: 8 }, (_, i) => [
-    `${view}:e${i + 1}`,
-    `${view} entity ${i + 1}`,
-  ]);
-}
-
 function heatmapResponse(params) {
   const view = params.get("view") ?? "statements";
   const metric = params.get("metric") ?? "time";
@@ -1276,7 +1259,7 @@ function heatmapResponse(params) {
 
   const rand = mulberry32(42);
   const style = METRIC_STYLE[metric] ?? { unit: "count", scale: 1000 };
-  const entities = (ENTITIES[view] ?? genericEntities(view)).slice(0, top);
+  const entities = (ENTITIES[view] ?? []).slice(0, top);
 
   const rows = entities.map(([entity, label]) => {
     const phase = rand() * Math.PI * 2;
@@ -1393,7 +1376,7 @@ const server = createServer((req, res) => {
   const frameMatch = url.pathname.match(/^\/v1\/frame\/([^/]+)$/);
   if (frameMatch !== null) {
     const body = frameResponse(decodeURIComponent(frameMatch[1]), params);
-    if (body === null) return sendError(res, 404, "unknown_view");
+    if (body === null) return sendError(res, 410, "view_gone");
     return sendJson(res, body);
   }
 

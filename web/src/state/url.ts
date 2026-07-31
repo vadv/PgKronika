@@ -26,6 +26,15 @@ export interface UiState {
 export const DEFAULT_SPAN = 3600;
 export const SPANS = [900, 3600, 21600, 86400] as const;
 
+/** Signed decimal int64 — the only accepted wire form for µs timestamps. */
+const DECIMAL_US = /^-?\d+$/;
+
+/** Timestamp from the hash, or null when absent/invalid — an invalid value
+ * must fall back to the live default, never reach `BigInt()` in render. */
+function parseTimestampUs(raw: string | null): string | null {
+  return raw !== null && DECIMAL_US.test(raw) ? raw : null;
+}
+
 export function parseHash(hash: string): UiState {
   const params = new URLSearchParams(hash.replace(/^#/, ""));
   const span = Number(params.get("span"));
@@ -33,11 +42,12 @@ export function parseHash(hash: string): UiState {
   const dock = params.get("dock");
   return {
     view: params.get("view") ?? "activity",
-    at: params.get("at"),
+    at: parseTimestampUs(params.get("at")),
     span: SPANS.includes(span as (typeof SPANS)[number]) ? span : DEFAULT_SPAN,
-    baseline: params.get("baseline"),
+    baseline: parseTimestampUs(params.get("baseline")),
     preset: params.get("preset"),
-    q: params.get("q"),
+    // `q` is transient: never parsed from a foreign link, never serialized.
+    q: null,
     sort: params.get("sort"),
     order: order === "asc" || order === "desc" ? order : null,
     focus: params.get("focus"),
@@ -54,7 +64,7 @@ export function toHash(state: UiState): string {
   if (state.baseline !== null) params.set("baseline", state.baseline);
   if (state.preset !== null) params.set("preset", state.preset);
   // `q` is transient on purpose: share URLs must not carry a free-text
-  // filter, so it is parsed from the hash but never written back.
+  // filter, so it is neither parsed from the hash nor written back.
   if (state.sort !== null) params.set("sort", state.sort);
   if (state.order !== null) params.set("order", state.order);
   if (state.focus !== null) params.set("focus", state.focus);

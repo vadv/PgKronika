@@ -11,9 +11,9 @@ import { Spine, type SpineProps } from "./Spine";
 
 afterEach(() => vi.unstubAllGlobals());
 
-/** Fixed cursor; the spine always shows the trailing 24 h before it. */
+/** Fixed cursor; the spine window follows the zoom span (1 h here). */
 const AT_US = 1_722_500_000_000_000;
-const WINDOW_US = 86_400_000_000;
+const WINDOW_US = 3_600_000_000;
 const FROM_US = AT_US - WINDOW_US;
 
 const spineFixture = makeSpineResponse({
@@ -29,9 +29,9 @@ const spineFixture = makeSpineResponse({
       aggregation: "avg",
       values: [1, 0.5, null],
       value_statuses: [
-        { status: "ok", reason: null },
-        { status: "ok", reason: null },
-        { status: "missing", reason: "no_snapshots" },
+        { status: "available", reason: null },
+        { status: "available", reason: null },
+        { status: "unavailable", reason: "producer_gap" },
       ],
     },
   ],
@@ -124,7 +124,7 @@ test("renders gutter, load polyline, cursor and event markers", async () => {
   expect(points?.split(" ")).toHaveLength(2);
   // Missing bucket surfaces as a dot whose title carries the wire status.
   const missing = screen.getByTestId("spine-missing-point");
-  expect(missing.querySelector("title")?.textContent).toContain("no_snapshots");
+  expect(missing.querySelector("title")?.textContent).toContain("producer_gap");
   // Metric caption shows the selected series (untranslated key in tests).
   expect(screen.getByTestId("spine-metric").textContent).toContain(
     "spine.load",

@@ -81,9 +81,6 @@ export function DataHealthPopover(props: DataHealthPopoverProps) {
   const skipped = (dq?.capabilities ?? []).filter(
     (c) => c.status !== "available",
   );
-  const integrityBad = st
-    ? st.integrity.quarantined_entries > 0 || st.integrity.orphan_overviews > 0
-    : false;
 
   return (
     <div
@@ -188,9 +185,7 @@ export function DataHealthPopover(props: DataHealthPopoverProps) {
             </span>
           </Row>
           <Row label={t("popover.integrity")}>
-            <Square
-              color={integrityBad ? "var(--sev-warn)" : "var(--sev-ok)"}
-            />
+            <Square color="var(--fg)" />
             <span>
               {t("popover.readable")} {st.integrity.readable_segments} ·{" "}
               {t("popover.quarantined")} {st.integrity.quarantined_entries} ·{" "}

@@ -4,6 +4,7 @@ import { ApiError } from "../api/client";
 import { useFrame } from "../api/frame";
 import type {
   ClassificationResultDto,
+  EvidenceDto,
   FrameColumnDto,
   FrameRowDto,
   FrameValue,
@@ -92,6 +93,32 @@ function nullTitle(
   return `${result.status}: ${result.reason}`;
 }
 
+function formatEvidence(evidence: EvidenceDto): string {
+  switch (evidence.kind) {
+    case "scalar":
+      return `observed ${numberFormat.format(evidence.observed)}`;
+    case "fraction":
+      return `${numberFormat.format(evidence.numerator)}/${numberFormat.format(evidence.denominator)} (${numberFormat.format(evidence.value)})`;
+    default:
+      return evidence.kind;
+  }
+}
+
+/** Mechanical why for a verdict cell: level, rule boundary, evidence —
+ * the operator must never have to guess what the color means. */
+function whyTitle(
+  result: ClassificationResultDto | undefined,
+): string | undefined {
+  if (result === undefined || !("level" in result)) return undefined;
+  if (result.level !== "warning" && result.level !== "critical")
+    return undefined;
+  const rule =
+    result.boundary != null
+      ? ` ${result.boundary.operator} ${numberFormat.format(result.boundary.value)}`
+      : "";
+  return `${result.level}:${rule} · ${formatEvidence(result.evidence)}`;
+}
+
 const SPARK_WIDTH = 60;
 const SPARK_HEIGHT = 14;
 
@@ -134,7 +161,12 @@ function Sparkline(props: { spark: SparkDto }) {
 
 export function TableView(props: TableViewProps) {
   const { t } = useTranslation();
-  const [cursor, setCursor] = useState<string | null>(null);
+  // The continuation cursor belongs to the intent (frameKey) it was taken
+  // from; a stale cursor must never ride along with new key arguments.
+  const [cursorState, setCursorState] = useState<{
+    key: string;
+    value: string;
+  } | null>(null);
   const [pages, setPages] = useState<Pages | null>(null);
   const [cursorExpired, setCursorExpired] = useState(false);
   const [hovered, setHovered] = useState<string | null>(null);
@@ -152,6 +184,11 @@ export function TableView(props: TableViewProps) {
     .map((v) => v ?? "")
     .join("|");
 
+  const cursor =
+    cursorState !== null && cursorState.key === frameKey
+      ? cursorState.value
+      : null;
+
   const frame = useFrame({
     view: props.view.code,
     at: props.at,
@@ -167,7 +204,7 @@ export function TableView(props: TableViewProps) {
   // Fresh key arguments invalidate accumulated pages and the cursor.
   useEffect(() => {
     setPages((p) => (p === null || p.key === frameKey ? p : null));
-    setCursor(null);
+    setCursorState(null);
     setCursorExpired(false);
     lastMatched.current = null;
   }, [frameKey]);
@@ -181,7 +218,7 @@ export function TableView(props: TableViewProps) {
       rows: [...(p !== null && p.key === frameKey ? p.rows : []), ...data.rows],
       next: data.page.next ?? null,
     }));
-    setCursor(null);
+    setCursorState(null);
   }, [frame.data, cursor, frameKey]);
 
   // First page arrived: adopt it unless it is just the cached base of an
@@ -195,14 +232,17 @@ export function TableView(props: TableViewProps) {
         ? p
         : { key: frameKey, rows: data.rows, next: data.page.next ?? null },
     );
+    // The fresh first page after a cursor expiry replaces the dead one.
+    setCursorExpired(false);
     if (lastMatched.current !== data.page.matched) {
       lastMatched.current = data.page.matched;
       onMatched?.(data.page.matched);
     }
   }, [frame.data, cursor, frameKey, onMatched]);
 
-  // A stale cursor fails the follow-up request; keep the loaded rows and
-  // offer a reset instead of losing them.
+  // A stale cursor fails the follow-up request: drop the continuation AND
+  // the accumulated pages — the contract is an automatic refetch of the
+  // first page of the same intent plus an explicit notice, not stale rows.
   useEffect(() => {
     const error = frame.error;
     if (
@@ -210,7 +250,8 @@ export function TableView(props: TableViewProps) {
       error instanceof ApiError &&
       (error.code === "cursor_expired" || error.status === 410)
     ) {
-      setCursor(null);
+      setCursorState(null);
+      setPages(null);
       setCursorExpired(true);
     }
   }, [frame.error, cursor]);
@@ -218,14 +259,20 @@ export function TableView(props: TableViewProps) {
   const presetSpec = props.preset
     ? props.view.presets.find((p) => p.code === props.preset)
     : undefined;
-  const availability = new Map(
-    props.view.columns.map((c) => [c.code, c.availability]),
+  const columnMeta = new Map(
+    props.view.columns.map((c) => [
+      c.code,
+      { availability: c.availability, reason: c.unavailable_reason ?? null },
+    ]),
   );
 
   const columns: DisplayColumn[] = [];
   if (frame.data !== undefined) {
     frame.data.columns.forEach((column, cellIndex) => {
-      if (availability.get(column.code) === "available") {
+      // `hidden` columns are materialized only for sort/filter — never shown.
+      // Unavailable (gated/not_collected) columns stay visible as honest
+      // nulls with their availability reason instead of being dropped.
+      if (!column.hidden) {
         columns.push({ column, cellIndex });
       }
     });
@@ -287,30 +334,48 @@ export function TableView(props: TableViewProps) {
       >
         <thead>
           <tr>
-            {columns.map(({ column }) => (
-              <th key={column.code} style={headerCellStyle(column.code)}>
-                {SORTABLE_TYPES.has(column.type) ? (
-                  <button
-                    type="button"
-                    onClick={() => cycleSort(column.code)}
-                    style={{
-                      fontFamily: "var(--mono-font)",
-                      textTransform: "uppercase",
-                      color: "inherit",
-                      background: "none",
-                      border: "none",
-                      padding: 0,
-                      cursor: "pointer",
-                    }}
-                  >
-                    {column.code}
-                    {sortArrow(column.code)}
-                  </button>
-                ) : (
-                  `${column.code}`
-                )}
-              </th>
-            ))}
+            {columns.map(({ column }) => {
+              const meta = columnMeta.get(column.code);
+              const unavailable =
+                meta !== undefined && meta.availability !== "available";
+              return (
+                <th
+                  key={column.code}
+                  title={
+                    unavailable
+                      ? `${meta.availability}${meta.reason !== null ? `: ${meta.reason}` : ""}`
+                      : undefined
+                  }
+                  style={{
+                    ...headerCellStyle(column.code),
+                    color: unavailable
+                      ? "var(--fg-dim)"
+                      : headerCellStyle(column.code).color,
+                  }}
+                >
+                  {SORTABLE_TYPES.has(column.type) ? (
+                    <button
+                      type="button"
+                      onClick={() => cycleSort(column.code)}
+                      style={{
+                        fontFamily: "var(--mono-font)",
+                        textTransform: "uppercase",
+                        color: "inherit",
+                        background: "none",
+                        border: "none",
+                        padding: 0,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {column.code}
+                      {sortArrow(column.code)}
+                    </button>
+                  ) : (
+                    `${column.code}`
+                  )}
+                </th>
+              );
+            })}
             <th style={headerCellStyle("")}>{t("table.spark")}</th>
           </tr>
         </thead>
@@ -347,13 +412,22 @@ export function TableView(props: TableViewProps) {
                   const classification = row.classifications.find(
                     (c) => c.column === column.code,
                   );
+                  const cellStatus = row.cell_statuses[cellIndex];
+                  const meta = columnMeta.get(column.code);
                   return (
                     <td
                       key={column.code}
                       title={
                         value === null
-                          ? nullTitle(classification?.result)
-                          : undefined
+                          ? cellStatus !== undefined &&
+                            cellStatus.status !== "available"
+                            ? `${cellStatus.status}${cellStatus.reason !== null ? `: ${cellStatus.reason}` : ""}`
+                            : (nullTitle(classification?.result) ??
+                              (meta !== undefined &&
+                              meta.availability !== "available"
+                                ? `${meta.availability}${meta.reason !== null ? `: ${meta.reason}` : ""}`
+                                : undefined))
+                          : whyTitle(classification?.result)
                       }
                       style={{
                         padding: "2px 8px",
@@ -405,39 +479,20 @@ export function TableView(props: TableViewProps) {
       )}
       {cursorExpired && (
         <div
+          role="status"
           style={{
-            display: "flex",
-            gap: "8px",
-            alignItems: "center",
             padding: "8px",
             color: "var(--sev-warn)",
           }}
         >
           {t("table.cursor_expired")}
-          <button
-            type="button"
-            onClick={() => {
-              setPages(null);
-              setCursorExpired(false);
-              void frame.refetch();
-            }}
-            style={{
-              fontFamily: "var(--mono-font)",
-              color: "var(--fg)",
-              background: "var(--bg-raised)",
-              border: "1px solid var(--border)",
-              cursor: "pointer",
-            }}
-          >
-            {t("table.reset")}
-          </button>
         </div>
       )}
       {!cursorExpired && nextCursor !== null && (
         <button
           type="button"
           disabled={loadingMore}
-          onClick={() => setCursor(nextCursor)}
+          onClick={() => setCursorState({ key: frameKey, value: nextCursor })}
           style={{
             fontFamily: "var(--mono-font)",
             color: "var(--accent)",

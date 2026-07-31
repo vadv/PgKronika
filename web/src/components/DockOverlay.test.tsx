@@ -55,6 +55,7 @@ function renderDock(overrides: Partial<DockOverlayProps> = {}) {
   const props: DockOverlayProps = {
     state: baseState,
     view: makeViewSpec({ code: "activity" }),
+    at: baseState.at ?? "1722400000000000",
     onClose: () => {},
     onSelectIncident: () => {},
     onPatch: () => {},
@@ -196,13 +197,24 @@ test("row dock renders history snapshots when at is not set", async () => {
   expect(cells.some((c) => c.dataset.status === "not_collected")).toBe(true);
 });
 
-test("row dock drills down from statements to plans and clears", async () => {
+test("row dock drills down via server related provenance and clears", async () => {
   stubFetch(
     makeEntityPointResponse({
       view: "statements",
       entity: "db:1",
       fields: [
         { code: "query", reason: null, status: "available", value: "select 1" },
+      ],
+      related: [
+        {
+          view: "plans",
+          entity: "plan:9",
+          relation: "statement_plan",
+          provenance: {
+            kind: "field_equality",
+            fields: ["queryid", "dbid", "userid"],
+          },
+        },
       ],
     }),
   );
@@ -218,12 +230,13 @@ test("row dock drills down from statements to plans and clears", async () => {
     onPatch,
   });
   await waitFor(() => expect(screen.getByText("select 1")).toBeDefined());
+  // The drill target comes from the API related list — typed identity, no
+  // client-side join by name/queryid.
   fireEvent.click(screen.getByRole("button", { name: "dock.row.drill" }));
   expect(onPatch).toHaveBeenCalledWith({
     view: "plans",
-    q: "db:1",
+    entity: "plan:9",
     dock: "row",
-    entity: null,
   });
   fireEvent.click(screen.getByRole("button", { name: "dock.row.clear" }));
   expect(onPatch).toHaveBeenCalledWith({ entity: null, dock: null });

@@ -9,14 +9,36 @@ export interface AlertBarProps {
 export function AlertBar(props: AlertBarProps) {
   const { t } = useTranslation();
   const q = props.summary?.quality;
-  // The active tail (current, still-open snapshot window) is the normal LIVE
-  // state, not a defect — warning on it would make the banner permanent.
-  // Alert only on what the operator can act on: gaps or degradation NOT
-  // explained by the open tail.
-  const stale =
-    props.live &&
+  // The banner is reserved for what the operator can act on, with the reason
+  // spelled out — a permanent warning trains people to ignore it:
+  // - the active tail (still-open snapshot window) is the normal LIVE state;
+  // - purely capability states (gated inputs, e.g. a missing optional
+  //   extension) are availability facts, already shown in the tab bar and
+  //   the data-health chip — they are not a data emergency.
+  const degradation: string[] = [];
+  if (q !== undefined) {
+    if (q.gaps.length > 0)
+      degradation.push(t("alertbar.reasons.gaps", { count: q.gaps.length }));
+    if (q.unavailable_revision.length > 0)
+      degradation.push(
+        t("alertbar.reasons.unavailable_revision", {
+          count: q.unavailable_revision.length,
+        }),
+      );
+    if (q.resource_limited.length > 0)
+      degradation.push(
+        t("alertbar.reasons.resource_limited", {
+          count: q.resource_limited.length,
+        }),
+      );
+  }
+  const degradedLive =
     q !== undefined &&
-    (q.gaps.length > 0 || (q.status !== "complete" && !q.active_tail));
+    q.status !== "complete" &&
+    !q.active_tail &&
+    q.gated.length === 0;
+  const stale =
+    props.live && q !== undefined && (degradation.length > 0 || degradedLive);
   if (!stale) return null;
   return (
     <div
@@ -31,6 +53,7 @@ export function AlertBar(props: AlertBarProps) {
       }}
     >
       {t("alertbar.stale")}
+      {degradation.length > 0 ? ` — ${degradation.join(" · ")}` : ""}
     </div>
   );
 }
