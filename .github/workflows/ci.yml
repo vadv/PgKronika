@@ -58,7 +58,11 @@ jobs:
       - name: Verify the committed UI asset tarball is current
         run: |
           make web-frontend
-          git diff --exit-code -- bins/pg_kronika-web/static.tar.gz
+          # Compare content, not bytes: gzip streams vary across zlib builds,
+          # so two identical builds can produce different tarballs.
+          tmp=$(mktemp -d)
+          tar -xzf bins/pg_kronika-web/static.tar.gz -C "$tmp"
+          diff -r --exclude='*.map' "$tmp" bins/pg_kronika-web/static
       - name: Verify the UI bundle stays within the size budget
         run: make web-bundle-budget
 
