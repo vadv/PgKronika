@@ -69,7 +69,7 @@ pub(crate) struct InputSpec {
     pub logical_sections: Vec<&'static str>,
     /// Supported physical type IDs for the logical sections.
     pub type_ids: Vec<u32>,
-    /// Source-specific availability.
+    /// Store-observed availability.
     pub availability: Availability,
     /// Machine reason when the input is not available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,7 +106,7 @@ pub(crate) struct MetricSpec {
     pub formula: &'static str,
     /// Input groups required by the formula.
     pub requires: Vec<&'static str>,
-    /// Source-specific availability.
+    /// Store-observed availability.
     pub availability: Availability,
     /// Machine reason when the metric is not available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,7 +137,7 @@ pub(crate) struct ColumnSpec {
     pub lazy: bool,
     /// Input groups required by this column.
     pub requires: Vec<&'static str>,
-    /// Source-specific availability.
+    /// Store-observed availability.
     pub availability: Availability,
     /// Machine reason when the column is not available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,9 +188,8 @@ pub(crate) struct ViewSpec {
     pub scope: Scope,
     /// Typed identity encoding revision.
     pub identity_revision: u16,
-    /// Source-specific view availability.
+    /// Store-observed view availability.
     pub availability: Availability,
-    /// Supported detail API operations.
     pub capabilities: ViewCapabilities,
     /// Physical input families.
     pub inputs: Vec<InputSpec>,

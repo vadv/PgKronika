@@ -139,7 +139,7 @@ ColumnSpec:
   properties:
     availability:
       $ref: '#/Availability'
-      description: Source-specific availability.
+      description: Store-observed availability.
     code:
       description: Stable column code.
       type: string
@@ -340,13 +340,19 @@ ContextReplicationInstance:
       - 'null'
     streaming_replicas:
       format: int64
-      type: integer
+      type:
+      - integer
+      - 'null'
     timeline_id:
       format: int64
-      type: integer
+      type:
+      - integer
+      - 'null'
   required:
   - timeline_id
   - streaming_replicas
+  - replay_lag_us
+  - replay_lag_reason
   type: object
 ContextResponse:
   properties:
@@ -363,7 +369,9 @@ ContextResponse:
     replication:
       $ref: '#/ContextReplication'
     snapshot_ts_us:
-      type: string
+      type:
+      - string
+      - 'null'
   required:
   - snapshot_ts_us
   - instance
@@ -426,7 +434,9 @@ DataQualityIntegrityDto:
       - 'null'
     quarantined_entries:
       minimum: 0
-      type: integer
+      type:
+      - integer
+      - 'null'
     readable_segments:
       minimum: 0
       type: integer
@@ -1063,7 +1073,7 @@ InputSpec:
   properties:
     availability:
       $ref: '#/Availability'
-      description: Source-specific availability.
+      description: Store-observed availability.
     code:
       description: Stable input code referenced by metrics and columns.
       type: string
@@ -1131,7 +1141,7 @@ MetricSpec:
       type: string
     availability:
       $ref: '#/Availability'
-      description: Source-specific availability.
+      description: Store-observed availability.
     code:
       description: Stable metric code inside its view.
       type: string
@@ -1640,13 +1650,12 @@ ViewSpec:
   properties:
     availability:
       $ref: '#/Availability'
-      description: Source-specific view availability.
+      description: Store-observed view availability.
     canonical_metric:
       description: Metric used by the canonical row spark.
       type: string
     capabilities:
       $ref: '#/ViewCapabilities'
-      description: Supported detail API operations.
     code:
       description: Public URL and JSON code.
       type: string

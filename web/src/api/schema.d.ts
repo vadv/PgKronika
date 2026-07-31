@@ -614,7 +614,7 @@ export interface components {
         };
         /** @description One table or detail projection column. */
         ColumnSpec: {
-            /** @description Source-specific availability. */
+            /** @description Store-observed availability. */
             availability: components["schemas"]["Availability"];
             /** @description Stable column code. */
             code: string;
@@ -683,13 +683,13 @@ export interface components {
             replicas: components["schemas"]["ContextReplica"][];
         };
         ContextReplicationInstance: {
-            replay_lag_reason?: string | null;
+            replay_lag_reason: string | null;
             /** Format: int64 */
-            replay_lag_us?: number | null;
+            replay_lag_us: number | null;
             /** Format: int64 */
-            streaming_replicas: number;
+            streaming_replicas: number | null;
             /** Format: int64 */
-            timeline_id: number;
+            timeline_id: number | null;
         };
         ContextResponse: {
             databases: components["schemas"]["ContextDatabase"][];
@@ -697,7 +697,7 @@ export interface components {
             instance: components["schemas"]["ContextInstance"];
             quality: components["schemas"]["ContextQuality"];
             replication: components["schemas"]["ContextReplication"];
-            snapshot_ts_us: string;
+            snapshot_ts_us: string | null;
         };
         /** @description Published exact counter-pair fields. */
         CounterDeltaPayload: {
@@ -735,7 +735,7 @@ export interface components {
         DataQualityIntegrityDto: {
             corrupt_segments: number;
             last_catalog_refresh_us: string | null;
-            quarantined_entries: number;
+            quarantined_entries: number | null;
             readable_segments: number;
             status: components["schemas"]["IntegrityStatus"];
         };
@@ -1235,7 +1235,7 @@ export interface components {
         };
         /** @description One alternative group of physical inputs for a view. */
         InputSpec: {
-            /** @description Source-specific availability. */
+            /** @description Store-observed availability. */
             availability: components["schemas"]["Availability"];
             /** @description Stable input code referenced by metrics and columns. */
             code: string;
@@ -1303,7 +1303,7 @@ export interface components {
         MetricSpec: {
             /** @description Bucket aggregation across segments. */
             aggregation: string;
-            /** @description Source-specific availability. */
+            /** @description Store-observed availability. */
             availability: components["schemas"]["Availability"];
             /** @description Stable metric code inside its view. */
             code: string;
@@ -1652,11 +1652,10 @@ export interface components {
         };
         /** @description One stable UI projection. */
         ViewSpec: {
-            /** @description Source-specific view availability. */
+            /** @description Store-observed view availability. */
             availability: components["schemas"]["Availability"];
             /** @description Metric used by the canonical row spark. */
             canonical_metric: string;
-            /** @description Supported detail API operations. */
             capabilities: components["schemas"]["ViewCapabilities"];
             /** @description Public URL and JSON code. */
             code: string;

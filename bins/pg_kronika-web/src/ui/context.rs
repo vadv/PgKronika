@@ -77,7 +77,8 @@ impl From<QueryError> for ContextError {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ContextResponse {
-    snapshot_ts_us: String,
+    #[schema(required = true)]
+    snapshot_ts_us: Option<String>,
     instance: ContextInstance,
     host: ContextHost,
     databases: Vec<ContextDatabase>,
@@ -119,9 +120,13 @@ struct ContextReplication {
 
 #[derive(Debug, Serialize, ToSchema)]
 struct ContextReplicationInstance {
-    timeline_id: i64,
-    streaming_replicas: i64,
+    #[schema(required = true)]
+    timeline_id: Option<i64>,
+    #[schema(required = true)]
+    streaming_replicas: Option<i64>,
+    #[schema(required = true)]
     replay_lag_us: Option<i64>,
+    #[schema(required = true)]
     replay_lag_reason: Option<&'static str>,
 }
 
@@ -156,7 +161,7 @@ pub(crate) fn build_context(
     limits: ContextLimits,
 ) -> Result<ContextResponse, ContextError> {
     let Some(resolved) = resolve_snapshot_at(snapshot, at_us)? else {
-        return Ok(empty_context(at_us));
+        return Ok(empty_context());
     };
     let query_limits = QueryLimits::with_bytes(limits.rows, limits.cells, limits.bytes);
     let mut query = SealedQuerySession::new(snapshot, query_limits);
@@ -216,7 +221,7 @@ pub(crate) fn build_context(
         })
         .collect::<Vec<_>>();
     Ok(ContextResponse {
-        snapshot_ts_us: snapshot_ts_us.to_string(),
+        snapshot_ts_us: Some(snapshot_ts_us.to_string()),
         instance,
         host,
         databases,
@@ -234,9 +239,9 @@ pub(crate) fn build_context(
     })
 }
 
-fn empty_context(at_us: i64) -> ContextResponse {
+fn empty_context() -> ContextResponse {
     ContextResponse {
-        snapshot_ts_us: at_us.to_string(),
+        snapshot_ts_us: None,
         instance: ContextInstance {
             hostname: None,
             pg_version_num: None,
@@ -354,8 +359,8 @@ fn context_replication(
         let replay_lag_us = optional_i64(row, "replay_lag_s")
             .and_then(|seconds| seconds.checked_mul(1_000_000).filter(|value| *value >= 0));
         ContextReplicationInstance {
-            timeline_id: integer(row, "timeline_id").unwrap_or_default(),
-            streaming_replicas: integer(row, "streaming_replicas").unwrap_or_default(),
+            timeline_id: integer(row, "timeline_id"),
+            streaming_replicas: integer(row, "streaming_replicas"),
             replay_lag_us,
             replay_lag_reason: replay_lag_us.is_none().then_some(if primary {
                 "primary"

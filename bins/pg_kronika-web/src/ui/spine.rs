@@ -23,7 +23,7 @@ pub(crate) struct SpineRequest {
 #[derive(Debug)]
 pub(crate) enum SpineError {
     Read(WebIndexReadError),
-    TooManySegments,
+    TooManySegments { observed: usize },
     Arithmetic,
 }
 
@@ -31,7 +31,9 @@ impl std::fmt::Display for SpineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Read(error) => write!(f, "{error}"),
-            Self::TooManySegments => f.write_str("spine segment limit exceeded"),
+            Self::TooManySegments { observed } => {
+                write!(f, "spine segment limit exceeded: {observed} selected")
+            }
             Self::Arithmetic => f.write_str("spine arithmetic overflow"),
         }
     }
@@ -41,7 +43,7 @@ impl std::error::Error for SpineError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Read(error) => Some(error),
-            Self::TooManySegments | Self::Arithmetic => None,
+            Self::TooManySegments { .. } | Self::Arithmetic => None,
         }
     }
 }
@@ -265,6 +267,10 @@ fn merge_values(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded merge, live-tail fold, and response assembly stay in one pass"
+)]
 pub(crate) fn spine(
     snapshot: &LocalDirSnapshot,
     live: &LiveView,
@@ -288,12 +294,9 @@ pub(crate) fn spine(
     } else {
         Vec::new()
     };
-    if descriptors
-        .len()
-        .checked_add(live_chunks.len())
-        .is_none_or(|count| count > ABSOLUTE_MAX_SELECTED_SEGMENTS)
-    {
-        return Err(SpineError::TooManySegments);
+    let selected = descriptors.len().saturating_add(live_chunks.len());
+    if selected > ABSOLUTE_MAX_SELECTED_SEGMENTS {
+        return Err(SpineError::TooManySegments { observed: selected });
     }
     descriptors
         .sort_by_key(|descriptor| (descriptor.max_ts, descriptor.min_ts, descriptor.locator));
@@ -329,12 +332,30 @@ pub(crate) fn spine(
     }
 
     let gaps = coverage_gaps(&coverage, request);
-    let load_statuses = value_statuses(&merged.load, &gaps, merged.gated.contains(&"load_per_cpu"));
-    let psi_statuses = value_statuses(&merged.psi, &gaps, merged.gated.contains(&"psi_io_some"));
+    let load_statuses = value_statuses(
+        &merged.load,
+        &gaps,
+        merged.gated.contains(&"load_per_cpu"),
+        request,
+    );
+    let psi_statuses = value_statuses(
+        &merged.psi,
+        &gaps,
+        merged.gated.contains(&"psi_io_some"),
+        request,
+    );
     merged.gated.sort_unstable();
     merged.resource_limited.sort_unstable();
     let partial =
         !gaps.is_empty() || !merged.gated.is_empty() || !merged.resource_limited.is_empty();
+    let gap_dtos = gaps
+        .iter()
+        .map(|(from_us, to_us)| SpineGap {
+            from_us: from_us.to_string(),
+            to_us: to_us.to_string(),
+            reason: "producer_gap",
+        })
+        .collect();
     Ok(SpineResponse {
         grid: SpineGrid {
             from_us: request.from_us.to_string(),
@@ -360,7 +381,7 @@ pub(crate) fn spine(
         quality: SpineQuality {
             status: if partial { "partial" } else { "complete" },
             snapshots: merged.snapshots,
-            gaps,
+            gaps: gap_dtos,
             gated: merged.gated,
             resource_limited: merged.resource_limited,
             active_tail,
@@ -368,32 +389,46 @@ pub(crate) fn spine(
     })
 }
 
-fn value_statuses(values: &[Option<f64>], gaps: &[SpineGap], gated: bool) -> Vec<SpineValueStatus> {
+/// Per-bucket reasons: a missing value blames `producer_gap` only when the
+/// bucket actually intersects a proven coverage gap.
+fn value_statuses(
+    values: &[Option<f64>],
+    gaps: &[(i64, i64)],
+    gated: bool,
+    request: SpineRequest,
+) -> Vec<SpineValueStatus> {
+    let span = i128::from(request.to_us - request.from_us);
+    let from = i128::from(request.from_us);
+    let bucket_count = values.len() as i128;
     values
         .iter()
-        .map(|value| {
+        .enumerate()
+        .map(|(index, value)| {
             if value.is_some() {
-                SpineValueStatus {
+                return SpineValueStatus {
                     status: "available",
                     reason: None,
-                }
+                };
+            }
+            let reason = if gated {
+                "not_collected"
             } else {
-                SpineValueStatus {
-                    status: "unavailable",
-                    reason: Some(if gated {
-                        "not_collected"
-                    } else if gaps.is_empty() {
-                        "no_sample"
-                    } else {
-                        "producer_gap"
-                    }),
-                }
+                let start = from + span * index as i128 / bucket_count;
+                let end = from + span * (index + 1) as i128 / bucket_count;
+                let in_gap = gaps.iter().any(|(gap_from, gap_to)| {
+                    i128::from(*gap_from) < end && start < i128::from(*gap_to)
+                });
+                if in_gap { "producer_gap" } else { "no_sample" }
+            };
+            SpineValueStatus {
+                status: "unavailable",
+                reason: Some(reason),
             }
         })
         .collect()
 }
 
-fn coverage_gaps(spans: &[(i64, i64)], request: SpineRequest) -> Vec<SpineGap> {
+fn coverage_gaps(spans: &[(i64, i64)], request: SpineRequest) -> Vec<(i64, i64)> {
     let mut gaps = Vec::new();
     let mut covered_to = request.from_us;
     let mut ordered = spans.to_vec();
@@ -402,20 +437,12 @@ fn coverage_gaps(spans: &[(i64, i64)], request: SpineRequest) -> Vec<SpineGap> {
         let start = minimum.max(request.from_us);
         let end = maximum.saturating_add(1).min(request.to_us);
         if start > covered_to {
-            gaps.push(SpineGap {
-                from_us: covered_to.to_string(),
-                to_us: start.to_string(),
-                reason: "producer_gap",
-            });
+            gaps.push((covered_to, start));
         }
         covered_to = covered_to.max(end);
     }
     if covered_to < request.to_us {
-        gaps.push(SpineGap {
-            from_us: covered_to.to_string(),
-            to_us: request.to_us.to_string(),
-            reason: "producer_gap",
-        });
+        gaps.push((covered_to, request.to_us));
     }
     gaps
 }

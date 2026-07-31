@@ -270,10 +270,31 @@ pub(crate) async fn data_quality(
     let live = Arc::clone(descriptor_view.live());
     let response = tokio::task::spawn_blocking(move || {
         let producer_status = producer_status_or_unknown(&snapshot);
+        let quarantined = kronika_layout::DataRoot::open(snapshot.data_dir())
+            .and_then(|root| root.scan_quarantine(kronika_layout::LayoutLimits::default()))
+            .map(|entries| entries.len())
+            .map_err(|error| {
+                tracing::warn!(
+                    event = "api_ui_quality_quarantine_scan_failed",
+                    error = %error,
+                    "quarantine scan failed; integrity reports degraded"
+                );
+            })
+            .ok();
+        let observed = observed_type_ids(&snapshot).map_err(|read| {
+            tracing::error!(
+                event = "api_ui_quality_catalog_read_failed",
+                error = %read,
+                "data quality catalog read failed"
+            );
+            ApiError::store_read_failed()
+        })?;
         Ok::<_, ApiError>(build_data_quality(
             &snapshot,
             &live,
             producer_status,
+            quarantined,
+            &observed,
             DataQualityRequest {
                 from_us,
                 to_us,
@@ -503,10 +524,10 @@ fn spine_error(error: SpineError) -> ApiError {
             );
             ApiError::store_read_failed()
         }
-        SpineError::TooManySegments => ApiError::query_limit_exceeded(
+        SpineError::TooManySegments { observed } => ApiError::query_limit_exceeded(
             LimitResource::SelectedSegments,
             count_u64(crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS),
-            None,
+            Some(count_u64(observed)),
         ),
         SpineError::Arithmetic => ApiError::internal_error(),
     }

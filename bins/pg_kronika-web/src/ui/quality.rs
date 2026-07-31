@@ -114,7 +114,8 @@ struct DataQualityIntegrityDto {
     status: IntegrityStatus,
     readable_segments: usize,
     corrupt_segments: usize,
-    quarantined_entries: usize,
+    #[schema(required = true)]
+    quarantined_entries: Option<usize>,
     #[schema(required = true)]
     last_catalog_refresh_us: Option<String>,
 }
@@ -211,6 +212,8 @@ pub(crate) fn build_data_quality(
     snapshot: &LocalDirSnapshot,
     live: &LiveView,
     producer_status: Option<ProducerStatus>,
+    quarantined: Option<usize>,
+    observed_type_ids: &BTreeSet<u32>,
     request: DataQualityRequest,
 ) -> DataQualityResponse {
     let mut descriptors = snapshot
@@ -289,7 +292,7 @@ pub(crate) fn build_data_quality(
     let gaps = coverage_gaps(&coverage_spans, request, expected_period_us);
     let coverage_partial = expected_snapshots
         .is_some_and(|expected| u64::try_from(observed.len()).unwrap_or(u64::MAX) < expected);
-    let integrity_degraded = corrupt_segments != 0;
+    let integrity_degraded = corrupt_segments != 0 || quarantined.is_none();
     let status = aggregate_status(
         readable_segments != 0,
         freshness_state,
@@ -297,7 +300,7 @@ pub(crate) fn build_data_quality(
         coverage_partial,
         integrity_degraded,
     );
-    let capabilities = web_views()
+    let mut capabilities = web_views()
         .iter()
         .map(|view| {
             let state = capability_states
@@ -332,11 +335,20 @@ pub(crate) fn build_data_quality(
                 reason,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    capabilities.extend(lens_capabilities(observed_type_ids));
     let producer = producer_dto(producer_status, request.to_us, request.stale_after_us);
+    // The newest segment file's mtime is when the served catalog last gained
+    // content; the index keeps no separate refresh timestamp.
     let last_catalog_refresh_us = descriptors
         .iter()
-        .map(|descriptor| descriptor.max_ts)
+        .map(|descriptor| descriptor.file_identity)
+        .filter_map(|identity| {
+            identity
+                .mtime_seconds
+                .checked_mul(1_000_000)?
+                .checked_add(identity.mtime_nanoseconds / 1_000)
+        })
         .max()
         .map(|timestamp| timestamp.to_string());
     DataQualityResponse {
@@ -365,7 +377,7 @@ pub(crate) fn build_data_quality(
             },
             readable_segments,
             corrupt_segments,
-            quarantined_entries: 0,
+            quarantined_entries: quarantined,
             last_catalog_refresh_us,
         },
         quality: DataQualityMetaDto {
@@ -378,6 +390,38 @@ pub(crate) fn build_data_quality(
             active_tail,
         },
     }
+}
+
+/// Lens availability from the store-observed section contracts: a lens is
+/// available when every section it reads was collected somewhere in retention.
+fn lens_capabilities(observed_type_ids: &BTreeSet<u32>) -> Vec<CapabilityDto> {
+    let contracts = kronika_registry::registry();
+    crate::incident::active_catalog()
+        .iter()
+        .map(|lens| {
+            let mut available = 0_usize;
+            let mut total = 0_usize;
+            for section in lens.inputs().iter().map(|input| input.section) {
+                total += 1;
+                available += usize::from(contracts.iter().any(|contract| {
+                    contract.name == section && observed_type_ids.contains(&contract.type_id.get())
+                }));
+            }
+            let (status, reason) = if available == total {
+                (CapabilityStatus::Available, None)
+            } else if available == 0 {
+                (CapabilityStatus::Unavailable, Some("not_collected"))
+            } else {
+                (CapabilityStatus::Partial, Some("not_collected"))
+            };
+            CapabilityDto {
+                kind: "lens",
+                code: lens.id(),
+                status,
+                reason,
+            }
+        })
+        .collect()
 }
 
 fn observed_period(observed: &BTreeSet<i64>) -> Option<i64> {

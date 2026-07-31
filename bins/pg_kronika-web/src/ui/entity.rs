@@ -247,7 +247,7 @@ impl EntityRequest {
                 include_related,
             }
         } else {
-            if !history_supported(view.name) {
+            if !view_spec.capabilities.history {
                 return Err(ApiError::invalid_query_constraint(
                     QueryConstraint::HistorySupported,
                 ));
@@ -451,12 +451,9 @@ fn entity_history(
                 .expect("admission validated history columns")
         })
         .collect::<Vec<_>>();
-    let expanded_from = args
-        .from_us
-        .saturating_sub(request.view.max_rate_gap_us.unwrap_or(0));
     let descriptors = snapshot
         .sealed_descriptors()
-        .filter(|descriptor| descriptor.max_ts >= expanded_from && descriptor.min_ts < args.to_us)
+        .filter(|descriptor| descriptor.max_ts >= args.from_us && descriptor.min_ts < args.to_us)
         .collect::<Vec<_>>();
     if descriptors.len() > MAX_HISTORY_SEGMENTS {
         return Err(EntityError::SelectedSegments {
@@ -690,13 +687,6 @@ fn parse_columns(
         ));
     }
     Ok(columns)
-}
-
-const fn history_supported(view: &str) -> bool {
-    matches!(
-        view.as_bytes(),
-        b"activity" | b"statements" | b"plans" | b"tables" | b"indexes" | b"processes"
-    )
 }
 
 fn history_fingerprint(
