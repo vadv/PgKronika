@@ -39,13 +39,22 @@ failing on any difference.
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `make web-frontend-check` | `tsc --noEmit`, `eslint --max-warnings 0`, `vitest run --coverage` |
-| `make web-frontend` | `vite build` plus deterministic tarball packing |
-| `npm run dev` | Vite dev server, proxying `/v1` to `127.0.0.1:8080` |
-| `npm run demo:stub` | Static API stub on fixture data, for screenshots without a database |
-| `npm run demo:shot` | Puppeteer screenshots of the stub in both themes |
+| Command                   | What it does                                                                           |
+| ------------------------- | -------------------------------------------------------------------------------------- |
+| `make web-frontend-check` | `tsc --noEmit`, `eslint --max-warnings 0`, `prettier --check`, `vitest run --coverage` |
+| `make web-frontend`       | `vite build` plus deterministic tarball packing                                        |
+| `make web-bundle-budget`  | Fails if `static.tar.gz` exceeds `WEB_BUNDLE_BUDGET_BYTES` (256 KiB)                   |
+| `npm run format`          | Prettier: reformat everything except `schema.d.ts` and the lockfile                    |
+| `npm run dev`             | Vite dev server, proxying `/v1` to `127.0.0.1:8080`                                    |
+| `npm run demo:stub`       | Static API stub on fixture data, for screenshots without a database                    |
+| `npm run demo:shot`       | Puppeteer screenshots of the stub in both themes                                       |
+
+Formatting is Prettier's job, not the reviewer's: run `npm run format` before
+committing; CI only checks. The bundle budget exists because the tarball ships
+inside the web binary on database hosts — raise `WEB_BUNDLE_BUDGET_BYTES`
+deliberately, in its own commit. CI additionally runs
+`npm audit --omit=dev --audit-level=high`: production dependencies are what
+lands in the bundle; dev-dependency updates arrive through Dependabot.
 
 Coverage thresholds live in `vitest.config.ts`. Bootstrap and type-only modules
 (`main.tsx`, `i18n/index.ts`, `api/types.ts`) are excluded from the denominator:

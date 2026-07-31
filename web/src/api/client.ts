@@ -20,7 +20,8 @@ export class ApiError extends Error {
 const client = createClient<paths>({
   // openapi-fetch resolves paths through `new URL`, which requires an
   // absolute base; the SPA is always served same-origin with the API.
-  baseUrl: typeof location === "undefined" ? "http://localhost" : location.origin,
+  baseUrl:
+    typeof location === "undefined" ? "http://localhost" : location.origin,
   headers: { accept: "application/json" },
   // Defer the fetch lookup to call time (createClient captures
   // `globalThis.fetch` eagerly, which would freeze out test stubs).
@@ -32,18 +33,19 @@ type GetPaths = PathsWithMethod<paths, "get">;
 type GetOperation<P extends GetPaths> = paths[P] extends { get: infer Op }
   ? Op
   : never;
-type GetParams<P extends GetPaths> = GetOperation<P> extends {
-  parameters: infer Params;
-}
-  ? Params
-  : Record<string, never>;
+type GetParams<P extends GetPaths> =
+  GetOperation<P> extends {
+    parameters: infer Params;
+  }
+    ? Params
+    : Record<string, never>;
 // Generated parameters mark unused slots as `header?: never` etc.; such
 // keys must not count as required when deciding whether the options
 // argument is mandatory.
 type ConcreteParams<P extends GetPaths> = {
-  [K in keyof GetParams<P> as [GetParams<P>[K]] extends [never]
-    ? never
-    : K]: GetParams<P>[K];
+  [
+    K in keyof GetParams<P> as [GetParams<P>[K]] extends [never] ? never : K
+  ]: GetParams<P>[K];
 };
 type OkStatus = 200 | 201 | 202 | 203 | 204 | 206 | 207 | "2XX";
 type JsonBodies<Responses> = {
@@ -54,11 +56,12 @@ type JsonBodies<Responses> = {
     : never;
 }[keyof Responses];
 /** Union of JSON bodies of the operation's 2xx responses. */
-type GetData<P extends GetPaths> = GetOperation<P> extends {
-  responses: infer R;
-}
-  ? JsonBodies<Pick<R, Extract<keyof R, OkStatus>>>
-  : never;
+type GetData<P extends GetPaths> =
+  GetOperation<P> extends {
+    responses: infer R;
+  }
+    ? JsonBodies<Pick<R, Extract<keyof R, OkStatus>>>
+    : never;
 
 interface ErrorBody {
   code?: string;

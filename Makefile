@@ -6,7 +6,7 @@ SCHEMATHESIS_VERSION ?= 4.24.3
 # what macOS ships as `tar`. `brew install gnu-tar` provides gtar.
 TAR ?= $(shell command -v gtar 2>/dev/null || echo tar)
 
-.PHONY: build collector web web-frontend web-frontend-check web-codegen dump openapi openapi-bundle openapi-lint test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
+.PHONY: build collector web web-frontend web-frontend-check web-bundle-budget web-codegen dump openapi openapi-bundle openapi-lint test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
 
 build: ## Build collector, web, and dump for the selected target.
 	@$(CARGO_BUILD) -p pg_kronika-collector -p pg_kronika-web -p pg_kronika-dump
@@ -22,8 +22,20 @@ web-frontend: ## Install, build the SPA and pack deterministic static.tar.gz for
 	$(TAR) --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --exclude='*.map' \
 		-czf bins/pg_kronika-web/static.tar.gz -C bins/pg_kronika-web/static .
 
-web-frontend-check: ## Typecheck, lint and test the SPA without building.
-	cd web && npm ci && npm run typecheck && npm run lint && npm run test
+web-frontend-check: ## Typecheck, lint, format-check and test the SPA without building.
+	cd web && npm ci && npm run typecheck && npm run lint && npm run format:check && npm run test
+
+# The SPA tarball is embedded into the web binary shipped to DB hosts, so its
+# size is a contract, not a coincidence. Bump deliberately, with the PR.
+WEB_BUNDLE_BUDGET_BYTES ?= 262144
+
+web-bundle-budget: ## Fail if the committed static.tar.gz exceeds the size budget.
+	@size=$$(wc -c < bins/pg_kronika-web/static.tar.gz | tr -d ' '); \
+	if [ "$$size" -gt "$(WEB_BUNDLE_BUDGET_BYTES)" ]; then \
+		echo "static.tar.gz is $$size bytes, over the $(WEB_BUNDLE_BUDGET_BYTES) budget"; \
+		exit 1; \
+	fi; \
+	echo "static.tar.gz is $$size bytes (budget $(WEB_BUNDLE_BUDGET_BYTES))"
 
 dump: ## Build pg_kronika-dump.
 	@$(CARGO_BUILD) -p pg_kronika-dump

@@ -14,16 +14,21 @@ test("useSummary requests /v1/views/summary?at=", async () => {
     views: [],
     quality: makeSummaryQuality(),
   };
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-    new Response(JSON.stringify(body), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
-  ));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ),
+  );
   const client = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client }, children);
-  const { result } = renderHook(() => useSummary("1722400000000000"), { wrapper });
+  const { result } = renderHook(() => useSummary("1722400000000000"), {
+    wrapper,
+  });
   await waitFor(() => expect(result.current.isSuccess).toBe(true));
   const req = vi.mocked(fetch).mock.calls[0]?.[0] as Request;
   const url = new URL(req.url);

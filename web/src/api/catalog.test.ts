@@ -9,12 +9,15 @@ afterEach(() => vi.unstubAllGlobals());
 
 test("useCatalog fetches catalog without query parameters", async () => {
   const body: ProjectionCatalog = { revision: 1, views: [] };
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-    new Response(JSON.stringify(body), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
-  ));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ),
+  );
   const client = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client }, children);

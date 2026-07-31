@@ -39,13 +39,22 @@ web/src/          vite build      bins/pg_kronika-web/static/   (в .gitignore)
 
 ## Команды
 
-| Команда | Что делает |
-|---|---|
-| `make web-frontend-check` | `tsc --noEmit`, `eslint --max-warnings 0`, `vitest run --coverage` |
-| `make web-frontend` | `vite build` плюс детерминированная упаковка тарболла |
-| `npm run dev` | Dev-сервер Vite, проксирует `/v1` на `127.0.0.1:8080` |
-| `npm run demo:stub` | Статический стаб API на фикстурах — скриншоты без базы |
-| `npm run demo:shot` | Puppeteer-скриншоты стаба в обеих темах |
+| Команда                   | Что делает                                                                             |
+| ------------------------- | -------------------------------------------------------------------------------------- |
+| `make web-frontend-check` | `tsc --noEmit`, `eslint --max-warnings 0`, `prettier --check`, `vitest run --coverage` |
+| `make web-frontend`       | `vite build` плюс детерминированная упаковка тарболла                                  |
+| `make web-bundle-budget`  | Падает, если `static.tar.gz` превышает `WEB_BUNDLE_BUDGET_BYTES` (256 КиБ)             |
+| `npm run format`          | Prettier: форматирует всё, кроме `schema.d.ts` и lock-файла                            |
+| `npm run dev`             | Dev-сервер Vite, проксирует `/v1` на `127.0.0.1:8080`                                  |
+| `npm run demo:stub`       | Статический стаб API на фикстурах — скриншоты без базы                                 |
+| `npm run demo:shot`       | Puppeteer-скриншоты стаба в обеих темах                                                |
+
+Форматирование — работа Prettier, а не ревьюера: перед коммитом
+`npm run format`; CI только проверяет. Бюджет бандла существует потому, что
+тарболл едет внутри бинарника на хосты БД — `WEB_BUNDLE_BUDGET_BYTES`
+поднимается осознанно, отдельным коммитом. В CI дополнительно
+`npm audit --omit=dev --audit-level=high`: продакшн-зависимости — это то, что
+попадает в бандл; обновления dev-зависимостей приезжают через Dependabot.
 
 Пороги покрытия живут в `vitest.config.ts`. Бутстрап и модули без поведения
 (`main.tsx`, `i18n/index.ts`, `api/types.ts`) исключены из знаменателя:

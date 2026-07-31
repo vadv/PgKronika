@@ -49,6 +49,8 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: make web-frontend-check
+      - name: Audit production npm dependencies
+        run: cd web && npm audit --omit=dev --audit-level=high
       - name: Verify generated frontend types are current
         run: |
           make web-codegen
@@ -57,6 +59,8 @@ jobs:
         run: |
           make web-frontend
           git diff --exit-code -- bins/pg_kronika-web/static.tar.gz
+      - name: Verify the UI bundle stays within the size budget
+        run: make web-bundle-budget
 
   deps:
     name: dependency rules

@@ -7,5 +7,9 @@ test("roundtrips state", () => {
 });
 
 test("defaults when hash empty", () => {
-  expect(parseHash("")).toEqual({ source: "local", view: "activity", at: null });
+  expect(parseHash("")).toEqual({
+    source: "local",
+    view: "activity",
+    at: null,
+  });
 });

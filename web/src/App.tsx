@@ -30,7 +30,14 @@ function Shell() {
   const activeView = catalog.data?.views.find((v) => v.code === state.view);
 
   return (
-    <div data-testid="app-shell" style={{ background: "var(--bg)", color: "var(--fg)", minHeight: "100dvh" }}>
+    <div
+      data-testid="app-shell"
+      style={{
+        background: "var(--bg)",
+        color: "var(--fg)",
+        minHeight: "100dvh",
+      }}
+    >
       <header style={{ fontFamily: "var(--mono-font)", padding: "4px 8px" }}>
         {t("app.title")} · {state.source}
       </header>

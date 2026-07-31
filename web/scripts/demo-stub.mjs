@@ -88,7 +88,10 @@ const ENTITIES = {
     ["stmt:7103", "INSERT INTO events (ts,kind,payload) VALUES ($1,$2,$3)"],
     ["stmt:7104", "SELECT count(*) FROM ledger WHERE account_id=$1"],
     ["stmt:7105", "DELETE FROM cart_items WHERE expires_at < $1"],
-    ["stmt:7106", "SELECT o.id, o.total FROM orders o JOIN users u ON u.id=o.user_id"],
+    [
+      "stmt:7106",
+      "SELECT o.id, o.total FROM orders o JOIN users u ON u.id=o.user_id",
+    ],
     ["stmt:7107", "UPDATE inventory SET qty=qty-$1 WHERE sku=$2"],
     ["stmt:7108", "VACUUM ANALYZE public.audit_log"],
   ],

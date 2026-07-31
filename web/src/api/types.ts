@@ -15,8 +15,7 @@ export type ProjectionCatalog = components["schemas"]["ProjectionCatalog"];
 export type SummaryQuality = components["schemas"]["SummaryQuality"];
 export type HeatmapQuality = components["schemas"]["HeatmapQuality"];
 export type ViewSummaryItem = components["schemas"]["ViewSummaryItem"];
-export type ViewSummaryResponse =
-  components["schemas"]["ViewSummaryResponse"];
+export type ViewSummaryResponse = components["schemas"]["ViewSummaryResponse"];
 export type HeatmapRow = components["schemas"]["HeatmapRow"];
 export type HeatmapResponse = components["schemas"]["HeatmapResponse"];
 export type VersionResponse = components["schemas"]["VersionResponse"];

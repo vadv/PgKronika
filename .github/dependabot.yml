@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # SPA toolchain (web/): keeps lint/test/build dependencies moving so
+  # vulnerability fixes arrive as routine PRs instead of big-bang upgrades.
+  # `npm audit --omit=dev --audit-level=high` gates production deps in CI.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

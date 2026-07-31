@@ -15,17 +15,28 @@ test("useHeatmap builds query with all params", async () => {
     rows: [],
     quality: makeHeatmapQuality({ status: "partial" }),
   };
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-    new Response(JSON.stringify(body), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
-  ));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    ),
+  );
   const client = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client }, children);
   const { result } = renderHook(
-    () => useHeatmap({ view: "statements", metric: "time", from: "0", to: "86400000000", buckets: 56, top: 8 }),
+    () =>
+      useHeatmap({
+        view: "statements",
+        metric: "time",
+        from: "0",
+        to: "86400000000",
+        buckets: 56,
+        top: 8,
+      }),
     { wrapper },
   );
   await waitFor(() => expect(result.current.isSuccess).toBe(true));

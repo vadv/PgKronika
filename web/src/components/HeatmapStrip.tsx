@@ -36,7 +36,13 @@ export function HeatmapStrip(props: {
 
   return (
     <section style={{ fontFamily: "var(--mono-font)", padding: "4px 8px" }}>
-      <div style={{ display: "flex", gap: "var(--gap, 4px)", alignItems: "baseline" }}>
+      <div
+        style={{
+          display: "flex",
+          gap: "var(--gap, 4px)",
+          alignItems: "baseline",
+        }}
+      >
         <span style={{ color: "var(--fg-dim)" }}>{t("heatmap.metric")}</span>
         {metrics.map((m) => (
           <button
