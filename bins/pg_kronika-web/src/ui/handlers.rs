@@ -33,7 +33,7 @@ use crate::params::{QueryParams, parse_i64};
 
 /// Maximum serialized projection catalog response.
 const MAX_CATALOG_RESPONSE_BYTES: usize = 512 * 1024;
-const MAX_CONTEXT_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_CONTEXT_RESPONSE_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_DATA_QUALITY_RESPONSE_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_ENTITY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HEATMAP_RESPONSE_BYTES: usize = 512 * 1024;
@@ -379,10 +379,9 @@ pub(crate) async fn context(
         ApiError::internal_error()
     })?;
     if body.len() > MAX_CONTEXT_RESPONSE_BYTES {
-        return Err(ApiError::query_limit_exceeded(
-            LimitResource::Bytes,
+        return Err(ApiError::response_too_large(
             count_u64(MAX_CONTEXT_RESPONSE_BYTES),
-            Some(count_u64(body.len())),
+            count_u64(body.len()),
         ));
     }
     let mut response = Response::new(Body::from(body));

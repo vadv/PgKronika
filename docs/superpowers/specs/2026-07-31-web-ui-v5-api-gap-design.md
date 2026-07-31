@@ -779,7 +779,7 @@ Endpoint не сканирует все raw PGM за 24 часа без стру
 
 | Ответ | Целевой размер | Жёсткий максимум |
 | --- | ---: | ---: |
-| UI context | 64 КиБ | 256 КиБ |
+| UI context | 64 КиБ | 512 КиБ |
 | Timeline spine | 32 КиБ | 256 КиБ |
 | Data quality | 64 КиБ | 512 КиБ |
 | Entity point | 128 КиБ | 512 КиБ |
@@ -805,6 +805,7 @@ Endpoint не сканирует все raw PGM за 24 часа без стру
 | Code | Когда |
 | --- | --- |
 | `entity_not_found` | Identity корректна, но строки нет в выбранном snapshot |
+| `response_too_large` | Serialized context ответ превысил hard bound 512 КиБ; список не усечается |
 
 Остальные ошибки следуют текущему `ApiError`:
 

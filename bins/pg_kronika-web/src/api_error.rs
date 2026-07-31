@@ -25,6 +25,7 @@ closed_string_enum! {
         CursorExpired => "cursor_expired",
         ViewGone => "view_gone",
         EntityNotFound => "entity_not_found",
+        ResponseTooLarge => "response_too_large",
         QueryLimitExceeded => "query_limit_exceeded",
         CursorCapacityUnavailable => "cursor_capacity_unavailable",
         AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
@@ -50,7 +51,7 @@ impl ErrorCode {
             | Self::InvalidCursor
             | Self::CursorQueryMismatch => StatusCode::BAD_REQUEST,
             Self::CursorExpired | Self::ViewGone => StatusCode::GONE,
-            Self::QueryLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::QueryLimitExceeded | Self::ResponseTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::CursorCapacityUnavailable
             | Self::AnalyticCapacityUnavailable
             | Self::ColdBuildOverloaded => StatusCode::SERVICE_UNAVAILABLE,
@@ -329,6 +330,17 @@ impl ApiError {
 
     pub(crate) fn entity_not_found() -> Self {
         Self::empty(ErrorCode::EntityNotFound)
+    }
+
+    pub(crate) fn response_too_large(limit: u64, observed: u64) -> Self {
+        Self::new(
+            ErrorCode::ResponseTooLarge,
+            serde_json::json!({
+                "resource": "response_bytes",
+                "limit": limit,
+                "observed": observed,
+            }),
+        )
     }
 
     pub(crate) fn query_limit_exceeded(
