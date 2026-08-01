@@ -109,12 +109,11 @@ function renderSpine(overrides: Partial<SpineProps> = {}) {
   return render(<Spine {...props} />, { wrapper });
 }
 
-test("renders gutter, load polyline, cursor and event markers", async () => {
+test("renders load polyline, cursor, bucket overlay and event markers", async () => {
   const { container } = renderSpine();
   await waitFor(() =>
     expect(screen.getByTestId("spine-health-line")).toBeDefined(),
   );
-  expect(screen.getByTestId("spine-gutter").style.width).toBe("158px");
   expect(screen.getByTestId("spine-cursor")).toBeDefined();
   expect(container.querySelectorAll("[data-tick]")).toHaveLength(25);
   // Checkpoint marker glyph; null bucket breaks the polyline into a segment.
@@ -122,9 +121,20 @@ test("renders gutter, load polyline, cursor and event markers", async () => {
   expect(screen.getByText("●")).toBeDefined();
   const points = screen.getByTestId("spine-health-line").getAttribute("points");
   expect(points?.split(" ")).toHaveLength(2);
-  // Missing bucket surfaces as a dot whose title carries the wire status.
-  const missing = screen.getByTestId("spine-missing-point");
-  expect(missing.querySelector("title")?.textContent).toContain("producer_gap");
+  // Missing bucket surfaces as a baseline dot; the bucket overlay's title
+  // carries the wire status for hover.
+  expect(screen.getByTestId("spine-missing-point")).toBeDefined();
+  const buckets = screen.getAllByTestId("spine-bucket");
+  expect(buckets).toHaveLength(3);
+  expect(buckets[2]?.querySelector("title")?.textContent).toContain(
+    "producer_gap",
+  );
+  expect(buckets[2]?.querySelector("title")?.textContent).toContain(
+    "spine.missing",
+  );
+  expect(buckets[0]?.querySelector("title")?.textContent).toContain(
+    "host.load1",
+  );
   // Metric caption shows the selected series (untranslated key in tests).
   expect(screen.getByTestId("spine-metric").textContent).toContain(
     "spine.load",
