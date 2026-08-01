@@ -364,7 +364,7 @@ function IncidentsDock(props: {
             textAlign: "start",
             background: "none",
             border: "1px solid var(--border)",
-            borderInlineStart: `3px solid ${levelColor(incident.level)}`,
+            borderInlineStart: `4px solid ${levelColor(incident.level)}`,
             borderRadius: "4px",
             padding: "6px 8px",
             marginBlockEnd: "6px",
