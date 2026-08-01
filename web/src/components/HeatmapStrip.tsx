@@ -218,7 +218,15 @@ export function HeatmapStrip(props: {
                 content={
                   <span style={{ display: "grid", gap: "2px" }}>
                     <span style={{ overflowWrap: "anywhere" }}>{r.label}</span>
-                    <TipRow label="entity" value={r.entity} mono />
+                    <TipRow
+                      label="entity"
+                      value={
+                        r.entity.length <= 14
+                          ? r.entity
+                          : `${r.entity.slice(0, 12)}…`
+                      }
+                      mono
+                    />
                   </span>
                 }
               >

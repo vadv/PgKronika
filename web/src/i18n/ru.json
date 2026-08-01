@@ -112,5 +112,12 @@
   "pageheader.matched": "matched",
   "pageheader.matchedHint": "Строк в сохранённом снапшоте по текущему фильтру",
   "sidebar.expand": "развернуть навигацию",
-  "sidebar.collapse": "свернуть навигацию"
+  "sidebar.collapse": "свернуть навигацию",
+  "incident.summary.anomaly.os_cpu.irq": "CPU: аппаратные прерывания",
+  "incident.summary.anomaly.os_cpu.softirq": "CPU: программные прерывания",
+  "incident.summary.anomaly.os_cpu.load": "CPU: высокая нагрузка",
+  "incident.summary.anomaly.os_psi.io": "I/O pressure",
+  "incident.summary.anomaly.pg.locks": "Конкуренция блокировок",
+  "incident.summary.anomaly.pg.autovacuum": "Autovacuum отстаёт",
+  "popover.error": "Ошибка загрузки"
 }

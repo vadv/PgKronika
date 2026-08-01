@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use kronika_analytics::Episode;
+use sha2::Digest;
 
 /// Bump when the canonical byte layout changes.
 const KEY_VERSION: u8 = 2;
@@ -163,7 +164,16 @@ impl IncidentKeyV2 {
         for member in ordered {
             member.encode(&mut bytes);
         }
-        Ok(Self { bytes })
+        // The canonical encoding is the full provenance for identity
+        // computation; the stored key is its digest. Nothing decodes a key
+        // (every consumer resolves it back through the incident payload), so
+        // keeping kilobytes of provenance per incident in memory and on the
+        // wire only bought cost. 12 digest bytes keep the same determinism
+        // for clustering, focus links and dedupe at a fixed small size.
+        let digest = sha2::Sha256::digest(&bytes);
+        Ok(Self {
+            bytes: digest[..12].to_vec(),
+        })
     }
 
     pub(crate) fn canonical_bytes(&self) -> &[u8] {
@@ -256,10 +266,13 @@ mod tests {
     }
 
     #[test]
-    fn key_carries_the_version_byte() {
+    fn key_is_a_fixed_size_digest_of_the_versioned_preimage() {
         let r = iref("s", &[IdentityValue::I64(1)], 0, 1);
         let key = IncidentKeyV2::new(0, 1, &[r], 1024).expect("within limit");
-        assert_eq!(key.canonical_bytes().first(), Some(&KEY_VERSION));
+        // The format version stays in the hashed preimage (KEY_VERSION is
+        // byte 0 of the canonical encoding), so a format bump still changes
+        // every key — while the stored key itself is a fixed 12-byte digest.
+        assert_eq!(key.canonical_bytes().len(), 12);
     }
 
     #[test]

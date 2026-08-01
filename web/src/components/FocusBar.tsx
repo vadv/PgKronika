@@ -50,7 +50,9 @@ export function FocusBar(props: FocusBarProps) {
           whiteSpace: "nowrap",
         }}
       >
-        {props.incident.incident_key}
+        {t(`incident.summary.${props.incident.summary_code}`, {
+          defaultValue: props.incident.summary_code,
+        })}
       </span>
       <span style={{ fontFamily: "var(--mono-font)", color: "var(--fg-dim)" }}>
         {formatIntervalTime(props.incident.interval.from)}→

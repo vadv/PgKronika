@@ -25,6 +25,24 @@ export interface DockOverlayProps {
   onPatch: (patch: Partial<UiState>) => void;
 }
 
+/** Opaque typed-identity tokens (entity keys) are API routing material, not
+ * display text: show a short readable form, keep the full token in the
+ * tooltip. */
+function shortEntity(token: string): string {
+  return token.length <= 12 ? token : `${token.slice(0, 8)}…`;
+}
+
+/** Localized incident title from the server's language-neutral summary code;
+ * the binary provenance key never renders as a headline. */
+function incidentTitle(
+  incident: IncidentResponse,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  return t(`incident.summary.${incident.summary_code}`, {
+    defaultValue: incident.summary_code,
+  });
+}
+
 /** Server incident level → color: the only severity source for incidents. */
 function levelColor(level: string): string {
   if (level === "critical") return "var(--sev-crit)";
@@ -223,9 +241,24 @@ function IncidentDetail(props: {
       </button>
       <div
         style={{
-          fontFamily: "var(--mono-font)",
+          fontFamily: "var(--ui-font)",
+          fontWeight: 600,
           marginBlockEnd: "4px",
           overflowWrap: "anywhere",
+        }}
+      >
+        {incidentTitle(incident, t)}
+      </div>
+      <div
+        title={incident.incident_key}
+        style={{
+          fontFamily: "var(--mono-font)",
+          fontSize: "var(--text-xs)",
+          color: "var(--fg-dim)",
+          marginBlockEnd: "6px",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
         }}
       >
         {incident.incident_key}
@@ -339,8 +372,11 @@ function IncidentsDock(props: {
             cursor: "pointer",
           }}
         >
-          <div style={{ fontFamily: "var(--mono-font)" }}>
-            {incident.incident_key}
+          <div
+            title={incident.incident_key}
+            style={{ fontFamily: "var(--ui-font)", overflowWrap: "anywhere" }}
+          >
+            {incidentTitle(incident, t)}
           </div>
           <div
             style={{ fontFamily: "var(--mono-font)", color: "var(--fg-dim)" }}
@@ -584,7 +620,10 @@ function RowDock(props: {
           overflowWrap: "anywhere",
         }}
       >
-        {viewCode} · {props.state.entity ?? "—"}
+        {viewCode} ·{" "}
+        <span title={props.state.entity ?? undefined}>
+          {shortEntity(props.state.entity ?? "—")}
+        </span>
       </div>
       {missing && (
         <div style={{ color: "var(--fg-dim)" }}>{t("dock.row.missing")}</div>
