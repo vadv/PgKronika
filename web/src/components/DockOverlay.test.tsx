@@ -163,7 +163,7 @@ test("row dock renders point fields from the entity endpoint", async () => {
   expect(screen.getByText("dock.row.partial")).toBeDefined();
   const missing = screen.getByText("—");
   expect(missing.dataset.status).toBe("unavailable");
-  expect(missing.title).toBe("producer_gap");
+  expect(missing.title).toBe("unavailable · producer_gap");
 });
 
 test("row dock renders history snapshots when at is not set", async () => {

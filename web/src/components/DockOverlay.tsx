@@ -1,18 +1,20 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ApiError } from "../api/client";
+import { ApiError, isWarmingUp } from "../api/client";
+import { colDesc, colLabel, statusLabel } from "../api/codes";
 import { useEntity } from "../api/entity";
 import { useIncidents } from "../api/incidents";
 import type {
+  ColumnSpec,
   EntitySnapshotDto,
   EntityHistoryResponse,
   EntityPointResponse,
-  FrameValue,
   IncidentFindingResponse,
   IncidentResponse,
   ViewSpec,
 } from "../api/types";
 import type { DockKind, UiState } from "../state/url";
+import { formatCellValue } from "./cellFormat";
 import { formatIntervalTime } from "./FocusBar";
 
 export interface DockOverlayProps {
@@ -53,11 +55,6 @@ function levelColor(level: string): string {
 /** Entity field status → color: honest null/missing fields stay dim. */
 function fieldStatusColor(status: string): string {
   return status === "available" ? "var(--fg)" : "var(--fg-dim)";
-}
-
-function formatCell(value: FrameValue): string {
-  if (value === null) return "—";
-  return String(value);
 }
 
 function formatEvidence(
@@ -323,12 +320,16 @@ function IncidentsDock(props: {
     <div>
       {incidents.isError && (
         <div style={{ color: "var(--sev-warn)" }} role="alert">
-          {t("dock.incidents.error")}
+          {isWarmingUp(incidents.error)
+            ? t("error.warming")
+            : t("dock.incidents.error")}
         </div>
       )}
-      {incidents.isLoading && (
+      {incidents.isPending && (
         <div style={{ color: "var(--fg-dim)" }}>
-          {t("dock.incidents.loading")}
+          {incidents.failureCount > 0 && isWarmingUp(incidents.failureReason)
+            ? t("loading.warming")
+            : t("dock.incidents.loading")}
         </div>
       )}
       {/* Analysis status comes first: findings are hypotheses until the
@@ -396,7 +397,12 @@ function IncidentsDock(props: {
   );
 }
 
-function EntityPointView(props: { data: EntityPointResponse }) {
+function EntityPointView(props: {
+  data: EntityPointResponse;
+  columns: Map<string, ColumnSpec>;
+  viewCode: string;
+}) {
+  const { t } = useTranslation();
   return (
     <div
       data-kv
@@ -408,6 +414,14 @@ function EntityPointView(props: { data: EntityPointResponse }) {
       }}
     >
       {props.data.fields.map((field) => {
+        const spec = props.columns.get(field.code);
+        const cellColumn = {
+          code: field.code,
+          type: spec?.type ?? "text",
+          unit: spec?.unit ?? null,
+        };
+        const label = colLabel(t, props.viewCode, field.code);
+        const desc = colDesc(t, props.viewCode, field.code);
         const isSql =
           typeof field.value === "string" &&
           (field.value.length > 60 || field.value.includes("\n"));
@@ -417,12 +431,13 @@ function EntityPointView(props: { data: EntityPointResponse }) {
             style={{ gridColumn: "1 / -1", marginBlock: "4px" }}
           >
             <div
+              title={desc ?? undefined}
               style={{
                 color: "var(--fg-dim)",
-                fontFamily: "var(--mono-font)",
+                fontFamily: "var(--ui-font)",
               }}
             >
-              {field.code}
+              {label}
             </div>
             <pre
               data-sql
@@ -443,23 +458,28 @@ function EntityPointView(props: { data: EntityPointResponse }) {
         ) : (
           <div key={field.code} style={{ display: "contents" }}>
             <span
+              title={desc ?? undefined}
               style={{
                 color: "var(--fg-dim)",
-                fontFamily: "var(--mono-font)",
+                fontFamily: "var(--ui-font)",
               }}
             >
-              {field.code}
+              {label}
             </span>
             <span
               data-status={field.status}
-              title={field.reason ?? field.status}
+              title={
+                field.status !== "available"
+                  ? `${statusLabel(t, field.status)}${field.reason !== null ? ` · ${statusLabel(t, field.reason)}` : ""}`
+                  : undefined
+              }
               style={{
                 fontFamily: "var(--mono-font)",
                 color: fieldStatusColor(field.status),
                 overflowWrap: "break-word",
               }}
             >
-              {formatCell(field.value)}
+              {formatCellValue(field.value, cellColumn, t)}
             </span>
           </div>
         );
@@ -484,6 +504,8 @@ const historyCellStyle = {
 
 function EntityHistoryView(props: {
   data: EntityHistoryResponse;
+  columns: Map<string, ColumnSpec>;
+  viewCode: string;
   loadingMore?: boolean;
   onLoadMore?: () => void;
 }) {
@@ -502,8 +524,12 @@ function EntityHistoryView(props: {
           <tr>
             <th style={historyHeadCellStyle}>ts</th>
             {data.columns.map((column) => (
-              <th key={column} style={historyHeadCellStyle}>
-                {column}
+              <th
+                key={column}
+                title={colDesc(t, props.viewCode, column) ?? undefined}
+                style={historyHeadCellStyle}
+              >
+                {colLabel(t, props.viewCode, column)}
               </th>
             ))}
           </tr>
@@ -517,17 +543,31 @@ function EntityHistoryView(props: {
               {data.columns.map((column, i) => {
                 const status = snapshot.statuses[i] ?? "unavailable";
                 const reason = snapshot.reasons[i] ?? null;
+                const spec = props.columns.get(column);
                 return (
                   <td
                     key={column}
                     data-status={status}
-                    title={reason ?? status}
+                    title={
+                      status !== "available"
+                        ? `${statusLabel(t, status)}${reason !== null ? ` · ${statusLabel(t, reason)}` : ""}`
+                        : undefined
+                    }
                     style={{
                       ...historyCellStyle,
+                      cursor: status !== "available" ? "help" : undefined,
                       color: fieldStatusColor(status),
                     }}
                   >
-                    {formatCell(snapshot.values[i] ?? null)}
+                    {formatCellValue(
+                      snapshot.values[i] ?? null,
+                      {
+                        code: column,
+                        type: spec?.type ?? "text",
+                        unit: spec?.unit ?? null,
+                      },
+                      t,
+                    )}
                   </td>
                 );
               })}
@@ -610,29 +650,56 @@ function RowDock(props: {
       apiError.status === 410);
   const failed = entity.isError && !notFound;
   const missing = props.state.entity === null || notFound;
+  const columnSpecs = new Map(
+    (props.view?.columns ?? []).map((c) => [c.code, c]),
+  );
+  // The API label is the human row name (index/relation/pid); the typed
+  // entity token is routing material — short form, full value in the title.
+  const label = data !== undefined && data.label !== "" ? data.label : null;
 
   return (
     <div>
       <div
         style={{
-          fontFamily: "var(--mono-font)",
-          marginBlockEnd: "8px",
+          fontFamily: "var(--ui-font)",
+          marginBlockEnd: "2px",
           overflowWrap: "anywhere",
         }}
       >
-        {viewCode} ·{" "}
-        <span title={props.state.entity ?? undefined}>
-          {shortEntity(props.state.entity ?? "—")}
+        <span style={{ color: "var(--fg-dim)" }}>{t(`tabs.${viewCode}`)}</span>
+        {" · "}
+        <span style={{ fontWeight: 600 }}>
+          {label ?? shortEntity(props.state.entity ?? "—")}
         </span>
       </div>
+      {label !== null && props.state.entity !== null && (
+        <div
+          title={props.state.entity}
+          style={{
+            fontFamily: "var(--mono-font)",
+            fontSize: "var(--text-xs)",
+            color: "var(--fg-dim)",
+            marginBlockEnd: "6px",
+          }}
+        >
+          {shortEntity(props.state.entity)}
+        </div>
+      )}
       {missing && (
         <div style={{ color: "var(--fg-dim)" }}>{t("dock.row.missing")}</div>
       )}
       {failed && (
         <div style={{ color: "var(--sev-warn)" }} role="alert">
-          {t("dock.row.error")}
+          {isWarmingUp(entity.error) ? t("error.warming") : t("dock.row.error")}
         </div>
       )}
+      {entity.isPending &&
+        entity.failureCount > 0 &&
+        isWarmingUp(entity.failureReason) && (
+          <div role="status" style={{ color: "var(--fg-dim)" }}>
+            {t("loading.warming")}
+          </div>
+        )}
       {data && data.quality.status !== "complete" && (
         <div
           style={{
@@ -644,7 +711,13 @@ function RowDock(props: {
           {t("dock.row.partial")}
         </div>
       )}
-      {data && "fields" in data && <EntityPointView data={data} />}
+      {data && "fields" in data && (
+        <EntityPointView
+          data={data}
+          columns={columnSpecs}
+          viewCode={viewCode}
+        />
+      )}
       {data && "snapshots" in data && (
         <EntityHistoryView
           data={{
@@ -652,6 +725,8 @@ function RowDock(props: {
             snapshots: [...data.snapshots, ...extraSnapshots],
             page: { next: nextCursor },
           }}
+          columns={columnSpecs}
+          viewCode={viewCode}
           loadingMore={historyCursor !== null && entity.isLoading}
           onLoadMore={
             nextCursor !== null ? () => setHistoryCursor(nextCursor) : undefined
