@@ -528,5 +528,6 @@
   "event.kind.pg.statistics.reset_observed.label": "сброс статистики",
   "event.kind.pg.statistics.reset_observed.desc": "Статистика базы была сброшена — истории счётчиков оборваны",
   "event.kind.pg.timeline.changed.label": "смена timeline",
-  "event.kind.pg.timeline.changed.desc": "WAL timeline изменился (после promote или восстановления на момент времени)"
+  "event.kind.pg.timeline.changed.desc": "WAL timeline изменился (после promote или восстановления на момент времени)",
+  "spine.bucketSpan": "бакет {{duration}}"
 }

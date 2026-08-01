@@ -199,7 +199,10 @@ function spineSeries(code, unit, aggregation, base, spike, buckets, rand) {
     const wave = 0.5 + 0.3 * Math.sin((b / buckets) * Math.PI * 4 + phase);
     const peak = 1.8 * Math.exp(-((b - SPINE_PEAK) ** 2) / (2 * 2.5 ** 2));
     const noise = rand() * 0.12;
-    values.push(Math.round(base * (wave + noise) + spike * peak));
+    // Ratios would collapse to 0/1 under integer rounding; keep milliunits.
+    values.push(
+      Math.round((base * (wave + noise) + spike * peak) * 1000) / 1000,
+    );
   }
   return { code, unit, aggregation, values };
 }
@@ -243,17 +246,67 @@ function spineResponse(params) {
   };
 }
 
+// --- health ----------------------------------------------------------------
+
+// Storyline for the strip: the previous window is calm; the current window
+// has a degraded block around 55–60% and a critical block around 70–75%
+// (lock contention on orders, matching the incidents below).
+function healthResponse(params) {
+  const from = Number(params.get("from") ?? String(nowUs() - 86_400 * US));
+  const to = Number(params.get("to") ?? String(nowUs()));
+  const step = Number(params.get("step") ?? String((to - from) / 96));
+  const span = to - from;
+  const points = [];
+  for (let start = from; start < to; start += step) {
+    const end = Math.min(start + step, to);
+    const midFraction = (start + step / 2 - from) / span;
+    let state = "normal";
+    // Doubled window queries: the second half (current window) carries the
+    // incidents; the first half (previous window) stays calm.
+    if (midFraction >= 0.77 && midFraction <= 0.85) state = "critical";
+    else if (midFraction >= 0.66 && midFraction < 0.71) state = "degraded";
+    points.push({
+      interval: { from_us: Math.round(start), to_us: Math.round(end) },
+      factor_set_id: "factors-demo-1",
+      health_policy_version: 1,
+      overall_state: state,
+      overall_score:
+        state === "critical" ? 0.3 : state === "degraded" ? 0.7 : 1,
+      continuous_score: null,
+      domains:
+        state === "normal"
+          ? []
+          : [
+              {
+                domain: "contention",
+                penalty: state === "critical" ? 0.7 : 0.3,
+                driving_factor_ids: [4],
+              },
+            ],
+      coverage: [],
+      floor_evidence: [],
+    });
+  }
+  return {
+    health_policy_version: 1,
+    factor_set_ids: ["factors-demo-1"],
+    points,
+    coverage: [],
+    meta: timelineMeta(from, to),
+  };
+}
+
 // --- events ----------------------------------------------------------------
 
 function demoEvents(fromUs, toUs) {
   const at = (fraction) => Math.round(fromUs + (toUs - fromUs) * fraction);
   const spec = [
-    [0.12, "checkpoint", "info", { kind: "checkpoint" }],
-    [0.3, "autovacuum", "info", { kind: "autovacuum" }],
-    [0.43, "marker", "info", { kind: "deploy:api-v2.14.0" }],
+    [0.12, "pg.checkpoint.completed", "info", { kind: "checkpoint" }],
+    [0.3, "pg.maintenance.autovacuum_reported", "info", { kind: "autovacuum" }],
+    [0.43, "pg.temp_file.reported", "info", { kind: "temp_file" }],
     [
       0.58,
-      "deadlock",
+      "pg.database.deadlock_delta",
       "deadlock",
       {
         kind: "deadlock",
@@ -263,8 +316,9 @@ function demoEvents(fromUs, toUs) {
         dropped_field_count: 0,
       },
     ],
-    [0.74, "checkpoint", "info", { kind: "checkpoint" }],
-    [0.9, "autovacuum", "info", { kind: "autovacuum" }],
+    [0.6, "pg.lock.wait_reported", "lock", { kind: "lock_wait" }],
+    [0.74, "pg.checkpoint.completed", "info", { kind: "checkpoint" }],
+    [0.9, "pg.maintenance.autovacuum_reported", "info", { kind: "autovacuum" }],
   ];
   return spec.map(([fraction, kind, cls, payload], i) => {
     const ts = at(fraction);
@@ -1353,6 +1407,9 @@ const server = createServer((req, res) => {
   }
   if (url.pathname === "/v1/timeline/spine") {
     return sendJson(res, spineResponse(params));
+  }
+  if (url.pathname === "/v1/timeline/health") {
+    return sendJson(res, healthResponse(params));
   }
   if (url.pathname === "/v1/timeline/events") {
     return sendJson(res, eventsResponse(params));

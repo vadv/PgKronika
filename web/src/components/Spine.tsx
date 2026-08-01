@@ -6,7 +6,11 @@ import { useIncidents } from "../api/incidents";
 import { useTimelineSpine } from "../api/spine";
 import { useTimelineEvents, useTimelineHealth } from "../api/timeline";
 import type { EventFact, HealthPointResponse, SpineSeries } from "../api/types";
-import { formatByUnit, formatTimestampUs } from "../design/format";
+import {
+  formatByUnit,
+  formatDurationUs,
+  formatTimestampUs,
+} from "../design/format";
 import { SPANS } from "../state/url";
 import { Tooltip } from "./Tooltip";
 import {
@@ -521,8 +525,9 @@ export function Spine(props: SpineProps) {
             const fmt = new Intl.DateTimeFormat(undefined, {
               hour: "2-digit",
               minute: "2-digit",
+              hour12: false,
             });
-            const when = `${fmt.format(new Date(bucketStart / 1000))}–${fmt.format(new Date(bucketEnd / 1000))}`;
+            const when = `${fmt.format(new Date(bucketStart / 1000))}–${fmt.format(new Date(bucketEnd / 1000))} · ${t("spine.bucketSpan", { duration: formatDurationUs(bucketEnd - bucketStart) })}`;
             const point = pointForBucket(i);
             const reason = bucketReason(point);
             const reasonText =
