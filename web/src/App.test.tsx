@@ -13,6 +13,7 @@ import {
   makeEntityHistoryResponse,
   makeEventsResponse,
   makeFrameResponse,
+  makeHealthResponse,
   makeHeatmapQuality,
   makeIncidentsResponse,
   makeSpineResponse,
@@ -108,7 +109,18 @@ function stubFetch() {
       });
     else if (path === "/v1/ui/context") body = makeContextResponse();
     else if (path === "/v1/incidents") body = makeIncidentsResponse();
-    else if (path === "/v1/timeline/spine") body = makeSpineResponse();
+    else if (path === "/v1/timeline/spine")
+      body = makeSpineResponse({
+        series: [
+          {
+            code: "host.load1",
+            unit: "loadavg",
+            aggregation: "avg",
+            values: [1, 0.5],
+          },
+        ],
+      });
+    else if (path === "/v1/timeline/health") body = makeHealthResponse();
     else if (path === "/v1/timeline/events") body = makeEventsResponse();
     else if (path === "/v1/timeline/heatmap") body = heatmapBody;
     else if (path.startsWith("/v1/frame/")) body = makeFrameResponse();

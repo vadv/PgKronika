@@ -54,6 +54,8 @@
   --sev-ok-bg: rgb(63 185 80 / 0.14);
   --sev-warn-bg: rgb(210 153 34 / 0.16);
   --sev-crit-bg: rgb(248 81 73 / 0.18);
+  /* Quiet verdict ribbon cell: calm buckets stay readable but recede. */
+  --sev-ok-quiet: rgb(63 185 80 / 0.25);
   --sev-ok-fg: #56d364;
   --sev-warn-fg: #e3b341;
   --sev-crit-fg: #ff7b72;
@@ -89,6 +91,8 @@
   --sev-ok-bg: rgb(26 127 55 / 0.12);
   --sev-warn-bg: rgb(154 103 0 / 0.14);
   --sev-crit-bg: rgb(207 34 46 / 0.12);
+  /* Quiet verdict ribbon cell: calm buckets stay readable but recede. */
+  --sev-ok-quiet: rgb(26 127 55 / 0.25);
   --sev-ok-fg: #1a7f37;
   --sev-warn-fg: #7d5a00;
   --sev-crit-fg: #a40e26;

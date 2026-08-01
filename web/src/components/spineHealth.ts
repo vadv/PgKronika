@@ -6,7 +6,11 @@
  * (server-computed `overall_state` per point). Client-side numbers are pure
  * aggregation of those verdicts — no thresholds on the data itself. The
  * 90/70 cutoffs below color the score chip only; they never touch data. */
-import type { EventFact, HealthPointResponse, IncidentResponse } from "../api/types";
+import type {
+  EventFact,
+  HealthPointResponse,
+  IncidentResponse,
+} from "../api/types";
 
 /** Verdict of one ribbon bucket. `gap` = no server verdict for the slice. */
 export type BucketVerdict = "ok" | "warn" | "crit" | "gap";
@@ -146,9 +150,10 @@ export function eventGlyph(event: EventFact): EventGlyph {
 
 /** Short reason for a non-ok bucket: the floor class when present, else the
  * domain with the highest penalty. Codes are localized by the caller. */
-export function bucketReason(
-  point: HealthPointResponse | null,
-): { floor: string | null; domain: string | null } {
+export function bucketReason(point: HealthPointResponse | null): {
+  floor: string | null;
+  domain: string | null;
+} {
   if (point === null) return { floor: null, domain: null };
   const floor = point.floor_evidence[0]?.class ?? null;
   let domain: string | null = null;

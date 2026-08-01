@@ -5,6 +5,10 @@ import { afterEach, expect, test, vi } from "vitest";
 import {
   makeEventFact,
   makeEventsResponse,
+  makeHealthPoint,
+  makeHealthResponse,
+  makeIncident,
+  makeIncidentsResponse,
   makeSpineResponse,
 } from "../testkit/apiFixtures";
 import { Spine, type SpineProps } from "./Spine";
@@ -32,20 +36,77 @@ const spineFixture = makeSpineResponse({
   ],
 });
 
+// Health is queried over the doubled window (previous + current) at 96
+// buckets per window: the previous hour fully calm, the current hour half
+// calm, then 24 degraded and 24 critical buckets.
+const BUCKET_US = WINDOW_US / 96;
+const healthFixture = makeHealthResponse({
+  points: [
+    ...Array.from({ length: 96 }, (_, i) =>
+      makeHealthPoint({
+        interval: {
+          from_us: FROM_US - WINDOW_US + i * BUCKET_US,
+          to_us: FROM_US - WINDOW_US + (i + 1) * BUCKET_US,
+        },
+        overall_state: "normal",
+      }),
+    ),
+    ...Array.from({ length: 96 }, (_, i) =>
+      makeHealthPoint({
+        interval: {
+          from_us: FROM_US + i * BUCKET_US,
+          to_us: FROM_US + (i + 1) * BUCKET_US,
+        },
+        overall_state: i < 48 ? "normal" : i < 72 ? "degraded" : "critical",
+        ...(i >= 72
+          ? {
+              floor_evidence: [{ class: "oom_kill", supporting_fact_id: "f1" }],
+            }
+          : i >= 48
+            ? {
+                domains: [
+                  {
+                    domain: "cpu_pressure",
+                    penalty: 0.4,
+                    driving_factor_ids: [1],
+                  },
+                ],
+              }
+            : {}),
+      }),
+    ),
+  ],
+});
+
+const incidentsFixture = makeIncidentsResponse({
+  incidents: [
+    makeIncident({
+      interval: { from: FROM_US + WINDOW_US / 2, to: AT_US },
+    }),
+  ],
+});
+
 const eventsFixture = makeEventsResponse({
   events: [
     makeEventFact({
-      event_kind: "pg_checkpoint_completed",
+      event_kind: "pg.checkpoint.completed",
       notable_class: "info",
       occurred_at_us: FROM_US + WINDOW_US / 2,
       sort_ts_us: FROM_US + WINDOW_US / 2,
     }),
     makeEventFact({
       event_instance_id: "instance-2",
-      event_kind: "pg_log_error_group_observed",
+      event_kind: "pg.log.error_group_observed",
       notable_class: "panic",
       occurred_at_us: FROM_US + WINDOW_US / 4,
       sort_ts_us: FROM_US + WINDOW_US / 4,
+    }),
+    makeEventFact({
+      event_instance_id: "instance-3",
+      event_kind: "pg.maintenance.autovacuum_reported",
+      notable_class: "info",
+      occurred_at_us: FROM_US + (WINDOW_US * 3) / 4,
+      sort_ts_us: FROM_US + (WINDOW_US * 3) / 4,
     }),
   ],
 });
@@ -67,7 +128,11 @@ function stubFetch() {
           : input.href;
     const body = url.includes("/v1/timeline/events")
       ? eventsFixture
-      : spineFixture;
+      : url.includes("/v1/timeline/health")
+        ? healthFixture
+        : url.includes("/v1/incidents")
+          ? incidentsFixture
+          : spineFixture;
     return Promise.resolve(jsonResponse(body));
   });
 }
@@ -104,45 +169,134 @@ function renderSpine(overrides: Partial<SpineProps> = {}) {
   return render(<Spine {...props} />, { wrapper });
 }
 
-test("renders load polyline, cursor, bucket overlay and event markers", async () => {
-  const { container } = renderSpine();
+test("renders verdict ribbon, score chip, glyphs, sparkline and summary", async () => {
+  renderSpine();
   await waitFor(() =>
-    expect(screen.getByTestId("spine-health-line")).toBeDefined(),
+    expect(screen.getAllByTestId("spine-ribbon-ok").length).toBeGreaterThan(0),
   );
-  expect(screen.getByTestId("spine-cursor")).toBeDefined();
-  expect(container.querySelectorAll("[data-tick]")).toHaveLength(25);
-  // Checkpoint marker glyph; null bucket breaks the polyline into a segment.
-  expect(screen.getByText("▲")).toBeDefined();
+  // Ribbon: calm buckets quiet, warn/crit full; no gap cells in this fixture.
+  expect(screen.getAllByTestId("spine-ribbon-warn").length).toBeGreaterThan(0);
+  expect(screen.getAllByTestId("spine-ribbon-crit").length).toBeGreaterThan(0);
+  expect(screen.queryByTestId("spine-ribbon-gap")).toBeNull();
+  // Bucket tooltip: time range, localized verdict and the API reason.
+  const critCell = screen.getAllByTestId("spine-ribbon-crit")[0];
+  expect(critCell?.querySelector("title")?.textContent).toContain(
+    "spine.verdict.crit",
+  );
+  expect(critCell?.querySelector("title")?.textContent).toContain(
+    "health.floor.oom_kill",
+  );
+  // Score chip: 24 crit buckets (15 min), 24 warn (15 min), 1 incident.
+  // 100 − 15×3 − 15×0.5 − 1×5 = 42.5 → 43; prev window is fully calm.
+  expect(screen.getByTestId("spine-score").textContent).toContain("43");
+  expect(screen.getByTestId("spine-score-delta").textContent).toContain("▼57");
+  // Event glyphs per the approved mapping.
   expect(screen.getByText("●")).toBeDefined();
-  const points = screen.getByTestId("spine-health-line").getAttribute("points");
-  expect(points?.split(" ")).toHaveLength(2);
-  // Missing bucket surfaces as a dim dot and a "missing" tooltip; the wire
-  // carries no per-bucket status anymore.
-  expect(screen.getByTestId("spine-missing-point")).toBeDefined();
-  const buckets = screen.getAllByTestId("spine-bucket");
-  expect(buckets).toHaveLength(3);
-  expect(buckets[2]?.querySelector("title")?.textContent).toContain(
-    "spine.missing",
+  expect(screen.getByText("◆")).toBeDefined();
+  expect(screen.getByText("○")).toBeDefined();
+  // Load sparkline skips the null bucket (one 2-point segment).
+  const spark = screen.getByTestId("spine-load-line");
+  expect(spark.getAttribute("points")?.split(" ")).toHaveLength(2);
+  // Right summary: cursor time + current load + crit/warn counts.
+  const summary = screen.getByTestId("spine-summary");
+  expect(summary.textContent).toContain("host.load1");
+  expect(summary.textContent).toContain("▲24");
+  expect(summary.textContent).toContain("●24");
+  expect(screen.getByTestId("spine-cursor")).toBeDefined();
+});
+
+test("a health-less window renders honest gap markers, not silence", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href;
+      const body = url.includes("/v1/timeline/health")
+        ? makeHealthResponse({ points: [] })
+        : url.includes("/v1/timeline/events")
+          ? makeEventsResponse({ events: [] })
+          : url.includes("/v1/incidents")
+            ? makeIncidentsResponse()
+            : spineFixture;
+      return Promise.resolve(jsonResponse(body));
+    }),
   );
-  expect(buckets[2]?.querySelector("title")?.textContent).not.toContain(
-    "producer_gap",
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+  render(
+    <Spine
+      at={String(AT_US)}
+      span={3600}
+      baseline={null}
+      onSelectAt={() => {}}
+      onSelectSpan={() => {}}
+      onSelectBaseline={() => {}}
+    />,
+    { wrapper },
   );
-  expect(buckets[0]?.querySelector("title")?.textContent).toContain(
-    "host.load1",
+  // Health has no points but the load series has values: the strip renders,
+  // every ribbon bucket an explicit gap marker with a "no data" tooltip.
+  await waitFor(() =>
+    expect(screen.getAllByTestId("spine-ribbon-gap")).toHaveLength(96),
   );
-  // Metric caption shows the selected series (untranslated key in tests).
-  expect(screen.getByTestId("spine-metric").textContent).toContain(
-    "spine.load",
+  expect(
+    screen.getAllByTestId("spine-ribbon-gap")[0]?.querySelector("title")
+      ?.textContent,
+  ).toContain("spine.missing");
+});
+
+test("an empty window shows the no-data line instead of a blank chart", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href;
+      const body = url.includes("/v1/timeline/health")
+        ? makeHealthResponse({ points: [] })
+        : url.includes("/v1/timeline/events")
+          ? makeEventsResponse({ events: [] })
+          : url.includes("/v1/incidents")
+            ? makeIncidentsResponse()
+            : makeSpineResponse({ series: [] });
+      return Promise.resolve(jsonResponse(body));
+    }),
   );
-  // Untranslated i18n keys surface verbatim: REPLAY mode for a fixed cursor.
-  expect(screen.getByRole("button", { name: /replay/ })).toBeDefined();
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+  render(
+    <Spine
+      at={String(AT_US)}
+      span={3600}
+      baseline={null}
+      onSelectAt={() => {}}
+      onSelectSpan={() => {}}
+      onSelectBaseline={() => {}}
+    />,
+    { wrapper },
+  );
+  await waitFor(() =>
+    expect(screen.getByTestId("spine-state").textContent).toContain(
+      "spine.missing",
+    ),
+  );
+  expect(screen.queryByRole("slider")).toBeNull();
 });
 
 test("click on the strip reports the cursor µs at that position", async () => {
   const onSelectAt = vi.fn();
   renderSpine({ onSelectAt });
   await waitFor(() =>
-    expect(screen.getByTestId("spine-health-line")).toBeDefined(),
+    expect(screen.getAllByTestId("spine-ribbon-ok").length).toBeGreaterThan(0),
   );
   const svg = screen.getByRole("slider");
   stubRect(svg);
@@ -173,13 +327,13 @@ test("shift+click sets the baseline, a repeat nearby clears it", async () => {
 test("mode button toggles LIVE → REPLAY and back", async () => {
   const onSelectAt = vi.fn();
   const { unmount } = renderSpine({ at: null, onSelectAt });
-  const liveButton = await screen.findByRole("button", { name: /live/ });
+  const liveButton = await screen.findByRole("button", { name: /live/i });
   fireEvent.click(liveButton);
   expect(onSelectAt).toHaveBeenCalledWith(expect.stringMatching(/^\d+$/));
   unmount();
 
   renderSpine({ at: String(AT_US), onSelectAt });
-  const replayButton = await screen.findByRole("button", { name: /replay/ });
+  const replayButton = await screen.findByRole("button", { name: /replay/i });
   fireEvent.click(replayButton);
   expect(onSelectAt).toHaveBeenLastCalledWith(null);
 });
@@ -188,7 +342,7 @@ test("zoom group reports the selected span", async () => {
   const onSelectSpan = vi.fn();
   renderSpine({ onSelectSpan });
   await waitFor(() =>
-    expect(screen.getByTestId("spine-health-line")).toBeDefined(),
+    expect(screen.getAllByTestId("spine-ribbon-ok").length).toBeGreaterThan(0),
   );
   fireEvent.click(screen.getByRole("button", { name: /86400/ }));
   expect(onSelectSpan).toHaveBeenCalledWith(86400);
