@@ -142,6 +142,44 @@ fn catalog_contains_every_v5_column_preset_capability_and_reason() {
 }
 
 #[test]
+fn gated_reason_distinguishes_extension_backed_from_built_in_inputs() {
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+
+    let plans = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "plans")
+        .expect("plans view");
+    assert_eq!(
+        plans.inputs[0].unavailable_reason,
+        Some("missing_extension")
+    );
+
+    let statements = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .expect("statements view");
+    assert_eq!(
+        statements.inputs[0].unavailable_reason,
+        Some("missing_extension")
+    );
+
+    let vacuum = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "vacuum")
+        .expect("vacuum view");
+    assert_eq!(vacuum.inputs[0].unavailable_reason, Some("not_collected"));
+    assert!(
+        vacuum
+            .metrics
+            .iter()
+            .all(|metric| metric.unavailable_reason != Some("missing_extension"))
+    );
+}
+
+#[test]
 fn every_preset_returns_its_sort_column() {
     let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
     for view in catalog.views() {

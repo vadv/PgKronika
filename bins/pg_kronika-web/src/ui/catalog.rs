@@ -284,7 +284,7 @@ fn apply_availability(view: &mut ViewSpec, observed: &BTreeSet<u32>) {
             input.unavailable_reason = None;
         } else {
             input.availability = Availability::Gated;
-            input.unavailable_reason = Some("missing_extension");
+            input.unavailable_reason = Some(input_reason(input));
         }
     }
     let input_available = |code: &str| {
@@ -294,16 +294,16 @@ fn apply_availability(view: &mut ViewSpec, observed: &BTreeSet<u32>) {
     };
     for metric in &mut view.metrics {
         metric.availability = availability_for(&metric.requires, &input_available);
-        metric.unavailable_reason =
-            (metric.availability != Availability::Available).then_some("missing_extension");
+        metric.unavailable_reason = (metric.availability != Availability::Available)
+            .then(|| reason_for_requires(&view.inputs, &metric.requires));
     }
     for column in &mut view.columns {
         if column.availability != Availability::NotCollected
             && column.unavailable_reason != Some("missing_provenance")
         {
             column.availability = availability_for(&column.requires, &input_available);
-            column.unavailable_reason =
-                (column.availability != Availability::Available).then_some("missing_extension");
+            column.unavailable_reason = (column.availability != Availability::Available)
+                .then(|| reason_for_requires(&view.inputs, &column.requires));
         }
     }
     view.availability = view
@@ -311,6 +311,38 @@ fn apply_availability(view: &mut ViewSpec, observed: &BTreeSet<u32>) {
         .iter()
         .find(|metric| metric.code == view.canonical_metric)
         .map_or(Availability::Gated, |metric| metric.availability);
+}
+
+/// Sections backed by a `PostgreSQL` extension; their absence has a
+/// different operator meaning than an uncollected built-in source.
+const EXTENSION_BACKED_SECTIONS: &[&str] = &[
+    "pg_stat_statements",
+    "pg_store_plans_ossc",
+    "pg_store_plans_vadv",
+];
+
+fn input_reason(input: &InputSpec) -> &'static str {
+    if input
+        .logical_sections
+        .iter()
+        .any(|section| EXTENSION_BACKED_SECTIONS.contains(section))
+    {
+        "missing_extension"
+    } else {
+        "not_collected"
+    }
+}
+
+fn reason_for_requires(inputs: &[InputSpec], requires: &[&'static str]) -> &'static str {
+    requires
+        .iter()
+        .find_map(|code| {
+            inputs
+                .iter()
+                .find(|input| input.code == *code && input.availability != Availability::Available)
+                .and_then(|input| input.unavailable_reason)
+        })
+        .unwrap_or("not_collected")
 }
 
 fn availability_for(required: &[&str], input_available: &impl Fn(&str) -> bool) -> Availability {
