@@ -193,11 +193,28 @@ function timelineMeta(fromUs, toUs) {
 const SPINE_GAP = [60, 61]; // two buckets lost to a collector restart
 const SPINE_PEAK = 42; // deploy-driven load spike in the middle of the window
 
+// Sparse scenario (PGK_DEMO_SPARSE=1): long collection holes, isolated
+// single points and honest gap reasons — the strip must stay readable.
+const SPARSE = process.env.PGK_DEMO_SPARSE === "1";
+// Buckets with data in sparse mode: a head segment, one isolated point, a
+// middle segment, another isolated point, a tail segment.
+const SPARSE_SPINE_KEEP = (b) =>
+  b <= 4 || b === 31 || (b >= 34 && b <= 59) || b === 71 || b >= 91;
+const SPARSE_SPINE_GAPS = [
+  [5, 31, "producer_restart"],
+  [60, 91, "producer_gap"],
+];
+// Health point holes in sparse mode (fractions of the requested range).
+const SPARSE_HEALTH_DROP = [
+  [0.56, 0.68],
+  [0.78, 0.84],
+];
+
 function spineSeries(code, unit, aggregation, base, spike, buckets, rand) {
   const phase = rand() * Math.PI * 2;
   const values = [];
   for (let b = 0; b < buckets; b++) {
-    if (SPINE_GAP.includes(b)) {
+    if (SPINE_GAP.includes(b) || (SPARSE && !SPARSE_SPINE_KEEP(b))) {
       values.push(null);
       continue;
     }
@@ -224,6 +241,22 @@ function spineResponse(params) {
   ];
 
   const bucketUs = (to - from) / BigInt(buckets);
+  const gaps = SPARSE
+    ? SPARSE_SPINE_GAPS.map(([start, end, reason]) => ({
+        from_us: (from + bucketUs * BigInt(start)).toString(),
+        to_us: (from + bucketUs * BigInt(end)).toString(),
+        reason,
+      }))
+    : [
+        {
+          from_us: (from + bucketUs * BigInt(SPINE_GAP[0])).toString(),
+          to_us: (
+            from +
+            bucketUs * BigInt(SPINE_GAP[SPINE_GAP.length - 1] + 1)
+          ).toString(),
+          reason: "producer_gap",
+        },
+      ];
   return {
     grid: {
       from_us: from.toString(),
@@ -233,17 +266,10 @@ function spineResponse(params) {
     series,
     quality: {
       status: "partial",
-      snapshots: buckets - SPINE_GAP.length,
-      gaps: [
-        {
-          from_us: (from + bucketUs * BigInt(SPINE_GAP[0])).toString(),
-          to_us: (
-            from +
-            bucketUs * BigInt(SPINE_GAP[SPINE_GAP.length - 1] + 1)
-          ).toString(),
-          reason: "producer_gap",
-        },
-      ],
+      snapshots: SPARSE
+        ? buckets - SPARSE_SPINE_GAPS.reduce((n, [s, e]) => n + (e - s), 0)
+        : buckets - SPINE_GAP.length,
+      gaps,
       gated: [],
       resource_limited: [],
       active_tail: true,
@@ -265,10 +291,20 @@ function healthResponse(params) {
   for (let start = from; start < to; start += step) {
     const end = Math.min(start + step, to);
     const midFraction = (start + step / 2 - from) / span;
+    // Sparse mode: whole ranges without points — honest ribbon holes.
+    if (
+      SPARSE &&
+      SPARSE_HEALTH_DROP.some(([a, b]) => midFraction >= a && midFraction < b)
+    ) {
+      continue;
+    }
     let state = "normal";
     // Doubled window queries: the second half (current window) carries the
     // incidents; the first half (previous window) stays calm.
-    if (midFraction >= 0.77 && midFraction <= 0.85) state = "critical";
+    if (SPARSE) {
+      if (midFraction >= 0.87 && midFraction <= 0.93) state = "critical";
+      else if (midFraction >= 0.52 && midFraction < 0.55) state = "degraded";
+    } else if (midFraction >= 0.77 && midFraction <= 0.85) state = "critical";
     else if (midFraction >= 0.66 && midFraction < 0.71) state = "degraded";
     points.push({
       interval: { from_us: Math.round(start), to_us: Math.round(end) },
