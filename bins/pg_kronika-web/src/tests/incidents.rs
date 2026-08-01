@@ -795,15 +795,16 @@ async fn incidents_distinguish_no_data_and_use_metadata_free_payload() {
     assert_eq!(body["catalog"]["diagnosis_available"], true);
 }
 
+/// Занятый слот — не повод для мгновенного 503: однотиковые опросы
+/// health-полосы (health+events летят вместе) иначе гарантированно
+/// отклоняют друг друга. Запрос ждёт слот в пределах bounded wait
+/// (`AppState::acquire_analytic`) и рендерится после освобождения.
 #[tokio::test]
-async fn analytic_endpoints_share_fail_fast_admission() {
+async fn analytic_requests_queue_behind_the_slot_and_complete_after_release() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_bgwriter_segment(dir.path(), "0.pgm", 0, 10 * 60 * 1_000_000);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
     let state = AppState::new(snapshot).expect("state");
-    let _permit = state
-        .try_acquire_analytic()
-        .expect("reserve the shared analytic slot");
 
     for uri in [
         "/v1/incidents?from=0&to=600000000&window=1m&step=1m",
@@ -812,25 +813,67 @@ async fn analytic_endpoints_share_fail_fast_admission() {
         "/v1/timeline/events?from=0&to=600000000",
         "/v1/timeline/health?from=0&to=600000000&step=60000000",
     ] {
-        let response = app(state.clone(), None, test_metrics_handle())
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .body(Body::empty())
-                    .expect("build request"),
-            )
-            .await
-            .expect("route request");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
-        assert_eq!(
-            response
-                .headers()
-                .get(header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok()),
-            Some("1"),
-            "{uri} advertises a valid retry delay",
+        let permit = state
+            .try_acquire_analytic()
+            .expect("reserve the shared analytic slot");
+        let request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request");
+        let mut pending = tokio::spawn(
+            app(state.clone(), None, test_metrics_handle()).oneshot(request),
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending)
+                .await
+                .is_err(),
+            "{uri} must wait for the analytic slot instead of failing fast"
+        );
+        drop(permit);
+        let response = pending.await.expect("join request").expect("route request");
+        assert_ne!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} must render after the slot is released, not lose the race"
         );
     }
+}
+
+/// Bounded wait ограничен: слот, занятый дольше дедлайна, по-прежнему даёт
+/// типизированный 503 с Retry-After — сигнал настоящей перегрузки.
+#[tokio::test]
+async fn analytic_requests_reject_after_the_bounded_wait() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bgwriter_segment(dir.path(), "0.pgm", 0, 10 * 60 * 1_000_000);
+    let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+    let state = AppState::new(snapshot).expect("state");
+    let _permit = state
+        .try_acquire_analytic()
+        .expect("reserve the shared analytic slot");
+
+    let started = std::time::Instant::now();
+    let response = app(state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/health?from=0&to=600000000&step=60000000")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("route request");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "the rejection must follow the bounded wait, not fail fast"
+    );
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "a genuine overload still advertises a valid retry delay",
+    );
 }
 
 #[tokio::test]
