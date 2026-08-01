@@ -52,6 +52,12 @@ export function TabBar(props: {
             )}
           </span>
         );
+        const dotColor =
+          v.availability === "available"
+            ? "var(--sev-ok)"
+            : v.availability === "gated"
+              ? "var(--sev-warn)"
+              : "var(--fg-dim)";
         return (
           <Tooltip key={v.code} content={tip}>
             <button
@@ -60,8 +66,8 @@ export function TabBar(props: {
               aria-disabled={gated}
               style={{
                 display: "inline-flex",
-                alignItems: "baseline",
-                gap: "4px",
+                alignItems: "center",
+                gap: "5px",
                 fontFamily: "var(--ui-font)",
                 fontSize: "var(--text-md)",
                 padding: "4px 8px",
@@ -81,6 +87,16 @@ export function TabBar(props: {
               }}
               onClick={() => !gated && props.onSelect(v.code)}
             >
+              <span
+                aria-hidden="true"
+                style={{
+                  width: "7px",
+                  height: "7px",
+                  borderRadius: "50%",
+                  background: dotColor,
+                  alignSelf: "center",
+                }}
+              />
               {t(`tabs.${v.code}`)}
               {!gated && summary && (
                 <TabBadge
