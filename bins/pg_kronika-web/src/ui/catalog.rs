@@ -1435,7 +1435,16 @@ fn processes_view() -> ViewSpec {
         vec![
             preset(
                 "cpu",
-                &["pid", "type", "cpu", "rss", "command"],
+                &[
+                    "pid",
+                    "type",
+                    "cpu",
+                    "rss",
+                    "threads",
+                    "read_bytes_per_second",
+                    "write_bytes_per_second",
+                    "command",
+                ],
                 "cpu",
                 "desc",
             ),
@@ -1702,27 +1711,29 @@ fn events_view() -> ViewSpec {
             ),
         ],
         vec![
+            // Human columns in presets: the raw severity/category integers
+            // stay available through `columns=` but never headline a table.
             preset(
                 "errors",
-                &["time", "severity", "type", "message"],
+                &["time", "severity_code", "category_code", "message"],
                 "time",
                 "desc",
             ),
             preset(
                 "checkpoints",
-                &["time", "type", "duration", "message"],
+                &["time", "category_code", "duration", "message"],
                 "time",
                 "desc",
             ),
             preset(
                 "vacuum",
-                &["time", "type", "duration", "message"],
+                &["time", "category_code", "duration", "message"],
                 "time",
                 "desc",
             ),
             preset(
                 "slow",
-                &["time", "type", "duration", "message"],
+                &["time", "category_code", "duration", "message"],
                 "duration",
                 "desc",
             ),
