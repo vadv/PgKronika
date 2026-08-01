@@ -720,6 +720,20 @@ fn activity_view() -> ViewSpec {
 )]
 fn statements_view() -> ViewSpec {
     let projection = projection("statements");
+    // The production collector writes `query` as NULL on purpose (unbounded
+    // text vs. a bounded segment budget), so the column is intrinsically
+    // not-collected rather than gated by the store: the UI must say
+    // "not collected", never show an empty value.
+    let mut query_text = raw_column(
+        "query",
+        ValueType::Text,
+        "statements.query",
+        true,
+        &["statements"],
+        None,
+    );
+    query_text.availability = Availability::NotCollected;
+    query_text.unavailable_reason = Some("query_text_not_collected");
     let columns = vec![
         raw_column(
             "queryid",
@@ -729,11 +743,20 @@ fn statements_view() -> ViewSpec {
             &["statements"],
             None,
         ),
+        query_text,
         raw_column(
-            "query",
+            "database",
             ValueType::Text,
-            "statements.query",
-            true,
+            "statements.datname",
+            false,
+            &["statements"],
+            None,
+        ),
+        raw_column(
+            "user",
+            ValueType::Text,
+            "statements.usename",
+            false,
             &["statements"],
             None,
         ),
@@ -816,11 +839,16 @@ fn statements_view() -> ViewSpec {
         ),
     ];
     let presets = vec![
+        // DBA composition: row identification (queryid token + database +
+        // user) first, then who eats the instance — calls, Σ/mean with
+        // units, share of time, rows. The query text is a detail-only
+        // column, so no preset lists it.
         preset(
             "time",
             &[
                 "queryid",
-                "query",
+                "database",
+                "user",
                 "calls",
                 "total",
                 "mean",
@@ -834,19 +862,26 @@ fn statements_view() -> ViewSpec {
         ),
         preset(
             "io",
-            &["queryid", "query", "calls", "hit_pct", "blks_read"],
+            &[
+                "queryid",
+                "database",
+                "user",
+                "calls",
+                "hit_pct",
+                "blks_read",
+            ],
             "blks_read",
             "desc",
         ),
         preset(
             "temp",
-            &["queryid", "query", "calls", "temp_written"],
+            &["queryid", "database", "user", "calls", "temp_written"],
             "temp_written",
             "desc",
         ),
         preset(
             "wal",
-            &["queryid", "query", "calls", "wal_bytes", "total"],
+            &["queryid", "database", "user", "calls", "wal_bytes", "total"],
             "wal_bytes",
             "desc",
         ),

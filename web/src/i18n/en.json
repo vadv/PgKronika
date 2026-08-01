@@ -529,5 +529,9 @@
   "event.kind.pg.statistics.reset_observed.desc": "Database statistics were reset — counter histories are broken",
   "event.kind.pg.timeline.changed.label": "timeline change",
   "event.kind.pg.timeline.changed.desc": "The WAL timeline changed (after a promote or point-in-time recovery)",
-  "spine.bucketSpan": "bucket {{duration}}"
+  "spine.bucketSpan": "bucket {{duration}}",
+"col.statements.database.desc": "Database the statement ran in (dbid from pg_stat_statements)",
+  "col.statements.user.desc": "Role the statement ran as (userid from pg_stat_statements)",
+  "dock.row.heading.statements": "Query · {{id}}",
+  "dock.row.heading.plans": "Plan · {{id}}"
 }

@@ -64,7 +64,12 @@ const catalog = JSON.parse(
 for (const view of catalog.views) {
   view.availability = "available";
   for (const group of [view.inputs, view.metrics, view.columns]) {
-    for (const item of group) item.availability = "available";
+    for (const item of group) {
+      // `not_collected` is intrinsic to the source (the collector never
+      // writes the value), not a property of the empty demo store.
+      if (item.availability !== "not_collected")
+        item.availability = "available";
+    }
   }
 }
 
@@ -645,8 +650,11 @@ function rowsActivity() {
   });
 }
 
+const STMT_DATABASES = ["orders", "orders", "billing", "analytics"];
+const STMT_USERS = ["app_rw", "app_rw", "billing_job", "report"];
+
 function rowsStatements() {
-  return QUERIES.map(([qid, query], i) => {
+  return QUERIES.map(([qid], i) => {
     const calls = 12_400_000 - i * 912_000;
     const total = r2(8_420_000 - i * 588_000);
     const mean = r2(total / Math.max(calls / 1000, 1));
@@ -662,12 +670,18 @@ function rowsStatements() {
         ),
       );
     }
+    // Mirror the live store: the collector writes the query text as NULL by
+    // design, so the label is the bare queryid and identification rides on
+    // database/user — the demo must not promise text the stand cannot show.
+    const queryid = String(9_180_220_441_120_000n + BigInt(qid));
     return {
       entity: `stmt:${qid}`,
-      label: query,
+      label: queryid,
       data: {
-        queryid: String(9_180_220_441_120_000n + BigInt(qid)),
-        query,
+        queryid,
+        query: null,
+        database: STMT_DATABASES[i % STMT_DATABASES.length],
+        user: STMT_USERS[i % STMT_USERS.length],
         calls,
         total,
         ms_per_row: r2(0.42 + i * 0.18),
@@ -1077,7 +1091,16 @@ function frameResponse(viewCode, params) {
   const pageRows = rows.slice(offset, offset + limit);
   const next = offset + limit < matched ? `o:${offset + limit}` : null;
 
-  const columns = view.columns.map((c) => ({
+  // Mirror the backend admission: a preset (default = first) selects the
+  // frame columns, lazy columns never ride the frame.
+  const presetParam = params.get("preset");
+  const preset = presetParam
+    ? view.presets.find((p) => p.code === presetParam)
+    : view.presets[0];
+  const frameColumns = (preset?.columns ?? view.columns.map((c) => c.code))
+    .map((code) => view.columns.find((c) => c.code === code && !c.lazy))
+    .filter((c) => c !== undefined);
+  const columns = frameColumns.map((c) => ({
     code: c.code,
     type: c.type,
     hidden: false,
@@ -1092,7 +1115,7 @@ function frameResponse(viewCode, params) {
     rows: pageRows.map((r) => ({
       entity: r.entity,
       label: r.label,
-      cells: view.columns.map((c) => r.data[c.code] ?? null),
+      cells: frameColumns.map((c) => r.data[c.code] ?? null),
       classifications: r.cls ?? [],
       spark: sparkFor(r.entity, SPARK_SCALES[viewCode] ?? 100),
     })),

@@ -529,5 +529,9 @@
   "event.kind.pg.statistics.reset_observed.desc": "Статистика базы была сброшена — истории счётчиков оборваны",
   "event.kind.pg.timeline.changed.label": "смена timeline",
   "event.kind.pg.timeline.changed.desc": "WAL timeline изменился (после promote или восстановления на момент времени)",
-  "spine.bucketSpan": "бакет {{duration}}"
+  "spine.bucketSpan": "бакет {{duration}}",
+"col.statements.database.desc": "База данных, в которой выполнялся запрос (dbid из pg_stat_statements)",
+  "col.statements.user.desc": "Роль, от имени которой выполнялся запрос (userid из pg_stat_statements)",
+  "dock.row.heading.statements": "Запрос · {{id}}",
+  "dock.row.heading.plans": "План · {{id}}"
 }

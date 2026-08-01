@@ -1097,6 +1097,8 @@ fn project_statements(
         let value = match column.code {
             "queryid" => raw_frame(row, "queryid", column.value_type),
             "query" => raw_frame(row, "query", column.value_type),
+            "database" => raw_frame(row, "datname", column.value_type),
+            "user" => raw_frame(row, "usename", column.value_type),
             "calls" => delta_frame(calls),
             "total" => delta_frame(exec),
             "ms_per_row" => divide_delta(exec, rows),
