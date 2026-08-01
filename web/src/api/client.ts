@@ -15,6 +15,40 @@ export class ApiError extends Error {
     super(code);
     this.name = "ApiError";
   }
+
+  /** Seconds the server asked us to wait before retrying (503 transients). */
+  get retryAfterSeconds(): number | null {
+    const value = this.params?.retry_after_seconds;
+    return typeof value === "number" && value > 0 ? value : null;
+  }
+}
+
+/**
+ * A 503 is the specified warm-up/overload signal (`cold_build_overloaded`,
+ * `analytic_capacity_unavailable`, always with `Retry-After`): the reader is
+ * building facts, not failing. Retry through the warm-up window (observed at
+ * ~8 minutes on a fresh stand) instead of flashing an error. 4xx is a typed
+ * answer — never retried.
+ */
+export function retryApiRequest(failureCount: number, error: unknown): boolean {
+  if (error instanceof ApiError) {
+    if (error.status === 503) return failureCount < 60;
+    if (error.status >= 400 && error.status < 500) return false;
+  }
+  return failureCount < 3;
+}
+
+/** Retry-After as the base, growing to a 15 s ceiling: ~13 minutes of
+ * patience at 60 attempts without hammering a warming reader. */
+export function apiRetryDelay(attempt: number, error: unknown): number {
+  const baseMs =
+    error instanceof ApiError ? (error.retryAfterSeconds ?? 1) * 1000 : 1000;
+  return Math.min(baseMs * (attempt + 1), 15_000);
+}
+
+/** True while a query is still retrying a 503: show "warming up", not an error. */
+export function isWarmingUp(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 503;
 }
 
 const client = createClient<paths>({
