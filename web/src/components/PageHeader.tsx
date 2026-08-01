@@ -21,7 +21,7 @@ function KpiStat(props: {
       style={{
         display: "inline-flex",
         alignItems: "baseline",
-        gap: "5px",
+        gap: "6px",
         padding: "1px 8px",
         background: tint !== undefined ? tint.background : "var(--bg-raised)",
         border: "1px solid var(--border)",

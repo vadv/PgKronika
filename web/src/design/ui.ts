@@ -102,7 +102,7 @@ export const input: CSSProperties = {
   background: "var(--bg)",
   border: "1px solid var(--border)",
   borderRadius: "var(--radius-sm)",
-  padding: "3px 8px",
+  padding: "2px 8px",
   outline: "none",
 };
 

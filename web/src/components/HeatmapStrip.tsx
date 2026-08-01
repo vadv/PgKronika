@@ -279,8 +279,8 @@ export function HeatmapStrip(props: {
                       data-cell
                       data-empty={v === null ? "true" : undefined}
                       style={{
-                        width: "11px",
-                        height: "13px",
+                        width: "12px",
+                        height: "12px",
                         margin: "0.5px",
                         borderRadius: "2px",
                         background: heatColor(

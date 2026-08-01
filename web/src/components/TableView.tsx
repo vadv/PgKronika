@@ -484,7 +484,7 @@ export function TableView(props: TableViewProps) {
                           : whyTitle(classification?.result)
                       }
                       style={{
-                        padding: "3px 10px",
+                        padding: "2px 10px",
                         borderBottom: "1px solid var(--border)",
                         fontSize: "var(--text-md)",
                         textAlign: numeric ? "end" : "start",

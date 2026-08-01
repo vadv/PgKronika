@@ -237,7 +237,7 @@ function Shell() {
                 textAlign: "start",
                 background: "var(--bg-raised)",
                 border: "1px solid var(--border)",
-                borderInlineStart: `3px solid ${
+                borderInlineStart: `4px solid ${
                   incident.level === "critical"
                     ? "var(--sev-crit)"
                     : incident.level === "warning"
