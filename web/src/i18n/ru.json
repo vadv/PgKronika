@@ -110,5 +110,7 @@
   "pageheader.collection": "сбор",
   "pageheader.collectionHint": "Собрано N из M в источнике",
   "pageheader.matched": "matched",
-  "pageheader.matchedHint": "Строк в сохранённом снапшоте по текущему фильтру"
+  "pageheader.matchedHint": "Строк в сохранённом снапшоте по текущему фильтру",
+  "sidebar.expand": "развернуть навигацию",
+  "sidebar.collapse": "свернуть навигацию"
 }

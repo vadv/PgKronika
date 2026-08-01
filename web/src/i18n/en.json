@@ -110,5 +110,7 @@
   "pageheader.collection": "collection",
   "pageheader.collectionHint": "Collected N of M from the source",
   "pageheader.matched": "matched",
-  "pageheader.matchedHint": "Rows in the retained snapshot for the current filter"
+  "pageheader.matchedHint": "Rows in the retained snapshot for the current filter",
+  "sidebar.expand": "expand navigation",
+  "sidebar.collapse": "collapse navigation"
 }

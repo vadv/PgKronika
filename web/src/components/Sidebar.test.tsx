@@ -31,6 +31,8 @@ test("active view is marked, gated views do not select", () => {
     <Sidebar
       views={views}
       active="statements"
+      collapsed={false}
+      onToggleCollapsed={() => {}}
       onSelect={onSelect}
       summaries={new Map()}
     />,
@@ -51,6 +53,8 @@ test("population and notable marker render from summary", () => {
     <Sidebar
       views={views}
       active="activity"
+      collapsed={false}
+      onToggleCollapsed={() => {}}
       onSelect={() => {}}
       summaries={
         new Map([
@@ -75,6 +79,8 @@ test("availability dots distinguish available, gated and not_collected", () => {
     <Sidebar
       views={views}
       active="activity"
+      collapsed={false}
+      onToggleCollapsed={() => {}}
       onSelect={() => {}}
       summaries={new Map()}
     />,
@@ -91,6 +97,8 @@ test("sidebar tooltip shows availability and population", async () => {
     <Sidebar
       views={views}
       active="activity"
+      collapsed={false}
+      onToggleCollapsed={() => {}}
       onSelect={() => {}}
       summaries={new Map([["activity", summary()]])}
     />,
@@ -100,4 +108,23 @@ test("sidebar tooltip shows availability and population", async () => {
   const tip = screen.getByRole("tooltip").textContent ?? "";
   expect(tip).toContain("available");
   expect(tip).toContain("142");
+});
+
+test("collapsed rail shows only dots and codes, toggle fires", () => {
+  const onToggle = vi.fn();
+  render(
+    <Sidebar
+      views={views}
+      active="activity"
+      collapsed={true}
+      onToggleCollapsed={onToggle}
+      onSelect={() => {}}
+      summaries={new Map([["activity", summary()]])}
+    />,
+  );
+  // Rail: the localized label is not rendered inline, the 2-letter code is.
+  expect(screen.queryByText("tabs.activity")).toBeNull();
+  expect(screen.getByText("ac")).toBeDefined();
+  fireEvent.click(screen.getByRole("button", { name: "sidebar.expand" }));
+  expect(onToggle).toHaveBeenCalledTimes(1);
 });

@@ -30,6 +30,8 @@ afterEach(() => {
 
 beforeEach(() => {
   history.replaceState(null, "", location.pathname);
+  // Tests assert localized view labels, so run with the sidebar expanded.
+  localStorage.setItem("pgk-sidebar", "open");
 });
 
 function jsonResponse(body: unknown): Response {

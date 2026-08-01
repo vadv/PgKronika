@@ -61,6 +61,16 @@ function Shell() {
   const { t } = useTranslation();
   const [state, setState] = useState(() => parseHash(location.hash));
   const [dataHealthOpen, setDataHealthOpen] = useState(false);
+  // The sidebar defaults to a narrow rail: full labels are opt-in, persisted.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem("pgk-sidebar") !== "open",
+  );
+  const toggleSidebar = () => {
+    setSidebarCollapsed((c) => {
+      localStorage.setItem("pgk-sidebar", c ? "open" : "collapsed");
+      return !c;
+    });
+  };
   const [matched, setMatched] = useState<number | null>(null);
   const [metricByView, setMetricByView] = useState<Record<string, string>>({});
   const mobile = useMobile();
@@ -280,6 +290,8 @@ function Shell() {
             <Sidebar
               views={views}
               active={state.view}
+              collapsed={sidebarCollapsed}
+              onToggleCollapsed={toggleSidebar}
               onSelect={(view) => patch({ view })}
               summaries={
                 new Map((summary.data?.views ?? []).map((v) => [v.view, v]))
