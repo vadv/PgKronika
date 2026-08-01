@@ -447,8 +447,8 @@ retained data, and always uploads the stand diagnostics. It has no automatic
 - Only one anomaly, incident, or uncached timeline response
   projection runs at a time. Equal timeline response misses share one response
   flight; cache hits do not consume the slot. Another distinct heavy request
-  receives `503` with `code=analytic_capacity_unavailable` and
-  `Retry-After: 1`; it is not queued.
+  waits for the slot up to 2 seconds and only then receives `503` with
+  `code=analytic_capacity_unavailable` and `Retry-After: 1`.
 
 Store scan warnings and damaged journal regions remain available to the reader
 and affect gaps/completeness. They are never converted to successful rows.

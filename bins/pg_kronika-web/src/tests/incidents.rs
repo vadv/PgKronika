@@ -820,9 +820,8 @@ async fn analytic_requests_queue_behind_the_slot_and_complete_after_release() {
             .uri(uri)
             .body(Body::empty())
             .expect("build request");
-        let mut pending = tokio::spawn(
-            app(state.clone(), None, test_metrics_handle()).oneshot(request),
-        );
+        let mut pending =
+            tokio::spawn(app(state.clone(), None, test_metrics_handle()).oneshot(request));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending)
                 .await

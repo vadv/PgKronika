@@ -93,8 +93,9 @@ pub(crate) async fn incidents(State(state): State<AppState>, RawQuery(raw): RawQ
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
-    let Ok(permit) = state.try_acquire_analytic() else {
-        return ApiError::analytic_capacity_unavailable().into_response();
+    let permit = match state.acquire_analytic().await {
+        Ok(permit) => permit,
+        Err(error) => return error.into_response(),
     };
 
     match tokio::task::spawn_blocking(move || {

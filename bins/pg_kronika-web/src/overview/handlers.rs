@@ -173,15 +173,18 @@ where
                         }
                     };
                     let cacheable = loaded.fact_set_id() == worker_key.fact_set_id;
-                    let Ok(permit) = worker_state.try_acquire_analytic() else {
-                        metrics::counter!("kronika_web_timeline_capacity_rejections_total")
-                            .increment(1);
-                        worker_state.finish_timeline_flight(
-                            &worker_key,
-                            &worker_flight,
-                            Err(ApiError::analytic_capacity_unavailable()),
-                        );
-                        return;
+                    let permit = match worker_state.acquire_analytic().await {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            metrics::counter!("kronika_web_timeline_capacity_rejections_total")
+                                .increment(1);
+                            worker_state.finish_timeline_flight(
+                                &worker_key,
+                                &worker_flight,
+                                Err(error),
+                            );
+                            return;
+                        }
                     };
                     let cache = worker_state.response_cache.clone();
                     let render_cache_key = cacheable.then_some(cache_key).flatten();
