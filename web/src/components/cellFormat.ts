@@ -13,6 +13,7 @@ import {
   formatNumber,
   formatTimestampUs,
   isIdentityColumn,
+  isPlainIntegerColumn,
   shortIdToken,
 } from "../design/format";
 
@@ -59,8 +60,12 @@ export function formatCellValue(
   if (column.code === "category_code" && typeof value === "string") {
     return eventKindLabel(t, value);
   }
-  if (typeof value === "number") return formatByUnit(value, column.unit);
+  if (typeof value === "number") {
+    if (isPlainIntegerColumn(column.code)) return String(value);
+    return formatByUnit(value, column.unit);
+  }
   if (NUMERIC_TYPES.has(column.type) && numericText(value)) {
+    if (isPlainIntegerColumn(column.code)) return String(value);
     return formatByUnit(Number(value), column.unit);
   }
   return value;

@@ -65,6 +65,7 @@ export function formatByUnit(
     case "ratio":
       return `${trim(value * 100)}%`;
     case "B":
+    case "bytes":
       return formatBytes(value);
     case "kib":
       return formatBytes(value * 1024);
@@ -94,6 +95,14 @@ export function formatTimestampUs(value: number | string): string {
  * with thousand separators reads as a number, so show a short hex token. */
 export function isIdentityColumn(code: string): boolean {
   return code === "queryid" || code === "planid";
+}
+
+/** Numeric identity columns (PIDs, relation OIDs): rendered as the plain
+ * integer operators type, never grouped ("12188", not "12,188"). Guarded
+ * by the column type at the call site — text columns named `table` hold
+ * names, not OIDs. */
+export function isPlainIntegerColumn(code: string): boolean {
+  return code === "pid" || code === "root_pid" || code === "table";
 }
 
 /** uint64 decimal string → `1a2b…9f0e`; falls back to a plain cut for
