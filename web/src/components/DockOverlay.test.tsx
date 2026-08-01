@@ -145,13 +145,8 @@ test("row dock renders point fields from the entity endpoint", async () => {
       view: "activity",
       entity: "db:1",
       fields: [
-        { code: "tup", reason: null, status: "available", value: 42 },
-        {
-          code: "locks",
-          reason: "producer_gap",
-          status: "unavailable",
-          value: null,
-        },
+        { code: "tup", value: 42 },
+        { code: "locks", value: null },
       ],
       quality: { status: "partial", gaps: [], gated: [] },
     }),
@@ -175,14 +170,10 @@ test("row dock renders history snapshots when the API answers history mode", asy
         {
           ts_us: "1722400000000000",
           values: [10, 0],
-          statuses: ["available", "available"],
-          reasons: [null, null],
         },
         {
           ts_us: "1722400060000000",
           values: [12, null],
-          statuses: ["available", "not_collected"],
-          reasons: [null, "not_collected"],
         },
       ],
     }),
@@ -219,7 +210,7 @@ test("row dock in LIVE mode sends the resolved at (point shape), not a bare toke
             entity: "db:1",
             label: "",
             fields: [
-              { code: "tup", reason: null, status: "available", value: 42 },
+              { code: "tup", value: 42 },
             ],
           }),
         ),
@@ -250,7 +241,7 @@ test("row dock drills down via server related provenance and clears", async () =
       view: "statements",
       entity: "db:1",
       fields: [
-        { code: "query", reason: null, status: "available", value: "select 1" },
+        { code: "query", value: "select 1" },
       ],
       related: [
         {

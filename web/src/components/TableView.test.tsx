@@ -174,7 +174,6 @@ test("verdict cell carries level color and the mechanical why in the title", asy
               },
             },
           ],
-          cell_statuses: [{ status: "available", reason: null }],
         }),
       ],
       page: { matched: 1, returned: 1 },

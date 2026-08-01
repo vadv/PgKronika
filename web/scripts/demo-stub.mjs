@@ -191,20 +191,17 @@ const SPINE_PEAK = 42; // deploy-driven load spike in the middle of the window
 function spineSeries(code, unit, aggregation, base, spike, buckets, rand) {
   const phase = rand() * Math.PI * 2;
   const values = [];
-  const value_statuses = [];
   for (let b = 0; b < buckets; b++) {
     if (SPINE_GAP.includes(b)) {
       values.push(null);
-      value_statuses.push({ status: "unavailable", reason: "producer_gap" });
       continue;
     }
     const wave = 0.5 + 0.3 * Math.sin((b / buckets) * Math.PI * 4 + phase);
     const peak = 1.8 * Math.exp(-((b - SPINE_PEAK) ** 2) / (2 * 2.5 ** 2));
     const noise = rand() * 0.12;
     values.push(Math.round(base * (wave + noise) + spike * peak));
-    value_statuses.push({ status: "available", reason: null });
   }
-  return { code, unit, aggregation, values, value_statuses };
+  return { code, unit, aggregation, values };
 }
 
 function spineResponse(params) {
@@ -1056,12 +1053,6 @@ function frameResponse(viewCode, params) {
       label: r.label,
       cells: view.columns.map((c) => r.data[c.code] ?? null),
       classifications: r.cls ?? [],
-      categorical_classifications: r.cat ?? [],
-      cell_statuses: view.columns.map((c) =>
-        (r.data[c.code] ?? null) === null
-          ? { status: "unavailable", reason: "not_observed" }
-          : { status: "available", reason: null },
-      ),
       spark: sparkFor(r.entity, SPARK_SCALES[viewCode] ?? 100),
     })),
     page: { matched, returned: pageRows.length, next },
@@ -1125,12 +1116,6 @@ function entityResponse(viewCode, entity, params) {
         if (typeof value === "number") return r2(value * (0.8 + rand() * 0.4));
         return value;
       }),
-      statuses: columns.map((code) =>
-        (row.data[code] ?? null) === null ? "unavailable" : "available",
-      ),
-      reasons: columns.map((code) =>
-        (row.data[code] ?? null) === null ? "not_observed" : null,
-      ),
     });
   }
   return {

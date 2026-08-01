@@ -277,7 +277,8 @@ async fn entity_point_returns_lazy_fields_and_only_proven_related_links() {
         .find(|field| field["code"] == "query")
         .expect("lazy query field");
     assert_eq!(query["value"], "select * from orders");
-    assert_eq!(query["status"], "available");
+    assert!(query.get("status").is_none());
+    assert!(query.get("reason").is_none());
     let related = body["related"].as_array().expect("related links");
     // The time-coincident plan with a different queryid must not link.
     assert_eq!(related.len(), 1);
@@ -351,7 +352,7 @@ async fn entity_history_tiles_view_snapshots_without_duplicates() {
 }
 
 #[tokio::test]
-async fn entity_history_marks_absent_entity_not_observed_without_producer_gap() {
+async fn entity_history_marks_absent_entity_as_null_without_status_fields() {
     let directory = entity_fixture();
     let uri = format!(
         "/v1/entity/statements/{}?from=1000&to=2001&columns=queryid&limit=10",
@@ -368,8 +369,9 @@ async fn entity_history_marks_absent_entity_not_observed_without_producer_gap() 
             .collect::<Vec<_>>(),
         ["1000", "2000"]
     );
-    assert_eq!(body["snapshots"][0]["statuses"][0], "unavailable");
-    assert_eq!(body["snapshots"][0]["reasons"][0], "not_observed");
+    assert_eq!(body["snapshots"][0]["values"][0], serde_json::Value::Null);
+    assert!(body["snapshots"][0].get("statuses").is_none());
+    assert!(body["snapshots"][0].get("reasons").is_none());
     assert_eq!(body["quality"]["gaps"], serde_json::json!([]));
 }
 

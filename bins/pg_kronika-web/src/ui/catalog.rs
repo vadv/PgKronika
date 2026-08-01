@@ -409,26 +409,6 @@ fn derived_column(
     }
 }
 
-const fn unavailable_column(
-    code: &'static str,
-    value_type: ValueType,
-    source: &'static str,
-    unit: Option<&'static str>,
-) -> ColumnSpec {
-    ColumnSpec {
-        code,
-        value_type,
-        source: Some(source),
-        formula: None,
-        unit,
-        threshold_metric: None,
-        lazy: false,
-        requires: Vec::new(),
-        availability: Availability::NotCollected,
-        unavailable_reason: Some("not_collected"),
-    }
-}
-
 const fn unavailable_column_with_reason(
     code: &'static str,
     value_type: ValueType,
@@ -1381,7 +1361,6 @@ fn processes_view() -> ViewSpec {
             &["process"],
             Some("count"),
         ),
-        unavailable_column("pss", ValueType::I64, "smaps_rollup.pss_kb", None),
         derived_column(
             "read_bytes_per_second",
             ValueType::F64,
@@ -1448,12 +1427,7 @@ fn processes_view() -> ViewSpec {
                 "cpu",
                 "desc",
             ),
-            preset(
-                "memory",
-                &["pid", "type", "rss", "pss", "command"],
-                "rss",
-                "desc",
-            ),
+            preset("memory", &["pid", "type", "rss", "command"], "rss", "desc"),
             preset(
                 "disk_io",
                 &[

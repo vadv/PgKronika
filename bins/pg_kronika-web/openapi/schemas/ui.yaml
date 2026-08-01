@@ -41,31 +41,6 @@ CapabilityStatus:
   - unavailable
   - partial
   type: string
-CategoricalClassificationDto:
-  properties:
-    code:
-      type:
-      - string
-      - 'null'
-    column:
-      type: string
-    level:
-      type:
-      - string
-      - 'null'
-    reason:
-      type:
-      - string
-      - 'null'
-    status:
-      type: string
-  required:
-  - column
-  - status
-  - code
-  - level
-  - reason
-  type: object
 CellClassificationDto:
   properties:
     column:
@@ -78,18 +53,6 @@ CellClassificationDto:
   - column
   - metric
   - result
-  type: object
-CellStatusDto:
-  properties:
-    reason:
-      type:
-      - string
-      - 'null'
-    status:
-      type: string
-  required:
-  - status
-  - reason
   type: object
 ClassificationResultDto:
   oneOf:
@@ -508,19 +471,11 @@ EntityFieldDto:
   properties:
     code:
       type: string
-    reason:
-      type:
-      - string
-      - 'null'
-    status:
-      type: string
     value:
       $ref: '#/FrameValue'
   required:
   - code
   - value
-  - status
-  - reason
   type: object
 EntityGapDto:
   properties:
@@ -634,16 +589,6 @@ EntityResponse:
   - $ref: '#/EntityHistoryResponse'
 EntitySnapshotDto:
   properties:
-    reasons:
-      items:
-        type:
-        - string
-        - 'null'
-      type: array
-    statuses:
-      items:
-        type: string
-      type: array
     ts_us:
       type: string
     values:
@@ -653,8 +598,6 @@ EntitySnapshotDto:
   required:
   - ts_us
   - values
-  - statuses
-  - reasons
   type: object
 EvidenceDto:
   oneOf:
@@ -939,14 +882,6 @@ FrameResponse:
   type: object
 FrameRowDto:
   properties:
-    categorical_classifications:
-      items:
-        $ref: '#/CategoricalClassificationDto'
-      type: array
-    cell_statuses:
-      items:
-        $ref: '#/CellStatusDto'
-      type: array
     cells:
       items:
         $ref: '#/FrameValue'
@@ -965,9 +900,7 @@ FrameRowDto:
   - entity
   - label
   - cells
-  - cell_statuses
   - classifications
-  - categorical_classifications
   - spark
   type: object
 FrameValue:
@@ -1488,10 +1421,6 @@ SpineSeries:
       type: string
     unit:
       type: string
-    value_statuses:
-      items:
-        $ref: '#/SpineValueStatus'
-      type: array
     values:
       items:
         format: double
@@ -1504,18 +1433,6 @@ SpineSeries:
   - unit
   - aggregation
   - values
-  - value_statuses
-  type: object
-SpineValueStatus:
-  properties:
-    reason:
-      type:
-      - string
-      - 'null'
-    status:
-      type: string
-  required:
-  - status
   type: object
 StorageIntegrityDto:
   properties:

@@ -128,10 +128,7 @@ async fn spine_returns_aligned_host_series_from_the_hidden_ovf_view() {
     assert_eq!(load[1], 1.0);
     assert_eq!(body["series"][1]["code"], "psi_io_some");
     assert_eq!(body["series"][1]["values"], serde_json::json!([12.0, 34.0]));
-    assert_eq!(
-        body["series"][0]["value_statuses"][0]["status"],
-        "available"
-    );
+    assert!(body["series"][0].get("value_statuses").is_none());
 }
 
 #[tokio::test]
@@ -146,18 +143,16 @@ async fn spine_distinguishes_observed_value_missing_sample_and_producer_gap() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let psi = &body["series"][1];
     let values = psi["values"].as_array().expect("psi values");
-    let statuses = psi["value_statuses"]
-        .as_array()
-        .expect("psi value statuses");
     assert_eq!(values[0], 12.0);
-    assert_eq!(statuses[0]["status"], "available");
-    assert_eq!(statuses[0]["reason"], serde_json::Value::Null);
     assert_eq!(values[1], serde_json::Value::Null);
-    assert_eq!(statuses[1]["status"], "unavailable");
-    assert_eq!(statuses[1]["reason"], "no_sample");
     assert_eq!(values[5], serde_json::Value::Null);
-    assert_eq!(statuses[5]["status"], "unavailable");
-    assert_eq!(statuses[5]["reason"], "producer_gap");
+    assert!(psi.get("value_statuses").is_none());
+    // Coverage truth moved to the aggregate place: quality.gaps spans.
+    assert_eq!(
+        body["quality"]["gaps"][0]["reason"],
+        serde_json::Value::String("producer_gap".to_owned())
+    );
+    assert_eq!(body["quality"]["status"], "partial");
 }
 
 #[tokio::test]

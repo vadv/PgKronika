@@ -76,13 +76,6 @@ struct SpineSeries {
     unit: &'static str,
     aggregation: &'static str,
     values: Vec<Option<f64>>,
-    value_statuses: Vec<SpineValueStatus>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-struct SpineValueStatus {
-    status: &'static str,
-    reason: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -340,18 +333,6 @@ pub(crate) fn spine(
     }
 
     let gaps = coverage_gaps(&coverage, request);
-    let load_statuses = value_statuses(
-        &merged.load,
-        &gaps,
-        merged.gated.contains(&"load_per_cpu"),
-        request,
-    );
-    let psi_statuses = value_statuses(
-        &merged.psi,
-        &gaps,
-        merged.gated.contains(&"psi_io_some"),
-        request,
-    );
     merged.gated.sort_unstable();
     merged.resource_limited.sort_unstable();
     let partial =
@@ -376,14 +357,12 @@ pub(crate) fn spine(
                 unit: "ratio",
                 aggregation: "max",
                 values: merged.load,
-                value_statuses: load_statuses,
             },
             SpineSeries {
                 code: "psi_io_some",
                 unit: "percent",
                 aggregation: "max",
                 values: merged.psi,
-                value_statuses: psi_statuses,
             },
         ],
         quality: SpineQuality {
@@ -395,45 +374,6 @@ pub(crate) fn spine(
             active_tail,
         },
     })
-}
-
-/// Per-bucket reasons: a missing value blames `producer_gap` only when the
-/// bucket actually intersects a proven coverage gap.
-fn value_statuses(
-    values: &[Option<f64>],
-    gaps: &[(i64, i64)],
-    gated: bool,
-    request: SpineRequest,
-) -> Vec<SpineValueStatus> {
-    let span = i128::from(request.to_us - request.from_us);
-    let from = i128::from(request.from_us);
-    let bucket_count = values.len() as i128;
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            if value.is_some() {
-                return SpineValueStatus {
-                    status: "available",
-                    reason: None,
-                };
-            }
-            let reason = if gated {
-                "not_collected"
-            } else {
-                let start = from + span * index as i128 / bucket_count;
-                let end = from + span * (index + 1) as i128 / bucket_count;
-                let in_gap = gaps.iter().any(|(gap_from, gap_to)| {
-                    i128::from(*gap_from) < end && start < i128::from(*gap_to)
-                });
-                if in_gap { "producer_gap" } else { "no_sample" }
-            };
-            SpineValueStatus {
-                status: "unavailable",
-                reason: Some(reason),
-            }
-        })
-        .collect()
 }
 
 fn coverage_gaps(spans: &[(i64, i64)], request: SpineRequest) -> Vec<(i64, i64)> {

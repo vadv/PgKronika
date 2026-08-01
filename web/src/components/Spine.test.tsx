@@ -28,11 +28,6 @@ const spineFixture = makeSpineResponse({
       unit: "loadavg",
       aggregation: "avg",
       values: [1, 0.5, null],
-      value_statuses: [
-        { status: "available", reason: null },
-        { status: "available", reason: null },
-        { status: "unavailable", reason: "producer_gap" },
-      ],
     },
   ],
 });
