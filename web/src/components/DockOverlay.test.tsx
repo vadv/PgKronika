@@ -139,6 +139,26 @@ test("tab switches the dock kind and close calls onClose", () => {
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
+test("row dock: no visible token line — the token rides tooltip and copy", async () => {
+  stubFetch(
+    makeEntityPointResponse({ view: "activity", entity: "AQAEBQAAx9" }),
+  );
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", {
+    value: { writeText },
+    configurable: true,
+  });
+  renderDock({ state: { ...baseState, dock: "row", entity: "AQAEBQAAx9" } });
+  await waitFor(() =>
+    expect(screen.getByTestId("dock-copy-token")).toBeDefined(),
+  );
+  // The raw token never renders as its own line; the heading carries it.
+  expect(screen.queryByText("AQAEBQAA…")).toBeNull();
+  expect(screen.getByTitle("AQAEBQAAx9")).toBeDefined();
+  fireEvent.click(screen.getByTestId("dock-copy-token"));
+  expect(writeText).toHaveBeenCalledWith("AQAEBQAAx9");
+});
+
 test("row dock renders point fields from the entity endpoint", async () => {
   stubFetch(
     makeEntityPointResponse({

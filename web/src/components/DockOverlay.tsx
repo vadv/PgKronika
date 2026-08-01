@@ -30,13 +30,6 @@ export interface DockOverlayProps {
   onPatch: (patch: Partial<UiState>) => void;
 }
 
-/** Opaque typed-identity tokens (entity keys) are API routing material, not
- * display text: show a short readable form, keep the full token in the
- * tooltip. */
-function shortEntity(token: string): string {
-  return token.length <= 12 ? token : `${token.slice(0, 8)}…`;
-}
-
 /** Localized incident title from the server's language-neutral summary code;
  * the binary provenance key never renders as a headline. */
 function incidentTitle(
@@ -701,12 +694,24 @@ function RowDock(props: {
       ? t(`dock.row.heading.${viewCode}`, { id: shortIdToken(label) })
       : label;
 
+  const [tokenCopied, setTokenCopied] = useState(false);
+  const copyToken = () => {
+    if (props.state.entity === null) return;
+    void navigator.clipboard.writeText(props.state.entity);
+    setTokenCopied(true);
+    setTimeout(() => setTokenCopied(false), 1700);
+  };
+
   return (
     <div>
+      {/* The heading is always human text (tab + server label); the entity
+          token is routing material — it lives in the heading tooltip and
+          rides the clipboard, never a visible line of its own. */}
       <div
+        title={props.state.entity ?? undefined}
         style={{
           fontFamily: "var(--ui-font)",
-          marginBlockEnd: "2px",
+          marginBlockEnd: "6px",
           overflowWrap: "anywhere",
         }}
       >
@@ -717,22 +722,27 @@ function RowDock(props: {
             <span style={{ fontWeight: 600 }}>{heading}</span>
           </>
         )}
+        {props.state.entity !== null && (
+          <button
+            type="button"
+            data-testid="dock-copy-token"
+            title={t("dock.row.copyToken")}
+            onClick={copyToken}
+            style={{
+              marginInlineStart: "6px",
+              fontFamily: "var(--mono-font)",
+              fontSize: "var(--text-xs)",
+              color: "var(--fg-dim)",
+              background: "none",
+              border: "none",
+              padding: 0,
+              cursor: "pointer",
+            }}
+          >
+            {tokenCopied ? t("dock.row.tokenCopied") : "⧉"}
+          </button>
+        )}
       </div>
-      {/* The entity token is routing material — short secondary line with
-          the full value in the tooltip, never the heading. */}
-      {props.state.entity !== null && (
-        <div
-          title={props.state.entity}
-          style={{
-            fontFamily: "var(--mono-font)",
-            fontSize: "var(--text-xs)",
-            color: "var(--fg-dim)",
-            marginBlockEnd: "6px",
-          }}
-        >
-          {shortEntity(props.state.entity)}
-        </div>
-      )}
       {missing && (
         <div style={{ color: "var(--fg-dim)" }}>{t("dock.row.missing")}</div>
       )}
