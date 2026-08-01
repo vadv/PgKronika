@@ -771,6 +771,48 @@ fn frame_returns_stable_event_codes_as_plain_cells() {
 }
 
 #[test]
+fn reset_counter_classifies_with_the_reset_reason() {
+    let request =
+        FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(5)),
+            ("total_exec_time", Value::F64(10.0)),
+        ]),
+    );
+    input.push_previous(
+        10,
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(50)),
+            ("total_exec_time", Value::F64(100.0)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    let body = serde_json::to_value(
+        FrameResponse::from_projected(&request, &catalog(), &frame).expect("response"),
+    )
+    .expect("serialize");
+
+    assert_eq!(body["rows"][0]["cells"][0], serde_json::Value::Null);
+    assert_eq!(
+        body["rows"][0]["classifications"][0]["result"]["reason"],
+        "reset"
+    );
+}
+
+#[test]
 fn statement_time_percent_rejects_a_partial_reset_denominator() {
     let request = FrameRequest::parse("statements", Some("at=20"), &catalog()).expect("request");
     let mut input = ProjectionInput::empty(20);

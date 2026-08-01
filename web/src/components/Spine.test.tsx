@@ -116,16 +116,16 @@ test("renders load polyline, cursor, bucket overlay and event markers", async ()
   expect(screen.getByText("●")).toBeDefined();
   const points = screen.getByTestId("spine-health-line").getAttribute("points");
   expect(points?.split(" ")).toHaveLength(2);
-  // Missing bucket surfaces as a baseline dot; the bucket overlay's title
-  // carries the wire status for hover.
+  // Missing bucket surfaces as a dim dot and a "missing" tooltip; the wire
+  // carries no per-bucket status anymore.
   expect(screen.getByTestId("spine-missing-point")).toBeDefined();
   const buckets = screen.getAllByTestId("spine-bucket");
   expect(buckets).toHaveLength(3);
   expect(buckets[2]?.querySelector("title")?.textContent).toContain(
-    "producer_gap",
-  );
-  expect(buckets[2]?.querySelector("title")?.textContent).toContain(
     "spine.missing",
+  );
+  expect(buckets[2]?.querySelector("title")?.textContent).not.toContain(
+    "producer_gap",
   );
   expect(buckets[0]?.querySelector("title")?.textContent).toContain(
     "host.load1",

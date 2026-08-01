@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use self::cursor::EntityHistoryCursor;
-use super::catalog::{Availability, ColumnSpec, ProjectionCatalog};
+use super::catalog::ProjectionCatalog;
 use super::frame::dto::FrameValue;
 use super::frame::projection::{FrameError, FrameLimits, FrameQuality, project_entity_at};
 use super::snapshot::read_summary_tolerant;

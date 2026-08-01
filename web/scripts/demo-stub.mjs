@@ -781,7 +781,6 @@ function rowsProcesses() {
         type,
         cpu,
         rss,
-        pss: i === 0 ? null : Math.round(rss * 0.7),
         read_bytes_per_second: readBps,
         write_bytes_per_second: writeBps,
         block_delay: r2(i % 4 === 0 ? 0.8 : 0.05),
@@ -830,18 +829,6 @@ function rowsLocks() {
         query: "UPDATE orders SET status=$1 WHERE id=$2",
       },
       cls,
-      cat:
-        i === 0
-          ? [
-              {
-                column: "lock",
-                status: "classified",
-                code: "blocked",
-                level: "critical",
-                reason: null,
-              },
-            ]
-          : [],
     };
   });
 }

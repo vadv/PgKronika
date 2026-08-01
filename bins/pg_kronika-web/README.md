@@ -164,7 +164,7 @@ request rows or run an analysis.
 | `GET /v1/views/summary` | `at` | Returns the latest exact population, status, `notable_level`, and `notable_count` at or before the cursor for all nine UI views. Sealed data reads only the shared `UiSummary` OVF block; a current active tail is merged from memory. |
 | `GET /v1/timeline/spine` | `from`, `to`; optional `buckets` | Returns aligned host load-per-CPU and I/O PSI series from indexed OVF blocks without opening PGM bodies. The half-open range is limited to 24 hours and the response to 256 KiB. |
 | `GET /v1/timeline/heatmap` | `view`, `metric`, `from`, `to`; optional `buckets`, `top` | Merges the selected view's local top-K series into a bounded heatmap with score bounds and an exact-ranking proof. The half-open range is limited to 24 hours, `buckets` to `1..=256`, `top` to `1..=64`, and the serialized response to 512 KiB. Sealed requests read only `EntitySeries(view)` and never a PGM body. |
-| `GET /v1/frame/{view}` | required `at`; optional `span`, `preset` or `columns`, `database`, `q`, `sort`, `order`, `limit`, `cursor` | Returns one exact, server-filtered page for any of the nine UI views. Cells carry aligned status/reason values; numeric and categorical classifications are server-owned. |
+| `GET /v1/frame/{view}` | required `at`; optional `span`, `preset` or `columns`, `database`, `q`, `sort`, `order`, `limit`, `cursor` | Returns one exact, server-filtered page for any of the nine UI views. Cells are bare values with `null` for missing data; numeric classifications are server-owned. |
 | `GET /v1/entity/{view}/{entity}` | point: `at`, optional `include=related`; history: `from`, `to`, `columns`, optional `limit`, `cursor` | Resolves the opaque entity token returned by frame. Point mode returns exact fields and proven related entities; history mode returns a bounded page from at most 32 selected segments. |
 | `GET /v1/data/quality` | `from`, `to` | Returns retained coverage, gaps, freshness, producer state, capabilities, integrity, and quality facts without reading section bodies. The range is limited to 24 hours and the response to 512 KiB. |
 | `GET /v1/storage` | none | Returns bounded PGM/OVF/journal/quarantine accounting, filesystem capacity, retention status, forecast, and integrity counters. |
@@ -202,10 +202,10 @@ fields:
 - `visibility`: one of `full`, `restricted`, and `unknown`.
 
 The UI catalog uses the closed availability set `available`, `gated`,
-`not_collected`, and `unsupported_type`. `processes.pss` remains
-`not_collected` until the collector writes bounded `smaps_rollup`; Activity
-CPU and I/O require both activity and process inputs. The serialized catalog
-has a 512 KiB hard ceiling.
+`not_collected`, and `unsupported_type`. The `processes` view has no `pss`
+column until the collector writes bounded `smaps_rollup`; Activity CPU and
+I/O require both activity and process inputs. The serialized catalog has a
+512 KiB hard ceiling.
 
 Heatmap values preserve the distinction between an absent sample (`null`) and
 an observed zero (`0`). `ranking.exact` is true only when every returned lower

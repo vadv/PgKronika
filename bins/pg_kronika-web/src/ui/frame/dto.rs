@@ -372,5 +372,6 @@ const fn reason_spelling(reason: NotClassifiedReason) -> &'static str {
         NotClassifiedReason::InvalidDenominator => "invalid_denominator",
         NotClassifiedReason::NotApplicable => "not_applicable",
         NotClassifiedReason::InputShapeMismatch => "input_shape_mismatch",
+        NotClassifiedReason::Reset => "reset",
     }
 }

@@ -1,4 +1,4 @@
-use kronika_analytics::{Classified, MetricId, MetricInput};
+use kronika_analytics::{Classified, MetricId, MetricInput, NotClassifiedReason};
 
 use super::projection::{DeltaOperand, ProjectedRow};
 use crate::ui::catalog::ColumnSpec;
@@ -156,14 +156,53 @@ pub(crate) fn classify_row(
         .iter()
         .filter_map(|column| {
             let binding = binding_for(view, column.code)?;
-            let input = prepare_input(binding.operand, row, context);
+            // A counter reset must survive as its own reason, not generic
+            // "missing": it tells the operator the previous value is
+            // non-comparable, not absent.
+            let result = if operand_reset(binding.operand, row) {
+                Classified::NotClassified(NotClassifiedReason::Reset)
+            } else {
+                kronika_analytics::threshold::classify(
+                    binding.metric_id,
+                    prepare_input(binding.operand, row, context),
+                )
+            };
             Some(CellClassification {
                 column: column.code,
                 metric_id: binding.metric_id,
-                result: kronika_analytics::threshold::classify(binding.metric_id, input),
+                result,
             })
         })
         .collect()
+}
+
+// ponytail: reset detection covers the stored delta operands (statement rates,
+// table scan ratio); inline-computed rates keep the generic missing reason.
+fn operand_reset(kind: OperandKind, row: &ProjectedRow) -> bool {
+    const fn reset(delta: DeltaOperand) -> bool {
+        matches!(delta, DeltaOperand::Reset)
+    }
+    let statement = row.operands.statements.as_ref();
+    match kind {
+        OperandKind::StatementMillisecondsPerRow => {
+            statement.is_some_and(|statement| reset(statement.exec_ms) || reset(statement.rows))
+        }
+        OperandKind::StatementMeanMilliseconds => {
+            statement.is_some_and(|statement| reset(statement.exec_ms) || reset(statement.calls))
+        }
+        OperandKind::StatementTimePercent => {
+            statement.is_some_and(|statement| reset(statement.exec_ms))
+        }
+        OperandKind::StatementPlanTimePercent => {
+            statement.is_some_and(|statement| reset(statement.plan_ms))
+        }
+        OperandKind::TableSequentialScanPercent => row
+            .operands
+            .table
+            .as_ref()
+            .is_some_and(|table| reset(table.seq_scan) || reset(table.idx_scan)),
+        _ => false,
+    }
 }
 
 #[allow(

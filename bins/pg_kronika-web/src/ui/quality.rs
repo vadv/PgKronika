@@ -164,6 +164,7 @@ struct ScanState {
     complete: BTreeSet<i64>,
     capability_states: BTreeMap<u16, CapabilityState>,
     resource_limited: BTreeSet<&'static str>,
+    degraded_collection: bool,
 }
 
 impl ScanState {
@@ -175,14 +176,29 @@ impl ScanState {
             .filter(|timestamp| *timestamp >= request.from_us && *timestamp < request.to_us)
         {
             self.observed.insert(timestamp);
-            if summary.views().iter().all(|view| {
-                summary
-                    .collection_state_at(view.view_code(), timestamp)
-                    .is_some_and(|(collected_at, collection)| {
-                        collected_at == timestamp
-                            && collection.read_state() == CollectionReadState::Complete
-                    })
-            }) {
+            let mut all_complete = true;
+            for view in summary.views() {
+                let Some((collected_at, collection)) =
+                    summary.collection_state_at(view.view_code(), timestamp)
+                else {
+                    all_complete = false;
+                    continue;
+                };
+                // Permission/read failures are actionable degradations of the
+                // one status surface; capability absence is informational only.
+                if matches!(
+                    collection.read_state(),
+                    CollectionReadState::Permission | CollectionReadState::ReadFailure
+                ) {
+                    self.degraded_collection = true;
+                }
+                if collected_at != timestamp
+                    || collection.read_state() != CollectionReadState::Complete
+                {
+                    all_complete = false;
+                }
+            }
+            if all_complete {
                 self.complete.insert(timestamp);
             }
         }
@@ -276,6 +292,7 @@ pub(crate) fn build_data_quality(
         complete,
         capability_states,
         resource_limited,
+        degraded_collection,
     } = inventory;
 
     let data_through_us = observed.iter().next_back().copied().or_else(|| {
@@ -299,8 +316,9 @@ pub(crate) fn build_data_quality(
         u64::try_from(rounded).ok()
     });
     let gaps = coverage_gaps(&coverage_spans, request, expected_period_us);
-    let coverage_partial = expected_snapshots
-        .is_some_and(|expected| u64::try_from(observed.len()).unwrap_or(u64::MAX) < expected);
+    let coverage_partial = degraded_collection
+        || expected_snapshots
+            .is_some_and(|expected| u64::try_from(observed.len()).unwrap_or(u64::MAX) < expected);
     let integrity_degraded = corrupt_segments != 0 || quarantined.is_none();
     let status = aggregate_status(
         readable_segments != 0,
