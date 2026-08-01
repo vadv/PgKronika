@@ -400,7 +400,12 @@ impl LiveBuilder {
             self.state = LiveState::NeedsRebuild;
             return Err(LiveFoldError::ViewGenerationMismatch);
         }
-        if self.refresh_changes_view(delta) && !delta.view_changed {
+        // A bootstrap re-delivers the complete authoritative descriptor set
+        // by construction; whether it changes the view is answered by its
+        // content and the generation validation below, not by the marker.
+        // Requiring the marker makes every rebaseline retry after a lost
+        // refresh fail with RefreshMismatch and pins the fold to NeedsRebuild.
+        if !bootstrap && self.refresh_changes_view(delta) && !delta.view_changed {
             self.state = LiveState::NeedsRebuild;
             return Err(LiveFoldError::RefreshMismatch);
         }
@@ -1690,6 +1695,43 @@ mod tests {
         builder.begin_refresh(&delta).expect("begin rebaseline");
         builder.complete_refresh().expect("complete rebaseline");
         assert_eq!(builder.state(), LiveState::Empty);
+    }
+
+    #[test]
+    fn a_quiet_bootstrap_baseline_resyncs_after_a_lost_refresh() {
+        // A refresh is lost while the journal keeps ticking quietly
+        // (`view_changed = false`, previous == new): the builder stays pinned
+        // to an old view generation and every later delta mismatches. The
+        // recovery rebuilds a fresh builder and re-delivers the complete
+        // descriptor set as a bootstrap that adopts the journal's view
+        // generation — it must be accepted without a `view_changed` marker.
+        let mut stuck = live_builder();
+        fold_slices(&mut stuck, &[&stream()]);
+        let adopted_view_generation = stuck.view_generation() + 4;
+
+        let rows = stream();
+        let bytes = lifecycle_part(&rows);
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
+        let mut delta = complete_delta(&stuck, stuck.folded_parts.clone(), PartTransition::Append);
+        delta.journal.bootstrap = true;
+        delta.journal.completed_parts = Arc::clone(&delta.journal.current_parts);
+        delta.view_changed = false;
+        delta.previous_view_generation = adopted_view_generation;
+        delta.new_view_generation = adopted_view_generation;
+
+        let mut rebuilt = live_builder();
+        rebuilt
+            .begin_refresh(&delta)
+            .expect("quiet baseline accepted");
+        for part in delta.journal.completed_parts.iter() {
+            rebuilt
+                .fold_part(part, &unit)
+                .expect("baseline part refolded");
+        }
+        rebuilt.complete_refresh().expect("baseline completes");
+
+        assert_eq!(rebuilt.state(), LiveState::Current);
+        assert_eq!(rebuilt.view_generation(), adopted_view_generation);
     }
 
     #[test]
