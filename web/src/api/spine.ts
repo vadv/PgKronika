@@ -1,5 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { apiGet } from "./client";
+import type { LiveQueryOptions } from "./timeline";
 
 export interface TimelineSpineArgs {
   from: string;
@@ -8,7 +9,10 @@ export interface TimelineSpineArgs {
   buckets?: number;
 }
 
-export function useTimelineSpine(args: TimelineSpineArgs) {
+export function useTimelineSpine(
+  args: TimelineSpineArgs,
+  opts?: LiveQueryOptions,
+) {
   return useQuery({
     queryKey: ["timeline-spine", args.from, args.to, args.buckets ?? null],
     // `from`/`to` travel through component state as decimal strings; the
@@ -23,5 +27,7 @@ export function useTimelineSpine(args: TimelineSpineArgs) {
           },
         },
       }),
+    placeholderData: keepPreviousData,
+    refetchInterval: opts?.refetchInterval,
   });
 }

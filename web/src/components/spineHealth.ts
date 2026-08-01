@@ -15,6 +15,22 @@ import type {
 /** Verdict of one ribbon bucket. `gap` = no server verdict for the slice. */
 export type BucketVerdict = "ok" | "warn" | "crit" | "gap";
 
+/** Pin the live window end to the absolute bucket grid: boundaries sit on
+ * multiples of `bucketSpanUs`, so two renders a second apart produce the
+ * identical grid and only the filling of the last (forming) bucket moves. */
+export function anchorWindowEnd(nowUs: number, bucketSpanUs: number): number {
+  return Math.ceil(nowUs / bucketSpanUs) * bucketSpanUs;
+}
+
+/** Score input: the forming tail bucket of a live window is excluded, so the
+ * score only moves on a completed-bucket boundary or an incident change. */
+export function scoreVerdicts(
+  verdicts: BucketVerdict[],
+  hasFormingTail: boolean,
+): BucketVerdict[] {
+  return hasFormingTail ? verdicts.slice(0, -1) : verdicts;
+}
+
 /** Wire `overall_state` → ribbon verdict; anything unknown is an honest gap. */
 export function mapHealthState(state: string): BucketVerdict {
   switch (state) {

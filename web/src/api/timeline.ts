@@ -1,5 +1,17 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { apiGet } from "./client";
+
+/** Live polling for the spine strip: keys stay anchored to the bucket grid,
+ * freshness comes from the interval — and the previous answer stays visible
+ * across a key change (no "warming" flash on a bucket boundary). */
+export interface LiveQueryOptions {
+  refetchInterval?: number;
+}
+
+const liveOptions = (opts?: LiveQueryOptions) => ({
+  placeholderData: keepPreviousData,
+  refetchInterval: opts?.refetchInterval,
+});
 
 export interface TimelineHealthArgs {
   from: string;
@@ -8,7 +20,10 @@ export interface TimelineHealthArgs {
   step?: number;
 }
 
-export function useTimelineHealth(args: TimelineHealthArgs) {
+export function useTimelineHealth(
+  args: TimelineHealthArgs,
+  opts?: LiveQueryOptions,
+) {
   return useQuery({
     queryKey: ["timeline-health", args.from, args.to, args.step ?? null],
     // `from`/`to` travel through component state as decimal strings; the
@@ -23,6 +38,7 @@ export function useTimelineHealth(args: TimelineHealthArgs) {
           },
         },
       }),
+    ...liveOptions(opts),
   });
 }
 
@@ -32,7 +48,10 @@ export interface TimelineEventsArgs {
   limit?: number;
 }
 
-export function useTimelineEvents(args: TimelineEventsArgs) {
+export function useTimelineEvents(
+  args: TimelineEventsArgs,
+  opts?: LiveQueryOptions,
+) {
   return useQuery({
     queryKey: ["timeline-events", args.from, args.to, args.limit ?? null],
     queryFn: () =>
@@ -45,5 +64,6 @@ export function useTimelineEvents(args: TimelineEventsArgs) {
           },
         },
       }),
+    ...liveOptions(opts),
   });
 }

@@ -347,3 +347,172 @@ test("zoom group reports the selected span", async () => {
   fireEvent.click(screen.getByRole("button", { name: /86400/ }));
   expect(onSelectSpan).toHaveBeenCalledWith(86400);
 });
+
+test("live mode anchors the grid and hatches the forming tail bucket", async () => {
+  vi.useFakeTimers({ now: AT_US / 1000, toFake: ["Date"] });
+  try {
+    renderSpine({ at: null });
+    await waitFor(() =>
+      expect(screen.getAllByTestId("spine-ribbon-ok").length).toBeGreaterThan(
+        0,
+      ),
+    );
+    // The tail bucket is hatched and its tooltip says the period is forming.
+    const forming = screen.getByTestId("spine-ribbon-forming");
+    expect(
+      forming.parentElement?.querySelector("title")?.textContent,
+    ).toContain("spine.forming");
+    // Score over the 95 completed buckets: 24 crit + 24 warn of 0.625 min
+    // each, 1 incident: 100 − 15×3 − 15×0.5 − 5 = 42.5 → 43.
+    expect(screen.getByTestId("spine-score").textContent).toContain("43");
+    expect(screen.getByTestId("spine-score-delta").textContent).toContain(
+      "▼57",
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a 503 during revalidation keeps the ribbon — warming is cold-start only", async () => {
+  const client = new QueryClient();
+  client.setQueryData(
+    ["timeline-health", String(FROM_US - WINDOW_US), String(AT_US), 37500000],
+    healthFixture,
+  );
+  client.setQueryData(
+    ["timeline-spine", String(FROM_US), String(AT_US), 96],
+    spineFixture,
+  );
+  client.setQueryData(
+    ["incidents", String(FROM_US - WINDOW_US), String(AT_US)],
+    incidentsFixture,
+  );
+  client.setQueryData(
+    ["timeline-events", String(FROM_US), String(AT_US), 50],
+    eventsFixture,
+  );
+  // Every refetch fails as a warm-up 503; cached answers must stay on screen.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            code: "analytic_capacity_unavailable",
+            params: { retry_after_seconds: 1 },
+          }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    ),
+  );
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+  render(
+    <Spine
+      at={String(AT_US)}
+      span={3600}
+      baseline={null}
+      onSelectAt={() => {}}
+      onSelectSpan={() => {}}
+      onSelectBaseline={() => {}}
+    />,
+    { wrapper },
+  );
+  await waitFor(() =>
+    expect(screen.getAllByTestId("spine-ribbon-crit").length).toBeGreaterThan(
+      0,
+    ),
+  );
+  expect(screen.queryByTestId("spine-state")).toBeNull();
+});
+
+test("a cold start under a 503 says warming, not error", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            code: "analytic_capacity_unavailable",
+            params: { retry_after_seconds: 1 },
+          }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    ),
+  );
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+  render(
+    <Spine
+      at={String(AT_US)}
+      span={3600}
+      baseline={null}
+      onSelectAt={() => {}}
+      onSelectSpan={() => {}}
+      onSelectBaseline={() => {}}
+    />,
+    { wrapper },
+  );
+  await waitFor(() =>
+    expect(screen.getByTestId("spine-state").textContent).toContain(
+      "loading.warming",
+    ),
+  );
+  expect(screen.queryByRole("slider")).toBeNull();
+});
+
+test("a window without a previous one says so instead of a bare dash", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href;
+      const body = url.includes("/v1/timeline/health")
+        ? makeHealthResponse({
+            points: Array.from({ length: 96 }, (_, i) =>
+              makeHealthPoint({
+                interval: {
+                  from_us: FROM_US + i * BUCKET_US,
+                  to_us: FROM_US + (i + 1) * BUCKET_US,
+                },
+                overall_state: "normal",
+              }),
+            ),
+          })
+        : url.includes("/v1/timeline/events")
+          ? makeEventsResponse({ events: [] })
+          : url.includes("/v1/incidents")
+            ? makeIncidentsResponse()
+            : spineFixture;
+      return Promise.resolve(jsonResponse(body));
+    }),
+  );
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+  render(
+    <Spine
+      at={String(AT_US)}
+      span={3600}
+      baseline={null}
+      onSelectAt={() => {}}
+      onSelectSpan={() => {}}
+      onSelectBaseline={() => {}}
+    />,
+    { wrapper },
+  );
+  await waitFor(() =>
+    expect(screen.getByTestId("spine-score-delta").textContent).toContain(
+      "spine.score.noPrev",
+    ),
+  );
+});

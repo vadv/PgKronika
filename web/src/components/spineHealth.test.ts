@@ -1,12 +1,14 @@
 import { expect, test } from "vitest";
 import { makeEventFact, makeHealthPoint } from "../testkit/apiFixtures";
 import {
+  anchorWindowEnd,
   bucketReason,
   bucketVerdicts,
   chipTone,
   countWindowIncidents,
   eventGlyph,
   mapHealthState,
+  scoreVerdicts,
   windowScore,
 } from "./spineHealth";
 
@@ -133,4 +135,22 @@ test("bucketReason prefers the floor class, then the worst domain", () => {
   const noEvidence = makeHealthPoint({ domains: [] });
   expect(bucketReason(noEvidence)).toEqual({ floor: null, domain: null });
   expect(bucketReason(null)).toEqual({ floor: null, domain: null });
+});
+
+test("anchorWindowEnd pins the grid: renders 1s apart share the same end", () => {
+  const bucket = 225_000_000; // 6 h span / 96 buckets
+  const t0 = 96 * bucket * 42 + 17_000_000; // mid-bucket instant
+  const end0 = anchorWindowEnd(t0, bucket);
+  const end1 = anchorWindowEnd(t0 + 1_000_000, bucket); // 1 s later
+  expect(end1).toBe(end0);
+  // The boundary is a multiple of the bucket span (absolute epoch grid).
+  expect(end0 % bucket).toBe(0);
+  // Crossing a bucket boundary moves the grid by exactly one bucket.
+  expect(anchorWindowEnd(end0 + 1, bucket)).toBe(end0 + bucket);
+});
+
+test("scoreVerdicts drops the forming tail bucket of a live window", () => {
+  const verdicts = ["ok", "crit", "warn"] as const;
+  expect(scoreVerdicts([...verdicts], true)).toEqual(["ok", "crit"]);
+  expect(scoreVerdicts([...verdicts], false)).toEqual([...verdicts]);
 });
