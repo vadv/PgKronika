@@ -1108,7 +1108,7 @@
       "presets": [
         {
           "code": "cpu",
-          "columns": ["pid", "type", "cpu", "rss", "command"],
+          "columns": ["pid", "type", "cpu", "rss", "threads", "read_bytes_per_second", "write_bytes_per_second", "command"],
           "sort": {
             "column": "cpu",
             "order": "desc"
