@@ -202,7 +202,9 @@ function Shell() {
       style={{
         background: "var(--bg)",
         color: "var(--fg)",
-        minHeight: "100dvh",
+        // Desktop pins the status bar to the viewport bottom; on mobile the
+        // same stretch reads as a giant void under short content.
+        minHeight: mobile ? undefined : "100dvh",
         display: "flex",
         flexDirection: "column",
       }}
@@ -416,12 +418,13 @@ function Shell() {
           )}
         </main>
       )}
-      <div style={{ flex: 1 }} />
+      {mobile === false && <div style={{ flex: 1 }} />}
       <StatusBar state={state} summary={summary.data} />
       <DockOverlay
         state={state}
         view={activeView}
         at={at}
+        mobile={mobile}
         onClose={() => patch({ dock: null })}
         onSelectIncident={(focus) => patch({ focus })}
         onPatch={patch}

@@ -22,6 +22,8 @@ export interface DockOverlayProps {
   view: ViewSpec | undefined;
   /** Shared cursor time (pinned LIVE tick from App) — never a local Date.now(). */
   at: string;
+  /** Narrow viewport: the dock docks to the bottom edge as a sheet. */
+  mobile: boolean;
   onClose: () => void;
   onSelectIncident: (key: string | null) => void;
   onPatch: (patch: Partial<UiState>) => void;
@@ -108,23 +110,35 @@ function stateWindow(at: string, span: number): { from: string; to: string } {
   };
 }
 
-const dockStyle = {
-  position: "fixed",
-  insetBlock: 0,
-  insetInlineEnd: 0,
-  // min() keeps the dock inside narrow viewports: on mobile triage
-  // (<760px) the dock is the only path to incidents/findings.
-  width: "min(100vw, clamp(400px, 32vw, 560px))",
-  background: "var(--bg-overlay)",
-  borderInlineStart: "1px solid var(--border)",
-  boxShadow: "var(--shadow-pop)",
-  color: "var(--fg)",
-  fontFamily: "var(--ui-font)",
-  overflowY: "auto",
-  overflowX: "hidden",
-  zIndex: 10,
-  padding: "12px",
-} as const;
+const dockStyle = (mobile: boolean) =>
+  ({
+    position: "fixed",
+    // min() keeps the dock inside narrow viewports: on mobile triage
+    // (<760px) the dock is the only path to incidents/findings.
+    ...(mobile
+      ? {
+          // Bottom sheet: the side panel would cover half the narrow
+          // viewport; a capped sheet keeps the content readable above it.
+          insetInline: 0,
+          insetBlockEnd: 0,
+          maxHeight: "60vh",
+          borderBlockStart: "1px solid var(--border)",
+        }
+      : {
+          insetBlock: 0,
+          insetInlineEnd: 0,
+          width: "min(100vw, clamp(400px, 32vw, 560px))",
+          borderInlineStart: "1px solid var(--border)",
+        }),
+    background: "var(--bg-overlay)",
+    boxShadow: "var(--shadow-pop)",
+    color: "var(--fg)",
+    fontFamily: "var(--ui-font)",
+    overflowY: "auto",
+    overflowX: "hidden",
+    zIndex: 10,
+    padding: "12px",
+  }) as const;
 
 const tabButtonStyle = (active: boolean) =>
   ({
@@ -816,7 +830,11 @@ export function DockOverlay(props: DockOverlayProps) {
   if (props.state.dock === null) return null;
   const active = props.state.dock;
   return (
-    <aside data-dock={active} style={dockStyle} aria-label={t("dock.title")}>
+    <aside
+      data-dock={active}
+      style={dockStyle(props.mobile)}
+      aria-label={t("dock.title")}
+    >
       <div
         role="tablist"
         style={{

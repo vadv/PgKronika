@@ -56,6 +56,7 @@ function renderDock(overrides: Partial<DockOverlayProps> = {}) {
     state: baseState,
     view: makeViewSpec({ code: "activity" }),
     at: baseState.at ?? "1722400000000000",
+    mobile: false,
     onClose: () => {},
     onSelectIncident: () => {},
     onPatch: () => {},
@@ -195,6 +196,17 @@ test("row dock renders history snapshots when the API answers history mode", asy
   expect(screen.getByText("12")).toBeDefined();
   const cells = screen.getAllByText("—");
   expect(cells.some((c) => c.dataset.status === "not_collected")).toBe(true);
+});
+
+test("mobile dock docks to the bottom as a capped sheet", () => {
+  renderDock({
+    state: { ...baseState, dock: "incidents" },
+    mobile: true,
+  });
+  const aside = screen.getByLabelText("dock.title");
+  expect(aside.style.maxHeight).toBe("60vh");
+  expect(aside.style.insetBlockEnd).toBe("0");
+  expect(aside.style.width).toBe("");
 });
 
 test("row dock in LIVE mode sends the resolved at (point shape), not a bare token", async () => {
