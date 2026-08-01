@@ -1037,7 +1037,16 @@ function frameResponse(viewCode, params) {
   const pageRows = rows.slice(offset, offset + limit);
   const next = offset + limit < matched ? `o:${offset + limit}` : null;
 
-  const columns = view.columns.map((c) => ({
+  // Mirror the backend admission: a preset (default = first) selects the
+  // frame columns, lazy columns never ride the frame.
+  const presetParam = params.get("preset");
+  const preset = presetParam
+    ? view.presets.find((p) => p.code === presetParam)
+    : view.presets[0];
+  const frameColumns = (preset?.columns ?? view.columns.map((c) => c.code))
+    .map((code) => view.columns.find((c) => c.code === code && !c.lazy))
+    .filter((c) => c !== undefined);
+  const columns = frameColumns.map((c) => ({
     code: c.code,
     type: c.type,
     hidden: false,
@@ -1052,7 +1061,7 @@ function frameResponse(viewCode, params) {
     rows: pageRows.map((r) => ({
       entity: r.entity,
       label: r.label,
-      cells: view.columns.map((c) => r.data[c.code] ?? null),
+      cells: frameColumns.map((c) => r.data[c.code] ?? null),
       classifications: r.cls ?? [],
       spark: sparkFor(r.entity, SPARK_SCALES[viewCode] ?? 100),
     })),
