@@ -11,10 +11,11 @@
 //! `calls`. `WITH ORDINALITY` identifies each materialized row, including
 //! otherwise indistinguishable rows whose `queryid` is masked.
 //!
-//! `queryid` is nullable when `PostgreSQL` masks another role's identity. The
-//! numeric core calls `pg_stat_statements(false)`, so `query` is always `NULL`.
-//! `datname` and `usename` are resolved through `LEFT JOIN`, so they are `None`
-//! for an oid with no catalog row. Collection returns owned rows; the caller
+//! `queryid` is nullable when `PostgreSQL` masks another role's identity; the
+//! same masking returns a null `query` for those rows. The source calls
+//! `pg_stat_statements(true)`: without `show_sql` the text column comes back
+//! null. `datname` and `usename` are resolved through `LEFT JOIN`, so they are
+//! `None` for an oid with no catalog row. Collection returns owned rows; the caller
 //! interns the names into the segment dictionary. The typed layout lives in
 //! `kronika-registry` (`PgStatStatementsV1`..`V6`).
 
@@ -92,10 +93,13 @@ fn parse_ext_version(extversion: &str) -> Option<(u32, u32)> {
 
 /// The SQL for one layout.
 ///
-/// `$1` is the per-axis top-N row count. Candidate selection keeps top-N
-/// statements by `total_exec_time` (or, on the legacy layout, `total_time`) and
-/// by `calls`. The source calls `pg_stat_statements(false)` once and does not
-/// materialize query text; the nullable `query` field is returned as `NULL`.
+/// `$1` is the per-axis top-N row count, `$2` the per-query character cap.
+/// Candidate selection keeps top-N statements by `total_exec_time` (or, on the
+/// legacy layout, `total_time`) and by `calls`. The source calls
+/// `pg_stat_statements(true)` (`show_sql` — `false` returns the text column
+/// null) once and materializes the text already capped
+/// by `left()`: the server truncates while building the CTE, so unbounded
+/// text never crosses the wire or the collector's memory.
 /// `datname`/`usename` are resolved with a `LEFT JOIN`.
 /// `server_major` controls only the CTE materialization spelling: `PostgreSQL`
 /// 10/11 materialize CTEs implicitly, while 12+ supports the explicit keyword.
@@ -121,7 +125,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
     };
     let source_columns = match version {
         StatementsVersion::V1 => {
-            "s.userid, s.dbid, s.queryid, s.calls, s.rows, \
+            "s.userid, s.dbid, s.queryid, left(s.query, $2::int4) AS query, s.calls, s.rows, \
              s.total_time, s.min_time, s.max_time, s.mean_time, s.stddev_time, \
              s.shared_blks_hit, s.shared_blks_read, s.shared_blks_dirtied, \
              s.shared_blks_written, s.local_blks_hit, s.local_blks_read, \
@@ -129,7 +133,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              s.temp_blks_written, s.blk_read_time, s.blk_write_time"
         }
         StatementsVersion::V2 => {
-            "s.userid, s.dbid, s.queryid, s.calls, s.rows, s.plans, \
+            "s.userid, s.dbid, s.queryid, left(s.query, $2::int4) AS query, s.calls, s.rows, s.plans, \
              s.total_exec_time, s.total_plan_time, s.min_exec_time, \
              s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
              s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
@@ -140,7 +144,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              s.blk_write_time, s.wal_records, s.wal_fpi, s.wal_bytes"
         }
         StatementsVersion::V3 => {
-            "s.userid, s.dbid, s.queryid, s.toplevel, s.calls, s.rows, s.plans, \
+            "s.userid, s.dbid, s.queryid, s.toplevel, left(s.query, $2::int4) AS query, s.calls, s.rows, s.plans, \
              s.total_exec_time, s.total_plan_time, s.min_exec_time, \
              s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
              s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
@@ -151,7 +155,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              s.blk_write_time, s.wal_records, s.wal_fpi, s.wal_bytes"
         }
         StatementsVersion::V4 => {
-            "s.userid, s.dbid, s.queryid, s.toplevel, s.calls, s.rows, s.plans, \
+            "s.userid, s.dbid, s.queryid, s.toplevel, left(s.query, $2::int4) AS query, s.calls, s.rows, s.plans, \
              s.total_exec_time, s.total_plan_time, s.min_exec_time, \
              s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
              s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
@@ -166,7 +170,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              s.jit_emission_count, s.jit_emission_time"
         }
         StatementsVersion::V5 => {
-            "s.userid, s.dbid, s.queryid, s.toplevel, s.calls, s.rows, s.plans, \
+            "s.userid, s.dbid, s.queryid, s.toplevel, left(s.query, $2::int4) AS query, s.calls, s.rows, s.plans, \
              s.total_exec_time, s.total_plan_time, s.min_exec_time, \
              s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
              s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
@@ -184,7 +188,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
              s.stats_since, s.minmax_stats_since"
         }
         StatementsVersion::V6 => {
-            "s.userid, s.dbid, s.queryid, s.toplevel, s.calls, s.rows, s.plans, \
+            "s.userid, s.dbid, s.queryid, s.toplevel, left(s.query, $2::int4) AS query, s.calls, s.rows, s.plans, \
              s.total_exec_time, s.total_plan_time, s.min_exec_time, \
              s.max_exec_time, s.mean_exec_time, s.stddev_exec_time, \
              s.min_plan_time, s.max_plan_time, s.mean_plan_time, \
@@ -216,7 +220,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
         "WITH source AS {materialized}( \
            SELECT s.ordinality AS source_ordinal, {source_columns}, \
                   count(*) OVER ()::int8 AS source_total \
-           FROM pg_stat_statements(false) WITH ORDINALITY AS s \
+           FROM pg_stat_statements(true) WITH ORDINALITY AS s \
          ), candidates AS ( \
            (SELECT source_ordinal FROM source \
             ORDER BY {time_axis} DESC NULLS LAST, calls DESC NULLS LAST, {tie_breakers} \
@@ -235,7 +239,7 @@ pub fn statements_query(version: StatementsVersion, server_major: u32) -> String
     let ts = "(extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
               s.source_total";
     let ident = "s.queryid, s.userid, s.dbid, d.datname::text AS datname, \
-                 r.rolname::text AS usename, NULL::text AS query";
+                 r.rolname::text AS usename, s.query";
     let order = " ORDER BY c.source_ordinal";
     let body = match version {
         StatementsVersion::V1 => format!(
@@ -926,7 +930,8 @@ pub async fn statements_extversion(
 ///
 /// Returns the raw instance-wide rows; the caller owns source selection, caches
 /// the chosen connection, interns the strings, and builds typed rows.
-/// `max_statements` is the per-axis top-N row count.
+/// `max_statements` is the per-axis top-N row count; `query_text_cap` is the
+/// per-query character limit applied by the server through `left()`.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the query fails.
@@ -935,9 +940,13 @@ pub async fn collect_statements(
     server_major: u32,
     version: StatementsVersion,
     max_statements: i64,
+    query_text_cap: i32,
 ) -> Result<(Vec<StatementsRow>, u64), tokio_postgres::Error> {
     let rows = client
-        .query(&statements_query(version, server_major), &[&max_statements])
+        .query(
+            &statements_query(version, server_major),
+            &[&max_statements, &query_text_cap],
+        )
         .await?;
     let source_total = rows
         .first()
@@ -1087,14 +1096,14 @@ mod tests {
         ] {
             let q = statements_query(v, 18);
             assert!(q.contains("pg_kronika"));
-            assert!(q.contains("NULL::text AS query"));
+            assert!(q.contains("left(s.query, $2::int4) AS query"));
             assert!(q.contains("LEFT JOIN pg_database"));
             assert!(q.contains("LEFT JOIN pg_roles"));
             assert!(q.contains("ORDER BY calls DESC NULLS LAST"));
             assert!(q.contains("source AS MATERIALIZED"), "{q}");
             assert!(q.contains("count(*) OVER ()::int8 AS source_total"), "{q}");
             assert_eq!(
-                q.match_indices("FROM pg_stat_statements(false) WITH ORDINALITY")
+                q.match_indices("FROM pg_stat_statements(true) WITH ORDINALITY")
                     .count(),
                 1,
                 "the PostgreSQL source must be read once: {q}"
@@ -1106,9 +1115,7 @@ mod tests {
             );
             assert!(!q.contains("FROM pg_stat_statements s"), "{q}");
             assert!(!q.contains("FROM pg_stat_statements "), "{q}");
-            assert!(!q.contains("pg_stat_statements(true)"), "{q}");
-            assert!(!q.contains("s.query,"), "{q}");
-            assert!(!q.contains("LEFT(s.query"), "{q}");
+            assert!(q.contains("pg_stat_statements(true)"), "{q}");
             assert!(!q.contains("s.*"), "{q}");
             assert!(
                 !q.contains("(SELECT count(*) FROM pg_stat_statements)"),

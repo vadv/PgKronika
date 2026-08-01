@@ -1242,6 +1242,7 @@ mod admission_tests {
             plans_interval: Duration::from_mins(5),
             max_plan_text: 32_768,
             plan_text_budget: 8 * 1024 * 1024,
+            max_query_text: 5_000,
             pool_refresh_secs: 600,
             heavy_timeout_cap_ms: 60_000,
             max_lock_rows: 1_000,

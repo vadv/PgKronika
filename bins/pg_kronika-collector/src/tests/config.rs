@@ -128,18 +128,18 @@ fn truncate_to_boundary_respects_utf8_and_short_inputs() {
 
 #[test]
 fn plan_text_limits_guard_matches_dictionary_bounds() {
-    assert!(validate_plan_text_limits(32_768, 8 * 1024 * 1024).is_ok());
-    assert!(validate_plan_text_limits(64 * 1024, 0).is_ok());
+    assert!(validate_plan_text_limits(32_768, 8 * 1024 * 1024, 5_000).is_ok());
+    assert!(validate_plan_text_limits(64 * 1024, 0, 5_000).is_ok());
     assert!(
-        validate_plan_text_limits(0, 1).is_err(),
+        validate_plan_text_limits(0, 1, 5_000).is_err(),
         "a zero per-text cap is rejected"
     );
     assert!(
-        validate_plan_text_limits(64 * 1024 + 1, 1).is_err(),
+        validate_plan_text_limits(64 * 1024 + 1, 1, 5_000).is_err(),
         "a per-text cap past the 64 KiB dictionary truncation is rejected"
     );
     assert!(
-        validate_plan_text_limits(1, 16 * 1024 * 1024 + 1).is_err(),
+        validate_plan_text_limits(1, 16 * 1024 * 1024 + 1, 5_000).is_err(),
         "a budget past the 16 MiB dictionary cap is rejected"
     );
 }
