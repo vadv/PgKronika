@@ -1,6 +1,12 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ViewSpec } from "../api/types";
+import {
+  input,
+  sectionTitle,
+  segmentedGroup,
+  segmentedItem,
+} from "../design/ui";
 
 export interface ToolbarProps {
   view: ViewSpec;
@@ -25,36 +31,34 @@ export function Toolbar(props: ToolbarProps) {
     <div
       style={{
         display: "flex",
-        gap: "4px",
+        gap: "8px",
         alignItems: "center",
-        padding: "4px 8px",
-        borderBottom: "1px solid var(--border)",
-        fontFamily: "var(--mono-font)",
+        flexWrap: "wrap",
+        padding: "4px 2px",
+        fontFamily: "var(--ui-font)",
       }}
     >
-      {props.view.presets.map((p) => {
-        const active = props.preset === p.code;
-        return (
-          <button
-            key={p.code}
-            type="button"
-            aria-pressed={active}
-            onClick={() => props.onSelectPreset(active ? null : p.code)}
-            style={{
-              fontFamily: "var(--mono-font)",
-              color: active ? "var(--accent)" : "var(--fg)",
-              background: "none",
-              border: "none",
-              borderBottom: active
-                ? "2px solid var(--accent)"
-                : "2px solid transparent",
-              cursor: "pointer",
-            }}
-          >
-            {p.code}
-          </button>
-        );
-      })}
+      <span style={sectionTitle}>{t("toolbar.presets")}</span>
+      <div
+        role="group"
+        aria-label={t("toolbar.presets")}
+        style={segmentedGroup}
+      >
+        {props.view.presets.map((p) => {
+          const active = props.preset === p.code;
+          return (
+            <button
+              key={p.code}
+              type="button"
+              aria-pressed={active}
+              onClick={() => props.onSelectPreset(active ? null : p.code)}
+              style={segmentedItem(active)}
+            >
+              {p.code}
+            </button>
+          );
+        })}
+      </div>
       <input
         type="search"
         aria-label={t("toolbar.filter")}
@@ -66,17 +70,17 @@ export function Toolbar(props: ToolbarProps) {
             props.onFilter(draft.trim() || null);
           }
         }}
-        style={{
-          fontFamily: "var(--mono-font)",
-          color: "var(--fg)",
-          background: "var(--bg-raised)",
-          border: "1px solid var(--border)",
-          padding: "2px 6px",
-          marginInlineStart: "8px",
-        }}
+        style={{ ...input, minWidth: "220px", marginInlineStart: "4px" }}
       />
       {props.matched !== null && (
-        <span style={{ marginInlineStart: "auto", color: "var(--fg-dim)" }}>
+        <span
+          style={{
+            marginInlineStart: "auto",
+            color: "var(--fg-dim)",
+            fontFamily: "var(--mono-font)",
+            fontSize: "var(--text-sm)",
+          }}
+        >
           {t("toolbar.rows", { count: props.matched })}
         </span>
       )}

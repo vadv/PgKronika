@@ -1,5 +1,6 @@
 import {
   act,
+  cleanup,
   fireEvent,
   render,
   screen,
@@ -22,10 +23,15 @@ import {
 } from "./testkit/apiFixtures";
 import { App } from "./App";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 beforeEach(() => {
   history.replaceState(null, "", location.pathname);
+  // Tests assert localized view labels, so run with the sidebar expanded.
+  localStorage.setItem("pgk-sidebar", "open");
 });
 
 function jsonResponse(body: unknown): Response {
@@ -80,6 +86,18 @@ function stubFetch() {
   });
 }
 
+function summaryFetchCount(): number {
+  return (vi.mocked(globalThis.fetch).mock.calls as unknown[][]).filter((c) => {
+    const u =
+      typeof c[0] === "string"
+        ? c[0]
+        : c[0] instanceof Request
+          ? c[0].url
+          : String(c[0]);
+    return u.includes("/v1/views/summary");
+  }).length;
+}
+
 function renderApp() {
   vi.stubGlobal("fetch", stubFetch());
   return render(<App />);
@@ -88,7 +106,9 @@ function renderApp() {
 test("renders the shell regions from fixtures", async () => {
   renderApp();
   expect(screen.getByTestId("app-shell")).toBeDefined();
-  await waitFor(() => expect(screen.getByText("tabs.activity")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
   expect(screen.getByTestId("instance-chip")).toBeDefined();
   expect(screen.getByLabelText("spine.caption")).toBeDefined();
   expect(screen.getByText(/statusbar\.hints/)).toBeDefined();
@@ -96,14 +116,18 @@ test("renders the shell regions from fixtures", async () => {
 
 test("digit key selects the nth catalog view", async () => {
   renderApp();
-  await waitFor(() => expect(screen.getByText("tabs.locks")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+  );
   fireEvent.keyDown(window, { key: "3" });
   expect(location.hash).toContain("view=locks");
 });
 
 test("space toggles LIVE: the hash gains and then loses the cursor", async () => {
   renderApp();
-  await waitFor(() => expect(screen.getByText("tabs.activity")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
   expect(location.hash).not.toContain("at=");
   fireEvent.keyDown(window, { key: " " });
   expect(location.hash).toContain("at=");
@@ -124,13 +148,86 @@ test("Escape closes an open dock", async () => {
 
 test("hashchange re-parses the state", async () => {
   renderApp();
-  await waitFor(() => expect(screen.getByText("tabs.locks")).toBeDefined());
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+  );
   act(() => {
     location.hash = "#view=locks";
     window.dispatchEvent(new Event("hashchange"));
   });
   await waitFor(() => {
-    const tab = screen.getByText("tabs.locks").closest("[role=tab]");
+    const tab = screen.getAllByText("tabs.locks")[0]?.closest("[role=tab]");
     expect(tab?.getAttribute("aria-selected")).toBe("true");
   });
+});
+
+test("arrow keys step the cursor; shift+arrow jumps an hour", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000`,
+  );
+  renderApp();
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
+  const before = new URLSearchParams(location.hash.slice(1)).get("at");
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  const stepped = new URLSearchParams(location.hash.slice(1)).get("at");
+  expect(BigInt(stepped ?? "0") > BigInt(before ?? "0")).toBe(true);
+  fireEvent.keyDown(window, { key: "ArrowLeft", shiftKey: true });
+  const jumped = new URLSearchParams(location.hash.slice(1)).get("at");
+  expect(BigInt(before ?? "0") - BigInt(jumped ?? "0")).toBe(
+    3_600_000_000n - 3_600_000_000n / 48n,
+  );
+});
+
+test("arrow keys on the spine slider step by its own delta, not the global one", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000`,
+  );
+  renderApp();
+  const slider = await screen.findByRole("slider");
+  fireEvent.keyDown(slider, { key: "ArrowRight" });
+  const stepped = new URLSearchParams(location.hash.slice(1)).get("at");
+  // The slider owns the key (5 min step); the global handler must not apply
+  // its span/48 step on top — exactly one patch, slider-sized.
+  expect(BigInt(stepped ?? "0") - 1_722_400_000_000_000n).toBe(300_000_000n);
+});
+
+test("Enter on a focused button belongs to the button, not global shortcuts", async () => {
+  renderApp();
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
+  const hashBefore = location.hash;
+  const button = screen.getByRole("button", { name: /header.copyLink/ });
+  button.focus();
+  fireEvent.keyDown(button, { key: "Enter" });
+  expect(location.hash).toBe(hashBefore);
+});
+
+test("LIVE cursor advances on the tick, not on every render", async () => {
+  vi.useFakeTimers();
+  renderApp();
+  // Let the initial queries settle.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(50);
+  });
+  const summaryCalls0 = summaryFetchCount();
+  expect(summaryCalls0).toBeGreaterThan(0);
+  // A few seconds of unrelated renders must not refetch summary: `at` is
+  // pinned to the tick, not recomputed per render.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2_000);
+  });
+  expect(summaryFetchCount()).toBe(summaryCalls0);
+  // The 15 s LIVE tick pins a new `at` and re-queries.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(15_000);
+  });
+  expect(summaryFetchCount()).toBeGreaterThan(summaryCalls0);
+  vi.useRealTimers();
 });

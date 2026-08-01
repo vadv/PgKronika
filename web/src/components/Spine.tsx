@@ -111,6 +111,7 @@ export function Spine(props: SpineProps) {
     return () => clearInterval(id);
   }, [live]);
 
+  const [hoverUs, setHoverUs] = useState<number | null>(null);
   const toUs = props.at !== null ? Number(props.at) : nowUs;
   // Wire range follows the zoom span (exact BigInt math); the 24 h bound is
   // enforced by the span whitelist in the URL codec.
@@ -177,6 +178,23 @@ export function Spine(props: SpineProps) {
     }
   };
 
+  const hoverBucket =
+    hoverUs !== null && geom !== null
+      ? Math.floor((hoverUs - geom.gridFromUs) / geom.bucketSpanUs)
+      : -1;
+  const hoverValue =
+    primary !== null && hoverBucket >= 0 && hoverBucket < primary.values.length
+      ? (primary.values[hoverBucket] ?? null)
+      : null;
+  const hoverLabel =
+    hoverUs !== null
+      ? new Intl.DateTimeFormat(undefined, {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }).format(new Date(hoverUs / 1000))
+      : null;
+
   const cursorDate = new Date(toUs / 1000);
   const cursorLabel = new Intl.DateTimeFormat(undefined, {
     dateStyle: "short",
@@ -189,15 +207,34 @@ export function Spine(props: SpineProps) {
       style={{
         display: "flex",
         flexDirection: "column",
-        gap: "4px",
-        padding: "4px 8px",
+        gap: "6px",
+        padding: "8px 12px 10px",
         background: "var(--bg-raised)",
-        borderBottom: "1px solid var(--border)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-md)",
         fontFamily: "var(--ui-font)",
       }}
     >
-      <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}>
-        <span style={{ color: "var(--fg-dim)" }}>{t("spine.caption")}</span>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          flexWrap: "wrap",
+        }}
+      >
+        <span
+          style={{
+            fontFamily: "var(--ui-font)",
+            fontSize: "var(--text-xs)",
+            fontWeight: 600,
+            textTransform: "uppercase",
+            letterSpacing: "var(--tracking-caps)",
+            color: "var(--fg-dim)",
+          }}
+        >
+          {t("spine.caption")}
+        </span>
         <button
           type="button"
           aria-pressed={!live}
@@ -205,16 +242,32 @@ export function Spine(props: SpineProps) {
             props.onSelectAt(live ? String(Date.now() * 1000) : null)
           }
           style={{
-            fontFamily: "var(--mono-font)",
-            color: live ? "var(--sev-ok)" : "var(--sev-warn)",
-            background: "none",
+            fontFamily: "var(--ui-font)",
+            fontSize: "var(--text-xs)",
+            fontWeight: 600,
+            letterSpacing: "var(--tracking-caps)",
+            color: live ? "var(--sev-ok-fg)" : "var(--sev-warn-fg)",
+            background: live ? "var(--sev-ok-bg)" : "var(--sev-warn-bg)",
             border: `1px solid ${live ? "var(--sev-ok)" : "var(--sev-warn)"}`,
+            borderRadius: "var(--radius-sm)",
+            padding: "1px 8px",
             cursor: "pointer",
           }}
         >
           {live ? t("spine.live") : t("spine.replay")}
         </button>
-        <div role="group" aria-label={t("spine.zoom")}>
+        <div
+          role="group"
+          aria-label={t("spine.zoom")}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--radius-sm)",
+            overflow: "hidden",
+          }}
+        >
           {SPANS.map((s) => (
             <button
               key={s}
@@ -222,15 +275,17 @@ export function Spine(props: SpineProps) {
               aria-pressed={props.span === s}
               onClick={() => props.onSelectSpan(s)}
               style={{
-                fontFamily: "var(--mono-font)",
-                color: props.span === s ? "var(--accent)" : "var(--fg)",
-                background: "none",
+                fontFamily: "var(--ui-font)",
+                fontSize: "var(--text-xs)",
+                padding: "2px 8px",
                 border: "none",
-                borderBottom:
-                  props.span === s
-                    ? "2px solid var(--accent)"
-                    : "2px solid transparent",
+                background:
+                  props.span === s ? "var(--active-bg)" : "transparent",
+                color:
+                  props.span === s ? "var(--accent-strong)" : "var(--fg-dim)",
                 cursor: "pointer",
+                transition:
+                  "color var(--transition-fast), background var(--transition-fast)",
               }}
             >
               {t(`spine.span.${s}`)}
@@ -239,14 +294,23 @@ export function Spine(props: SpineProps) {
         </div>
         <span
           data-testid="spine-cursor-time"
-          style={{ marginInlineStart: "auto", color: "var(--fg-dim)" }}
+          style={{
+            marginInlineStart: "auto",
+            color: "var(--fg-dim)",
+            fontFamily: "var(--mono-font)",
+            fontSize: "var(--text-sm)",
+          }}
         >
           {cursorLabel}
         </span>
         {primary !== null && (
           <span
             data-testid="spine-metric"
-            style={{ fontFamily: "var(--mono-font)", color: "var(--fg-dim)" }}
+            style={{
+              fontFamily: "var(--mono-font)",
+              fontSize: "var(--text-sm)",
+              color: "var(--fg-dim)",
+            }}
           >
             {t("spine.load", { code: primary.code, unit: primary.unit })}
           </span>
@@ -268,6 +332,12 @@ export function Spine(props: SpineProps) {
           preserveAspectRatio="none"
           onClick={onStripClick}
           onKeyDown={onStripKeyDown}
+          onMouseMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const fraction = (e.clientX - rect.left) / rect.width;
+            setHoverUs(Math.round(fromUs + fraction * windowNum));
+          }}
+          onMouseLeave={() => setHoverUs(null)}
           style={{
             flex: 1,
             height: `${SVG_HEIGHT}px`,
@@ -286,6 +356,19 @@ export function Spine(props: SpineProps) {
               y2={SVG_HEIGHT}
               stroke="var(--border)"
               strokeWidth="1"
+            />
+          ))}
+          {[0.25, 0.5, 0.75].map((f) => (
+            <line
+              key={f}
+              x1={0}
+              x2={SVG_WIDTH}
+              y1={SVG_HEIGHT * f}
+              y2={SVG_HEIGHT * f}
+              stroke="var(--border)"
+              strokeWidth="1"
+              strokeDasharray="2 4"
+              vectorEffect="non-scaling-stroke"
             />
           ))}
           {segments.map((points, i) => (
@@ -347,6 +430,30 @@ export function Spine(props: SpineProps) {
               y2={SVG_HEIGHT}
               stroke="var(--fg)"
               strokeWidth="1"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+          {hoverUs !== null && hoverLabel !== null && (
+            <text
+              data-testid="spine-hover-readout"
+              x={Math.min(Math.max(cursorX(hoverUs) + 6, 4), SVG_WIDTH - 150)}
+              y={12}
+              fontSize="10"
+              fill="var(--fg)"
+              style={{ fontFamily: "var(--mono-font)" }}
+            >
+              {`${hoverLabel} · ${hoverValue === null ? "—" : hoverValue.toFixed(2)}`}
+            </text>
+          )}
+          {hoverUs !== null && (
+            <line
+              x1={cursorX(hoverUs)}
+              x2={cursorX(hoverUs)}
+              y1={0}
+              y2={SVG_HEIGHT}
+              stroke="var(--fg-dim)"
+              strokeWidth="1"
+              strokeDasharray="3 3"
               vectorEffect="non-scaling-stroke"
             />
           )}

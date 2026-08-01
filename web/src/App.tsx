@@ -12,6 +12,7 @@ import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
 import { Spine } from "./components/Spine";
 import { StatusBar } from "./components/StatusBar";
+import { PageHeader } from "./components/PageHeader";
 import { TabBar } from "./components/TabBar";
 import { TableView } from "./components/TableView";
 import { Toolbar } from "./components/Toolbar";
@@ -191,18 +192,107 @@ function Shell() {
       />
       <AlertBar live={state.at === null} summary={summary.data} />
       {mobile ? (
-        <div
+        <main
           data-testid="mobile-triage"
           style={{
-            padding: "8px",
-            color: "var(--fg-dim)",
+            display: "flex",
+            flexDirection: "column",
+            gap: "var(--space-2)",
+            padding: "var(--space-2) var(--space-3)",
             fontFamily: "var(--ui-font)",
           }}
         >
-          {t("app.mobileTriage")}
-        </div>
+          <span style={{ color: "var(--fg-dim)", fontSize: "var(--text-sm)" }}>
+            {t("app.mobileTriage")}
+          </span>
+          {/* Mobile triage shows the incidents inline — the chip-only path
+              read as an empty, broken page. */}
+          {incidents.isLoading && (
+            <span style={{ color: "var(--fg-dim)" }}>
+              {t("dock.incidents.loading")}
+            </span>
+          )}
+          {incidents.isError && (
+            <span role="alert" style={{ color: "var(--sev-warn-fg)" }}>
+              {t("dock.incidents.error")}
+            </span>
+          )}
+          {incidents.isSuccess &&
+            (incidents.data?.incidents.length ?? 0) === 0 && (
+              <span style={{ color: "var(--fg-dim)" }}>
+                {t("dock.incidents.empty")}
+              </span>
+            )}
+          {(incidents.data?.incidents ?? []).map((incident) => (
+            <button
+              key={incident.incident_key}
+              type="button"
+              data-incident={incident.incident_key}
+              onClick={() =>
+                patch({ dock: "incidents", focus: incident.incident_key })
+              }
+              style={{
+                display: "block",
+                width: "100%",
+                textAlign: "start",
+                background: "var(--bg-raised)",
+                border: "1px solid var(--border)",
+                borderInlineStart: `3px solid ${
+                  incident.level === "critical"
+                    ? "var(--sev-crit)"
+                    : incident.level === "warning"
+                      ? "var(--sev-warn)"
+                      : "var(--border)"
+                }`,
+                borderRadius: "var(--radius-sm)",
+                padding: "8px 10px",
+                color: "var(--fg)",
+                cursor: "pointer",
+              }}
+            >
+              <span
+                style={{
+                  display: "block",
+                  fontFamily: "var(--mono-font)",
+                  fontSize: "var(--text-sm)",
+                }}
+              >
+                {incident.incident_key}
+              </span>
+              <span
+                style={{
+                  display: "block",
+                  color: "var(--fg-dim)",
+                  fontSize: "var(--text-xs)",
+                }}
+              >
+                {t("dock.incidents.counts", {
+                  members: incident.members.length,
+                  findings: incident.findings.length,
+                })}
+              </span>
+            </button>
+          ))}
+        </main>
       ) : (
-        <>
+        <main
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "var(--space-2)",
+            padding: "var(--space-2) var(--space-3)",
+          }}
+        >
+          {catalog.isSuccess && (
+            <TabBar
+              views={views}
+              active={state.view}
+              onSelect={(view) => patch({ view })}
+              summaries={
+                new Map((summary.data?.views ?? []).map((v) => [v.view, v]))
+              }
+            />
+          )}
           <Spine
             at={state.at}
             span={state.span}
@@ -217,14 +307,11 @@ function Shell() {
               onExit={() => patch({ focus: null })}
             />
           )}
-          {catalog.isSuccess && (
-            <TabBar
-              views={views}
-              active={state.view}
-              onSelect={(view) => patch({ view })}
-              summaries={
-                new Map((summary.data?.views ?? []).map((v) => [v.view, v]))
-              }
+          {tableReady && (
+            <PageHeader
+              view={activeView}
+              summary={summary.data?.views.find((v) => v.view === state.view)}
+              matched={matched}
             />
           )}
           {heatmapReady && (
@@ -266,7 +353,7 @@ function Shell() {
               onMatched={setMatched}
             />
           )}
-        </>
+        </main>
       )}
       <div style={{ flex: 1 }} />
       <StatusBar state={state} summary={summary.data} />

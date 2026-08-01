@@ -84,7 +84,13 @@ test("renders row labels and one cell per bucket, null cell marked empty", async
   expect(container.querySelectorAll("[data-cell]")).toHaveLength(8);
   const empty = container.querySelector("[data-empty='true']");
   expect(empty).not.toBeNull();
-  expect(empty?.getAttribute("title")).toContain("—");
+  // The structured tooltip shows the honest null marker on hover.
+  fireEvent.mouseEnter(empty as Element);
+  await waitFor(() =>
+    expect(container.querySelector("[role='tooltip']")?.textContent).toContain(
+      "—",
+    ),
+  );
 });
 
 test("partial quality renders a warning badge", async () => {
@@ -108,4 +114,26 @@ test("row label click reports the entity", async () => {
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
   fireEvent.click(screen.getByText("alpha"));
   expect(onSelectEntity).toHaveBeenCalledWith("e1");
+});
+
+test("partial chip tooltip lists localized quality reasons", async () => {
+  const original = fixture.quality;
+  fixture.quality = makeHeatmapQuality({
+    status: "partial",
+    gaps: [{ from_us: "1", to_us: "2" }],
+    gated: ["statements"],
+    resource_limited: [],
+    active_tail: true,
+  });
+  const { container } = renderStrip();
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  const chip = screen.getByText("heatmap.partial");
+  fireEvent.mouseEnter(chip);
+  await waitFor(() =>
+    expect(container.querySelector("[role='tooltip']")).not.toBeNull(),
+  );
+  const tip = container.querySelector("[role='tooltip']")?.textContent ?? "";
+  expect(tip).toContain("heatmap.quality.gated");
+  expect(tip).toContain("heatmap.quality.active_tail");
+  fixture.quality = original;
 });

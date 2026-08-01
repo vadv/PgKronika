@@ -182,7 +182,8 @@ test("verdict cell carries level color and the mechanical why in the title", asy
   );
   renderTable();
   const cell = await screen.findByText("42");
-  expect(cell.style.color).toBe("var(--sev-crit)");
+  expect(cell.style.color).toBe("var(--sev-crit-fg)");
+  expect(cell.style.background).toBe("var(--sev-crit-bg)");
   expect(cell.getAttribute("title")).toBe("critical: > 10 · observed 42");
 });
 
@@ -241,7 +242,7 @@ test("410 cursor expiry refetches the first page automatically", async () => {
   };
   render(<TableView {...props} />, { wrapper: noRetryWrapper });
   await waitFor(() => expect(screen.getByText("5")).toBeDefined());
-  fireEvent.click(screen.getByRole("button", { name: "table.more" }));
+  fireEvent.click(screen.getByRole("button", { name: /table.more/ }));
   // The expiry notice appears while the fresh first page is requested…
   await waitFor(() =>
     expect(screen.getByText("table.cursor_expired")).toBeDefined(),

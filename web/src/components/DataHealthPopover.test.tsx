@@ -79,7 +79,12 @@ test("renders freshness, coverage and gaps from the data quality response", asyn
   const text = container.textContent ?? "";
   expect(text).toContain("stale");
   expect(text).toContain("popover.age 5s");
-  expect(text).toContain(new Date(1_722_400_000_000).toISOString());
+  expect(text).toContain(
+    new Intl.DateTimeFormat(undefined, {
+      dateStyle: "short",
+      timeStyle: "medium",
+    }).format(new Date(1_722_400_000_000)),
+  );
   expect(text).toContain("5/7");
   expect(text).toContain("popover.complete: 4");
   expect(text).toContain("collector restart");
