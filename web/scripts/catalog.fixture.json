@@ -387,6 +387,24 @@
           "source": "statements.query",
           "lazy": true,
           "requires": ["statements"],
+          "availability": "not_collected",
+          "unavailable_reason": "query_text_not_collected"
+        },
+        {
+          "code": "database",
+          "type": "text",
+          "source": "statements.datname",
+          "lazy": false,
+          "requires": ["statements"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "user",
+          "type": "text",
+          "source": "statements.usename",
+          "lazy": false,
+          "requires": ["statements"],
           "availability": "gated",
           "unavailable_reason": "missing_extension"
         },
@@ -504,7 +522,8 @@
           "code": "time",
           "columns": [
             "queryid",
-            "query",
+            "database",
+            "user",
             "calls",
             "total",
             "mean",
@@ -520,7 +539,14 @@
         },
         {
           "code": "io",
-          "columns": ["queryid", "query", "calls", "hit_pct", "blks_read"],
+          "columns": [
+            "queryid",
+            "database",
+            "user",
+            "calls",
+            "hit_pct",
+            "blks_read"
+          ],
           "sort": {
             "column": "blks_read",
             "order": "desc"
@@ -528,7 +554,7 @@
         },
         {
           "code": "temp",
-          "columns": ["queryid", "query", "calls", "temp_written"],
+          "columns": ["queryid", "database", "user", "calls", "temp_written"],
           "sort": {
             "column": "temp_written",
             "order": "desc"
@@ -536,7 +562,14 @@
         },
         {
           "code": "wal",
-          "columns": ["queryid", "query", "calls", "wal_bytes", "total"],
+          "columns": [
+            "queryid",
+            "database",
+            "user",
+            "calls",
+            "wal_bytes",
+            "total"
+          ],
           "sort": {
             "column": "wal_bytes",
             "order": "desc"

@@ -14,6 +14,7 @@ import type {
   ViewSpec,
 } from "../api/types";
 import type { DockKind, UiState } from "../state/url";
+import { isIdentityColumn, shortIdToken } from "../design/format";
 import { formatCellValue } from "./cellFormat";
 import { formatIntervalTime } from "./FocusBar";
 
@@ -27,13 +28,6 @@ export interface DockOverlayProps {
   onClose: () => void;
   onSelectIncident: (key: string | null) => void;
   onPatch: (patch: Partial<UiState>) => void;
-}
-
-/** Opaque typed-identity tokens (entity keys) are API routing material, not
- * display text: show a short readable form, keep the full token in the
- * tooltip. */
-function shortEntity(token: string): string {
-  return token.length <= 12 ? token : `${token.slice(0, 8)}…`;
 }
 
 /** Localized incident title from the server's language-neutral summary code;
@@ -448,10 +442,24 @@ function EntityPointView(props: {
         };
         const label = colLabel(t, props.viewCode, field.code);
         const desc = colDesc(t, props.viewCode, field.code);
+        const availability = spec?.availability ?? "available";
         const isSql =
           typeof field.value === "string" &&
           (field.value.length > 60 || field.value.includes("\n"));
-        return isSql ? (
+        // Honest absence: a column the source never fills (or the store
+        // gates) renders its availability status, not a blank em-dash.
+        const notCollected =
+          field.value === null && availability !== "available";
+        // Identifier values are never cut in the dock: full mono text,
+        // wrap anywhere, one click selects the whole value for copying.
+        const fullIdentity =
+          isIdentityColumn(field.code) && field.value !== null;
+        const display = notCollected
+          ? t(`availability.${availability}`, { defaultValue: availability })
+          : fullIdentity
+            ? String(field.value)
+            : formatCellValue(field.value, cellColumn, t);
+        return isSql && !notCollected ? (
           <div
             key={field.code}
             style={{ gridColumn: "1 / -1", marginBlock: "4px" }}
@@ -495,11 +503,15 @@ function EntityPointView(props: {
             <span
               style={{
                 fontFamily: "var(--mono-font)",
-                color: field.value !== null ? "var(--fg)" : "var(--fg-dim)",
+                color:
+                  field.value !== null && !notCollected
+                    ? "var(--fg)"
+                    : "var(--fg-dim)",
                 overflowWrap: "break-word",
+                ...(fullIdentity ? { userSelect: "all" } : {}),
               }}
             >
-              {formatCellValue(field.value, cellColumn, t)}
+              {display}
             </span>
           </div>
         );
@@ -672,39 +684,65 @@ function RowDock(props: {
   // The API label is the human row name (index/relation/pid); the typed
   // entity token is routing material — short form, full value in the title.
   const label = data !== undefined && data.label !== "" ? data.label : null;
+  // statements/plans have no collected text to grow a name from: their label
+  // is the bare numeric identity. The heading is the tab name plus a short
+  // id; the full id stays in the field list below, uncut.
+  const heading =
+    label !== null &&
+    (viewCode === "statements" || viewCode === "plans") &&
+    /^-?\d+$/.test(label)
+      ? t(`dock.row.heading.${viewCode}`, { id: shortIdToken(label) })
+      : label;
+
+  const [tokenCopied, setTokenCopied] = useState(false);
+  const copyToken = () => {
+    if (props.state.entity === null) return;
+    void navigator.clipboard.writeText(props.state.entity);
+    setTokenCopied(true);
+    setTimeout(() => setTokenCopied(false), 1700);
+  };
 
   return (
     <div>
+      {/* The heading is always human text (tab + server label); the entity
+          token is routing material — it lives in the heading tooltip and
+          rides the clipboard, never a visible line of its own. */}
       <div
+        title={props.state.entity ?? undefined}
         style={{
           fontFamily: "var(--ui-font)",
-          marginBlockEnd: "2px",
+          marginBlockEnd: "6px",
           overflowWrap: "anywhere",
         }}
       >
         <span style={{ color: "var(--fg-dim)" }}>{t(`tabs.${viewCode}`)}</span>
-        {label !== null && (
+        {heading !== null && (
           <>
             {" · "}
-            <span style={{ fontWeight: 600 }}>{label}</span>
+            <span style={{ fontWeight: 600 }}>{heading}</span>
           </>
         )}
+        {props.state.entity !== null && (
+          <button
+            type="button"
+            data-testid="dock-copy-token"
+            title={t("dock.row.copyToken")}
+            onClick={copyToken}
+            style={{
+              marginInlineStart: "6px",
+              fontFamily: "var(--mono-font)",
+              fontSize: "var(--text-xs)",
+              color: "var(--fg-dim)",
+              background: "none",
+              border: "none",
+              padding: 0,
+              cursor: "pointer",
+            }}
+          >
+            {tokenCopied ? t("dock.row.tokenCopied") : "⧉"}
+          </button>
+        )}
       </div>
-      {/* The entity token is routing material — short secondary line with
-          the full value in the tooltip, never the heading. */}
-      {props.state.entity !== null && (
-        <div
-          title={props.state.entity}
-          style={{
-            fontFamily: "var(--mono-font)",
-            fontSize: "var(--text-xs)",
-            color: "var(--fg-dim)",
-            marginBlockEnd: "6px",
-          }}
-        >
-          {shortEntity(props.state.entity)}
-        </div>
-      )}
       {missing && (
         <div style={{ color: "var(--fg-dim)" }}>{t("dock.row.missing")}</div>
       )}

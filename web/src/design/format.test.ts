@@ -47,6 +47,13 @@ describe("shortIdToken", () => {
     expect(shortIdToken("AQAEBQAABbbbccccdd")).toBe("AQAEBQAA…");
     expect(shortIdToken("short")).toBe("short");
   });
+
+  test("signed int64 normalizes to the unsigned 64-bit form", () => {
+    // queryid arrives as a signed bigint string; the same uint64 must tokenize
+    // identically whether the wire carries the negative or unsigned spelling.
+    expect(shortIdToken("-1999008735841373854")).toBe("e442…b162");
+    expect(shortIdToken("16447735337868177762")).toBe("e442…b162");
+  });
 });
 
 test("isIdentityColumn", () => {

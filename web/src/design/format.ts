@@ -108,11 +108,14 @@ export function isPlainIntegerColumn(code: string): boolean {
 }
 
 /** uint64 decimal string → `1a2b…9f0e`; falls back to a plain cut for
- * non-numeric tokens. The full value always stays available in a tooltip. */
+ * non-numeric tokens. pg_stat_statements queryid is a uint64 exposed as a
+ * signed bigint, so negatives normalize to the unsigned 64-bit form first —
+ * otherwise "-1999008…" and a hex cut of the same id read as two different
+ * identifiers. The full value always stays available in a tooltip. */
 export function shortIdToken(raw: string): string {
   const text = raw.trim();
-  if (/^[0-9]+$/.test(text)) {
-    const hex = BigInt(text).toString(16);
+  if (/^-?[0-9]+$/.test(text)) {
+    const hex = BigInt.asUintN(64, BigInt(text)).toString(16);
     return hex.length <= 9 ? hex : `${hex.slice(0, 4)}…${hex.slice(-4)}`;
   }
   return text.length <= 10 ? text : `${text.slice(0, 8)}…`;

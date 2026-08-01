@@ -64,7 +64,12 @@ const catalog = JSON.parse(
 for (const view of catalog.views) {
   view.availability = "available";
   for (const group of [view.inputs, view.metrics, view.columns]) {
-    for (const item of group) item.availability = "available";
+    for (const item of group) {
+      // `not_collected` is intrinsic to the source (the collector never
+      // writes the value), not a property of the empty demo store.
+      if (item.availability !== "not_collected")
+        item.availability = "available";
+    }
   }
 }
 
@@ -188,18 +193,38 @@ function timelineMeta(fromUs, toUs) {
 const SPINE_GAP = [60, 61]; // two buckets lost to a collector restart
 const SPINE_PEAK = 42; // deploy-driven load spike in the middle of the window
 
+// Sparse scenario (PGK_DEMO_SPARSE=1): long collection holes, isolated
+// single points and honest gap reasons — the strip must stay readable.
+const SPARSE = process.env.PGK_DEMO_SPARSE === "1";
+// Buckets with data in sparse mode: a head segment, one isolated point, a
+// middle segment, another isolated point, a tail segment.
+const SPARSE_SPINE_KEEP = (b) =>
+  b <= 4 || b === 31 || (b >= 34 && b <= 59) || b === 71 || b >= 91;
+const SPARSE_SPINE_GAPS = [
+  [5, 31, "producer_restart"],
+  [60, 91, "producer_gap"],
+];
+// Health point holes in sparse mode (fractions of the requested range).
+const SPARSE_HEALTH_DROP = [
+  [0.56, 0.68],
+  [0.78, 0.84],
+];
+
 function spineSeries(code, unit, aggregation, base, spike, buckets, rand) {
   const phase = rand() * Math.PI * 2;
   const values = [];
   for (let b = 0; b < buckets; b++) {
-    if (SPINE_GAP.includes(b)) {
+    if (SPINE_GAP.includes(b) || (SPARSE && !SPARSE_SPINE_KEEP(b))) {
       values.push(null);
       continue;
     }
     const wave = 0.5 + 0.3 * Math.sin((b / buckets) * Math.PI * 4 + phase);
     const peak = 1.8 * Math.exp(-((b - SPINE_PEAK) ** 2) / (2 * 2.5 ** 2));
     const noise = rand() * 0.12;
-    values.push(Math.round(base * (wave + noise) + spike * peak));
+    // Ratios would collapse to 0/1 under integer rounding; keep milliunits.
+    values.push(
+      Math.round((base * (wave + noise) + spike * peak) * 1000) / 1000,
+    );
   }
   return { code, unit, aggregation, values };
 }
@@ -216,6 +241,22 @@ function spineResponse(params) {
   ];
 
   const bucketUs = (to - from) / BigInt(buckets);
+  const gaps = SPARSE
+    ? SPARSE_SPINE_GAPS.map(([start, end, reason]) => ({
+        from_us: (from + bucketUs * BigInt(start)).toString(),
+        to_us: (from + bucketUs * BigInt(end)).toString(),
+        reason,
+      }))
+    : [
+        {
+          from_us: (from + bucketUs * BigInt(SPINE_GAP[0])).toString(),
+          to_us: (
+            from +
+            bucketUs * BigInt(SPINE_GAP[SPINE_GAP.length - 1] + 1)
+          ).toString(),
+          reason: "producer_gap",
+        },
+      ];
   return {
     grid: {
       from_us: from.toString(),
@@ -225,21 +266,74 @@ function spineResponse(params) {
     series,
     quality: {
       status: "partial",
-      snapshots: buckets - SPINE_GAP.length,
-      gaps: [
-        {
-          from_us: (from + bucketUs * BigInt(SPINE_GAP[0])).toString(),
-          to_us: (
-            from +
-            bucketUs * BigInt(SPINE_GAP[SPINE_GAP.length - 1] + 1)
-          ).toString(),
-          reason: "producer_gap",
-        },
-      ],
+      snapshots: SPARSE
+        ? buckets - SPARSE_SPINE_GAPS.reduce((n, [s, e]) => n + (e - s), 0)
+        : buckets - SPINE_GAP.length,
+      gaps,
       gated: [],
       resource_limited: [],
       active_tail: true,
     },
+  };
+}
+
+// --- health ----------------------------------------------------------------
+
+// Storyline for the strip: the previous window is calm; the current window
+// has a degraded block around 55–60% and a critical block around 70–75%
+// (lock contention on orders, matching the incidents below).
+function healthResponse(params) {
+  const from = Number(params.get("from") ?? String(nowUs() - 86_400 * US));
+  const to = Number(params.get("to") ?? String(nowUs()));
+  const step = Number(params.get("step") ?? String((to - from) / 96));
+  const span = to - from;
+  const points = [];
+  for (let start = from; start < to; start += step) {
+    const end = Math.min(start + step, to);
+    const midFraction = (start + step / 2 - from) / span;
+    // Sparse mode: whole ranges without points — honest ribbon holes.
+    if (
+      SPARSE &&
+      SPARSE_HEALTH_DROP.some(([a, b]) => midFraction >= a && midFraction < b)
+    ) {
+      continue;
+    }
+    let state = "normal";
+    // Doubled window queries: the second half (current window) carries the
+    // incidents; the first half (previous window) stays calm.
+    if (SPARSE) {
+      if (midFraction >= 0.87 && midFraction <= 0.93) state = "critical";
+      else if (midFraction >= 0.52 && midFraction < 0.55) state = "degraded";
+    } else if (midFraction >= 0.77 && midFraction <= 0.85) state = "critical";
+    else if (midFraction >= 0.66 && midFraction < 0.71) state = "degraded";
+    points.push({
+      interval: { from_us: Math.round(start), to_us: Math.round(end) },
+      factor_set_id: "factors-demo-1",
+      health_policy_version: 1,
+      overall_state: state,
+      overall_score:
+        state === "critical" ? 0.3 : state === "degraded" ? 0.7 : 1,
+      continuous_score: null,
+      domains:
+        state === "normal"
+          ? []
+          : [
+              {
+                domain: "contention",
+                penalty: state === "critical" ? 0.7 : 0.3,
+                driving_factor_ids: [4],
+              },
+            ],
+      coverage: [],
+      floor_evidence: [],
+    });
+  }
+  return {
+    health_policy_version: 1,
+    factor_set_ids: ["factors-demo-1"],
+    points,
+    coverage: [],
+    meta: timelineMeta(from, to),
   };
 }
 
@@ -248,12 +342,12 @@ function spineResponse(params) {
 function demoEvents(fromUs, toUs) {
   const at = (fraction) => Math.round(fromUs + (toUs - fromUs) * fraction);
   const spec = [
-    [0.12, "checkpoint", "info", { kind: "checkpoint" }],
-    [0.3, "autovacuum", "info", { kind: "autovacuum" }],
-    [0.43, "marker", "info", { kind: "deploy:api-v2.14.0" }],
+    [0.12, "pg.checkpoint.completed", "info", { kind: "checkpoint" }],
+    [0.3, "pg.maintenance.autovacuum_reported", "info", { kind: "autovacuum" }],
+    [0.43, "pg.temp_file.reported", "info", { kind: "temp_file" }],
     [
       0.58,
-      "deadlock",
+      "pg.database.deadlock_delta",
       "deadlock",
       {
         kind: "deadlock",
@@ -263,8 +357,9 @@ function demoEvents(fromUs, toUs) {
         dropped_field_count: 0,
       },
     ],
-    [0.74, "checkpoint", "info", { kind: "checkpoint" }],
-    [0.9, "autovacuum", "info", { kind: "autovacuum" }],
+    [0.6, "pg.lock.wait_reported", "lock", { kind: "lock_wait" }],
+    [0.74, "pg.checkpoint.completed", "info", { kind: "checkpoint" }],
+    [0.9, "pg.maintenance.autovacuum_reported", "info", { kind: "autovacuum" }],
   ];
   return spec.map(([fraction, kind, cls, payload], i) => {
     const ts = at(fraction);
@@ -591,8 +686,11 @@ function rowsActivity() {
   });
 }
 
+const STMT_DATABASES = ["orders", "orders", "billing", "analytics"];
+const STMT_USERS = ["app_rw", "app_rw", "billing_job", "report"];
+
 function rowsStatements() {
-  return QUERIES.map(([qid, query], i) => {
+  return QUERIES.map(([qid], i) => {
     const calls = 12_400_000 - i * 912_000;
     const total = r2(8_420_000 - i * 588_000);
     const mean = r2(total / Math.max(calls / 1000, 1));
@@ -608,12 +706,18 @@ function rowsStatements() {
         ),
       );
     }
+    // Mirror the live store: the collector writes the query text as NULL by
+    // design, so the label is the bare queryid and identification rides on
+    // database/user — the demo must not promise text the stand cannot show.
+    const queryid = String(9_180_220_441_120_000n + BigInt(qid));
     return {
       entity: `stmt:${qid}`,
-      label: query,
+      label: queryid,
       data: {
-        queryid: String(9_180_220_441_120_000n + BigInt(qid)),
-        query,
+        queryid,
+        query: null,
+        database: STMT_DATABASES[i % STMT_DATABASES.length],
+        user: STMT_USERS[i % STMT_USERS.length],
         calls,
         total,
         ms_per_row: r2(0.42 + i * 0.18),
@@ -1023,7 +1127,16 @@ function frameResponse(viewCode, params) {
   const pageRows = rows.slice(offset, offset + limit);
   const next = offset + limit < matched ? `o:${offset + limit}` : null;
 
-  const columns = view.columns.map((c) => ({
+  // Mirror the backend admission: a preset (default = first) selects the
+  // frame columns, lazy columns never ride the frame.
+  const presetParam = params.get("preset");
+  const preset = presetParam
+    ? view.presets.find((p) => p.code === presetParam)
+    : view.presets[0];
+  const frameColumns = (preset?.columns ?? view.columns.map((c) => c.code))
+    .map((code) => view.columns.find((c) => c.code === code && !c.lazy))
+    .filter((c) => c !== undefined);
+  const columns = frameColumns.map((c) => ({
     code: c.code,
     type: c.type,
     hidden: false,
@@ -1038,7 +1151,7 @@ function frameResponse(viewCode, params) {
     rows: pageRows.map((r) => ({
       entity: r.entity,
       label: r.label,
-      cells: view.columns.map((c) => r.data[c.code] ?? null),
+      cells: frameColumns.map((c) => r.data[c.code] ?? null),
       classifications: r.cls ?? [],
       spark: sparkFor(r.entity, SPARK_SCALES[viewCode] ?? 100),
     })),
@@ -1353,6 +1466,9 @@ const server = createServer((req, res) => {
   }
   if (url.pathname === "/v1/timeline/spine") {
     return sendJson(res, spineResponse(params));
+  }
+  if (url.pathname === "/v1/timeline/health") {
+    return sendJson(res, healthResponse(params));
   }
   if (url.pathname === "/v1/timeline/events") {
     return sendJson(res, eventsResponse(params));

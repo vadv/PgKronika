@@ -153,3 +153,15 @@ test("null reason pairs status and reason through the dictionary", () => {
   expect(nullReasonTitle("unavailable", "unavailable", t)).toBe("unavailable");
   expect(nullReasonTitle("unavailable", null, t)).toBe("unavailable");
 });
+
+test("pg state/phase enums localize with a raw fallback for unknown values", () => {
+  const state = { code: "state", type: "text" };
+  // Fallback t() returns the defaultValue: unknown enums pass through raw.
+  expect(formatCellValue("idle in transaction", state, t)).toBe(
+    "idle in transaction",
+  );
+  expect(fullCellValue("active", state)).toBe("active");
+  const phase = { code: "phase", type: "text" };
+  expect(formatCellValue("scanning heap", phase, t)).toBe("scanning heap");
+  expect(fullCellValue("vacuuming heap", phase)).toBe("vacuuming heap");
+});

@@ -1,11 +1,29 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { metricLabel } from "../api/codes";
+import { eventKindLabel, metricLabel } from "../api/codes";
+import { isWarmingUp } from "../api/client";
+import { useIncidents } from "../api/incidents";
 import { useTimelineSpine } from "../api/spine";
-import { useTimelineEvents } from "../api/timeline";
-import type { EventFact, SpineSeries } from "../api/types";
-import { formatByUnit, formatTimestampUs } from "../design/format";
+import { useTimelineEvents, useTimelineHealth } from "../api/timeline";
+import type { EventFact, HealthPointResponse, SpineSeries } from "../api/types";
+import {
+  formatByUnit,
+  formatDurationUs,
+  formatTimestampUs,
+} from "../design/format";
 import { SPANS } from "../state/url";
+import { Tooltip } from "./Tooltip";
+import {
+  anchorWindowEnd,
+  bucketReason,
+  bucketVerdicts,
+  chipTone,
+  countWindowIncidents,
+  eventGlyph,
+  scoreVerdicts,
+  windowScore,
+  type BucketVerdict,
+} from "./spineHealth";
 
 export interface SpineProps {
   /** Cursor timestamp (int64 µs, decimal string); null = LIVE. */
@@ -19,30 +37,22 @@ export interface SpineProps {
   onSelectBaseline: (baseline: string | null) => void;
 }
 
-/** The spine always shows the trailing 24 h of recording. */
-const SVG_HEIGHT = 28;
+const SVG_HEIGHT = 40;
 const SVG_WIDTH = 1000;
-const TICK_COUNT = 24;
+/** Verdict ribbon band (top of the strip). */
+const RIBBON_Y = 2;
+const RIBBON_H = 8;
+/** Event glyph row baseline. */
+const GLYPH_Y = 20;
+/** Load sparkline band (bottom of the strip). */
+const SPARK_Y = 26;
+const SPARK_H = 12;
 const LIVE_REFRESH_MS = 5000;
 const KEYBOARD_STEP_US = 300 * 1_000_000;
-/** Grid resolution requested from `/v1/timeline/spine`. */
+/** Grid resolution requested from `/v1/timeline/spine` and the ribbon. */
 const SPINE_BUCKETS = 96;
 /** Repeat shift-click within this share of the window clears the baseline. */
 const BASELINE_CLEAR_FRACTION = 0.02;
-
-function eventSymbol(event: EventFact): string {
-  const kind = event.event_kind.toLowerCase();
-  if (kind.includes("checkpoint")) return "▲";
-  if (kind.includes("error") || kind.includes("deadlock")) return "●";
-  if (kind.includes("autovacuum")) return "⚑";
-  if (kind.includes("marker") || kind.includes("annotation")) return "◆";
-  return "●";
-}
-
-function pointY(fraction: number): number {
-  const clamped = Math.min(1, Math.max(0, fraction));
-  return SVG_HEIGHT - 4 - clamped * (SVG_HEIGHT - 8);
-}
 
 // Primary series: the first one that carries at least one real sample. The
 // API orders series by relevance (host load first, PSI after it), so we do
@@ -68,10 +78,9 @@ function bucketX(
   return ((mid - fromUs) / windowUs) * SVG_WIDTH;
 }
 
-/** Contiguous non-null runs of the series. Runs of 2+ points become
- * polylines; a lone point becomes a dot — never a dangling diagonal
- * fragment floating over empty space. */
-function seriesSegments(
+/** Contiguous non-null runs of the load series as sparkline segments inside
+ * the bottom band; a lone point becomes a dot — never a dangling diagonal. */
+function sparkSegments(
   series: SpineSeries,
   geom: BucketGeometry,
   fromUs: number,
@@ -83,6 +92,8 @@ function seriesSegments(
     0,
   );
   const scale = max > 0 ? max : 1;
+  const y = (v: number) =>
+    SPARK_Y + SPARK_H - Math.min(1, Math.max(0, v / scale)) * SPARK_H;
   const lines: string[] = [];
   const dots: Array<[number, number]> = [];
   let current: string[] = [];
@@ -91,8 +102,8 @@ function seriesSegments(
     else if (current.length === 1) {
       const first = current[0];
       if (first !== undefined) {
-        const [x, y] = first.split(",").map(Number);
-        if (x !== undefined && y !== undefined) dots.push([x, y]);
+        const [x, yy] = first.split(",").map(Number);
+        if (x !== undefined && yy !== undefined) dots.push([x, yy]);
       }
     }
     current = [];
@@ -103,12 +114,37 @@ function seriesSegments(
       flush();
       continue;
     }
-    const x = bucketX(geom, i, fromUs, windowUs);
-    const y = pointY(v / scale);
-    current.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+    current.push(
+      `${bucketX(geom, i, fromUs, windowUs).toFixed(1)},${y(v).toFixed(1)}`,
+    );
   }
   flush();
   return { lines, dots };
+}
+
+const VERDICT_FILL: Record<Exclude<BucketVerdict, "gap">, string> = {
+  ok: "var(--sev-ok-quiet)",
+  warn: "var(--sev-warn)",
+  crit: "var(--sev-crit)",
+};
+
+const GLYPH_FILL = {
+  crit: "var(--sev-crit)",
+  warn: "var(--sev-warn)",
+  info: "var(--accent)",
+  dim: "var(--fg-dim)",
+} as const;
+
+const CHIP_FG = {
+  ok: "var(--sev-ok-fg)",
+  warn: "var(--sev-warn-fg)",
+  crit: "var(--sev-crit-fg)",
+} as const;
+
+function formatMin(minutes: number): string {
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: minutes < 10 ? 1 : 0,
+  }).format(minutes);
 }
 
 export function Spine(props: SpineProps) {
@@ -123,18 +159,42 @@ export function Spine(props: SpineProps) {
   }, [live]);
 
   const [hoverUs, setHoverUs] = useState<number | null>(null);
-  const toUs = props.at !== null ? Number(props.at) : nowUs;
   // Wire range follows the zoom span (exact BigInt math); the 24 h bound is
   // enforced by the span whitelist in the URL codec.
   const windowUs = BigInt(props.span) * 1_000_000n;
-  const toBig = props.at !== null ? BigInt(props.at) : BigInt(nowUs);
-  const from = (toBig - windowUs).toString();
-  const to = toBig.toString();
   const windowNum = props.span * 1_000_000;
+  // The ribbon grid is anchored to the absolute epoch: LIVE window end is
+  // the end of the currently forming bucket, so bucket boundaries are
+  // multiples of the bucket span and the grid is identical between renders.
+  const bucketSpanUs = windowNum / SPINE_BUCKETS;
+  const toUs =
+    props.at !== null ? Number(props.at) : anchorWindowEnd(nowUs, bucketSpanUs);
+  const toBig = BigInt(toUs);
+  const fromBig = toBig - windowUs;
+  const from = fromBig.toString();
+  const to = toBig.toString();
+  const prevFrom = (fromBig - windowUs).toString();
   const fromUs = toUs - windowNum;
+  // LIVE: the last bucket is still forming — hatched, out of the score.
+  const hasFormingTail = live;
 
-  const spine = useTimelineSpine({ from, to, buckets: SPINE_BUCKETS });
-  const events = useTimelineEvents({ from, to, limit: 50 });
+  // Query keys ride the anchored grid, so they only change on a bucket
+  // boundary; within a bucket freshness comes from the refetch interval
+  // (the snapshot cadence), and keepPreviousData holds the last answer
+  // across a boundary — no placeholder flash.
+  const liveOpts = { refetchInterval: live ? LIVE_REFRESH_MS : undefined };
+  // Health and incidents are queried over the doubled window so the score
+  // delta against the previous window costs no extra requests.
+  const health = useTimelineHealth(
+    { from: prevFrom, to, step: bucketSpanUs },
+    liveOpts,
+  );
+  const spine = useTimelineSpine(
+    { from, to, buckets: SPINE_BUCKETS },
+    liveOpts,
+  );
+  const events = useTimelineEvents({ from, to, limit: 50 }, liveOpts);
+  const incidents = useIncidents({ from: prevFrom, to }, liveOpts);
 
   const cursorX = (us: number) => ((us - fromUs) / windowNum) * SVG_WIDTH;
   const allSeries = spine.data?.series ?? [];
@@ -149,13 +209,82 @@ export function Spine(props: SpineProps) {
     : null;
   const { lines, dots } =
     primary !== null && geom !== null
-      ? seriesSegments(primary, geom, fromUs, windowNum)
+      ? sparkSegments(primary, geom, fromUs, windowNum)
       : { lines: [], dots: [] };
   const baselineUs = props.baseline !== null ? Number(props.baseline) : null;
   const visibleEvents = (events.data?.events ?? []).filter((e) => {
     const ts = e.occurred_at_us ?? e.sort_ts_us;
     return ts >= fromUs && ts <= toUs;
   });
+
+  // Health points split into the current window and the previous one by
+  // interval midpoint; buckets without a point stay honest gaps.
+  const points = health.data?.points ?? [];
+  const pointMid = (p: HealthPointResponse) =>
+    (p.interval.from_us + p.interval.to_us) / 2;
+  const currentPoints = points.filter((p) => pointMid(p) >= fromUs);
+  const previousPoints = points.filter((p) => pointMid(p) < fromUs);
+  const verdicts = bucketVerdicts(currentPoints, fromUs, toUs, SPINE_BUCKETS);
+  const previousVerdicts = bucketVerdicts(
+    previousPoints,
+    fromUs - windowNum,
+    fromUs,
+    SPINE_BUCKETS,
+  );
+  const allIncidents = incidents.data?.incidents ?? [];
+  // Score input excludes the forming tail bucket: the score only moves on a
+  // completed-bucket boundary or an incident opening/closing (variant 2A).
+  const scored = scoreVerdicts(verdicts, hasFormingTail);
+  const score = windowScore(
+    scored,
+    (props.span * scored.length) / SPINE_BUCKETS,
+    countWindowIncidents(allIncidents, fromUs, toUs),
+  );
+  const previousScore = windowScore(
+    previousVerdicts,
+    props.span,
+    countWindowIncidents(allIncidents, fromUs - windowNum, fromUs),
+  );
+  const hasPrevious = previousVerdicts.some((v) => v !== "gap");
+  const delta = hasPrevious ? score.score - previousScore.score : null;
+  const tone = chipTone(score.score);
+
+  const currentValue = (() => {
+    if (primary === null) return null;
+    for (let i = primary.values.length - 1; i >= 0; i--) {
+      const v = primary.values[i];
+      if (v !== null && v !== undefined) return v;
+    }
+    return null;
+  })();
+
+  const counts = {
+    crit: scored.filter((v) => v === "crit").length,
+    warn: scored.filter((v) => v === "warn").length,
+    ok: scored.filter((v) => v === "ok").length,
+  };
+
+  // Gap reason from the spine quality report: a hole carries its cause
+  // (producer restart, index build), never a bare "no data".
+  const gapReasonFor = (bucketStart: number, bucketEnd: number): string => {
+    const gaps = spine.data?.quality.gaps ?? [];
+    const hit = gaps.find(
+      (g) => Number(g.from_us) < bucketEnd && Number(g.to_us) > bucketStart,
+    );
+    if (hit === undefined) return "";
+    return t(`spine.gap.${hit.reason}`, { defaultValue: "" });
+  };
+
+  /** Health point covering a bucket (for the tooltip reason). */
+  const pointForBucket = (index: number): HealthPointResponse | null => {
+    const start = fromUs + (index / SPINE_BUCKETS) * windowNum;
+    const end = fromUs + ((index + 1) / SPINE_BUCKETS) * windowNum;
+    return (
+      currentPoints.find(
+        (p) => p.interval.from_us < end && p.interval.to_us > start,
+      ) ?? null
+    );
+  };
 
   const pickUs = (e: React.MouseEvent<SVGSVGElement>): number => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -192,7 +321,27 @@ export function Spine(props: SpineProps) {
 
   const cursorLabel = formatTimestampUs(toUs);
 
-  const bucketCount = spine.data?.grid.bucket_count ?? 0;
+  // "Warming up" is only honest on a cold start — not one successful
+  // response yet. With any data on screen (kept or fresh), a 503 window is
+  // a real ribbon with honest gap cells, never a placeholder.
+  const cold = health.data === undefined && spine.data === undefined;
+  const retrying = [health, spine, incidents].some(
+    (q) => q.isPending || (q.error !== null && isWarmingUp(q.error)),
+  );
+  const warming = cold && retrying;
+  const failed =
+    cold &&
+    !warming &&
+    [health, spine].some((q) => q.error !== null && !isWarmingUp(q.error));
+  const empty =
+    !cold &&
+    !failed &&
+    health.data !== undefined &&
+    spine.data !== undefined &&
+    verdicts.every((v) => v === "gap") &&
+    allSeries.every((s) => s.values.every((v) => v === null));
+
+  const glyphOf = (e: EventFact) => eventGlyph(e);
 
   return (
     <section
@@ -274,194 +423,356 @@ export function Spine(props: SpineProps) {
           </button>
         ))}
       </div>
-      <svg
-        role="slider"
-        tabIndex={0}
-        aria-label={t("spine.timeline")}
-        aria-valuemin={fromUs}
-        aria-valuemax={toUs}
-        aria-valuenow={toUs}
-        viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
-        preserveAspectRatio="none"
-        onClick={onStripClick}
-        onKeyDown={onStripKeyDown}
-        onMouseMove={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          const fraction = (e.clientX - rect.left) / rect.width;
-          setHoverUs(Math.round(fromUs + fraction * windowNum));
-        }}
-        onMouseLeave={() => setHoverUs(null)}
-        style={{
-          flex: 1,
-          minWidth: "200px",
-          height: `${SVG_HEIGHT}px`,
-          display: "block",
-          background: "var(--bg)",
-          cursor: "crosshair",
-        }}
-      >
-        {Array.from({ length: TICK_COUNT + 1 }, (_, i) => (
-          <line
-            key={i}
-            data-tick
-            x1={(i / TICK_COUNT) * SVG_WIDTH}
-            x2={(i / TICK_COUNT) * SVG_WIDTH}
-            y1={SVG_HEIGHT - 4}
-            y2={SVG_HEIGHT}
-            stroke="var(--border)"
-            strokeWidth="1"
-          />
-        ))}
-        {lines.map((points, i) => (
-          <polyline
-            key={i}
-            data-testid="spine-health-line"
-            points={points}
-            fill="none"
-            stroke="var(--accent)"
-            strokeWidth="1.5"
-            vectorEffect="non-scaling-stroke"
-          />
-        ))}
-        {dots.map(([x, y], i) => (
-          <circle
-            key={i}
-            data-testid="spine-lone-point"
-            cx={x}
-            cy={y}
-            r={1.5}
-            fill="var(--accent)"
-          />
-        ))}
-        {primary !== null &&
-          geom !== null &&
-          primary.values.map((v, i) => {
-            if (v !== null) return null;
-            // Honest missing: the bucket has no sample, the polyline breaks
-            // here; the dot at the baseline marks the hole.
-            return (
-              <circle
-                key={i}
-                data-testid="spine-missing-point"
-                cx={bucketX(geom, i, fromUs, windowNum)}
-                cy={SVG_HEIGHT - 2}
-                r={1.5}
-                fill="var(--sev-warn)"
-              />
-            );
-          })}
-        {baselineUs !== null && baselineUs >= fromUs && baselineUs <= toUs && (
-          <line
-            data-testid="spine-baseline"
-            x1={cursorX(baselineUs)}
-            x2={cursorX(baselineUs)}
-            y1={0}
-            y2={SVG_HEIGHT}
-            stroke="var(--accent)"
-            strokeWidth="1"
-            strokeDasharray="4 3"
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
-        {!live && (
-          <line
-            data-testid="spine-cursor"
-            x1={SVG_WIDTH}
-            x2={SVG_WIDTH}
-            y1={0}
-            y2={SVG_HEIGHT}
-            stroke="var(--fg)"
-            strokeWidth="1"
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
-        {hoverUs !== null && (
-          <line
-            x1={cursorX(hoverUs)}
-            x2={cursorX(hoverUs)}
-            y1={0}
-            y2={SVG_HEIGHT}
-            stroke="var(--fg-dim)"
-            strokeWidth="1"
-            strokeDasharray="3 3"
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
-        {visibleEvents.map((e) => {
-          const ts = e.occurred_at_us ?? e.sort_ts_us;
-          return (
-            <text
-              key={e.event_instance_id}
-              data-event-kind={e.event_kind}
-              x={cursorX(ts)}
-              y={SVG_HEIGHT - 6}
-              fontSize="10"
-              textAnchor="middle"
-              fill="var(--accent)"
-            >
-              {/* Event markers are neutral: the API carries no event
-                  severity; verdicts belong to incidents. */}
-              <title>{`${e.event_kind} · ${new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "medium" }).format(new Date(ts / 1000))}`}</title>
-              {eventSymbol(e)}
-            </text>
-          );
-        })}
-        {/* Bucket overlay: every grid cell owns its slice of the strip and
-            carries the honest tooltip (values of all series, or the exact
-            no-data reason) — no misaligned hover math. */}
-        {geom !== null &&
-          Array.from({ length: bucketCount }, (_, i) => {
-            const start = geom.gridFromUs + i * geom.bucketSpanUs;
-            const when = new Intl.DateTimeFormat(undefined, {
-              hour: "2-digit",
-              minute: "2-digit",
-            }).format(new Date(start / 1000));
-            const parts = allSeries.map((s) => {
-              const v = s.values[i];
-              const label = metricLabel(t, "os", s.code);
-              if (v === null || v === undefined) {
-                return `${label}: ${t("spine.missing")}`;
-              }
-              return `${label}: ${formatByUnit(v, s.unit)}`;
-            });
-            return (
-              <rect
-                key={i}
-                data-testid="spine-bucket"
-                x={(i / bucketCount) * SVG_WIDTH}
-                y={0}
-                width={SVG_WIDTH / bucketCount}
-                height={SVG_HEIGHT}
-                fill="transparent"
+      {!warming && !failed && !empty && (
+        <Tooltip
+          content={
+            <span>
+              {t("spine.score.formula")}
+              <br />
+              {t("spine.score.breakdown", {
+                crit: formatMin(score.critMin),
+                warn: formatMin(score.warnMin),
+                count: score.incidents,
+              })}
+              {incidents.error !== null && (
+                <>
+                  <br />
+                  {t("spine.score.incidentsUnavailable")}
+                </>
+              )}
+            </span>
+          }
+        >
+          <span
+            data-testid="spine-score"
+            aria-label={t("spine.score.aria")}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+              whiteSpace: "nowrap",
+              lineHeight: 1.2,
+            }}
+          >
+            <span style={{ textAlign: "center" }}>
+              <span
+                style={{
+                  display: "block",
+                  fontFamily: "var(--mono-font)",
+                  fontSize: 20,
+                  fontWeight: 600,
+                  color: CHIP_FG[tone],
+                }}
               >
-                <title>{`${when} · ${parts.join(" · ")}`}</title>
-              </rect>
-            );
-          })}
-      </svg>
-      <span
-        data-testid="spine-cursor-time"
-        style={{
-          color: "var(--fg-dim)",
-          fontFamily: "var(--mono-font)",
-          fontSize: "var(--text-sm)",
-        }}
-      >
-        {cursorLabel}
-      </span>
-      {primary !== null && (
+                {score.score}
+              </span>
+              <span
+                style={{
+                  display: "block",
+                  fontSize: "var(--text-xs)",
+                  color: "var(--fg-dim)",
+                }}
+              >
+                {t("spine.score.caption")}
+              </span>
+            </span>
+            <span
+              style={{
+                fontSize: "var(--text-xs)",
+                color: "var(--fg-dim)",
+              }}
+            >
+              {delta === null ? (
+                <span data-testid="spine-score-delta">
+                  {t("spine.score.noPrev")}
+                </span>
+              ) : (
+                <>
+                  {t(`spine.span.${props.span}`)}
+                  <br />
+                  <span
+                    data-testid="spine-score-delta"
+                    style={{
+                      fontFamily: "var(--mono-font)",
+                      color:
+                        delta < 0 ? "var(--sev-crit-fg)" : "var(--sev-ok-fg)",
+                    }}
+                  >
+                    {`${delta < 0 ? "▼" : "▲"}${Math.abs(delta)}`}
+                  </span>{" "}
+                  {t("spine.score.vsPrev")}
+                </>
+              )}
+            </span>
+          </span>
+        </Tooltip>
+      )}
+      {warming || failed || empty ? (
         <span
-          data-testid="spine-metric"
+          data-testid="spine-state"
           style={{
-            fontFamily: "var(--mono-font)",
-            fontSize: "var(--text-sm)",
+            flex: 1,
+            minWidth: "200px",
+            fontSize: "var(--text-xs)",
             color: "var(--fg-dim)",
           }}
         >
-          {t("spine.load", {
-            code: metricLabel(t, "os", primary.code),
-            unit: primary.unit,
+          {failed
+            ? t("spine.error")
+            : empty
+              ? t("spine.missing")
+              : t("loading.warming")}
+        </span>
+      ) : (
+        <svg
+          role="slider"
+          tabIndex={0}
+          aria-label={t("spine.timeline")}
+          aria-valuemin={fromUs}
+          aria-valuemax={toUs}
+          aria-valuenow={toUs}
+          viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
+          preserveAspectRatio="none"
+          onClick={onStripClick}
+          onKeyDown={onStripKeyDown}
+          onMouseMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const fraction = (e.clientX - rect.left) / rect.width;
+            setHoverUs(Math.round(fromUs + fraction * windowNum));
+          }}
+          onMouseLeave={() => setHoverUs(null)}
+          style={{
+            flex: 1,
+            minWidth: "200px",
+            height: `${SVG_HEIGHT}px`,
+            display: "block",
+            background: "var(--bg)",
+            cursor: "crosshair",
+          }}
+        >
+          {/* Forming-bucket hatch: diagonal hairlines over the dimmed
+              verdict of the still-open tail bucket. */}
+          <defs>
+            <pattern
+              id="spine-forming-hatch"
+              width="3"
+              height="3"
+              patternUnits="userSpaceOnUse"
+              patternTransform="rotate(45)"
+            >
+              <line
+                x1="0"
+                y1="0"
+                x2="0"
+                y2="3"
+                stroke="var(--fg-dim)"
+                strokeWidth="0.7"
+                opacity="0.6"
+              />
+            </pattern>
+          </defs>
+          {/* Verdict ribbon: one cell per bucket, calm cells quiet, warn/crit
+              full-saturation; a bucket with no server verdict is an explicit
+              gap substrate (raised band + hairline), never a silent hole. */}
+          {verdicts.map((v, i) => {
+            const w = SVG_WIDTH / SPINE_BUCKETS;
+            const x = i * w;
+            const cellW = Math.max(w - 1, 0.5);
+            const bucketStart = Math.round(
+              fromUs + (i / SPINE_BUCKETS) * windowNum,
+            );
+            const bucketEnd = Math.round(
+              fromUs + ((i + 1) / SPINE_BUCKETS) * windowNum,
+            );
+            const fmt = new Intl.DateTimeFormat(undefined, {
+              hour: "2-digit",
+              minute: "2-digit",
+              hour12: false,
+            });
+            const when = `${fmt.format(new Date(bucketStart / 1000))}–${fmt.format(new Date(bucketEnd / 1000))} · ${t("spine.bucketSpan", { duration: formatDurationUs(bucketEnd - bucketStart) })}`;
+            const forming = hasFormingTail && i === SPINE_BUCKETS - 1;
+            const point = pointForBucket(i);
+            const reason = bucketReason(point);
+            const reasonText =
+              reason.floor !== null
+                ? t(`health.floor.${reason.floor}`)
+                : reason.domain !== null
+                  ? t(`health.domain.${reason.domain}`)
+                  : null;
+            const bucketEvents = visibleEvents.filter((e) => {
+              const ts = e.occurred_at_us ?? e.sort_ts_us;
+              return ts >= bucketStart && ts < bucketEnd;
+            });
+            const gapReason =
+              v === "gap" ? gapReasonFor(bucketStart, bucketEnd) : "";
+            const verdictLabel =
+              v === "gap"
+                ? `${t("spine.missing")}${gapReason !== "" ? `: ${gapReason}` : ""}`
+                : t(`spine.verdict.${v}`);
+            const tip = [
+              when,
+              `${verdictLabel}${reasonText !== null ? `: ${reasonText}` : ""}${forming ? ` · ${t("spine.forming")}` : ""}`,
+              ...bucketEvents.map(
+                (e) => `${glyphOf(e).glyph} ${eventKindLabel(t, e.event_kind)}`,
+              ),
+            ].join("\n");
+            return (
+              <g key={i}>
+                {v === "gap" ? (
+                  <rect
+                    data-testid="spine-ribbon-gap"
+                    x={x}
+                    y={RIBBON_Y}
+                    width={cellW}
+                    height={RIBBON_H}
+                    fill="var(--bg-raised)"
+                    stroke="var(--border)"
+                    strokeWidth="0.5"
+                  >
+                    <title>{tip}</title>
+                  </rect>
+                ) : (
+                  <rect
+                    data-testid={`spine-ribbon-${v}`}
+                    x={x}
+                    y={RIBBON_Y}
+                    width={cellW}
+                    height={RIBBON_H}
+                    rx={1}
+                    fill={VERDICT_FILL[v]}
+                    opacity={forming ? 0.5 : 1}
+                  >
+                    <title>{tip}</title>
+                  </rect>
+                )}
+                {forming && (
+                  <rect
+                    data-testid="spine-ribbon-forming"
+                    x={x}
+                    y={RIBBON_Y}
+                    width={cellW}
+                    height={RIBBON_H}
+                    fill="url(#spine-forming-hatch)"
+                    pointerEvents="none"
+                  />
+                )}
+              </g>
+            );
           })}
+          {/* Load sparkline under the ribbon, same X axis. */}
+          {lines.map((points, i) => (
+            <polyline
+              key={i}
+              data-testid="spine-load-line"
+              points={points}
+              fill="none"
+              stroke="var(--accent)"
+              strokeWidth="1.2"
+              opacity="0.8"
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+          {dots.map(([x, y], i) => (
+            <circle
+              key={i}
+              data-testid="spine-lone-point"
+              cx={x}
+              cy={y}
+              r={1.5}
+              fill="var(--accent)"
+            />
+          ))}
+          {baselineUs !== null &&
+            baselineUs >= fromUs &&
+            baselineUs <= toUs && (
+              <line
+                data-testid="spine-baseline"
+                x1={cursorX(baselineUs)}
+                x2={cursorX(baselineUs)}
+                y1={0}
+                y2={SVG_HEIGHT}
+                stroke="var(--accent)"
+                strokeWidth="1"
+                strokeDasharray="4 3"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+          {!live && (
+            <line
+              data-testid="spine-cursor"
+              x1={SVG_WIDTH}
+              x2={SVG_WIDTH}
+              y1={0}
+              y2={SVG_HEIGHT}
+              stroke="var(--fg)"
+              strokeWidth="1"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+          {hoverUs !== null && (
+            <line
+              x1={cursorX(hoverUs)}
+              x2={cursorX(hoverUs)}
+              y1={0}
+              y2={SVG_HEIGHT}
+              stroke="var(--fg-dim)"
+              strokeWidth="1"
+              strokeDasharray="3 3"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+          {visibleEvents.map((e) => {
+            const ts = e.occurred_at_us ?? e.sort_ts_us;
+            const g = glyphOf(e);
+            return (
+              <text
+                key={e.event_instance_id}
+                data-event-kind={e.event_kind}
+                x={cursorX(ts)}
+                y={GLYPH_Y}
+                fontSize="10"
+                textAnchor="middle"
+                fill={GLYPH_FILL[g.tone]}
+              >
+                <title>{`${eventKindLabel(t, e.event_kind)} · ${new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "medium" }).format(new Date(ts / 1000))}`}</title>
+                {g.glyph}
+              </text>
+            );
+          })}
+        </svg>
+      )}
+      {!warming && !failed && !empty && (
+        <span
+          data-testid="spine-right"
+          style={{
+            display: "inline-flex",
+            flexDirection: "column",
+            alignItems: "flex-end",
+            color: "var(--fg-dim)",
+            fontFamily: "var(--mono-font)",
+            fontSize: "var(--text-xs)",
+            lineHeight: 1.4,
+            whiteSpace: "nowrap",
+          }}
+        >
+          <span data-testid="spine-cursor-time">{cursorLabel}</span>
+          <span
+            data-testid="spine-summary"
+            title={t("spine.counts", {
+              crit: counts.crit,
+              warn: counts.warn,
+              ok: counts.ok,
+            })}
+          >
+            {primary !== null && currentValue !== null && (
+              <>
+                {metricLabel(t, "os", primary.code)}{" "}
+                {formatByUnit(currentValue, primary.unit)} ·{" "}
+              </>
+            )}
+            <span style={{ color: "var(--sev-crit-fg)" }}>▲{counts.crit}</span>{" "}
+            <span style={{ color: "var(--sev-warn-fg)" }}>●{counts.warn}</span>
+          </span>
         </span>
       )}
     </section>

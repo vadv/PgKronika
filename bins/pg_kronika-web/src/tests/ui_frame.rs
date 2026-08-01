@@ -481,7 +481,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
                 ("rows", Value::U64(20)),
                 ("total_exec_time", Value::F64(30.0)),
             ]),
-            8,
+            10,
         ),
         (
             "plans",

@@ -420,6 +420,59 @@ fn statements_hit_percentage_uses_window_deltas() {
 }
 
 #[test]
+fn statements_query_text_is_intrinsically_not_collected() {
+    // The production collector writes `query` as NULL by design; the column
+    // must stay `not_collected` even when every input is available, in the
+    // store-derived catalog and in the materialization one alike.
+    for catalog in [
+        ProjectionCatalog::for_type_ids(&all_type_ids()),
+        ProjectionCatalog::for_materialization(),
+    ] {
+        let query = catalog
+            .views()
+            .iter()
+            .find(|view| view.code == "statements")
+            .and_then(|view| view.columns.iter().find(|column| column.code == "query"))
+            .expect("statements.query");
+        assert_eq!(query.availability, Availability::NotCollected);
+        assert_eq!(query.unavailable_reason, Some("query_text_not_collected"));
+        assert!(query.lazy, "query text stays a detail-only column");
+    }
+}
+
+#[test]
+fn statements_presets_identify_rows_by_database_and_user() {
+    let catalog = ProjectionCatalog::for_type_ids(&all_type_ids());
+    let statements = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .expect("statements view");
+    for column in ["database", "user"] {
+        let spec = statements
+            .columns
+            .iter()
+            .find(|candidate| candidate.code == column)
+            .unwrap_or_else(|| panic!("statements.{column}"));
+        assert!(!spec.lazy, "{column} is a frame column");
+    }
+    for preset in &statements.presets {
+        assert!(
+            !preset.columns.contains(&"query"),
+            "preset {} must not promise the lazy query column",
+            preset.code
+        );
+        for column in ["database", "user"] {
+            assert!(
+                preset.columns.contains(&column),
+                "preset {} identifies rows by {column}",
+                preset.code
+            );
+        }
+    }
+}
+
+#[test]
 fn activity_cpu_requires_both_activity_and_process_inputs() {
     let activity_type = first_type_id("pg_stat_activity");
     let process_type = first_type_id("os_process");

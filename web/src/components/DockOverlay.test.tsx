@@ -139,6 +139,26 @@ test("tab switches the dock kind and close calls onClose", () => {
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
+test("row dock: no visible token line — the token rides tooltip and copy", async () => {
+  stubFetch(
+    makeEntityPointResponse({ view: "activity", entity: "AQAEBQAAx9" }),
+  );
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", {
+    value: { writeText },
+    configurable: true,
+  });
+  renderDock({ state: { ...baseState, dock: "row", entity: "AQAEBQAAx9" } });
+  await waitFor(() =>
+    expect(screen.getByTestId("dock-copy-token")).toBeDefined(),
+  );
+  // The raw token never renders as its own line; the heading carries it.
+  expect(screen.queryByText("AQAEBQAA…")).toBeNull();
+  expect(screen.getByTitle("AQAEBQAAx9")).toBeDefined();
+  fireEvent.click(screen.getByTestId("dock-copy-token"));
+  expect(writeText).toHaveBeenCalledWith("AQAEBQAAx9");
+});
+
 test("row dock renders point fields from the entity endpoint", async () => {
   stubFetch(
     makeEntityPointResponse({
@@ -230,6 +250,50 @@ test("row dock in LIVE mode sends the resolved at (point shape), not a bare toke
   const heading = screen.getByText("tabs.activity");
   expect(heading.parentElement?.textContent).not.toContain("db:1");
   expect(screen.getByTitle("db:1")).toBeDefined();
+});
+
+test("statements row dock: query heading fallback, uncut id, honest uncollected field", async () => {
+  const full = "-1999008735841373854";
+  stubFetch(
+    makeEntityPointResponse({
+      view: "statements",
+      entity: "stmt:1",
+      label: full,
+      fields: [
+        { code: "queryid", value: full },
+        { code: "query", value: null },
+      ],
+    }),
+  );
+  renderDock({
+    state: { ...baseState, view: "statements", dock: "row", entity: "stmt:1" },
+    view: makeViewSpec({
+      code: "statements",
+      columns: [
+        {
+          code: "queryid",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+        {
+          code: "query",
+          type: "text",
+          lazy: true,
+          requires: [],
+          availability: "not_collected",
+          unavailable_reason: "query_text_not_collected",
+        },
+      ],
+    }),
+  });
+  // The identifier renders complete — never a "-1999008…" cut.
+  await waitFor(() => expect(screen.getByText(full)).toBeDefined());
+  // The bare numeric label heads as a localized "Query · <short id>" fallback.
+  expect(screen.getByText(/dock\.row\.heading\.statements/)).toBeDefined();
+  // A column the collector never fills states its availability, not a blank.
+  expect(screen.getByText("not_collected")).toBeDefined();
 });
 
 test("row dock drills down via server related provenance and clears", async () => {
