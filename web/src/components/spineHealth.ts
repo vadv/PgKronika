@@ -136,7 +136,8 @@ export function eventGlyph(event: EventFact): EventGlyph {
     kind.includes("sessions_") ||
     kind.includes("recovery_conflict") ||
     kind.includes("replication") ||
-    kind.includes("lifecycle")
+    kind.includes("signal_termination") ||
+    kind.includes("shutdown_requested")
   ) {
     return { glyph: "▲", tone: "warn" };
   }
