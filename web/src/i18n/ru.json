@@ -14,7 +14,7 @@
   "header.dataOk": "полные",
   "header.dataPartial": "частичные",
   "header.dataUnknown": "нет данных",
-  "header.replicas": "реплик",
+  "header.replicas": "{{count, plural, one{# реплика} few{# реплики} many{# реплик} other{# реплики}}}",
   "header.lag": "лаг",
   "header.critical": "критические",
   "header.warning": "предупреждения",

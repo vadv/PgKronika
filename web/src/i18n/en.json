@@ -14,7 +14,7 @@
   "header.dataOk": "complete",
   "header.dataPartial": "partial",
   "header.dataUnknown": "no data",
-  "header.replicas": "replicas",
+  "header.replicas": "{{count, plural, one{# replica} other{# replicas}}}",
   "header.lag": "lag",
   "header.critical": "critical",
   "header.warning": "warnings",

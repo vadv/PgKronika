@@ -170,7 +170,7 @@ function RoleChip(props: { context: ContextResponse | undefined }) {
               : undefined
           }
         >
-          {`${repl.streaming_replicas} ${t("header.replicas")} · ${t("header.lag")} ${lag}`}
+          {`${t("header.replicas", { count: repl.streaming_replicas })} · ${t("header.lag")} ${lag}`}
         </span>
       )}
     </span>
