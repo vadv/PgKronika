@@ -1,10 +1,11 @@
 version: 2
 updates:
-  # SPA toolchain (web/): keeps lint/test/build dependencies moving so
-  # vulnerability fixes arrive as routine PRs instead of big-bang upgrades.
+  # SPA toolchain (web/): version bumps are batched manually (majors move
+  # together: vitest+coverage, plugin-react+vite, TS+openapi-typescript), so
+  # weekly bump PRs are disabled — limit 0 keeps security-update PRs flowing.
   # `npm audit --omit=dev --audit-level=high` gates production deps in CI.
   - package-ecosystem: npm
     directory: /web
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
