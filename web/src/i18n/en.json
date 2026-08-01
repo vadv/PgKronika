@@ -457,5 +457,9 @@
   "header.replicas_one": "{{count}} replica",
   "header.replicas_few": "{{count}} replicas",
   "header.replicas_many": "{{count}} replicas",
-  "header.replicas_other": "{{count}} replicas"
+  "header.replicas_other": "{{count}} replicas",
+  "col.statements.database.desc": "Database the statement ran in (dbid from pg_stat_statements)",
+  "col.statements.user.desc": "Role the statement ran as (userid from pg_stat_statements)",
+  "dock.row.heading.statements": "Query · {{id}}",
+  "dock.row.heading.plans": "Plan · {{id}}"
 }

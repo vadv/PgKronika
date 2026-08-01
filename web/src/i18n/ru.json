@@ -457,5 +457,9 @@
   "header.replicas_one": "{{count}} реплика",
   "header.replicas_few": "{{count}} реплики",
   "header.replicas_many": "{{count}} реплик",
-  "header.replicas_other": "{{count}} реплики"
+  "header.replicas_other": "{{count}} реплики",
+  "col.statements.database.desc": "База данных, в которой выполнялся запрос (dbid из pg_stat_statements)",
+  "col.statements.user.desc": "Роль, от имени которой выполнялся запрос (userid из pg_stat_statements)",
+  "dock.row.heading.statements": "Запрос · {{id}}",
+  "dock.row.heading.plans": "План · {{id}}"
 }

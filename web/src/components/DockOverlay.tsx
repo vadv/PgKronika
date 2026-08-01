@@ -14,6 +14,7 @@ import type {
   ViewSpec,
 } from "../api/types";
 import type { DockKind, UiState } from "../state/url";
+import { isIdentityColumn, shortIdToken } from "../design/format";
 import { formatCellValue } from "./cellFormat";
 import { formatIntervalTime } from "./FocusBar";
 
@@ -448,10 +449,24 @@ function EntityPointView(props: {
         };
         const label = colLabel(t, props.viewCode, field.code);
         const desc = colDesc(t, props.viewCode, field.code);
+        const availability = spec?.availability ?? "available";
         const isSql =
           typeof field.value === "string" &&
           (field.value.length > 60 || field.value.includes("\n"));
-        return isSql ? (
+        // Honest absence: a column the source never fills (or the store
+        // gates) renders its availability status, not a blank em-dash.
+        const notCollected =
+          field.value === null && availability !== "available";
+        // Identifier values are never cut in the dock: full mono text,
+        // wrap anywhere, one click selects the whole value for copying.
+        const fullIdentity =
+          isIdentityColumn(field.code) && field.value !== null;
+        const display = notCollected
+          ? t(`availability.${availability}`, { defaultValue: availability })
+          : fullIdentity
+            ? String(field.value)
+            : formatCellValue(field.value, cellColumn, t);
+        return isSql && !notCollected ? (
           <div
             key={field.code}
             style={{ gridColumn: "1 / -1", marginBlock: "4px" }}
@@ -495,11 +510,15 @@ function EntityPointView(props: {
             <span
               style={{
                 fontFamily: "var(--mono-font)",
-                color: field.value !== null ? "var(--fg)" : "var(--fg-dim)",
+                color:
+                  field.value !== null && !notCollected
+                    ? "var(--fg)"
+                    : "var(--fg-dim)",
                 overflowWrap: "break-word",
+                ...(fullIdentity ? { userSelect: "all" } : {}),
               }}
             >
-              {formatCellValue(field.value, cellColumn, t)}
+              {display}
             </span>
           </div>
         );
@@ -672,6 +691,15 @@ function RowDock(props: {
   // The API label is the human row name (index/relation/pid); the typed
   // entity token is routing material — short form, full value in the title.
   const label = data !== undefined && data.label !== "" ? data.label : null;
+  // statements/plans have no collected text to grow a name from: their label
+  // is the bare numeric identity. Headline it as "Запрос · <short id>", the
+  // full id stays in the field list below, uncut.
+  const heading =
+    label !== null &&
+    (viewCode === "statements" || viewCode === "plans") &&
+    /^-?\d+$/.test(label)
+      ? t(`dock.row.heading.${viewCode}`, { id: shortIdToken(label) })
+      : label;
 
   return (
     <div>
@@ -683,10 +711,10 @@ function RowDock(props: {
         }}
       >
         <span style={{ color: "var(--fg-dim)" }}>{t(`tabs.${viewCode}`)}</span>
-        {label !== null && (
+        {heading !== null && (
           <>
             {" · "}
-            <span style={{ fontWeight: 600 }}>{label}</span>
+            <span style={{ fontWeight: 600 }}>{heading}</span>
           </>
         )}
       </div>
