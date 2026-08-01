@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { useCatalog } from "./api/catalog";
+import { apiRetryDelay, isWarmingUp, retryApiRequest } from "./api/client";
 import { useUiContext } from "./api/context";
 import { useIncidents } from "./api/incidents";
 import { useSummary } from "./api/summary";
@@ -18,7 +19,14 @@ import { TableView } from "./components/TableView";
 import { Toolbar } from "./components/Toolbar";
 import { parseHash, toHash, type UiState } from "./state/url";
 
-const queryClient = new QueryClient();
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: retryApiRequest,
+      retryDelay: apiRetryDelay,
+    },
+  },
+});
 
 /** Incidents are always queried over the trailing 24 h (µs). */
 const INCIDENTS_WINDOW_US = 86_400_000_000n;
@@ -227,14 +235,19 @@ function Shell() {
           </span>
           {/* Mobile triage shows the incidents inline — the chip-only path
               read as an empty, broken page. */}
-          {incidents.isLoading && (
+          {incidents.isPending && (
             <span style={{ color: "var(--fg-dim)" }}>
-              {t("dock.incidents.loading")}
+              {incidents.failureCount > 0 &&
+              isWarmingUp(incidents.failureReason)
+                ? t("loading.warming")
+                : t("dock.incidents.loading")}
             </span>
           )}
           {incidents.isError && (
             <span role="alert" style={{ color: "var(--sev-warn-fg)" }}>
-              {t("dock.incidents.error")}
+              {isWarmingUp(incidents.error)
+                ? t("error.warming")
+                : t("dock.incidents.error")}
             </span>
           )}
           {incidents.isSuccess &&
@@ -336,6 +349,8 @@ function Shell() {
               view={activeView}
               summary={summary.data?.views.find((v) => v.view === state.view)}
               matched={matched}
+              live={state.at === null}
+              onOpenIncidents={() => patch({ dock: "incidents" })}
             />
           )}
           {heatmapReady && (
@@ -352,7 +367,29 @@ function Shell() {
               onSelectEntity={(entity) => patch({ entity, dock: "row" })}
             />
           )}
-          {tableReady && (
+          {/* A gated view renders its availability reason, never an empty
+              table — the tab may still be active from a shared link. */}
+          {tableReady && activeView.availability !== "available" && (
+            <section
+              role="status"
+              style={{
+                background: "var(--bg-raised)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-md)",
+                padding: "12px",
+                fontFamily: "var(--ui-font)",
+                color: "var(--fg-dim)",
+              }}
+            >
+              {t("view.gated")} ·{" "}
+              {t("view.gatedHint", {
+                reason: t(`availability.${activeView.availability}`, {
+                  defaultValue: activeView.availability,
+                }),
+              })}
+            </section>
+          )}
+          {heatmapReady && (
             <Toolbar
               view={activeView}
               preset={state.preset}
@@ -362,7 +399,7 @@ function Shell() {
               onFilter={(q) => patch({ q })}
             />
           )}
-          {tableReady && (
+          {heatmapReady && (
             <TableView
               view={activeView}
               at={at}
