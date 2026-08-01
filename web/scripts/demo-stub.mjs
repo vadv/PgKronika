@@ -745,6 +745,7 @@ function rowsVacuum() {
     data: {
       pid: 12188 + i * 7,
       table: String(16390 + i * 12),
+      relation: table,
       phase,
       is_autovacuum: isAuto,
       progress,
@@ -952,7 +953,7 @@ function rowsEventsView() {
         severity === "ERROR"
           ? [
               {
-                column: "severity",
+                column: "severity_code",
                 metric: "pg.events.severity",
                 result: {
                   status: "classified",
@@ -1091,6 +1092,7 @@ function entityResponse(viewCode, entity, params) {
     return {
       view: viewCode,
       entity,
+      label: row.label,
       mode: "point",
       snapshot_ts_us: at,
       fields: view.columns.map((c) => {
@@ -1134,6 +1136,7 @@ function entityResponse(viewCode, entity, params) {
   return {
     view: viewCode,
     entity,
+    label: row.label,
     mode: "history",
     columns,
     snapshots,
