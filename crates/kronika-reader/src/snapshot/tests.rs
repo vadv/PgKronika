@@ -197,6 +197,36 @@ fn selective_web_index_read_loads_only_the_addressed_ovf_body() {
 }
 
 #[test]
+fn web_index_read_over_an_unpublished_sidecar_is_typed_absent() {
+    let source = tempfile::tempdir().expect("source directory");
+    write_segment(source.path(), 1_500, &lifecycle_part(7));
+    let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
+    let descriptor = snapshot
+        .sealed_descriptors()
+        .next()
+        .expect("sealed descriptor");
+
+    // Descriptor-first publication: the descriptor is pinned before any fact
+    // load builds the sidecar, and that window is a typed state, not I/O.
+    assert!(matches!(
+        snapshot.read_ui_summary(&descriptor, &LIMIT),
+        Err(WebIndexReadError::SidecarAbsent)
+    ));
+    assert!(matches!(
+        snapshot.read_entity_series(&descriptor, 9, &LIMIT),
+        Err(WebIndexReadError::SidecarAbsent)
+    ));
+
+    let store = FactStore::new(source.path());
+    snapshot
+        .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+        .expect("lazy build publishes the sidecar");
+    snapshot
+        .read_ui_summary(&descriptor, &LIMIT)
+        .expect("published summary");
+}
+
+#[test]
 fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
     let source = tempfile::tempdir().expect("source directory");
     let bytes = lifecycle_part(7);

@@ -293,7 +293,14 @@ pub enum SealedFactError {
 pub enum WebIndexReadError {
     /// The descriptor is absent or changed in the pinned snapshot.
     Descriptor(SealedFactError),
-    /// The OVF is missing, incompatible, corrupt, oversized, or unreadable.
+    /// The descriptor is pinned, but no sidecar is published for it yet.
+    ///
+    /// Publication is descriptor-first by contract: fact files are built
+    /// lazily by admitted fact loads, so a sealed segment without a sibling
+    /// OVF is an expected transient state, not a storage failure. Callers
+    /// either degrade typed or load facts through `FactStore`.
+    SidecarAbsent,
+    /// The OVF is incompatible, corrupt, oversized, or unreadable.
     Cache(CacheReadError),
 }
 
@@ -301,6 +308,7 @@ impl std::fmt::Display for WebIndexReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Descriptor(error) => write!(f, "{error}"),
+            Self::SidecarAbsent => f.write_str("overview sidecar is not published yet"),
             Self::Cache(error) => write!(f, "{error}"),
         }
     }
@@ -310,6 +318,7 @@ impl std::error::Error for WebIndexReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Descriptor(error) => Some(error),
+            Self::SidecarAbsent => None,
             Self::Cache(error) => Some(error),
         }
     }
@@ -827,8 +836,10 @@ impl LocalDirSnapshot {
     ///
     /// # Errors
     ///
-    /// Returns [`WebIndexReadError`] when the descriptor changed or the
-    /// selected OVF metadata/body fails admission.
+    /// Returns [`WebIndexReadError::SidecarAbsent`] when no sidecar is
+    /// published for the pinned descriptor yet, and
+    /// [`WebIndexReadError::Cache`] when the selected OVF metadata/body fails
+    /// admission.
     pub fn read_ui_summary(
         &self,
         descriptor: &SegmentDescriptor,
@@ -846,8 +857,10 @@ impl LocalDirSnapshot {
     ///
     /// # Errors
     ///
-    /// Returns [`WebIndexReadError`] when the descriptor changed or the
-    /// selected OVF metadata/body fails admission.
+    /// Returns [`WebIndexReadError::SidecarAbsent`] when no sidecar is
+    /// published for the pinned descriptor yet, and
+    /// [`WebIndexReadError::Cache`] when the selected OVF metadata/body fails
+    /// admission.
     pub fn read_entity_series(
         &self,
         descriptor: &SegmentDescriptor,
@@ -888,12 +901,7 @@ impl LocalDirSnapshot {
             .map_err(|error| WebIndexReadError::Cache(layout_cache_error(error)))?;
         root.open_ovf(context.address())
             .map_err(|error| WebIndexReadError::Cache(layout_cache_error(error)))?
-            .ok_or_else(|| {
-                WebIndexReadError::Cache(CacheReadError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "overview sidecar is absent",
-                )))
-            })
+            .ok_or(WebIndexReadError::SidecarAbsent)
     }
 
     /// Loads persistent overview facts for one sealed unit.
