@@ -56,7 +56,7 @@ test("notable button carries the level text and drills into incidents", () => {
     />,
   );
   const button = screen.getByRole("button", {
-    name: /pageheader.notable/,
+    name: /critical ×2/,
   });
   expect(button.textContent).toContain("critical ×2");
   fireEvent.click(button);

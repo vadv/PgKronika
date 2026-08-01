@@ -1,5 +1,6 @@
 import { useTranslation } from "react-i18next";
 import type { ViewSpec, ViewSummaryItem } from "../api/types";
+import { formatTimestampUs } from "../design/format";
 import { verdictTint } from "../design/ui";
 
 export function PageHeader(props: {
@@ -14,12 +15,7 @@ export function PageHeader(props: {
   const { t } = useTranslation();
   const s = props.summary;
   const snapshotLabel =
-    s?.snapshot_ts_us != null
-      ? new Intl.DateTimeFormat(undefined, {
-          dateStyle: "short",
-          timeStyle: "medium",
-        }).format(new Date(Number(s.snapshot_ts_us) / 1000))
-      : null;
+    s?.snapshot_ts_us != null ? formatTimestampUs(s.snapshot_ts_us) : null;
   const collection = s?.collection;
 
   // One context line instead of boxed KPI chips: population, collection
@@ -90,7 +86,6 @@ export function PageHeader(props: {
           style={{
             display: "inline-flex",
             alignItems: "baseline",
-            gap: "6px",
             padding: "1px 8px",
             ...verdictTint(
               s.notable_level === "critical" ? "critical" : "warning",
@@ -99,28 +94,15 @@ export function PageHeader(props: {
             borderRadius: "var(--radius-sm)",
             whiteSpace: "nowrap",
             cursor: "pointer",
+            fontFamily: "var(--mono-font)",
+            fontSize: "var(--text-md)",
+            fontWeight: 600,
           }}
         >
-          <span
-            style={{
-              fontFamily: "var(--ui-font)",
-              fontSize: "var(--text-xs)",
-            }}
-          >
-            {t("pageheader.notable")}
-          </span>
-          <span
-            style={{
-              fontFamily: "var(--mono-font)",
-              fontSize: "var(--text-md)",
-              fontWeight: 600,
-            }}
-          >
-            {t(`verdict.level.${s.notable_level}`, {
-              defaultValue: s.notable_level,
-            })}
-            {` ×${s.notable_count}`}
-          </span>
+          {t(`verdict.level.${s.notable_level}`, {
+            defaultValue: s.notable_level,
+          })}
+          {` ×${s.notable_count}`}
         </button>
       )}
     </div>

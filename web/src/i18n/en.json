@@ -111,7 +111,6 @@
   "pageheader.livePending": "LIVE · no snapshot recorded yet",
   "pageheader.population": "entities",
   "pageheader.populationHint": "View entities in the selected snapshot",
-  "pageheader.notable": "notable",
   "pageheader.notableHint": "Server notable classification",
   "pageheader.collection": "collection",
   "pageheader.collectionHint": "Collected N of M from the source",
