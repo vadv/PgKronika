@@ -1254,7 +1254,8 @@
           "lazy": false,
           "requires": ["vacuum"],
           "availability": "gated",
-          "unavailable_reason": "missing_extension"
+          "unavailable_reason": "missing_extension",
+          "unit": "ratio"
         },
         {
           "code": "dead_tuples",
@@ -1434,7 +1435,8 @@
           "lazy": false,
           "requires": ["process"],
           "availability": "gated",
-          "unavailable_reason": "missing_extension"
+          "unavailable_reason": "missing_extension",
+          "unit": "bytes_per_second"
         },
         {
           "code": "write_bytes_per_second",
@@ -1443,7 +1445,8 @@
           "lazy": false,
           "requires": ["process"],
           "availability": "gated",
-          "unavailable_reason": "missing_extension"
+          "unavailable_reason": "missing_extension",
+          "unit": "bytes_per_second"
         },
         {
           "code": "block_delay",
@@ -1665,7 +1668,8 @@
           "lazy": false,
           "requires": ["locks"],
           "availability": "gated",
-          "unavailable_reason": "missing_extension"
+          "unavailable_reason": "missing_extension",
+          "unit": "us"
         },
         {
           "code": "query",
@@ -1841,7 +1845,8 @@
           "lazy": false,
           "requires": ["events"],
           "availability": "gated",
-          "unavailable_reason": "missing_extension"
+          "unavailable_reason": "missing_extension",
+          "unit": "us"
         },
         {
           "code": "message",

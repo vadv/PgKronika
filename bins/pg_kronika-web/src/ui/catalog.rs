@@ -1290,7 +1290,7 @@ fn vacuum_view() -> ViewSpec {
                 ValueType::F64,
                 "heap_blks_scanned / max(heap_blks_total, 1)",
                 &["vacuum"],
-                None,
+                Some("ratio"),
             ),
             derived_column(
                 "dead_tuples",
@@ -1387,14 +1387,14 @@ fn processes_view() -> ViewSpec {
             ValueType::F64,
             "positive_delta(read_bytes) / elapsed",
             &["process"],
-            None,
+            Some("bytes_per_second"),
         ),
         derived_column(
             "write_bytes_per_second",
             ValueType::F64,
             "positive_delta(write_bytes) / elapsed",
             &["process"],
-            None,
+            Some("bytes_per_second"),
         ),
         derived_column(
             "block_delay",
@@ -1569,7 +1569,7 @@ fn locks_view() -> ViewSpec {
                 ValueType::F64,
                 "proven_wait_or_hold_duration_us",
                 &["locks"],
-                None,
+                Some("us"),
             ),
             raw_column(
                 "query",
@@ -1691,7 +1691,7 @@ fn events_view() -> ViewSpec {
                 "events.duration_us",
                 false,
                 &["events"],
-                None,
+                Some("us"),
             ),
             raw_column(
                 "message",
