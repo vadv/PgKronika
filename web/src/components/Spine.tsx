@@ -4,7 +4,7 @@ import { metricLabel, statusLabel } from "../api/codes";
 import { useTimelineSpine } from "../api/spine";
 import { useTimelineEvents } from "../api/timeline";
 import type { EventFact, SpineSeries } from "../api/types";
-import { formatByUnit } from "../design/format";
+import { formatByUnit, formatTimestampUs } from "../design/format";
 import { SPANS } from "../state/url";
 
 export interface SpineProps {
@@ -190,11 +190,7 @@ export function Spine(props: SpineProps) {
     }
   };
 
-  const cursorDate = new Date(toUs / 1000);
-  const cursorLabel = new Intl.DateTimeFormat(undefined, {
-    dateStyle: "short",
-    timeStyle: "medium",
-  }).format(cursorDate);
+  const cursorLabel = formatTimestampUs(toUs);
 
   const bucketCount = spine.data?.grid.bucket_count ?? 0;
 
