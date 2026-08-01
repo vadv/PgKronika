@@ -88,7 +88,7 @@ test("renders row labels and one cell per bucket, null cell marked empty", async
   fireEvent.mouseEnter(empty as Element);
   await waitFor(() =>
     expect(container.querySelector("[role='tooltip']")?.textContent).toContain(
-      "—",
+      "spine.missing",
     ),
   );
 });
