@@ -435,6 +435,7 @@ export function makeEntityPointResponse(
   return {
     view: "activity",
     entity: "db:1",
+    label: "app → pg",
     mode: "point",
     snapshot_ts_us: "1722400000000000",
     fields: [],
@@ -450,6 +451,7 @@ export function makeEntityHistoryResponse(
   return {
     view: "activity",
     entity: "db:1",
+    label: "app → pg",
     mode: "history",
     columns: [],
     snapshots: [],

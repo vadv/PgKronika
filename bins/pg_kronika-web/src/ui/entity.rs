@@ -76,6 +76,9 @@ pub(crate) struct EntityPointResponse {
     mode: &'static str,
     view: &'static str,
     entity: String,
+    /// Human row label from the same projection as frame rows — the entity
+    /// token above is routing material, never display text.
+    label: String,
     snapshot_ts_us: String,
     fields: Vec<EntityFieldDto>,
     related: Vec<RelatedEntityDto>,
@@ -87,6 +90,9 @@ pub(crate) struct EntityHistoryResponse {
     mode: &'static str,
     view: &'static str,
     entity: String,
+    /// Label of the first observed snapshot; empty when the entity never
+    /// appears in the window.
+    label: String,
     columns: Vec<&'static str>,
     snapshots: Vec<EntitySnapshotDto>,
     page: EntityPageDto,
@@ -414,6 +420,7 @@ fn entity_point(
         mode: "point",
         view: request.view.name,
         entity: request.encoded_entity.clone(),
+        label: row.label.clone(),
         snapshot_ts_us: projected.snapshot_ts_us.to_string(),
         fields,
         related,
@@ -513,6 +520,7 @@ fn entity_history(
         .take(args.limit.saturating_add(1))
         .collect::<Vec<_>>();
     let has_more = selected.len() > args.limit;
+    let mut label = String::new();
     let mut snapshots = Vec::with_capacity(selected.len().min(args.limit));
     for timestamp in selected.iter().take(args.limit).copied() {
         let projected = project_entity_at(
@@ -551,6 +559,9 @@ fn entity_history(
             });
             continue;
         };
+        if label.is_empty() {
+            label.clone_from(&row.label);
+        }
         let mut values = Vec::with_capacity(columns.len());
         let mut statuses = Vec::with_capacity(columns.len());
         let mut reasons = Vec::with_capacity(columns.len());
@@ -594,6 +605,7 @@ fn entity_history(
         mode: "history",
         view: request.view.name,
         entity: request.encoded_entity.clone(),
+        label,
         columns: args.columns.to_vec(),
         snapshots,
         page: EntityPageDto { next },

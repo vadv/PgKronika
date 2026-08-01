@@ -135,6 +135,13 @@ button:hover:not(:disabled) {
   background: var(--hover-bg);
 }
 
+/* Hint affordance: anything carrying a native tooltip shows the help
+ * cursor; interactive elements keep their own (pointer/crosshair). Table
+ * cells stay on the row's pointer — the row is the click target. */
+[title]:not(button, a, input, select, textarea, tr, td, th, [role="tab"]) {
+  cursor: help;
+}
+
 /* Mobile: the status-bar hints would overlap the counters. */
 @media (max-width: 760px) {
   .statusbar-hints {

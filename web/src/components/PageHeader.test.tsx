@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { expect, test, vi } from "vitest";
 import type { ViewSummaryItem } from "../api/types";
 import { makeViewSpec } from "../testkit/apiFixtures";
@@ -20,20 +20,27 @@ function summary(overrides: Partial<ViewSummaryItem> = {}): ViewSummaryItem {
   };
 }
 
-test("renders view title, population and matched", () => {
-  render(<PageHeader view={view} summary={summary()} matched={12} />);
+test("renders view title and one context line with population and matched", () => {
+  render(<PageHeader view={view} summary={summary()} matched={12} live />);
   expect(screen.getByText("tabs.statements")).toBeDefined();
-  expect(screen.getByText("500")).toBeDefined();
-  expect(screen.getByText("12")).toBeDefined();
+  const context = screen.getByTitle("pageheader.matchedHint");
+  expect(context.textContent).toContain("pageheader.population: 500");
+  expect(context.textContent).toContain("pageheader.matched: 12");
 });
 
-test("missing summary and matched render honest dashes", () => {
-  render(<PageHeader view={view} summary={undefined} matched={null} />);
-  expect(screen.getByText("—")).toBeDefined();
+test("missing snapshot in live mode reads as pending, not an error", () => {
+  render(<PageHeader view={view} summary={undefined} matched={null} live />);
+  expect(screen.getByText("pageheader.livePending")).toBeDefined();
+});
+
+test("missing snapshot on a pinned cursor keeps the honest no-snapshot", () => {
+  render(
+    <PageHeader view={view} summary={undefined} matched={null} live={false} />,
+  );
   expect(screen.getByText("pageheader.noSnapshot")).toBeDefined();
 });
 
-test("notable stat is tinted and drills into incidents", () => {
+test("notable button carries the level text and drills into incidents", () => {
   const onOpenIncidents = vi.fn();
   render(
     <PageHeader
@@ -44,18 +51,19 @@ test("notable stat is tinted and drills into incidents", () => {
         notable_count: 2,
       })}
       matched={null}
+      live
       onOpenIncidents={onOpenIncidents}
     />,
   );
   const button = screen.getByRole("button", {
-    name: /pageheader.notable/,
+    name: /critical ×2/,
   });
   expect(button.textContent).toContain("critical ×2");
   fireEvent.click(button);
   expect(onOpenIncidents).toHaveBeenCalledTimes(1);
 });
 
-test("collection N/M renders when present", () => {
+test("collection coverage joins the context line when present", () => {
   render(
     <PageHeader
       view={view}
@@ -68,16 +76,9 @@ test("collection N/M renders when present", () => {
         },
       })}
       matched={null}
+      live
     />,
   );
-  expect(screen.getByText("42/45")).toBeDefined();
-});
-
-test("view code tooltip shows canonical metric and availability", async () => {
-  render(<PageHeader view={view} summary={summary()} matched={null} />);
-  fireEvent.mouseEnter(screen.getByText("statements", { exact: true }));
-  await waitFor(() => expect(screen.getByRole("tooltip")).toBeDefined());
-  const tip = screen.getByRole("tooltip").textContent ?? "";
-  expect(tip).toContain("time");
-  expect(tip).toContain("available");
+  const context = screen.getByTitle("pageheader.matchedHint");
+  expect(context.textContent).toContain("pageheader.collection: 42/45");
 });

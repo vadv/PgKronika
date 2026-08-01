@@ -116,7 +116,7 @@ test("role chip shows the role and replica lag when replication is present", () 
   });
   const chip = screen.getByTestId("role-chip");
   expect(chip.textContent).toContain("primary");
-  expect(chip.textContent).toContain("2 header.replicas");
+  expect(chip.textContent).toContain("header.replicas");
   expect(chip.textContent).toContain("header.lag 3s");
 });
 

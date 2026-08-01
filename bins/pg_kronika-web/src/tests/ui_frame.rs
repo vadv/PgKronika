@@ -556,7 +556,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
                 ("rmem_kb", Value::U64(1_024)),
                 ("cmdline", Value::Str("secret".to_owned())),
             ]),
-            4,
+            7,
         ),
         (
             "locks",

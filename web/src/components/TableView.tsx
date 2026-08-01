@@ -1,11 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ApiError } from "../api/client";
-import { TipRow, Tooltip } from "./Tooltip";
+import { ApiError, isWarmingUp } from "../api/client";
+import { colDesc, colLabel } from "../api/codes";
+import { TipFormula, TipRow, Tooltip } from "./Tooltip";
+import {
+  formatCellValue,
+  fullCellValue,
+  nullReasonTitle,
+  whyTitle,
+} from "./cellFormat";
 import { useFrame } from "../api/frame";
 import type {
   ClassificationResultDto,
-  EvidenceDto,
   FrameColumnDto,
   FrameRowDto,
   FrameValue,
@@ -44,41 +50,6 @@ const SORTABLE_TYPES = new Set(["i64", "u64", "f64", "timestamp"]);
 /** Column types whose wire value may arrive as a decimal string. */
 const NUMERIC_TYPES = new Set(["i64", "u64", "f64"]);
 
-const numberFormat = new Intl.NumberFormat(undefined, {
-  maximumFractionDigits: 2,
-});
-
-function formatBytes(value: number): string {
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let scaled = value;
-  let unit = 0;
-  while (Math.abs(scaled) >= 1024 && unit < units.length - 1) {
-    scaled /= 1024;
-    unit += 1;
-  }
-  return `${numberFormat.format(Number(scaled.toFixed(1)))} ${units[unit]}`;
-}
-
-function formatNumber(value: number, unit: string | null | undefined): string {
-  if (unit === "B") return formatBytes(value);
-  if (unit === "%") return `${numberFormat.format(value)}%`;
-  return numberFormat.format(value);
-}
-
-function formatCell(value: FrameValue, column: FrameColumnDto): string {
-  if (value === null) return "—";
-  if (typeof value === "boolean") return value ? "✓" : "✗";
-  if (typeof value === "number") return formatNumber(value, column.unit);
-  if (
-    NUMERIC_TYPES.has(column.type) &&
-    value.trim() !== "" &&
-    !Number.isNaN(Number(value))
-  ) {
-    return formatNumber(Number(value), column.unit);
-  }
-  return value;
-}
-
 /** Verdict tint (background wash + foreground) from a classification result. */
 function verdictTintOf(
   result: ClassificationResultDto,
@@ -89,39 +60,6 @@ function verdictTintOf(
   if (result.level === "critical")
     return { background: "var(--sev-crit-bg)", color: "var(--sev-crit-fg)" };
   return undefined;
-}
-
-function nullTitle(
-  result: ClassificationResultDto | undefined,
-): string | undefined {
-  if (result === undefined || "level" in result) return undefined;
-  return `${result.status}: ${result.reason}`;
-}
-
-function formatEvidence(evidence: EvidenceDto): string {
-  switch (evidence.kind) {
-    case "scalar":
-      return `observed ${numberFormat.format(evidence.observed)}`;
-    case "fraction":
-      return `${numberFormat.format(evidence.numerator)}/${numberFormat.format(evidence.denominator)} (${numberFormat.format(evidence.value)})`;
-    default:
-      return evidence.kind;
-  }
-}
-
-/** Mechanical why for a verdict cell: level, rule boundary, evidence —
- * the operator must never have to guess what the color means. */
-function whyTitle(
-  result: ClassificationResultDto | undefined,
-): string | undefined {
-  if (result === undefined || !("level" in result)) return undefined;
-  if (result.level !== "warning" && result.level !== "critical")
-    return undefined;
-  const rule =
-    result.boundary != null
-      ? ` ${result.boundary.operator} ${numberFormat.format(result.boundary.value)}`
-      : "";
-  return `${result.level}:${rule} · ${formatEvidence(result.evidence)}`;
 }
 
 const SPARK_WIDTH = 60;
@@ -314,8 +252,6 @@ export function TableView(props: TableViewProps) {
     fontFamily: "var(--ui-font)",
     fontSize: "var(--text-xs)",
     fontWeight: 600,
-    letterSpacing: "var(--tracking-caps)",
-    textTransform: "uppercase",
     color: props.sort === code ? "var(--accent-strong)" : "var(--fg-dim)",
     whiteSpace: "nowrap",
   });
@@ -356,32 +292,47 @@ export function TableView(props: TableViewProps) {
               const unavailable =
                 meta !== undefined && meta.availability !== "available";
               const spec = columnSpec.get(column.code);
+              const label = colLabel(t, props.view.code, column.code);
+              const desc = colDesc(t, props.view.code, column.code);
               const tip = (
                 <span style={{ display: "grid", gap: "2px" }}>
-                  <span style={{ fontFamily: "var(--mono-font)" }}>
-                    {column.code}
-                    {column.unit != null ? ` · ${column.unit}` : ""}
-                    {` · ${column.type}`}
-                  </span>
+                  {desc !== null && <span>{desc}</span>}
+                  <TipRow
+                    label={t("tooltip.code")}
+                    value={`${column.code} · ${column.type}${column.unit != null ? ` · ${column.unit}` : ""}`}
+                    mono
+                  />
                   {spec?.formula != null && (
-                    <TipRow label="formula" value={spec.formula} mono />
+                    <TipFormula
+                      label={t("tooltip.formula")}
+                      value={spec.formula}
+                    />
                   )}
                   {spec?.source != null && (
-                    <TipRow label="source" value={spec.source} mono />
+                    <TipRow
+                      label={t("tooltip.source")}
+                      value={spec.source}
+                      mono
+                    />
                   )}
                   {spec?.threshold_metric != null && (
                     <TipRow
-                      label="threshold"
+                      label={t("tooltip.threshold")}
                       value={spec.threshold_metric}
                       mono
                     />
                   )}
                   {spec?.lazy === true && (
-                    <TipRow label="lazy" value="detail only" />
+                    <TipRow
+                      label={t("tooltip.lazy")}
+                      value={t("tooltip.lazyValue")}
+                    />
                   )}
                   {unavailable && (
                     <TipRow
-                      label={meta.availability}
+                      label={t(`availability.${meta.availability}`, {
+                        defaultValue: meta.availability,
+                      })}
                       value={meta.reason ?? "—"}
                     />
                   )}
@@ -403,8 +354,6 @@ export function TableView(props: TableViewProps) {
                         type="button"
                         onClick={() => cycleSort(column.code)}
                         style={{
-                          fontFamily: "var(--mono-font)",
-                          textTransform: "uppercase",
                           color: "inherit",
                           background: "none",
                           border: "none",
@@ -412,11 +361,11 @@ export function TableView(props: TableViewProps) {
                           cursor: "pointer",
                         }}
                       >
-                        {column.code}
+                        {label}
                         {sortArrow(column.code)}
                       </button>
                     ) : (
-                      <span>{column.code}</span>
+                      <span>{label}</span>
                     )}
                   </Tooltip>
                 </th>
@@ -468,6 +417,13 @@ export function TableView(props: TableViewProps) {
                       ? verdictTintOf(classification.result)
                       : undefined;
                   const numeric = NUMERIC_TYPES.has(column.type);
+                  const full = fullCellValue(value, column);
+                  const classificationResult = classification?.result;
+                  const notClassified =
+                    classificationResult !== undefined &&
+                    !("level" in classificationResult)
+                      ? classificationResult
+                      : undefined;
                   return (
                     <td
                       key={column.code}
@@ -475,13 +431,26 @@ export function TableView(props: TableViewProps) {
                         value === null
                           ? cellStatus !== undefined &&
                             cellStatus.status !== "available"
-                            ? `${cellStatus.status}${cellStatus.reason !== null ? `: ${cellStatus.reason}` : ""}`
-                            : (nullTitle(classification?.result) ??
-                              (meta !== undefined &&
-                              meta.availability !== "available"
-                                ? `${meta.availability}${meta.reason !== null ? `: ${meta.reason}` : ""}`
-                                : undefined))
-                          : whyTitle(classification?.result)
+                            ? nullReasonTitle(
+                                cellStatus.status,
+                                cellStatus.reason,
+                                t,
+                              )
+                            : notClassified !== undefined
+                              ? nullReasonTitle(
+                                  notClassified.status,
+                                  notClassified.reason,
+                                  t,
+                                )
+                              : meta !== undefined &&
+                                  meta.availability !== "available"
+                                ? nullReasonTitle(
+                                    meta.availability,
+                                    meta.reason,
+                                    t,
+                                  )
+                                : undefined
+                          : (full ?? whyTitle(classification?.result, t))
                       }
                       style={{
                         padding: "2px 10px",
@@ -497,7 +466,7 @@ export function TableView(props: TableViewProps) {
                         maxWidth: "320px",
                       }}
                     >
-                      {formatCell(value, column)}
+                      {formatCellValue(value, column, t)}
                     </td>
                   );
                 })}
@@ -516,6 +485,19 @@ export function TableView(props: TableViewProps) {
       </table>
       {frame.isLoading && cursor === null && (
         <div style={{ padding: "8px" }} aria-busy="true">
+          {frame.failureCount > 0 && isWarmingUp(frame.failureReason) && (
+            <div
+              role="status"
+              style={{
+                color: "var(--fg-dim)",
+                fontFamily: "var(--ui-font)",
+                fontSize: "var(--text-sm)",
+                marginBlockEnd: "8px",
+              }}
+            >
+              {t("loading.warming")}
+            </div>
+          )}
           {[0, 1, 2, 3].map((i) => (
             <div
               key={i}
@@ -542,7 +524,7 @@ export function TableView(props: TableViewProps) {
             color: "var(--sev-crit-fg)",
           }}
         >
-          {t("table.error")}
+          {isWarmingUp(frame.error) ? t("error.warming") : t("table.error")}
           <button
             type="button"
             onClick={() => void frame.refetch()}

@@ -3,6 +3,10 @@ import type { CSSProperties } from "react";
 /** Shared visual primitives for the v2 chrome — single source so every
  * panel, chip and button speaks the same design language. */
 
+/** Heatmap row-label column width: long lock/relation labels must not
+ * truncate while there is room to give them. */
+export const HEATMAP_LABEL_COL_PX = 220;
+
 export const font = {
   sans: "var(--ui-font)",
   mono: "var(--mono-font)",

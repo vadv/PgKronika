@@ -7,9 +7,16 @@ test("renders population for available view", () => {
   expect(screen.getByText("500")).toBeDefined();
 });
 
-test("renders em-dash for null population (gated)", () => {
-  render(<TabBadge population={null} status="unavailable" notable={false} />);
-  expect(screen.getByText("—")).toBeDefined();
+test("renders nothing for null population without notables", () => {
+  const { container } = render(
+    <TabBadge population={null} status="unavailable" notable={false} />,
+  );
+  expect(container.firstChild).toBeNull();
+});
+
+test("null population with notables gets the warning mark, no dash", () => {
+  render(<TabBadge population={null} status="unavailable" notable={true} />);
+  expect(screen.getByText("!")).toBeDefined();
 });
 
 test("notable view gets accent marker", () => {

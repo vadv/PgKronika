@@ -3,6 +3,9 @@ export function TabBadge(props: {
   status: string;
   notable: boolean;
 }) {
+  // No dangling dash: the counter appears only when a real count exists; a
+  // notable view without a population still gets its warning mark.
+  if (props.population === null && !props.notable) return null;
   return (
     <span
       data-notable={props.notable}
@@ -17,7 +20,7 @@ export function TabBadge(props: {
         marginInlineStart: "4px",
       }}
     >
-      {props.population ?? "—"}
+      {props.population ?? "!"}
     </span>
   );
 }

@@ -1721,8 +1721,10 @@ fn display(value: &Value) -> Option<String> {
         Value::U64(value) => Some(value.to_string()),
         Value::F64(value) if value.is_finite() => Some(value.to_string()),
         Value::Bool(value) => Some(value.to_string()),
-        Value::Str(value) => Some(value.clone()),
-        Value::Blob { text, .. } => Some(text.clone()),
+        // An empty string is not a name: joining it produces dangling
+        // separators ("postgres / ") in labels and composite columns.
+        Value::Str(value) => (!value.is_empty()).then(|| value.clone()),
+        Value::Blob { text, .. } => (!text.is_empty()).then(|| text.clone()),
         Value::ListI32(values) => Some(
             values
                 .iter()

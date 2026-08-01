@@ -51,10 +51,11 @@ export function Toolbar(props: ToolbarProps) {
               key={p.code}
               type="button"
               aria-pressed={active}
+              title={p.code}
               onClick={() => props.onSelectPreset(active ? null : p.code)}
               style={segmentedItem(active)}
             >
-              {p.code}
+              {t(`preset.${p.code}`, { defaultValue: p.code })}
             </button>
           );
         })}

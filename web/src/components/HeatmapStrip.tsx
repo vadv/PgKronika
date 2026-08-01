@@ -1,13 +1,16 @@
-import { Fragment } from "react";
+import { Fragment, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { metricDesc, metricLabel } from "../api/codes";
 import { useHeatmap } from "../api/heatmap";
-import type { HeatmapQuality, ViewSpec } from "../api/types";
+import type { HeatmapQuality, HeatmapRow, ViewSpec } from "../api/types";
+import { breakableCode, formatByUnit, shortIdToken } from "../design/format";
 import { heatColor } from "./heatmapColor";
-import { TipRow, Tooltip } from "./Tooltip";
+import { HEATMAP_LABEL_COL_PX } from "../design/ui";
+import { TipFormula, TipRow, Tooltip } from "./Tooltip";
 
-function formatValue(v: number): string {
-  return String(Number(v.toFixed(v < 10 ? 2 : 0)));
-}
+/** Fraction of the global max below which a cell reads as "normal" — the
+ * same cut the color scale makes between heat-1 and heat-2. */
+const NORMAL_FRACTION = 0.4;
 
 /** Localized breakdown of heatmap quality reasons for the partial chip:
  * a bare "partial data" gives the operator nothing to act on. */
@@ -30,6 +33,131 @@ function qualityReasonRows(
   return rows;
 }
 
+/** Heatmap row labels for token views are raw uint64 decimals — shorten to
+ * the same hex token the table uses; the full value stays in the tooltip. */
+function displayLabel(view: string, label: string): string {
+  if (
+    (view === "statements" || view === "plans") &&
+    /^[0-9]+$/.test(label) &&
+    label.length > 10
+  ) {
+    return shortIdToken(label);
+  }
+  return label;
+}
+
+function bucketTime(
+  gridFromUs: number,
+  bucketWidthUs: number,
+  index: number,
+): string {
+  const start = new Date((gridFromUs + index * bucketWidthUs) / 1000);
+  const end = new Date((gridFromUs + (index + 1) * bucketWidthUs) / 1000);
+  const fmt = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `${fmt.format(start)}–${fmt.format(end)}`;
+}
+
+function HeatmapRowView(props: {
+  row: HeatmapRow;
+  view: string;
+  metricText: string;
+  gridFromUs: number | null;
+  bucketWidthUs: number;
+  max: number;
+  onSelectEntity: (entity: string) => void;
+}) {
+  const { t } = useTranslation();
+  const r = props.row;
+  const label = displayLabel(props.view, r.label);
+  return (
+    <Fragment>
+      <Tooltip
+        content={
+          <span style={{ display: "grid", gap: "2px" }}>
+            <span>{breakableCode(r.label)}</span>
+            <TipRow
+              label={t("tooltip.entity")}
+              value={breakableCode(r.entity)}
+              mono
+            />
+          </span>
+        }
+      >
+        <button
+          onClick={() => props.onSelectEntity(r.entity)}
+          style={{
+            fontFamily: "var(--mono-font)",
+            fontSize: "var(--text-sm)",
+            lineHeight: "14px",
+            color: "var(--fg)",
+            background: "none",
+            border: "none",
+            padding: 0,
+            textAlign: "start",
+            cursor: "pointer",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {label}
+        </button>
+      </Tooltip>
+      {r.values.map((v, i) => {
+        const when =
+          props.gridFromUs !== null
+            ? bucketTime(props.gridFromUs, props.bucketWidthUs, i)
+            : null;
+        return (
+          <Tooltip
+            key={i}
+            preferAbove
+            content={
+              <span style={{ display: "grid", gap: "2px" }}>
+                <span
+                  style={{
+                    overflowWrap: "anywhere",
+                    color: "var(--fg-strong)",
+                  }}
+                >
+                  {breakableCode(r.label)}
+                </span>
+                <TipRow
+                  label={props.metricText}
+                  value={
+                    v === null ? t("spine.missing") : formatByUnit(v, r.unit)
+                  }
+                  mono
+                />
+                {when !== null && (
+                  <TipRow label={t("tooltip.bucket")} value={when} mono />
+                )}
+              </span>
+            }
+          >
+            <div
+              data-cell
+              data-empty={v === null ? "true" : undefined}
+              style={{
+                width: "10px",
+                height: "10px",
+                margin: "2px 0.5px",
+                borderRadius: "2px",
+                background: heatColor(
+                  v === null ? null : props.max > 0 ? v / props.max : 0,
+                ),
+              }}
+            />
+          </Tooltip>
+        );
+      })}
+    </Fragment>
+  );
+}
+
 export function HeatmapStrip(props: {
   view: ViewSpec;
   metric: string;
@@ -39,6 +167,7 @@ export function HeatmapStrip(props: {
   onSelectEntity: (entity: string) => void;
 }) {
   const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
   const heatmap = useHeatmap({
     view: props.view.code,
     metric: props.metric,
@@ -62,6 +191,25 @@ export function HeatmapStrip(props: {
         heatmap.data.grid.bucket_count
       : 0;
 
+  // Density: quiet rows collapse into one-line summaries; loud rows keep
+  // their full grid. Empty (all-null) rows collapse separately — absence of
+  // data is not "normal".
+  const emptyRows = rows.filter((r) => r.values.every((v) => v === null));
+  const normalRows = rows.filter(
+    (r) =>
+      !emptyRows.includes(r) &&
+      r.values.every(
+        (v) => v === null || (max > 0 ? v / max : 0) < NORMAL_FRACTION,
+      ),
+  );
+  const visibleRows = rows.filter(
+    (r) => !emptyRows.includes(r) && !normalRows.includes(r),
+  );
+  const shownRows = expanded ? rows : visibleRows;
+  const collapsedCount = rows.length - visibleRows.length;
+
+  const metricText = metricLabel(t, props.view.code, props.metric);
+
   return (
     <section
       style={{
@@ -69,7 +217,7 @@ export function HeatmapStrip(props: {
         background: "var(--bg-raised)",
         border: "1px solid var(--border)",
         borderRadius: "var(--radius-md)",
-        padding: "8px 12px 10px",
+        padding: "6px 12px",
       }}
     >
       <div
@@ -104,30 +252,53 @@ export function HeatmapStrip(props: {
             overflow: "hidden",
           }}
         >
-          {metrics.map((m) => (
-            <button
-              key={m.code}
-              onClick={() => props.onMetricChange(m.code)}
-              aria-pressed={props.metric === m.code}
-              style={{
-                fontFamily: "var(--ui-font)",
-                fontSize: "var(--text-xs)",
-                padding: "2px 8px",
-                border: "none",
-                background:
-                  props.metric === m.code ? "var(--active-bg)" : "transparent",
-                color:
-                  props.metric === m.code
-                    ? "var(--accent-strong)"
-                    : "var(--fg-dim)",
-                cursor: "pointer",
-                transition:
-                  "color var(--transition-fast), background var(--transition-fast)",
-              }}
-            >
-              {m.code}
-            </button>
-          ))}
+          {metrics.map((m) => {
+            const label = metricLabel(t, props.view.code, m.code);
+            const desc = metricDesc(t, props.view.code, m.code);
+            return (
+              <Tooltip
+                key={m.code}
+                content={
+                  <span style={{ display: "grid", gap: "2px" }}>
+                    {desc !== null && <span>{desc}</span>}
+                    <TipRow
+                      label={t("tooltip.code")}
+                      value={`${m.code} · ${m.unit}`}
+                      mono
+                    />
+                    <TipFormula
+                      label={t("tooltip.formula")}
+                      value={m.formula}
+                    />
+                  </span>
+                }
+              >
+                <button
+                  onClick={() => props.onMetricChange(m.code)}
+                  aria-pressed={props.metric === m.code}
+                  style={{
+                    fontFamily: "var(--ui-font)",
+                    fontSize: "var(--text-xs)",
+                    padding: "2px 8px",
+                    border: "none",
+                    background:
+                      props.metric === m.code
+                        ? "var(--active-bg)"
+                        : "transparent",
+                    color:
+                      props.metric === m.code
+                        ? "var(--accent-strong)"
+                        : "var(--fg-dim)",
+                    cursor: "pointer",
+                    transition:
+                      "color var(--transition-fast), background var(--transition-fast)",
+                  }}
+                >
+                  {label}
+                </button>
+              </Tooltip>
+            );
+          })}
         </div>
         {heatmap.data &&
           (heatmap.data.quality.gaps.length > 0 ||
@@ -207,100 +378,76 @@ export function HeatmapStrip(props: {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: `180px repeat(${bucketCount}, 1fr)`,
-            marginTop: "8px",
-            gap: "2px 0",
+            gridTemplateColumns: `${HEATMAP_LABEL_COL_PX}px repeat(${bucketCount}, 1fr)`,
+            marginTop: "4px",
+            gap: "1px 0",
           }}
         >
-          {rows.map((r) => (
-            <Fragment key={r.entity}>
-              <Tooltip
-                content={
-                  <span style={{ display: "grid", gap: "2px" }}>
-                    <span style={{ overflowWrap: "anywhere" }}>{r.label}</span>
-                    <TipRow
-                      label="entity"
-                      value={
-                        r.entity.length <= 14
-                          ? r.entity
-                          : `${r.entity.slice(0, 12)}…`
-                      }
-                      mono
-                    />
-                  </span>
-                }
-              >
-                <button
-                  onClick={() => props.onSelectEntity(r.entity)}
-                  style={{
-                    fontFamily: "var(--mono-font)",
-                    color: "var(--fg)",
-                    background: "none",
-                    border: "none",
-                    padding: 0,
-                    textAlign: "start",
-                    cursor: "pointer",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {r.label}
-                </button>
-              </Tooltip>
-              {r.values.map((v, i) => {
-                const bucketStart =
-                  gridFromUs !== null ? gridFromUs + i * bucketWidthUs : null;
-                const when =
-                  bucketStart !== null
-                    ? new Intl.DateTimeFormat(undefined, {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      }).format(new Date(bucketStart / 1000))
-                    : null;
-                return (
-                  <Tooltip
-                    key={i}
-                    preferAbove
-                    content={
-                      <span style={{ display: "grid", gap: "2px" }}>
-                        <span
-                          style={{
-                            overflowWrap: "anywhere",
-                            color: "var(--fg-strong)",
-                          }}
-                        >
-                          {r.label}
-                        </span>
-                        <TipRow
-                          label={props.metric}
-                          value={v === null ? "—" : formatValue(v)}
-                          mono
-                        />
-                        {when !== null && (
-                          <TipRow label="bucket" value={when} mono />
-                        )}
-                      </span>
-                    }
-                  >
-                    <div
-                      data-cell
-                      data-empty={v === null ? "true" : undefined}
-                      style={{
-                        width: "12px",
-                        height: "12px",
-                        margin: "0.5px",
-                        borderRadius: "2px",
-                        background: heatColor(
-                          v === null ? null : max > 0 ? v / max : 0,
-                        ),
-                      }}
-                    />
-                  </Tooltip>
-                );
-              })}
-            </Fragment>
+          {shownRows.map((r) => (
+            <HeatmapRowView
+              key={r.entity}
+              row={r}
+              view={props.view.code}
+              metricText={metricText}
+              gridFromUs={gridFromUs}
+              bucketWidthUs={bucketWidthUs}
+              max={max}
+              onSelectEntity={props.onSelectEntity}
+            />
           ))}
+          {!expanded && collapsedCount > 0 && (
+            <button
+              type="button"
+              title={[...normalRows, ...emptyRows]
+                .map((r) => displayLabel(props.view.code, r.label))
+                .slice(0, 20)
+                .join(", ")}
+              onClick={() => setExpanded(true)}
+              style={{
+                gridColumn: "1 / -1",
+                fontFamily: "var(--ui-font)",
+                fontSize: "var(--text-xs)",
+                lineHeight: "14px",
+                textAlign: "start",
+                color: "var(--fg-dim)",
+                background: "none",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+              }}
+            >
+              {[
+                normalRows.length > 0
+                  ? t("heatmap.collapsedNormal", { count: normalRows.length })
+                  : null,
+                emptyRows.length > 0
+                  ? t("heatmap.collapsedEmpty", { count: emptyRows.length })
+                  : null,
+              ]
+                .filter((part) => part !== null)
+                .join(" · ")}
+            </button>
+          )}
+          {expanded && collapsedCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setExpanded(false)}
+              style={{
+                gridColumn: "1 / -1",
+                fontFamily: "var(--ui-font)",
+                fontSize: "var(--text-xs)",
+                lineHeight: "14px",
+                textAlign: "start",
+                color: "var(--fg-dim)",
+                background: "none",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+              }}
+            >
+              {t("heatmap.collapse")}
+            </button>
+          )}
         </div>
       )}
     </section>

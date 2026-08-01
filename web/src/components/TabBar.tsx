@@ -24,10 +24,22 @@ export function TabBar(props: {
         const gated = v.availability !== "available";
         const summary = props.summaries.get(v.code);
         const active = props.active === v.code;
+        // The gated reason comes from the first blocked input or column —
+        // the view itself carries only the availability verdict.
+        const gatedReason = gated
+          ? ([...v.inputs, ...v.columns, ...v.metrics]
+              .map((item) => item.unavailable_reason)
+              .find((reason) => reason != null) ?? null)
+          : null;
         const tip = (
           <span style={{ display: "grid", gap: "2px" }}>
             <span style={{ fontFamily: "var(--mono-font)" }}>{v.code}</span>
-            <TipRow label="availability" value={v.availability} />
+            <TipRow
+              label="availability"
+              value={t(`availability.${v.availability}`, {
+                defaultValue: v.availability,
+              })}
+            />
             {summary?.snapshot_ts_us != null && (
               <TipRow
                 label="population"
@@ -44,11 +56,8 @@ export function TabBar(props: {
                 value={`${summary.notable_level} ×${summary.notable_count}`}
               />
             )}
-            {v.availability !== "available" && (
-              <TipRow
-                label="reason"
-                value={t(`availability.${v.availability}`)}
-              />
+            {gatedReason !== null && (
+              <TipRow label="reason" value={gatedReason} mono />
             )}
           </span>
         );

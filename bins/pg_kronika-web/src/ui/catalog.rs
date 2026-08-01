@@ -737,7 +737,7 @@ fn statements_view() -> ViewSpec {
             ValueType::F64,
             "positive_delta(total_exec_time)",
             &["statements"],
-            None,
+            Some("duration_ms"),
         ),
         derived_column(
             "ms_per_row",
@@ -1290,7 +1290,7 @@ fn vacuum_view() -> ViewSpec {
                 ValueType::F64,
                 "heap_blks_scanned / max(heap_blks_total, 1)",
                 &["vacuum"],
-                None,
+                Some("ratio"),
             ),
             derived_column(
                 "dead_tuples",
@@ -1387,14 +1387,14 @@ fn processes_view() -> ViewSpec {
             ValueType::F64,
             "positive_delta(read_bytes) / elapsed",
             &["process"],
-            None,
+            Some("bytes_per_second"),
         ),
         derived_column(
             "write_bytes_per_second",
             ValueType::F64,
             "positive_delta(write_bytes) / elapsed",
             &["process"],
-            None,
+            Some("bytes_per_second"),
         ),
         derived_column(
             "block_delay",
@@ -1435,7 +1435,16 @@ fn processes_view() -> ViewSpec {
         vec![
             preset(
                 "cpu",
-                &["pid", "type", "cpu", "rss", "command"],
+                &[
+                    "pid",
+                    "type",
+                    "cpu",
+                    "rss",
+                    "threads",
+                    "read_bytes_per_second",
+                    "write_bytes_per_second",
+                    "command",
+                ],
                 "cpu",
                 "desc",
             ),
@@ -1560,7 +1569,7 @@ fn locks_view() -> ViewSpec {
                 ValueType::F64,
                 "proven_wait_or_hold_duration_us",
                 &["locks"],
-                None,
+                Some("us"),
             ),
             raw_column(
                 "query",
@@ -1682,7 +1691,7 @@ fn events_view() -> ViewSpec {
                 "events.duration_us",
                 false,
                 &["events"],
-                None,
+                Some("us"),
             ),
             raw_column(
                 "message",
@@ -1702,27 +1711,29 @@ fn events_view() -> ViewSpec {
             ),
         ],
         vec![
+            // Human columns in presets: the raw severity/category integers
+            // stay available through `columns=` but never headline a table.
             preset(
                 "errors",
-                &["time", "severity", "type", "message"],
+                &["time", "severity_code", "category_code", "message"],
                 "time",
                 "desc",
             ),
             preset(
                 "checkpoints",
-                &["time", "type", "duration", "message"],
+                &["time", "category_code", "duration", "message"],
                 "time",
                 "desc",
             ),
             preset(
                 "vacuum",
-                &["time", "type", "duration", "message"],
+                &["time", "category_code", "duration", "message"],
                 "time",
                 "desc",
             ),
             preset(
                 "slow",
-                &["time", "type", "duration", "message"],
+                &["time", "category_code", "duration", "message"],
                 "duration",
                 "desc",
             ),

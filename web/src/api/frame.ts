@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { ApiError, apiGet } from "./client";
+import { apiGet } from "./client";
 
 export interface FrameArgs {
   view: string;
@@ -51,13 +51,7 @@ export function useFrame(args: FrameArgs) {
           },
         },
       }),
-    // 4xx is a typed answer (expired cursor, bad constraint), not a transient
-    // failure — retrying only delays the honest recovery path.
-    retry: (count, error) =>
-      !(
-        error instanceof ApiError &&
-        error.status >= 400 &&
-        error.status < 500
-      ) && count < 3,
+    // Retry policy (503 warm-up patience, no 4xx retries) comes from the
+    // QueryClient defaults in App.
   });
 }

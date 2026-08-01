@@ -540,6 +540,11 @@ EntityHistoryResponse:
       type: array
     entity:
       type: string
+    label:
+      description: |-
+        Label of the first observed snapshot; empty when the entity never
+        appears in the window.
+      type: string
     mode:
       type: string
     page:
@@ -556,6 +561,7 @@ EntityHistoryResponse:
   - mode
   - view
   - entity
+  - label
   - columns
   - snapshots
   - page
@@ -578,6 +584,11 @@ EntityPointResponse:
       items:
         $ref: '#/EntityFieldDto'
       type: array
+    label:
+      description: |-
+        Human row label from the same projection as frame rows — the entity
+        token above is routing material, never display text.
+      type: string
     mode:
       type: string
     quality:
@@ -594,6 +605,7 @@ EntityPointResponse:
   - mode
   - view
   - entity
+  - label
   - snapshot_ts_us
   - fields
   - related

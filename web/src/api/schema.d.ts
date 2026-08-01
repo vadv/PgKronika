@@ -803,6 +803,11 @@ export interface components {
         EntityHistoryResponse: {
             columns: string[];
             entity: string;
+            /**
+             * @description Label of the first observed snapshot; empty when the entity never
+             *     appears in the window.
+             */
+            label: string;
             mode: string;
             page: components["schemas"]["EntityPageDto"];
             quality: components["schemas"]["EntityQualityDto"];
@@ -815,6 +820,11 @@ export interface components {
         EntityPointResponse: {
             entity: string;
             fields: components["schemas"]["EntityFieldDto"][];
+            /**
+             * @description Human row label from the same projection as frame rows — the entity
+             *     token above is routing material, never display text.
+             */
+            label: string;
             mode: string;
             quality: components["schemas"]["EntityQualityDto"];
             related: components["schemas"]["RelatedEntityDto"][];
