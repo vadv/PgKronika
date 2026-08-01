@@ -25,6 +25,13 @@ export interface DockOverlayProps {
   onPatch: (patch: Partial<UiState>) => void;
 }
 
+/** Opaque typed-identity tokens (entity keys) are API routing material, not
+ * display text: show a short readable form, keep the full token in the
+ * tooltip. */
+function shortEntity(token: string): string {
+  return token.length <= 12 ? token : `${token.slice(0, 8)}…`;
+}
+
 /** Localized incident title from the server's language-neutral summary code;
  * the binary provenance key never renders as a headline. */
 function incidentTitle(
@@ -613,7 +620,10 @@ function RowDock(props: {
           overflowWrap: "anywhere",
         }}
       >
-        {viewCode} · {props.state.entity ?? "—"}
+        {viewCode} ·{" "}
+        <span title={props.state.entity ?? undefined}>
+          {shortEntity(props.state.entity ?? "—")}
+        </span>
       </div>
       {missing && (
         <div style={{ color: "var(--fg-dim)" }}>{t("dock.row.missing")}</div>

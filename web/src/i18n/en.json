@@ -118,5 +118,6 @@
   "incident.summary.anomaly.os_cpu.load": "CPU: high load",
   "incident.summary.anomaly.os_psi.io": "I/O pressure",
   "incident.summary.anomaly.pg.locks": "Lock contention",
-  "incident.summary.anomaly.pg.autovacuum": "Autovacuum backlog"
+  "incident.summary.anomaly.pg.autovacuum": "Autovacuum backlog",
+  "popover.error": "Failed to load"
 }

@@ -112,7 +112,9 @@ export function DataHealthPopover(props: DataHealthPopoverProps) {
     >
       {!dq ? (
         <Row label={t("popover.loading")}>
-          <span>{quality.isError ? String(quality.error) : "…"}</span>
+          <span style={{ color: "var(--sev-warn-fg)" }}>
+            {quality.isError ? t("popover.error") : "…"}
+          </span>
         </Row>
       ) : (
         <>
@@ -159,7 +161,7 @@ export function DataHealthPopover(props: DataHealthPopoverProps) {
       {!st ? (
         <Row label={t("popover.storage")}>
           <span>
-            {storage.isError ? String(storage.error) : t("popover.loading")}
+            {storage.isError ? t("popover.error") : t("popover.loading")}
           </span>
         </Row>
       ) : (

@@ -118,5 +118,6 @@
   "incident.summary.anomaly.os_cpu.load": "CPU: высокая нагрузка",
   "incident.summary.anomaly.os_psi.io": "I/O pressure",
   "incident.summary.anomaly.pg.locks": "Конкуренция блокировок",
-  "incident.summary.anomaly.pg.autovacuum": "Autovacuum отстаёт"
+  "incident.summary.anomaly.pg.autovacuum": "Autovacuum отстаёт",
+  "popover.error": "Ошибка загрузки"
 }
