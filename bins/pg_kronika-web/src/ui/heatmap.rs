@@ -342,7 +342,16 @@ pub(crate) fn heatmap(
         .map(|descriptor| (descriptor.min_ts, descriptor.max_ts))
         .collect::<Vec<_>>();
     for descriptor in &descriptors {
-        let (block, _stats) = snapshot.read_entity_series(descriptor, view.code, &LIMIT)?;
+        let block = match snapshot.read_entity_series(descriptor, view.code, &LIMIT) {
+            Ok((block, _stats)) => block,
+            // Descriptor-first publication leaves a window with no built index
+            // after every seal: unbounded candidates, not a read failure.
+            Err(WebIndexReadError::SidecarAbsent) => {
+                merged.mark_unbounded(segment_token(descriptor));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let Some(block) = block else {
             merged.mark_unbounded(segment_token(descriptor));
             continue;

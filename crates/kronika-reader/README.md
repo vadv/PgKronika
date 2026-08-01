@@ -145,6 +145,12 @@ is written to a same-directory process-unique temporary file, synchronized,
 and atomically renamed over the same sidecar path. The PGM path does not
 participate in `FactKey` or lineage.
 
+The selective web-index reads `read_ui_summary` and `read_entity_series`
+never trigger that extraction. Descriptor publication is descriptor-first and
+fact files are built lazily, so an absent sidecar is an expected transient
+state: these reads report it as the typed `WebIndexReadError::SidecarAbsent`
+and leave the skip-or-build decision to the caller.
+
 The persistent sidecar remains the first lookup. If canonical encoding and
 full admission succeed but publication fails for a recoverable storage reason,
 `FactStore` may retain the immutable `Arc<SegmentFacts>` in a process-local

@@ -4,7 +4,7 @@ use kronika_registry::os_loadavg::OsLoadavg;
 use kronika_registry::os_psi::OsPsi;
 use kronika_registry::os_topology::OsTopology;
 
-fn host_spine_fixture() -> tempfile::TempDir {
+fn write_host_segment() -> tempfile::TempDir {
     let load_rows = [
         OsLoadavg {
             ts: Ts(60_000_000),
@@ -95,6 +95,11 @@ fn host_spine_fixture() -> tempfile::TempDir {
     );
     let directory = tempfile::tempdir().expect("tempdir");
     crate::test_layout::write_named_pgm(directory.path(), "host-spine.pgm", &bytes);
+    directory
+}
+
+fn host_spine_fixture() -> tempfile::TempDir {
+    let directory = write_host_segment();
     let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
     let store = FactStore::new(directory.path());
     for descriptor in snapshot.sealed_descriptors() {
@@ -153,6 +158,56 @@ async fn spine_distinguishes_observed_value_missing_sample_and_producer_gap() {
         serde_json::Value::String("producer_gap".to_owned())
     );
     assert_eq!(body["quality"]["status"], "partial");
+}
+
+#[tokio::test]
+async fn spine_over_an_unindexed_sealed_window_reports_a_typed_gap() {
+    let directory = write_host_segment();
+    // No publish: the descriptor is visible right after the seal, while the
+    // sidecar is built lazily by the first admitted timeline load.
+
+    let (status, body) = serve(
+        directory.path(),
+        "/v1/timeline/spine?from=60000000&to=180000000&buckets=2",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["quality"]["status"], "partial");
+    // The pending window is a typed gap, not a producer hole; nothing indexed
+    // is claimed for it, so every bucket in it stays null.
+    assert_eq!(
+        body["quality"]["gaps"],
+        serde_json::json!([
+            {"from_us": "60000000", "to_us": "120000001", "reason": "index_pending"},
+            {"from_us": "120000001", "to_us": "180000000", "reason": "producer_gap"},
+        ])
+    );
+    assert_eq!(body["series"][0]["values"], serde_json::json!([null, null]));
+
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish host web index");
+    }
+    let (status, healed) = serve(
+        directory.path(),
+        "/v1/timeline/spine?from=60000000&to=180000000&buckets=2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{healed}");
+    assert_eq!(
+        healed["quality"]["gaps"],
+        serde_json::json!([
+            {"from_us": "120000001", "to_us": "180000000", "reason": "producer_gap"},
+        ])
+    );
+    assert_eq!(
+        healed["series"][1]["values"],
+        serde_json::json!([12.0, 34.0])
+    );
 }
 
 #[tokio::test]

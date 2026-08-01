@@ -10,7 +10,7 @@ use kronika_reader::{
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use super::snapshot::read_summary_tolerant;
+use super::snapshot::{SummaryRead, read_summary_tolerant};
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ViewSummaryResponse {
@@ -101,13 +101,17 @@ pub(crate) fn view_summary(
         .rev()
         .filter(|descriptor| descriptor.min_ts <= at_us)
     {
-        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
-            incompatible_seen = true;
-            continue;
-        };
-        resolve_summary(&summary, at_us, &mut resolved);
-        if resolved.iter().all(Option::is_some) {
-            break;
+        match read_summary_tolerant(snapshot, descriptor)? {
+            SummaryRead::Block(summary) => {
+                resolve_summary(&summary, at_us, &mut resolved);
+                if resolved.iter().all(Option::is_some) {
+                    break;
+                }
+            }
+            SummaryRead::StaleContract => incompatible_seen = true,
+            // A pending index has no verdict; unresolved views stay honestly
+            // "unavailable" instead of borrowing a false revision reason.
+            SummaryRead::IndexPending => {}
         }
     }
 

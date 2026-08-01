@@ -10,7 +10,7 @@ use kronika_reader::{
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use super::snapshot::read_summary_tolerant;
+use super::snapshot::{SummaryRead, read_summary_tolerant};
 
 #[derive(Debug, Clone, Copy)]
 #[allow(
@@ -268,14 +268,18 @@ pub(crate) fn build_data_quality(
     let mut corrupt_segments = 0_usize;
     for descriptor in &descriptors {
         match read_summary_tolerant(snapshot, descriptor) {
-            Ok(Some(summary)) => {
+            Ok(SummaryRead::Block(summary)) => {
                 readable_segments = readable_segments.saturating_add(1);
                 inventory.scan(&summary, &request);
             }
             // A stale-contract sidecar degrades availability, not integrity.
-            Ok(None) => {
+            Ok(SummaryRead::StaleContract) => {
                 inventory.resource_limited.insert("index_revision");
             }
+            // A not-yet-built index is the designed lazy-publication window:
+            // the source is intact, so neither integrity nor availability
+            // verdicts apply; coverage math reflects the missing snapshots.
+            Ok(SummaryRead::IndexPending) => {}
             Err(_) => {
                 corrupt_segments = corrupt_segments.saturating_add(1);
             }

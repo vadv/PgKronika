@@ -301,11 +301,21 @@ pub(crate) fn spine(
         .iter()
         .map(|descriptor| (descriptor.min_ts, descriptor.max_ts))
         .collect::<Vec<_>>();
+    let mut pending = Vec::new();
     for descriptor in &descriptors {
         let block = match snapshot.read_entity_series(descriptor, HOST_SIGNALS_VIEW_CODE, &LIMIT) {
             Ok((block, _stats)) => block,
             Err(WebIndexReadError::Cache(CacheReadError::Incompatible)) => {
                 push_unique(&mut merged.resource_limited, "host_signals");
+                continue;
+            }
+            // Descriptor-first publication leaves a window with no built index
+            // after every seal: a typed gap, not a read failure.
+            Err(WebIndexReadError::SidecarAbsent) => {
+                pending.push((
+                    descriptor.min_ts.max(request.from_us),
+                    descriptor.max_ts.saturating_add(1).min(request.to_us),
+                ));
                 continue;
             }
             Err(error) => return Err(SpineError::Read(error)),
@@ -332,17 +342,26 @@ pub(crate) fn spine(
         push_unique(&mut merged.resource_limited, "active_tail");
     }
 
-    let gaps = coverage_gaps(&coverage, request);
+    let mut gaps = coverage_gaps(&coverage, request)
+        .into_iter()
+        .map(|(from_us, to_us)| (from_us, to_us, "producer_gap"))
+        .collect::<Vec<_>>();
+    gaps.extend(
+        pending
+            .iter()
+            .map(|&(from_us, to_us)| (from_us, to_us, "index_pending")),
+    );
+    gaps.sort_unstable();
     merged.gated.sort_unstable();
     merged.resource_limited.sort_unstable();
     let partial =
         !gaps.is_empty() || !merged.gated.is_empty() || !merged.resource_limited.is_empty();
     let gap_dtos = gaps
         .iter()
-        .map(|(from_us, to_us)| SpineGap {
+        .map(|&(from_us, to_us, reason)| SpineGap {
             from_us: from_us.to_string(),
             to_us: to_us.to_string(),
-            reason: "producer_gap",
+            reason,
         })
         .collect();
     Ok(SpineResponse {

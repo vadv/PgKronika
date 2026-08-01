@@ -8,16 +8,32 @@ use kronika_reader::{
     UiSummaryBlock, WebIndexReadError,
 };
 
-/// Reads one descriptor's summary, degrading a sidecar written under another
-/// contract into a typed skip: the data is intact, only the index is stale.
-/// Corruption, absence, and I/O failures stay hard errors.
+/// Outcome of a tolerance-aware summary read for one sealed descriptor.
+#[derive(Debug)]
+pub(crate) enum SummaryRead {
+    /// The admitted summary block.
+    Block(UiSummaryBlock),
+    /// The sidecar was written under another contract: the data is intact,
+    /// only the index is stale.
+    StaleContract,
+    /// The descriptor is published but its derived index is not built yet.
+    /// Fact files are built lazily by admitted timeline requests, so this is
+    /// an expected transient state, not a storage failure.
+    IndexPending,
+}
+
+/// Reads one descriptor's summary, degrading a stale-contract or not-yet-built
+/// sidecar into a typed skip. Corruption and I/O failures stay hard errors.
 pub(crate) fn read_summary_tolerant(
     snapshot: &LocalDirSnapshot,
     descriptor: &SegmentDescriptor,
-) -> Result<Option<UiSummaryBlock>, WebIndexReadError> {
+) -> Result<SummaryRead, WebIndexReadError> {
     match snapshot.read_ui_summary(descriptor, &LIMIT) {
-        Ok((summary, _stats)) => Ok(Some(summary)),
-        Err(WebIndexReadError::Cache(CacheReadError::Incompatible)) => Ok(None),
+        Ok((summary, _stats)) => Ok(SummaryRead::Block(summary)),
+        Err(WebIndexReadError::Cache(CacheReadError::Incompatible)) => {
+            Ok(SummaryRead::StaleContract)
+        }
+        Err(WebIndexReadError::SidecarAbsent) => Ok(SummaryRead::IndexPending),
         Err(error) => Err(error),
     }
 }
@@ -73,8 +89,9 @@ pub(crate) fn resolve_snapshot_at(
         {
             break;
         }
-        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
-            continue;
+        let summary = match read_summary_tolerant(snapshot, descriptor)? {
+            SummaryRead::Block(summary) => summary,
+            SummaryRead::StaleContract | SummaryRead::IndexPending => continue,
         };
         let upper = summary
             .snapshot_times()
@@ -119,11 +136,17 @@ pub(crate) fn resolve_view_snapshot(
         if settled {
             break;
         }
-        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
-            if fallback_quality.is_none() && descriptor.min_ts <= at_us {
-                fallback_quality = Some(SnapshotSummaryQuality::UnavailableRevision);
+        let summary = match read_summary_tolerant(snapshot, descriptor)? {
+            SummaryRead::Block(summary) => summary,
+            SummaryRead::StaleContract => {
+                if fallback_quality.is_none() && descriptor.min_ts <= at_us {
+                    fallback_quality = Some(SnapshotSummaryQuality::UnavailableRevision);
+                }
+                continue;
             }
-            continue;
+            // A pending index answers nothing about the view; reporting a
+            // revision or resource verdict for it would be a false reason.
+            SummaryRead::IndexPending => continue,
         };
         let Some(view_summary) = summary
             .views()

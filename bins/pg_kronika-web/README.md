@@ -331,7 +331,11 @@ retained data, and always uploads the stand diagnostics. It has no automatic
   `FactBuildKey`, survive request cancellation, and enter the configurable
   process-wide FIFO scheduler. Queue exhaustion, an overweight build, or FIFO
   timeout returns `503` with `code=cold_build_overloaded` and the configured
-  `Retry-After`.
+  `Retry-After`. Until the first admitted load builds the sibling sidecar,
+  index-reading endpoints serve that window as a typed pending state instead
+  of failing: unresolved summary views report `unavailable`, spine reports the
+  range in `gaps` with `reason=index_pending`, heatmap ranking stays inexact
+  for it, and frame sparks are marked incomplete.
 - A selected sealed segment that fails while the request is loading facts does
   not become a successful empty segment and does not fail the whole request.
   The response is `200` with that interval in `known_gaps`, reduced
