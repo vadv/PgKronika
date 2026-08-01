@@ -230,7 +230,15 @@
       "presets": [
         {
           "code": "sessions",
-          "columns": ["pid", "user", "database", "application", "state", "query", "query_duration_us"],
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "application",
+            "state",
+            "query",
+            "query_duration_us"
+          ],
           "sort": {
             "column": "query_duration_us",
             "order": "desc"
@@ -238,7 +246,14 @@
         },
         {
           "code": "waits",
-          "columns": ["pid", "user", "database", "wait_event", "query", "query_duration_us"],
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "wait_event",
+            "query",
+            "query_duration_us"
+          ],
           "sort": {
             "column": "query_duration_us",
             "order": "desc"
@@ -254,7 +269,13 @@
         },
         {
           "code": "transaction_age",
-          "columns": ["pid", "user", "database", "state", "transaction_duration_us"],
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "state",
+            "transaction_duration_us"
+          ],
           "sort": {
             "column": "transaction_duration_us",
             "order": "desc"
@@ -262,7 +283,15 @@
         },
         {
           "code": "replication",
-          "columns": ["pid", "user", "application", "backend_type", "replication_state", "sync_state", "replay_lag_us"],
+          "columns": [
+            "pid",
+            "user",
+            "application",
+            "backend_type",
+            "replication_state",
+            "sync_state",
+            "replay_lag_us"
+          ],
           "sort": {
             "column": "replay_lag_us",
             "order": "desc"
@@ -472,7 +501,17 @@
       "presets": [
         {
           "code": "time",
-          "columns": ["queryid", "query", "calls", "total", "mean", "ms_per_row", "time_pct", "plan_time_pct", "rows"],
+          "columns": [
+            "queryid",
+            "query",
+            "calls",
+            "total",
+            "mean",
+            "ms_per_row",
+            "time_pct",
+            "plan_time_pct",
+            "rows"
+          ],
           "sort": {
             "column": "total",
             "order": "desc"
@@ -654,7 +693,14 @@
         },
         {
           "code": "io",
-          "columns": ["planid", "plan", "queryid", "calls", "shared_hit", "shared_read"],
+          "columns": [
+            "planid",
+            "plan",
+            "queryid",
+            "calls",
+            "shared_hit",
+            "shared_read"
+          ],
           "sort": {
             "column": "shared_read",
             "order": "desc"
@@ -891,7 +937,14 @@
       "presets": [
         {
           "code": "activity",
-          "columns": ["relation", "seq_scan", "idx_scan", "seq_scan_pct", "dead_pct", "dead_tuples"],
+          "columns": [
+            "relation",
+            "seq_scan",
+            "idx_scan",
+            "seq_scan_pct",
+            "dead_pct",
+            "dead_tuples"
+          ],
           "sort": {
             "column": "dead_pct",
             "order": "desc"
@@ -899,7 +952,12 @@
         },
         {
           "code": "writes",
-          "columns": ["relation", "modified_since_analyze", "inserted_since_vacuum", "dead_pct"],
+          "columns": [
+            "relation",
+            "modified_since_analyze",
+            "inserted_since_vacuum",
+            "dead_pct"
+          ],
           "sort": {
             "column": "inserted_since_vacuum",
             "order": "desc"
@@ -924,7 +982,13 @@
         },
         {
           "code": "io",
-          "columns": ["relation", "seq_scan", "idx_scan", "seq_scan_pct", "io_hit_pct"],
+          "columns": [
+            "relation",
+            "seq_scan",
+            "idx_scan",
+            "seq_scan_pct",
+            "io_hit_pct"
+          ],
           "sort": {
             "column": "io_hit_pct",
             "order": "desc"
@@ -1214,7 +1278,14 @@
       "presets": [
         {
           "code": "progress",
-          "columns": ["pid", "relation", "phase", "progress", "dead_tuples", "elapsed"],
+          "columns": [
+            "pid",
+            "relation",
+            "phase",
+            "progress",
+            "dead_tuples",
+            "elapsed"
+          ],
           "sort": {
             "column": "progress",
             "order": "desc"
@@ -1430,7 +1501,14 @@
         },
         {
           "code": "disk_io",
-          "columns": ["pid", "type", "read_bytes_per_second", "write_bytes_per_second", "block_delay", "command"],
+          "columns": [
+            "pid",
+            "type",
+            "read_bytes_per_second",
+            "write_bytes_per_second",
+            "block_delay",
+            "command"
+          ],
           "sort": {
             "column": "read_bytes_per_second",
             "order": "desc"
@@ -1689,7 +1767,10 @@
             "pg_log_temp_files",
             "pg_log_source_status"
           ],
-          "type_ids": [1022001, 1024001, 1025001, 1026001, 1027001, 1028001, 1029001, 1030001, 1039001],
+          "type_ids": [
+            1022001, 1024001, 1025001, 1026001, 1027001, 1028001, 1029001,
+            1030001, 1039001
+          ],
           "availability": "gated",
           "unavailable_reason": "missing_extension"
         }

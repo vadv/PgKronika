@@ -921,7 +921,11 @@ function rowsEventsView() {
     // Wire codes mirror event_severity_code/event_kind_code in the frame
     // projection: the human text comes from the web i18n dictionaries.
     const severityCode =
-      severity === "ERROR" ? "error" : severity === "WARNING" ? "warning" : "log";
+      severity === "ERROR"
+        ? "error"
+        : severity === "WARNING"
+          ? "warning"
+          : "log";
     const categoryCode =
       type === 1
         ? "pg.log.error_group_observed"
