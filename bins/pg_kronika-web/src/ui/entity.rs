@@ -17,7 +17,7 @@ use self::cursor::EntityHistoryCursor;
 use super::catalog::ProjectionCatalog;
 use super::frame::dto::FrameValue;
 use super::frame::projection::{FrameError, FrameLimits, FrameQuality, project_entity_at};
-use super::snapshot::read_summary_tolerant;
+use super::snapshot::{SummaryRead, read_summary_tolerant};
 use crate::api_error::{
     ApiError, ExpectedValue, InvalidParameterLocation, LimitResource, QueryConstraint,
     QueryParameter, count_u64,
@@ -468,7 +468,7 @@ fn entity_history(
     let mut timestamps = BTreeSet::new();
     let mut combined_quality = FrameQuality::default();
     for descriptor in &descriptors {
-        let Some(summary) = read_summary_tolerant(snapshot, descriptor)? else {
+        let SummaryRead::Block(summary) = read_summary_tolerant(snapshot, descriptor)? else {
             continue;
         };
         let Some(view_summary) = summary

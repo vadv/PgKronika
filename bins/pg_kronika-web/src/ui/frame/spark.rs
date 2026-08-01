@@ -87,7 +87,16 @@ pub(crate) fn attach_sparks(
         .collect::<Vec<_>>();
     let mut blocks = 0_usize;
     for descriptor in &descriptors {
-        let (block, _stats) = snapshot.read_entity_series(descriptor, request.view.code, &LIMIT)?;
+        let block = match snapshot.read_entity_series(descriptor, request.view.code, &LIMIT) {
+            Ok((block, _stats)) => block,
+            // Descriptor-first publication leaves a window with no built index
+            // after every seal: an incomplete spark, not a read failure.
+            Err(WebIndexReadError::SidecarAbsent) => {
+                mark_incomplete(frame);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let Some(block) = block else {
             mark_incomplete(frame);
             continue;

@@ -191,6 +191,46 @@ async fn ui_summary_returns_exact_event_population_and_all_views() {
 }
 
 #[tokio::test]
+async fn ui_summary_over_an_unindexed_sealed_segment_degrades_without_failing() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    write_event_segment(directory.path());
+    // No publish_web_index: descriptor-first publication makes the sealed
+    // descriptor visible right after the seal, while the sidecar is built
+    // lazily by the first admitted timeline load.
+
+    let (status, body) = serve(directory.path(), "/v1/views/summary?at=1500").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let views = body["views"].as_array().expect("views");
+    assert_eq!(views.len(), 9);
+    let events = views
+        .iter()
+        .find(|view| view["view"] == "events")
+        .expect("events");
+    assert_eq!(events["status"], "unavailable");
+    assert!(events["snapshot_ts_us"].is_null());
+    // A pending index borrows no false revision or resource verdict.
+    assert_eq!(
+        body["quality"]["unavailable_revision"],
+        serde_json::json!([])
+    );
+    assert_eq!(body["quality"]["resource_limited"], serde_json::json!([]));
+    assert_eq!(body["quality"]["status"], "partial");
+
+    publish_web_index(directory.path());
+    let (status, healed) = serve(directory.path(), "/v1/views/summary?at=1500").await;
+    assert_eq!(status, StatusCode::OK, "{healed}");
+    let healed_events = healed["views"]
+        .as_array()
+        .expect("views")
+        .iter()
+        .find(|view| view["view"] == "events")
+        .expect("events");
+    assert_eq!(healed_events["status"], "complete");
+    assert_eq!(healed_events["population"], 1);
+}
+
+#[tokio::test]
 async fn summary_returns_notable_level_and_count() {
     let directory = tempfile::tempdir().expect("tempdir");
     write_event_segment(directory.path());
