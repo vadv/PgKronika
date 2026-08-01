@@ -40,9 +40,20 @@ function incidentTitle(
   incident: IncidentResponse,
   t: (key: string, opts?: Record<string, unknown>) => string,
 ): string {
-  return t(`incident.summary.${incident.summary_code}`, {
-    defaultValue: incident.summary_code,
+  const specific = t(`incident.summary.${incident.summary_code}`, {
+    defaultValue: "",
   });
+  if (specific !== "") return specific;
+  // Dynamic codes `anomaly.{section}.{column}` fall back to the column's
+  // human label — a raw dotted code is never a headline.
+  const dynamic = /^anomaly\.[^.]+\.(.+)$/.exec(incident.summary_code);
+  if (dynamic !== null) {
+    const label = t(`col.${dynamic[1]}.label`, { defaultValue: "" });
+    if (label !== "") {
+      return t("incident.summary.anomaly.generic", { what: label });
+    }
+  }
+  return incident.summary_code;
 }
 
 /** Server incident level → color: the only severity source for incidents. */
@@ -344,7 +355,9 @@ function IncidentsDock(props: {
             }}
           >
             {t("dock.incidents.analysis", {
-              status: incidents.data.analysis_status,
+              status: t(`incident.analysis.${incidents.data.analysis_status}`, {
+                defaultValue: incidents.data.analysis_status,
+              }),
             })}
           </div>
         )}
@@ -386,6 +399,10 @@ function IncidentsDock(props: {
             {formatIntervalTime(incident.interval.to)}
           </div>
           <div style={{ color: "var(--fg-dim)", fontSize: "0.85em" }}>
+            {t(`verdict.level.${incident.level}`, {
+              defaultValue: incident.level,
+            })}
+            {" · "}
             {t("dock.incidents.counts", {
               members: incident.members.length,
               findings: incident.findings.length,
