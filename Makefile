@@ -23,6 +23,7 @@ web-frontend: ## Install, build the SPA and pack deterministic static.tar.gz for
 		-czf bins/pg_kronika-web/static.tar.gz -C bins/pg_kronika-web/static .
 
 web-frontend-check: ## Typecheck, lint, format-check and test the SPA without building.
+	python3 -B scripts/check-design-tokens.py
 	cd web && npm ci && npm run typecheck && npm run lint && npm run format:check && npm run test
 
 # The SPA tarball is embedded into the web binary shipped to DB hosts, so its

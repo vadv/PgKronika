@@ -107,7 +107,7 @@ function CopyLinkButton(props: { url: string }) {
             top: "100%",
             right: 0,
             marginTop: "6px",
-            padding: "3px 8px",
+            padding: "2px 8px",
             background: "var(--bg-overlay)",
             border: "1px solid var(--border)",
             borderRadius: "var(--radius-sm)",

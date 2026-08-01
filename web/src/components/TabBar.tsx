@@ -67,7 +67,7 @@ export function TabBar(props: {
               style={{
                 display: "inline-flex",
                 alignItems: "center",
-                gap: "5px",
+                gap: "6px",
                 fontFamily: "var(--ui-font)",
                 fontSize: "var(--text-md)",
                 padding: "4px 8px",
@@ -90,8 +90,8 @@ export function TabBar(props: {
               <span
                 aria-hidden="true"
                 style={{
-                  width: "7px",
-                  height: "7px",
+                  width: "8px",
+                  height: "8px",
                   borderRadius: "50%",
                   background: dotColor,
                   alignSelf: "center",
