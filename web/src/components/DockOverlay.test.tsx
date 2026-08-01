@@ -166,7 +166,7 @@ test("row dock renders point fields from the entity endpoint", async () => {
   expect(missing.title).toBe("unavailable · producer_gap");
 });
 
-test("row dock renders history snapshots when at is not set", async () => {
+test("row dock renders history snapshots when the API answers history mode", async () => {
   stubFetch(
     makeEntityHistoryResponse({
       columns: ["tup", "locks"],
@@ -187,7 +187,7 @@ test("row dock renders history snapshots when at is not set", async () => {
     }),
   );
   renderDock({
-    state: { ...baseState, at: null, dock: "row", entity: "db:1" },
+    state: { ...baseState, dock: "row", entity: "db:1" },
   });
   await waitFor(() => expect(screen.getByText("tup")).toBeDefined());
   expect(screen.getByText("locks")).toBeDefined();
@@ -195,6 +195,41 @@ test("row dock renders history snapshots when at is not set", async () => {
   expect(screen.getByText("12")).toBeDefined();
   const cells = screen.getAllByText("—");
   expect(cells.some((c) => c.dataset.status === "not_collected")).toBe(true);
+});
+
+test("row dock in LIVE mode sends the resolved at (point shape), not a bare token", async () => {
+  const fetchMock = vi.fn().mockImplementation(() =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify(
+          makeEntityPointResponse({
+            view: "activity",
+            entity: "db:1",
+            label: "",
+            fields: [
+              { code: "tup", reason: null, status: "available", value: 42 },
+            ],
+          }),
+        ),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  renderDock({
+    state: { ...baseState, at: null, dock: "row", entity: "db:1" },
+    at: "1722400000000000",
+  });
+  await waitFor(() => expect(screen.getByText("42")).toBeDefined());
+  const input = fetchMock.mock.calls[0]?.[0];
+  const url = input instanceof Request ? input.url : String(input);
+  expect(url).toContain("/v1/entity/activity/db%3A1");
+  expect(url).toContain("at=1722400000000000");
+  // No label from the API: the view name heads the dock, the token stays a
+  // short secondary line — never the raw token as the title.
+  const heading = screen.getByText("tabs.activity");
+  expect(heading.parentElement?.textContent).not.toContain("db:1");
+  expect(screen.getByTitle("db:1")).toBeDefined();
 });
 
 test("row dock drills down via server related provenance and clears", async () => {

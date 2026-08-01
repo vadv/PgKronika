@@ -1407,6 +1407,16 @@ const server = createServer((req, res) => {
 
   const entityMatch = url.pathname.match(/^\/v1\/entity\/([^/]+)\/(.+)$/);
   if (entityMatch !== null) {
+    // Mirror the backend's admission: point (`at`) or history
+    // (`from`+`to`+`columns`) — a bare token is a 400, not a guess.
+    const pointShape = params.get("at") !== null;
+    const historyShape =
+      params.get("from") !== null &&
+      params.get("to") !== null &&
+      params.get("columns") !== null;
+    if (!pointShape && !historyShape) {
+      return sendError(res, 400, "invalid_query_constraint");
+    }
     const body = entityResponse(
       decodeURIComponent(entityMatch[1]),
       decodeURIComponent(entityMatch[2]),

@@ -619,6 +619,10 @@ function EntityHistoryView(props: {
 function RowDock(props: {
   state: UiState;
   view: ViewSpec | undefined;
+  /** Resolved cursor time (LIVE tick when the URL pins none) — the entity
+   * point query needs it: the API admits only point (`at`) or history
+   * (`from`+`to`+`columns`) shapes, a bare token is a 400. */
+  at: string;
   onPatch: (patch: Partial<UiState>) => void;
 }) {
   const { t } = useTranslation();
@@ -630,7 +634,7 @@ function RowDock(props: {
   const entity = useEntity({
     view: props.state.view,
     entity: props.state.entity ?? "",
-    at: props.state.at ?? undefined,
+    at: props.at,
     includeRelated: true,
     cursor: historyCursor,
   });
@@ -684,12 +688,16 @@ function RowDock(props: {
         }}
       >
         <span style={{ color: "var(--fg-dim)" }}>{t(`tabs.${viewCode}`)}</span>
-        {" · "}
-        <span style={{ fontWeight: 600 }}>
-          {label ?? shortEntity(props.state.entity ?? "—")}
-        </span>
+        {label !== null && (
+          <>
+            {" · "}
+            <span style={{ fontWeight: 600 }}>{label}</span>
+          </>
+        )}
       </div>
-      {label !== null && props.state.entity !== null && (
+      {/* The entity token is routing material — short secondary line with
+          the full value in the tooltip, never the heading. */}
+      {props.state.entity !== null && (
         <div
           title={props.state.entity}
           style={{
@@ -858,6 +866,7 @@ export function DockOverlay(props: DockOverlayProps) {
         <RowDock
           state={props.state}
           view={props.view}
+          at={props.at}
           onPatch={props.onPatch}
         />
       )}
