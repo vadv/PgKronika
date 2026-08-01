@@ -25,6 +25,17 @@ export interface DockOverlayProps {
   onPatch: (patch: Partial<UiState>) => void;
 }
 
+/** Localized incident title from the server's language-neutral summary code;
+ * the binary provenance key never renders as a headline. */
+function incidentTitle(
+  incident: IncidentResponse,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  return t(`incident.summary.${incident.summary_code}`, {
+    defaultValue: incident.summary_code,
+  });
+}
+
 /** Server incident level → color: the only severity source for incidents. */
 function levelColor(level: string): string {
   if (level === "critical") return "var(--sev-crit)";
@@ -223,9 +234,24 @@ function IncidentDetail(props: {
       </button>
       <div
         style={{
-          fontFamily: "var(--mono-font)",
+          fontFamily: "var(--ui-font)",
+          fontWeight: 600,
           marginBlockEnd: "4px",
           overflowWrap: "anywhere",
+        }}
+      >
+        {incidentTitle(incident, t)}
+      </div>
+      <div
+        title={incident.incident_key}
+        style={{
+          fontFamily: "var(--mono-font)",
+          fontSize: "var(--text-xs)",
+          color: "var(--fg-dim)",
+          marginBlockEnd: "6px",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
         }}
       >
         {incident.incident_key}
@@ -339,8 +365,11 @@ function IncidentsDock(props: {
             cursor: "pointer",
           }}
         >
-          <div style={{ fontFamily: "var(--mono-font)" }}>
-            {incident.incident_key}
+          <div
+            title={incident.incident_key}
+            style={{ fontFamily: "var(--ui-font)", overflowWrap: "anywhere" }}
+          >
+            {incidentTitle(incident, t)}
           </div>
           <div
             style={{ fontFamily: "var(--mono-font)", color: "var(--fg-dim)" }}

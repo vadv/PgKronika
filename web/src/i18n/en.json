@@ -112,5 +112,11 @@
   "pageheader.matched": "matched",
   "pageheader.matchedHint": "Rows in the retained snapshot for the current filter",
   "sidebar.expand": "expand navigation",
-  "sidebar.collapse": "collapse navigation"
+  "sidebar.collapse": "collapse navigation",
+  "incident.summary.anomaly.os_cpu.irq": "CPU: hardware interrupts",
+  "incident.summary.anomaly.os_cpu.softirq": "CPU: software interrupts",
+  "incident.summary.anomaly.os_cpu.load": "CPU: high load",
+  "incident.summary.anomaly.os_psi.io": "I/O pressure",
+  "incident.summary.anomaly.pg.locks": "Lock contention",
+  "incident.summary.anomaly.pg.autovacuum": "Autovacuum backlog"
 }

@@ -8,6 +8,7 @@ test("renders key, interval and the first finding scope", () => {
     <FocusBar
       incident={makeIncident({
         incident_key: "incident-42",
+        summary_code: "anomaly.os_cpu.irq",
         interval: { from: 1_722_400_000_000_000, to: 1_722_403_600_000_000 },
         findings: [
           makeIncidentFinding({
@@ -23,7 +24,10 @@ test("renders key, interval and the first finding scope", () => {
     />,
   );
   expect(screen.getByRole("status")).toBeDefined();
-  expect(screen.getByText("incident-42")).toBeDefined();
+  // The bar shows the localized summary title; the binary key stays out of
+  // the headline.
+  expect(screen.getByText("anomaly.os_cpu.irq")).toBeDefined();
+  expect(screen.queryByText("incident-42")).toBeNull();
   expect(screen.getByText("pg_stat_database·xact")).toBeDefined();
   const interval = `${formatIntervalTime(1_722_400_000_000_000)}→${formatIntervalTime(1_722_403_600_000_000)}`;
   expect(screen.getByText(interval)).toBeDefined();

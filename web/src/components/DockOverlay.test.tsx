@@ -100,16 +100,16 @@ test("incident list opens the detail and back returns", async () => {
     onSelectIncident,
   });
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: /incident-1/ })).toBeDefined(),
+    expect(screen.getByRole("button", { name: /summary/ })).toBeDefined(),
   );
-  fireEvent.click(screen.getByRole("button", { name: /incident-1/ }));
+  fireEvent.click(screen.getByRole("button", { name: /summary/ }));
   expect(onSelectIncident).toHaveBeenCalledWith("incident-1");
   expect(screen.getByText("lens-1")).toBeDefined();
 
   fireEvent.click(screen.getByRole("button", { name: "dock.incidents.back" }));
   expect(onSelectIncident).toHaveBeenCalledWith(null);
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: /incident-1/ })).toBeDefined(),
+    expect(screen.getByRole("button", { name: /summary/ })).toBeDefined(),
   );
 });
 
@@ -118,9 +118,9 @@ test("finding jump patches the view and focuses the incident", async () => {
   const onPatch = vi.fn();
   renderDock({ state: { ...baseState, dock: "incidents" }, onPatch });
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: /incident-1/ })).toBeDefined(),
+    expect(screen.getByRole("button", { name: /summary/ })).toBeDefined(),
   );
-  fireEvent.click(screen.getByRole("button", { name: /incident-1/ }));
+  fireEvent.click(screen.getByRole("button", { name: /summary/ }));
   fireEvent.click(screen.getByRole("button", { name: "dock.incidents.jump" }));
   expect(onPatch).toHaveBeenCalledWith({
     view: "locks",

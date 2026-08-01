@@ -253,11 +253,15 @@ function Shell() {
               <span
                 style={{
                   display: "block",
-                  fontFamily: "var(--mono-font)",
+                  fontFamily: "var(--ui-font)",
                   fontSize: "var(--text-sm)",
+                  overflowWrap: "anywhere",
                 }}
+                title={incident.incident_key}
               >
-                {incident.incident_key}
+                {t(`incident.summary.${incident.summary_code}`, {
+                  defaultValue: incident.summary_code,
+                })}
               </span>
               <span
                 style={{
