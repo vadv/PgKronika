@@ -60,6 +60,14 @@ export function formatCellValue(
   if (column.code === "category_code" && typeof value === "string") {
     return eventKindLabel(t, value);
   }
+  // pg_stat_activity.state / pg_stat_progress_vacuum.phase are wire enums:
+  // localized labels, the machine form stays for the tooltip.
+  if (column.code === "state" && typeof value === "string") {
+    return t(`pg.state.${value}`, { defaultValue: value });
+  }
+  if (column.code === "phase" && typeof value === "string") {
+    return t(`pg.vacuumPhase.${value}`, { defaultValue: value });
+  }
   if (typeof value === "number") {
     if (isPlainIntegerColumn(column.code)) return String(value);
     return formatByUnit(value, column.unit);
@@ -81,7 +89,9 @@ export function fullCellValue(
   if (
     isIdentityColumn(column.code) ||
     column.code === "severity_code" ||
-    column.code === "category_code"
+    column.code === "category_code" ||
+    column.code === "state" ||
+    column.code === "phase"
   ) {
     return String(value);
   }

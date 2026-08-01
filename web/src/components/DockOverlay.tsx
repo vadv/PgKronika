@@ -685,8 +685,8 @@ function RowDock(props: {
   // entity token is routing material — short form, full value in the title.
   const label = data !== undefined && data.label !== "" ? data.label : null;
   // statements/plans have no collected text to grow a name from: their label
-  // is the bare numeric identity. Headline it as "Запрос · <short id>", the
-  // full id stays in the field list below, uncut.
+  // is the bare numeric identity. The heading is the tab name plus a short
+  // id; the full id stays in the field list below, uncut.
   const heading =
     label !== null &&
     (viewCode === "statements" || viewCode === "plans") &&

@@ -164,6 +164,19 @@
   "verdict.evidence.age": "age {{value}}",
   "verdict.evidence.free_capacity": "{{available}} free of {{total}}",
   "verdict.why": "{{level}}: {{rule}} · {{evidence}}",
+  "pg.state.active": "active",
+  "pg.state.idle": "idle",
+  "pg.state.idle in transaction": "idle in transaction",
+  "pg.state.idle in transaction (aborted)": "idle in transaction (aborted)",
+  "pg.state.fastpath function call": "fastpath function call",
+  "pg.state.disabled": "disabled",
+  "pg.vacuumPhase.initializing": "initializing",
+  "pg.vacuumPhase.scanning heap": "scanning heap",
+  "pg.vacuumPhase.vacuuming indexes": "vacuuming indexes",
+  "pg.vacuumPhase.vacuuming heap": "vacuuming heap",
+  "pg.vacuumPhase.cleaning up indexes": "cleaning up indexes",
+  "pg.vacuumPhase.truncating heap": "truncating heap",
+  "pg.vacuumPhase.performing final cleanup": "performing final cleanup",
   "event.severity.error": "error",
   "event.severity.fatal": "FATAL",
   "event.severity.panic": "PANIC",
@@ -540,6 +553,6 @@
   "col.statements.user.desc": "Role the statement ran as (userid from pg_stat_statements)",
   "dock.row.copyToken": "copy entity token",
   "dock.row.tokenCopied": "copied",
-  "dock.row.heading.statements": "Query · {{id}}",
-  "dock.row.heading.plans": "Plan · {{id}}"
+  "dock.row.heading.statements": "{{id}}",
+  "dock.row.heading.plans": "{{id}}"
 }
