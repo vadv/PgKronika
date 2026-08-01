@@ -70,6 +70,8 @@ pub enum NotClassifiedReason {
     NotApplicable,
     /// The supplied input shape does not match the metric policy.
     InputShapeMismatch,
+    /// The counter epoch reset between the predecessor and the observation.
+    Reset,
 }
 
 /// Fixed-size operands accepted by built-in threshold policies.

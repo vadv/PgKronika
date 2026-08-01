@@ -36,12 +36,8 @@ components:
       $ref: schemas/ui.yaml#/CapabilityStatus
     CapacityPayload:
       $ref: schemas/timeline.yaml#/CapacityPayload
-    CategoricalClassificationDto:
-      $ref: schemas/ui.yaml#/CategoricalClassificationDto
     CellClassificationDto:
       $ref: schemas/ui.yaml#/CellClassificationDto
-    CellStatusDto:
-      $ref: schemas/ui.yaml#/CellStatusDto
     ClassificationResultDto:
       $ref: schemas/ui.yaml#/ClassificationResultDto
     ClassifiedResultDto:
@@ -282,8 +278,6 @@ components:
       $ref: schemas/ui.yaml#/SpineResponse
     SpineSeries:
       $ref: schemas/ui.yaml#/SpineSeries
-    SpineValueStatus:
-      $ref: schemas/ui.yaml#/SpineValueStatus
     SqlstateCountDto:
       $ref: schemas/timeline.yaml#/SqlstateCountDto
     StateTransitionPayload:

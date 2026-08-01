@@ -145,13 +145,8 @@ test("row dock renders point fields from the entity endpoint", async () => {
       view: "activity",
       entity: "db:1",
       fields: [
-        { code: "tup", reason: null, status: "available", value: 42 },
-        {
-          code: "locks",
-          reason: "producer_gap",
-          status: "unavailable",
-          value: null,
-        },
+        { code: "tup", value: 42 },
+        { code: "locks", value: null },
       ],
       quality: { status: "partial", gaps: [], gated: [] },
     }),
@@ -163,8 +158,8 @@ test("row dock renders point fields from the entity endpoint", async () => {
   expect(screen.getByText("tup")).toBeDefined();
   expect(screen.getByText("dock.row.partial")).toBeDefined();
   const missing = screen.getByText("—");
-  expect(missing.dataset.status).toBe("unavailable");
-  expect(missing.title).toBe("unavailable · producer_gap");
+  expect(missing.dataset.status).toBeUndefined();
+  expect(missing.title).toBe("");
 });
 
 test("row dock renders history snapshots when the API answers history mode", async () => {
@@ -175,14 +170,10 @@ test("row dock renders history snapshots when the API answers history mode", asy
         {
           ts_us: "1722400000000000",
           values: [10, 0],
-          statuses: ["available", "available"],
-          reasons: [null, null],
         },
         {
           ts_us: "1722400060000000",
           values: [12, null],
-          statuses: ["available", "not_collected"],
-          reasons: [null, "not_collected"],
         },
       ],
     }),
@@ -194,8 +185,7 @@ test("row dock renders history snapshots when the API answers history mode", asy
   expect(screen.getByText("locks")).toBeDefined();
   expect(screen.getByText("10")).toBeDefined();
   expect(screen.getByText("12")).toBeDefined();
-  const cells = screen.getAllByText("—");
-  expect(cells.some((c) => c.dataset.status === "not_collected")).toBe(true);
+  expect(screen.getAllByText("—").length).toBeGreaterThan(0);
 });
 
 test("mobile dock docks to the bottom as a capped sheet", () => {
@@ -218,9 +208,7 @@ test("row dock in LIVE mode sends the resolved at (point shape), not a bare toke
             view: "activity",
             entity: "db:1",
             label: "",
-            fields: [
-              { code: "tup", reason: null, status: "available", value: 42 },
-            ],
+            fields: [{ code: "tup", value: 42 }],
           }),
         ),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -249,9 +237,7 @@ test("row dock drills down via server related provenance and clears", async () =
     makeEntityPointResponse({
       view: "statements",
       entity: "db:1",
-      fields: [
-        { code: "query", reason: null, status: "available", value: "select 1" },
-      ],
+      fields: [{ code: "query", value: "select 1" }],
       related: [
         {
           view: "plans",

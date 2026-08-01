@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
-import { colDesc, colLabel, statusLabel } from "../api/codes";
+import { colDesc, colLabel } from "../api/codes";
 import { useEntity } from "../api/entity";
 import { useIncidents } from "../api/incidents";
 import type {
@@ -63,11 +63,6 @@ function levelColor(level: string): string {
   if (level === "critical") return "var(--sev-crit)";
   if (level === "warning") return "var(--sev-warn)";
   return "var(--border)";
-}
-
-/** Entity field status → color: honest null/missing fields stay dim. */
-function fieldStatusColor(status: string): string {
-  return status === "available" ? "var(--fg)" : "var(--fg-dim)";
 }
 
 function formatEvidence(
@@ -498,15 +493,9 @@ function EntityPointView(props: {
               {label}
             </span>
             <span
-              data-status={field.status}
-              title={
-                field.status !== "available"
-                  ? `${statusLabel(t, field.status)}${field.reason !== null ? ` · ${statusLabel(t, field.reason)}` : ""}`
-                  : undefined
-              }
               style={{
                 fontFamily: "var(--mono-font)",
-                color: fieldStatusColor(field.status),
+                color: field.value !== null ? "var(--fg)" : "var(--fg-dim)",
                 overflowWrap: "break-word",
               }}
             >
@@ -572,26 +561,18 @@ function EntityHistoryView(props: {
                 {formatIntervalTime(Number(snapshot.ts_us))}
               </td>
               {data.columns.map((column, i) => {
-                const status = snapshot.statuses[i] ?? "unavailable";
-                const reason = snapshot.reasons[i] ?? null;
+                const value = snapshot.values[i] ?? null;
                 const spec = props.columns.get(column);
                 return (
                   <td
                     key={column}
-                    data-status={status}
-                    title={
-                      status !== "available"
-                        ? `${statusLabel(t, status)}${reason !== null ? ` · ${statusLabel(t, reason)}` : ""}`
-                        : undefined
-                    }
                     style={{
                       ...historyCellStyle,
-                      cursor: status !== "available" ? "help" : undefined,
-                      color: fieldStatusColor(status),
+                      color: value !== null ? "var(--fg)" : "var(--fg-dim)",
                     }}
                   >
                     {formatCellValue(
-                      snapshot.values[i] ?? null,
+                      value,
                       {
                         code: column,
                         type: spec?.type ?? "text",

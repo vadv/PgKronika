@@ -410,8 +410,6 @@ export function TableView(props: TableViewProps) {
                   const classification = row.classifications.find(
                     (c) => c.column === column.code,
                   );
-                  const cellStatus = row.cell_statuses[cellIndex];
-                  const meta = columnMeta.get(column.code);
                   const tint =
                     classification !== undefined
                       ? verdictTintOf(classification.result)
@@ -428,28 +426,12 @@ export function TableView(props: TableViewProps) {
                     <td
                       key={column.code}
                       title={
-                        value === null
-                          ? cellStatus !== undefined &&
-                            cellStatus.status !== "available"
-                            ? nullReasonTitle(
-                                cellStatus.status,
-                                cellStatus.reason,
-                                t,
-                              )
-                            : notClassified !== undefined
-                              ? nullReasonTitle(
-                                  notClassified.status,
-                                  notClassified.reason,
-                                  t,
-                                )
-                              : meta !== undefined &&
-                                  meta.availability !== "available"
-                                ? nullReasonTitle(
-                                    meta.availability,
-                                    meta.reason,
-                                    t,
-                                  )
-                                : undefined
+                        value === null && notClassified !== undefined
+                          ? nullReasonTitle(
+                              notClassified.status,
+                              notClassified.reason,
+                              t,
+                            )
                           : (full ?? whyTitle(classification?.result, t))
                       }
                       style={{

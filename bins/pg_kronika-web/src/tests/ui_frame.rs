@@ -713,10 +713,14 @@ fn frame_filter_does_not_search_hidden_lazy_values() {
 }
 
 #[test]
-fn frame_null_cells_have_aligned_machine_reasons() {
+fn frame_null_cells_render_bare_nulls() {
     let catalog = catalog();
-    let request = FrameRequest::parse("processes", Some("at=20&columns=pss&sort=pss"), &catalog)
-        .expect("request");
+    let request = FrameRequest::parse(
+        "processes",
+        Some("at=20&columns=read_bytes_per_second&sort=read_bytes_per_second"),
+        &catalog,
+    )
+    .expect("request");
     let input = ProjectionInput::single(
         20,
         "os_process",
@@ -734,17 +738,11 @@ fn frame_null_cells_have_aligned_machine_reasons() {
     .expect("serialize");
 
     assert_eq!(body["rows"][0]["cells"][0], serde_json::Value::Null);
-    assert_eq!(
-        body["rows"][0]["cell_statuses"][0],
-        serde_json::json!({
-            "status": "unavailable",
-            "reason": "not_collected",
-        })
-    );
+    assert!(body["rows"][0].get("cell_statuses").is_none());
 }
 
 #[test]
-fn frame_returns_server_owned_categorical_classifications() {
+fn frame_returns_stable_event_codes_as_plain_cells() {
     let catalog = catalog();
     let request = FrameRequest::parse(
         "events",
@@ -767,24 +765,50 @@ fn frame_returns_server_owned_categorical_classifications() {
     )
     .expect("serialize");
 
+    assert_eq!(body["rows"][0]["cells"][0], "warning");
+    assert_eq!(body["rows"][0]["cells"][1], "pg.log.error_group_observed");
+    assert!(body["rows"][0].get("categorical_classifications").is_none());
+}
+
+#[test]
+fn reset_counter_classifies_with_the_reset_reason() {
+    let request =
+        FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(5)),
+            ("total_exec_time", Value::F64(10.0)),
+        ]),
+    );
+    input.push_previous(
+        10,
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(50)),
+            ("total_exec_time", Value::F64(100.0)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    let body = serde_json::to_value(
+        FrameResponse::from_projected(&request, &catalog(), &frame).expect("response"),
+    )
+    .expect("serialize");
+
+    assert_eq!(body["rows"][0]["cells"][0], serde_json::Value::Null);
     assert_eq!(
-        body["rows"][0]["categorical_classifications"],
-        serde_json::json!([
-            {
-                "column": "severity_code",
-                "status": "classified",
-                "code": "warning",
-                "level": "warning",
-                "reason": null,
-            },
-            {
-                "column": "category_code",
-                "status": "classified",
-                "code": "pg.log.error_group_observed",
-                "level": "warning",
-                "reason": null,
-            }
-        ])
+        body["rows"][0]["classifications"][0]["result"]["reason"],
+        "reset"
     );
 }
 

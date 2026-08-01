@@ -581,21 +581,10 @@ export interface components {
             /** Format: int64 */
             total_bytes: number;
         };
-        CategoricalClassificationDto: {
-            code: string | null;
-            column: string;
-            level: string | null;
-            reason: string | null;
-            status: string;
-        };
         CellClassificationDto: {
             column: string;
             metric: string;
             result: components["schemas"]["ClassificationResultDto"];
-        };
-        CellStatusDto: {
-            reason: string | null;
-            status: string;
         };
         ClassificationResultDto: components["schemas"]["ClassifiedResultDto"] | components["schemas"]["NotClassifiedResultDto"];
         ClassifiedResultDto: {
@@ -792,8 +781,6 @@ export interface components {
         };
         EntityFieldDto: {
             code: string;
-            reason: string | null;
-            status: string;
             value: components["schemas"]["FrameValue"];
         };
         EntityGapDto: {
@@ -838,8 +825,6 @@ export interface components {
         };
         EntityResponse: components["schemas"]["EntityPointResponse"] | components["schemas"]["EntityHistoryResponse"];
         EntitySnapshotDto: {
-            reasons: (string | null)[];
-            statuses: string[];
             ts_us: string;
             values: components["schemas"]["FrameValue"][];
         };
@@ -1025,8 +1010,6 @@ export interface components {
             view: string;
         };
         FrameRowDto: {
-            categorical_classifications: components["schemas"]["CategoricalClassificationDto"][];
-            cell_statuses: components["schemas"]["CellStatusDto"][];
             cells: components["schemas"]["FrameValue"][];
             classifications: components["schemas"]["CellClassificationDto"][];
             entity: string;
@@ -1535,12 +1518,7 @@ export interface components {
             aggregation: string;
             code: string;
             unit: string;
-            value_statuses: components["schemas"]["SpineValueStatus"][];
             values: (number | null)[];
-        };
-        SpineValueStatus: {
-            reason?: string | null;
-            status: string;
         };
         /** @description One SQLSTATE digest entry. */
         SqlstateCountDto: {

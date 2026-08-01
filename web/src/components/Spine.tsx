@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { metricLabel, statusLabel } from "../api/codes";
+import { metricLabel } from "../api/codes";
 import { useTimelineSpine } from "../api/spine";
 import { useTimelineEvents } from "../api/timeline";
 import type { EventFact, SpineSeries } from "../api/types";
@@ -420,12 +420,7 @@ export function Spine(props: SpineProps) {
               const v = s.values[i];
               const label = metricLabel(t, "os", s.code);
               if (v === null || v === undefined) {
-                const status = s.value_statuses[i];
-                const reason =
-                  status !== undefined
-                    ? statusLabel(t, status.reason ?? status.status)
-                    : t("spine.missing");
-                return `${label}: ${t("spine.missing")} (${reason})`;
+                return `${label}: ${t("spine.missing")}`;
               }
               return `${label}: ${formatByUnit(v, s.unit)}`;
             });

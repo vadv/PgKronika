@@ -137,8 +137,8 @@ pub(crate) fn resolve_view_snapshot(
             view.revision,
             view_summary.status(),
         );
-        // The fallback belongs to the newest descriptor holding the view, which
-        // the reverse order visits first.
+        // The fallback answers "how did the newest segment see this view"
+        // when the exact snapshot cannot be resolved.
         if fallback_quality.is_none() && descriptor.min_ts <= at_us {
             fallback_quality = Some(quality);
         }

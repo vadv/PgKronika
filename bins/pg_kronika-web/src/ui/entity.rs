@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use self::cursor::EntityHistoryCursor;
-use super::catalog::{Availability, ColumnSpec, ProjectionCatalog};
+use super::catalog::ProjectionCatalog;
 use super::frame::dto::FrameValue;
 use super::frame::projection::{FrameError, FrameLimits, FrameQuality, project_entity_at};
 use super::snapshot::read_summary_tolerant;
@@ -103,17 +103,12 @@ pub(crate) struct EntityHistoryResponse {
 struct EntityFieldDto {
     code: &'static str,
     value: FrameValue,
-    status: &'static str,
-    #[schema(required = true)]
-    reason: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 struct EntitySnapshotDto {
     ts_us: String,
     values: Vec<FrameValue>,
-    statuses: Vec<&'static str>,
-    reasons: Vec<Option<&'static str>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -393,14 +388,9 @@ fn entity_point(
     let fields = columns
         .iter()
         .zip(&row.values)
-        .map(|(column, (_code, value))| {
-            let (status, reason) = field_status(column, value, &projected.quality);
-            EntityFieldDto {
-                code: column.code,
-                value: value.clone(),
-                status,
-                reason,
-            }
+        .map(|(column, (_code, value))| EntityFieldDto {
+            code: column.code,
+            value: value.clone(),
         })
         .collect();
     let related = projected
@@ -543,39 +533,21 @@ fn entity_history(
             snapshots.push(EntitySnapshotDto {
                 ts_us: timestamp.to_string(),
                 values: vec![FrameValue::Null; columns.len()],
-                statuses: vec!["unavailable"; columns.len()],
-                reasons: vec![Some("producer_gap"); columns.len()],
             });
             continue;
         }
-        let Some(row) = projected.row else {
-            // The view was collected at this snapshot; the entity itself is
-            // absent (top-N eviction, exited process) — not a producer gap.
-            snapshots.push(EntitySnapshotDto {
-                ts_us: timestamp.to_string(),
-                values: vec![FrameValue::Null; columns.len()],
-                statuses: vec!["unavailable"; columns.len()],
-                reasons: vec![Some("not_observed"); columns.len()],
-            });
-            continue;
-        };
-        if label.is_empty() {
-            label.clone_from(&row.label);
-        }
-        let mut values = Vec::with_capacity(columns.len());
-        let mut statuses = Vec::with_capacity(columns.len());
-        let mut reasons = Vec::with_capacity(columns.len());
-        for (column, (_code, value)) in columns.iter().zip(row.values) {
-            let (status, reason) = field_status(column, &value, &projected.quality);
-            values.push(value);
-            statuses.push(status);
-            reasons.push(reason);
-        }
+        let row_values = projected.row.map_or_else(
+            || vec![FrameValue::Null; columns.len()],
+            |row| {
+                if label.is_empty() {
+                    label.clone_from(&row.label);
+                }
+                row.values.into_iter().map(|(_code, value)| value).collect()
+            },
+        );
         snapshots.push(EntitySnapshotDto {
             ts_us: timestamp.to_string(),
-            values,
-            statuses,
-            reasons,
+            values: row_values,
         });
     }
     combined_quality.gaps.sort_by_key(|gap| (gap.from, gap.to));
@@ -658,25 +630,6 @@ fn catalog_view<'a>(
         .iter()
         .find(|view| view.code == code)
         .ok_or(EntityError::Gone)
-}
-
-const fn field_status(
-    column: &ColumnSpec,
-    value: &FrameValue,
-    quality: &FrameQuality,
-) -> (&'static str, Option<&'static str>) {
-    if !matches!(value, FrameValue::Null) {
-        return ("available", None);
-    }
-    if !quality.gaps.is_empty() {
-        return ("unavailable", Some("producer_gap"));
-    }
-    match column.availability {
-        Availability::NotCollected => ("not_collected", Some("not_collected")),
-        Availability::UnsupportedType => ("unavailable", Some("unsupported_type")),
-        Availability::Gated => ("unavailable", Some("not_collected")),
-        Availability::Available => ("unavailable", Some("unknown")),
-    }
 }
 
 fn quality_dto(quality: &FrameQuality) -> EntityQualityDto {

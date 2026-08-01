@@ -146,8 +146,6 @@ export function makeFrameRow(
     label: "postgres",
     cells: [],
     classifications: [],
-    categorical_classifications: [],
-    cell_statuses: [],
     spark: { complete: true, values: [] },
     ...overrides,
   };
