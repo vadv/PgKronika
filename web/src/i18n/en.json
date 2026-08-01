@@ -33,6 +33,12 @@
   "spine.span.21600": "6h",
   "spine.span.86400": "24h",
   "spine.load": "Load: {{code}} ({{unit}})",
+  "spine.score.noPrev": "no prev window",
+  "spine.forming": "forming",
+  "spine.gap.producer_gap": "collection gap",
+  "spine.gap.producer_restart": "collector restart",
+  "spine.gap.collector_restart": "collector restart",
+  "spine.gap.index_pending": "index building",
   "spine.missing": "no data",
   "heatmap.metric": "Metric",
   "heatmap.partial": "partial data",
@@ -532,6 +538,8 @@
   "spine.bucketSpan": "bucket {{duration}}",
   "col.statements.database.desc": "Database the statement ran in (dbid from pg_stat_statements)",
   "col.statements.user.desc": "Role the statement ran as (userid from pg_stat_statements)",
+  "dock.row.copyToken": "copy entity token",
+  "dock.row.tokenCopied": "copied",
   "dock.row.heading.statements": "Query · {{id}}",
   "dock.row.heading.plans": "Plan · {{id}}"
 }

@@ -33,6 +33,12 @@
   "spine.span.21600": "6ч",
   "spine.span.86400": "24ч",
   "spine.load": "Нагрузка: {{code}} ({{unit}})",
+  "spine.score.noPrev": "нет пред. окна",
+  "spine.forming": "формируется",
+  "spine.gap.producer_gap": "разрыв сбора",
+  "spine.gap.producer_restart": "рестарт коллектора",
+  "spine.gap.collector_restart": "рестарт коллектора",
+  "spine.gap.index_pending": "индекс строится",
   "spine.missing": "нет данных",
   "heatmap.metric": "Метрика",
   "heatmap.partial": "данные неполные",
@@ -532,6 +538,8 @@
   "spine.bucketSpan": "бакет {{duration}}",
   "col.statements.database.desc": "База данных, в которой выполнялся запрос (dbid из pg_stat_statements)",
   "col.statements.user.desc": "Роль, от имени которой выполнялся запрос (userid из pg_stat_statements)",
+  "dock.row.copyToken": "копировать токен сущности",
+  "dock.row.tokenCopied": "скопировано",
   "dock.row.heading.statements": "Запрос · {{id}}",
   "dock.row.heading.plans": "План · {{id}}"
 }
