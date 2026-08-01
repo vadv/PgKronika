@@ -918,13 +918,29 @@ function rowsEventsView() {
   return defs.map(([minAgo, severity, type, duration, message], i) => {
     const sevCode =
       severity === "ERROR" ? 21 : severity === "WARNING" ? 17 : 13;
+    // Wire codes mirror event_severity_code/event_kind_code in the frame
+    // projection: the human text comes from the web i18n dictionaries.
+    const severityCode =
+      severity === "ERROR" ? "error" : severity === "WARNING" ? "warning" : "log";
+    const categoryCode =
+      type === 1
+        ? "pg.log.error_group_observed"
+        : type === 2
+          ? "pg.checkpoint.completed"
+          : type === 4
+            ? "pg.query.slow_group_reported"
+            : message.includes("analyze")
+              ? "pg.maintenance.autoanalyze_reported"
+              : "pg.maintenance.autovacuum_reported";
     return {
       entity: `evt:${i + 1}`,
       label: message,
       data: {
         time: String(now - minAgo * 60 * US),
         severity: sevCode,
+        severity_code: severityCode,
         type,
+        category_code: categoryCode,
         duration,
         message,
       },

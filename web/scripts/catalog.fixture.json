@@ -1,5 +1,5 @@
 {
-  "revision": 1,
+  "revision": 2,
   "views": [
     {
       "view_code": 1,
@@ -8,18 +8,32 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": false
+      },
       "inputs": [
         {
           "code": "activity",
           "logical_sections": ["pg_stat_activity"],
           "type_ids": [1001001, 1001002, 1001003],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "process",
           "logical_sections": ["os_process"],
           "type_ids": [1100001],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "replication_replicas",
+          "logical_sections": ["pg_stat_replication"],
+          "type_ids": [1016001],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "joins": [
@@ -29,6 +43,13 @@
           "fields": ["pid", "backend_start=starttime"],
           "cardinality": "zero_or_one",
           "provenance": "pid_and_process_start_match"
+        },
+        {
+          "left": "activity",
+          "right": "replication_replicas",
+          "fields": ["pid", "ts"],
+          "cardinality": "zero_or_one",
+          "provenance": "same_snapshot_walsender_pid"
         }
       ],
       "metrics": [
@@ -39,7 +60,8 @@
           "aggregation": "sum",
           "formula": "sum(observed_wait_duration_us)",
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "cpu",
@@ -48,7 +70,8 @@
           "aggregation": "max",
           "formula": "positive_delta(utime + stime) / elapsed",
           "requires": ["activity", "process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "io",
@@ -57,7 +80,8 @@
           "aggregation": "max",
           "formula": "positive_delta(read_bytes + write_bytes) / elapsed",
           "requires": ["activity", "process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "active_fraction",
@@ -66,7 +90,8 @@
           "aggregation": "max",
           "formula": "active_samples / observed_samples",
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -76,7 +101,8 @@
           "source": "activity.pid",
           "lazy": false,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "user",
@@ -84,7 +110,8 @@
           "source": "activity.usename",
           "lazy": false,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "database",
@@ -92,7 +119,8 @@
           "source": "activity.datname",
           "lazy": false,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "application",
@@ -100,7 +128,17 @@
           "source": "activity.application_name",
           "lazy": false,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "backend_type",
+          "type": "text",
+          "source": "activity.backend_type",
+          "lazy": false,
+          "requires": ["activity"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "state",
@@ -108,7 +146,8 @@
           "source": "activity.state",
           "lazy": false,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "wait_event",
@@ -116,7 +155,8 @@
           "formula": "join_non_null(wait_event_type, ':', wait_event)",
           "lazy": false,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "query",
@@ -124,7 +164,8 @@
           "source": "activity.query",
           "lazy": true,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "query_duration_us",
@@ -134,7 +175,8 @@
           "threshold_metric": "pg.activity.query_duration_seconds",
           "lazy": false,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "transaction_duration_us",
@@ -144,7 +186,8 @@
           "threshold_metric": "pg.activity.transaction_duration_seconds",
           "lazy": false,
           "requires": ["activity"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "cpu",
@@ -152,21 +195,42 @@
           "formula": "positive_delta(utime + stime) / elapsed",
           "lazy": false,
           "requires": ["activity", "process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "replication_state",
+          "type": "text",
+          "source": "replication_replicas.state",
+          "lazy": false,
+          "requires": ["activity", "replication_replicas"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "sync_state",
+          "type": "text",
+          "source": "replication_replicas.sync_state",
+          "lazy": false,
+          "requires": ["activity", "replication_replicas"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "replay_lag_us",
+          "type": "i64",
+          "source": "replication_replicas.replay_lag_us",
+          "unit": "us",
+          "lazy": false,
+          "requires": ["activity", "replication_replicas"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "presets": [
         {
           "code": "sessions",
-          "columns": [
-            "pid",
-            "user",
-            "database",
-            "application",
-            "state",
-            "query",
-            "query_duration_us"
-          ],
+          "columns": ["pid", "user", "database", "application", "state", "query", "query_duration_us"],
           "sort": {
             "column": "query_duration_us",
             "order": "desc"
@@ -174,14 +238,7 @@
         },
         {
           "code": "waits",
-          "columns": [
-            "pid",
-            "user",
-            "database",
-            "wait_event",
-            "query",
-            "query_duration_us"
-          ],
+          "columns": ["pid", "user", "database", "wait_event", "query", "query_duration_us"],
           "sort": {
             "column": "query_duration_us",
             "order": "desc"
@@ -197,25 +254,22 @@
         },
         {
           "code": "transaction_age",
-          "columns": [
-            "pid",
-            "user",
-            "database",
-            "state",
-            "transaction_duration_us"
-          ],
+          "columns": ["pid", "user", "database", "state", "transaction_duration_us"],
           "sort": {
             "column": "transaction_duration_us",
             "order": "desc"
           }
+        },
+        {
+          "code": "replication",
+          "columns": ["pid", "user", "application", "backend_type", "replication_state", "sync_state", "replay_lag_us"],
+          "sort": {
+            "column": "replay_lag_us",
+            "order": "desc"
+          }
         }
       ],
-      "canonical_metric": "active_fraction",
-      "capabilities": {
-        "detail": true,
-        "history": true,
-        "related": true
-      }
+      "canonical_metric": "active_fraction"
     },
     {
       "view_code": 2,
@@ -224,18 +278,25 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      },
       "inputs": [
         {
           "code": "statements",
           "logical_sections": ["pg_stat_statements"],
           "type_ids": [1002001, 1002002, 1002003, 1002004, 1002005, 1002006],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "settings",
           "logical_sections": ["pg_settings"],
           "type_ids": [1019001],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "joins": [],
@@ -247,7 +308,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(total_exec_time))",
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "calls",
@@ -256,7 +318,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(calls))",
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "io",
@@ -265,7 +328,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(shared_blks_read + local_blks_read))",
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "temp",
@@ -274,7 +338,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(temp_blks_written))",
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -284,7 +349,8 @@
           "source": "statements.queryid",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "query",
@@ -292,7 +358,8 @@
           "source": "statements.query",
           "lazy": true,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "calls",
@@ -300,7 +367,8 @@
           "formula": "positive_delta(calls)",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "total",
@@ -308,7 +376,8 @@
           "formula": "positive_delta(total_exec_time)",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "ms_per_row",
@@ -318,7 +387,8 @@
           "threshold_metric": "pg.statements.milliseconds_per_row",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "mean",
@@ -328,7 +398,8 @@
           "threshold_metric": "pg.statements.mean_time_ms",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "time_pct",
@@ -338,7 +409,8 @@
           "threshold_metric": "pg.statements.time_pct",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "plan_time_pct",
@@ -348,7 +420,8 @@
           "threshold_metric": "pg.statements.plan_time_pct",
           "lazy": false,
           "requires": ["statements", "settings"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "rows",
@@ -356,7 +429,8 @@
           "formula": "positive_delta(rows)",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "hit_pct",
@@ -364,7 +438,8 @@
           "formula": "100 * positive_delta(shared_blks_hit) / max(positive_delta(shared_blks_hit + shared_blks_read), 1)",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "blks_read",
@@ -372,7 +447,8 @@
           "formula": "positive_delta(shared_blks_read + local_blks_read)",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "temp_written",
@@ -380,7 +456,8 @@
           "formula": "positive_delta(temp_blks_written)",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "wal_bytes",
@@ -388,23 +465,14 @@
           "formula": "positive_delta(wal_bytes)",
           "lazy": false,
           "requires": ["statements"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "presets": [
         {
           "code": "time",
-          "columns": [
-            "queryid",
-            "query",
-            "calls",
-            "total",
-            "mean",
-            "ms_per_row",
-            "time_pct",
-            "plan_time_pct",
-            "rows"
-          ],
+          "columns": ["queryid", "query", "calls", "total", "mean", "ms_per_row", "time_pct", "plan_time_pct", "rows"],
           "sort": {
             "column": "total",
             "order": "desc"
@@ -435,12 +503,7 @@
           }
         }
       ],
-      "canonical_metric": "time",
-      "capabilities": {
-        "detail": true,
-        "history": true,
-        "related": true
-      }
+      "canonical_metric": "time"
     },
     {
       "view_code": 3,
@@ -449,12 +512,18 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": false
+      },
       "inputs": [
         {
           "code": "plans",
           "logical_sections": ["pg_store_plans_ossc", "pg_store_plans_vadv"],
           "type_ids": [1003001, 1004001],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "joins": [],
@@ -466,7 +535,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(total_time)) * 1000",
           "requires": ["plans"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "calls",
@@ -475,7 +545,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(calls))",
           "requires": ["plans"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -485,7 +556,8 @@
           "source": "plans.planid",
           "lazy": false,
           "requires": ["plans"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "plan",
@@ -493,7 +565,8 @@
           "source": "plans.plan",
           "lazy": true,
           "requires": ["plans"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "queryid",
@@ -501,7 +574,8 @@
           "formula": "coalesce(queryid, queryid_stat_statements)",
           "lazy": false,
           "requires": ["plans"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "calls",
@@ -509,7 +583,8 @@
           "formula": "positive_delta(calls)",
           "lazy": false,
           "requires": ["plans"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "mean",
@@ -517,7 +592,8 @@
           "formula": "positive_delta(total_time) / max(positive_delta(calls), 1)",
           "lazy": false,
           "requires": ["plans"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "rows",
@@ -525,7 +601,46 @@
           "formula": "positive_delta(rows)",
           "lazy": false,
           "requires": ["plans"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "shared_hit",
+          "type": "f64",
+          "formula": "positive_delta(shared_blks_hit)",
+          "unit": "blocks",
+          "lazy": false,
+          "requires": ["plans"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "shared_read",
+          "type": "f64",
+          "formula": "positive_delta(shared_blks_read)",
+          "unit": "blocks",
+          "lazy": false,
+          "requires": ["plans"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "first_seen",
+          "type": "timestamp",
+          "source": "plans.first_call",
+          "lazy": false,
+          "requires": ["plans"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "last_seen",
+          "type": "timestamp",
+          "source": "plans.last_call",
+          "lazy": false,
+          "requires": ["plans"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "presets": [
@@ -539,9 +654,9 @@
         },
         {
           "code": "io",
-          "columns": ["planid", "plan", "queryid", "calls"],
+          "columns": ["planid", "plan", "queryid", "calls", "shared_hit", "shared_read"],
           "sort": {
-            "column": "calls",
+            "column": "shared_read",
             "order": "desc"
           }
         },
@@ -562,12 +677,7 @@
           }
         }
       ],
-      "canonical_metric": "time",
-      "capabilities": {
-        "detail": true,
-        "history": true,
-        "related": true
-      }
+      "canonical_metric": "time"
     },
     {
       "view_code": 4,
@@ -576,12 +686,18 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": false
+      },
       "inputs": [
         {
           "code": "tables",
           "logical_sections": ["pg_stat_user_tables"],
           "type_ids": [1013001, 1013002, 1013003, 1013004],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "joins": [],
@@ -593,7 +709,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(heap_blks_read + idx_blks_read + toast_blks_read + tidx_blks_read))",
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "writes",
@@ -602,7 +719,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(n_tup_ins + n_tup_upd + n_tup_del))",
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "dead",
@@ -611,7 +729,8 @@
           "aggregation": "max",
           "formula": "max(n_dead_tup / max(n_live_tup + n_dead_tup, 1))",
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -621,7 +740,18 @@
           "formula": "qualify(schemaname, relname)",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "size",
+          "type": "i64",
+          "source": "tables.main_fork_bytes",
+          "unit": "bytes",
+          "lazy": false,
+          "requires": ["tables"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "seq_scan",
@@ -629,7 +759,8 @@
           "source": "tables.seq_scan",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "idx_scan",
@@ -637,7 +768,8 @@
           "source": "tables.idx_scan",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "dead_pct",
@@ -647,7 +779,38 @@
           "threshold_metric": "pg.tables.dead_tuple_pct",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "io_hit_pct",
+          "type": "f64",
+          "formula": "100 * positive_delta(heap_blks_hit + idx_blks_hit) / max(positive_delta(heap_blks_hit + idx_blks_hit + heap_blks_read + idx_blks_read), 1)",
+          "unit": "percent",
+          "lazy": false,
+          "requires": ["tables"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "xid_age",
+          "type": "i64",
+          "source": "tables.xid_age",
+          "unit": "transactions",
+          "lazy": false,
+          "requires": ["tables"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "mxid_age",
+          "type": "i64",
+          "source": "tables.mxid_age",
+          "unit": "multixacts",
+          "lazy": false,
+          "requires": ["tables"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "dead_tuples",
@@ -657,7 +820,8 @@
           "threshold_metric": "pg.tables.dead_tuples",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "seq_scan_pct",
@@ -667,7 +831,8 @@
           "threshold_metric": "pg.tables.sequential_scan_pct",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "modified_since_analyze",
@@ -677,7 +842,8 @@
           "threshold_metric": "pg.tables.modified_since_analyze",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "inserted_since_vacuum",
@@ -687,7 +853,8 @@
           "threshold_metric": "pg.tables.inserted_since_vacuum",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "last_autovacuum",
@@ -695,7 +862,8 @@
           "source": "tables.last_autovacuum",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "autovacuum_age_seconds",
@@ -705,7 +873,8 @@
           "threshold_metric": "pg.tables.autovacuum_age_seconds",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "autoanalyze_age_seconds",
@@ -715,20 +884,14 @@
           "threshold_metric": "pg.tables.autoanalyze_age_seconds",
           "lazy": false,
           "requires": ["tables"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "presets": [
         {
           "code": "activity",
-          "columns": [
-            "relation",
-            "seq_scan",
-            "idx_scan",
-            "seq_scan_pct",
-            "dead_pct",
-            "dead_tuples"
-          ],
+          "columns": ["relation", "seq_scan", "idx_scan", "seq_scan_pct", "dead_pct", "dead_tuples"],
           "sort": {
             "column": "dead_pct",
             "order": "desc"
@@ -736,12 +899,7 @@
         },
         {
           "code": "writes",
-          "columns": [
-            "relation",
-            "modified_since_analyze",
-            "inserted_since_vacuum",
-            "dead_pct"
-          ],
+          "columns": ["relation", "modified_since_analyze", "inserted_since_vacuum", "dead_pct"],
           "sort": {
             "column": "inserted_since_vacuum",
             "order": "desc"
@@ -766,19 +924,22 @@
         },
         {
           "code": "io",
-          "columns": ["relation", "seq_scan", "idx_scan", "seq_scan_pct"],
+          "columns": ["relation", "seq_scan", "idx_scan", "seq_scan_pct", "io_hit_pct"],
           "sort": {
-            "column": "seq_scan_pct",
+            "column": "io_hit_pct",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "size",
+          "columns": ["relation", "size", "dead_pct", "xid_age", "mxid_age"],
+          "sort": {
+            "column": "size",
             "order": "desc"
           }
         }
       ],
-      "canonical_metric": "writes",
-      "capabilities": {
-        "detail": true,
-        "history": true,
-        "related": true
-      }
+      "canonical_metric": "writes"
     },
     {
       "view_code": 5,
@@ -787,12 +948,18 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": false
+      },
       "inputs": [
         {
           "code": "indexes",
           "logical_sections": ["pg_stat_user_indexes"],
           "type_ids": [1014001, 1014002],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "joins": [],
@@ -804,7 +971,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(idx_blks_read))",
           "requires": ["indexes"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "scans",
@@ -813,7 +981,8 @@
           "aggregation": "sum",
           "formula": "sum(positive_delta(idx_scan))",
           "requires": ["indexes"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -823,7 +992,8 @@
           "source": "indexes.indexrelname",
           "lazy": false,
           "requires": ["indexes"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "table",
@@ -831,7 +1001,18 @@
           "source": "indexes.relname",
           "lazy": false,
           "requires": ["indexes"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "size",
+          "type": "i64",
+          "source": "indexes.main_fork_bytes",
+          "unit": "bytes",
+          "lazy": false,
+          "requires": ["indexes"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "scans",
@@ -839,7 +1020,8 @@
           "formula": "positive_delta(idx_scan)",
           "lazy": false,
           "requires": ["indexes"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "rows_per_scan",
@@ -847,7 +1029,27 @@
           "formula": "positive_delta(idx_tup_read) / max(positive_delta(idx_scan), 1)",
           "lazy": false,
           "requires": ["indexes"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "io_hit_pct",
+          "type": "f64",
+          "formula": "100 * positive_delta(idx_blks_hit) / max(positive_delta(idx_blks_hit + idx_blks_read), 1)",
+          "unit": "percent",
+          "lazy": false,
+          "requires": ["indexes"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "last_idx_scan",
+          "type": "timestamp",
+          "source": "indexes.last_idx_scan",
+          "lazy": false,
+          "requires": ["indexes"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "presets": [
@@ -868,20 +1070,23 @@
           }
         },
         {
-          "code": "io",
-          "columns": ["index", "table", "scans"],
+          "code": "size",
+          "columns": ["index", "table", "size", "scans", "last_idx_scan"],
           "sort": {
-            "column": "scans",
+            "column": "size",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "io",
+          "columns": ["index", "table", "scans", "io_hit_pct"],
+          "sort": {
+            "column": "io_hit_pct",
             "order": "desc"
           }
         }
       ],
-      "canonical_metric": "scans",
-      "capabilities": {
-        "detail": true,
-        "history": true,
-        "related": true
-      }
+      "canonical_metric": "scans"
     },
     {
       "view_code": 6,
@@ -890,15 +1095,36 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": false,
+        "related": false
+      },
       "inputs": [
         {
           "code": "vacuum",
           "logical_sections": ["pg_stat_progress_vacuum"],
           "type_ids": [1012001],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "tables",
+          "logical_sections": ["pg_stat_user_tables"],
+          "type_ids": [1013001, 1013002, 1013003, 1013004],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
-      "joins": [],
+      "joins": [
+        {
+          "left": "vacuum",
+          "right": "tables",
+          "fields": ["datid", "relid", "ts"],
+          "cardinality": "zero_or_one",
+          "provenance": "same_snapshot_database_relation_oid"
+        }
+      ],
       "metrics": [
         {
           "code": "progress",
@@ -907,7 +1133,8 @@
           "aggregation": "max",
           "formula": "max(heap_blks_scanned / max(heap_blks_total, 1))",
           "requires": ["vacuum"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -917,7 +1144,8 @@
           "source": "vacuum.pid",
           "lazy": false,
           "requires": ["vacuum"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "table",
@@ -925,7 +1153,17 @@
           "source": "vacuum.relid",
           "lazy": false,
           "requires": ["vacuum"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "relation",
+          "type": "text",
+          "formula": "qualify(tables.schemaname, tables.relname) by same (datid, relid, ts)",
+          "lazy": false,
+          "requires": ["vacuum", "tables"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "phase",
@@ -933,7 +1171,8 @@
           "source": "vacuum.phase",
           "lazy": false,
           "requires": ["vacuum"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "is_autovacuum",
@@ -941,7 +1180,8 @@
           "source": "vacuum.is_autovacuum",
           "lazy": false,
           "requires": ["vacuum"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "progress",
@@ -949,7 +1189,8 @@
           "formula": "heap_blks_scanned / max(heap_blks_total, 1)",
           "lazy": false,
           "requires": ["vacuum"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "dead_tuples",
@@ -957,13 +1198,23 @@
           "formula": "coalesce(num_dead_tuples, num_dead_item_ids)",
           "lazy": false,
           "requires": ["vacuum"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "elapsed",
+          "type": "f64",
+          "formula": "snapshot_ts - proven_vacuum_start",
+          "lazy": false,
+          "requires": [],
+          "availability": "gated",
+          "unavailable_reason": "missing_provenance"
         }
       ],
       "presets": [
         {
           "code": "progress",
-          "columns": ["pid", "table", "phase", "progress", "dead_tuples"],
+          "columns": ["pid", "relation", "phase", "progress", "dead_tuples", "elapsed"],
           "sort": {
             "column": "progress",
             "order": "desc"
@@ -971,7 +1222,7 @@
         },
         {
           "code": "phase",
-          "columns": ["pid", "table", "phase", "progress"],
+          "columns": ["pid", "relation", "phase", "progress", "elapsed"],
           "sort": {
             "column": "phase",
             "order": "asc"
@@ -979,19 +1230,14 @@
         },
         {
           "code": "dead_tuples",
-          "columns": ["pid", "table", "dead_tuples", "progress"],
+          "columns": ["pid", "relation", "dead_tuples", "progress", "elapsed"],
           "sort": {
             "column": "dead_tuples",
             "order": "desc"
           }
         }
       ],
-      "canonical_metric": "progress",
-      "capabilities": {
-        "detail": true,
-        "history": true,
-        "related": true
-      }
+      "canonical_metric": "progress"
     },
     {
       "view_code": 7,
@@ -1000,15 +1246,36 @@
       "scope": "host",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": false
+      },
       "inputs": [
         {
           "code": "process",
           "logical_sections": ["os_process"],
           "type_ids": [1100001],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "cgroup_mapping",
+          "logical_sections": ["os_cgroup_mapping"],
+          "type_ids": [1200001],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
-      "joins": [],
+      "joins": [
+        {
+          "left": "process",
+          "right": "cgroup_mapping",
+          "fields": ["pid", "starttime", "ts"],
+          "cardinality": "zero_or_one",
+          "provenance": "same_snapshot_pid_and_process_start"
+        }
+      ],
       "metrics": [
         {
           "code": "cpu",
@@ -1017,7 +1284,8 @@
           "aggregation": "max",
           "formula": "positive_delta(utime + stime) / elapsed",
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "io",
@@ -1026,7 +1294,8 @@
           "aggregation": "max",
           "formula": "positive_delta(read_bytes + write_bytes) / elapsed",
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -1036,7 +1305,8 @@
           "source": "process.pid",
           "lazy": false,
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "type",
@@ -1044,7 +1314,8 @@
           "source": "process.comm",
           "lazy": false,
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "cpu",
@@ -1052,7 +1323,8 @@
           "formula": "positive_delta(utime + stime) / elapsed",
           "lazy": false,
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "rss",
@@ -1062,7 +1334,18 @@
           "threshold_metric": "os.process.rss_kib",
           "lazy": false,
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "threads",
+          "type": "u64",
+          "source": "process.num_threads",
+          "unit": "count",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "pss",
@@ -1070,7 +1353,8 @@
           "source": "smaps_rollup.pss_kb",
           "lazy": false,
           "requires": [],
-          "availability": "not_collected"
+          "availability": "not_collected",
+          "unavailable_reason": "not_collected"
         },
         {
           "code": "read_bytes_per_second",
@@ -1078,7 +1362,8 @@
           "formula": "positive_delta(read_bytes) / elapsed",
           "lazy": false,
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "write_bytes_per_second",
@@ -1086,7 +1371,8 @@
           "formula": "positive_delta(write_bytes) / elapsed",
           "lazy": false,
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "block_delay",
@@ -1094,7 +1380,8 @@
           "formula": "positive_delta(blkdelay_ticks) / elapsed",
           "lazy": false,
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "command",
@@ -1102,13 +1389,32 @@
           "source": "process.cmdline",
           "lazy": true,
           "requires": ["process"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "cgroup",
+          "type": "text",
+          "source": "cgroup_mapping.cgroup_path",
+          "lazy": false,
+          "requires": ["process", "cgroup_mapping"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "presets": [
         {
           "code": "cpu",
-          "columns": ["pid", "type", "cpu", "rss", "threads", "read_bytes_per_second", "write_bytes_per_second", "command"],
+          "columns": [
+            "pid",
+            "type",
+            "cpu",
+            "rss",
+            "threads",
+            "read_bytes_per_second",
+            "write_bytes_per_second",
+            "command"
+          ],
           "sort": {
             "column": "cpu",
             "order": "desc"
@@ -1124,26 +1430,30 @@
         },
         {
           "code": "disk_io",
-          "columns": [
-            "pid",
-            "type",
-            "read_bytes_per_second",
-            "write_bytes_per_second",
-            "block_delay",
-            "command"
-          ],
+          "columns": ["pid", "type", "read_bytes_per_second", "write_bytes_per_second", "block_delay", "command"],
           "sort": {
             "column": "read_bytes_per_second",
             "order": "desc"
           }
+        },
+        {
+          "code": "cgroup",
+          "columns": ["pid", "type", "cgroup", "cpu", "rss", "command"],
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "threads",
+          "columns": ["pid", "type", "threads", "cpu", "rss", "command"],
+          "sort": {
+            "column": "threads",
+            "order": "desc"
+          }
         }
       ],
-      "canonical_metric": "cpu",
-      "capabilities": {
-        "detail": true,
-        "history": true,
-        "related": true
-      }
+      "canonical_metric": "cpu"
     },
     {
       "view_code": 8,
@@ -1152,12 +1462,18 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": false,
+        "related": false
+      },
       "inputs": [
         {
           "code": "locks",
           "logical_sections": ["pg_locks"],
           "type_ids": [1011001, 1011002],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "joins": [],
@@ -1169,7 +1485,8 @@
           "aggregation": "max",
           "formula": "max(proven_wait_or_hold_duration_us)",
           "requires": ["locks"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -1179,7 +1496,35 @@
           "source": "locks.pid",
           "lazy": false,
           "requires": ["locks"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "depth",
+          "type": "i64",
+          "source": "locks.depth",
+          "lazy": false,
+          "requires": ["locks"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "root_pid",
+          "type": "i64",
+          "source": "locks.root_pid",
+          "lazy": false,
+          "requires": ["locks"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "blocked_by",
+          "type": "text",
+          "source": "locks.blocked_by",
+          "lazy": false,
+          "requires": ["locks"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "user_application",
@@ -1187,7 +1532,8 @@
           "formula": "join_non_null(usename, ' / ', application_name)",
           "lazy": false,
           "requires": ["locks"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "lock",
@@ -1195,7 +1541,35 @@
           "formula": "join_non_null(wait_event_type, ':', wait_event)",
           "lazy": false,
           "requires": ["locks"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "granted",
+          "type": "bool",
+          "source": "locks.lock_granted",
+          "lazy": false,
+          "requires": ["locks"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "lock_mode",
+          "type": "text",
+          "source": "locks.lock_mode",
+          "lazy": false,
+          "requires": ["locks"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "lock_type",
+          "type": "text",
+          "source": "locks.lock_locktype",
+          "lazy": false,
+          "requires": ["locks"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "target",
@@ -1203,7 +1577,8 @@
           "source": "locks.lock_relname",
           "lazy": false,
           "requires": ["locks"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "wait_or_hold_us",
@@ -1211,7 +1586,8 @@
           "formula": "proven_wait_or_hold_duration_us",
           "lazy": false,
           "requires": ["locks"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "query",
@@ -1219,7 +1595,8 @@
           "source": "locks.query",
           "lazy": true,
           "requires": ["locks"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "presets": [
@@ -1227,8 +1604,14 @@
           "code": "tree",
           "columns": [
             "pid",
+            "depth",
+            "root_pid",
+            "blocked_by",
             "user_application",
             "lock",
+            "granted",
+            "lock_mode",
+            "lock_type",
             "target",
             "wait_or_hold_us",
             "query"
@@ -1240,7 +1623,17 @@
         },
         {
           "code": "blockers",
-          "columns": ["pid", "user_application", "target", "wait_or_hold_us"],
+          "columns": [
+            "pid",
+            "root_pid",
+            "blocked_by",
+            "user_application",
+            "granted",
+            "lock_mode",
+            "lock_type",
+            "target",
+            "wait_or_hold_us"
+          ],
           "sort": {
             "column": "wait_or_hold_us",
             "order": "desc"
@@ -1250,8 +1643,14 @@
           "code": "waiters",
           "columns": [
             "pid",
+            "depth",
+            "root_pid",
+            "blocked_by",
             "user_application",
             "lock",
+            "granted",
+            "lock_mode",
+            "lock_type",
             "target",
             "query",
             "wait_or_hold_us"
@@ -1262,12 +1661,7 @@
           }
         }
       ],
-      "canonical_metric": "wait",
-      "capabilities": {
-        "detail": true,
-        "history": true,
-        "related": true
-      }
+      "canonical_metric": "wait"
     },
     {
       "view_code": 9,
@@ -1276,6 +1670,11 @@
       "scope": "instance",
       "identity_revision": 1,
       "availability": "gated",
+      "capabilities": {
+        "detail": true,
+        "history": false,
+        "related": false
+      },
       "inputs": [
         {
           "code": "events",
@@ -1290,11 +1689,9 @@
             "pg_log_temp_files",
             "pg_log_source_status"
           ],
-          "type_ids": [
-            1022001, 1024001, 1025001, 1026001, 1027001, 1028001, 1029001,
-            1030001, 1039001
-          ],
-          "availability": "gated"
+          "type_ids": [1022001, 1024001, 1025001, 1026001, 1027001, 1028001, 1029001, 1030001, 1039001],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "joins": [],
@@ -1306,7 +1703,8 @@
           "aggregation": "sum",
           "formula": "count(events)",
           "requires": ["events"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "columns": [
@@ -1316,7 +1714,8 @@
           "source": "events.ts",
           "lazy": false,
           "requires": ["events"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "severity",
@@ -1324,7 +1723,17 @@
           "source": "events.severity",
           "lazy": false,
           "requires": ["events"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "severity_code",
+          "type": "text",
+          "source": "stable_severity_code(events.severity)",
+          "lazy": false,
+          "requires": ["events"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "type",
@@ -1332,7 +1741,17 @@
           "source": "events.category",
           "lazy": false,
           "requires": ["events"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "category_code",
+          "type": "text",
+          "source": "stable_category_code(events.category, events.kind)",
+          "lazy": false,
+          "requires": ["events"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "duration",
@@ -1340,7 +1759,8 @@
           "source": "events.duration_us",
           "lazy": false,
           "requires": ["events"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "message",
@@ -1348,13 +1768,23 @@
           "source": "events.message",
           "lazy": true,
           "requires": ["events"],
-          "availability": "gated"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "detail",
+          "type": "text",
+          "source": "events.typed_detail",
+          "lazy": true,
+          "requires": ["events"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         }
       ],
       "presets": [
         {
           "code": "errors",
-          "columns": ["time", "severity", "type", "message"],
+          "columns": ["time", "severity_code", "category_code", "message"],
           "sort": {
             "column": "time",
             "order": "desc"
@@ -1362,7 +1792,7 @@
         },
         {
           "code": "checkpoints",
-          "columns": ["time", "type", "duration", "message"],
+          "columns": ["time", "category_code", "duration", "message"],
           "sort": {
             "column": "time",
             "order": "desc"
@@ -1370,7 +1800,7 @@
         },
         {
           "code": "vacuum",
-          "columns": ["time", "type", "duration", "message"],
+          "columns": ["time", "category_code", "duration", "message"],
           "sort": {
             "column": "time",
             "order": "desc"
@@ -1378,19 +1808,14 @@
         },
         {
           "code": "slow",
-          "columns": ["time", "type", "duration", "message"],
+          "columns": ["time", "category_code", "duration", "message"],
           "sort": {
             "column": "duration",
             "order": "desc"
           }
         }
       ],
-      "canonical_metric": "count",
-      "capabilities": {
-        "detail": true,
-        "history": false,
-        "related": false
-      }
+      "canonical_metric": "count"
     }
   ]
 }
