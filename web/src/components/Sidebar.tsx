@@ -208,7 +208,9 @@ export function Sidebar(props: {
             summary={summary}
             label={t(`tabs.${v.code}`)}
             tip={tip}
-            onSelect={() => v.availability === "available" && props.onSelect(v.code)}
+            onSelect={() =>
+              v.availability === "available" && props.onSelect(v.code)
+            }
           />
         );
       })}
