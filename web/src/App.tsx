@@ -118,6 +118,26 @@ function Shell() {
     ? incidents.data?.incidents.find((i) => i.incident_key === state.focus)
     : undefined;
 
+  // View-scoped URL params: preset and sort only exist within one view's
+  // catalog. Switching the view without validating them leaves a 400-ошибку
+  // ("ошибка загрузки") in the frame — drop what the next view does not have.
+  const selectView = (code: string) => {
+    const next = views.find((v) => v.code === code);
+    const keepPreset =
+      next !== undefined &&
+      state.preset !== null &&
+      next.presets.some((p) => p.code === state.preset);
+    const keepSort =
+      next !== undefined &&
+      state.sort !== null &&
+      next.columns.some((c) => c.code === state.sort);
+    patch({
+      view: code,
+      ...(keepPreset || state.preset === null ? {} : { preset: null }),
+      ...(keepSort || state.sort === null ? {} : { sort: null, order: null }),
+    });
+  };
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       // A component that already handled the key (slider, button) owns it.
@@ -130,7 +150,7 @@ function Shell() {
       if (e.key >= "1" && e.key <= "9") {
         const view = views[Number(e.key) - 1];
         if (view !== undefined && view.availability === "available") {
-          patch({ view: view.code });
+          selectView(view.code);
         }
         return;
       }
@@ -287,7 +307,7 @@ function Shell() {
             <TabBar
               views={views}
               active={state.view}
-              onSelect={(view) => patch({ view })}
+              onSelect={selectView}
               summaries={
                 new Map((summary.data?.views ?? []).map((v) => [v.view, v]))
               }

@@ -45,8 +45,28 @@ const catalogBody = {
   revision: 1,
   views: [
     makeViewSpec({ code: "activity", view_code: 1 }),
-    makeViewSpec({ code: "statements", view_code: 2 }),
-    makeViewSpec({ code: "locks", view_code: 3 }),
+    makeViewSpec({
+      code: "statements",
+      view_code: 2,
+      presets: [
+        { code: "memory", columns: ["total"], sort: { column: "total", order: "desc" } },
+        { code: "stmt_only", columns: ["total"], sort: { column: "total", order: "desc" } },
+      ],
+      columns: [
+        {
+          availability: "available",
+          code: "total",
+          lazy: false,
+          requires: [],
+          type: "f64",
+        },
+      ],
+    }),
+    makeViewSpec({
+      code: "locks",
+      view_code: 3,
+      presets: [{ code: "memory", columns: ["total"], sort: { column: "total", order: "desc" } }],
+    }),
   ],
 };
 
@@ -230,4 +250,39 @@ test("LIVE cursor advances on the tick, not on every render", async () => {
   });
   expect(summaryFetchCount()).toBeGreaterThan(summaryCalls0);
   vi.useRealTimers();
+});
+
+test("switching view drops preset and sort the next view does not have", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=statements&preset=stmt_only&sort=total&order=desc`,
+  );
+  renderApp();
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+  );
+  expect(location.hash).toContain("preset=stmt_only");
+  fireEvent.keyDown(window, { key: "3" });
+  const params = new URLSearchParams(location.hash.slice(1));
+  expect(params.get("view")).toBe("locks");
+  expect(params.get("preset")).toBeNull();
+  expect(params.get("sort")).toBeNull();
+  expect(params.get("order")).toBeNull();
+});
+
+test("switching view keeps a preset both views share", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=statements&preset=memory`,
+  );
+  renderApp();
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+  );
+  fireEvent.keyDown(window, { key: "3" });
+  expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBe(
+    "memory",
+  );
 });
