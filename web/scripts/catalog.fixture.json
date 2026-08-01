@@ -406,7 +406,8 @@
           "lazy": false,
           "requires": ["statements"],
           "availability": "gated",
-          "unavailable_reason": "missing_extension"
+          "unavailable_reason": "missing_extension",
+          "unit": "duration_ms"
         },
         {
           "code": "ms_per_row",

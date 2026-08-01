@@ -58,6 +58,8 @@ export function formatByUnit(
       return formatDurationUs(value);
     case "ms":
       return `${trim(value)} ms`;
+    case "duration_ms":
+      return formatDurationUs(value * 1_000);
     case "seconds":
       return formatDurationUs(value * 1_000_000);
     case "percent":

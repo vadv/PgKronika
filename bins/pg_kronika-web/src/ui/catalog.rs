@@ -737,7 +737,7 @@ fn statements_view() -> ViewSpec {
             ValueType::F64,
             "positive_delta(total_exec_time)",
             &["statements"],
-            None,
+            Some("duration_ms"),
         ),
         derived_column(
             "ms_per_row",
