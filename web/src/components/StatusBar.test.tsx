@@ -23,7 +23,14 @@ const state: UiState = {
 
 test("renders keyboard hints", () => {
   render(<StatusBar state={state} summary={undefined} />);
+  expect(screen.getByRole("contentinfo")).toBeDefined();
   expect(screen.getByText(/statusbar\.hints/)).toBeDefined();
+});
+
+test("embedded content does not create a nested footer landmark", () => {
+  render(<StatusBar embedded state={state} summary={undefined} />);
+  expect(screen.queryByRole("contentinfo")).toBeNull();
+  expect(screen.getByTestId("statusbar-content").style.height).toBe("100%");
 });
 
 test("counts notable views on the right", () => {

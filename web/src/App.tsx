@@ -179,6 +179,8 @@ function Shell() {
 
   const globalContext = (
     <Header
+      embedded
+      mobile={mobile}
       range={range}
       context={context.data}
       incidents={incidents.data}
@@ -190,18 +192,17 @@ function Shell() {
       onOpenIncidents={() => patch({ dock: "incidents" })}
     />
   );
-  const primaryNavigation =
-    !mobile && catalog.isSuccess ? (
-      <PrimaryNavigation
-        groups={navigationGroups}
-        activeView={state.view}
-        isLive={state.at === null}
-        span={state.span}
-        onSelect={selectView}
-        onToggleLive={toggleLive}
-        onSelectSpan={setSpan}
-      />
-    ) : null;
+  const primaryNavigation = !mobile ? (
+    <PrimaryNavigation
+      groups={navigationGroups}
+      activeView={state.view}
+      isLive={state.at === null}
+      span={state.span}
+      onSelect={selectView}
+      onToggleLive={toggleLive}
+      onSelectSpan={setSpan}
+    />
+  ) : null;
 
   return (
     <ShellLayout
@@ -209,7 +210,7 @@ function Shell() {
       globalContext={globalContext}
       primaryNavigation={primaryNavigation}
       primaryNavigationLabel={t("navigation.primary")}
-      status={<StatusBar state={state} summary={summary.data} />}
+      status={<StatusBar embedded state={state} summary={summary.data} />}
       overlay={
         <DockOverlay
           state={state}

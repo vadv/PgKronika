@@ -70,11 +70,41 @@ test("instance chip falls back to local, shows the context hostname", () => {
   expect(screen.getByTestId("instance-chip").textContent).toContain("prod-1");
 });
 
-test("fits the fixed Global context shell region", () => {
+test("preserves its standalone banner landmark and wrapping flow", () => {
   renderHeader();
+  const content = screen.getByRole("banner");
+  expect(content).toBe(screen.getByTestId("global-context-content"));
+  expect(content.style.height).toBe("");
+  expect(content.style.flexWrap).toBe("wrap");
+});
+
+test("fits the fixed desktop Global context region when embedded", () => {
+  renderHeader({ embedded: true, mobile: false });
   const content = screen.getByTestId("global-context-content");
+  expect(screen.queryByRole("banner")).toBeNull();
   expect(content.style.height).toBe("100%");
   expect(content.style.minWidth).toBe("0");
+  expect(content.style.flexWrap).toBe("nowrap");
+});
+
+test("embedded mobile Header wraps incident chips at natural height", () => {
+  renderHeader({
+    embedded: true,
+    mobile: true,
+    incidents: makeIncidentsResponse({
+      incidents: [
+        makeIncident({ incident_key: "crit", level: "critical" }),
+        makeIncident({ incident_key: "warn", level: "warning" }),
+      ],
+    }),
+  });
+
+  const content = screen.getByTestId("global-context-content");
+  expect(screen.queryByRole("banner")).toBeNull();
+  expect(content.style.height).toBe("");
+  expect(content.style.flexWrap).toBe("wrap");
+  expect(screen.getByTestId("incidents-critical")).toBeDefined();
+  expect(screen.getByTestId("incidents-warning")).toBeDefined();
 });
 
 test("role chip shows an honest dash with the reason in the title", () => {

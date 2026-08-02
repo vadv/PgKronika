@@ -163,10 +163,100 @@ function summaryFetchCount(): number {
   }).length;
 }
 
-function renderApp() {
-  vi.stubGlobal("fetch", stubFetch());
+function renderApp(fetchImpl = stubFetch()) {
+  vi.stubGlobal("fetch", fetchImpl);
   return render(<App />);
 }
+
+test("keeps the 32px navigation and time controls on a cold catalog error", async () => {
+  const baseFetch = stubFetch();
+  const failedFetch = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    if (new URL(url).pathname === "/v1/ui/catalog") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ code: "catalog_unavailable" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return baseFetch(input);
+  });
+
+  renderApp(failedFetch);
+  await waitFor(() =>
+    expect(
+      failedFetch.mock.calls.some(([input]) =>
+        String(input instanceof Request ? input.url : input).includes(
+          "/v1/ui/catalog",
+        ),
+      ),
+    ).toBe(true),
+  );
+
+  const navigation = screen.getByRole("navigation");
+  expect(navigation.style.height).toBe("32px");
+  expect(screen.getAllByRole("tab")).toHaveLength(8);
+  expect(
+    screen
+      .getAllByRole("tab")
+      .every((tab) => tab.getAttribute("aria-disabled") === "true"),
+  ).toBe(true);
+  expect(
+    within(navigation).getByRole("button", { name: /spine\.live/i }),
+  ).toBeDefined();
+  expect(
+    within(navigation).getByRole("button", { name: /spine\.span\.86400/i }),
+  ).toBeDefined();
+});
+
+test("keeps unavailable destinations and time controls while catalog is pending", async () => {
+  const baseFetch = stubFetch();
+  let resolveCatalog: ((response: Response) => void) | undefined;
+  const pendingCatalog = new Promise<Response>((resolve) => {
+    resolveCatalog = resolve;
+  });
+  const pendingFetch = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? pendingCatalog
+      : baseFetch(input);
+  });
+
+  renderApp(pendingFetch);
+  const navigation = screen.getByRole("navigation");
+  expect(navigation.style.height).toBe("32px");
+  expect(screen.getAllByRole("tab")).toHaveLength(8);
+  expect(
+    screen
+      .getAllByRole("tab")
+      .every((tab) => tab.getAttribute("aria-disabled") === "true"),
+  ).toBe(true);
+  expect(
+    within(navigation).getByRole("button", { name: /spine\.live/i }),
+  ).toBeDefined();
+
+  await act(async () => {
+    resolveCatalog?.(jsonResponse(catalogBody));
+  });
+  await waitFor(() =>
+    expect(
+      screen
+        .getByRole("tab", { name: /tabs\.activity/i })
+        .getAttribute("aria-disabled"),
+    ).toBe("false"),
+  );
+});
 
 test("renders the shell regions from fixtures", async () => {
   renderApp();

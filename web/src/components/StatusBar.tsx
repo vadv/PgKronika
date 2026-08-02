@@ -3,6 +3,8 @@ import type { ViewSummaryResponse } from "../api/types";
 import type { UiState } from "../state/url";
 
 export interface StatusBarProps {
+  /** Render content-only when ShellLayout already owns the footer landmark. */
+  embedded?: boolean;
   state: UiState;
   summary: ViewSummaryResponse | undefined;
 }
@@ -10,10 +12,12 @@ export interface StatusBarProps {
 export function StatusBar(props: StatusBarProps) {
   const { t } = useTranslation();
   const notable = props.summary?.views.filter((v) => v.notable).length ?? 0;
+  const Root = props.embedded === true ? "div" : "footer";
   return (
-    <div
+    <Root
+      data-testid="statusbar-content"
       style={{
-        height: "100%",
+        height: props.embedded === true ? "100%" : undefined,
         display: "flex",
         alignItems: "center",
         gap: "8px",
@@ -51,6 +55,6 @@ export function StatusBar(props: StatusBarProps) {
           {t("statusbar.notable")}: {notable}
         </span>
       )}
-    </div>
+    </Root>
   );
 }

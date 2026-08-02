@@ -7,6 +7,10 @@ import { DataHealthPopover } from "./DataHealthPopover";
 import { TipRow, Tooltip } from "./Tooltip";
 
 export interface HeaderProps {
+  /** Render content-only when ShellLayout already owns the header landmark. */
+  embedded?: boolean;
+  /** Preserve wrapping and natural height in the <=760 px incident flow. */
+  mobile?: boolean;
   range: TimeRange;
   context: ContextResponse | undefined;
   incidents: IncidentsResponse | undefined;
@@ -180,6 +184,8 @@ function RoleChip(props: { context: ContextResponse | undefined }) {
 export function Header(props: HeaderProps) {
   const { t } = useTranslation();
   const health = dataHealth(props.context?.quality);
+  const Root = props.embedded === true ? "div" : "header";
+  const compact = props.embedded === true && props.mobile !== true;
 
   // Incident severity is the server's typed verdict (`level` with
   // `level_policy_revision`), never a client-side approximation from finding
@@ -192,15 +198,15 @@ export function Header(props: HeaderProps) {
   }
 
   return (
-    <div
+    <Root
       data-testid="global-context-content"
       style={{
-        height: "100%",
+        height: compact ? "100%" : undefined,
         minWidth: 0,
         display: "flex",
         alignItems: "center",
         gap: "6px",
-        flexWrap: "nowrap",
+        flexWrap: compact ? "nowrap" : "wrap",
         padding: "6px 12px",
         background: "var(--bg)",
         borderBottom: "1px solid var(--border)",
@@ -285,6 +291,6 @@ export function Header(props: HeaderProps) {
       <span style={{ flex: 1 }} />
       <Clock />
       <CopyLinkButton url={props.shareUrl} />
-    </div>
+    </Root>
   );
 }
