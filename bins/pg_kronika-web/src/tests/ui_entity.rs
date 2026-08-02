@@ -317,7 +317,7 @@ fn entity_request_rejects_bad_revision_and_ephemeral_history_before_io() {
 }
 
 #[tokio::test]
-async fn entity_point_returns_lazy_fields_and_only_proven_related_links() {
+async fn entity_point_returns_lazy_fields_and_fork_specific_best_effort_relations() {
     let directory = entity_fixture(PlanFork::Ossc);
     let entity = frame_entity_token(directory.path()).await;
     let uri = format!("/v1/entity/statements/{entity}?at=2000&include=related");

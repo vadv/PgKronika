@@ -476,8 +476,6 @@ struct ProcessIoCandidate {
     intervals: usize,
     observed_at_us: i64,
     source_window: SourceWindow,
-    postgres_backend_candidate: bool,
-    device: Option<(u64, u64)>,
 }
 
 impl ProcessIoWhoLens {
@@ -561,9 +559,9 @@ impl ProcessIoWhoLens {
         sink: &mut FindingSink<'_>,
         identity: Arc<[IdentityValue]>,
     ) -> Result<Option<ProcessIoCandidate>, LimitHit> {
-        let Some((pid, starttime)) = Self::process_identity(&identity) else {
+        if Self::process_identity(&identity).is_none() {
             return Ok(None);
-        };
+        }
         let columns = if typed.has_counter(OS_PROCESS, "cancelled_write_bytes", &identity) {
             &Self::COLUMNS[..]
         } else {
@@ -598,13 +596,29 @@ impl ProcessIoWhoLens {
             intervals: sums.intervals,
             observed_at_us,
             source_window: sums.source_window,
-            postgres_backend_candidate: typed.process_matches_postgres_backend_candidate(
-                pid,
-                starttime,
-                observed_at_us,
-            ),
-            device: Self::associated_device(typed, pid, starttime, observed_at_us, sink)?,
         }))
+    }
+
+    fn candidate_order(
+        left: &ProcessIoCandidate,
+        right: &ProcessIoCandidate,
+    ) -> std::cmp::Ordering {
+        right
+            .bytes
+            .total_cmp(&left.bytes)
+            .then_with(|| left.identity.cmp(&right.identity))
+    }
+
+    fn retain_ranked(candidates: &mut Vec<ProcessIoCandidate>, candidate: ProcessIoCandidate) {
+        let insertion = candidates
+            .partition_point(|current| Self::candidate_order(current, &candidate).is_lt());
+        if insertion >= Self::MAX_CONTRIBUTORS {
+            return;
+        }
+        if candidates.len() == Self::MAX_CONTRIBUTORS {
+            candidates.pop();
+        }
+        candidates.insert(insertion, candidate);
     }
 }
 
@@ -648,30 +662,30 @@ impl Lens for ProcessIoWhoLens {
             return Ok(());
         };
         sink.charge_points(typed.counter_identity_count(OS_PROCESS, "read_bytes"))?;
-        let identities = typed.counter_identities(OS_PROCESS, "read_bytes");
-        let mut candidates = Vec::new();
-        for identity in identities {
+        let mut candidates = Vec::with_capacity(Self::MAX_CONTRIBUTORS);
+        for identity in typed.counter_identities(OS_PROCESS, "read_bytes") {
             if let Some(candidate) = Self::candidate(typed, context, sink, identity)? {
-                candidates.push(candidate);
+                Self::retain_ranked(&mut candidates, candidate);
             }
         }
-        candidates.sort_by(|left, right| {
-            right
-                .bytes
-                .total_cmp(&left.bytes)
-                .then_with(|| left.identity.cmp(&right.identity))
-        });
-        candidates.truncate(Self::MAX_CONTRIBUTORS);
         let mut evidence = Vec::new();
         for candidate in candidates {
             let Some((pid, starttime)) = Self::process_identity(&candidate.identity) else {
                 continue;
             };
-            let category = if candidate.postgres_backend_candidate && candidate.device.is_some() {
+            let postgres_backend_candidate = typed.process_matches_postgres_backend_candidate(
+                pid,
+                starttime,
+                candidate.observed_at_us,
+                |points| sink.charge_points(points),
+            )?;
+            let device =
+                Self::associated_device(typed, pid, starttime, candidate.observed_at_us, sink)?;
+            let category = if postgres_backend_candidate && device.is_some() {
                 "postgres_backend_cgroup_device_candidates_unproven"
-            } else if candidate.postgres_backend_candidate {
+            } else if postgres_backend_candidate {
                 "postgres_backend_candidate_unproven"
-            } else if candidate.device.is_some() {
+            } else if device.is_some() {
                 "cgroup_device_candidate_unproven"
             } else {
                 "process_association"
@@ -680,7 +694,7 @@ impl Lens for ProcessIoWhoLens {
                 IdentityValue::Text(category.to_owned()),
                 IdentityValue::Text(Self::hash_identity(pid, starttime)),
             ];
-            if let Some((major, minor)) = candidate.device {
+            if let Some((major, minor)) = device {
                 public_identity.push(IdentityValue::U64(major));
                 public_identity.push(IdentityValue::U64(minor));
             }
@@ -768,6 +782,27 @@ mod tests {
             typed,
             &[lens],
             &IncidentConfig::for_test(5, 10_000_000, ClockRelation::Unknown),
+        )
+        .expect("analysis")
+    }
+
+    fn outcome_with_work_limit(
+        lens: &dyn Lens,
+        episode: EnrichedEpisode,
+        typed: &TypedInputs,
+        work_limit: u64,
+    ) -> crate::incident::EngineOutcome {
+        analyze(
+            vec![episode],
+            &SeriesSet::for_test(0),
+            typed,
+            &[lens],
+            &IncidentConfig::for_test_with_work_limit(
+                5,
+                10_000_000,
+                ClockRelation::Unknown,
+                work_limit,
+            ),
         )
         .expect("analysis")
     }
@@ -1057,5 +1092,106 @@ mod tests {
                 IdentityValue::Text("process_association".to_owned())
             );
         }
+    }
+
+    #[test]
+    fn process_io_truncates_before_discarded_cgroup_association_work() {
+        use super::super::typed::ProcessCgroupSample;
+
+        let mut typed = TypedInputs::new();
+        let mut first = None;
+        for (pid, value) in (1_i64..=9).zip([
+            900.0, 800.0, 700.0, 600.0, 500.0, 400.0, 300.0, 200.0, 100.0,
+        ]) {
+            let identity: Arc<[IdentityValue]> =
+                Arc::from(vec![IdentityValue::I64(pid), IdentityValue::I64(100)]);
+            first.get_or_insert_with(|| Arc::clone(&identity));
+            for (column, delta) in ProcessIoWhoLens::COLUMNS.iter().zip([value, 0.0, 0.0]) {
+                typed.insert_counter(
+                    OS_PROCESS,
+                    column,
+                    Arc::clone(&identity),
+                    vec![(1, point(delta)), (2, point(delta))],
+                );
+            }
+        }
+        typed.insert_process_cgroups(vec![ProcessCgroupSample {
+            ts: 2,
+            pid: 9,
+            starttime: 100,
+            cgroup_path: "/discarded".into(),
+        }]);
+        let device: Arc<[IdentityValue]> = Arc::from(vec![
+            IdentityValue::Text("/discarded".to_owned()),
+            IdentityValue::U64(8),
+            IdentityValue::U64(0),
+        ]);
+        for column in ["rbytes", "wbytes"] {
+            typed.insert_counter(
+                "os_cgroup_io",
+                column,
+                Arc::clone(&device),
+                vec![(2, point(50.0))],
+            );
+        }
+
+        let result = outcome_with_work_limit(
+            &ProcessIoWhoLens,
+            episode(
+                OS_PROCESS,
+                "read_bytes",
+                first.expect("first process identity"),
+            ),
+            &typed,
+            73,
+        );
+
+        assert!(result.complete);
+        assert_eq!(result.incidents[0].findings[0].evidence().len(), 8);
+    }
+
+    #[test]
+    fn process_io_postgres_association_charges_scanned_lookup_work() {
+        use super::super::typed::{ActivityBackend, ActivitySnapshot, SnapshotCompleteness};
+        use crate::incident::LimitAxis;
+
+        let process: Arc<[IdentityValue]> =
+            Arc::from(vec![IdentityValue::I64(7), IdentityValue::I64(100)]);
+        let mut typed = TypedInputs::new();
+        for (column, value) in ProcessIoWhoLens::COLUMNS.iter().zip([100.0, 200.0, 0.0]) {
+            typed.insert_counter(
+                OS_PROCESS,
+                column,
+                Arc::clone(&process),
+                vec![(1, point(value)), (2, point(value))],
+            );
+        }
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 2,
+            backends: vec![ActivityBackend {
+                pid: 7,
+                backend_start: 200,
+                xid_age: None,
+                xmin_age: None,
+                state: None,
+                wait_event_type: None,
+                wait_event: None,
+                xact_age_us: None,
+            }],
+            completeness: SnapshotCompleteness::Complete,
+        });
+
+        let result = outcome_with_work_limit(
+            &ProcessIoWhoLens,
+            episode(OS_PROCESS, "read_bytes", process),
+            &typed,
+            10,
+        );
+
+        assert!(!result.complete);
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].limit.axis, LimitAxis::Work);
+        assert_eq!(result.skipped[0].limit.limit, 10);
+        assert!(result.skipped[0].limit.observed > result.skipped[0].limit.limit);
     }
 }

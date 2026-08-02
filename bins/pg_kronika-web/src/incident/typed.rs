@@ -915,12 +915,11 @@ impl TypedInputs {
         &self,
         section: &'static str,
         column: &'static str,
-    ) -> Vec<Arc<[IdentityValue]>> {
+    ) -> impl Iterator<Item = Arc<[IdentityValue]>> + '_ {
         self.counters
             .keys()
-            .filter(|key| key.section == section && key.column == column)
+            .filter(move |key| key.section == section && key.column == column)
             .map(|key| Arc::clone(&key.identity))
-            .collect()
     }
 
     /// Sum `column_a` and `column_b` deltas of one series inside
@@ -1142,40 +1141,61 @@ impl TypedInputs {
         pid: i64,
         starttime: i64,
         observed_at_us: i64,
-    ) -> bool {
+        mut charge_points: impl FnMut(usize) -> Result<(), super::dispatch::LimitHit>,
+    ) -> Result<bool, super::dispatch::LimitHit> {
         if pid <= 0 || starttime <= 0 {
-            return false;
+            return Ok(false);
         }
-        if !self
-            .activity
-            .iter()
-            .filter(|snapshot| snapshot.ts == observed_at_us)
-            .any(|snapshot| snapshot.backends.iter().any(|backend| backend.pid == pid))
-        {
-            return false;
+        let mut activity_match = false;
+        'snapshots: for snapshot in &self.activity {
+            charge_points(1)?;
+            if snapshot.ts != observed_at_us {
+                continue;
+            }
+            for backend in &snapshot.backends {
+                charge_points(1)?;
+                if backend.pid == pid {
+                    activity_match = true;
+                    break 'snapshots;
+                }
+            }
         }
-        let mut candidates = self.counters.iter().filter(|(key, track)| {
-            key.section == "os_process"
-                && key.column == "read_bytes"
-                && matches!(
-                    key.identity.as_ref(),
-                    [IdentityValue::I64(candidate_pid), IdentityValue::I64(candidate_starttime)]
-                        if *candidate_pid == pid && *candidate_starttime > 0
-                )
-                && track
-                    .points
-                    .iter()
-                    .any(|point| point.end_us == observed_at_us)
-        });
-        let Some((candidate, _)) = candidates.next() else {
-            return false;
-        };
-        candidates.next().is_none()
-            && matches!(
-                candidate.identity.as_ref(),
-                [IdentityValue::I64(_), IdentityValue::I64(candidate_starttime)]
-                    if *candidate_starttime == starttime
-            )
+        if !activity_match {
+            return Ok(false);
+        }
+        let mut matched_starttime = None;
+        for (key, track) in &self.counters {
+            charge_points(1)?;
+            let [
+                IdentityValue::I64(candidate_pid),
+                IdentityValue::I64(candidate_starttime),
+            ] = key.identity.as_ref()
+            else {
+                continue;
+            };
+            if key.section != "os_process"
+                || key.column != "read_bytes"
+                || *candidate_pid != pid
+                || *candidate_starttime <= 0
+            {
+                continue;
+            }
+            let mut observed = false;
+            for point in &track.points {
+                charge_points(1)?;
+                if point.end_us == observed_at_us {
+                    observed = true;
+                    break;
+                }
+            }
+            if !observed {
+                continue;
+            }
+            if matched_starttime.replace(*candidate_starttime).is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(matched_starttime == Some(starttime))
     }
 
     pub(crate) fn insert_process_cgroups(&mut self, samples: Vec<ProcessCgroupSample>) {
@@ -2188,6 +2208,17 @@ mod tests {
         Arc::from(vec![IdentityValue::I64(pid), IdentityValue::I64(starttime)])
     }
 
+    fn postgres_process_candidate(
+        typed: &TypedInputs,
+        pid: i64,
+        starttime: i64,
+        observed_at_us: i64,
+    ) -> bool {
+        typed
+            .process_matches_postgres_backend_candidate(pid, starttime, observed_at_us, |_| Ok(()))
+            .expect("unbounded test work budget")
+    }
+
     #[test]
     fn activity_window_uses_half_open_request_bounds() {
         let mut typed = TypedInputs::new();
@@ -2219,7 +2250,7 @@ mod tests {
             vec![(10, value(1.0))],
         );
 
-        assert!(typed.process_matches_postgres_backend_candidate(7, 100, 10));
+        assert!(postgres_process_candidate(&typed, 7, 100, 10));
     }
 
     #[test]
@@ -2237,7 +2268,7 @@ mod tests {
             vec![(10, value(1.0))],
         );
 
-        assert!(!typed.process_matches_postgres_backend_candidate(7, 100, 10));
+        assert!(!postgres_process_candidate(&typed, 7, 100, 10));
     }
 
     #[test]
@@ -2257,8 +2288,8 @@ mod tests {
             );
         }
 
-        assert!(!typed.process_matches_postgres_backend_candidate(7, 100, 10));
-        assert!(!typed.process_matches_postgres_backend_candidate(7, 200, 10));
+        assert!(!postgres_process_candidate(&typed, 7, 100, 10));
+        assert!(!postgres_process_candidate(&typed, 7, 200, 10));
     }
 
     #[test]
