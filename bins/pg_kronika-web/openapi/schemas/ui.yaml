@@ -1062,6 +1062,9 @@ JoinSpec:
       items:
         type: string
       type: array
+    kind:
+      $ref: '#/RelationKind'
+      description: Maximum evidentiary strength of this relationship.
     left:
       description: Left input code.
       type: string
@@ -1074,6 +1077,7 @@ JoinSpec:
   required:
   - left
   - right
+  - kind
   - fields
   - cardinality
   - provenance
@@ -1252,6 +1256,15 @@ RelatedEntityDto:
   - entity
   - provenance
   type: object
+RelationKind:
+  description: Maximum evidentiary strength the catalog assigns to a relationship.
+  enum:
+  - exact
+  - lifetime
+  - temporal
+  - best_effort
+  - unavailable
+  type: string
 RelationProvenanceDto:
   properties:
     fields:
@@ -1259,9 +1272,12 @@ RelationProvenanceDto:
         type: string
       type: array
     kind:
+      $ref: '#/RelationKind'
+    method:
       type: string
   required:
   - kind
+  - method
   - fields
   type: object
 RetentionDto:

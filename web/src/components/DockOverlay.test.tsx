@@ -308,7 +308,8 @@ test("row dock drills down via server related provenance and clears", async () =
           entity: "plan:9",
           relation: "statement_plan",
           provenance: {
-            kind: "field_equality",
+            kind: "best_effort",
+            method: "ossc_queryid_dbid_userid_attribution",
             fields: ["queryid", "dbid", "userid"],
           },
         },

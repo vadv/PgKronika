@@ -234,6 +234,8 @@ components:
       $ref: schemas/ui.yaml#/Ranking
     RelatedEntityDto:
       $ref: schemas/ui.yaml#/RelatedEntityDto
+    RelationKind:
+      $ref: schemas/ui.yaml#/RelationKind
     RelationProvenanceDto:
       $ref: schemas/ui.yaml#/RelationProvenanceDto
     RetentionDto:
