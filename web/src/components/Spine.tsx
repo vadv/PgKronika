@@ -28,7 +28,7 @@ import {
 export interface SpineProps {
   /** Cursor timestamp (int64 µs, decimal string); null = LIVE. */
   at: string | null;
-  /** Window length in seconds (900 / 3600 / 21600 / 86400). */
+  /** Window length in integer seconds (1..86400). */
   span: number;
   /** Baseline cursor (int64 µs string); null = no baseline. */
   baseline: string | null;
@@ -154,11 +154,13 @@ export function Spine(props: SpineProps) {
   const { t } = useTranslation();
   const live = props.at === null;
   const [hoverUs, setHoverUs] = useState<number | null>(null);
-  // Wire range follows the zoom span (exact BigInt math); the 24 h bound is
-  // enforced by the span whitelist in the URL codec.
+  // Wire range follows the zoom span (exact BigInt math); the URL codec
+  // enforces the public 1 second..24 hour bound.
   const windowUs = BigInt(props.span) * 1_000_000n;
   const windowNum = props.span * 1_000_000;
-  const bucketSpanUs = windowNum / SPINE_BUCKETS;
+  // The endpoint parses `step` as u64. Ceil keeps arbitrary accepted spans
+  // integral and yields at most the requested 96 health buckets.
+  const bucketSpanUs = Math.ceil(windowNum / SPINE_BUCKETS);
   const toBig = BigInt(props.range.toUs);
   const fromBig = BigInt(props.range.fromUs);
   const from = fromBig.toString();

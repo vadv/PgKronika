@@ -302,6 +302,21 @@ test("an arbitrary replay span reaches heatmap consumers exactly", async () => {
     const params = new URL(heatmapCall ?? location.href).searchParams;
     expect(params.get("from")).toBe("1722399963000000");
     expect(params.get("to")).toBe("1722400000000000");
+
+    const healthCall = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map(([input]) =>
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href,
+      )
+      .find((url) => new URL(url).pathname === "/v1/timeline/health");
+    expect(healthCall).toBeDefined();
+    expect(new URL(healthCall ?? location.href).searchParams.get("step")).toBe(
+      "385417",
+    );
   });
 });
 
