@@ -19,7 +19,7 @@ use crate::api_error::ErrorCode;
 use crate::ui::catalog::ProjectionCatalog;
 use crate::ui::frame::FrameRequest;
 use crate::ui::frame::cursor::{FrameCursor, SortKey};
-use crate::ui::frame::dto::{ClassificationResultDto, FrameResponse};
+use crate::ui::frame::dto::{ClassificationResultDto, FrameResponse, FrameValue as DtoFrameValue};
 use crate::ui::frame::projection::{
     DeltaOperand, FrameLimits, ProjectedRow, RowOperands, StatementOperands, TableOperands,
     project_frame,
@@ -604,6 +604,156 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
             "{view} leaked a lazy field"
         );
     }
+}
+
+#[test]
+fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
+    let request = FrameRequest::parse(
+        "activity",
+        Some("at=20000000&columns=process_link,cpu"),
+        &catalog(),
+    )
+    .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "pg_stat_activity",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("backend_start", Value::Ts(1_000_000)),
+        ]),
+    );
+    input.push(
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(70)),
+            ("stime", Value::U64(50)),
+            ("read_bytes", Value::U64(900)),
+            ("write_bytes", Value::U64(500)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(20)),
+            ("stime", Value::U64(10)),
+            ("read_bytes", Value::U64(300)),
+            ("write_bytes", Value::U64(100)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![
+            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::Number(9.0),
+        ]
+    );
+}
+
+#[test]
+fn activity_rejects_ambiguous_same_snapshot_pid_process_evidence() {
+    let request = FrameRequest::parse(
+        "activity",
+        Some("at=20000000&columns=process_link,cpu"),
+        &catalog(),
+    )
+    .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "pg_stat_activity",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("backend_start", Value::Ts(1_000_000)),
+        ]),
+    );
+    for (starttime, utime, stime) in [(2_000_000, 70, 50), (3_000_000, 80, 60)] {
+        input.push(
+            "os_process",
+            out_row(&[
+                ("ts", Value::Ts(20_000_000)),
+                ("pid", Value::I64(7)),
+                ("starttime", Value::Ts(starttime)),
+                ("utime", Value::U64(utime)),
+                ("stime", Value::U64(stime)),
+            ]),
+        );
+    }
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(20)),
+            ("stime", Value::U64(10)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![DtoFrameValue::Null, DtoFrameValue::Null]
+    );
+}
+
+#[test]
+fn activity_does_not_bridge_process_counters_across_starttime() {
+    let request = FrameRequest::parse(
+        "activity",
+        Some("at=20000000&columns=process_link,cpu"),
+        &catalog(),
+    )
+    .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "pg_stat_activity",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("backend_start", Value::Ts(1_000_000)),
+        ]),
+    );
+    input.push(
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(3_000_000)),
+            ("utime", Value::U64(70)),
+            ("stime", Value::U64(50)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(20)),
+            ("stime", Value::U64(10)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![
+            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::Null,
+        ]
+    );
 }
 
 #[test]

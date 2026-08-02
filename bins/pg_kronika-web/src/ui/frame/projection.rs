@@ -987,6 +987,23 @@ fn project_activity(
     out.operands.activity_state = text(row, "state").map(str::to_owned);
     out.operands.query_start_us = timestamp(row, "query_start")?;
     out.operands.transaction_start_us = timestamp(row, "xact_start")?;
+    let needs_process = columns
+        .iter()
+        .any(|column| matches!(column.code, "process_link" | "cpu"));
+    let current_process = if needs_process {
+        activity_process_candidate(row, &input.current, input.snapshot_ts_us)
+    } else {
+        None
+    };
+    let previous_process = if columns.iter().any(|column| column.code == "cpu") {
+        current_process.and_then(|current| {
+            input.predecessor_ts_us.and_then(|timestamp| {
+                activity_process_predecessor(current, &input.previous, timestamp)
+            })
+        })
+    } else {
+        None
+    };
     for column in columns {
         let value = match column.code {
             "pid" => raw_frame(row, "pid", column.value_type),
@@ -999,21 +1016,18 @@ fn project_activity(
             "query" => raw_frame(row, "query", column.value_type),
             "query_duration_us" => duration_us(input.snapshot_ts_us, row, "query_start")?,
             "transaction_duration_us" => duration_us(input.snapshot_ts_us, row, "xact_start")?,
-            "cpu" => {
-                let current_process = activity_process(row, &input.current, input.snapshot_ts_us);
-                let previous_process = input
-                    .predecessor_ts_us
-                    .and_then(|timestamp| activity_process(row, &input.previous, timestamp));
-                current_process.map_or(FrameValue::Null, |current| {
-                    rate_sum(
-                        current,
-                        previous_process,
-                        &["utime", "stime"],
-                        input,
-                        has_gap,
-                    )
-                })
-            }
+            "process_link" => current_process.map_or(FrameValue::Null, |_process| {
+                FrameValue::String("best_effort".to_owned())
+            }),
+            "cpu" => current_process.map_or(FrameValue::Null, |current| {
+                rate_sum(
+                    current,
+                    previous_process,
+                    &["utime", "stime"],
+                    input,
+                    has_gap,
+                )
+            }),
             "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
                 .map_or(FrameValue::Null, |replica| {
                     raw_frame(replica, "state", column.value_type)
@@ -1045,17 +1059,31 @@ fn activity_replica<'a>(
     })
 }
 
-fn activity_process<'a>(
+fn activity_process_candidate<'a>(
     activity: &OutRow,
     sections: &'a BTreeMap<String, Vec<OutRow>>,
     timestamp_us: i64,
 ) -> Option<&'a OutRow> {
     let pid = finite_number(activity, "pid").ok().flatten()?;
-    let backend_start = timestamp(activity, "backend_start").ok().flatten()?;
+    let mut candidates = sections.get("os_process")?.iter().filter(|process| {
+        timestamp(process, "ts").ok().flatten() == Some(timestamp_us)
+            && finite_number(process, "pid").ok().flatten() == Some(pid)
+    });
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
+}
+
+fn activity_process_predecessor<'a>(
+    current: &OutRow,
+    sections: &'a BTreeMap<String, Vec<OutRow>>,
+    timestamp_us: i64,
+) -> Option<&'a OutRow> {
+    let pid = finite_number(current, "pid").ok().flatten()?;
+    let starttime = timestamp(current, "starttime").ok().flatten()?;
     sections.get("os_process")?.iter().find(|process| {
         timestamp(process, "ts").ok().flatten() == Some(timestamp_us)
             && finite_number(process, "pid").ok().flatten() == Some(pid)
-            && timestamp(process, "starttime").ok().flatten() == Some(backend_start)
+            && timestamp(process, "starttime").ok().flatten() == Some(starttime)
     })
 }
 

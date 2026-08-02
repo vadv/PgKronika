@@ -638,6 +638,13 @@ fn activity_view() -> ViewSpec {
             Some("us"),
         ),
         derived_column(
+            "process_link",
+            ValueType::Text,
+            "best_effort same-snapshot PID association",
+            &["activity", "process"],
+            None,
+        ),
+        derived_column(
             "cpu",
             ValueType::F64,
             "positive_delta(utime + stime) / elapsed",
