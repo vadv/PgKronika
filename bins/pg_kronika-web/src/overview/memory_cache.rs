@@ -138,6 +138,16 @@ impl DecodedFactCache {
         self.inner.lock().expect("cache lock").bytes
     }
 
+    /// Drops every retained entry; the cache refills lazily on demand.
+    pub(crate) fn clear(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.entries.clear();
+        inner.bytes = 0;
+    }
+
     #[cfg(feature = "qualification")]
     pub(crate) fn qualification_snapshot(&self) -> DecodedCacheSnapshot {
         let inner = self

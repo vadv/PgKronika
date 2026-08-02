@@ -50,6 +50,11 @@ pub(crate) struct OverviewFactLoader {
 }
 
 impl OverviewFactLoader {
+    /// Drops every decoded-fact entry; the cache refills lazily on demand.
+    pub(crate) fn clear_decoded(&self) {
+        self.decoded.clear();
+    }
+
     pub(crate) fn new(
         store: FactStore,
         config: ColdAdmissionConfig,

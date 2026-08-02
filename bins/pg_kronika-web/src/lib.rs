@@ -69,7 +69,7 @@ macro_rules! closed_string_enum {
 }
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -287,7 +287,7 @@ impl Default for OverviewConfig {
             gc: GcConfig::default(),
             response_cache_bytes: RESPONSE_CACHE_BYTES,
             response_cache_entries: RESPONSE_CACHE_ENTRIES,
-            decoded_cache_bytes: 256 * 1024 * 1024,
+            decoded_cache_bytes: 64 * 1024 * 1024,
             decoded_cache_entries: 4_096,
             source_scrub_interval: Duration::from_mins(1),
             cursor_max_views: 64,
@@ -339,6 +339,8 @@ pub struct AppState {
     pub last_refresh: Arc<AtomicU64>,
     /// Number of completed refresh loop iterations (successful or not).
     pub refresh_loop_iterations: Arc<AtomicU64>,
+    /// Unix timestamp (seconds) of the last non-infrastructure request.
+    last_activity: Arc<AtomicU64>,
     /// Age threshold after which the store is considered stale.
     pub stale_after: Duration,
     analytic_requests: Arc<Semaphore>,
@@ -351,8 +353,11 @@ pub struct AppState {
     pub(crate) response_cache: overview::cache::ResponseCache,
 }
 
-/// Byte budget for the exact response cache: 64 MiB.
-const RESPONSE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Byte budget for the exact response cache: 8 MiB.
+///
+/// Time-shaped request keys keep the hit rate low, so the budget pays for
+/// the one-tick health strip, not for history.
+const RESPONSE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 /// Secondary response-cache ceiling for small bodies.
 const RESPONSE_CACHE_ENTRIES: usize = 4_096;
 /// How long an analytic request waits for the shared slot before a 503.
@@ -605,6 +610,7 @@ impl AppState {
             published: Arc::new(ArcSwap::from_pointee(published)),
             last_refresh: Arc::new(AtomicU64::new(last_refresh_secs)),
             refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
+            last_activity: Arc::new(AtomicU64::new(unix_secs())),
             stale_after,
             analytic_requests: Arc::new(Semaphore::new(1)),
             timeline_flights: Arc::new(Mutex::new(HashMap::new())),
@@ -644,6 +650,35 @@ impl AppState {
             Ok(Err(_closed)) => Err(api_error::ApiError::internal_error()),
             Err(_elapsed) => Err(api_error::ApiError::analytic_capacity_unavailable()),
         }
+    }
+
+    /// Records a non-infrastructure request for standby timing.
+    pub(crate) fn note_activity(&self) {
+        self.last_activity.store(unix_secs(), Ordering::Relaxed);
+    }
+
+    /// Seconds since the last non-infrastructure request.
+    #[must_use]
+    pub fn idle_secs(&self) -> u64 {
+        unix_secs().saturating_sub(self.last_activity.load(Ordering::Relaxed))
+    }
+
+    /// Publishes the empty-live standby view and clears the decoded and
+    /// response caches, releasing the decoded working set while unused.
+    pub fn enter_standby(&self, snapshot: LocalDirSnapshot) {
+        let timeline = self
+            .overview
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .enter_standby();
+        self.overview_loader.clear_decoded();
+        self.response_cache.clear();
+        let snapshot = Arc::new(snapshot);
+        self.published.store(Arc::new(PublishedStoreView {
+            snapshot: Arc::clone(&snapshot),
+            timeline_snapshot: snapshot,
+            timeline: Arc::new(timeline),
+        }));
     }
 
     pub(crate) fn timeline_flight(&self, key: &overview::cache::ResponseKey) -> TimelineFlightRole {
@@ -806,6 +841,26 @@ impl AppState {
     }
 }
 
+/// Stamps the last non-infrastructure request for standby decisions. It is
+/// layered only on the protected router, so probes and `/metrics` do not
+/// count as activity.
+async fn track_activity(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    state.note_activity();
+    next.run(request).await
+}
+
+/// Seconds since the Unix epoch, or 0 if the clock predates it.
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Per-request metrics middleware.
 ///
 /// Increments `kronika_web_requests_total` and records
@@ -868,6 +923,10 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
             api_error::ApiError::method_not_allowed("GET, HEAD")
         })
         .fallback(handlers::static_::static_handler);
+    protected = protected.layer(middleware::from_fn_with_state(
+        state.clone(),
+        track_activity,
+    ));
     if let Some(cfg) = auth {
         // `layer`, not `route_layer`: auth must also cover the static fallback,
         // which `route_layer` (matched routes only) leaves open.

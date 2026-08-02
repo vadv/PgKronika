@@ -28,9 +28,9 @@ views. Sealed fact bodies are loaded only for admitted timeline requests.
 | `KRONIKA_WEB_OVERVIEW_GC_ARTIFACT_GRACE_S` | `600` | Minimum age of a recognized publication temporary file before cleanup. |
 | `KRONIKA_WEB_OVERVIEW_CACHE_MAX_LOGICAL_BYTES` | unset | Optional logical-`st_size` ceiling for recognized derived sidecars and publication artifacts. |
 | `KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES` | unset | Optional file-count ceiling for recognized derived sidecars and publication artifacts. |
-| `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES` | `67108864` | Logical-byte budget for the serialized overview/health response cache. |
+| `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES` | `8388608` | Logical-byte budget for the serialized overview/health response cache. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES` | `4096` | Serialized overview/health response-cache entry budget. |
-| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_BYTES` | `268435456` | Logical resident-byte budget for decoded sealed facts retained in memory. |
+| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_BYTES` | `67108864` | Logical resident-byte budget for decoded sealed facts retained in memory. |
 | `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_ENTRIES` | `4096` | Entry budget for decoded sealed facts retained in memory. |
 | `KRONIKA_WEB_OVERVIEW_SOURCE_SCRUB_INTERVAL_S` | `60` | Seconds between streaming CRC scrubs; each due scrub checks one sealed section. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS` | `64` | Maximum event views pinned for cursor continuation. |
@@ -71,8 +71,8 @@ Timeline resource policy defaults and constraints are:
 | Non-live final grace | 2 distinct authoritative GC generations and 120 s | Both values must be nonzero; generation grace must be at least 2 |
 | Recognized publication-artifact grace | 600 s | Must be nonzero |
 | Derived sidecar admission | No byte or file ceiling by default | Optional nonzero logical-byte and file-count ceilings |
-| Serialized overview/health response cache | 4,096 entries, 64 MiB logical charge | Both configured budgets are nonzero and fit `usize`. |
-| Decoded sealed facts in memory | 4,096 entries, 256 MiB logical resident charge | Exact hits bypass source-build admission; both configured budgets are nonzero and fit `usize`. |
+| Serialized overview/health response cache | 4,096 entries, 8 MiB logical charge | Both configured budgets are nonzero and fit `usize`. |
+| Decoded sealed facts in memory | 4,096 entries, 64 MiB logical resident charge | Exact hits bypass source-build admission; both configured budgets are nonzero and fit `usize`. |
 | Streaming source scrub | One sealed section every 60 s | Interval is nonzero; CRC failure removes the source from the usable descriptor set. |
 | Cursor-pinned event views | 64 views, 512 MiB logical charge, 300 s TTL | All budgets are nonzero; count and bytes fit `usize`. |
 | Selected sealed segments per timeline request | 1,024 | Configurable from 1 through the absolute v1 ceiling of 4,096 |
@@ -84,6 +84,16 @@ Timeline resource policy defaults and constraints are:
 | Events page | 100 items | 1,000 items |
 | Notable preview | 100 items | Fixed by notable policy v1 |
 | Health line | — | 2,000 points |
+
+## Standby
+
+The live fold holds the decoded journal between two seals under a 64 MiB
+aggregate cap. After 60 seconds without non-infrastructure requests (probes
+and `/metrics` do not count) the process enters standby: it publishes an
+empty-live view, clears the decoded-fact and serialized-response caches, and
+returns free allocator pages to the OS. The store scan still runs every
+second, so readiness stays fresh; the next request re-folds the current
+journal within one refresh tick. `kronika_web_standby` reports the state.
 
 Numeric `KRONIKA_WEB_OVERVIEW_*` policy variables accept unsigned decimal integers.
 Required budgets, intervals, queue sizes, and weighted capacities must be

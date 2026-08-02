@@ -139,6 +139,16 @@ pub const LIMIT: Bounds = Bounds {
     web_series_stored_bytes: 256 * KIB,
 };
 
+/// Live-fold admission bounds.
+///
+/// The live fold holds the decoded journal between two seals and is rebuilt
+/// from it at any time, so its aggregate decoded working set is capped far
+/// below the sealed-fact format limit: 64 MiB instead of 1 GiB.
+pub const LIVE_LIMIT: Bounds = Bounds {
+    decoded_file_bytes: 64 * MIB,
+    ..LIMIT
+};
+
 const KIB: u64 = 1_024;
 const _: () = assert!(
     LIMIT.web_series_stored_bytes >= LIMIT.web_series_decoded_bytes,
