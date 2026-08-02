@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
-import { colDesc, colLabel, relationKindDesc, relationKindLabel } from "../api/codes";
+import {
+  colDesc,
+  colLabel,
+  relationKindDesc,
+  relationKindLabel,
+} from "../api/codes";
 import { useEntity } from "../api/entity";
 import { useIncidents } from "../api/incidents";
 import type {
