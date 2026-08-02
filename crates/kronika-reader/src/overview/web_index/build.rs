@@ -1607,9 +1607,7 @@ fn evaluate_lock_duration(
     let mut entities = BTreeMap::<Vec<u8>, (String, Vec<Option<f64>>)>::new();
     for indexed in rows {
         let ts = row_ts(indexed.row)?;
-        let start = ["waitstart", "xact_start", "query_start"]
-            .iter()
-            .find_map(|field| cell_timestamp(indexed.row.get(field)));
+        let start = cell_timestamp(indexed.row.get("waitstart"));
         let Some(start) = start.filter(|start| *start <= ts) else {
             continue;
         };
@@ -2021,6 +2019,7 @@ mod tests {
     use kronika_registry::pg_stat_user_indexes::PgStatUserIndexesV1;
     use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
     use kronika_registry::{Cell, Row, Section, StrId, Ts, registry};
+    use kronika_registry::{PgLocksV1, PgLocksV2};
     use kronika_writer::{Interner, dict};
 
     use super::{
@@ -2103,6 +2102,122 @@ mod tests {
             query_start: None,
             state_change: None,
         }
+    }
+
+    fn lock_row_v1(ts: i64, pid: i32) -> PgLocksV1 {
+        PgLocksV1 {
+            ts: Ts(ts),
+            pid,
+            blocked_by: vec![],
+            depth: 0,
+            root_pid: pid,
+            datid: 1,
+            datname: StrId(1),
+            usename: None,
+            application_name: StrId(1),
+            client_addr: StrId(1),
+            backend_type: StrId(1),
+            state: None,
+            wait_event_type: None,
+            wait_event: None,
+            query: StrId(1),
+            backend_xid_age: None,
+            backend_xmin_age: None,
+            backend_start: Some(Ts(ts - 10_000)),
+            xact_start: Some(Ts(ts - 5_000)),
+            query_start: Some(Ts(ts - 1_000)),
+            state_change: None,
+            lock_locktype: None,
+            lock_mode: None,
+            lock_granted: Some(false),
+            lock_database: None,
+            lock_relation: None,
+            lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
+            lock_virtualxid: None,
+            lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
+            lock_fastpath: None,
+            lock_target: None,
+        }
+    }
+
+    fn lock_row_v2(ts: i64, pid: i32, granted: bool, waitstart: Option<i64>) -> PgLocksV2 {
+        PgLocksV2 {
+            ts: Ts(ts),
+            pid,
+            blocked_by: vec![],
+            depth: 0,
+            root_pid: pid,
+            datid: 1,
+            datname: StrId(1),
+            usename: None,
+            application_name: StrId(1),
+            client_addr: StrId(1),
+            backend_type: StrId(1),
+            state: None,
+            wait_event_type: None,
+            wait_event: None,
+            query: StrId(1),
+            backend_xid_age: None,
+            backend_xmin_age: None,
+            backend_start: Some(Ts(ts - 10_000)),
+            xact_start: Some(Ts(ts - 5_000)),
+            query_start: Some(Ts(ts - 1_000)),
+            state_change: None,
+            lock_locktype: None,
+            lock_mode: None,
+            lock_granted: Some(granted),
+            lock_database: None,
+            lock_relation: None,
+            lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
+            lock_virtualxid: None,
+            lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
+            lock_fastpath: None,
+            lock_target: None,
+            waitstart: waitstart.map(Ts),
+        }
+    }
+
+    fn locks_pgm(v1: &[PgLocksV1], v2: &[PgLocksV2]) -> Vec<u8> {
+        let mut bodies = Vec::new();
+        if !v1.is_empty() {
+            bodies.push((
+                1_011_001,
+                u32::try_from(v1.len()).expect("small PG10-13 lock fixture"),
+                PgLocksV1::encode(v1).expect("encode PG10-13 locks"),
+            ));
+        }
+        if !v2.is_empty() {
+            bodies.push((
+                1_011_002,
+                u32::try_from(v2.len()).expect("small PG14+ lock fixture"),
+                PgLocksV2::encode(v2).expect("encode PG14+ locks"),
+            ));
+        }
+        let inputs = bodies
+            .iter()
+            .map(|(type_id, rows, body)| SectionInput {
+                type_id: *type_id,
+                rows: *rows,
+                body,
+            })
+            .collect::<Vec<_>>();
+        build_part(
+            &inputs,
+            PartMeta {
+                min_ts: 10_000,
+                max_ts: 20_000,
+            },
+        )
     }
 
     fn instance_metadata(ts: i64, clock_ticks_per_sec: i64) -> InstanceMetadata {
@@ -2196,6 +2311,33 @@ mod tests {
         assert_eq!(processes.status(), IndexStatus::Complete);
         assert_eq!(cpu.status(), MetricStatus::Complete);
         assert_eq!(cpu.series()[0].value_at(0), Some(0.09));
+    }
+
+    #[test]
+    fn lock_wait_metric_uses_waitstart_not_transaction_or_query_age() {
+        let bytes = locks_pgm(
+            &[lock_row_v1(10_000, 1)],
+            &[
+                lock_row_v2(15_000, 2, true, None),
+                lock_row_v2(20_000, 3, false, Some(19_000)),
+            ],
+        );
+        let unit = PgmUnit::open(bytes).expect("open lock PGM");
+        let blocks = build_web_index(&unit, &[], 10_000, 20_000, &LIMIT).expect("build lock index");
+        let locks = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 8)
+            .expect("lock series");
+        let wait = locks
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 1)
+            .expect("lock wait metric");
+
+        assert_eq!(wait.status(), MetricStatus::Complete);
+        assert_eq!(wait.series().len(), 1);
+        assert_eq!(wait.series()[0].value_at(0), Some(1_000.0));
     }
 
     #[test]
