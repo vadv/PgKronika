@@ -77,6 +77,81 @@ fn map_sealed_open_error(error: io::Error, unit_idx: usize) -> ReadError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JournalPrefixDigest([u8; 32]);
 
+/// Resumable SHA-256 state over the journal prefix, bound to one journal file.
+///
+/// A proven append extends it from the tail instead of re-hashing the whole
+/// journal on every refresh; any other transition rebuilds it. The resumed
+/// form trusts bytes already hashed: it proves append continuity and the
+/// anchored segment identity, not immutability of frame payloads (frame CRCs
+/// remain the torn-write backstop).
+#[derive(Debug, Clone)]
+struct JournalDigestState {
+    identity: Option<JournalIdentity>,
+    segment_id: Option<i64>,
+    hashed_len: u64,
+    hasher: Sha256,
+}
+
+impl JournalDigestState {
+    /// Finalizes the digest of the hashed prefix.
+    fn digest(&self) -> JournalPrefixDigest {
+        let mut hasher = self.hasher.clone();
+        hasher.update(self.hashed_len.to_le_bytes());
+        JournalPrefixDigest(hasher.finalize().into())
+    }
+
+    /// True while the live journal header still carries the segment this
+    /// state was built from: an in-place whole-journal rewrite mints a new
+    /// segment id and must force a full rebuild.
+    fn matches_current_segment(&self, dir: &LocalDir) -> io::Result<bool> {
+        let Some(expected) = self.segment_id else {
+            return Ok(true);
+        };
+        let Some(mut file) = dir.open_active()? else {
+            return Ok(false);
+        };
+        let mut header_bytes = [0_u8; JOURNAL_HEADER_LEN];
+        file.read_exact(&mut header_bytes)?;
+        let header = JournalHeader::decode(header_bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(matches!(header.state, JournalState::Active { segment_id } if segment_id == expected))
+    }
+
+    /// Extends the state over the appended tail `[hashed_len, new_valid_len)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the journal file cannot be opened or the tail
+    /// bytes cannot be read.
+    fn extend(&self, dir: &LocalDir, new_valid_len: u64) -> io::Result<Self> {
+        let file = dir
+            .open_active()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "active.parts is absent"))?;
+        let mut hasher = self.hasher.clone();
+        let mut buffer = vec![0_u8; JOURNAL_HASH_BUFFER_BYTES].into_boxed_slice();
+        let mut offset = self.hashed_len;
+        while offset < new_valid_len {
+            let wanted =
+                usize::try_from((new_valid_len - offset).min(JOURNAL_HASH_BUFFER_BYTES as u64))
+                    .map_err(|_error| io::Error::other("journal hash range overflow"))?;
+            file.read_exact_at(&mut buffer[..wanted], offset)?;
+            hasher.update(&buffer[..wanted]);
+            offset = offset
+                .checked_add(
+                    u64::try_from(wanted)
+                        .map_err(|_error| io::Error::other("journal hash read length overflow"))?,
+                )
+                .ok_or_else(|| io::Error::other("journal hash offset overflow"))?;
+        }
+        Ok(Self {
+            identity: self.identity,
+            segment_id: self.segment_id,
+            hashed_len: new_valid_len,
+            hasher,
+        })
+    }
+}
+
 // Counts `open_unit` calls so batch tests can assert a unit is opened once.
 // Thread-local, so parallel tests do not perturb each other; a test resets it
 // to 0 before the call it measures.
@@ -245,6 +320,9 @@ pub struct LocalDirSnapshot {
     journal_identity: Option<JournalIdentity>,
     /// Digest of the exact journal bytes through `last_valid_len`.
     journal_prefix_digest: JournalPrefixDigest,
+    /// Resumable digest state behind `journal_prefix_digest`, valid only
+    /// while the journal identity matches the stored scan.
+    prefix_digest_state: Option<JournalDigestState>,
     /// Whether the active descriptor set in `scan` is authoritative.
     journal_descriptors_complete: bool,
     /// Whether a delta consumer has received the current journal baseline.
@@ -380,12 +458,16 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be opened or scanned.
     pub fn open(root: &Path) -> io::Result<Self> {
         let dir = LocalDir::open(root)?;
-        let (scan, journal_identity, journal_prefix_digest, sealed_active_generation_match) =
+        let (scan, journal_identity, prefix_state, sealed_active_generation_match) =
             retry_stale_proof(|| {
-                let (scan, identity, prefix_digest) = full_scan_consistent(&dir, &[])?;
-                let matched =
-                    prove_sealed_generation_matches_active(&dir, &scan, identity, prefix_digest)?;
-                Ok((scan, identity, prefix_digest, matched))
+                let (scan, identity, prefix_state) = full_scan_consistent(&dir, &[])?;
+                let matched = prove_sealed_generation_matches_active(
+                    &dir,
+                    &scan,
+                    identity,
+                    prefix_state.digest(),
+                )?;
+                Ok((scan, identity, prefix_state, matched))
             })?;
         let last_valid_len = scan.valid_len;
         let journal_descriptors_complete = journal_descriptors_complete(&scan);
@@ -398,7 +480,8 @@ impl LocalDirSnapshot {
             view_generation: 0,
             journal_generation: JournalGenerationId(0),
             journal_identity,
-            journal_prefix_digest,
+            journal_prefix_digest: prefix_state.digest(),
+            prefix_digest_state: Some(prefix_state),
             journal_descriptors_complete,
             delta_initialized: false,
             tail_pending,
@@ -423,18 +506,18 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh(&mut self) -> io::Result<()> {
         retry_stale_proof(|| {
-            let (scan, identity, transition, prefix_digest) = self.scan_full_consistent()?;
-            self.install_baseline(scan, identity, prefix_digest, transition)
+            let (scan, identity, transition, prefix_state) = self.scan_full_consistent()?;
+            self.install_baseline(scan, identity, prefix_state, transition)
         })
     }
 
     /// Re-scan the store incrementally, reading only the journal tail.
     ///
     /// Uses the last known journal offset to skip already-validated frames: an
-    /// unchanged journal is not re-read. Before an appended tail is accepted,
-    /// the exact previously validated prefix is re-hashed; a mismatch forces a
-    /// full scan and a new generation. A truncate-in-place reset rescans from
-    /// the start. Sealed `.pgm` files are always re-listed.
+    /// unchanged journal is not re-read. The prefix digest chain resumes from
+    /// the stored hasher state, so a proven append hashes only the new tail; a
+    /// truncate-in-place reset rescans from the start. Sealed `.pgm` files are
+    /// always re-listed.
     ///
     /// The decode-time staleness check in [`decode_unit`](Self::decode_unit) and
     /// friends remains the backstop against a part changing under a reader.
@@ -444,8 +527,8 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh_incremental(&mut self) -> io::Result<()> {
         retry_stale_proof(|| {
-            let (scan, identity, transition, prefix_digest) = self.scan_incremental_consistent()?;
-            self.install_baseline(scan, identity, prefix_digest, transition)
+            let (scan, identity, transition, prefix_state) = self.scan_incremental_consistent()?;
+            self.install_baseline(scan, identity, prefix_state, transition)
         })
     }
 
@@ -472,7 +555,7 @@ impl LocalDirSnapshot {
         let previous_view_generation = self.view_generation;
         let bootstrap = !self.delta_initialized;
 
-        let (mut scan, current_identity, transition, prefix_digest) =
+        let (mut scan, current_identity, transition, prefix_state) =
             self.scan_incremental_consistent()?;
         let new_valid_len = scan.valid_len;
         let generation_id = if transition.preserves_generation() {
@@ -519,7 +602,7 @@ impl LocalDirSnapshot {
             &self.dir,
             &scan,
             current_identity,
-            prefix_digest,
+            prefix_state.digest(),
         )?;
 
         let changed = !completed_parts.is_empty()
@@ -547,7 +630,8 @@ impl LocalDirSnapshot {
         self.last_valid_len = new_valid_len;
         self.journal_generation = generation_id;
         self.journal_identity = current_identity;
-        self.journal_prefix_digest = prefix_digest;
+        self.journal_prefix_digest = prefix_state.digest();
+        self.prefix_digest_state = Some(prefix_state);
         self.journal_descriptors_complete = current_parts_complete;
         self.view_generation = new_view_generation;
         self.delta_initialized = true;
@@ -582,25 +666,25 @@ impl LocalDirSnapshot {
         LocalScan,
         Option<JournalIdentity>,
         PartTransition,
-        JournalPrefixDigest,
+        JournalDigestState,
     )> {
-        let ((journal, base_transition, prefix_digest), identity) = with_stable_journal_identity(
+        let ((journal, base_transition, prefix_state), identity) = with_stable_journal_identity(
             || journal_identity(&self.dir),
             |identity_before| {
                 let transition = self
                     .verified_transition(identity_before)
                     .map_err(ScanAttemptError::journal)?;
                 let journal = self.dir.scan_journal().map_err(ScanAttemptError::store)?;
-                let prefix_digest = journal_prefix_digest(&self.dir, journal.valid_len)
+                let prefix_state = journal_prefix_state(&self.dir, journal.valid_len)
                     .map_err(ScanAttemptError::journal)?;
-                Ok((journal, transition, prefix_digest))
+                Ok((journal, transition, prefix_state))
             },
         )?;
         let same_file = same_journal_file(self.journal_identity, identity);
         let same_committed_reset = same_file
             && self.scan.committed_reset
             && journal.committed_reset
-            && self.journal_prefix_digest == prefix_digest;
+            && self.journal_prefix_digest == prefix_state.digest();
         let transition = apply_committed_reset_transition(
             base_transition,
             same_file,
@@ -614,19 +698,42 @@ impl LocalDirSnapshot {
         } else {
             PartTransition::Uncertain
         };
-        Ok((scan, identity, transition, prefix_digest))
+        Ok((scan, identity, transition, prefix_state))
     }
 
     /// Scans from the current watermark when the journal identity permits it.
+    /// Resumes the stored digest state across a proven append, rebuilding it
+    /// from the journal on any discontinuity.
+    fn prefix_state_for(
+        &self,
+        journal: &JournalScan,
+        identity: Option<JournalIdentity>,
+        transition: PartTransition,
+    ) -> io::Result<JournalDigestState> {
+        let resumable = transition.preserves_generation()
+            && !self.scan.committed_reset
+            && !journal.committed_reset
+            && self.prefix_digest_state.as_ref().is_some_and(|state| {
+                state.hashed_len <= journal.valid_len && same_journal_file(state.identity, identity)
+            });
+        self.prefix_digest_state
+            .as_ref()
+            .filter(|_| resumable)
+            .map_or_else(
+                || journal_prefix_state(&self.dir, journal.valid_len),
+                |state| state.extend(&self.dir, journal.valid_len),
+            )
+    }
+
     fn scan_incremental_consistent(
         &self,
     ) -> io::Result<(
         LocalScan,
         Option<JournalIdentity>,
         PartTransition,
-        JournalPrefixDigest,
+        JournalDigestState,
     )> {
-        let ((journal, base_transition, prefix_digest), identity) = with_stable_journal_identity(
+        let ((journal, base_transition, prefix_state), identity) = with_stable_journal_identity(
             || journal_identity(&self.dir),
             |identity_before| {
                 let transition = self
@@ -639,16 +746,17 @@ impl LocalDirSnapshot {
                     self.dir.scan_journal()
                 };
                 let journal = journal.map_err(ScanAttemptError::store)?;
-                let prefix_digest = journal_prefix_digest(&self.dir, journal.valid_len)
+                let prefix_state = self
+                    .prefix_state_for(&journal, identity_before, transition)
                     .map_err(ScanAttemptError::journal)?;
-                Ok((journal, transition, prefix_digest))
+                Ok((journal, transition, prefix_state))
             },
         )?;
         let same_file = same_journal_file(self.journal_identity, identity);
         let same_committed_reset = same_file
             && self.scan.committed_reset
             && journal.committed_reset
-            && self.journal_prefix_digest == prefix_digest;
+            && self.journal_prefix_digest == prefix_state.digest();
         let transition = apply_committed_reset_transition(
             base_transition,
             same_file,
@@ -662,7 +770,7 @@ impl LocalDirSnapshot {
         } else {
             PartTransition::Uncertain
         };
-        Ok((scan, identity, transition, prefix_digest))
+        Ok((scan, identity, transition, prefix_state))
     }
 
     fn verified_transition(&self, current: Option<JournalIdentity>) -> io::Result<PartTransition> {
@@ -683,9 +791,19 @@ impl LocalDirSnapshot {
             && !self.scan.committed_reset
             && !self.scan.active.is_empty()
         {
-            let observed = journal_prefix_digest(&self.dir, self.last_valid_len)?;
-            if observed != self.journal_prefix_digest {
-                return Ok(PartTransition::Uncertain);
+            let prefix_proven = match self.prefix_digest_state.as_ref() {
+                Some(state) => {
+                    state.hashed_len == self.last_valid_len
+                        && same_journal_file(state.identity, current)
+                        && state.matches_current_segment(&self.dir)?
+                }
+                None => false,
+            };
+            if !prefix_proven {
+                let observed = journal_prefix_digest(&self.dir, self.last_valid_len)?;
+                if observed != self.journal_prefix_digest {
+                    return Ok(PartTransition::Uncertain);
+                }
             }
         }
         Ok(transition)
@@ -696,7 +814,7 @@ impl LocalDirSnapshot {
         &mut self,
         mut scan: LocalScan,
         identity: Option<JournalIdentity>,
-        prefix_digest: JournalPrefixDigest,
+        prefix_state: JournalDigestState,
         transition: PartTransition,
     ) -> io::Result<()> {
         let rebase_after_committed_reset = self.scan.committed_reset
@@ -715,8 +833,12 @@ impl LocalDirSnapshot {
         let sealed = sealed_delta(&scan, self.scan.sealed.as_slice());
         let current_parts_complete = journal_descriptors_complete(&scan);
         let current_tail_pending = tail_pending(identity, scan.valid_len);
-        let current_sealed_active_generation_match =
-            prove_sealed_generation_matches_active(&self.dir, &scan, identity, prefix_digest)?;
+        let current_sealed_active_generation_match = prove_sealed_generation_matches_active(
+            &self.dir,
+            &scan,
+            identity,
+            prefix_state.digest(),
+        )?;
         let changed = !same_active_parts(&self.scan, &scan)
             || !same_sealed_units(&self.scan, &scan)
             || !same_warnings(&self.scan.warnings, &scan.warnings)
@@ -736,7 +858,8 @@ impl LocalDirSnapshot {
         self.last_valid_len = scan.valid_len;
         self.scan = scan;
         self.journal_identity = identity;
-        self.journal_prefix_digest = prefix_digest;
+        self.journal_prefix_digest = prefix_state.digest();
+        self.prefix_digest_state = Some(prefix_state);
         self.journal_generation = generation;
         self.journal_descriptors_complete = current_parts_complete;
         self.view_generation = view_generation;
@@ -1726,18 +1849,18 @@ fn part_descriptors(
 fn full_scan_consistent(
     dir: &LocalDir,
     previous_sealed: &[SealedUnit],
-) -> io::Result<(LocalScan, Option<JournalIdentity>, JournalPrefixDigest)> {
-    let ((journal, prefix_digest), identity) = with_stable_journal_identity(
+) -> io::Result<(LocalScan, Option<JournalIdentity>, JournalDigestState)> {
+    let ((journal, prefix_state), identity) = with_stable_journal_identity(
         || journal_identity(dir),
         |_identity_before| {
             let journal = dir.scan_journal().map_err(ScanAttemptError::store)?;
-            let prefix_digest =
-                journal_prefix_digest(dir, journal.valid_len).map_err(ScanAttemptError::journal)?;
-            Ok((journal, prefix_digest))
+            let prefix_state =
+                journal_prefix_state(dir, journal.valid_len).map_err(ScanAttemptError::journal)?;
+            Ok((journal, prefix_state))
         },
     )?;
     let scan = dir.complete_scan_cached(journal, previous_sealed)?;
-    Ok((scan, identity, prefix_digest))
+    Ok((scan, identity, prefix_state))
 }
 
 #[derive(Debug)]
@@ -1824,11 +1947,22 @@ fn retry_stale_proof<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Res
 }
 
 fn journal_prefix_digest(dir: &LocalDir, valid_len: u64) -> io::Result<JournalPrefixDigest> {
+    Ok(journal_prefix_state(dir, valid_len)?.digest())
+}
+
+/// Builds the resumable digest state over the journal prefix through
+/// `valid_len`, streaming the body once with a fixed-size buffer.
+fn journal_prefix_state(dir: &LocalDir, valid_len: u64) -> io::Result<JournalDigestState> {
     let mut hasher = Sha256::new();
     hasher.update(JOURNAL_PREFIX_DOMAIN);
-    hasher.update(valid_len.to_le_bytes());
+    let identity = journal_identity(dir)?;
     if valid_len == 0 {
-        return Ok(JournalPrefixDigest(hasher.finalize().into()));
+        return Ok(JournalDigestState {
+            identity,
+            segment_id: None,
+            hashed_len: 0,
+            hasher,
+        });
     }
 
     if valid_len < JOURNAL_HEADER_LEN as u64 {
@@ -1842,6 +1976,7 @@ fn journal_prefix_digest(dir: &LocalDir, valid_len: u64) -> io::Result<JournalPr
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "active.parts is absent"))?;
     let mut header_bytes = [0_u8; JOURNAL_HEADER_LEN];
     file.read_exact(&mut header_bytes)?;
+    let mut segment_id = None;
     if is_committed_reset_state(&file, valid_len, header_bytes)? {
         hasher.update([0]);
     } else {
@@ -1849,9 +1984,12 @@ fn journal_prefix_digest(dir: &LocalDir, valid_len: u64) -> io::Result<JournalPr
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         match header.state {
             JournalState::Empty => hasher.update([0]),
-            JournalState::Active { segment_id } => {
+            JournalState::Active {
+                segment_id: active_segment,
+            } => {
                 hasher.update([1]);
-                hasher.update(segment_id.to_le_bytes());
+                hasher.update(active_segment.to_le_bytes());
+                segment_id = Some(active_segment);
             }
         }
     }
@@ -1868,7 +2006,12 @@ fn journal_prefix_digest(dir: &LocalDir, valid_len: u64) -> io::Result<JournalPr
             .map_err(|_error| io::Error::other("journal hash read length overflow"))?;
         remaining -= consumed;
     }
-    Ok(JournalPrefixDigest(hasher.finalize().into()))
+    Ok(JournalDigestState {
+        identity,
+        segment_id,
+        hashed_len: valid_len,
+        hasher,
+    })
 }
 
 fn is_committed_reset_state(
