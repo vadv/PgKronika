@@ -2978,9 +2978,10 @@ mod tests {
                 cell("plan", Value::Str("must not be retained".to_owned())),
             ]
         };
-        let ossc = plan_sample(&common("queryid", 42), PlanFork::Ossc).expect("exact bridge");
+        let ossc =
+            plan_sample(&common("queryid", 42), PlanFork::Ossc).expect("OSSC queryid attribution");
         let vadv = plan_sample(&common("queryid_stat_statements", 42), PlanFork::Vadv)
-            .expect("best-effort bridge");
+            .expect("vadv queryid attribution");
         assert_eq!((ossc.queryid, ossc.planid, ossc.calls), (42, 9, 3.0));
         assert_eq!(vadv.fork, PlanFork::Vadv);
         let unattributed = plan_sample(&common("queryid_stat_statements", 0), PlanFork::Vadv)

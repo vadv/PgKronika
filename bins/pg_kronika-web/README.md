@@ -370,6 +370,21 @@ retained data, and always uploads the stand diagnostics. It has no automatic
   without a valid rate carries one of the response codes `reset`, `gap`,
   `first_point`, `anomaly`, or `not_collected`; `anomaly` here means that the
   timestamps did not advance or the scalar kinds were inconsistent.
+- The catalog and related-entity provenance use the closed relation-kind
+  vocabulary `exact`, `lifetime`, `temporal`, `best_effort`, and `unavailable`.
+  `exact` proves every declared identity field; `lifetime` is valid only within
+  a proven process lifetime; `temporal` applies only at the declared snapshot;
+  `best_effort` is an attribution rather than identity proof; and `unavailable`
+  means the required evidence is absent. These are locale-neutral API values.
+- Activity OS metrics use `best_effort` enrichment from one unique OS-process
+  row with the same snapshot and PID. They do not compare PostgreSQL
+  `backend_start` with OS `starttime`; a missing or ambiguous PID candidate
+  leaves the enrichment empty. CPU and I/O deltas stay within the selected
+  OS-process `(pid, starttime)` lifetime, so PID reuse cannot bridge counters.
+- Statement-to-plan links are fork-specific `best_effort` attribution, not
+  cross-extension identity. OSSC uses `queryid`, `dbid`, and `userid`; the vadv
+  fork uses `queryid_stat_statements`, `dbid`, and `userid`. The emitted
+  `method` and field names identify which attribution established each link.
 - Anomaly search compares each current window with the other usable points in
   the selected period. The strongest absolute peak score appears first.
   Equal-score results use section, column/dimension, identity, and interval fields as

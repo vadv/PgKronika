@@ -1247,6 +1247,8 @@ export interface components {
             cardinality: string;
             /** @description Equality fields, in comparison order. */
             fields: string[];
+            /** @description Maximum evidentiary strength of this relationship. */
+            kind: components["schemas"]["RelationKind"];
             /** @description Left input code. */
             left: string;
             /** @description Evidence required before the join is accepted. */
@@ -1392,9 +1394,15 @@ export interface components {
             relation: string;
             view: string;
         };
+        /**
+         * @description Maximum evidentiary strength the catalog assigns to a relationship.
+         * @enum {string}
+         */
+        RelationKind: "exact" | "lifetime" | "temporal" | "best_effort" | "unavailable";
         RelationProvenanceDto: {
             fields: string[];
-            kind: string;
+            kind: components["schemas"]["RelationKind"];
+            method: string;
         };
         RetentionDto: {
             /** Format: int64 */

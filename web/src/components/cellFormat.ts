@@ -1,7 +1,7 @@
 /** Cell value and verdict rendering shared by the table, the dock and every
  * other grid: one formatter per catalog type, localized verdict phrases. */
 import type { TFunction } from "i18next";
-import { eventKindLabel, severityLabel, statusLabel } from "../api/codes";
+import { eventKindLabel, relationKindLabel, severityLabel, statusLabel } from "../api/codes";
 import type {
   ClassificationResultDto,
   EvidenceDto,
@@ -68,6 +68,11 @@ export function formatCellValue(
   if (column.code === "phase" && typeof value === "string") {
     return t(`pg.vacuumPhase.${value}`, { defaultValue: value });
   }
+  // process_link carries the closed RelationKind vocabulary: localized label,
+  // the machine kind stays for the tooltip.
+  if (column.code === "process_link" && typeof value === "string") {
+    return relationKindLabel(t, value);
+  }
   if (typeof value === "number") {
     if (isPlainIntegerColumn(column.code)) return String(value);
     return formatByUnit(value, column.unit);
@@ -91,7 +96,8 @@ export function fullCellValue(
     column.code === "severity_code" ||
     column.code === "category_code" ||
     column.code === "state" ||
-    column.code === "phase"
+    column.code === "phase" ||
+    column.code === "process_link"
   ) {
     return String(value);
   }

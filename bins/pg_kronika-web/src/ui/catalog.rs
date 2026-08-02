@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use super::thresholds::binding_for;
 
 /// Catalog schema revision.
-const CATALOG_REVISION: u16 = 2;
+const CATALOG_REVISION: u16 = 3;
 
 /// Availability of one input, metric, or column in the served store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -28,6 +28,21 @@ pub(crate) enum Availability {
         reason = "reserved wire state for a source type newer than the local projection"
     )]
     UnsupportedType,
+}
+
+/// Maximum evidentiary strength the catalog assigns to a relationship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(
+    dead_code,
+    reason = "closed catalog vocabulary reserves wire states that no current join establishes"
+)]
+pub(crate) enum RelationKind {
+    Exact,
+    Lifetime,
+    Temporal,
+    BestEffort,
+    Unavailable,
 }
 
 /// UI ownership scope of one view.
@@ -83,6 +98,8 @@ pub(crate) struct JoinSpec {
     pub left: &'static str,
     /// Right input code.
     pub right: &'static str,
+    /// Maximum evidentiary strength of this relationship.
+    pub kind: RelationKind,
     /// Equality fields, in comparison order.
     pub fields: Vec<&'static str>,
     /// Declared join cardinality.
@@ -528,13 +545,15 @@ fn activity_view() -> ViewSpec {
         JoinSpec {
             left: "activity",
             right: "process",
-            fields: vec!["pid", "backend_start=starttime"],
+            kind: RelationKind::BestEffort,
+            fields: vec!["pid", "ts"],
             cardinality: "zero_or_one",
-            provenance: "pid_and_process_start_match",
+            provenance: "same_snapshot_pid_only",
         },
         JoinSpec {
             left: "activity",
             right: "replication_replicas",
+            kind: RelationKind::Temporal,
             fields: vec!["pid", "ts"],
             cardinality: "zero_or_one",
             provenance: "same_snapshot_walsender_pid",
@@ -619,11 +638,32 @@ fn activity_view() -> ViewSpec {
             Some("us"),
         ),
         derived_column(
+            "process_link",
+            ValueType::Text,
+            "best_effort same-snapshot PID association",
+            &["activity", "process"],
+            None,
+        ),
+        derived_column(
             "cpu",
             ValueType::F64,
             "positive_delta(utime + stime) / elapsed",
             &["activity", "process"],
             None,
+        ),
+        derived_column(
+            "read_bytes_per_second",
+            ValueType::F64,
+            "positive_delta(read_bytes) / elapsed",
+            &["activity", "process"],
+            Some("bytes_per_second"),
+        ),
+        derived_column(
+            "write_bytes_per_second",
+            ValueType::F64,
+            "positive_delta(write_bytes) / elapsed",
+            &["activity", "process"],
+            Some("bytes_per_second"),
         ),
         raw_column(
             "replication_state",
@@ -1288,6 +1328,7 @@ fn vacuum_view() -> ViewSpec {
         vec![JoinSpec {
             left: "vacuum",
             right: "tables",
+            kind: RelationKind::Temporal,
             fields: vec!["datid", "relid", "ts"],
             cardinality: "zero_or_one",
             provenance: "same_snapshot_database_relation_oid",
@@ -1473,6 +1514,7 @@ fn processes_view() -> ViewSpec {
         vec![JoinSpec {
             left: "process",
             right: "cgroup_mapping",
+            kind: RelationKind::Exact,
             fields: vec!["pid", "starttime", "ts"],
             cardinality: "zero_or_one",
             provenance: "same_snapshot_pid_and_process_start",

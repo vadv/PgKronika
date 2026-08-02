@@ -915,12 +915,11 @@ impl TypedInputs {
         &self,
         section: &'static str,
         column: &'static str,
-    ) -> Vec<Arc<[IdentityValue]>> {
+    ) -> impl Iterator<Item = Arc<[IdentityValue]>> + '_ {
         self.counters
             .keys()
-            .filter(|key| key.section == section && key.column == column)
+            .filter(move |key| key.section == section && key.column == column)
             .map(|key| Arc::clone(&key.identity))
-            .collect()
     }
 
     /// Sum `column_a` and `column_b` deltas of one series inside
@@ -1132,22 +1131,71 @@ impl TypedInputs {
         &self.plans[start..end]
     }
 
-    /// Whether scalar fields make this OS process a possible `PostgreSQL`
-    /// backend. This is not a cross-domain identity relation: the current
-    /// adapter has no canonical session-to-process bridge or lifetime coverage.
+    /// Whether this is the only OS lifetime for `pid` observed alongside a
+    /// `PostgreSQL` backend in the same snapshot. The scan allocates nothing;
+    /// it reads the bounded counter tracks already owned by this input.
+    /// `starttime` selects the OS identity but is never compared with
+    /// `backend_start`, which belongs to a different clock and lifecycle event.
     pub(crate) fn process_matches_postgres_backend_candidate(
         &self,
         pid: i64,
         starttime: i64,
-        from_us: i64,
-        to_us: i64,
-    ) -> bool {
-        self.activity_window(from_us, to_us).any(|snapshot| {
-            snapshot
-                .backends
-                .iter()
-                .any(|backend| backend.pid == pid && backend.backend_start == starttime)
-        })
+        observed_at_us: i64,
+        mut charge_points: impl FnMut(usize) -> Result<(), super::dispatch::LimitHit>,
+    ) -> Result<bool, super::dispatch::LimitHit> {
+        if pid <= 0 || starttime <= 0 {
+            return Ok(false);
+        }
+        let mut activity_match = false;
+        'snapshots: for snapshot in &self.activity {
+            charge_points(1)?;
+            if snapshot.ts != observed_at_us {
+                continue;
+            }
+            for backend in &snapshot.backends {
+                charge_points(1)?;
+                if backend.pid == pid {
+                    activity_match = true;
+                    break 'snapshots;
+                }
+            }
+        }
+        if !activity_match {
+            return Ok(false);
+        }
+        let mut matched_starttime = None;
+        for (key, track) in &self.counters {
+            charge_points(1)?;
+            let [
+                IdentityValue::I64(candidate_pid),
+                IdentityValue::I64(candidate_starttime),
+            ] = key.identity.as_ref()
+            else {
+                continue;
+            };
+            if key.section != "os_process"
+                || key.column != "read_bytes"
+                || *candidate_pid != pid
+                || *candidate_starttime <= 0
+            {
+                continue;
+            }
+            let mut observed = false;
+            for point in &track.points {
+                charge_points(1)?;
+                if point.end_us == observed_at_us {
+                    observed = true;
+                    break;
+                }
+            }
+            if !observed {
+                continue;
+            }
+            if matched_starttime.replace(*candidate_starttime).is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(matched_starttime == Some(starttime))
     }
 
     pub(crate) fn insert_process_cgroups(&mut self, samples: Vec<ProcessCgroupSample>) {
@@ -2143,6 +2191,34 @@ mod tests {
         }
     }
 
+    fn activity_backend(pid: i64, backend_start: i64) -> ActivityBackend {
+        ActivityBackend {
+            pid,
+            backend_start,
+            xid_age: None,
+            xmin_age: None,
+            state: None,
+            wait_event_type: None,
+            wait_event: None,
+            xact_age_us: None,
+        }
+    }
+
+    fn process_identity(pid: i64, starttime: i64) -> Arc<[IdentityValue]> {
+        Arc::from(vec![IdentityValue::I64(pid), IdentityValue::I64(starttime)])
+    }
+
+    fn postgres_process_candidate(
+        typed: &TypedInputs,
+        pid: i64,
+        starttime: i64,
+        observed_at_us: i64,
+    ) -> bool {
+        typed
+            .process_matches_postgres_backend_candidate(pid, starttime, observed_at_us, |_| Ok(()))
+            .expect("unbounded test work budget")
+    }
+
     #[test]
     fn activity_window_uses_half_open_request_bounds() {
         let mut typed = TypedInputs::new();
@@ -2157,6 +2233,63 @@ mod tests {
             .map(|snapshot| snapshot.backends[0].state.as_deref().expect("state"))
             .collect();
         assert_eq!(states, ["start", "inside"], "the end bound is excluded");
+    }
+
+    #[test]
+    fn postgres_process_candidate_accepts_cross_clock_identity_in_same_snapshot() {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 10,
+            backends: vec![activity_backend(7, 200)],
+            completeness: SnapshotCompleteness::Complete,
+        });
+        typed.insert_counter(
+            "os_process",
+            "read_bytes",
+            process_identity(7, 100),
+            vec![(10, value(1.0))],
+        );
+
+        assert!(postgres_process_candidate(&typed, 7, 100, 10));
+    }
+
+    #[test]
+    fn postgres_process_candidate_rejects_activity_from_a_different_snapshot() {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 9,
+            backends: vec![activity_backend(7, 200)],
+            completeness: SnapshotCompleteness::Complete,
+        });
+        typed.insert_counter(
+            "os_process",
+            "read_bytes",
+            process_identity(7, 100),
+            vec![(10, value(1.0))],
+        );
+
+        assert!(!postgres_process_candidate(&typed, 7, 100, 10));
+    }
+
+    #[test]
+    fn postgres_process_candidate_rejects_two_lifetimes_in_one_snapshot() {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 10,
+            backends: vec![activity_backend(7, 200)],
+            completeness: SnapshotCompleteness::Complete,
+        });
+        for starttime in [100, 200] {
+            typed.insert_counter(
+                "os_process",
+                "read_bytes",
+                process_identity(7, starttime),
+                vec![(10, value(1.0))],
+            );
+        }
+
+        assert!(!postgres_process_candidate(&typed, 7, 100, 10));
+        assert!(!postgres_process_candidate(&typed, 7, 200, 10));
     }
 
     #[test]

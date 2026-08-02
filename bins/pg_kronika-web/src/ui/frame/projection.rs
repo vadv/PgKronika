@@ -15,7 +15,7 @@ use super::cursor::FrameCursor;
 use super::dto::{FrameValue, SparkDto};
 use super::query::{filter_sort_page, value_sort_key};
 use super::threshold::{CellClassification, FrameThresholdContext, classify_row};
-use crate::ui::catalog::{ColumnSpec, ProjectionCatalog, ValueType, ViewSpec};
+use crate::ui::catalog::{ColumnSpec, ProjectionCatalog, RelationKind, ValueType, ViewSpec};
 use crate::ui::snapshot::{ResolvedViewSnapshot, SnapshotSummaryQuality, resolve_view_snapshot};
 
 const JS_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
@@ -107,6 +107,8 @@ pub(crate) struct ProjectedRelation {
     pub relation: &'static str,
     pub view: &'static str,
     pub entity: Vec<u8>,
+    pub kind: RelationKind,
+    pub method: &'static str,
     pub fields: Vec<&'static str>,
 }
 
@@ -562,12 +564,27 @@ fn statement_plan_relations(
     reject_internal_continuation(&pages, limits.rows)?;
     let mut relations = Vec::new();
     for section in ["pg_store_plans_ossc", "pg_store_plans_vadv"] {
+        // Fork-specific attribution is a per-section constant: resolve it once
+        // instead of allocating the field list for every scanned row.
+        let (queryid_column, method, fields): (&str, &'static str, [&'static str; 3]) =
+            match section {
+                "pg_store_plans_ossc" => (
+                    "queryid",
+                    "ossc_queryid_dbid_userid_attribution",
+                    ["queryid", "dbid", "userid"],
+                ),
+                "pg_store_plans_vadv" => (
+                    "queryid_stat_statements",
+                    "vadv_queryid_stat_statements_dbid_userid_attribution",
+                    ["queryid_stat_statements", "dbid", "userid"],
+                ),
+                _ => continue,
+            };
         for row in pages.get(section).into_iter().flat_map(|page| &page.rows) {
             if timestamp(row, "ts")? != Some(snapshot_ts_us)
                 || value(row, "dbid") != Some(statement_dbid)
                 || value(row, "userid") != Some(statement_userid)
-                || value(row, "queryid").or_else(|| value(row, "queryid_stat_statements"))
-                    != Some(statement_queryid)
+                || value(row, queryid_column) != Some(statement_queryid)
             {
                 continue;
             }
@@ -575,7 +592,9 @@ fn statement_plan_relations(
                 relation: "statement_plan",
                 view: "plans",
                 entity: entity_for(plan_view, section, row, snapshot_ts_us)?,
-                fields: vec!["queryid", "dbid", "userid"],
+                kind: RelationKind::BestEffort,
+                method,
+                fields: fields.to_vec(),
             });
         }
     }
@@ -709,26 +728,26 @@ fn columns_require_predecessor(view: &WebView, columns: &[&ColumnSpec]) -> bool 
 fn column_requires_predecessor(view: &str, column: &str) -> bool {
     matches!(
         (view, column),
-        ("activity", "cpu")
-            | (
-                "statements",
-                "calls"
-                    | "total"
-                    | "ms_per_row"
-                    | "mean"
-                    | "time_pct"
-                    | "plan_time_pct"
-                    | "rows"
-                    | "hit_pct"
-                    | "blks_read"
-                    | "temp_written"
-                    | "wal_bytes"
-            )
-            | (
-                "plans",
-                "calls" | "mean" | "rows" | "shared_hit" | "shared_read"
-            )
-            | ("tables", "seq_scan_pct" | "io_hit_pct")
+        (
+            "activity",
+            "cpu" | "read_bytes_per_second" | "write_bytes_per_second",
+        ) | (
+            "statements",
+            "calls"
+                | "total"
+                | "ms_per_row"
+                | "mean"
+                | "time_pct"
+                | "plan_time_pct"
+                | "rows"
+                | "hit_pct"
+                | "blks_read"
+                | "temp_written"
+                | "wal_bytes"
+        ) | (
+            "plans",
+            "calls" | "mean" | "rows" | "shared_hit" | "shared_read"
+        ) | ("tables", "seq_scan_pct" | "io_hit_pct")
             | ("indexes", "scans" | "rows_per_scan" | "io_hit_pct")
             | (
                 "processes",
@@ -987,6 +1006,31 @@ fn project_activity(
     out.operands.activity_state = text(row, "state").map(str::to_owned);
     out.operands.query_start_us = timestamp(row, "query_start")?;
     out.operands.transaction_start_us = timestamp(row, "xact_start")?;
+    let needs_process = columns.iter().any(|column| {
+        matches!(
+            column.code,
+            "process_link" | "cpu" | "read_bytes_per_second" | "write_bytes_per_second"
+        )
+    });
+    let current_process = if needs_process {
+        activity_process_candidate(row, &input.current, input.snapshot_ts_us)
+    } else {
+        None
+    };
+    let previous_process = if columns.iter().any(|column| {
+        matches!(
+            column.code,
+            "cpu" | "read_bytes_per_second" | "write_bytes_per_second"
+        )
+    }) {
+        current_process.and_then(|current| {
+            input.predecessor_ts_us.and_then(|timestamp| {
+                activity_process_predecessor(current, &input.previous, timestamp)
+            })
+        })
+    } else {
+        None
+    };
     for column in columns {
         let value = match column.code {
             "pid" => raw_frame(row, "pid", column.value_type),
@@ -999,21 +1043,24 @@ fn project_activity(
             "query" => raw_frame(row, "query", column.value_type),
             "query_duration_us" => duration_us(input.snapshot_ts_us, row, "query_start")?,
             "transaction_duration_us" => duration_us(input.snapshot_ts_us, row, "xact_start")?,
-            "cpu" => {
-                let current_process = activity_process(row, &input.current, input.snapshot_ts_us);
-                let previous_process = input
-                    .predecessor_ts_us
-                    .and_then(|timestamp| activity_process(row, &input.previous, timestamp));
-                current_process.map_or(FrameValue::Null, |current| {
-                    rate_sum(
-                        current,
-                        previous_process,
-                        &["utime", "stime"],
-                        input,
-                        has_gap,
-                    )
-                })
-            }
+            "process_link" => current_process.map_or(FrameValue::Null, |_process| {
+                FrameValue::String("best_effort".to_owned())
+            }),
+            "cpu" => current_process.map_or(FrameValue::Null, |current| {
+                rate_sum(
+                    current,
+                    previous_process,
+                    &["utime", "stime"],
+                    input,
+                    has_gap,
+                )
+            }),
+            "read_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
+                rate_sum(current, previous_process, &["read_bytes"], input, has_gap)
+            }),
+            "write_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
+                rate_sum(current, previous_process, &["write_bytes"], input, has_gap)
+            }),
             "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
                 .map_or(FrameValue::Null, |replica| {
                     raw_frame(replica, "state", column.value_type)
@@ -1045,17 +1092,31 @@ fn activity_replica<'a>(
     })
 }
 
-fn activity_process<'a>(
+fn activity_process_candidate<'a>(
     activity: &OutRow,
     sections: &'a BTreeMap<String, Vec<OutRow>>,
     timestamp_us: i64,
 ) -> Option<&'a OutRow> {
     let pid = finite_number(activity, "pid").ok().flatten()?;
-    let backend_start = timestamp(activity, "backend_start").ok().flatten()?;
+    let mut candidates = sections.get("os_process")?.iter().filter(|process| {
+        timestamp(process, "ts").ok().flatten() == Some(timestamp_us)
+            && finite_number(process, "pid").ok().flatten() == Some(pid)
+    });
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
+}
+
+fn activity_process_predecessor<'a>(
+    current: &OutRow,
+    sections: &'a BTreeMap<String, Vec<OutRow>>,
+    timestamp_us: i64,
+) -> Option<&'a OutRow> {
+    let pid = finite_number(current, "pid").ok().flatten()?;
+    let starttime = timestamp(current, "starttime").ok().flatten()?;
     sections.get("os_process")?.iter().find(|process| {
         timestamp(process, "ts").ok().flatten() == Some(timestamp_us)
             && finite_number(process, "pid").ok().flatten() == Some(pid)
-            && timestamp(process, "starttime").ok().flatten() == Some(backend_start)
+            && timestamp(process, "starttime").ok().flatten() == Some(starttime)
     })
 }
 

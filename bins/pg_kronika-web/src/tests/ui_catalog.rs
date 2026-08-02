@@ -5,6 +5,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use kronika_analytics::MetricId;
 use kronika_registry::registry;
+use serde_json::json;
 use tower::ServiceExt;
 
 use crate::ui::catalog::{Availability, ProjectionCatalog};
@@ -82,6 +83,40 @@ fn catalog_exposes_all_nine_views_in_stable_code_order() {
             (9, "events"),
         ]
     );
+}
+
+#[test]
+fn catalog_serializes_relation_quality_without_promoting_pid_only_evidence() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let activity_joins = serialized_view(&catalog, "activity")["joins"]
+        .as_array()
+        .expect("activity joins");
+    let activity_join = activity_joins
+        .iter()
+        .find(|join| join["right"] == "process")
+        .expect("activity to process join");
+    let replication_join = activity_joins
+        .iter()
+        .find(|join| join["right"] == "replication_replicas")
+        .expect("activity to replication join");
+    let vacuum_join = serialized_view(&catalog, "vacuum")["joins"]
+        .as_array()
+        .expect("vacuum joins")
+        .first()
+        .expect("vacuum to tables join");
+    let process_cgroup_join = serialized_view(&catalog, "processes")["joins"]
+        .as_array()
+        .expect("process joins")
+        .first()
+        .expect("process to cgroup join");
+
+    assert_eq!(activity_join["kind"], "best_effort");
+    assert_eq!(activity_join["fields"], json!(["pid", "ts"]));
+    assert_eq!(activity_join["provenance"], "same_snapshot_pid_only");
+    assert_eq!(replication_join["kind"], "temporal");
+    assert_eq!(vacuum_join["kind"], "temporal");
+    assert_eq!(process_cgroup_join["kind"], "exact");
 }
 
 #[test]
@@ -527,7 +562,7 @@ async fn ui_catalog_returns_nine_views_for_the_root() {
 
     let response = serve_captured(dir.path(), "/v1/ui/catalog", &[]).await;
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body["revision"], 2);
+    assert_eq!(response.body["revision"], 3);
     assert_eq!(
         response.body["views"].as_array().map(Vec::len),
         Some(9),

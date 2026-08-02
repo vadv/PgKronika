@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
-import { colDesc, colLabel } from "../api/codes";
+import { colDesc, colLabel, relationKindDesc, relationKindLabel } from "../api/codes";
 import { useEntity } from "../api/entity";
 import { useIncidents } from "../api/incidents";
 import type {
@@ -803,23 +803,31 @@ function RowDock(props: {
             list — never a client-side join by name/queryid via free text. */}
         {data &&
           "fields" in data &&
-          data.related.map((rel) => (
-            <button
-              key={`${rel.view}:${rel.entity}`}
-              type="button"
-              title={`${rel.relation} (${rel.provenance.kind}: ${rel.provenance.fields.join(", ")})`}
-              onClick={() =>
-                props.onPatch({
-                  view: rel.view,
-                  entity: rel.entity,
-                  dock: "row",
-                })
-              }
-              style={drillButtonStyle}
-            >
-              {t("dock.row.drill", { view: rel.view })}
-            </button>
-          ))}
+          data.related.map((rel) => {
+            // Localized kind label + explanation; the machine method/fields
+            // stay in the tooltip as the full provenance value.
+            const kindDesc = relationKindDesc(t, rel.provenance.kind);
+            const title = `${rel.relation}: ${relationKindLabel(t, rel.provenance.kind)}${
+              kindDesc !== null ? ` — ${kindDesc}` : ""
+            } [${rel.provenance.method} · ${rel.provenance.fields.join(", ")}]`;
+            return (
+              <button
+                key={`${rel.view}:${rel.entity}`}
+                type="button"
+                title={title}
+                onClick={() =>
+                  props.onPatch({
+                    view: rel.view,
+                    entity: rel.entity,
+                    dock: "row",
+                  })
+                }
+                style={drillButtonStyle}
+              >
+                {t("dock.row.drill", { view: rel.view })}
+              </button>
+            );
+          })}
         <button
           type="button"
           onClick={() => props.onPatch({ entity: null, dock: null })}

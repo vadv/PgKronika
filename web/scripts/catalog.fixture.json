@@ -1,5 +1,5 @@
 {
-  "revision": 2,
+  "revision": 3,
   "views": [
     {
       "view_code": 1,
@@ -40,13 +40,15 @@
         {
           "left": "activity",
           "right": "process",
-          "fields": ["pid", "backend_start=starttime"],
+          "kind": "best_effort",
+          "fields": ["pid", "ts"],
           "cardinality": "zero_or_one",
-          "provenance": "pid_and_process_start_match"
+          "provenance": "same_snapshot_pid_only"
         },
         {
           "left": "activity",
           "right": "replication_replicas",
+          "kind": "temporal",
           "fields": ["pid", "ts"],
           "cardinality": "zero_or_one",
           "provenance": "same_snapshot_walsender_pid"
@@ -190,9 +192,38 @@
           "unavailable_reason": "missing_extension"
         },
         {
+          "code": "process_link",
+          "type": "text",
+          "formula": "best_effort same-snapshot PID association",
+          "lazy": false,
+          "requires": ["activity", "process"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
           "code": "cpu",
           "type": "f64",
           "formula": "positive_delta(utime + stime) / elapsed",
+          "lazy": false,
+          "requires": ["activity", "process"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "read_bytes_per_second",
+          "type": "f64",
+          "formula": "positive_delta(read_bytes) / elapsed",
+          "unit": "bytes_per_second",
+          "lazy": false,
+          "requires": ["activity", "process"],
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
+        },
+        {
+          "code": "write_bytes_per_second",
+          "type": "f64",
+          "formula": "positive_delta(write_bytes) / elapsed",
+          "unit": "bytes_per_second",
           "lazy": false,
           "requires": ["activity", "process"],
           "availability": "gated",
@@ -1218,6 +1249,7 @@
         {
           "left": "vacuum",
           "right": "tables",
+          "kind": "temporal",
           "fields": ["datid", "relid", "ts"],
           "cardinality": "zero_or_one",
           "provenance": "same_snapshot_database_relation_oid"
@@ -1377,6 +1409,7 @@
         {
           "left": "process",
           "right": "cgroup_mapping",
+          "kind": "exact",
           "fields": ["pid", "starttime", "ts"],
           "cardinality": "zero_or_one",
           "provenance": "same_snapshot_pid_and_process_start"
