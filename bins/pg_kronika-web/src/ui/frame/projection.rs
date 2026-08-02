@@ -709,26 +709,26 @@ fn columns_require_predecessor(view: &WebView, columns: &[&ColumnSpec]) -> bool 
 fn column_requires_predecessor(view: &str, column: &str) -> bool {
     matches!(
         (view, column),
-        ("activity", "cpu")
-            | (
-                "statements",
-                "calls"
-                    | "total"
-                    | "ms_per_row"
-                    | "mean"
-                    | "time_pct"
-                    | "plan_time_pct"
-                    | "rows"
-                    | "hit_pct"
-                    | "blks_read"
-                    | "temp_written"
-                    | "wal_bytes"
-            )
-            | (
-                "plans",
-                "calls" | "mean" | "rows" | "shared_hit" | "shared_read"
-            )
-            | ("tables", "seq_scan_pct" | "io_hit_pct")
+        (
+            "activity",
+            "cpu" | "read_bytes_per_second" | "write_bytes_per_second",
+        ) | (
+            "statements",
+            "calls"
+                | "total"
+                | "ms_per_row"
+                | "mean"
+                | "time_pct"
+                | "plan_time_pct"
+                | "rows"
+                | "hit_pct"
+                | "blks_read"
+                | "temp_written"
+                | "wal_bytes"
+        ) | (
+            "plans",
+            "calls" | "mean" | "rows" | "shared_hit" | "shared_read"
+        ) | ("tables", "seq_scan_pct" | "io_hit_pct")
             | ("indexes", "scans" | "rows_per_scan" | "io_hit_pct")
             | (
                 "processes",
@@ -987,15 +987,23 @@ fn project_activity(
     out.operands.activity_state = text(row, "state").map(str::to_owned);
     out.operands.query_start_us = timestamp(row, "query_start")?;
     out.operands.transaction_start_us = timestamp(row, "xact_start")?;
-    let needs_process = columns
-        .iter()
-        .any(|column| matches!(column.code, "process_link" | "cpu"));
+    let needs_process = columns.iter().any(|column| {
+        matches!(
+            column.code,
+            "process_link" | "cpu" | "read_bytes_per_second" | "write_bytes_per_second"
+        )
+    });
     let current_process = if needs_process {
         activity_process_candidate(row, &input.current, input.snapshot_ts_us)
     } else {
         None
     };
-    let previous_process = if columns.iter().any(|column| column.code == "cpu") {
+    let previous_process = if columns.iter().any(|column| {
+        matches!(
+            column.code,
+            "cpu" | "read_bytes_per_second" | "write_bytes_per_second"
+        )
+    }) {
         current_process.and_then(|current| {
             input.predecessor_ts_us.and_then(|timestamp| {
                 activity_process_predecessor(current, &input.previous, timestamp)
@@ -1027,6 +1035,12 @@ fn project_activity(
                     input,
                     has_gap,
                 )
+            }),
+            "read_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
+                rate_sum(current, previous_process, &["read_bytes"], input, has_gap)
+            }),
+            "write_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
+                rate_sum(current, previous_process, &["write_bytes"], input, has_gap)
             }),
             "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
                 .map_or(FrameValue::Null, |replica| {

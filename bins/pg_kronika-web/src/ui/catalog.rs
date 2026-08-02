@@ -651,6 +651,20 @@ fn activity_view() -> ViewSpec {
             &["activity", "process"],
             None,
         ),
+        derived_column(
+            "read_bytes_per_second",
+            ValueType::F64,
+            "positive_delta(read_bytes) / elapsed",
+            &["activity", "process"],
+            Some("bytes_per_second"),
+        ),
+        derived_column(
+            "write_bytes_per_second",
+            ValueType::F64,
+            "positive_delta(write_bytes) / elapsed",
+            &["activity", "process"],
+            Some("bytes_per_second"),
+        ),
         raw_column(
             "replication_state",
             ValueType::Text,
