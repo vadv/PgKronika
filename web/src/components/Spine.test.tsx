@@ -161,9 +161,11 @@ function renderSpine(overrides: Partial<SpineProps> = {}) {
     at: String(AT_US),
     span: 3600,
     baseline: null,
+    range: { fromUs: String(FROM_US), toUs: String(AT_US) },
     onSelectAt: () => {},
     onSelectSpan: () => {},
     onSelectBaseline: () => {},
+    onToggleLive: () => {},
     ...overrides,
   };
   return render(<Spine {...props} />, { wrapper });
@@ -233,9 +235,11 @@ test("a health-less window renders honest gap markers, not silence", async () =>
       at={String(AT_US)}
       span={3600}
       baseline={null}
+      range={{ fromUs: String(FROM_US), toUs: String(AT_US) }}
       onSelectAt={() => {}}
       onSelectSpan={() => {}}
       onSelectBaseline={() => {}}
+      onToggleLive={() => {}}
     />,
     { wrapper },
   );
@@ -278,9 +282,11 @@ test("an empty window shows the no-data line instead of a blank chart", async ()
       at={String(AT_US)}
       span={3600}
       baseline={null}
+      range={{ fromUs: String(FROM_US), toUs: String(AT_US) }}
       onSelectAt={() => {}}
       onSelectSpan={() => {}}
       onSelectBaseline={() => {}}
+      onToggleLive={() => {}}
     />,
     { wrapper },
   );
@@ -324,18 +330,18 @@ test("shift+click sets the baseline, a repeat nearby clears it", async () => {
   expect(onSelectBaseline).toHaveBeenLastCalledWith(null);
 });
 
-test("mode button toggles LIVE → REPLAY and back", async () => {
-  const onSelectAt = vi.fn();
-  const { unmount } = renderSpine({ at: null, onSelectAt });
+test("mode button delegates LIVE and REPLAY changes to the shared clock", async () => {
+  const onToggleLive = vi.fn();
+  const { unmount } = renderSpine({ at: null, onToggleLive });
   const liveButton = await screen.findByRole("button", { name: /live/i });
   fireEvent.click(liveButton);
-  expect(onSelectAt).toHaveBeenCalledWith(expect.stringMatching(/^\d+$/));
+  expect(onToggleLive).toHaveBeenCalledTimes(1);
   unmount();
 
-  renderSpine({ at: String(AT_US), onSelectAt });
+  renderSpine({ at: String(AT_US), onToggleLive });
   const replayButton = await screen.findByRole("button", { name: /replay/i });
   fireEvent.click(replayButton);
-  expect(onSelectAt).toHaveBeenLastCalledWith(null);
+  expect(onToggleLive).toHaveBeenCalledTimes(2);
 });
 
 test("zoom group reports the selected span", async () => {
@@ -362,11 +368,11 @@ test("live mode anchors the grid and hatches the forming tail bucket", async () 
     expect(
       forming.parentElement?.querySelector("title")?.textContent,
     ).toContain("spine.forming");
-    // Score over the 95 completed buckets: 24 crit + 24 warn of 0.625 min
-    // each, 1 incident: 100 − 15×3 − 15×0.5 − 5 = 42.5 → 43.
-    expect(screen.getByTestId("spine-score").textContent).toContain("43");
+    // Score over the 95 completed buckets: the forming tail removes one
+    // critical bucket, so 23 crit + 24 warn and 1 incident round to 44.
+    expect(screen.getByTestId("spine-score").textContent).toContain("44");
     expect(screen.getByTestId("spine-score-delta").textContent).toContain(
-      "▼57",
+      "▼56",
     );
   } finally {
     vi.useRealTimers();
@@ -413,9 +419,11 @@ test("a 503 during revalidation keeps the ribbon — warming is cold-start only"
       at={String(AT_US)}
       span={3600}
       baseline={null}
+      range={{ fromUs: String(FROM_US), toUs: String(AT_US) }}
       onSelectAt={() => {}}
       onSelectSpan={() => {}}
       onSelectBaseline={() => {}}
+      onToggleLive={() => {}}
     />,
     { wrapper },
   );
@@ -452,9 +460,11 @@ test("a cold start under a 503 says warming, not error", async () => {
       at={String(AT_US)}
       span={3600}
       baseline={null}
+      range={{ fromUs: String(FROM_US), toUs: String(AT_US) }}
       onSelectAt={() => {}}
       onSelectSpan={() => {}}
       onSelectBaseline={() => {}}
+      onToggleLive={() => {}}
     />,
     { wrapper },
   );
@@ -504,9 +514,11 @@ test("a window without a previous one says so instead of a bare dash", async () 
       at={String(AT_US)}
       span={3600}
       baseline={null}
+      range={{ fromUs: String(FROM_US), toUs: String(AT_US) }}
       onSelectAt={() => {}}
       onSelectSpan={() => {}}
       onSelectBaseline={() => {}}
+      onToggleLive={() => {}}
     />,
     { wrapper },
   );

@@ -10,6 +10,7 @@ import {
 } from "react";
 import {
   isTimestampUs,
+  INT64_MIN,
   isValidSpan,
   parseHash,
   SPANS,
@@ -49,6 +50,7 @@ export interface TimeGeometryProviderProps {
 const LIVE_TICK_MS = 15_000;
 const US_PER_SECOND = 1_000_000n;
 const MAX_RANGE_US = 86_400n * US_PER_SECOND;
+const INCIDENT_LOOKBACK_US = 86_400n * US_PER_SECOND;
 
 const TimeGeometryContext = createContext<TimeGeometryValue | null>(null);
 
@@ -65,9 +67,37 @@ function normalizeDraft(range: TimeRange): TimeRange | null {
     : { fromUs: to.toString(), toUs: from.toString() };
 }
 
+/** Every current consumer stays inside int64: the application reads a fixed
+ * trailing 24 h incident window, while Health reads the selected and previous
+ * windows together for its comparison score. */
+function hasSafeHistory(cursorUs: string, span: number): boolean {
+  const selectedAndPreviousUs = BigInt(span) * US_PER_SECOND * 2n;
+  const requiredHistoryUs =
+    selectedAndPreviousUs > INCIDENT_LOOKBACK_US
+      ? selectedAndPreviousUs
+      : INCIDENT_LOOKBACK_US;
+  return BigInt(cursorUs) >= INT64_MIN + requiredHistoryUs;
+}
+
+function sanitizeInitialState(state: UiState): UiState {
+  return state.at !== null && !hasSafeHistory(state.at, state.span)
+    ? { ...state, at: null }
+    : state;
+}
+
+function replaceHashSilently(state: UiState): void {
+  const hash = toHash(state);
+  if (location.hash === hash) return;
+  history.replaceState(
+    history.state,
+    "",
+    `${location.pathname}${location.search}${hash}`,
+  );
+}
+
 function sanitizePatch(previous: UiState, patch: Partial<UiState>): UiState {
   const merged = { ...previous, ...patch };
-  return {
+  const next = {
     ...merged,
     at:
       merged.at === null || isTimestampUs(merged.at) ? merged.at : previous.at,
@@ -77,10 +107,18 @@ function sanitizePatch(previous: UiState, patch: Partial<UiState>): UiState {
         ? merged.baseline
         : previous.baseline,
   };
+  if (next.at !== null && !hasSafeHistory(next.at, next.span)) {
+    // Reject the time mutation as a unit while retaining unrelated UI fields.
+    next.at = previous.at;
+    next.span = previous.span;
+  }
+  return next;
 }
 
 export function TimeGeometryProvider({ children }: TimeGeometryProviderProps) {
-  const [state, setState] = useState(() => parseHash(location.hash));
+  const [state, setState] = useState(() =>
+    sanitizeInitialState(parseHash(location.hash)),
+  );
   const stateRef = useRef(state);
   const [liveTickUs, setLiveTickUs] = useState(nowUs);
   const liveTickRef = useRef(liveTickUs);
@@ -91,6 +129,11 @@ export function TimeGeometryProvider({ children }: TimeGeometryProviderProps) {
   liveTickRef.current = liveTickUs;
 
   const replaceState = useCallback((next: UiState) => {
+    if (stateRef.current.at !== null && next.at === null) {
+      const nextLiveTick = nowUs();
+      liveTickRef.current = nextLiveTick;
+      setLiveTickUs(nextLiveTick);
+    }
     stateRef.current = next;
     setState(next);
     const hash = toHash(next);
@@ -106,11 +149,20 @@ export function TimeGeometryProvider({ children }: TimeGeometryProviderProps) {
   );
 
   useEffect(() => {
+    // An invalid/unsafe deep link falls back to Live; keep the address bar
+    // canonical as well, without manufacturing an extra history entry.
+    replaceHashSilently(stateRef.current);
     const onHashChange = () => {
       if (location.hash === toHash(stateRef.current)) return;
-      const next = parseHash(location.hash);
+      const next = sanitizeInitialState(parseHash(location.hash));
+      if (stateRef.current.at !== null && next.at === null) {
+        const nextLiveTick = nowUs();
+        liveTickRef.current = nextLiveTick;
+        setLiveTickUs(nextLiveTick);
+      }
       stateRef.current = next;
       setState(next);
+      replaceHashSilently(next);
       setHoverState(null);
       setBrushDraftState(null);
     };
@@ -159,6 +211,7 @@ export function TimeGeometryProvider({ children }: TimeGeometryProviderProps) {
           : (durationUs + US_PER_SECOND - 1n) / US_PER_SECOND;
       const span = Number(roundedSeconds);
       if (!isValidSpan(span)) return;
+      if (!hasSafeHistory(normalized.toUs, span)) return;
       setBrushDraftState(null);
       patchUiState({ at: normalized.toUs, span });
     },
@@ -192,9 +245,6 @@ export function TimeGeometryProvider({ children }: TimeGeometryProviderProps) {
       patchUiState({ at: liveTickRef.current });
       return;
     }
-    const nextLiveTick = nowUs();
-    liveTickRef.current = nextLiveTick;
-    setLiveTickUs(nextLiveTick);
     patchUiState({ at: null });
   }, [patchUiState]);
 

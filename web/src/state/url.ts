@@ -4,7 +4,7 @@ export interface UiState {
   view: string;
   /** Cursor timestamp (int64 µs, decimal string); null = LIVE. */
   at: string | null;
-  /** Window length in seconds (900 / 3600 / 21600 / 86400). */
+  /** Window length in integer seconds (1..86400); prepared controls are SPANS. */
   span: number;
   /** Baseline cursor for the heatmap Δ-mode (int64 µs string). */
   baseline: string | null;
@@ -31,10 +31,14 @@ export const MAX_SPAN = 86_400;
 /** Signed decimal int64 — the only accepted wire form for µs timestamps. */
 const DECIMAL_US = /^-?\d+$/;
 const DECIMAL_SECONDS = /^\d+$/;
-const INT64_MIN = -(1n << 63n);
-const INT64_MAX = (1n << 63n) - 1n;
+export const INT64_MIN = -(1n << 63n);
+export const INT64_MAX = (1n << 63n) - 1n;
 
 export function isTimestampUs(raw: string): boolean {
+  // A signed int64 needs at most 20 characters including the minus sign.
+  // Reject before BigInt parsing so a hostile hash cannot force work linear
+  // in an otherwise unbounded decimal string.
+  if (raw.length === 0 || raw.length > 20) return false;
   if (!DECIMAL_US.test(raw)) return false;
   const timestamp = BigInt(raw);
   return timestamp >= INT64_MIN && timestamp <= INT64_MAX;

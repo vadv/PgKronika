@@ -26,6 +26,7 @@ import { App } from "./App";
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -302,6 +303,66 @@ test("an arbitrary replay span reaches heatmap consumers exactly", async () => {
     expect(params.get("from")).toBe("1722399963000000");
     expect(params.get("to")).toBe("1722400000000000");
   });
+});
+
+test("real timeline and data-health endpoints share the pinned LIVE geometry", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-08-03T12:00:00.123Z"));
+  renderApp();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(50);
+  });
+  fireEvent.click(screen.getByTestId("data-health-chip"));
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(50);
+  });
+
+  const expectedTo = "1785758400123000";
+  const expectedFrom = "1785754800123000";
+  const expectedPreviousFrom = "1785751200123000";
+  const calls = () =>
+    vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      );
+  const latest = (path: string) =>
+    calls()
+      .filter((url) => url.pathname === path)
+      .at(-1) ?? new URL(location.href);
+
+  for (const path of [
+    "/v1/timeline/spine",
+    "/v1/timeline/events",
+    "/v1/timeline/heatmap",
+    "/v1/data/quality",
+  ]) {
+    expect(latest(path).searchParams.get("from")).toBe(expectedFrom);
+    expect(latest(path).searchParams.get("to")).toBe(expectedTo);
+  }
+  expect(latest("/v1/timeline/health").searchParams.get("from")).toBe(
+    expectedPreviousFrom,
+  );
+  expect(latest("/v1/timeline/health").searchParams.get("to")).toBe(expectedTo);
+
+  const qualityCalls = calls().filter(
+    (url) => url.pathname === "/v1/data/quality",
+  ).length;
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2_000);
+  });
+  expect(
+    calls().filter((url) => url.pathname === "/v1/data/quality").length,
+  ).toBe(qualityCalls);
+  expect(latest("/v1/data/quality").searchParams.get("to")).toBe(expectedTo);
+  vi.useRealTimers();
 });
 
 test("switching view drops preset and sort the next view does not have", async () => {

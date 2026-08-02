@@ -185,7 +185,7 @@ function Shell() {
       }}
     >
       <Header
-        state={state}
+        range={range}
         context={context.data}
         incidents={incidents.data}
         // Share always carries the absolute cursor time: a LIVE link must
@@ -311,9 +311,11 @@ function Shell() {
             at={state.at}
             span={state.span}
             baseline={state.baseline}
-            onSelectAt={(nextAt) => patch({ at: nextAt })}
+            range={range}
+            onSelectAt={setCursor}
             onSelectSpan={setSpan}
             onSelectBaseline={setBaseline}
+            onToggleLive={toggleLive}
           />
           {focusedIncident !== undefined && (
             <FocusBar

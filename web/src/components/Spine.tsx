@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { eventKindLabel, metricLabel } from "../api/codes";
 import { isWarmingUp } from "../api/client";
@@ -12,9 +12,9 @@ import {
   formatTimestampUs,
 } from "../design/format";
 import { SPANS } from "../state/url";
+import type { TimeRange } from "../state/timeGeometry";
 import { Tooltip } from "./Tooltip";
 import {
-  anchorWindowEnd,
   bucketReason,
   bucketVerdicts,
   chipTone,
@@ -32,9 +32,12 @@ export interface SpineProps {
   span: number;
   /** Baseline cursor (int64 µs string); null = no baseline. */
   baseline: string | null;
-  onSelectAt: (at: string | null) => void;
+  /** Canonical provider-owned selected range. */
+  range: TimeRange;
+  onSelectAt: (at: string) => void;
   onSelectSpan: (span: number) => void;
   onSelectBaseline: (baseline: string | null) => void;
+  onToggleLive: () => void;
 }
 
 const SVG_HEIGHT = 40;
@@ -150,30 +153,20 @@ function formatMin(minutes: number): string {
 export function Spine(props: SpineProps) {
   const { t } = useTranslation();
   const live = props.at === null;
-  const [nowUs, setNowUs] = useState(() => Date.now() * 1000);
-
-  useEffect(() => {
-    if (!live) return;
-    const id = setInterval(() => setNowUs(Date.now() * 1000), LIVE_REFRESH_MS);
-    return () => clearInterval(id);
-  }, [live]);
-
   const [hoverUs, setHoverUs] = useState<number | null>(null);
   // Wire range follows the zoom span (exact BigInt math); the 24 h bound is
   // enforced by the span whitelist in the URL codec.
   const windowUs = BigInt(props.span) * 1_000_000n;
   const windowNum = props.span * 1_000_000;
-  // The ribbon grid is anchored to the absolute epoch: LIVE window end is
-  // the end of the currently forming bucket, so bucket boundaries are
-  // multiples of the bucket span and the grid is identical between renders.
   const bucketSpanUs = windowNum / SPINE_BUCKETS;
-  const toUs =
-    props.at !== null ? Number(props.at) : anchorWindowEnd(nowUs, bucketSpanUs);
-  const toBig = BigInt(toUs);
-  const fromBig = toBig - windowUs;
+  const toBig = BigInt(props.range.toUs);
+  const fromBig = BigInt(props.range.fromUs);
   const from = fromBig.toString();
   const to = toBig.toString();
   const prevFrom = (fromBig - windowUs).toString();
+  // Absolute timestamps are converted only for the existing bounded SVG
+  // geometry; every API query above keeps the exact provider-owned strings.
+  const toUs = Number(toBig);
   const fromUs = toUs - windowNum;
   // LIVE: the last bucket is still forming — hatched, out of the score.
   const hasFormingTail = live;
@@ -372,9 +365,7 @@ export function Spine(props: SpineProps) {
       <button
         type="button"
         aria-pressed={!live}
-        onClick={() =>
-          props.onSelectAt(live ? String(Date.now() * 1000) : null)
-        }
+        onClick={props.onToggleLive}
         style={{
           fontSize: "var(--text-xs)",
           fontWeight: 600,

@@ -2,7 +2,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { act, createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
-import type { UiState } from "../state/url";
 import {
   makeContextResponse,
   makeDataQualityResponse,
@@ -12,20 +11,6 @@ import {
   makeStorageResponse,
 } from "../testkit/apiFixtures";
 import { Header, type HeaderProps } from "./Header";
-
-const state: UiState = {
-  view: "activity",
-  at: null,
-  span: 3600,
-  baseline: null,
-  preset: null,
-  q: null,
-  sort: null,
-  order: null,
-  focus: null,
-  dock: null,
-  entity: null,
-};
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -57,7 +42,7 @@ function renderHeader(overrides: Partial<HeaderProps> = {}) {
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client }, children);
   const props: HeaderProps = {
-    state,
+    range: { fromUs: "1722396400000000", toUs: "1722400000000000" },
     context: undefined,
     incidents: undefined,
     shareUrl: "https://pgkronika.local/#view=activity&at=1722400000000000",

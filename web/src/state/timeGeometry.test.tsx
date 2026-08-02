@@ -205,3 +205,69 @@ test("toggleLive pins replay and then returns to the shared LIVE clock", () => {
   expect(value().state.at).toBeNull();
   expect(value().range.toUs).toBe("1785758460000000");
 });
+
+test("hash navigation from replay to LIVE pins wall time immediately", () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-08-03T12:00:00.000Z"));
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000`,
+  );
+  renderProvider();
+
+  vi.setSystemTime(new Date("2026-08-03T14:00:00.000Z"));
+  act(() => {
+    history.replaceState(null, "", `${location.pathname}#view=activity`);
+    window.dispatchEvent(new Event("hashchange"));
+  });
+
+  expect(value().isLive).toBe(true);
+  expect(value().cursorUs).toBe("1785765600000000");
+});
+
+test("accepts only cursors whose complete consumer history stays in int64", () => {
+  // At the maximum 24 h span Spine reads current + previous windows (48 h).
+  const int64Min = -(1n << 63n);
+  const safe = int64Min + 172_800_000_000n;
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=${safe}&span=86400`,
+  );
+  renderProvider();
+  expect(value().state.at).toBe(safe.toString());
+  cleanup();
+  observed = null;
+
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=${safe - 1n}&span=86400`,
+  );
+  renderProvider();
+  expect(value().state.at).toBeNull();
+  expect(location.hash).not.toContain("at=");
+});
+
+test("rejects an unsafe sub-second brush and unsafe span expansion", () => {
+  const int64Min = -(1n << 63n);
+  const safeForOneSecond = int64Min + 86_400_000_000n;
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=${safeForOneSecond}&span=1`,
+  );
+  renderProvider();
+
+  act(() => {
+    value().commitRange({
+      fromUs: (safeForOneSecond - 500_001n).toString(),
+      toUs: (safeForOneSecond - 1n).toString(),
+    });
+  });
+  expect(value().state.at).toBe(safeForOneSecond.toString());
+
+  act(() => value().setSpan(86_400));
+  expect(value().state.span).toBe(1);
+});

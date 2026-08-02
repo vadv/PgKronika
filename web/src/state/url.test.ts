@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { parseHash, SPANS, toHash, type UiState } from "./url";
+import { isTimestampUs, parseHash, SPANS, toHash, type UiState } from "./url";
 
 function fullState(overrides: Partial<UiState> = {}): UiState {
   return {
@@ -65,6 +65,11 @@ test("invalid and out-of-int64 timestamps fall back to null", () => {
   expect(parseHash("#baseline=-3600000000").baseline).toBe("-3600000000");
   expect(parseHash("#at=9223372036854775807").at).toBe("9223372036854775807");
   expect(parseHash("#at=-9223372036854775808").at).toBe("-9223372036854775808");
+});
+
+test("rejects overlong decimal input before BigInt parsing", () => {
+  expect(isTimestampUs("9".repeat(100_000))).toBe(false);
+  expect(isTimestampUs(`-${"0".repeat(100_000)}`)).toBe(false);
 });
 
 test("source is not part of the URL contract", () => {
