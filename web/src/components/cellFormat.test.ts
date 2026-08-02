@@ -52,6 +52,23 @@ test("severity and category codes route through the dictionary", () => {
   expect(fullCellValue("plain", { code: "query", type: "text" })).toBeNull();
 });
 
+test("process_link renders the localized relation kind, machine form in tooltip", () => {
+  const column = { code: "process_link", type: "text" };
+  const dict: Record<string, string> = {
+    "relation.kind.best_effort.label": "приблизительная",
+  };
+  const localized = ((key: string, opts?: Record<string, unknown>) =>
+    dict[key] ??
+    (opts?.defaultValue as string | undefined) ??
+    key) as TFunction<"translation", undefined>;
+  expect(formatCellValue("best_effort", column, localized)).toBe(
+    "приблизительная",
+  );
+  // Missing dictionary falls back to the honest machine code, never blank.
+  expect(formatCellValue("best_effort", column, t)).toBe("best_effort");
+  expect(fullCellValue("best_effort", column)).toBe("best_effort");
+});
+
 test("numeric cells honor the catalog unit", () => {
   const us = { code: "mean", type: "f64", unit: "us" };
   expect(formatCellValue(12_480_000, us, t)).toBe("12.5 s");

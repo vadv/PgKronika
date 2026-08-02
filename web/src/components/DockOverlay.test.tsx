@@ -330,7 +330,14 @@ test("row dock drills down via server related provenance and clears", async () =
   await waitFor(() => expect(screen.getByText("select 1")).toBeDefined());
   // The drill target comes from the API related list — typed identity, no
   // client-side join by name/queryid.
-  fireEvent.click(screen.getByRole("button", { name: "dock.row.drill" }));
+  const drill = screen.getByRole("button", { name: "dock.row.drill" });
+  // Provenance tooltip: kind through the relation-kind dictionary (tests run
+  // without a dictionary, so the honest machine code falls through), plus the
+  // fork-specific method and fields — never a bare DSL dump.
+  expect(drill.title).toContain("best_effort");
+  expect(drill.title).toContain("ossc_queryid_dbid_userid_attribution");
+  expect(drill.title).toContain("queryid, dbid, userid");
+  fireEvent.click(drill);
   expect(onPatch).toHaveBeenCalledWith({
     view: "plans",
     entity: "plan:9",
