@@ -1404,14 +1404,13 @@ fn project_vacuum(
             "relation" => vacuum_relation(row, &input.current, input.snapshot_ts_us),
             "phase" => raw_frame(row, "phase", column.value_type),
             "is_autovacuum" => raw_frame(row, "is_autovacuum", column.value_type),
-            "progress" => ratio(
-                finite_number(row, "heap_blks_scanned")?,
-                finite_number(row, "heap_blks_total")?,
-                1.0,
+            "progress" => finite_division(
+                numeric_number(row, "heap_blks_scanned")?,
+                numeric_number(row, "heap_blks_total")?,
             ),
-            "dead_tuples" => finite_number(row, "num_dead_tuples")?
-                .or(finite_number(row, "num_dead_item_ids")?)
-                .map_or(FrameValue::Null, finite_frame),
+            "dead_tuples" => raw_frame(row, "num_dead_tuples", column.value_type),
+            "dead_item_ids" => raw_frame(row, "num_dead_item_ids", column.value_type),
+            "dead_tuple_bytes" => raw_frame(row, "dead_tuple_bytes", column.value_type),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1776,6 +1775,20 @@ pub(crate) fn finite_number(
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "projection formulas use f64 operands while preserving integer source fields"
+)]
+fn numeric_number(row: &OutRow, name: &'static str) -> Result<Option<f64>, ProjectionError> {
+    match value(row, name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::I64(value)) => Ok(Some(*value as f64)),
+        Some(Value::U64(value)) => Ok(Some(*value as f64)),
+        Some(Value::F64(value)) => Ok(Some(*value)),
+        _ => Err(ProjectionError::InvalidValue(name)),
+    }
+}
+
 pub(crate) fn timestamp(row: &OutRow, name: &'static str) -> Result<Option<i64>, ProjectionError> {
     match value(row, name) {
         None | Some(Value::Null) => Ok(None),
@@ -2008,6 +2021,17 @@ fn ratio(numerator: Option<f64>, other: Option<f64>, scale: f64) -> FrameValue {
     match (numerator, other) {
         (Some(numerator), Some(other)) if numerator + other > 0.0 => {
             finite_frame(scale * numerator / (numerator + other))
+        }
+        _ => FrameValue::Null,
+    }
+}
+
+fn finite_division(numerator: Option<f64>, denominator: Option<f64>) -> FrameValue {
+    match (numerator, denominator) {
+        (Some(numerator), Some(denominator))
+            if numerator.is_finite() && denominator.is_finite() && denominator != 0.0 =>
+        {
+            finite_frame(numerator / denominator)
         }
         _ => FrameValue::Null,
     }

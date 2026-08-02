@@ -517,13 +517,13 @@ const INDEX_METRICS: &[WebMetric] = &[
 const VACUUM_METRICS: &[WebMetric] = &[WebMetric {
     code: 1,
     name: "progress",
-    revision: 1,
+    revision: 2,
     unit: WebUnit::Ratio,
     aggregation: WebAggregation::Max,
     formula: WebFormula::GaugeRatio {
         numerator: "heap_blks_scanned",
         denominator: "heap_blks_total",
-        expression: "max(heap_blks_scanned / max(heap_blks_total, 1))",
+        expression: "max(heap_blks_scanned / heap_blks_total)",
     },
     requires: &["vacuum"],
     canonical: true,
@@ -633,7 +633,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 6,
         name: "vacuum",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: None,
         inputs: VACUUM_INPUTS,

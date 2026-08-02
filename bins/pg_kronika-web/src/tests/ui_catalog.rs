@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use kronika_analytics::MetricId;
+use kronika_analytics::web_projection::web_view_by_name;
 use kronika_registry::registry;
 use serde_json::json;
 use tower::ServiceExt;
@@ -217,6 +218,73 @@ fn plan_call_timestamps_keep_their_source_names() {
         .expect("locks.wait");
     assert_eq!(wait["revision"], json!(2));
     assert_eq!(wait["formula"], "max(wait_age_us from waitstart)");
+}
+
+#[test]
+fn vacuum_catalog_keeps_generation_specific_dead_work_units() {
+    let projection = web_view_by_name("vacuum").expect("vacuum projection");
+    assert_eq!(projection.code, 6);
+    assert_eq!(projection.revision, 2);
+    assert_eq!(projection.metrics[0].code, 1);
+    assert_eq!(projection.metrics[0].revision, 2);
+
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let vacuum = serialized_view(&catalog, "vacuum");
+    assert_eq!(vacuum["view_code"], json!(6));
+    assert_eq!(vacuum["view_revision"], json!(2));
+
+    let metric = vacuum["metrics"]
+        .as_array()
+        .expect("vacuum metrics")
+        .iter()
+        .find(|metric| metric["code"] == "progress")
+        .expect("vacuum progress metric");
+    assert_eq!(metric["revision"], json!(2));
+    assert_eq!(
+        metric["formula"],
+        "max(heap_blks_scanned / heap_blks_total)"
+    );
+
+    let columns = vacuum["columns"].as_array().expect("vacuum columns");
+    for (code, source, unit) in [
+        ("dead_tuples", "vacuum.num_dead_tuples", "count"),
+        ("dead_item_ids", "vacuum.num_dead_item_ids", "count"),
+        ("dead_tuple_bytes", "vacuum.dead_tuple_bytes", "bytes"),
+    ] {
+        let column = columns
+            .iter()
+            .find(|column| column["code"] == code)
+            .unwrap_or_else(|| panic!("vacuum.{code}"));
+        assert_eq!(column["type"], "i64", "vacuum.{code}");
+        assert_eq!(column["source"], source, "vacuum.{code}");
+        assert!(column["formula"].is_null(), "vacuum.{code}");
+        assert_eq!(column["unit"], unit, "vacuum.{code}");
+    }
+
+    let progress = columns
+        .iter()
+        .find(|column| column["code"] == "progress")
+        .expect("vacuum.progress");
+    assert_eq!(progress["formula"], "heap_blks_scanned / heap_blks_total");
+    assert_eq!(progress["unit"], "ratio");
+
+    for preset in ["progress", "dead_tuples"] {
+        let columns = vacuum["presets"]
+            .as_array()
+            .expect("vacuum presets")
+            .iter()
+            .find(|candidate| candidate["code"] == preset)
+            .unwrap_or_else(|| panic!("vacuum preset {preset}"))["columns"]
+            .as_array()
+            .expect("preset columns");
+        for code in ["dead_tuples", "dead_item_ids", "dead_tuple_bytes"] {
+            assert!(
+                columns.iter().any(|column| column == code),
+                "{preset}.{code}"
+            );
+        }
+    }
 }
 
 #[test]

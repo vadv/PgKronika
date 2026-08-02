@@ -1376,16 +1376,33 @@ fn vacuum_view() -> ViewSpec {
             derived_column(
                 "progress",
                 ValueType::F64,
-                "heap_blks_scanned / max(heap_blks_total, 1)",
+                "heap_blks_scanned / heap_blks_total",
                 &["vacuum"],
                 Some("ratio"),
             ),
-            derived_column(
+            raw_column(
                 "dead_tuples",
-                ValueType::F64,
-                "coalesce(num_dead_tuples, num_dead_item_ids)",
+                ValueType::I64,
+                "vacuum.num_dead_tuples",
+                false,
                 &["vacuum"],
-                None,
+                Some("count"),
+            ),
+            raw_column(
+                "dead_item_ids",
+                ValueType::I64,
+                "vacuum.num_dead_item_ids",
+                false,
+                &["vacuum"],
+                Some("count"),
+            ),
+            raw_column(
+                "dead_tuple_bytes",
+                ValueType::I64,
+                "vacuum.dead_tuple_bytes",
+                false,
+                &["vacuum"],
+                Some("bytes"),
             ),
             unavailable_column_with_reason(
                 "elapsed",
@@ -1394,34 +1411,48 @@ fn vacuum_view() -> ViewSpec {
                 "missing_provenance",
             ),
         ],
-        vec![
-            preset(
-                "progress",
-                &[
-                    "pid",
-                    "relation",
-                    "phase",
-                    "progress",
-                    "dead_tuples",
-                    "elapsed",
-                ],
-                "progress",
-                "desc",
-            ),
-            preset(
-                "phase",
-                &["pid", "relation", "phase", "progress", "elapsed"],
-                "phase",
-                "asc",
-            ),
-            preset(
-                "dead_tuples",
-                &["pid", "relation", "dead_tuples", "progress", "elapsed"],
-                "dead_tuples",
-                "desc",
-            ),
-        ],
+        vacuum_presets(),
     )
+}
+
+fn vacuum_presets() -> Vec<PresetSpec> {
+    vec![
+        preset(
+            "progress",
+            &[
+                "pid",
+                "relation",
+                "phase",
+                "progress",
+                "dead_tuples",
+                "dead_item_ids",
+                "dead_tuple_bytes",
+                "elapsed",
+            ],
+            "progress",
+            "desc",
+        ),
+        preset(
+            "phase",
+            &["pid", "relation", "phase", "progress", "elapsed"],
+            "phase",
+            "asc",
+        ),
+        preset(
+            "dead_tuples",
+            &[
+                "pid",
+                "relation",
+                "dead_tuples",
+                "dead_item_ids",
+                "dead_tuple_bytes",
+                "progress",
+                "elapsed",
+            ],
+            "dead_tuples",
+            "desc",
+        ),
+    ]
 }
 
 #[allow(

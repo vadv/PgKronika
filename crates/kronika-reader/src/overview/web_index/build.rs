@@ -1457,7 +1457,14 @@ fn evaluate_gauge_ratio(
         if view.name == "tables" {
             denominator_value += numerator_value;
         }
-        let value = numerator_value / denominator_value.max(1.0);
+        let value = if view.name == "vacuum" {
+            if denominator_value == 0.0 {
+                continue;
+            }
+            numerator_value / denominator_value
+        } else {
+            numerator_value / denominator_value.max(1.0)
+        };
         let entry = entities
             .entry(key)
             .or_insert_with(|| (label.clone(), empty_buckets(grid)));
@@ -2015,6 +2022,7 @@ mod tests {
     use kronika_registry::os_psi::OsPsi;
     use kronika_registry::os_topology::OsTopology;
     use kronika_registry::pg_stat_activity::PgStatActivityV1;
+    use kronika_registry::pg_stat_progress_vacuum::PgStatProgressVacuum;
     use kronika_registry::pg_stat_statements::PgStatStatementsV2;
     use kronika_registry::pg_stat_user_indexes::PgStatUserIndexesV1;
     use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
@@ -2101,6 +2109,30 @@ mod tests {
             xact_start: None,
             query_start: None,
             state_change: None,
+        }
+    }
+
+    fn vacuum_row(ts: i64, pid: i32, total: i64, scanned: i64) -> PgStatProgressVacuum {
+        PgStatProgressVacuum {
+            ts: Ts(ts),
+            pid,
+            datid: 1,
+            datname: StrId(1),
+            relid: u32::try_from(pid).expect("positive vacuum pid"),
+            is_autovacuum: true,
+            phase: StrId(1),
+            heap_blks_total: total,
+            heap_blks_scanned: scanned,
+            heap_blks_vacuumed: 0,
+            index_vacuum_count: 0,
+            max_dead_tuples: None,
+            num_dead_tuples: None,
+            max_dead_tuple_bytes: None,
+            dead_tuple_bytes: None,
+            num_dead_item_ids: None,
+            indexes_total: None,
+            indexes_processed: None,
+            delay_time: None,
         }
     }
 
@@ -2311,6 +2343,44 @@ mod tests {
         assert_eq!(processes.status(), IndexStatus::Complete);
         assert_eq!(cpu.status(), MetricStatus::Complete);
         assert_eq!(cpu.series()[0].value_at(0), Some(0.09));
+    }
+
+    #[test]
+    fn vacuum_progress_web_index_rejects_zero_total() {
+        let rows = [vacuum_row(20_000, 7, 100, 25), vacuum_row(20_000, 8, 0, 25)];
+        let body = PgStatProgressVacuum::encode(&rows).expect("encode vacuum progress");
+        let bytes = build_part(
+            &[SectionInput {
+                type_id: 1_012_001,
+                rows: 2,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: 20_000,
+                max_ts: 20_000,
+            },
+        );
+        let unit = PgmUnit::open(bytes).expect("open vacuum PGM");
+        let blocks =
+            build_web_index(&unit, &[], 20_000, 20_000, &LIMIT).expect("build vacuum index");
+        let vacuum = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 6)
+            .expect("vacuum series");
+        let progress = vacuum
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 1)
+            .expect("vacuum progress metric");
+        let values = progress
+            .series()
+            .iter()
+            .flat_map(|series| series.observed_values().map(|(_bucket, value)| value))
+            .collect::<Vec<_>>();
+
+        assert_eq!(progress.status(), MetricStatus::Complete);
+        assert_eq!(values, vec![0.25]);
     }
 
     #[test]

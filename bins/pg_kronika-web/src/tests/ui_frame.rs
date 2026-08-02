@@ -446,6 +446,100 @@ fn out_row(values: &[(&str, Value)]) -> OutRow {
 }
 
 #[test]
+fn vacuum_progress_divides_by_total_not_total_plus_scanned() {
+    let request = FrameRequest::parse("vacuum", Some("at=20&columns=pid,progress"), &catalog())
+        .expect("vacuum request");
+
+    for (case, denominator, expected) in [
+        (
+            "finite total",
+            Some(Value::U64(100)),
+            DtoFrameValue::Number(0.25),
+        ),
+        ("zero total", Some(Value::U64(0)), DtoFrameValue::Null),
+        ("missing total", None, DtoFrameValue::Null),
+        (
+            "non-finite total",
+            Some(Value::F64(f64::NAN)),
+            DtoFrameValue::Null,
+        ),
+    ] {
+        let mut row = out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(11)),
+            ("datid", Value::U64(3)),
+            ("relid", Value::U64(4)),
+            ("phase", Value::Str("scanning heap".to_owned())),
+            ("heap_blks_scanned", Value::U64(25)),
+        ]);
+        if let Some(denominator) = denominator {
+            row.push(("heap_blks_total".to_owned(), denominator));
+        }
+        let input = ProjectionInput::single(20, "pg_stat_progress_vacuum", row);
+
+        let frame = project_input(&request, &catalog(), input)
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(frame.rows[0].cells[1], expected, "{case}");
+    }
+}
+
+#[test]
+fn vacuum_dead_work_fields_are_not_coalesced() {
+    let request = FrameRequest::parse(
+        "vacuum",
+        Some("at=20&columns=pid,dead_tuples,dead_item_ids,dead_tuple_bytes"),
+        &catalog(),
+    )
+    .expect("vacuum request");
+
+    let pre17 = ProjectionInput::single(
+        20,
+        "pg_stat_progress_vacuum",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(16)),
+            ("datid", Value::U64(3)),
+            ("relid", Value::U64(4)),
+            ("num_dead_tuples", Value::I64(7)),
+        ]),
+    );
+    let pre17 = project_input(&request, &catalog(), pre17).expect("PG16 projection");
+    assert_eq!(
+        pre17.rows[0].cells,
+        vec![
+            DtoFrameValue::Number(16.0),
+            DtoFrameValue::Number(7.0),
+            DtoFrameValue::Null,
+            DtoFrameValue::Null,
+        ]
+    );
+
+    let pg17 = ProjectionInput::single(
+        20,
+        "pg_stat_progress_vacuum",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(17)),
+            ("datid", Value::U64(3)),
+            ("relid", Value::U64(4)),
+            ("num_dead_item_ids", Value::I64(11)),
+            ("dead_tuple_bytes", Value::I64(2_500)),
+        ]),
+    );
+    let pg17 = project_input(&request, &catalog(), pg17).expect("PG17 projection");
+    assert_eq!(
+        pg17.rows[0].cells,
+        vec![
+            DtoFrameValue::Number(17.0),
+            DtoFrameValue::Null,
+            DtoFrameValue::Number(11.0),
+            DtoFrameValue::Number(2_500.0),
+        ],
+        "PG17 item identifiers and byte usage keep their source units"
+    );
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the golden keeps all nine projection fixtures adjacent for completeness review"
@@ -544,7 +638,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
                 ("heap_blks_scanned", Value::U64(25)),
                 ("num_dead_tuples", Value::U64(5)),
             ]),
-            6,
+            8,
         ),
         (
             "processes",
