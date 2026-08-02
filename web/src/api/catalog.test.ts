@@ -19,7 +19,7 @@ test("demo catalog preserves the current relation provenance contract", () => {
   const activity = fixture.views.find((view) => view.code === "activity");
   const processJoin = activity?.joins.find((join) => join.right === "process");
 
-  expect(fixture.revision).toBe(3);
+  expect(fixture.revision).toBe(4);
   expect(processJoin).toMatchObject({
     kind: "best_effort",
     fields: ["pid", "ts"],

@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use super::thresholds::binding_for;
 
 /// Catalog schema revision.
-const CATALOG_REVISION: u16 = 3;
+const CATALOG_REVISION: u16 = 4;
 
 /// Availability of one input, metric, or column in the served store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]

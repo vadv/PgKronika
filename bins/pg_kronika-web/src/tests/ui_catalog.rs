@@ -87,6 +87,44 @@ fn catalog_exposes_all_nine_views_in_stable_code_order() {
 }
 
 #[test]
+fn metric_semantics_publish_revision_four_with_stable_numeric_ids() {
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    assert_eq!(catalog.revision, 4);
+
+    let actual = catalog
+        .views()
+        .iter()
+        .map(|view| {
+            let projection = web_view_by_name(view.code).expect("catalog projection");
+            (
+                projection.code,
+                projection.revision,
+                projection
+                    .metrics
+                    .iter()
+                    .map(|metric| (metric.code, metric.revision))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual,
+        vec![
+            (1, 2, vec![(1, 1), (2, 2), (3, 1), (4, 1)]),
+            (2, 3, vec![(1, 3), (2, 2), (3, 2), (4, 2)]),
+            (3, 2, vec![(1, 2), (2, 2)]),
+            (4, 1, vec![(1, 1), (2, 1), (3, 1)]),
+            (5, 1, vec![(1, 1), (2, 1)]),
+            (6, 2, vec![(1, 2)]),
+            (7, 2, vec![(1, 2), (2, 1)]),
+            (8, 2, vec![(1, 2)]),
+            (9, 1, vec![(1, 1)]),
+        ]
+    );
+}
+
+#[test]
 fn catalog_serializes_relation_quality_without_promoting_pid_only_evidence() {
     let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
         .expect("serialize catalog");
@@ -751,7 +789,7 @@ async fn ui_catalog_returns_nine_views_for_the_root() {
 
     let response = serve_captured(dir.path(), "/v1/ui/catalog", &[]).await;
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body["revision"], 3);
+    assert_eq!(response.body["revision"], 4);
     assert_eq!(
         response.body["views"].as_array().map(Vec::len),
         Some(9),

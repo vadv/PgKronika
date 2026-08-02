@@ -347,7 +347,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 1,
         name: "time",
-        revision: 2,
+        revision: 3,
         unit: WebUnit::Milliseconds,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -361,7 +361,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 2,
         name: "calls",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Count,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -375,7 +375,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 3,
         name: "io",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Blocks,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -389,7 +389,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 4,
         name: "temp",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Blocks,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -406,7 +406,7 @@ const PLAN_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 1,
         name: "time",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Microseconds,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -420,7 +420,7 @@ const PLAN_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 2,
         name: "calls",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Count,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -597,7 +597,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 2,
         name: "statements",
-        revision: 2,
+        revision: 3,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: STATEMENTS_INPUTS,
