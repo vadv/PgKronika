@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use self::cursor::EntityHistoryCursor;
-use super::catalog::ProjectionCatalog;
+use super::catalog::{ProjectionCatalog, RelationKind};
 use super::frame::dto::FrameValue;
 use super::frame::projection::{FrameError, FrameLimits, FrameQuality, project_entity_at};
 use super::snapshot::{SummaryRead, read_summary_tolerant};
@@ -121,7 +121,8 @@ struct RelatedEntityDto {
 
 #[derive(Debug, Serialize, ToSchema)]
 struct RelationProvenanceDto {
-    kind: &'static str,
+    kind: RelationKind,
+    method: &'static str,
     fields: Vec<&'static str>,
 }
 
@@ -401,7 +402,8 @@ fn entity_point(
             view: relation.view,
             entity: URL_SAFE_NO_PAD.encode(&relation.entity),
             provenance: RelationProvenanceDto {
-                kind: "field_equality",
+                kind: relation.kind,
+                method: relation.method,
                 fields: relation.fields.clone(),
             },
         })

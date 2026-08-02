@@ -15,7 +15,7 @@ use super::cursor::FrameCursor;
 use super::dto::{FrameValue, SparkDto};
 use super::query::{filter_sort_page, value_sort_key};
 use super::threshold::{CellClassification, FrameThresholdContext, classify_row};
-use crate::ui::catalog::{ColumnSpec, ProjectionCatalog, ValueType, ViewSpec};
+use crate::ui::catalog::{ColumnSpec, ProjectionCatalog, RelationKind, ValueType, ViewSpec};
 use crate::ui::snapshot::{ResolvedViewSnapshot, SnapshotSummaryQuality, resolve_view_snapshot};
 
 const JS_EXACT_INTEGER: u64 = 9_007_199_254_740_991;
@@ -107,6 +107,8 @@ pub(crate) struct ProjectedRelation {
     pub relation: &'static str,
     pub view: &'static str,
     pub entity: Vec<u8>,
+    pub kind: RelationKind,
+    pub method: &'static str,
     pub fields: Vec<&'static str>,
 }
 
@@ -563,11 +565,23 @@ fn statement_plan_relations(
     let mut relations = Vec::new();
     for section in ["pg_store_plans_ossc", "pg_store_plans_vadv"] {
         for row in pages.get(section).into_iter().flat_map(|page| &page.rows) {
+            let (plan_queryid, method, fields) = match section {
+                "pg_store_plans_ossc" => (
+                    value(row, "queryid"),
+                    "ossc_queryid_dbid_userid_attribution",
+                    vec!["queryid", "dbid", "userid"],
+                ),
+                "pg_store_plans_vadv" => (
+                    value(row, "queryid_stat_statements"),
+                    "vadv_queryid_stat_statements_dbid_userid_attribution",
+                    vec!["queryid_stat_statements", "dbid", "userid"],
+                ),
+                _ => continue,
+            };
             if timestamp(row, "ts")? != Some(snapshot_ts_us)
                 || value(row, "dbid") != Some(statement_dbid)
                 || value(row, "userid") != Some(statement_userid)
-                || value(row, "queryid").or_else(|| value(row, "queryid_stat_statements"))
-                    != Some(statement_queryid)
+                || plan_queryid != Some(statement_queryid)
             {
                 continue;
             }
@@ -575,7 +589,9 @@ fn statement_plan_relations(
                 relation: "statement_plan",
                 view: "plans",
                 entity: entity_for(plan_view, section, row, snapshot_ts_us)?,
-                fields: vec!["queryid", "dbid", "userid"],
+                kind: RelationKind::BestEffort,
+                method,
+                fields,
             });
         }
     }
