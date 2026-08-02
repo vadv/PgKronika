@@ -500,13 +500,18 @@ fn canonical_collections(decoded: &[DecodedSection]) -> Result<CollectionTimelin
         let Some(view) = collection_view(source_type) else {
             continue;
         };
-        let status = CollectionStatus::new(
+        // An invalid state/visibility/count combination (legacy collector
+        // rows predate the canonical pairs) withholds the coverage point
+        // instead of failing the whole segment build: the UI renders a gap,
+        // which is the honest representation of unprovable coverage.
+        let Ok(status) = CollectionStatus::new(
             fact.collected,
             fact.total_exact.then_some(fact.source_total),
             collection_read_state(fact.read_state)?,
             collection_visibility(fact.visibility)?,
-        )
-        .map_err(|_error| corrupt_error())?;
+        ) else {
+            continue;
+        };
         if collections
             .insert(
                 (view.code, ts),
@@ -2191,6 +2196,29 @@ mod tests {
             build_summary(&bytes),
             Err(BuildError::Source(SourceError::Corrupt))
         ));
+    }
+
+    #[test]
+    fn legacy_complete_restricted_coverage_withholds_the_point_instead_of_failing() {
+        // Legacy collector rows could pair Complete with Restricted; the
+        // canonical pairs no longer include it. The point is withheld, not
+        // the whole segment build.
+        let legacy = SnapshotCoverageV1 {
+            source_total: 40,
+            collected: 40,
+            ..snapshot_coverage(1_002_001, 0, 1, 40)
+        };
+        let bytes = coverage_pgm(&[legacy], &[]);
+        let summary = build_summary(&bytes).expect("legacy combination degrades");
+        let withheld: usize = summary
+            .views()
+            .iter()
+            .map(|view| view.collections().len())
+            .sum();
+        assert_eq!(
+            withheld, 0,
+            "the invalid coverage point is withheld, not fatal"
+        );
     }
 
     #[test]
