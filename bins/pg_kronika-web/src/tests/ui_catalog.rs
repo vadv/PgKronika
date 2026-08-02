@@ -215,6 +215,26 @@ fn gated_reason_distinguishes_extension_backed_from_built_in_inputs() {
 }
 
 #[test]
+fn reset_metadata_is_auxiliary_to_extension_metric_availability() {
+    let statements_type = first_type_id("pg_stat_statements");
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::from([statements_type]));
+    let statements = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .expect("statements view");
+    let reset_metadata = statements
+        .inputs
+        .iter()
+        .find(|input| input.code == "reset_metadata")
+        .expect("reset metadata input");
+
+    assert_eq!(statements.availability, Availability::Available);
+    assert_eq!(reset_metadata.availability, Availability::Gated);
+    assert_eq!(reset_metadata.unavailable_reason, Some("not_collected"));
+}
+
+#[test]
 fn every_preset_returns_its_sort_column() {
     let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
     for view in catalog.views() {

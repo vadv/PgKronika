@@ -1013,6 +1013,144 @@ fn reset_counter_classifies_with_the_reset_reason() {
 }
 
 #[test]
+fn exact_statement_reset_invalidates_increasing_counters() {
+    let request =
+        FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(20)),
+            ("total_exec_time", Value::F64(200.0)),
+        ]),
+    );
+    input.push_previous(
+        10,
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(10)),
+            ("total_exec_time", Value::F64(100.0)),
+        ]),
+    );
+    input.push(
+        "reset_metadata",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pg_stat_statements_reset_at", Value::Ts(15)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    let body = serde_json::to_value(
+        FrameResponse::from_projected(&request, &catalog(), &frame).expect("response"),
+    )
+    .expect("serialize");
+
+    assert_eq!(body["rows"][0]["cells"][0], serde_json::Value::Null);
+    assert_eq!(
+        body["rows"][0]["classifications"][0]["result"]["reason"],
+        "reset"
+    );
+}
+
+#[test]
+fn exact_plan_reset_invalidates_increasing_counters() {
+    let request = FrameRequest::parse("plans", Some("at=20&columns=calls,mean"), &catalog())
+        .expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_store_plans_vadv",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("dbid", Value::U64(20)),
+            ("userid", Value::U64(10)),
+            ("planid", Value::I64(1)),
+            ("queryid", Value::I64(2)),
+            ("calls", Value::I64(20)),
+            ("total_time", Value::F64(200.0)),
+            ("rows", Value::I64(20)),
+        ]),
+    );
+    input.push_previous(
+        10,
+        "pg_store_plans_vadv",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("dbid", Value::U64(20)),
+            ("userid", Value::U64(10)),
+            ("planid", Value::I64(1)),
+            ("queryid", Value::I64(2)),
+            ("calls", Value::I64(10)),
+            ("total_time", Value::F64(100.0)),
+            ("rows", Value::I64(10)),
+        ]),
+    );
+    input.push(
+        "reset_metadata",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pg_store_plans_reset_at", Value::Ts(15)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![DtoFrameValue::Null, DtoFrameValue::Null]
+    );
+}
+
+#[test]
+fn reset_before_the_predecessor_does_not_break_the_interval() {
+    let request =
+        FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(20)),
+            ("total_exec_time", Value::F64(200.0)),
+        ]),
+    );
+    input.push_previous(
+        10,
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(10)),
+            ("total_exec_time", Value::F64(100.0)),
+        ]),
+    );
+    input.push(
+        "reset_metadata",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pg_stat_statements_reset_at", Value::Ts(5)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Number(10.0)]);
+}
+
+#[test]
 fn statement_time_percent_rejects_a_partial_reset_denominator() {
     let request = FrameRequest::parse("statements", Some("at=20"), &catalog()).expect("request");
     let mut input = ProjectionInput::empty(20);

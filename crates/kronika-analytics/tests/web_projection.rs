@@ -50,7 +50,7 @@ fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
             .iter()
             .map(|input| input.code)
             .collect::<Vec<_>>(),
-        vec!["statements", "settings"]
+        vec!["statements", "reset_metadata", "settings"]
     );
     assert_eq!(
         statements

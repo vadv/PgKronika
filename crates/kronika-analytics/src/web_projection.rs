@@ -209,14 +209,24 @@ const STATEMENTS_INPUTS: &[WebInput] = &[
         sections: &["pg_stat_statements"],
     },
     WebInput {
+        code: "reset_metadata",
+        sections: &["reset_metadata"],
+    },
+    WebInput {
         code: "settings",
         sections: &["pg_settings"],
     },
 ];
-const PLANS_INPUTS: &[WebInput] = &[WebInput {
-    code: "plans",
-    sections: &["pg_store_plans_ossc", "pg_store_plans_vadv"],
-}];
+const PLANS_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "plans",
+        sections: &["pg_store_plans_ossc", "pg_store_plans_vadv"],
+    },
+    WebInput {
+        code: "reset_metadata",
+        sections: &["reset_metadata"],
+    },
+];
 const TABLES_INPUTS: &[WebInput] = &[WebInput {
     code: "tables",
     sections: &["pg_stat_user_tables"],

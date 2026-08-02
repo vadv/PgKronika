@@ -29,6 +29,14 @@ pub(crate) enum DeltaOperand {
     Value(f64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuityVerdict {
+    Continuous,
+    FirstPoint,
+    Gap,
+    Reset,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct StatementOperands {
     pub calls: DeltaOperand,
@@ -211,6 +219,34 @@ impl ProjectionInput {
         self.gaps.push(gap);
         self.gaps.sort_by_key(|gap| (gap.from, gap.to));
         self.gaps.dedup();
+    }
+}
+
+fn continuity_for(view: &WebView, input: &ProjectionInput) -> ContinuityVerdict {
+    if !input.gaps.is_empty() {
+        return ContinuityVerdict::Gap;
+    }
+    let Some(predecessor_ts_us) = input.predecessor_ts_us else {
+        return ContinuityVerdict::FirstPoint;
+    };
+    let reset_field = match view.name {
+        "statements" => "pg_stat_statements_reset_at",
+        "plans" => "pg_store_plans_reset_at",
+        _ => return ContinuityVerdict::Continuous,
+    };
+    let reset_at = input
+        .current
+        .get("reset_metadata")
+        .into_iter()
+        .flatten()
+        .filter(|row| timestamp(row, "ts").ok().flatten() == Some(input.snapshot_ts_us))
+        .find_map(|row| timestamp(row, reset_field).ok().flatten());
+    if reset_at
+        .is_some_and(|reset_at| reset_at > predecessor_ts_us && reset_at <= input.snapshot_ts_us)
+    {
+        ContinuityVerdict::Reset
+    } else {
+        ContinuityVerdict::Continuous
     }
 }
 
@@ -419,7 +455,7 @@ pub(crate) fn project_entity_at(
         .filter(|(at, _row)| *at <= input.snapshot_ts_us)
         .max_by_key(|(at, _row)| *at)
         .is_some_and(|(_at, row)| text(row, "setting") == Some("on"));
-    let has_gap = !input.gaps.is_empty();
+    let continuity = continuity_for(view, &input);
     let mut source = None;
     let mut projected = None;
     for section in primary_sections {
@@ -441,7 +477,7 @@ pub(crate) fn project_entity_at(
                 predecessor,
                 &input,
                 track_planning,
-                has_gap,
+                continuity,
             )?);
             source = Some((*section, row));
             break;
@@ -454,7 +490,7 @@ pub(crate) fn project_entity_at(
         && columns.iter().any(|column| column.code == "time_pct")
         && let Some(row) = &mut projected
     {
-        let denominator = statement_denominator(view, &input, &previous, has_gap)?;
+        let denominator = statement_denominator(view, &input, &previous, continuity)?;
         let replacement = row
             .operands
             .statements
@@ -504,7 +540,7 @@ fn statement_denominator(
     view: &'static WebView,
     input: &ProjectionInput,
     previous: &BTreeMap<Vec<u8>, &OutRow>,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> Result<Option<f64>, ProjectionError> {
     let mut denominator = 0.0;
     for section in view.inputs[0].sections {
@@ -517,7 +553,7 @@ fn statement_denominator(
                 row,
                 previous.get(&entity).copied(),
                 "total_exec_time",
-                has_gap,
+                continuity,
             );
             let DeltaOperand::Value(value) = delta else {
                 return Ok(None);
@@ -832,7 +868,7 @@ pub(crate) fn project_input(
         }
     }
     let track_planning = track_planning_value.is_some_and(|(_timestamp, setting)| setting == "on");
-    let has_gap = !input.gaps.is_empty();
+    let continuity = continuity_for(request.view, &input);
     let mut rows = Vec::new();
     for section in primary_sections {
         for row in input.current.get(*section).into_iter().flatten() {
@@ -850,7 +886,7 @@ pub(crate) fn project_input(
                 predecessor,
                 &input,
                 track_planning,
-                has_gap,
+                continuity,
             )?;
             rows.push(projected);
         }
@@ -920,10 +956,10 @@ fn project_view(
     previous: Option<&OutRow>,
     input: &ProjectionInput,
     track_planning: bool,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     match view.name {
-        "activity" => project_activity(view, columns, section, row, previous, input, has_gap),
+        "activity" => project_activity(view, columns, section, row, previous, input, continuity),
         "statements" => project_statements(
             view,
             columns,
@@ -932,13 +968,13 @@ fn project_view(
             previous,
             input,
             track_planning,
-            has_gap,
+            continuity,
         ),
-        "plans" => project_plans(view, columns, section, row, previous, input, has_gap),
-        "tables" => project_tables(view, columns, section, row, previous, input, has_gap),
-        "indexes" => project_indexes(view, columns, section, row, previous, input, has_gap),
+        "plans" => project_plans(view, columns, section, row, previous, input, continuity),
+        "tables" => project_tables(view, columns, section, row, previous, input, continuity),
+        "indexes" => project_indexes(view, columns, section, row, previous, input, continuity),
         "vacuum" => project_vacuum(view, columns, section, row, input),
-        "processes" => project_processes(view, columns, section, row, previous, input, has_gap),
+        "processes" => project_processes(view, columns, section, row, previous, input, continuity),
         "locks" => project_locks(view, columns, section, row, input),
         "events" => project_events(view, columns, section, row, input),
         _ => Err(ProjectionError::MissingCatalogView),
@@ -1000,7 +1036,7 @@ fn project_activity(
     row: &OutRow,
     _previous: Option<&OutRow>,
     input: &ProjectionInput,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     let mut out = row_shell(view, section, row, input.snapshot_ts_us)?;
     out.operands.activity_state = text(row, "state").map(str::to_owned);
@@ -1052,14 +1088,26 @@ fn project_activity(
                     previous_process,
                     &["utime", "stime"],
                     input,
-                    has_gap,
+                    continuity,
                 )
             }),
             "read_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
-                rate_sum(current, previous_process, &["read_bytes"], input, has_gap)
+                rate_sum(
+                    current,
+                    previous_process,
+                    &["read_bytes"],
+                    input,
+                    continuity,
+                )
             }),
             "write_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
-                rate_sum(current, previous_process, &["write_bytes"], input, has_gap)
+                rate_sum(
+                    current,
+                    previous_process,
+                    &["write_bytes"],
+                    input,
+                    continuity,
+                )
             }),
             "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
                 .map_or(FrameValue::Null, |replica| {
@@ -1132,15 +1180,15 @@ fn project_statements(
     previous: Option<&OutRow>,
     input: &ProjectionInput,
     track_planning: bool,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     let mut out = row_shell(view, section, row, input.snapshot_ts_us)?;
-    let calls = delta(row, previous, "calls", has_gap);
-    let rows = delta(row, previous, "rows", has_gap);
-    let exec = delta(row, previous, "total_exec_time", has_gap);
+    let calls = delta(row, previous, "calls", continuity);
+    let rows = delta(row, previous, "rows", continuity);
+    let exec = delta(row, previous, "total_exec_time", continuity);
     let planning_fields = value(row, "total_plan_time").is_some_and(|value| *value != Value::Null);
     let plan = if planning_fields {
-        delta(row, previous, "total_plan_time", has_gap)
+        delta(row, previous, "total_plan_time", continuity)
     } else {
         DeltaOperand::Missing
     };
@@ -1167,12 +1215,12 @@ fn project_statements(
             "plan_time_pct" if track_planning && planning_fields => percent_of_sum(plan, exec),
             "rows" => delta_frame(rows),
             "hit_pct" => ratio_delta(
-                delta(row, previous, "shared_blks_hit", has_gap),
+                delta(row, previous, "shared_blks_hit", continuity),
                 delta_sum(
                     row,
                     previous,
                     &["shared_blks_hit", "shared_blks_read"],
-                    has_gap,
+                    continuity,
                 ),
                 100.0,
             ),
@@ -1180,10 +1228,10 @@ fn project_statements(
                 row,
                 previous,
                 &["shared_blks_read", "local_blks_read"],
-                has_gap,
+                continuity,
             ),
-            "temp_written" => delta_frame(delta(row, previous, "temp_blks_written", has_gap)),
-            "wal_bytes" => delta_frame(delta(row, previous, "wal_bytes", has_gap)),
+            "temp_written" => delta_frame(delta(row, previous, "temp_blks_written", continuity)),
+            "wal_bytes" => delta_frame(delta(row, previous, "wal_bytes", continuity)),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1198,12 +1246,12 @@ fn project_plans(
     row: &OutRow,
     previous: Option<&OutRow>,
     input: &ProjectionInput,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     let mut out = row_shell(view, section, row, input.snapshot_ts_us)?;
-    let calls = delta(row, previous, "calls", has_gap);
-    let total = delta(row, previous, "total_time", has_gap);
-    let rows = delta(row, previous, "rows", has_gap);
+    let calls = delta(row, previous, "calls", continuity);
+    let total = delta(row, previous, "total_time", continuity);
+    let rows = delta(row, previous, "rows", continuity);
     for column in columns {
         let value = match column.code {
             "planid" => raw_frame(row, "planid", column.value_type),
@@ -1212,8 +1260,8 @@ fn project_plans(
             "calls" => delta_frame(calls),
             "mean" => divide_delta(total, calls),
             "rows" => delta_frame(rows),
-            "shared_hit" => delta_frame(delta(row, previous, "shared_blks_hit", has_gap)),
-            "shared_read" => delta_frame(delta(row, previous, "shared_blks_read", has_gap)),
+            "shared_hit" => delta_frame(delta(row, previous, "shared_blks_hit", continuity)),
+            "shared_read" => delta_frame(delta(row, previous, "shared_blks_read", continuity)),
             "first_seen" => raw_frame(row, "first_call", column.value_type),
             "last_seen" => raw_frame(row, "last_call", column.value_type),
             _ => FrameValue::Null,
@@ -1230,13 +1278,13 @@ fn project_tables(
     row: &OutRow,
     previous: Option<&OutRow>,
     input: &ProjectionInput,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     let mut out = row_shell(view, section, row, input.snapshot_ts_us)?;
     let live = finite_number(row, "n_live_tup")?;
     let dead = finite_number(row, "n_dead_tup")?;
-    let seq = delta(row, previous, "seq_scan", has_gap);
-    let idx = delta(row, previous, "idx_scan", has_gap);
+    let seq = delta(row, previous, "seq_scan", continuity);
+    let idx = delta(row, previous, "idx_scan", continuity);
     out.operands.table = Some(TableOperands {
         live,
         dead,
@@ -1257,7 +1305,12 @@ fn project_tables(
             "idx_scan" => raw_frame(row, "idx_scan", column.value_type),
             "dead_pct" => ratio(dead, live, 100.0),
             "io_hit_pct" => ratio_delta(
-                delta_sum_nullable(row, previous, &["heap_blks_hit", "idx_blks_hit"], has_gap),
+                delta_sum_nullable(
+                    row,
+                    previous,
+                    &["heap_blks_hit", "idx_blks_hit"],
+                    continuity,
+                ),
                 delta_sum_nullable(
                     row,
                     previous,
@@ -1267,7 +1320,7 @@ fn project_tables(
                         "heap_blks_read",
                         "idx_blks_read",
                     ],
-                    has_gap,
+                    continuity,
                 ),
                 100.0,
             ),
@@ -1296,11 +1349,11 @@ fn project_indexes(
     row: &OutRow,
     previous: Option<&OutRow>,
     input: &ProjectionInput,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     let mut out = row_shell(view, section, row, input.snapshot_ts_us)?;
-    let scans = delta(row, previous, "idx_scan", has_gap);
-    let read = delta(row, previous, "idx_tup_read", has_gap);
+    let scans = delta(row, previous, "idx_scan", continuity);
+    let read = delta(row, previous, "idx_tup_read", continuity);
     for column in columns {
         let value = match column.code {
             "index" => raw_frame(row, "indexrelname", column.value_type),
@@ -1309,8 +1362,13 @@ fn project_indexes(
             "scans" => delta_frame(scans),
             "rows_per_scan" => divide_delta(read, scans),
             "io_hit_pct" => ratio_delta(
-                delta(row, previous, "idx_blks_hit", has_gap),
-                delta_sum(row, previous, &["idx_blks_hit", "idx_blks_read"], has_gap),
+                delta(row, previous, "idx_blks_hit", continuity),
+                delta_sum(
+                    row,
+                    previous,
+                    &["idx_blks_hit", "idx_blks_read"],
+                    continuity,
+                ),
                 100.0,
             ),
             "last_idx_scan" => raw_frame(row, "last_idx_scan", column.value_type),
@@ -1377,7 +1435,7 @@ fn project_processes(
     row: &OutRow,
     previous: Option<&OutRow>,
     input: &ProjectionInput,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     let mut out = row_shell(view, section, row, input.snapshot_ts_us)?;
     out.operands.process_rss_kib = finite_number(row, "rmem_kb")?;
@@ -1385,12 +1443,14 @@ fn project_processes(
         let value = match column.code {
             "pid" => raw_frame(row, "pid", column.value_type),
             "type" => raw_frame(row, "comm", column.value_type),
-            "cpu" => rate_sum(row, previous, &["utime", "stime"], input, has_gap),
+            "cpu" => rate_sum(row, previous, &["utime", "stime"], input, continuity),
             "rss" => raw_frame(row, "rmem_kb", column.value_type),
             "threads" => raw_frame(row, "num_threads", column.value_type),
-            "read_bytes_per_second" => rate_sum(row, previous, &["read_bytes"], input, has_gap),
-            "write_bytes_per_second" => rate_sum(row, previous, &["write_bytes"], input, has_gap),
-            "block_delay" => rate_sum(row, previous, &["blkdelay_ticks"], input, has_gap),
+            "read_bytes_per_second" => rate_sum(row, previous, &["read_bytes"], input, continuity),
+            "write_bytes_per_second" => {
+                rate_sum(row, previous, &["write_bytes"], input, continuity)
+            }
+            "block_delay" => rate_sum(row, previous, &["blkdelay_ticks"], input, continuity),
             "command" => raw_frame(row, "cmdline", column.value_type),
             "cgroup" => process_cgroup(row, &input.current, input.snapshot_ts_us)
                 .map_or(FrameValue::Null, |mapping| {
@@ -1832,10 +1892,13 @@ fn delta(
     current: &OutRow,
     previous: Option<&OutRow>,
     field: &'static str,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> DeltaOperand {
-    if has_gap {
-        return DeltaOperand::Gap;
+    match continuity {
+        ContinuityVerdict::Continuous => {}
+        ContinuityVerdict::FirstPoint => return DeltaOperand::Missing,
+        ContinuityVerdict::Gap => return DeltaOperand::Gap,
+        ContinuityVerdict::Reset => return DeltaOperand::Reset,
     }
     let (Ok(Some(current)), Some(previous)) = (finite_number(current, field), previous) else {
         return DeltaOperand::Missing;
@@ -1854,10 +1917,10 @@ fn delta_sum(
     current: &OutRow,
     previous: Option<&OutRow>,
     fields: &[&'static str],
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> DeltaOperand {
     fields.iter().fold(DeltaOperand::Value(0.0), |sum, field| {
-        match (sum, delta(current, previous, field, has_gap)) {
+        match (sum, delta(current, previous, field, continuity)) {
             (DeltaOperand::Value(left), DeltaOperand::Value(right)) => {
                 DeltaOperand::Value(left + right)
             }
@@ -1872,7 +1935,7 @@ fn delta_sum_nullable(
     current: &OutRow,
     previous: Option<&OutRow>,
     fields: &[&'static str],
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> DeltaOperand {
     fields.iter().fold(DeltaOperand::Value(0.0), |sum, field| {
         let operand = match (
@@ -1880,7 +1943,7 @@ fn delta_sum_nullable(
             previous.and_then(|row| value(row, field)),
         ) {
             (Some(Value::Null), Some(Value::Null)) => DeltaOperand::Value(0.0),
-            _ => delta(current, previous, field, has_gap),
+            _ => delta(current, previous, field, continuity),
         };
         match (sum, operand) {
             (DeltaOperand::Value(left), DeltaOperand::Value(right)) => {
@@ -1904,9 +1967,9 @@ fn delta_sum_frame(
     current: &OutRow,
     previous: Option<&OutRow>,
     fields: &[&'static str],
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> FrameValue {
-    delta_frame(delta_sum(current, previous, fields, has_gap))
+    delta_frame(delta_sum(current, previous, fields, continuity))
 }
 
 fn divide_delta(numerator: DeltaOperand, denominator: DeltaOperand) -> FrameValue {
@@ -1954,7 +2017,7 @@ fn rate_sum(
     previous: Option<&OutRow>,
     fields: &[&'static str],
     input: &ProjectionInput,
-    has_gap: bool,
+    continuity: ContinuityVerdict,
 ) -> FrameValue {
     let Some(previous_ts) = input.predecessor_ts_us else {
         return FrameValue::Null;
@@ -1963,7 +2026,7 @@ fn rate_sum(
     if elapsed <= 0 {
         return FrameValue::Null;
     }
-    match delta_sum(current, previous, fields, has_gap) {
+    match delta_sum(current, previous, fields, continuity) {
         DeltaOperand::Value(value) => finite_frame(value / (elapsed as f64 / 1_000_000.0)),
         _ => FrameValue::Null,
     }
