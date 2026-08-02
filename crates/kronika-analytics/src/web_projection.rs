@@ -117,7 +117,7 @@ pub enum WebFormula {
         /// Normative catalog expression.
         expression: &'static str,
     },
-    /// Maximum proven lock wait or hold duration.
+    /// Maximum observed lock wait age measured from `waitstart`.
     LockDuration {
         /// Normative catalog expression.
         expression: &'static str,
@@ -561,11 +561,11 @@ const PROCESS_METRICS: &[WebMetric] = &[
 const LOCK_METRICS: &[WebMetric] = &[WebMetric {
     code: 1,
     name: "wait",
-    revision: 1,
+    revision: 2,
     unit: WebUnit::Microseconds,
     aggregation: WebAggregation::Max,
     formula: WebFormula::LockDuration {
-        expression: "max(proven_wait_or_hold_duration_us)",
+        expression: "max(wait_age_us from waitstart)",
     },
     requires: &["locks"],
     canonical: true,
@@ -606,7 +606,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 3,
         name: "plans",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PLANS_INPUTS,
@@ -651,7 +651,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 8,
         name: "locks",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: None,
         inputs: LOCK_INPUTS,

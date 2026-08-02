@@ -1355,6 +1355,70 @@ fn exact_plan_reset_invalidates_increasing_counters() {
 }
 
 #[test]
+fn lock_wait_age_requires_waitstart() {
+    let request = FrameRequest::parse("locks", Some("at=20&columns=wait_age_us"), &catalog())
+        .expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_locks",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(1)),
+            ("backend_start", Value::Ts(1)),
+            ("lock_granted", Value::Bool(false)),
+            ("waitstart", Value::Ts(5)),
+        ]),
+    );
+    input.push(
+        "pg_locks",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(2)),
+            ("backend_start", Value::Ts(2)),
+            ("lock_granted", Value::Bool(true)),
+            ("xact_start", Value::Ts(3)),
+            ("query_start", Value::Ts(4)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Number(15.0)]);
+    assert_eq!(frame.rows[1].cells, vec![DtoFrameValue::Null]);
+}
+
+#[test]
+fn plan_call_timestamps_keep_their_source_names() {
+    let request = FrameRequest::parse(
+        "plans",
+        Some("at=20&columns=first_call,last_call"),
+        &catalog(),
+    )
+    .expect("request");
+    let input = ProjectionInput::single(
+        20,
+        "pg_store_plans_vadv",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("dbid", Value::U64(3)),
+            ("userid", Value::U64(2)),
+            ("planid", Value::I64(9)),
+            ("queryid", Value::I64(8)),
+            ("first_call", Value::Ts(7)),
+            ("last_call", Value::Ts(18)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![
+            DtoFrameValue::String("7".to_owned()),
+            DtoFrameValue::String("18".to_owned()),
+        ]
+    );
+}
+
+#[test]
 fn reset_before_the_predecessor_does_not_break_the_interval() {
     let request =
         FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");

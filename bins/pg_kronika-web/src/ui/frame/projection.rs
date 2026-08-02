@@ -1272,8 +1272,8 @@ fn project_plans(
             "rows" => delta_frame(rows),
             "shared_hit" => delta_frame(delta(row, previous, "shared_blks_hit", continuity)),
             "shared_read" => delta_frame(delta(row, previous, "shared_blks_read", continuity)),
-            "first_seen" => raw_frame(row, "first_call", column.value_type),
-            "last_seen" => raw_frame(row, "last_call", column.value_type),
+            "first_call" => raw_frame(row, "first_call", column.value_type),
+            "last_call" => raw_frame(row, "last_call", column.value_type),
             _ => FrameValue::Null,
         };
         out.values.push((column.code, value));
@@ -1509,12 +1509,7 @@ fn project_locks(
             "lock_mode" => raw_frame(row, "lock_mode", column.value_type),
             "lock_type" => raw_frame(row, "lock_locktype", column.value_type),
             "target" => raw_frame(row, "lock_relname", column.value_type),
-            "wait_or_hold_us" => ["waitstart", "xact_start", "query_start"]
-                .iter()
-                .find_map(|name| timestamp(row, name).ok().flatten())
-                .map_or(FrameValue::Null, |start| {
-                    finite_frame((input.snapshot_ts_us - start) as f64)
-                }),
+            "wait_age_us" => duration_us(input.snapshot_ts_us, row, "waitstart")?,
             "query" => raw_frame(row, "query", column.value_type),
             _ => FrameValue::Null,
         };

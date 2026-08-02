@@ -128,7 +128,7 @@ fn catalog_contains_every_v5_column_preset_capability_and_reason() {
         ("activity", &["backend_type"][..]),
         (
             "plans",
-            &["shared_hit", "shared_read", "first_seen", "last_seen"],
+            &["shared_hit", "shared_read", "first_call", "last_call"],
         ),
         ("tables", &["size", "io_hit_pct", "xid_age", "mxid_age"]),
         ("indexes", &["size", "io_hit_pct", "last_idx_scan"]),
@@ -143,7 +143,7 @@ fn catalog_contains_every_v5_column_preset_capability_and_reason() {
                 "granted",
                 "lock_mode",
                 "lock_type",
-                "wait_or_hold_us",
+                "wait_age_us",
             ],
         ),
         ("events", &["severity_code", "category_code", "detail"]),
@@ -174,6 +174,49 @@ fn catalog_contains_every_v5_column_preset_capability_and_reason() {
             .all(|column| column["code"] != "pss"),
         "pss stays out of the catalog until it is actually collected"
     );
+}
+
+#[test]
+fn plan_call_timestamps_keep_their_source_names() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let plans = serialized_view(&catalog, "plans");
+    let columns = plans["columns"].as_array().expect("plan columns");
+
+    for (code, source) in [
+        (
+            "first_call",
+            serde_json::Value::String("plans.first_call".to_owned()),
+        ),
+        (
+            "last_call",
+            serde_json::Value::String("plans.last_call".to_owned()),
+        ),
+    ] {
+        let column = columns
+            .iter()
+            .find(|column| column["code"] == code)
+            .unwrap_or_else(|| panic!("plans.{code}"));
+        assert_eq!(column["source"], source);
+    }
+    assert!(
+        columns
+            .iter()
+            .all(|column| !matches!(column["code"].as_str(), Some("first_seen" | "last_seen"))),
+        "the catalog must not rename the collected call timestamps as observations"
+    );
+    assert_eq!(plans["view_revision"], json!(2));
+
+    let locks = serialized_view(&catalog, "locks");
+    assert_eq!(locks["view_revision"], json!(2));
+    let wait = locks["metrics"]
+        .as_array()
+        .expect("lock metrics")
+        .iter()
+        .find(|metric| metric["code"] == "wait")
+        .expect("locks.wait");
+    assert_eq!(wait["revision"], json!(2));
+    assert_eq!(wait["formula"], "max(wait_age_us from waitstart)");
 }
 
 #[test]
