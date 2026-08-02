@@ -120,6 +120,19 @@ enum ProcessEvidence<'a> {
 
 type ProcessEvidenceIndex<'a> = BTreeMap<(i64, i32), ProcessEvidence<'a>>;
 
+#[derive(Clone, Copy)]
+struct ResetSample {
+    ts_us: i64,
+    statements_at: Option<i64>,
+    plans_at: Option<i64>,
+}
+
+#[derive(Default)]
+struct CounterContinuityIndex {
+    failed_or_lossy: BTreeMap<u32, Vec<i64>>,
+    resets: Vec<ResetSample>,
+}
+
 enum Evaluation {
     Complete(Vec<Candidate>),
     Unsupported,
@@ -200,6 +213,7 @@ pub(crate) fn build_web_index<R: ReadAt>(
     };
     let grid = TimeGrid::for_range(min_ts, max_ts).map_err(block_build_error)?;
     let collections = canonical_collections(&decoded)?;
+    let counter_continuity = CounterContinuityIndex::from_decoded(&decoded, &collections)?;
     let (summary, summary_inputs) = build_summary(
         &decoded,
         &available_sections,
@@ -228,6 +242,7 @@ pub(crate) fn build_web_index<R: ReadAt>(
             grid,
             primary,
             bounds,
+            &counter_continuity,
         )?);
     }
     if let Some(host) = build_host_series(&decoded, &available_sections, grid, bounds)? {
@@ -540,6 +555,112 @@ fn canonical_collections(decoded: &[DecodedSection]) -> Result<CollectionTimelin
     Ok(collections)
 }
 
+impl CounterContinuityIndex {
+    fn from_decoded(
+        decoded: &[DecodedSection],
+        collections: &CollectionTimeline,
+    ) -> Result<Self, BuildError> {
+        let mut failed_or_lossy = BTreeMap::<u32, Vec<i64>>::new();
+        for ((_, ts_us), collection) in collections {
+            if matches!(
+                collection.status.read_state(),
+                CollectionReadState::ReadFailure | CollectionReadState::CollectorLimitOrLoss
+            ) {
+                failed_or_lossy
+                    .entry(collection.source_type)
+                    .or_default()
+                    .push(*ts_us);
+            }
+        }
+        for timestamps in failed_or_lossy.values_mut() {
+            timestamps.sort_unstable();
+            timestamps.dedup();
+        }
+
+        let mut resets = BTreeMap::<i64, ResetSample>::new();
+        for section in decoded
+            .iter()
+            .filter(|section| section.name == "reset_metadata")
+        {
+            for row in &section.rows {
+                let ts_us = row_ts(row)?;
+                let sample = ResetSample {
+                    ts_us,
+                    statements_at: optional_timestamp(row, "pg_stat_statements_reset_at")?,
+                    plans_at: optional_timestamp(row, "pg_store_plans_reset_at")?,
+                };
+                if resets.insert(ts_us, sample).is_some() {
+                    return corrupt();
+                }
+            }
+        }
+        Ok(Self {
+            failed_or_lossy,
+            resets: resets.into_values().collect(),
+        })
+    }
+
+    fn accepts(
+        &self,
+        view: &WebView,
+        previous: IndexedRow<'_>,
+        current: IndexedRow<'_>,
+        previous_ts_us: i64,
+        current_ts_us: i64,
+    ) -> bool {
+        if previous.type_id != current.type_id {
+            return false;
+        }
+        let Some(elapsed_us) = current_ts_us.checked_sub(previous_ts_us) else {
+            return false;
+        };
+        if elapsed_us <= 0
+            || view
+                .max_rate_gap_us
+                .is_none_or(|maximum| elapsed_us > maximum)
+        {
+            return false;
+        }
+        if self
+            .failed_or_lossy
+            .get(&current.type_id)
+            .is_some_and(|gaps| {
+                let first = gaps.partition_point(|ts_us| *ts_us <= previous_ts_us);
+                gaps.get(first).is_some_and(|ts_us| *ts_us <= current_ts_us)
+            })
+        {
+            return false;
+        }
+        let reset_at = match view.name {
+            "statements" => self.latest_reset_at(current_ts_us, |sample| sample.statements_at),
+            "plans" => self.latest_reset_at(current_ts_us, |sample| sample.plans_at),
+            _ => None,
+        };
+        !reset_at.is_some_and(|reset_at| reset_at > previous_ts_us && reset_at <= current_ts_us)
+    }
+
+    fn latest_reset_at(
+        &self,
+        current_ts_us: i64,
+        field: impl FnOnce(ResetSample) -> Option<i64>,
+    ) -> Option<i64> {
+        let end = self
+            .resets
+            .partition_point(|sample| sample.ts_us <= current_ts_us);
+        end.checked_sub(1)
+            .and_then(|index| self.resets.get(index).copied())
+            .and_then(field)
+    }
+}
+
+fn optional_timestamp(row: &Row, field: &str) -> Result<Option<i64>, BuildError> {
+    match row.get(field) {
+        Some(Cell::Ts(value)) => Ok(Some(*value)),
+        Some(Cell::Null) => Ok(None),
+        _ => corrupt(),
+    }
+}
+
 fn insert_collection_fact(
     facts: &mut BTreeMap<(u32, i64), CollectionFacts>,
     source_type: u32,
@@ -815,6 +936,10 @@ const fn notable_level(class: NotableClass) -> NotableLevel {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the view builder receives one shared bounded continuity index explicitly"
+)]
 fn build_view_series(
     view: &'static WebView,
     decoded: &[DecodedSection],
@@ -823,6 +948,7 @@ fn build_view_series(
     grid: TimeGrid,
     primary: Vec<IndexedRow<'_>>,
     bounds: &Bounds,
+    counter_continuity: &CounterContinuityIndex,
 ) -> Result<EntitySeriesBlock, BuildError> {
     let mut evaluated = Vec::with_capacity(view.metrics.len());
     for metric in view.metrics {
@@ -852,7 +978,7 @@ fn build_view_series(
                 }
                 let input = input_by_code(view, metric.requires[0]).ok_or(BuildError::Internal)?;
                 let rows = rows_for_input(decoded, input)?;
-                evaluate_metric(view, metric, &rows, dictionary, grid)?
+                evaluate_metric(view, metric, &rows, dictionary, grid, counter_continuity)?
             };
         let (status, mut candidates) = match evaluation {
             Evaluation::Complete(candidates) => (MetricStatus::Complete, candidates),
@@ -1090,16 +1216,33 @@ fn evaluate_metric(
     rows: &[IndexedRow<'_>],
     dictionary: &Dictionary,
     grid: TimeGrid,
+    counter_continuity: &CounterContinuityIndex,
 ) -> Result<Evaluation, BuildError> {
     match metric.formula {
         WebFormula::PositiveDeltaSum {
             field_sets, scale, ..
         } => evaluate_deltas(
-            view, metric, rows, dictionary, grid, field_sets, scale, false,
+            view,
+            metric,
+            rows,
+            dictionary,
+            grid,
+            field_sets,
+            scale,
+            false,
+            counter_continuity,
         ),
-        WebFormula::PositiveDeltaRate { field_sets, .. } => {
-            evaluate_deltas(view, metric, rows, dictionary, grid, field_sets, 1.0, true)
-        }
+        WebFormula::PositiveDeltaRate { field_sets, .. } => evaluate_deltas(
+            view,
+            metric,
+            rows,
+            dictionary,
+            grid,
+            field_sets,
+            1.0,
+            true,
+            counter_continuity,
+        ),
         WebFormula::PositiveDeltaTickRate { .. } => Err(BuildError::Internal),
         WebFormula::GaugeRatio {
             numerator,
@@ -1374,6 +1517,7 @@ fn evaluate_deltas(
     field_sets: &[&[&str]],
     scale: f64,
     rate: bool,
+    counter_continuity: &CounterContinuityIndex,
 ) -> Result<Evaluation, BuildError> {
     let compatible = rows
         .iter()
@@ -1397,8 +1541,8 @@ fn evaluate_deltas(
             let Some(current) = sum_fields(indexed.row, fields) else {
                 continue;
             };
-            if let Some((previous_ts, previous_value)) = previous
-                && ts > previous_ts
+            if let Some((previous_row, previous_ts, previous_value)) = previous
+                && counter_continuity.accepts(view, previous_row, *indexed, previous_ts, ts)
                 && current >= previous_value
             {
                 let mut value = (current - previous_value) * scale;
@@ -1407,7 +1551,7 @@ fn evaluate_deltas(
                 }
                 insert_bucket(&mut buckets, grid, ts, value, metric.aggregation)?;
             }
-            previous = Some((ts, current));
+            previous = Some((*indexed, ts, current));
         }
         if buckets.iter().any(Option::is_some) {
             candidates.push(candidate(
@@ -2025,6 +2169,8 @@ mod tests {
     use kronika_registry::pg_stat_progress_vacuum::PgStatProgressVacuum;
     use kronika_registry::pg_stat_statements::PgStatStatementsV2;
     use kronika_registry::pg_stat_user_indexes::PgStatUserIndexesV1;
+    use kronika_registry::pg_store_plans::PgStorePlansVadvV1;
+    use kronika_registry::reset_metadata::ResetMetadata;
     use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
     use kronika_registry::{Cell, Row, Section, StrId, Ts, registry};
     use kronika_registry::{PgLocksV1, PgLocksV2};
@@ -2830,6 +2976,255 @@ mod tests {
             wal_fpi: 0,
             wal_bytes: 0,
         }
+    }
+
+    fn plan_row(ts: i64, calls: i64) -> PgStorePlansVadvV1 {
+        let total_time = f64::from(i32::try_from(calls).expect("small fixture count")) * 10.0;
+        PgStorePlansVadvV1 {
+            ts: Ts(ts),
+            queryid_stat_statements: 7,
+            planid: 8,
+            userid: 10,
+            dbid: 20,
+            datname: None,
+            usename: None,
+            plan: None,
+            calls,
+            slow_log_calls: 0,
+            total_time,
+            min_time: 0.0,
+            max_time: 0.0,
+            mean_time: 0.0,
+            stddev_time: 0.0,
+            rows: calls,
+            shared_blks_hit: 0,
+            shared_blks_read: 0,
+            shared_blks_dirtied: 0,
+            shared_blks_written: 0,
+            local_blks_hit: 0,
+            local_blks_read: 0,
+            local_blks_dirtied: 0,
+            local_blks_written: 0,
+            temp_blks_read: 0,
+            temp_blks_written: 0,
+            blk_read_time: 0.0,
+            blk_write_time: 0.0,
+            first_call: Ts(1),
+            last_call: Ts(ts),
+            total_plan_time: 0.0,
+            min_plan_time: 0.0,
+            max_plan_time: 0.0,
+            mean_plan_time: 0.0,
+        }
+    }
+
+    fn reset_row(
+        ts: i64,
+        statement_reset_at: Option<i64>,
+        plan_reset_at: Option<i64>,
+    ) -> ResetMetadata {
+        ResetMetadata {
+            ts: Ts(ts),
+            postmaster_start_time: Ts(1),
+            pg_stat_database_reset_max_at: None,
+            pg_stat_statements_reset_at: statement_reset_at.map(Ts),
+            pg_store_plans_reset_at: plan_reset_at.map(Ts),
+            pg_stat_bgwriter_reset_at: None,
+            pg_stat_checkpointer_reset_at: None,
+            pg_stat_wal_reset_at: None,
+            pg_stat_archiver_reset_at: None,
+            pg_stat_io_reset_at: None,
+            ext_pg_stat_statements_version: None,
+            ext_pg_store_plans_version: None,
+            compute_query_id: None,
+            track_io_timing: None,
+            track_wal_io_timing: None,
+        }
+    }
+
+    fn counter_semantics_pgm(
+        statements: &[PgStatStatementsV2],
+        plans: &[PgStorePlansVadvV1],
+        resets: &[ResetMetadata],
+        snapshots: &[SnapshotCoverageV1],
+        collections: &[CollectionCoverageV1],
+    ) -> Vec<u8> {
+        let mut bodies = Vec::new();
+        if !statements.is_empty() {
+            bodies.push((
+                1_002_002,
+                u32::try_from(statements.len()).expect("small statement fixture"),
+                PgStatStatementsV2::encode(statements).expect("encode statements"),
+            ));
+        }
+        if !plans.is_empty() {
+            bodies.push((
+                1_004_001,
+                u32::try_from(plans.len()).expect("small plan fixture"),
+                PgStorePlansVadvV1::encode(plans).expect("encode plans"),
+            ));
+        }
+        if !resets.is_empty() {
+            bodies.push((
+                1_020_001,
+                u32::try_from(resets.len()).expect("small reset fixture"),
+                ResetMetadata::encode(resets).expect("encode resets"),
+            ));
+        }
+        if !collections.is_empty() {
+            bodies.push((
+                1_023_001,
+                u32::try_from(collections.len()).expect("small collection fixture"),
+                CollectionCoverageV1::encode(collections).expect("encode collection coverage"),
+            ));
+        }
+        if !snapshots.is_empty() {
+            bodies.push((
+                1_038_001,
+                u32::try_from(snapshots.len()).expect("small snapshot fixture"),
+                SnapshotCoverageV1::encode(snapshots).expect("encode snapshot coverage"),
+            ));
+        }
+        bodies.sort_unstable_by_key(|(type_id, _, _)| *type_id);
+        let inputs = bodies
+            .iter()
+            .map(|(type_id, rows, body)| SectionInput {
+                type_id: *type_id,
+                rows: *rows,
+                body,
+            })
+            .collect::<Vec<_>>();
+        let min_ts = statements
+            .iter()
+            .map(|row| row.ts.0)
+            .chain(plans.iter().map(|row| row.ts.0))
+            .chain(resets.iter().map(|row| row.ts.0))
+            .chain(snapshots.iter().map(|row| row.ts.0))
+            .chain(collections.iter().map(|row| row.ts.0))
+            .min()
+            .expect("non-empty counter fixture");
+        let max_ts = statements
+            .iter()
+            .map(|row| row.ts.0)
+            .chain(plans.iter().map(|row| row.ts.0))
+            .chain(resets.iter().map(|row| row.ts.0))
+            .chain(snapshots.iter().map(|row| row.ts.0))
+            .chain(collections.iter().map(|row| row.ts.0))
+            .max()
+            .expect("non-empty counter fixture");
+        build_part(&inputs, PartMeta { min_ts, max_ts })
+    }
+
+    fn metric_values(bytes: Vec<u8>, min_ts: i64, max_ts: i64, view: u16) -> Vec<f64> {
+        let unit = PgmUnit::open(bytes).expect("open counter PGM");
+        let blocks =
+            build_web_index(&unit, &[], min_ts, max_ts, &LIMIT).expect("build counter web index");
+        let block = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == view)
+            .expect("counter view series");
+        let metric = block
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 1)
+            .expect("canonical counter metric");
+        assert_eq!(metric.status(), MetricStatus::Complete);
+        metric
+            .series()
+            .iter()
+            .flat_map(|series| series.observed_values().map(|(_bucket, value)| value))
+            .collect()
+    }
+
+    #[test]
+    fn statement_series_rejects_an_increasing_pair_across_its_exact_reset() {
+        let rows = [statement_row(10, 10, None), statement_row(20, 20, None)];
+        let bytes = counter_semantics_pgm(&rows, &[], &[reset_row(18, Some(15), None)], &[], &[]);
+
+        assert!(metric_values(bytes, 10, 20, 2).is_empty());
+    }
+
+    #[test]
+    fn plan_series_rejects_an_increasing_pair_across_its_exact_reset() {
+        let rows = [plan_row(10, 10), plan_row(20, 20)];
+        let bytes = counter_semantics_pgm(&[], &rows, &[reset_row(18, None, Some(15))], &[], &[]);
+
+        assert!(metric_values(bytes, 10, 20, 3).is_empty());
+    }
+
+    #[test]
+    fn generic_counter_series_rejects_over_limit_pair_but_uses_next_short_pair() {
+        let rows = [
+            statement_row(10, 10, None),
+            statement_row(1_000_000_010, 20, None),
+            statement_row(1_100_000_010, 21, None),
+        ];
+        let bytes = counter_semantics_pgm(&rows, &[], &[], &[], &[]);
+
+        assert_eq!(metric_values(bytes, 10, 1_100_000_010, 2), vec![10.0]);
+    }
+
+    #[test]
+    fn generic_counter_series_rejects_pair_across_recorded_read_failure() {
+        let rows = [
+            statement_row(10, 10, None),
+            statement_row(20, 20, None),
+            statement_row(30, 30, None),
+        ];
+        let failed = SnapshotCoverageV1 {
+            ts: Ts(15),
+            section_type_id: 1_002_002,
+            collector_pid: 42,
+            collector_started_at: Ts(1),
+            read_state: 3,
+            visibility: 2,
+            source_total: 0,
+            collected: 0,
+        };
+        let lost = CollectionCoverageV1 {
+            ts: Ts(15),
+            section_type_id: 1_002_002,
+            total: 0,
+            unknown_total: true,
+            collected: 0,
+            max_n: 500,
+            order_by: StrId(1),
+            cutoff_value: None,
+            reason: 1,
+        };
+
+        for bytes in [
+            counter_semantics_pgm(&rows, &[], &[], &[failed], &[]),
+            counter_semantics_pgm(&rows, &[], &[], &[], &[lost]),
+        ] {
+            assert_eq!(metric_values(bytes, 10, 30, 2), vec![100.0]);
+        }
+    }
+
+    #[test]
+    fn exact_reset_interval_keeps_open_predecessor_and_closed_current_endpoints() {
+        let rows = [statement_row(10, 10, None), statement_row(20, 20, None)];
+        let at_predecessor =
+            counter_semantics_pgm(&rows, &[], &[reset_row(18, Some(10), None)], &[], &[]);
+        let at_current =
+            counter_semantics_pgm(&rows, &[], &[reset_row(20, Some(20), None)], &[], &[]);
+
+        assert_eq!(metric_values(at_predecessor, 10, 20, 2), vec![100.0]);
+        assert!(metric_values(at_current, 10, 20, 2).is_empty());
+    }
+
+    #[test]
+    fn exact_reset_markers_are_isolated_by_counter_family() {
+        let statements = [statement_row(10, 10, None), statement_row(20, 20, None)];
+        let plans = [plan_row(10, 10), plan_row(20, 20)];
+        let statement_bytes =
+            counter_semantics_pgm(&statements, &[], &[reset_row(18, None, Some(15))], &[], &[]);
+        let plan_bytes =
+            counter_semantics_pgm(&[], &plans, &[reset_row(18, Some(15), None)], &[], &[]);
+
+        assert_eq!(metric_values(statement_bytes, 10, 20, 2), vec![100.0]);
+        assert_eq!(metric_values(plan_bytes, 10, 20, 3), vec![100_000.0]);
     }
 
     fn statements_pgm(include_query_text: bool) -> Vec<u8> {

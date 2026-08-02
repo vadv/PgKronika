@@ -252,6 +252,87 @@ fn continuity_for(view: &WebView, input: &ProjectionInput) -> ContinuityVerdict 
     }
 }
 
+#[cfg(test)]
+mod continuity_tests {
+    use kronika_analytics::web_projection::web_view_by_name;
+    use kronika_reader::{Gap, Value};
+
+    use super::{ContinuityVerdict, ProjectionInput, continuity_for};
+
+    fn reset_input(
+        predecessor_ts_us: Option<i64>,
+        statement_reset_at: Option<i64>,
+        plan_reset_at: Option<i64>,
+        gaps: Vec<Gap>,
+    ) -> ProjectionInput {
+        let mut input = ProjectionInput::empty(20);
+        input.predecessor_ts_us = predecessor_ts_us;
+        input.neighbors.previous = predecessor_ts_us;
+        input.gaps = gaps;
+        input.current.insert(
+            "reset_metadata".to_owned(),
+            vec![vec![
+                ("ts".to_owned(), Value::Ts(20)),
+                (
+                    "pg_stat_statements_reset_at".to_owned(),
+                    statement_reset_at.map_or(Value::Null, Value::Ts),
+                ),
+                (
+                    "pg_store_plans_reset_at".to_owned(),
+                    plan_reset_at.map_or(Value::Null, Value::Ts),
+                ),
+            ]],
+        );
+        input
+    }
+
+    #[test]
+    fn frame_reset_interval_is_open_at_predecessor_and_closed_at_snapshot() {
+        let statements = web_view_by_name("statements").expect("statements view");
+
+        assert_eq!(
+            continuity_for(statements, &reset_input(Some(10), Some(10), None, vec![])),
+            ContinuityVerdict::Continuous
+        );
+        assert_eq!(
+            continuity_for(statements, &reset_input(Some(10), Some(20), None, vec![])),
+            ContinuityVerdict::Reset
+        );
+    }
+
+    #[test]
+    fn frame_reset_markers_are_isolated_by_counter_family() {
+        let statements = web_view_by_name("statements").expect("statements view");
+        let plans = web_view_by_name("plans").expect("plans view");
+        let input = reset_input(Some(10), Some(15), None, vec![]);
+
+        assert_eq!(continuity_for(statements, &input), ContinuityVerdict::Reset);
+        assert_eq!(continuity_for(plans, &input), ContinuityVerdict::Continuous);
+    }
+
+    #[test]
+    fn frame_gap_and_first_point_precede_reset_evidence() {
+        let statements = web_view_by_name("statements").expect("statements view");
+        let gap = Gap { from: 11, to: 12 };
+
+        assert_eq!(
+            continuity_for(
+                statements,
+                &reset_input(Some(10), Some(15), None, vec![gap])
+            ),
+            ContinuityVerdict::Gap
+        );
+        assert_eq!(
+            continuity_for(statements, &reset_input(None, Some(15), None, vec![])),
+            ContinuityVerdict::FirstPoint
+        );
+        assert_eq!(
+            continuity_for(statements, &reset_input(None, Some(15), None, vec![gap])),
+            ContinuityVerdict::Gap
+        );
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ProjectionError {
     MissingCatalogView,
