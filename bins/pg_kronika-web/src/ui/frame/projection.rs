@@ -1083,7 +1083,7 @@ fn project_activity(
                 FrameValue::String("best_effort".to_owned())
             }),
             "cpu" => current_process.map_or(FrameValue::Null, |current| {
-                rate_sum(
+                tick_rate_sum(
                     current,
                     previous_process,
                     &["utime", "stime"],
@@ -1443,14 +1443,14 @@ fn project_processes(
         let value = match column.code {
             "pid" => raw_frame(row, "pid", column.value_type),
             "type" => raw_frame(row, "comm", column.value_type),
-            "cpu" => rate_sum(row, previous, &["utime", "stime"], input, continuity),
+            "cpu" => tick_rate_sum(row, previous, &["utime", "stime"], input, continuity),
             "rss" => raw_frame(row, "rmem_kb", column.value_type),
             "threads" => raw_frame(row, "num_threads", column.value_type),
             "read_bytes_per_second" => rate_sum(row, previous, &["read_bytes"], input, continuity),
             "write_bytes_per_second" => {
                 rate_sum(row, previous, &["write_bytes"], input, continuity)
             }
-            "block_delay" => rate_sum(row, previous, &["blkdelay_ticks"], input, continuity),
+            "block_delay" => tick_rate_sum(row, previous, &["blkdelay_ticks"], input, continuity),
             "command" => raw_frame(row, "cmdline", column.value_type),
             "cgroup" => process_cgroup(row, &input.current, input.snapshot_ts_us)
                 .map_or(FrameValue::Null, |mapping| {
@@ -2030,6 +2030,45 @@ fn rate_sum(
         DeltaOperand::Value(value) => finite_frame(value / (elapsed as f64 / 1_000_000.0)),
         _ => FrameValue::Null,
     }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "bounded microsecond elapsed time becomes the projection's f64 tick-rate denominator"
+)]
+fn tick_rate_sum(
+    current: &OutRow,
+    previous: Option<&OutRow>,
+    fields: &[&'static str],
+    input: &ProjectionInput,
+    continuity: ContinuityVerdict,
+) -> FrameValue {
+    let Some(previous_ts) = input.predecessor_ts_us else {
+        return FrameValue::Null;
+    };
+    let elapsed = input.snapshot_ts_us - previous_ts;
+    if elapsed <= 0 {
+        return FrameValue::Null;
+    }
+    let Some(clock) = clock_ticks_per_sec(input) else {
+        return FrameValue::Null;
+    };
+    match delta_sum(current, previous, fields, continuity) {
+        DeltaOperand::Value(value) => {
+            finite_frame(value / (clock * (elapsed as f64 / 1_000_000.0)))
+        }
+        _ => FrameValue::Null,
+    }
+}
+
+fn clock_ticks_per_sec(input: &ProjectionInput) -> Option<f64> {
+    input
+        .current
+        .get("instance_metadata")?
+        .iter()
+        .find(|row| timestamp(row, "ts").ok().flatten() == Some(input.snapshot_ts_us))
+        .and_then(|row| finite_number(row, "clock_ticks_per_sec").ok().flatten())
+        .filter(|clock| clock.is_finite() && *clock > 0.0)
 }
 
 const fn finite_frame(value: f64) -> FrameValue {

@@ -647,8 +647,8 @@ fn activity_view() -> ViewSpec {
         derived_column(
             "cpu",
             ValueType::F64,
-            "positive_delta(utime + stime) / elapsed",
-            &["activity", "process"],
+            "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
+            &["activity", "process", "instance"],
             None,
         ),
         derived_column(
@@ -1449,8 +1449,8 @@ fn processes_view() -> ViewSpec {
         derived_column(
             "cpu",
             ValueType::F64,
-            "positive_delta(utime + stime) / elapsed",
-            &["process"],
+            "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
+            &["process", "instance"],
             None,
         ),
         raw_column(
@@ -1486,8 +1486,8 @@ fn processes_view() -> ViewSpec {
         derived_column(
             "block_delay",
             ValueType::F64,
-            "positive_delta(blkdelay_ticks) / elapsed",
-            &["process"],
+            "positive_delta(blkdelay_ticks) / (clock_ticks_per_sec * elapsed_seconds)",
+            &["process", "instance"],
             None,
         ),
         raw_column(

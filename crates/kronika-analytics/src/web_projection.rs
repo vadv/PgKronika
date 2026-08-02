@@ -199,6 +199,10 @@ const ACTIVITY_INPUTS: &[WebInput] = &[
         sections: &["os_process"],
     },
     WebInput {
+        code: "instance",
+        sections: &["instance_metadata"],
+    },
+    WebInput {
         code: "replication_replicas",
         sections: &["pg_stat_replication"],
     },
@@ -251,6 +255,10 @@ const PROCESS_INPUTS: &[WebInput] = &[
         sections: &["os_process"],
     },
     WebInput {
+        code: "instance",
+        sections: &["instance_metadata"],
+    },
+    WebInput {
         code: "cgroup_mapping",
         sections: &["os_cgroup_mapping"],
     },
@@ -290,14 +298,14 @@ const ACTIVITY_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 2,
         name: "cpu",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Ratio,
         aggregation: WebAggregation::Max,
         formula: WebFormula::PositiveDeltaRate {
             field_sets: &[&["utime", "stime"]],
-            expression: "positive_delta(utime + stime) / elapsed",
+            expression: "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
         },
-        requires: &["activity", "process"],
+        requires: &["activity", "process", "instance"],
         canonical: false,
     },
     WebMetric {
@@ -517,14 +525,14 @@ const PROCESS_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 1,
         name: "cpu",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Ratio,
         aggregation: WebAggregation::Max,
         formula: WebFormula::PositiveDeltaRate {
             field_sets: &[&["utime", "stime"]],
-            expression: "positive_delta(utime + stime) / elapsed",
+            expression: "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
         },
-        requires: &["process"],
+        requires: &["process", "instance"],
         canonical: true,
     },
     WebMetric {
@@ -572,7 +580,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 1,
         name: "activity",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: ACTIVITY_INPUTS,
@@ -626,7 +634,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 7,
         name: "processes",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PROCESS_INPUTS,

@@ -531,6 +531,7 @@ fn statements_presets_identify_rows_by_database_and_user() {
 fn activity_cpu_requires_both_activity_and_process_inputs() {
     let activity_type = first_type_id("pg_stat_activity");
     let process_type = first_type_id("os_process");
+    let instance_type = first_type_id("instance_metadata");
 
     let activity_only = ProjectionCatalog::for_type_ids(&BTreeSet::from([activity_type]));
     let cpu = activity_only
@@ -542,7 +543,59 @@ fn activity_cpu_requires_both_activity_and_process_inputs() {
     let cpu = joined
         .metric("activity", "cpu")
         .expect("activity cpu metric");
+    assert_eq!(cpu.availability, Availability::Gated);
+
+    let joined = ProjectionCatalog::for_type_ids(&BTreeSet::from([
+        activity_type,
+        process_type,
+        instance_type,
+    ]));
+    let cpu = joined
+        .metric("activity", "cpu")
+        .expect("activity cpu metric");
     assert_eq!(cpu.availability, Availability::Available);
+}
+
+#[test]
+fn process_cpu_requires_instance_metadata_but_activity_stays_available() {
+    let activity_type = first_type_id("pg_stat_activity");
+    let process_type = first_type_id("os_process");
+    let instance_type = first_type_id("instance_metadata");
+
+    let without_instance =
+        ProjectionCatalog::for_type_ids(&BTreeSet::from([activity_type, process_type]));
+    let processes = without_instance
+        .views()
+        .iter()
+        .find(|view| view.code == "processes")
+        .expect("processes view");
+    assert_eq!(processes.availability, Availability::Gated);
+    assert_eq!(
+        without_instance
+            .metric("processes", "cpu")
+            .expect("process cpu metric")
+            .availability,
+        Availability::Gated
+    );
+    assert_eq!(
+        without_instance
+            .views()
+            .iter()
+            .find(|view| view.code == "activity")
+            .expect("activity view")
+            .availability,
+        Availability::Available
+    );
+
+    let with_instance =
+        ProjectionCatalog::for_type_ids(&BTreeSet::from([process_type, instance_type]));
+    assert_eq!(
+        with_instance
+            .metric("processes", "cpu")
+            .expect("process cpu metric")
+            .availability,
+        Availability::Available
+    );
 }
 
 #[test]
