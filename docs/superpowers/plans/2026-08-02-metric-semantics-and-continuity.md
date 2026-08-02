@@ -120,10 +120,11 @@ git commit -m "fix(web): honor exact counter reset boundaries"
 - Modify: `bins/pg_kronika-web/src/ui/frame/projection.rs`
 - Modify: `bins/pg_kronika-web/src/tests/ui_frame.rs`
 - Modify: `bins/pg_kronika-web/src/tests/ui_catalog.rs`
+- Modify: `crates/kronika-reader/src/overview/web_index/build.rs`
 
 **Interfaces:**
-- Consumes: exact-snapshot `instance_metadata.clock_ticks_per_sec` and the Task 1 continuity verdict.
-- Produces: `clock_ticks_per_sec(input) -> Option<f64>` and a tick-rate evaluator returning CPU/block-wait seconds per wall second.
+- Consumes: the latest bounded `instance_metadata.clock_ticks_per_sec` at-or-before each process snapshot in the same PGM, plus the Task 1 continuity verdict.
+- Produces: `clock_ticks_per_sec(input) -> Option<f64>`, an executable HZ-aware web-index formula, and tick-rate evaluators returning CPU/block-wait seconds per wall second in both frames and heatmap/spark series.
 
 - [ ] **Step 1: Write failing HZ and denominator tests**
 
@@ -132,13 +133,15 @@ Add focused cases with a 10-second interval:
 ```rust
 #[test]
 fn process_cpu_and_block_delay_are_divided_by_clock_ticks() {
-    // HZ=100; CPU tick delta=90; blkdelay tick delta=20.
+    // HZ=100 metadata precedes the current process snapshot;
+    // CPU tick delta=90; blkdelay tick delta=20.
     // Assert CPU=0.09 and block_delay=0.02.
 }
 
 #[test]
 fn activity_cpu_uses_the_same_instance_clock() {
-    // Unique same-snapshot PID association, HZ=100, CPU tick delta=90.
+    // Unique same-snapshot PID association, carried-forward HZ=100,
+    // CPU tick delta=90.
     // Assert best_effort link remains visible and CPU=0.09.
 }
 
@@ -146,6 +149,18 @@ fn activity_cpu_uses_the_same_instance_clock() {
 fn tick_rates_are_null_without_a_positive_clock() {
     // Exercise missing, zero, and negative clock_ticks_per_sec.
     // Assert CPU and block_delay are null; byte rates remain computable.
+}
+
+#[test]
+fn process_cpu_web_index_uses_hz_without_gating_the_canonical_metric() {
+    // Build a PGM with process snapshots at 10s and 20s and one HZ=100
+    // metadata row at or before both. Assert metric status Complete and 0.09.
+}
+
+#[test]
+fn activity_cpu_web_index_uses_unique_same_snapshot_pid_attribution() {
+    // Attribute activity samples to the unique same-timestamp process lifetime,
+    // then assert the HZ-aware activity CPU series value; ambiguity yields none.
 }
 ```
 
@@ -162,7 +177,7 @@ Expected: current CPU/block-delay values are larger by the HZ factor or incorrec
 
 - [ ] **Step 3: Add metadata requirements and tick conversion**
 
-Add an `instance` input backed by mandatory `instance_metadata` to activity and process views. Require it for CPU and block-delay metrics/columns, but not for process byte rates; the process view is correctly gated when its canonical CPU metric cannot be interpreted without HZ, while activity's non-CPU canonical metric remains available. Change normative formulas to:
+Add an `instance` input backed by mandatory `instance_metadata` to activity and process views. The frame query reads this slow-cadence service section from the current descriptor start through the selected snapshot and selects the latest valid row at-or-before the snapshot, matching the established context projection. Require it for CPU and block-delay metrics/columns, but not for process byte rates; the process view is correctly gated when its canonical CPU metric cannot be interpreted without HZ, while activity's non-CPU canonical metric remains available. Change normative formulas to:
 
 ```text
 positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)
@@ -170,6 +185,8 @@ positive_delta(blkdelay_ticks) / (clock_ticks_per_sec * elapsed_seconds)
 ```
 
 Bump activity CPU and process CPU metric revisions to `2`; bump activity and process view revisions to `2`. Return `null` for absent/non-finite/non-positive HZ or elapsed time, and do not clamp the result to one core.
+
+Represent tick rates as an executable formula variant distinct from ordinary byte-per-second rates. Extend the bounded reader web-index evaluator so process CPU consumes process rows plus the carried-forward HZ timeline, and activity CPU additionally uses the existing unique same-snapshot PID attribution without bridging different `(pid,starttime)` lifetimes. Do not leave either CPU metric gated merely because it has metadata/attribution inputs.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -179,6 +196,7 @@ Run:
 cargo test --target aarch64-apple-darwin -p pg_kronika-web ui_frame
 cargo test --target aarch64-apple-darwin -p pg_kronika-web ui_catalog
 cargo test --target aarch64-apple-darwin -p kronika-analytics web_projection
+cargo test --target aarch64-apple-darwin -p kronika-reader web_index
 ```
 
 Expected: PASS.
@@ -186,7 +204,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/kronika-analytics/src/web_projection.rs bins/pg_kronika-web/src/ui/catalog.rs bins/pg_kronika-web/src/ui/frame/projection.rs bins/pg_kronika-web/src/tests/ui_frame.rs bins/pg_kronika-web/src/tests/ui_catalog.rs
+git add crates/kronika-analytics/src/web_projection.rs crates/kronika-reader/src/overview/web_index/build.rs bins/pg_kronika-web/src/ui/catalog.rs bins/pg_kronika-web/src/ui/frame/projection.rs bins/pg_kronika-web/src/tests/ui_frame.rs bins/pg_kronika-web/src/tests/ui_catalog.rs
 git commit -m "fix(web): convert process ticks with instance hz"
 ```
 
