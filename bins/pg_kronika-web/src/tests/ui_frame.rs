@@ -638,7 +638,7 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
     input.push(
         "instance_metadata",
         out_row(&[
-            ("ts", Value::Ts(20_000_000)),
+            ("ts", Value::Ts(5_000_000)),
             ("clock_ticks_per_sec", Value::I64(100)),
         ]),
     );
@@ -691,7 +691,7 @@ fn process_cpu_and_block_delay_are_divided_by_clock_ticks() {
     input.push(
         "instance_metadata",
         out_row(&[
-            ("ts", Value::Ts(20_000_000)),
+            ("ts", Value::Ts(5_000_000)),
             ("clock_ticks_per_sec", Value::I64(100)),
         ]),
     );
@@ -713,6 +713,82 @@ fn process_cpu_and_block_delay_are_divided_by_clock_ticks() {
         frame.rows[0].cells,
         vec![DtoFrameValue::Number(0.09), DtoFrameValue::Number(0.02)]
     );
+}
+
+#[test]
+fn tick_rates_preserve_multi_core_cpu() {
+    let request = FrameRequest::parse("processes", Some("at=20000000&columns=cpu"), &catalog())
+        .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(2_010)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(5_000_000)),
+            ("clock_ticks_per_sec", Value::I64(100)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(10)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Number(2.0)]);
+}
+
+#[test]
+fn tick_rates_are_null_for_a_non_finite_clock() {
+    let request = FrameRequest::parse("processes", Some("at=20000000&columns=cpu"), &catalog())
+        .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(100)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(5_000_000)),
+            ("clock_ticks_per_sec", Value::F64(f64::NAN)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(10)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Null]);
 }
 
 #[test]

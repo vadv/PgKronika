@@ -818,7 +818,7 @@ fn build_view_series(
             input_by_code(view, required)
                 .is_some_and(|input| input_available(available_sections, input))
         });
-        if !requirements_available || metric.requires.len() != 1 {
+        if !requirements_available {
             evaluated.push(EvaluatedMetric {
                 metric,
                 status: MetricStatus::Gated,
@@ -826,9 +826,22 @@ fn build_view_series(
             });
             continue;
         }
-        let input = input_by_code(view, metric.requires[0]).ok_or(BuildError::Internal)?;
-        let rows = rows_for_input(decoded, input)?;
-        let evaluation = evaluate_metric(view, metric, &rows, dictionary, grid)?;
+        let evaluation =
+            if let WebFormula::PositiveDeltaTickRate { field_sets, .. } = metric.formula {
+                evaluate_tick_rate(view, metric, decoded, dictionary, grid, field_sets)?
+            } else {
+                if metric.requires.len() != 1 {
+                    evaluated.push(EvaluatedMetric {
+                        metric,
+                        status: MetricStatus::Gated,
+                        candidates: Vec::new(),
+                    });
+                    continue;
+                }
+                let input = input_by_code(view, metric.requires[0]).ok_or(BuildError::Internal)?;
+                let rows = rows_for_input(decoded, input)?;
+                evaluate_metric(view, metric, &rows, dictionary, grid)?
+            };
         let (status, mut candidates) = match evaluation {
             Evaluation::Complete(candidates) => (MetricStatus::Complete, candidates),
             Evaluation::Unsupported => (MetricStatus::UnsupportedType, Vec::new()),
@@ -1075,6 +1088,7 @@ fn evaluate_metric(
         WebFormula::PositiveDeltaRate { field_sets, .. } => {
             evaluate_deltas(view, metric, rows, dictionary, grid, field_sets, 1.0, true)
         }
+        WebFormula::PositiveDeltaTickRate { .. } => Err(BuildError::Internal),
         WebFormula::GaugeRatio {
             numerator,
             denominator,
@@ -1091,6 +1105,196 @@ fn evaluate_metric(
             evaluate_lock_duration(view, metric, rows, dictionary, grid)
         }
     }
+}
+
+fn evaluate_tick_rate(
+    view: &'static WebView,
+    metric: &'static WebMetric,
+    decoded: &[DecodedSection],
+    dictionary: &Dictionary,
+    grid: TimeGrid,
+    field_sets: &[&[&str]],
+) -> Result<Evaluation, BuildError> {
+    let process = input_by_code(view, "process").ok_or(BuildError::Internal)?;
+    let instance = input_by_code(view, "instance").ok_or(BuildError::Internal)?;
+    let process_rows = rows_for_input(decoded, process)?;
+    let metadata_rows = rows_for_input(decoded, instance)?;
+    match view.name {
+        "processes" => evaluate_process_tick_rate(
+            view,
+            metric,
+            &process_rows,
+            &metadata_rows,
+            dictionary,
+            grid,
+            field_sets,
+        ),
+        "activity" => {
+            let activity = input_by_code(view, "activity").ok_or(BuildError::Internal)?;
+            let activity_rows = rows_for_input(decoded, activity)?;
+            evaluate_activity_tick_rate(
+                view,
+                metric,
+                &activity_rows,
+                &process_rows,
+                &metadata_rows,
+                dictionary,
+                grid,
+                field_sets,
+            )
+        }
+        _ => Err(BuildError::Internal),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the evaluator keeps tick counters, effective metadata, and identity provenance explicit"
+)]
+fn evaluate_process_tick_rate(
+    view: &'static WebView,
+    metric: &'static WebMetric,
+    process_rows: &[IndexedRow<'_>],
+    metadata_rows: &[IndexedRow<'_>],
+    dictionary: &Dictionary,
+    grid: TimeGrid,
+    field_sets: &[&[&str]],
+) -> Result<Evaluation, BuildError> {
+    let compatible = process_rows
+        .iter()
+        .copied()
+        .filter(|indexed| compatible_field_set(indexed.row, field_sets).is_some())
+        .collect::<Vec<_>>();
+    if compatible.is_empty() {
+        return Ok(Evaluation::Unsupported);
+    }
+    let mut grouped = group_rows(view, &compatible, dictionary)?;
+    let mut candidates = Vec::new();
+    for (key, (label, entity_rows)) in &mut grouped {
+        entity_rows.sort_by_key(|indexed| row_ts(indexed.row).unwrap_or(i64::MIN));
+        let mut buckets = empty_buckets(grid);
+        let mut previous = None;
+        for indexed in entity_rows {
+            let ts = row_ts(indexed.row)?;
+            let Some(clock) = clock_ticks_per_sec(metadata_rows, ts) else {
+                previous = None;
+                continue;
+            };
+            let Some(fields) = compatible_field_set(indexed.row, field_sets) else {
+                previous = None;
+                continue;
+            };
+            let Some(current) = sum_fields(indexed.row, fields) else {
+                previous = None;
+                continue;
+            };
+            if let Some((previous_ts, previous_value)) = previous
+                && ts > previous_ts
+                && current >= previous_value
+            {
+                let elapsed_seconds = (ts - previous_ts) as f64 / 1_000_000.0;
+                let value = (current - previous_value) / (clock * elapsed_seconds);
+                insert_bucket(&mut buckets, grid, ts, value, metric.aggregation)?;
+            }
+            previous = Some((ts, current));
+        }
+        if buckets.iter().any(Option::is_some) {
+            candidates.push(candidate(
+                key.clone(),
+                label.clone(),
+                buckets,
+                metric.aggregation,
+            )?);
+        }
+    }
+    Ok(Evaluation::Complete(candidates))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the evaluator keeps activity attribution, process lifetime, and metadata provenance explicit"
+)]
+fn evaluate_activity_tick_rate(
+    view: &'static WebView,
+    metric: &'static WebMetric,
+    activity_rows: &[IndexedRow<'_>],
+    process_rows: &[IndexedRow<'_>],
+    metadata_rows: &[IndexedRow<'_>],
+    dictionary: &Dictionary,
+    grid: TimeGrid,
+    field_sets: &[&[&str]],
+) -> Result<Evaluation, BuildError> {
+    let mut grouped = group_rows(view, activity_rows, dictionary)?;
+    let mut candidates = Vec::new();
+    for (key, (label, entity_rows)) in &mut grouped {
+        entity_rows.sort_by_key(|indexed| row_ts(indexed.row).unwrap_or(i64::MIN));
+        let mut buckets = empty_buckets(grid);
+        let mut previous = None;
+        for activity in entity_rows {
+            let ts = row_ts(activity.row)?;
+            let Some(process) = activity_process_candidate(activity, process_rows) else {
+                previous = None;
+                continue;
+            };
+            let Some(clock) = clock_ticks_per_sec(metadata_rows, ts) else {
+                previous = None;
+                continue;
+            };
+            let Some(fields) = compatible_field_set(process.row, field_sets) else {
+                previous = None;
+                continue;
+            };
+            let Some(current) = sum_fields(process.row, fields) else {
+                previous = None;
+                continue;
+            };
+            let starttime =
+                cell_timestamp(process.row.get("starttime")).ok_or(BuildError::Internal)?;
+            if let Some((previous_ts, previous_value, previous_starttime)) = previous
+                && starttime == previous_starttime
+                && ts > previous_ts
+                && current >= previous_value
+            {
+                let elapsed_seconds = (ts - previous_ts) as f64 / 1_000_000.0;
+                let value = (current - previous_value) / (clock * elapsed_seconds);
+                insert_bucket(&mut buckets, grid, ts, value, metric.aggregation)?;
+            }
+            previous = Some((ts, current, starttime));
+        }
+        if buckets.iter().any(Option::is_some) {
+            candidates.push(candidate(
+                key.clone(),
+                label.clone(),
+                buckets,
+                metric.aggregation,
+            )?);
+        }
+    }
+    Ok(Evaluation::Complete(candidates))
+}
+
+fn activity_process_candidate<'a>(
+    activity: &IndexedRow<'_>,
+    process_rows: &'a [IndexedRow<'a>],
+) -> Option<IndexedRow<'a>> {
+    let ts = row_ts(activity.row).ok()?;
+    let pid = cell_number(activity.row.get("pid"))?;
+    let mut candidates = process_rows.iter().copied().filter(|process| {
+        row_ts(process.row).ok() == Some(ts) && cell_number(process.row.get("pid")) == Some(pid)
+    });
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
+}
+
+fn clock_ticks_per_sec(metadata_rows: &[IndexedRow<'_>], snapshot_ts_us: i64) -> Option<f64> {
+    metadata_rows
+        .iter()
+        .copied()
+        .filter_map(|metadata| row_ts(metadata.row).ok().map(|ts| (ts, metadata)))
+        .filter(|(ts, _metadata)| *ts <= snapshot_ts_us)
+        .max_by_key(|(ts, _metadata)| *ts)
+        .and_then(|(_ts, metadata)| cell_number(metadata.row.get("clock_ticks_per_sec")))
+        .filter(|clock| clock.is_finite() && *clock > 0.0)
 }
 
 #[allow(
@@ -1743,9 +1947,12 @@ mod tests {
     use kronika_analytics::web_projection::{WebAggregation, web_view_by_name};
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::collection_coverage::CollectionCoverageV1;
+    use kronika_registry::instance_metadata::InstanceMetadata;
     use kronika_registry::os_loadavg::OsLoadavg;
+    use kronika_registry::os_process::OsProcess;
     use kronika_registry::os_psi::OsPsi;
     use kronika_registry::os_topology::OsTopology;
+    use kronika_registry::pg_stat_activity::PgStatActivityV1;
     use kronika_registry::pg_stat_statements::PgStatStatementsV2;
     use kronika_registry::pg_stat_user_indexes::PgStatUserIndexesV1;
     use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
@@ -1759,9 +1966,282 @@ mod tests {
     use crate::PgmUnit;
     use crate::overview::facts::{BuildError, SourceError};
     use crate::overview::limits::LIMIT;
-    use crate::overview::web_index::{CollectionReadState, CollectionVisibility, UiSummaryBlock};
+    use crate::overview::web_index::{
+        CollectionReadState, CollectionVisibility, IndexStatus, MetricStatus, UiSummaryBlock,
+    };
 
     const COVERAGE_TS: i64 = 100;
+    const PROCESS_FIRST_TS: i64 = 10_000_000;
+    const PROCESS_SECOND_TS: i64 = 20_000_000;
+
+    fn process_row(ts: i64, starttime: i64, utime: i64) -> OsProcess {
+        OsProcess {
+            ts: Ts(ts),
+            pid: 7,
+            starttime: Ts(starttime),
+            ppid: 1,
+            uid: 1,
+            euid: 1,
+            gid: 1,
+            egid: 1,
+            state: b'S',
+            num_threads: 1,
+            tty: 0,
+            comm: StrId(1),
+            cmdline: None,
+            utime,
+            stime: 0,
+            nice: 0,
+            prio: 0,
+            rtprio: 0,
+            policy: 0,
+            curcpu: 0,
+            rundelay_ns: 0,
+            blkdelay_ticks: 0,
+            nvcsw: 0,
+            nivcsw: 0,
+            minflt: 0,
+            majflt: 0,
+            vmem_kb: 0,
+            rmem_kb: 0,
+            vswap_kb: 0,
+            syscr: None,
+            syscw: None,
+            rchar: None,
+            wchar: None,
+            read_bytes: None,
+            write_bytes: None,
+            cancelled_write_bytes: None,
+            exit_signal: 0,
+            scope: 0,
+        }
+    }
+
+    fn activity_row(ts: i64) -> PgStatActivityV1 {
+        PgStatActivityV1 {
+            ts: Ts(ts),
+            pid: 7,
+            datname: None,
+            usename: None,
+            application_name: StrId(1),
+            client_addr: StrId(1),
+            backend_type: StrId(1),
+            state: None,
+            wait_event_type: None,
+            wait_event: None,
+            query: None,
+            backend_xid_age: None,
+            backend_xmin_age: None,
+            backend_start: Ts(1_000_000),
+            xact_start: None,
+            query_start: None,
+            state_change: None,
+        }
+    }
+
+    fn instance_metadata(ts: i64, clock_ticks_per_sec: i64) -> InstanceMetadata {
+        InstanceMetadata {
+            ts: Ts(ts),
+            hostname: StrId(1),
+            pg_version_num: 170_000,
+            kernel_version: StrId(1),
+            pg_system_identifier: None,
+            clock_ticks_per_sec,
+            page_size_bytes: 4096,
+            boot_id: StrId(1),
+            btime: Ts(0),
+        }
+    }
+
+    fn tick_rate_pgm(
+        activity: &[PgStatActivityV1],
+        processes: &[OsProcess],
+        metadata: &[InstanceMetadata],
+    ) -> Vec<u8> {
+        let mut bodies = vec![
+            (
+                1_021_001,
+                u32::try_from(metadata.len()).expect("small metadata fixture"),
+                InstanceMetadata::encode(metadata).expect("encode metadata"),
+            ),
+            (
+                1_100_001,
+                u32::try_from(processes.len()).expect("small process fixture"),
+                OsProcess::encode(processes).expect("encode processes"),
+            ),
+        ];
+        if !activity.is_empty() {
+            bodies.push((
+                1_001_001,
+                u32::try_from(activity.len()).expect("small activity fixture"),
+                PgStatActivityV1::encode(activity).expect("encode activity"),
+            ));
+        }
+        bodies.sort_unstable_by_key(|(type_id, _, _)| *type_id);
+        let inputs = bodies
+            .iter()
+            .map(|(type_id, rows, body)| SectionInput {
+                type_id: *type_id,
+                rows: *rows,
+                body,
+            })
+            .collect::<Vec<_>>();
+        build_part(
+            &inputs,
+            PartMeta {
+                min_ts: 5_000_000,
+                max_ts: PROCESS_SECOND_TS,
+            },
+        )
+    }
+
+    #[test]
+    fn process_cpu_web_index_uses_carried_forward_hz_without_gating_the_canonical_metric() {
+        let bytes = tick_rate_pgm(
+            &[],
+            &[
+                process_row(PROCESS_FIRST_TS, 2_000_000, 10),
+                process_row(PROCESS_SECOND_TS, 2_000_000, 100),
+            ],
+            &[instance_metadata(5_000_000, 100)],
+        );
+        let unit = PgmUnit::open(bytes).expect("open process PGM");
+        let blocks = build_web_index(&unit, &[], 5_000_000, PROCESS_SECOND_TS, &LIMIT)
+            .expect("build process index");
+        let processes = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 7)
+            .expect("process series");
+        let cpu = processes
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 1)
+            .expect("process CPU metric");
+
+        assert_eq!(processes.status(), IndexStatus::Complete);
+        assert_eq!(cpu.status(), MetricStatus::Complete);
+        assert_eq!(cpu.series()[0].value_at(0), Some(0.09));
+    }
+
+    #[test]
+    fn process_cpu_web_index_preserves_multi_core_tick_rates() {
+        let bytes = tick_rate_pgm(
+            &[],
+            &[
+                process_row(PROCESS_FIRST_TS, 2_000_000, 10),
+                process_row(PROCESS_SECOND_TS, 2_000_000, 2_010),
+            ],
+            &[instance_metadata(5_000_000, 100)],
+        );
+        let unit = PgmUnit::open(bytes).expect("open multi-core process PGM");
+        let blocks = build_web_index(&unit, &[], 5_000_000, PROCESS_SECOND_TS, &LIMIT)
+            .expect("build process index");
+        let processes = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 7)
+            .expect("process series");
+        let cpu = processes
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 1)
+            .expect("process CPU metric");
+
+        assert_eq!(cpu.status(), MetricStatus::Complete);
+        assert_eq!(cpu.series()[0].value_at(0), Some(2.0));
+    }
+
+    #[test]
+    fn activity_cpu_web_index_uses_unique_same_snapshot_pid_attribution() {
+        let bytes = tick_rate_pgm(
+            &[
+                activity_row(PROCESS_FIRST_TS),
+                activity_row(PROCESS_SECOND_TS),
+            ],
+            &[
+                process_row(PROCESS_FIRST_TS, 2_000_000, 10),
+                process_row(PROCESS_SECOND_TS, 2_000_000, 100),
+            ],
+            &[instance_metadata(5_000_000, 100)],
+        );
+        let unit = PgmUnit::open(bytes).expect("open activity PGM");
+        let blocks = build_web_index(&unit, &[], 5_000_000, PROCESS_SECOND_TS, &LIMIT)
+            .expect("build activity index");
+        let activity = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 1)
+            .expect("activity series");
+        let cpu = activity
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 2)
+            .expect("activity CPU metric");
+
+        assert_eq!(cpu.status(), MetricStatus::Complete);
+        assert_eq!(cpu.series()[0].value_at(0), Some(0.09));
+    }
+
+    #[test]
+    fn activity_cpu_web_index_rejects_ambiguous_same_snapshot_pid_attribution() {
+        let bytes = tick_rate_pgm(
+            &[
+                activity_row(PROCESS_FIRST_TS),
+                activity_row(PROCESS_SECOND_TS),
+            ],
+            &[
+                process_row(PROCESS_FIRST_TS, 2_000_000, 10),
+                process_row(PROCESS_SECOND_TS, 2_000_000, 100),
+                process_row(PROCESS_SECOND_TS, 3_000_000, 100),
+            ],
+            &[instance_metadata(5_000_000, 100)],
+        );
+        let unit = PgmUnit::open(bytes).expect("open ambiguous activity PGM");
+        let blocks = build_web_index(&unit, &[], 5_000_000, PROCESS_SECOND_TS, &LIMIT)
+            .expect("build activity index");
+        let activity = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 1)
+            .expect("activity series");
+        let cpu = activity
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 2)
+            .expect("activity CPU metric");
+
+        assert_eq!(cpu.status(), MetricStatus::Complete);
+        assert!(cpu.series().is_empty());
+    }
+
+    #[test]
+    fn process_cpu_web_index_does_not_bridge_lifetimes() {
+        let bytes = tick_rate_pgm(
+            &[],
+            &[
+                process_row(PROCESS_FIRST_TS, 2_000_000, 10),
+                process_row(PROCESS_SECOND_TS, 3_000_000, 100),
+            ],
+            &[instance_metadata(5_000_000, 100)],
+        );
+        let unit = PgmUnit::open(bytes).expect("open process lifetime PGM");
+        let blocks = build_web_index(&unit, &[], 5_000_000, PROCESS_SECOND_TS, &LIMIT)
+            .expect("build process index");
+        let processes = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 7)
+            .expect("process series");
+        let cpu = processes
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 1)
+            .expect("process CPU metric");
+
+        assert_eq!(cpu.status(), MetricStatus::Complete);
+        assert!(cpu.series().is_empty());
+    }
 
     #[test]
     fn web_index_projects_load_per_cpu_and_io_psi_into_hidden_host_series() {

@@ -656,7 +656,7 @@ fn read_projection_input(
     let exact_section_names = section_names
         .iter()
         .copied()
-        .filter(|name| *name != "pg_settings")
+        .filter(|name| !matches!(*name, "pg_settings" | "instance_metadata"))
         .collect::<Vec<_>>();
     let cursors = BTreeMap::new();
     let current_descriptor = resolved
@@ -708,6 +708,17 @@ fn read_projection_input(
         )?;
         reject_internal_continuation(&settings, limits.rows)?;
         current.extend(settings);
+    }
+    if section_names.contains(&"instance_metadata") {
+        let metadata = query.sections(
+            &current_descriptor,
+            current_descriptor.min_ts,
+            neighbors.current,
+            &["instance_metadata"],
+            &cursors,
+        )?;
+        reject_internal_continuation(&metadata, limits.rows)?;
+        current.extend(metadata);
     }
     let previous = match (rate_previous, resolved.previous_descriptor.as_ref()) {
         (Some(previous), Some(previous_descriptor)) => {
@@ -2066,7 +2077,10 @@ fn clock_ticks_per_sec(input: &ProjectionInput) -> Option<f64> {
         .current
         .get("instance_metadata")?
         .iter()
-        .find(|row| timestamp(row, "ts").ok().flatten() == Some(input.snapshot_ts_us))
+        .filter_map(|row| timestamp(row, "ts").ok().flatten().map(|ts| (ts, row)))
+        .filter(|(ts, _row)| *ts <= input.snapshot_ts_us)
+        .max_by_key(|(ts, _row)| *ts)
+        .map(|(_ts, row)| row)
         .and_then(|row| finite_number(row, "clock_ticks_per_sec").ok().flatten())
         .filter(|clock| clock.is_finite() && *clock > 0.0)
 }

@@ -91,6 +91,13 @@ pub enum WebFormula {
         /// Normative catalog expression.
         expression: &'static str,
     },
+    /// Divide a positive tick-counter delta by instance HZ and elapsed wall time.
+    PositiveDeltaTickRate {
+        /// Alternative cumulative field sets, newest compatible layout first.
+        field_sets: &'static [&'static [&'static str]],
+        /// Normative catalog expression.
+        expression: &'static str,
+    },
     /// Sum observed wait duration inferred from consecutive activity samples.
     ActivityWait {
         /// Normative catalog expression.
@@ -129,6 +136,7 @@ impl WebFormula {
         match self {
             Self::PositiveDeltaSum { expression, .. }
             | Self::PositiveDeltaRate { expression, .. }
+            | Self::PositiveDeltaTickRate { expression, .. }
             | Self::ActivityWait { expression }
             | Self::ActiveFraction { expression }
             | Self::GaugeRatio { expression, .. }
@@ -301,7 +309,7 @@ const ACTIVITY_METRICS: &[WebMetric] = &[
         revision: 2,
         unit: WebUnit::Ratio,
         aggregation: WebAggregation::Max,
-        formula: WebFormula::PositiveDeltaRate {
+        formula: WebFormula::PositiveDeltaTickRate {
             field_sets: &[&["utime", "stime"]],
             expression: "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
         },
@@ -528,7 +536,7 @@ const PROCESS_METRICS: &[WebMetric] = &[
         revision: 2,
         unit: WebUnit::Ratio,
         aggregation: WebAggregation::Max,
-        formula: WebFormula::PositiveDeltaRate {
+        formula: WebFormula::PositiveDeltaTickRate {
             field_sets: &[&["utime", "stime"]],
             expression: "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
         },
