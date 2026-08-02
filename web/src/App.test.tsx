@@ -278,6 +278,32 @@ test("LIVE cursor advances on the tick, not on every render", async () => {
   vi.useRealTimers();
 });
 
+test("an arbitrary replay span reaches heatmap consumers exactly", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000&span=37`,
+  );
+  renderApp();
+
+  await waitFor(() => {
+    const heatmapCall = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map(([input]) =>
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href,
+      )
+      .find((url) => new URL(url).pathname === "/v1/timeline/heatmap");
+    expect(heatmapCall).toBeDefined();
+    const params = new URL(heatmapCall ?? location.href).searchParams;
+    expect(params.get("from")).toBe("1722399963000000");
+    expect(params.get("to")).toBe("1722400000000000");
+  });
+});
+
 test("switching view drops preset and sort the next view does not have", async () => {
   history.replaceState(
     null,
