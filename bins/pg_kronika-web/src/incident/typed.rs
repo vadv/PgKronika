@@ -1132,23 +1132,50 @@ impl TypedInputs {
         &self.plans[start..end]
     }
 
-    /// Whether scalar fields make this OS process a possible `PostgreSQL`
-    /// backend. This is not a cross-domain identity relation: the current
-    /// adapter has no canonical session-to-process bridge or lifetime coverage.
-    /// `starttime` validates the OS identity but is never compared with
+    /// Whether this is the only OS lifetime for `pid` observed alongside a
+    /// `PostgreSQL` backend in the same snapshot. The scan allocates nothing;
+    /// it reads the bounded counter tracks already owned by this input.
+    /// `starttime` selects the OS identity but is never compared with
     /// `backend_start`, which belongs to a different clock and lifecycle event.
     pub(crate) fn process_matches_postgres_backend_candidate(
         &self,
         pid: i64,
         starttime: i64,
-        from_us: i64,
-        to_us: i64,
+        observed_at_us: i64,
     ) -> bool {
         if pid <= 0 || starttime <= 0 {
             return false;
         }
-        self.activity_window(from_us, to_us)
+        if !self
+            .activity
+            .iter()
+            .filter(|snapshot| snapshot.ts == observed_at_us)
             .any(|snapshot| snapshot.backends.iter().any(|backend| backend.pid == pid))
+        {
+            return false;
+        }
+        let mut candidates = self.counters.iter().filter(|(key, track)| {
+            key.section == "os_process"
+                && key.column == "read_bytes"
+                && matches!(
+                    key.identity.as_ref(),
+                    [IdentityValue::I64(candidate_pid), IdentityValue::I64(candidate_starttime)]
+                        if *candidate_pid == pid && *candidate_starttime > 0
+                )
+                && track
+                    .points
+                    .iter()
+                    .any(|point| point.end_us == observed_at_us)
+        });
+        let Some((candidate, _)) = candidates.next() else {
+            return false;
+        };
+        candidates.next().is_none()
+            && matches!(
+                candidate.identity.as_ref(),
+                [IdentityValue::I64(_), IdentityValue::I64(candidate_starttime)]
+                    if *candidate_starttime == starttime
+            )
     }
 
     pub(crate) fn insert_process_cgroups(&mut self, samples: Vec<ProcessCgroupSample>) {
@@ -2144,6 +2171,23 @@ mod tests {
         }
     }
 
+    fn activity_backend(pid: i64, backend_start: i64) -> ActivityBackend {
+        ActivityBackend {
+            pid,
+            backend_start,
+            xid_age: None,
+            xmin_age: None,
+            state: None,
+            wait_event_type: None,
+            wait_event: None,
+            xact_age_us: None,
+        }
+    }
+
+    fn process_identity(pid: i64, starttime: i64) -> Arc<[IdentityValue]> {
+        Arc::from(vec![IdentityValue::I64(pid), IdentityValue::I64(starttime)])
+    }
+
     #[test]
     fn activity_window_uses_half_open_request_bounds() {
         let mut typed = TypedInputs::new();
@@ -2161,24 +2205,60 @@ mod tests {
     }
 
     #[test]
-    fn postgres_process_candidate_does_not_compare_cross_domain_start_times() {
+    fn postgres_process_candidate_accepts_cross_clock_identity_in_same_snapshot() {
         let mut typed = TypedInputs::new();
         typed.insert_activity_snapshot(ActivitySnapshot {
             ts: 10,
-            backends: vec![ActivityBackend {
-                pid: 7,
-                backend_start: 200,
-                xid_age: None,
-                xmin_age: None,
-                state: None,
-                wait_event_type: None,
-                wait_event: None,
-                xact_age_us: None,
-            }],
+            backends: vec![activity_backend(7, 200)],
             completeness: SnapshotCompleteness::Complete,
         });
+        typed.insert_counter(
+            "os_process",
+            "read_bytes",
+            process_identity(7, 100),
+            vec![(10, value(1.0))],
+        );
 
-        assert!(typed.process_matches_postgres_backend_candidate(7, 100, 10, 11));
+        assert!(typed.process_matches_postgres_backend_candidate(7, 100, 10));
+    }
+
+    #[test]
+    fn postgres_process_candidate_rejects_activity_from_a_different_snapshot() {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 9,
+            backends: vec![activity_backend(7, 200)],
+            completeness: SnapshotCompleteness::Complete,
+        });
+        typed.insert_counter(
+            "os_process",
+            "read_bytes",
+            process_identity(7, 100),
+            vec![(10, value(1.0))],
+        );
+
+        assert!(!typed.process_matches_postgres_backend_candidate(7, 100, 10));
+    }
+
+    #[test]
+    fn postgres_process_candidate_rejects_two_lifetimes_in_one_snapshot() {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 10,
+            backends: vec![activity_backend(7, 200)],
+            completeness: SnapshotCompleteness::Complete,
+        });
+        for starttime in [100, 200] {
+            typed.insert_counter(
+                "os_process",
+                "read_bytes",
+                process_identity(7, starttime),
+                vec![(10, value(1.0))],
+            );
+        }
+
+        assert!(!typed.process_matches_postgres_backend_candidate(7, 100, 10));
+        assert!(!typed.process_matches_postgres_backend_candidate(7, 200, 10));
     }
 
     #[test]

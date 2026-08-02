@@ -601,8 +601,7 @@ impl ProcessIoWhoLens {
             postgres_backend_candidate: typed.process_matches_postgres_backend_candidate(
                 pid,
                 starttime,
-                context.incident_start_us,
-                context.incident_end_us,
+                observed_at_us,
             ),
             device: Self::associated_device(typed, pid, starttime, observed_at_us, sink)?,
         }))
@@ -957,7 +956,7 @@ mod tests {
             );
         }
         typed.insert_activity_snapshot(ActivitySnapshot {
-            ts: 1,
+            ts: 2,
             backends: vec![ActivityBackend {
                 pid: 7,
                 backend_start: 100,
@@ -1006,5 +1005,57 @@ mod tests {
             &row.entity().identity()[2..],
             &[IdentityValue::U64(8), IdentityValue::U64(0)]
         );
+    }
+
+    #[test]
+    fn process_io_rejects_ambiguous_postgres_pid_lifetimes_in_one_snapshot() {
+        use super::super::typed::{ActivityBackend, ActivitySnapshot, SnapshotCompleteness};
+
+        let first: Arc<[IdentityValue]> =
+            Arc::from(vec![IdentityValue::I64(7), IdentityValue::I64(100)]);
+        let reused: Arc<[IdentityValue]> =
+            Arc::from(vec![IdentityValue::I64(7), IdentityValue::I64(200)]);
+        let mut typed = TypedInputs::new();
+        for identity in [&first, &reused] {
+            for (column, value) in ProcessIoWhoLens::COLUMNS.iter().zip([100.0, 200.0, 0.0]) {
+                typed.insert_counter(
+                    OS_PROCESS,
+                    column,
+                    Arc::clone(identity),
+                    vec![(1, point(value)), (2, point(value))],
+                );
+            }
+        }
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 2,
+            backends: vec![ActivityBackend {
+                pid: 7,
+                backend_start: 300,
+                xid_age: None,
+                xmin_age: None,
+                state: None,
+                wait_event_type: None,
+                wait_event: None,
+                xact_age_us: None,
+            }],
+            completeness: SnapshotCompleteness::Complete,
+        });
+
+        let result = outcome(
+            &ProcessIoWhoLens,
+            episode(OS_PROCESS, "read_bytes", Arc::clone(&first)),
+            &typed,
+        );
+        let evidence = result.incidents[0].findings[0].evidence();
+        assert_eq!(evidence.len(), 2);
+        for row in evidence {
+            let Evidence::GaugeObservation(row) = row else {
+                panic!("typed observation");
+            };
+            assert_eq!(
+                row.entity().identity()[0],
+                IdentityValue::Text("process_association".to_owned())
+            );
+        }
     }
 }
