@@ -13,6 +13,7 @@ use kronika_reader::{FactStore, LIMIT, LocalDirSnapshot, OutRow, Value};
 use kronika_registry::pg_log::PgLogLifecycleV1;
 use kronika_registry::pg_settings::PgSettingsV1;
 use kronika_registry::pg_stat_statements::PgStatStatementsV2;
+use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::{Section, StrId, Ts};
 
 use crate::api_error::ErrorCode;
@@ -1287,7 +1288,7 @@ fn exact_statement_reset_invalidates_increasing_counters() {
     input.push(
         "reset_metadata",
         out_row(&[
-            ("ts", Value::Ts(20)),
+            ("ts", Value::Ts(18)),
             ("pg_stat_statements_reset_at", Value::Ts(15)),
         ]),
     );
@@ -1340,7 +1341,7 @@ fn exact_plan_reset_invalidates_increasing_counters() {
     input.push(
         "reset_metadata",
         out_row(&[
-            ("ts", Value::Ts(20)),
+            ("ts", Value::Ts(18)),
             ("pg_store_plans_reset_at", Value::Ts(15)),
         ]),
     );
@@ -1649,6 +1650,92 @@ fn statement_row(ts: i64, calls: i64, rows: i64, exec_ms: f64, plan_ms: f64) -> 
         wal_fpi: 0,
         wal_bytes: 0,
     }
+}
+
+fn reset_metadata_row(
+    ts: i64,
+    statement_reset_at: Option<i64>,
+    plan_reset_at: Option<i64>,
+) -> ResetMetadata {
+    ResetMetadata {
+        ts: Ts(ts),
+        postmaster_start_time: Ts(1),
+        pg_stat_database_reset_max_at: None,
+        pg_stat_statements_reset_at: statement_reset_at.map(Ts),
+        pg_store_plans_reset_at: plan_reset_at.map(Ts),
+        pg_stat_bgwriter_reset_at: None,
+        pg_stat_checkpointer_reset_at: None,
+        pg_stat_wal_reset_at: None,
+        pg_stat_archiver_reset_at: None,
+        pg_stat_io_reset_at: None,
+        ext_pg_stat_statements_version: None,
+        ext_pg_store_plans_version: None,
+        compute_query_id: None,
+        track_io_timing: None,
+        track_wal_io_timing: None,
+    }
+}
+
+fn frame_statement_reset_cadence_fixture() -> tempfile::TempDir {
+    let statements = PgStatStatementsV2::encode(&[
+        statement_row(10, 10, 10, 100.0, 0.0),
+        statement_row(20, 20, 20, 200.0, 0.0),
+    ])
+    .expect("encode statement reset fixture");
+    let resets = ResetMetadata::encode(&[
+        reset_metadata_row(12, Some(5), None),
+        reset_metadata_row(18, Some(15), None),
+    ])
+    .expect("encode reset metadata fixture");
+    let pgm = build_part(
+        &[
+            SectionInput {
+                type_id: 1_002_002,
+                rows: 2,
+                body: &statements,
+            },
+            SectionInput {
+                type_id: 1_020_001,
+                rows: 2,
+                body: &resets,
+            },
+        ],
+        PartMeta {
+            min_ts: 10,
+            max_ts: 20,
+        },
+    );
+    let directory = tempfile::tempdir().expect("tempdir");
+    crate::test_layout::write_named_pgm(directory.path(), "frame-statement-reset.pgm", &pgm);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish web index");
+    }
+    directory
+}
+
+#[test]
+fn frame_reads_latest_reset_metadata_before_statement_snapshot() {
+    let directory = frame_statement_reset_cadence_fixture();
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let request =
+        FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");
+
+    let frame = project_frame(&snapshot, &request, &catalog(), FrameLimits::default())
+        .expect("frame projection");
+    let body = serde_json::to_value(
+        FrameResponse::from_projected(&request, &catalog(), &frame).expect("response"),
+    )
+    .expect("serialize");
+
+    assert_eq!(body["rows"][0]["cells"][0], serde_json::Value::Null);
+    assert_eq!(
+        body["rows"][0]["classifications"][0]["result"]["reason"],
+        "reset"
+    );
 }
 
 fn frame_statement_planning_fixture() -> tempfile::TempDir {

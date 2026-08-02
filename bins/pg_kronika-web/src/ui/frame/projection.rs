@@ -239,8 +239,10 @@ fn continuity_for(view: &WebView, input: &ProjectionInput) -> ContinuityVerdict 
         .get("reset_metadata")
         .into_iter()
         .flatten()
-        .filter(|row| timestamp(row, "ts").ok().flatten() == Some(input.snapshot_ts_us))
-        .find_map(|row| timestamp(row, reset_field).ok().flatten());
+        .filter_map(|row| timestamp(row, "ts").ok().flatten().map(|at| (at, row)))
+        .filter(|(at, _row)| *at <= input.snapshot_ts_us)
+        .max_by_key(|(at, _row)| *at)
+        .and_then(|(_at, row)| timestamp(row, reset_field).ok().flatten());
     if reset_at
         .is_some_and(|reset_at| reset_at > predecessor_ts_us && reset_at <= input.snapshot_ts_us)
     {
@@ -656,7 +658,12 @@ fn read_projection_input(
     let exact_section_names = section_names
         .iter()
         .copied()
-        .filter(|name| !matches!(*name, "pg_settings" | "instance_metadata"))
+        .filter(|name| {
+            !matches!(
+                *name,
+                "pg_settings" | "instance_metadata" | "reset_metadata"
+            )
+        })
         .collect::<Vec<_>>();
     let cursors = BTreeMap::new();
     let current_descriptor = resolved
@@ -698,27 +705,19 @@ fn read_projection_input(
         &cursors,
     )?;
     reject_internal_continuation(&current, limits.rows)?;
-    if section_names.contains(&"pg_settings") {
-        let settings = query.sections(
+    for service_section in ["pg_settings", "instance_metadata", "reset_metadata"] {
+        if !section_names.contains(&service_section) {
+            continue;
+        }
+        let pages = query.sections(
             &current_descriptor,
             current_descriptor.min_ts,
             neighbors.current,
-            &["pg_settings"],
+            &[service_section],
             &cursors,
         )?;
-        reject_internal_continuation(&settings, limits.rows)?;
-        current.extend(settings);
-    }
-    if section_names.contains(&"instance_metadata") {
-        let metadata = query.sections(
-            &current_descriptor,
-            current_descriptor.min_ts,
-            neighbors.current,
-            &["instance_metadata"],
-            &cursors,
-        )?;
-        reject_internal_continuation(&metadata, limits.rows)?;
-        current.extend(metadata);
+        reject_internal_continuation(&pages, limits.rows)?;
+        current.extend(pages);
     }
     let previous = match (rate_previous, resolved.previous_descriptor.as_ref()) {
         (Some(previous), Some(previous_descriptor)) => {

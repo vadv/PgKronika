@@ -216,22 +216,27 @@ fn gated_reason_distinguishes_extension_backed_from_built_in_inputs() {
 
 #[test]
 fn reset_metadata_is_auxiliary_to_extension_metric_availability() {
-    let statements_type = first_type_id("pg_stat_statements");
-    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::from([statements_type]));
-    let statements = catalog
-        .views()
-        .iter()
-        .find(|view| view.code == "statements")
-        .expect("statements view");
-    let reset_metadata = statements
-        .inputs
-        .iter()
-        .find(|input| input.code == "reset_metadata")
-        .expect("reset metadata input");
+    for (view_code, primary_section) in [
+        ("statements", "pg_stat_statements"),
+        ("plans", "pg_store_plans_vadv"),
+    ] {
+        let primary_type = first_type_id(primary_section);
+        let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::from([primary_type]));
+        let view = catalog
+            .views()
+            .iter()
+            .find(|view| view.code == view_code)
+            .unwrap_or_else(|| panic!("{view_code} view"));
+        let reset_metadata = view
+            .inputs
+            .iter()
+            .find(|input| input.code == "reset_metadata")
+            .expect("reset metadata input");
 
-    assert_eq!(statements.availability, Availability::Available);
-    assert_eq!(reset_metadata.availability, Availability::Gated);
-    assert_eq!(reset_metadata.unavailable_reason, Some("not_collected"));
+        assert_eq!(view.availability, Availability::Available, "{view_code}");
+        assert_eq!(reset_metadata.availability, Availability::Gated);
+        assert_eq!(reset_metadata.unavailable_reason, Some("not_collected"));
+    }
 }
 
 #[test]
