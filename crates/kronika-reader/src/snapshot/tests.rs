@@ -2091,3 +2091,59 @@ fn non_journal_corruption_is_not_retried_during_journal_churn() {
         "a non-journal failure does not consume an after-identity retry gate"
     );
 }
+
+#[test]
+fn digest_state_extend_matches_full_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("active.parts");
+    fs::write(&journal_path, journal(&make_part(1000, 2000, 1))).unwrap();
+    let local = LocalDir::open(dir.path()).unwrap();
+
+    let base_len = fs::metadata(&journal_path).unwrap().len();
+    let base_state = journal_prefix_state(&local, base_len).unwrap();
+    let mut state = base_state;
+    for step in 2..=4_i64 {
+        crate::test_layout::append_journal_part(
+            &journal_path,
+            &make_part(step * 1000, step * 1000 + 1000, step),
+        );
+        let valid_len = fs::metadata(&journal_path).unwrap().len();
+        state = state.extend(&local, valid_len).unwrap();
+        let rebuilt = journal_prefix_state(&local, valid_len).unwrap();
+        assert_eq!(
+            state.digest(),
+            rebuilt.digest(),
+            "extended digest diverged from a full rebuild at step {step}"
+        );
+    }
+}
+
+#[test]
+fn delta_refresh_resumes_prefix_digest_across_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("active.parts");
+    fs::write(&journal_path, journal(&make_part(1000, 2000, 1))).unwrap();
+
+    let mut snapshot = LocalDirSnapshot::open(dir.path()).unwrap();
+    let local = LocalDir::open(dir.path()).unwrap();
+    for step in 2..=4_i64 {
+        crate::test_layout::append_journal_part(
+            &journal_path,
+            &make_part(step * 1000, step * 1000 + 1000, step),
+        );
+        let delta = snapshot.refresh_incremental_delta().unwrap();
+        assert_eq!(delta.journal.transition, PartTransition::Append);
+        let full = journal_prefix_digest(&local, snapshot.last_valid_len).unwrap();
+        assert_eq!(
+            snapshot.journal_prefix_digest, full,
+            "resumed digest chain diverged from a full rebuild at step {step}"
+        );
+        assert_eq!(
+            snapshot
+                .prefix_digest_state
+                .as_ref()
+                .map(|state| state.hashed_len),
+            Some(snapshot.last_valid_len),
+        );
+    }
+}
