@@ -1,7 +1,12 @@
 /** Cell value and verdict rendering shared by the table, the dock and every
  * other grid: one formatter per catalog type, localized verdict phrases. */
 import type { TFunction } from "i18next";
-import { eventKindLabel, relationKindLabel, severityLabel, statusLabel } from "../api/codes";
+import {
+  eventKindLabel,
+  relationKindLabel,
+  severityLabel,
+  statusLabel,
+} from "../api/codes";
 import type {
   ClassificationResultDto,
   EvidenceDto,
