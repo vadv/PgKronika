@@ -58,7 +58,7 @@ pub use fallback::{
     FallbackStats, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS,
 };
 pub use gc::{GcCategoryUsage, GcConfig, GcConfigError, GcMark, GcOutcome, GcSkipReason, GcUsage};
-pub use limits::{Bounds, LIMIT};
+pub use limits::{Bounds, LIMIT, LIVE_LIMIT};
 pub use live::{
     FoldEffect, LiveBuilder, LiveConfigError, LiveFoldError, LiveState, LiveView, SealOutcome,
     reconcile_seal,

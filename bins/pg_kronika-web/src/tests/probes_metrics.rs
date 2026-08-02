@@ -198,3 +198,39 @@ fn selected_segment_policy_exports_one_static_rejection_series_and_its_effective
         );
     }
 }
+
+#[tokio::test]
+async fn only_non_infrastructure_requests_reset_the_standby_idle_clock() {
+    let (_dir, snapshot) = empty_snapshot();
+    let state = AppState::new(snapshot).expect("state");
+    state
+        .last_activity
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    for uri in ["/metrics", "/healthz", "/readyz"] {
+        let _response = app(state.clone(), None, test_metrics_handle())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+        assert!(state.idle_secs() > 100, "{uri} must not count as activity");
+    }
+
+    let _response = app(state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/version")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("route request");
+    assert!(
+        state.idle_secs() < 100,
+        "an API request resets the standby idle clock"
+    );
+}

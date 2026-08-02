@@ -38,6 +38,20 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// How often the refresh task re-scans the store directory.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Idle time without non-infrastructure requests before the process drops
+/// its decoded working set and stops folding the live journal.
+const STANDBY_AFTER_SECS: u64 = 60;
+
+// Linked in by mimalloc's `override` build; `force` also returns free arena
+// pages to the OS.
+#[allow(
+    unsafe_code,
+    reason = "releasing allocator pages on standby requires the mimalloc C API"
+)]
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Config first, before any I/O or logging: a bad environment must fail
@@ -147,6 +161,41 @@ fn install_metrics() -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
     Ok(handle)
 }
 
+/// Tracks the idle clock and toggles standby: entering drops the live fold
+/// and caches and trims the allocator; leaving resets delta delivery so the
+/// next delta arrives as a bootstrap and the live fold re-folds the whole
+/// current journal once.
+fn update_standby(state: &AppState, snap: &mut LocalDirSnapshot, standby: &mut bool) {
+    let idle_secs = state.idle_secs();
+    if idle_secs >= STANDBY_AFTER_SECS && !*standby {
+        *standby = true;
+        state.enter_standby(snap.clone());
+        trim_allocator();
+        tracing::info!(idle_secs, "entering standby: live fold and caches dropped");
+        metrics::gauge!("kronika_web_standby").set(1.0);
+    } else if idle_secs < STANDBY_AFTER_SECS && *standby {
+        *standby = false;
+        metrics::gauge!("kronika_web_standby").set(0.0);
+        tracing::info!("leaving standby");
+        if let Err(error) = snap.refresh_incremental() {
+            metrics::counter!("kronika_web_refresh_errors_total").increment(1);
+            tracing::warn!(%error, "post-standby snapshot refresh failed");
+        }
+    }
+}
+
+/// Returns free mimalloc arena pages to the OS.
+fn trim_allocator() {
+    #[allow(
+        unsafe_code,
+        reason = "mi_collect is provided by the linked mimalloc allocator"
+    )]
+    // SAFETY: `mi_collect` is provided by the linked mimalloc allocator.
+    unsafe {
+        mi_collect(true);
+    }
+}
+
 /// Re-scan the store once a second and republish the snapshot.
 ///
 /// The task owns a private mutable snapshot and publishes a fresh clone after
@@ -170,16 +219,22 @@ async fn refresh_loop(state: AppState) {
     metrics::gauge!("kronika_web_store_warnings").set(health.0 as f64);
     metrics::gauge!("kronika_web_store_damages").set(health.1 as f64);
 
+    let mut standby = false;
     loop {
         tokio::time::sleep(REFRESH_INTERVAL).await;
         state.prune_timeline_cursors(now_unix_secs());
         state.refresh_loop_iterations.fetch_add(1, Relaxed);
         metrics::counter!("kronika_web_refresh_loop_iterations_total").increment(1);
+        update_standby(&state, &mut snap, &mut standby);
         let fallback_snapshot = snap.clone();
         let worker_state = state.clone();
         let refreshed = tokio::task::spawn_blocking(move || {
             let scan = snap.refresh_incremental_delta();
             let publication = match &scan {
+                Ok(delta) if standby => {
+                    let _ = delta;
+                    Ok(())
+                }
                 Ok(delta) => match worker_state.republish_store_view(snap.clone(), delta) {
                     Ok(()) => Ok(()),
                     Err(error) => {

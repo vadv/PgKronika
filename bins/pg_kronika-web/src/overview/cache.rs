@@ -181,6 +181,16 @@ impl ResponseCache {
         }
     }
 
+    /// Drops every retained response.
+    pub(crate) fn clear(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.entries.clear();
+        inner.bytes = 0;
+    }
+
     /// The number of retained entries; test-only.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

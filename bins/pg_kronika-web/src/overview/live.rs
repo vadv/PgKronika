@@ -11,8 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kronika_reader::{
     FactBuildKey, FactKey, FactStore, FallbackConfig, FileKind, FoldEffect, GcConfig, GcMark,
-    GcOutcome, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState, LocalDirSnapshot,
-    RefreshDelta, SealedFactError, SealedLocator, SegmentDescriptor, SegmentFacts,
+    GcOutcome, LIVE_LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState,
+    LocalDirSnapshot, RefreshDelta, SealedFactError, SealedLocator, SegmentDescriptor,
+    SegmentFacts,
 };
 
 use super::admission::{ColdAdmissionConfig, ColdWorkWeight};
@@ -154,7 +155,7 @@ impl OverviewWriter {
         let next_source_scrub = Instant::now()
             .checked_add(source_scrub_interval)
             .ok_or(OverviewBuildError::SourceScrubInterval)?;
-        let live = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
+        let live = LiveBuilder::new(LIVE_LIMIT).map_err(OverviewBuildError::Config)?;
         Ok(Self {
             store: FactStore::with_configs(data_dir, fallback, gc),
             sealed: BTreeMap::new(),
@@ -220,6 +221,15 @@ impl OverviewWriter {
         Some(self.store.collect_garbage(&mark))
     }
 
+    /// Drops the live fold and returns an empty-live view to publish, so an
+    /// unused process releases the decoded working set. Sealed descriptors
+    /// stay admitted; the next assemble must start from a bootstrap delta,
+    /// which re-folds the whole current journal.
+    pub(crate) fn enter_standby(&mut self) -> DescriptorView {
+        self.live = LiveBuilder::new(LIVE_LIMIT).expect("LIVE_LIMIT satisfies the absolute bounds");
+        self.current_view(self.view_generation, None)
+    }
+
     /// Applies one reader delta and returns the next immutable view.
     ///
     /// Sealed state and the live builder are committed only after the live
@@ -240,7 +250,8 @@ impl OverviewWriter {
         let fold_stats = match fold_refresh(&mut live, snapshot, delta) {
             Ok(stats) => stats,
             Err(first_error) => {
-                let mut rebuilt = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
+                let mut rebuilt =
+                    LiveBuilder::new(LIVE_LIMIT).map_err(OverviewBuildError::Config)?;
                 let baseline = full_live_baseline(delta);
                 let stats = fold_refresh(&mut rebuilt, snapshot, &baseline)
                     .map_err(|_error| first_error)?;
@@ -698,6 +709,49 @@ mod tests {
             torn,
             "the fail-closed scan must not rewrite or truncate damaged input"
         );
+    }
+
+    #[test]
+    fn enter_standby_drops_the_live_fold_and_the_next_bootstrap_refolds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let part = lifecycle_part(&[PgLogLifecycleV1 {
+            ts: Ts(1_500),
+            kind: 0,
+            pid: Some(1),
+            signal: Some(9),
+            shutdown_mode: None,
+            message: None,
+            query_detail: None,
+            dict_dropped_fields: 0,
+        }]);
+        let segment_id = crate::test_layout::address(FIRST_SEGMENT_ID).id;
+        std::fs::write(
+            dir.path().join("active.parts"),
+            crate::test_layout::journal_bytes(segment_id, &[&part]),
+        )
+        .expect("write journal");
+
+        let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        let delta = snapshot
+            .refresh_incremental_delta()
+            .expect("bootstrap delta");
+        let mut index = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
+        let view = index.assemble(&snapshot, &delta).expect("live view");
+        assert!(matches!(view.live().state(), LiveState::Current));
+
+        let standby = index.enter_standby();
+        assert!(matches!(standby.live().state(), LiveState::Warming));
+
+        snapshot.refresh_incremental().expect("baseline reset");
+        let wake_delta = snapshot
+            .refresh_incremental_delta()
+            .expect("wake bootstrap delta");
+        assert!(wake_delta.journal.bootstrap);
+        let woken = index
+            .assemble_with_live(&snapshot, &wake_delta)
+            .expect("woken view");
+        assert!(matches!(woken.live().state(), LiveState::Current));
     }
 
     #[tokio::test]
