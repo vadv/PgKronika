@@ -36,7 +36,7 @@
 
 **Interfaces:**
 - Consumes: `ProjectionInput::{current,previous,gaps,predecessor_ts_us,snapshot_ts_us}` and the `reset_metadata` fields `pg_stat_statements_reset_at`, `pg_store_plans_reset_at`.
-- Produces: private `ContinuityVerdict::{Continuous,FirstPoint,Gap,Reset}` and `continuity_for(view, input) -> ContinuityVerdict`; `delta` and delta-sum helpers consume the verdict instead of a boolean.
+- Produces: private `ContinuityVerdict::{Continuous,FirstPoint,Gap,Reset}` and `continuity_for(view, input) -> ContinuityVerdict`; `delta` and delta-sum helpers consume the verdict instead of a boolean. The effective reset row is the latest bounded service-section sample at-or-before the selected snapshot in the same PGM.
 
 - [ ] **Step 1: Write failing continuity tests**
 
@@ -45,7 +45,8 @@ Add tests that make the reason observable:
 ```rust
 #[test]
 fn exact_statement_reset_invalidates_increasing_counters() {
-    // predecessor at 10, current at 20, reset marker at 15;
+    // predecessor at 10, current at 20, reset metadata sampled at 18
+    // with its exact extension reset marker at 15;
     // calls and total_exec_time both increase across the samples.
     // Assert mean is null and its classification reason is "reset".
 }
@@ -76,7 +77,7 @@ Expected: the increasing counters are incorrectly emitted because only negative 
 
 - [ ] **Step 3: Add bounded auxiliary reset inputs and continuity evaluation**
 
-Add `reset_metadata` as an auxiliary `WebInput` for statements and plans, without making its absence gate their primary raw rows. Compute one verdict per projected frame with this order:
+Add `reset_metadata` as an auxiliary `WebInput` for statements and plans, without making its absence gate their primary raw rows. Because reset metadata is collected every 30 seconds rather than at every statement/plan snapshot, read it from the current descriptor start through the selected snapshot and use the latest row at-or-before that snapshot. Compute one verdict per projected frame with this order:
 
 ```rust
 enum ContinuityVerdict {
