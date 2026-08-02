@@ -348,8 +348,12 @@ git commit -m "fix(web): separate vacuum progress semantics"
 
 **Files:**
 - Modify: `bins/pg_kronika-web/src/ui/catalog.rs`
-- Modify: `docs/api/openapi.json` or the repository's canonical generated OpenAPI path
-- Modify: `web/src/demo/fixture.json` or the repository's canonical generated demo fixture path
+- Modify: `crates/kronika-analytics/src/web_projection.rs`
+- Modify: `crates/kronika-reader/src/overview/facts.rs`
+- Regenerate: `bins/pg_kronika-web/openapi/`
+- Regenerate: `web/src/api/schema.d.ts`
+- Regenerate: `web/scripts/catalog.fixture.json`
+- Regenerate: `bins/pg_kronika-web/static.tar.gz`
 - Modify if contract wording is present: `crates/kronika-analytics/README.md`
 - Modify if contract wording is present: `crates/kronika-analytics/README.ru.md`
 - Modify if contract wording is present: `bins/pg_kronika-web/README.md`
@@ -365,15 +369,20 @@ Ensure catalog tests assert:
 
 ```rust
 assert_eq!(catalog.revision, 4);
-// Affected view revisions are 2, affected metric revisions are 2,
-// numeric view and metric codes are unchanged.
+// statements was already view rev2 and its time metric was already rev2:
+// reset-aware semantics therefore publish statements view rev3, time rev3,
+// and calls/io/temp rev2. Plans started at rev1 and publish view+metrics rev2.
+// Activity/process CPU, lock, and vacuum view/metric revisions are 2.
+// Numeric view and metric codes are unchanged.
 ```
 
 Run the focused catalog test and verify RED while the revision is still `3`.
 
 - [ ] **Step 2: Bump revision and regenerate with repository commands**
 
-Discover the checked-in generator commands from `xtask`, package scripts, or contributor docs, run those commands, and do not hand-edit generated JSON. Update both README language mirrors only where they state a changed contract.
+Discover the checked-in generator commands from `xtask`, package scripts, or contributor docs, run those commands, and do not hand-edit generated JSON. Update both README language mirrors only where they state a changed contract. Regenerate the committed SPA archive after every frontend/catalog-fixture change. On macOS create the final archive without AppleDouble/xattrs (`COPYFILE_DISABLE=1 tar --no-xattrs ...`) and verify extraction contains no `._*` entries, because CI extracts with GNU tar.
+
+Before the full gate, update the stale source-corruption regression in `overview/facts.rs`: `instance_metadata` (`1_021_001`) is now consumed by HZ-aware CPU web-index construction, so a corrupt body must produce `BuildError::Source(SourceError::Corrupt)` like every other consumed source. Remove the legacy passive-metadata exception; do not weaken CRC enforcement.
 
 - [ ] **Step 3: Review memory and comment quality**
 
@@ -395,10 +404,10 @@ Run:
 cargo fmt --all -- --check
 cargo clippy --target aarch64-apple-darwin --workspace --all-targets --all-features -- -D warnings
 cargo test --target aarch64-apple-darwin --workspace
-cargo xtask check-deps
+cargo run --target aarch64-apple-darwin -p xtask -- check-deps
 ```
 
-Then run the repository's OpenAPI freshness command and frontend Node 22 suite. If system Node is not 22, resolve the Node 22 executable with `npx -y node@22 -p 'process.execPath'` and invoke the installed npm CLI through it. Expected: every gate PASS; existing explicitly ignored tests remain ignored.
+Then run `make openapi`, `make web-codegen`, the frontend Node 22 check/test/build suite, bundle budget, and an exact comparison between the committed archive and the freshly built static directory. If system Node is not 22, resolve the Node 22 executable with `npx -y node@22 -p 'process.execPath'` and invoke the installed npm CLI through it. Expected: every gate PASS; existing explicitly ignored tests remain ignored.
 
 - [ ] **Step 5: Commit**
 
