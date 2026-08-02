@@ -3508,13 +3508,6 @@ mod tests {
             let offset = usize::try_from(entry.offset).expect("fixture source offset fits usize");
             damaged[offset] ^= 0x40;
             let unit = PgmUnit::open(damaged.as_slice()).expect("catalog remains readable");
-            if entry.type_id == 1_021_001 {
-                assert!(
-                    SegmentFacts::extract(&unit, &LIMIT).is_ok(),
-                    "passive metadata must not enter derived extraction"
-                );
-                continue;
-            }
             assert!(
                 matches!(
                     SegmentFacts::extract(&unit, &LIMIT),

@@ -43,14 +43,14 @@ fn registry_has_nine_unique_ordered_views_with_one_canonical_metric_each() {
 #[test]
 fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
     let statements = web_view_by_name("statements").expect("statements view");
-    assert_eq!(statements.revision, 2);
+    assert_eq!(statements.revision, 3);
     assert_eq!(
         statements
             .inputs
             .iter()
             .map(|input| input.code)
             .collect::<Vec<_>>(),
-        vec!["statements", "settings"]
+        vec!["statements", "reset_metadata", "settings"]
     );
     assert_eq!(
         statements
@@ -72,17 +72,17 @@ fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
             (
                 1,
                 "time",
-                2,
+                3,
                 6,
                 "sum",
                 "sum(positive_delta(total_exec_time))",
                 true,
             ),
-            (2, "calls", 1, 2, "sum", "sum(positive_delta(calls))", false,),
+            (2, "calls", 2, 2, "sum", "sum(positive_delta(calls))", false,),
             (
                 3,
                 "io",
-                1,
+                2,
                 3,
                 "sum",
                 "sum(positive_delta(shared_blks_read + local_blks_read))",
@@ -91,7 +91,7 @@ fn statements_metrics_keep_executable_formulas_and_wire_metadata_together() {
             (
                 4,
                 "temp",
-                1,
+                2,
                 3,
                 "sum",
                 "sum(positive_delta(temp_blks_written))",

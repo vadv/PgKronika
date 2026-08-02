@@ -91,6 +91,13 @@ pub enum WebFormula {
         /// Normative catalog expression.
         expression: &'static str,
     },
+    /// Divide a positive tick-counter delta by instance HZ and elapsed wall time.
+    PositiveDeltaTickRate {
+        /// Alternative cumulative field sets, newest compatible layout first.
+        field_sets: &'static [&'static [&'static str]],
+        /// Normative catalog expression.
+        expression: &'static str,
+    },
     /// Sum observed wait duration inferred from consecutive activity samples.
     ActivityWait {
         /// Normative catalog expression.
@@ -110,7 +117,7 @@ pub enum WebFormula {
         /// Normative catalog expression.
         expression: &'static str,
     },
-    /// Maximum proven lock wait or hold duration.
+    /// Maximum observed lock wait age measured from `waitstart`.
     LockDuration {
         /// Normative catalog expression.
         expression: &'static str,
@@ -129,6 +136,7 @@ impl WebFormula {
         match self {
             Self::PositiveDeltaSum { expression, .. }
             | Self::PositiveDeltaRate { expression, .. }
+            | Self::PositiveDeltaTickRate { expression, .. }
             | Self::ActivityWait { expression }
             | Self::ActiveFraction { expression }
             | Self::GaugeRatio { expression, .. }
@@ -199,6 +207,10 @@ const ACTIVITY_INPUTS: &[WebInput] = &[
         sections: &["os_process"],
     },
     WebInput {
+        code: "instance",
+        sections: &["instance_metadata"],
+    },
+    WebInput {
         code: "replication_replicas",
         sections: &["pg_stat_replication"],
     },
@@ -209,14 +221,24 @@ const STATEMENTS_INPUTS: &[WebInput] = &[
         sections: &["pg_stat_statements"],
     },
     WebInput {
+        code: "reset_metadata",
+        sections: &["reset_metadata"],
+    },
+    WebInput {
         code: "settings",
         sections: &["pg_settings"],
     },
 ];
-const PLANS_INPUTS: &[WebInput] = &[WebInput {
-    code: "plans",
-    sections: &["pg_store_plans_ossc", "pg_store_plans_vadv"],
-}];
+const PLANS_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "plans",
+        sections: &["pg_store_plans_ossc", "pg_store_plans_vadv"],
+    },
+    WebInput {
+        code: "reset_metadata",
+        sections: &["reset_metadata"],
+    },
+];
 const TABLES_INPUTS: &[WebInput] = &[WebInput {
     code: "tables",
     sections: &["pg_stat_user_tables"],
@@ -239,6 +261,10 @@ const PROCESS_INPUTS: &[WebInput] = &[
     WebInput {
         code: "process",
         sections: &["os_process"],
+    },
+    WebInput {
+        code: "instance",
+        sections: &["instance_metadata"],
     },
     WebInput {
         code: "cgroup_mapping",
@@ -280,14 +306,14 @@ const ACTIVITY_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 2,
         name: "cpu",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Ratio,
         aggregation: WebAggregation::Max,
-        formula: WebFormula::PositiveDeltaRate {
+        formula: WebFormula::PositiveDeltaTickRate {
             field_sets: &[&["utime", "stime"]],
-            expression: "positive_delta(utime + stime) / elapsed",
+            expression: "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
         },
-        requires: &["activity", "process"],
+        requires: &["activity", "process", "instance"],
         canonical: false,
     },
     WebMetric {
@@ -321,7 +347,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 1,
         name: "time",
-        revision: 2,
+        revision: 3,
         unit: WebUnit::Milliseconds,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -335,7 +361,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 2,
         name: "calls",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Count,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -349,7 +375,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 3,
         name: "io",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Blocks,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -363,7 +389,7 @@ const STATEMENT_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 4,
         name: "temp",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Blocks,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -380,7 +406,7 @@ const PLAN_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 1,
         name: "time",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Microseconds,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -394,7 +420,7 @@ const PLAN_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 2,
         name: "calls",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Count,
         aggregation: WebAggregation::Sum,
         formula: WebFormula::PositiveDeltaSum {
@@ -491,13 +517,13 @@ const INDEX_METRICS: &[WebMetric] = &[
 const VACUUM_METRICS: &[WebMetric] = &[WebMetric {
     code: 1,
     name: "progress",
-    revision: 1,
+    revision: 2,
     unit: WebUnit::Ratio,
     aggregation: WebAggregation::Max,
     formula: WebFormula::GaugeRatio {
         numerator: "heap_blks_scanned",
         denominator: "heap_blks_total",
-        expression: "max(heap_blks_scanned / max(heap_blks_total, 1))",
+        expression: "max(heap_blks_scanned / heap_blks_total)",
     },
     requires: &["vacuum"],
     canonical: true,
@@ -507,14 +533,14 @@ const PROCESS_METRICS: &[WebMetric] = &[
     WebMetric {
         code: 1,
         name: "cpu",
-        revision: 1,
+        revision: 2,
         unit: WebUnit::Ratio,
         aggregation: WebAggregation::Max,
-        formula: WebFormula::PositiveDeltaRate {
+        formula: WebFormula::PositiveDeltaTickRate {
             field_sets: &[&["utime", "stime"]],
-            expression: "positive_delta(utime + stime) / elapsed",
+            expression: "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
         },
-        requires: &["process"],
+        requires: &["process", "instance"],
         canonical: true,
     },
     WebMetric {
@@ -535,11 +561,11 @@ const PROCESS_METRICS: &[WebMetric] = &[
 const LOCK_METRICS: &[WebMetric] = &[WebMetric {
     code: 1,
     name: "wait",
-    revision: 1,
+    revision: 2,
     unit: WebUnit::Microseconds,
     aggregation: WebAggregation::Max,
     formula: WebFormula::LockDuration {
-        expression: "max(proven_wait_or_hold_duration_us)",
+        expression: "max(wait_age_us from waitstart)",
     },
     requires: &["locks"],
     canonical: true,
@@ -562,7 +588,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 1,
         name: "activity",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: ACTIVITY_INPUTS,
@@ -571,7 +597,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 2,
         name: "statements",
-        revision: 2,
+        revision: 3,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: STATEMENTS_INPUTS,
@@ -580,7 +606,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 3,
         name: "plans",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PLANS_INPUTS,
@@ -607,7 +633,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 6,
         name: "vacuum",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: None,
         inputs: VACUUM_INPUTS,
@@ -616,7 +642,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 7,
         name: "processes",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PROCESS_INPUTS,
@@ -625,7 +651,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 8,
         name: "locks",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: None,
         inputs: LOCK_INPUTS,

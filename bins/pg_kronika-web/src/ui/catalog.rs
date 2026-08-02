@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use super::thresholds::binding_for;
 
 /// Catalog schema revision.
-const CATALOG_REVISION: u16 = 3;
+const CATALOG_REVISION: u16 = 4;
 
 /// Availability of one input, metric, or column in the served store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -647,8 +647,8 @@ fn activity_view() -> ViewSpec {
         derived_column(
             "cpu",
             ValueType::F64,
-            "positive_delta(utime + stime) / elapsed",
-            &["activity", "process"],
+            "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
+            &["activity", "process", "instance"],
             None,
         ),
         derived_column(
@@ -998,7 +998,7 @@ fn plans_view() -> ViewSpec {
                 Some("blocks"),
             ),
             raw_column(
-                "first_seen",
+                "first_call",
                 ValueType::Timestamp,
                 "plans.first_call",
                 false,
@@ -1006,7 +1006,7 @@ fn plans_view() -> ViewSpec {
                 None,
             ),
             raw_column(
-                "last_seen",
+                "last_call",
                 ValueType::Timestamp,
                 "plans.last_call",
                 false,
@@ -1376,16 +1376,33 @@ fn vacuum_view() -> ViewSpec {
             derived_column(
                 "progress",
                 ValueType::F64,
-                "heap_blks_scanned / max(heap_blks_total, 1)",
+                "heap_blks_scanned / heap_blks_total",
                 &["vacuum"],
                 Some("ratio"),
             ),
-            derived_column(
+            raw_column(
                 "dead_tuples",
-                ValueType::F64,
-                "coalesce(num_dead_tuples, num_dead_item_ids)",
+                ValueType::I64,
+                "vacuum.num_dead_tuples",
+                false,
                 &["vacuum"],
-                None,
+                Some("count"),
+            ),
+            raw_column(
+                "dead_item_ids",
+                ValueType::I64,
+                "vacuum.num_dead_item_ids",
+                false,
+                &["vacuum"],
+                Some("count"),
+            ),
+            raw_column(
+                "dead_tuple_bytes",
+                ValueType::I64,
+                "vacuum.dead_tuple_bytes",
+                false,
+                &["vacuum"],
+                Some("bytes"),
             ),
             unavailable_column_with_reason(
                 "elapsed",
@@ -1394,34 +1411,48 @@ fn vacuum_view() -> ViewSpec {
                 "missing_provenance",
             ),
         ],
-        vec![
-            preset(
-                "progress",
-                &[
-                    "pid",
-                    "relation",
-                    "phase",
-                    "progress",
-                    "dead_tuples",
-                    "elapsed",
-                ],
-                "progress",
-                "desc",
-            ),
-            preset(
-                "phase",
-                &["pid", "relation", "phase", "progress", "elapsed"],
-                "phase",
-                "asc",
-            ),
-            preset(
-                "dead_tuples",
-                &["pid", "relation", "dead_tuples", "progress", "elapsed"],
-                "dead_tuples",
-                "desc",
-            ),
-        ],
+        vacuum_presets(),
     )
+}
+
+fn vacuum_presets() -> Vec<PresetSpec> {
+    vec![
+        preset(
+            "progress",
+            &[
+                "pid",
+                "relation",
+                "phase",
+                "progress",
+                "dead_tuples",
+                "dead_item_ids",
+                "dead_tuple_bytes",
+                "elapsed",
+            ],
+            "progress",
+            "desc",
+        ),
+        preset(
+            "phase",
+            &["pid", "relation", "phase", "progress", "elapsed"],
+            "phase",
+            "asc",
+        ),
+        preset(
+            "dead_tuples",
+            &[
+                "pid",
+                "relation",
+                "dead_tuples",
+                "dead_item_ids",
+                "dead_tuple_bytes",
+                "progress",
+                "elapsed",
+            ],
+            "dead_tuples",
+            "desc",
+        ),
+    ]
 }
 
 #[allow(
@@ -1449,8 +1480,8 @@ fn processes_view() -> ViewSpec {
         derived_column(
             "cpu",
             ValueType::F64,
-            "positive_delta(utime + stime) / elapsed",
-            &["process"],
+            "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
+            &["process", "instance"],
             None,
         ),
         raw_column(
@@ -1486,8 +1517,8 @@ fn processes_view() -> ViewSpec {
         derived_column(
             "block_delay",
             ValueType::F64,
-            "positive_delta(blkdelay_ticks) / elapsed",
-            &["process"],
+            "positive_delta(blkdelay_ticks) / (clock_ticks_per_sec * elapsed_seconds)",
+            &["process", "instance"],
             None,
         ),
         raw_column(
@@ -1648,9 +1679,9 @@ fn locks_view() -> ViewSpec {
                 None,
             ),
             derived_column(
-                "wait_or_hold_us",
+                "wait_age_us",
                 ValueType::F64,
-                "proven_wait_or_hold_duration_us",
+                "wait_age_us from waitstart",
                 &["locks"],
                 Some("us"),
             ),
@@ -1677,10 +1708,10 @@ fn locks_view() -> ViewSpec {
                     "lock_mode",
                     "lock_type",
                     "target",
-                    "wait_or_hold_us",
+                    "wait_age_us",
                     "query",
                 ],
-                "wait_or_hold_us",
+                "wait_age_us",
                 "desc",
             ),
             preset(
@@ -1694,9 +1725,9 @@ fn locks_view() -> ViewSpec {
                     "lock_mode",
                     "lock_type",
                     "target",
-                    "wait_or_hold_us",
+                    "wait_age_us",
                 ],
-                "wait_or_hold_us",
+                "wait_age_us",
                 "desc",
             ),
             preset(
@@ -1713,9 +1744,9 @@ fn locks_view() -> ViewSpec {
                     "lock_type",
                     "target",
                     "query",
-                    "wait_or_hold_us",
+                    "wait_age_us",
                 ],
-                "wait_or_hold_us",
+                "wait_age_us",
                 "desc",
             ),
         ],

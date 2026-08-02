@@ -419,7 +419,7 @@ function incidentsResponse(params) {
         {
           logical_section: "pg_locks",
           identity: ["public.orders"],
-          column: "wait_or_hold_us",
+          column: "wait_age_us",
           from: lockInterval.from,
           to: lockInterval.to,
         },
@@ -441,7 +441,7 @@ function incidentsResponse(params) {
           scope: {
             logical_section: "locks",
             identity: ["public.orders"],
-            column: "wait_or_hold_us",
+            column: "wait_age_us",
           },
           evidence: [
             "wait chain depth 6 on public.orders",
@@ -913,8 +913,8 @@ function rowsLocks() {
       waitUs > 120_000_000
         ? [
             verdict(
-              "wait_or_hold_us",
-              "pg.locks.wait_or_hold_us",
+              "wait_age_us",
+              "pg.locks.wait_age_us",
               waitUs,
               i < 2 ? "critical" : "warning",
               60_000_000,
@@ -929,7 +929,7 @@ function rowsLocks() {
         user_application: ua,
         lock,
         target,
-        wait_or_hold_us: waitUs,
+        wait_age_us: waitUs,
         query: "UPDATE orders SET status=$1 WHERE id=$2",
       },
       cls,

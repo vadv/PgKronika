@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use kronika_analytics::MetricId;
+use kronika_analytics::web_projection::web_view_by_name;
 use kronika_registry::registry;
 use serde_json::json;
 use tower::ServiceExt;
@@ -86,6 +87,44 @@ fn catalog_exposes_all_nine_views_in_stable_code_order() {
 }
 
 #[test]
+fn metric_semantics_publish_revision_four_with_stable_numeric_ids() {
+    let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    assert_eq!(catalog.revision, 4);
+
+    let actual = catalog
+        .views()
+        .iter()
+        .map(|view| {
+            let projection = web_view_by_name(view.code).expect("catalog projection");
+            (
+                projection.code,
+                projection.revision,
+                projection
+                    .metrics
+                    .iter()
+                    .map(|metric| (metric.code, metric.revision))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual,
+        vec![
+            (1, 2, vec![(1, 1), (2, 2), (3, 1), (4, 1)]),
+            (2, 3, vec![(1, 3), (2, 2), (3, 2), (4, 2)]),
+            (3, 2, vec![(1, 2), (2, 2)]),
+            (4, 1, vec![(1, 1), (2, 1), (3, 1)]),
+            (5, 1, vec![(1, 1), (2, 1)]),
+            (6, 2, vec![(1, 2)]),
+            (7, 2, vec![(1, 2), (2, 1)]),
+            (8, 2, vec![(1, 2)]),
+            (9, 1, vec![(1, 1)]),
+        ]
+    );
+}
+
+#[test]
 fn catalog_serializes_relation_quality_without_promoting_pid_only_evidence() {
     let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
         .expect("serialize catalog");
@@ -128,7 +167,7 @@ fn catalog_contains_every_v5_column_preset_capability_and_reason() {
         ("activity", &["backend_type"][..]),
         (
             "plans",
-            &["shared_hit", "shared_read", "first_seen", "last_seen"],
+            &["shared_hit", "shared_read", "first_call", "last_call"],
         ),
         ("tables", &["size", "io_hit_pct", "xid_age", "mxid_age"]),
         ("indexes", &["size", "io_hit_pct", "last_idx_scan"]),
@@ -143,7 +182,7 @@ fn catalog_contains_every_v5_column_preset_capability_and_reason() {
                 "granted",
                 "lock_mode",
                 "lock_type",
-                "wait_or_hold_us",
+                "wait_age_us",
             ],
         ),
         ("events", &["severity_code", "category_code", "detail"]),
@@ -174,6 +213,116 @@ fn catalog_contains_every_v5_column_preset_capability_and_reason() {
             .all(|column| column["code"] != "pss"),
         "pss stays out of the catalog until it is actually collected"
     );
+}
+
+#[test]
+fn plan_call_timestamps_keep_their_source_names() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let plans = serialized_view(&catalog, "plans");
+    let columns = plans["columns"].as_array().expect("plan columns");
+
+    for (code, source) in [
+        (
+            "first_call",
+            serde_json::Value::String("plans.first_call".to_owned()),
+        ),
+        (
+            "last_call",
+            serde_json::Value::String("plans.last_call".to_owned()),
+        ),
+    ] {
+        let column = columns
+            .iter()
+            .find(|column| column["code"] == code)
+            .unwrap_or_else(|| panic!("plans.{code}"));
+        assert_eq!(column["source"], source);
+    }
+    assert!(
+        columns
+            .iter()
+            .all(|column| !matches!(column["code"].as_str(), Some("first_seen" | "last_seen"))),
+        "the catalog must not rename the collected call timestamps as observations"
+    );
+    assert_eq!(plans["view_revision"], json!(2));
+
+    let locks = serialized_view(&catalog, "locks");
+    assert_eq!(locks["view_revision"], json!(2));
+    let wait = locks["metrics"]
+        .as_array()
+        .expect("lock metrics")
+        .iter()
+        .find(|metric| metric["code"] == "wait")
+        .expect("locks.wait");
+    assert_eq!(wait["revision"], json!(2));
+    assert_eq!(wait["formula"], "max(wait_age_us from waitstart)");
+}
+
+#[test]
+fn vacuum_catalog_keeps_generation_specific_dead_work_units() {
+    let projection = web_view_by_name("vacuum").expect("vacuum projection");
+    assert_eq!(projection.code, 6);
+    assert_eq!(projection.revision, 2);
+    assert_eq!(projection.metrics[0].code, 1);
+    assert_eq!(projection.metrics[0].revision, 2);
+
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let vacuum = serialized_view(&catalog, "vacuum");
+    assert_eq!(vacuum["view_code"], json!(6));
+    assert_eq!(vacuum["view_revision"], json!(2));
+
+    let metric = vacuum["metrics"]
+        .as_array()
+        .expect("vacuum metrics")
+        .iter()
+        .find(|metric| metric["code"] == "progress")
+        .expect("vacuum progress metric");
+    assert_eq!(metric["revision"], json!(2));
+    assert_eq!(
+        metric["formula"],
+        "max(heap_blks_scanned / heap_blks_total)"
+    );
+
+    let columns = vacuum["columns"].as_array().expect("vacuum columns");
+    for (code, source, unit) in [
+        ("dead_tuples", "vacuum.num_dead_tuples", "count"),
+        ("dead_item_ids", "vacuum.num_dead_item_ids", "count"),
+        ("dead_tuple_bytes", "vacuum.dead_tuple_bytes", "bytes"),
+    ] {
+        let column = columns
+            .iter()
+            .find(|column| column["code"] == code)
+            .unwrap_or_else(|| panic!("vacuum.{code}"));
+        assert_eq!(column["type"], "i64", "vacuum.{code}");
+        assert_eq!(column["source"], source, "vacuum.{code}");
+        assert!(column["formula"].is_null(), "vacuum.{code}");
+        assert_eq!(column["unit"], unit, "vacuum.{code}");
+    }
+
+    let progress = columns
+        .iter()
+        .find(|column| column["code"] == "progress")
+        .expect("vacuum.progress");
+    assert_eq!(progress["formula"], "heap_blks_scanned / heap_blks_total");
+    assert_eq!(progress["unit"], "ratio");
+
+    for preset in ["progress", "dead_tuples"] {
+        let columns = vacuum["presets"]
+            .as_array()
+            .expect("vacuum presets")
+            .iter()
+            .find(|candidate| candidate["code"] == preset)
+            .unwrap_or_else(|| panic!("vacuum preset {preset}"))["columns"]
+            .as_array()
+            .expect("preset columns");
+        for code in ["dead_tuples", "dead_item_ids", "dead_tuple_bytes"] {
+            assert!(
+                columns.iter().any(|column| column == code),
+                "{preset}.{code}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -212,6 +361,31 @@ fn gated_reason_distinguishes_extension_backed_from_built_in_inputs() {
             .iter()
             .all(|metric| metric.unavailable_reason != Some("missing_extension"))
     );
+}
+
+#[test]
+fn reset_metadata_is_auxiliary_to_extension_metric_availability() {
+    for (view_code, primary_section) in [
+        ("statements", "pg_stat_statements"),
+        ("plans", "pg_store_plans_vadv"),
+    ] {
+        let primary_type = first_type_id(primary_section);
+        let catalog = ProjectionCatalog::for_type_ids(&BTreeSet::from([primary_type]));
+        let view = catalog
+            .views()
+            .iter()
+            .find(|view| view.code == view_code)
+            .unwrap_or_else(|| panic!("{view_code} view"));
+        let reset_metadata = view
+            .inputs
+            .iter()
+            .find(|input| input.code == "reset_metadata")
+            .expect("reset metadata input");
+
+        assert_eq!(view.availability, Availability::Available, "{view_code}");
+        assert_eq!(reset_metadata.availability, Availability::Gated);
+        assert_eq!(reset_metadata.unavailable_reason, Some("not_collected"));
+    }
 }
 
 #[test]
@@ -511,6 +685,7 @@ fn statements_presets_identify_rows_by_database_and_user() {
 fn activity_cpu_requires_both_activity_and_process_inputs() {
     let activity_type = first_type_id("pg_stat_activity");
     let process_type = first_type_id("os_process");
+    let instance_type = first_type_id("instance_metadata");
 
     let activity_only = ProjectionCatalog::for_type_ids(&BTreeSet::from([activity_type]));
     let cpu = activity_only
@@ -522,7 +697,59 @@ fn activity_cpu_requires_both_activity_and_process_inputs() {
     let cpu = joined
         .metric("activity", "cpu")
         .expect("activity cpu metric");
+    assert_eq!(cpu.availability, Availability::Gated);
+
+    let joined = ProjectionCatalog::for_type_ids(&BTreeSet::from([
+        activity_type,
+        process_type,
+        instance_type,
+    ]));
+    let cpu = joined
+        .metric("activity", "cpu")
+        .expect("activity cpu metric");
     assert_eq!(cpu.availability, Availability::Available);
+}
+
+#[test]
+fn process_cpu_requires_instance_metadata_but_activity_stays_available() {
+    let activity_type = first_type_id("pg_stat_activity");
+    let process_type = first_type_id("os_process");
+    let instance_type = first_type_id("instance_metadata");
+
+    let without_instance =
+        ProjectionCatalog::for_type_ids(&BTreeSet::from([activity_type, process_type]));
+    let processes = without_instance
+        .views()
+        .iter()
+        .find(|view| view.code == "processes")
+        .expect("processes view");
+    assert_eq!(processes.availability, Availability::Gated);
+    assert_eq!(
+        without_instance
+            .metric("processes", "cpu")
+            .expect("process cpu metric")
+            .availability,
+        Availability::Gated
+    );
+    assert_eq!(
+        without_instance
+            .views()
+            .iter()
+            .find(|view| view.code == "activity")
+            .expect("activity view")
+            .availability,
+        Availability::Available
+    );
+
+    let with_instance =
+        ProjectionCatalog::for_type_ids(&BTreeSet::from([process_type, instance_type]));
+    assert_eq!(
+        with_instance
+            .metric("processes", "cpu")
+            .expect("process cpu metric")
+            .availability,
+        Availability::Available
+    );
 }
 
 #[test]
@@ -562,7 +789,7 @@ async fn ui_catalog_returns_nine_views_for_the_root() {
 
     let response = serve_captured(dir.path(), "/v1/ui/catalog", &[]).await;
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.body["revision"], 3);
+    assert_eq!(response.body["revision"], 4);
     assert_eq!(
         response.body["views"].as_array().map(Vec::len),
         Some(9),

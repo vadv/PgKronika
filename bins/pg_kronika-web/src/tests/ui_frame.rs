@@ -13,6 +13,7 @@ use kronika_reader::{FactStore, LIMIT, LocalDirSnapshot, OutRow, Value};
 use kronika_registry::pg_log::PgLogLifecycleV1;
 use kronika_registry::pg_settings::PgSettingsV1;
 use kronika_registry::pg_stat_statements::PgStatStatementsV2;
+use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::{Section, StrId, Ts};
 
 use crate::api_error::ErrorCode;
@@ -445,6 +446,100 @@ fn out_row(values: &[(&str, Value)]) -> OutRow {
 }
 
 #[test]
+fn vacuum_progress_divides_by_total_not_total_plus_scanned() {
+    let request = FrameRequest::parse("vacuum", Some("at=20&columns=pid,progress"), &catalog())
+        .expect("vacuum request");
+
+    for (case, denominator, expected) in [
+        (
+            "finite total",
+            Some(Value::U64(100)),
+            DtoFrameValue::Number(0.25),
+        ),
+        ("zero total", Some(Value::U64(0)), DtoFrameValue::Null),
+        ("missing total", None, DtoFrameValue::Null),
+        (
+            "non-finite total",
+            Some(Value::F64(f64::NAN)),
+            DtoFrameValue::Null,
+        ),
+    ] {
+        let mut row = out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(11)),
+            ("datid", Value::U64(3)),
+            ("relid", Value::U64(4)),
+            ("phase", Value::Str("scanning heap".to_owned())),
+            ("heap_blks_scanned", Value::U64(25)),
+        ]);
+        if let Some(denominator) = denominator {
+            row.push(("heap_blks_total".to_owned(), denominator));
+        }
+        let input = ProjectionInput::single(20, "pg_stat_progress_vacuum", row);
+
+        let frame = project_input(&request, &catalog(), input)
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(frame.rows[0].cells[1], expected, "{case}");
+    }
+}
+
+#[test]
+fn vacuum_dead_work_fields_are_not_coalesced() {
+    let request = FrameRequest::parse(
+        "vacuum",
+        Some("at=20&columns=pid,dead_tuples,dead_item_ids,dead_tuple_bytes"),
+        &catalog(),
+    )
+    .expect("vacuum request");
+
+    let pre17 = ProjectionInput::single(
+        20,
+        "pg_stat_progress_vacuum",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(16)),
+            ("datid", Value::U64(3)),
+            ("relid", Value::U64(4)),
+            ("num_dead_tuples", Value::I64(7)),
+        ]),
+    );
+    let pre17 = project_input(&request, &catalog(), pre17).expect("PG16 projection");
+    assert_eq!(
+        pre17.rows[0].cells,
+        vec![
+            DtoFrameValue::Number(16.0),
+            DtoFrameValue::Number(7.0),
+            DtoFrameValue::Null,
+            DtoFrameValue::Null,
+        ]
+    );
+
+    let pg17 = ProjectionInput::single(
+        20,
+        "pg_stat_progress_vacuum",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(17)),
+            ("datid", Value::U64(3)),
+            ("relid", Value::U64(4)),
+            ("num_dead_item_ids", Value::I64(11)),
+            ("dead_tuple_bytes", Value::I64(2_500)),
+        ]),
+    );
+    let pg17 = project_input(&request, &catalog(), pg17).expect("PG17 projection");
+    assert_eq!(
+        pg17.rows[0].cells,
+        vec![
+            DtoFrameValue::Number(17.0),
+            DtoFrameValue::Null,
+            DtoFrameValue::Number(11.0),
+            DtoFrameValue::Number(2_500.0),
+        ],
+        "PG17 item identifiers and byte usage keep their source units"
+    );
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the golden keeps all nine projection fixtures adjacent for completeness review"
@@ -543,7 +638,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
                 ("heap_blks_scanned", Value::U64(25)),
                 ("num_dead_tuples", Value::U64(5)),
             ]),
-            6,
+            8,
         ),
         (
             "processes",
@@ -635,6 +730,13 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
             ("write_bytes", Value::U64(500)),
         ]),
     );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(5_000_000)),
+            ("clock_ticks_per_sec", Value::I64(100)),
+        ]),
+    );
     input.push_previous(
         10_000_000,
         "os_process",
@@ -654,11 +756,248 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
         frame.rows[0].cells,
         vec![
             DtoFrameValue::String("best_effort".to_owned()),
-            DtoFrameValue::Number(9.0),
+            DtoFrameValue::Number(0.09),
             DtoFrameValue::Number(60.0),
             DtoFrameValue::Number(40.0),
         ]
     );
+}
+
+#[test]
+fn process_cpu_and_block_delay_are_divided_by_clock_ticks() {
+    let request = FrameRequest::parse(
+        "processes",
+        Some("at=20000000&columns=cpu,block_delay"),
+        &catalog(),
+    )
+    .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(100)),
+            ("stime", Value::U64(0)),
+            ("blkdelay_ticks", Value::U64(30)),
+        ]),
+    );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(5_000_000)),
+            ("clock_ticks_per_sec", Value::I64(100)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(10)),
+            ("stime", Value::U64(0)),
+            ("blkdelay_ticks", Value::U64(10)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![DtoFrameValue::Number(0.09), DtoFrameValue::Number(0.02)]
+    );
+}
+
+#[test]
+fn tick_rates_preserve_multi_core_cpu() {
+    let request = FrameRequest::parse("processes", Some("at=20000000&columns=cpu"), &catalog())
+        .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(2_010)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(5_000_000)),
+            ("clock_ticks_per_sec", Value::I64(100)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(10)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Number(2.0)]);
+}
+
+#[test]
+fn tick_rates_are_null_for_a_non_finite_clock() {
+    let request = FrameRequest::parse("processes", Some("at=20000000&columns=cpu"), &catalog())
+        .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(100)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(5_000_000)),
+            ("clock_ticks_per_sec", Value::F64(f64::NAN)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(10)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Null]);
+}
+
+#[test]
+fn activity_cpu_uses_the_same_instance_clock() {
+    let request = FrameRequest::parse(
+        "activity",
+        Some("at=20000000&columns=process_link,cpu"),
+        &catalog(),
+    )
+    .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "pg_stat_activity",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("backend_start", Value::Ts(1_000_000)),
+        ]),
+    );
+    input.push(
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(100)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("clock_ticks_per_sec", Value::I64(100)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(10)),
+            ("stime", Value::U64(0)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![
+            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::Number(0.09),
+        ]
+    );
+}
+
+#[test]
+fn tick_rates_are_null_without_a_positive_clock() {
+    for clock in [None, Some(0), Some(-100)] {
+        let request = FrameRequest::parse(
+            "processes",
+            Some("at=20000000&columns=cpu,block_delay,read_bytes_per_second"),
+            &catalog(),
+        )
+        .expect("request");
+        let mut input = ProjectionInput::single(
+            20_000_000,
+            "os_process",
+            out_row(&[
+                ("ts", Value::Ts(20_000_000)),
+                ("pid", Value::I64(7)),
+                ("starttime", Value::Ts(2_000_000)),
+                ("utime", Value::U64(100)),
+                ("stime", Value::U64(0)),
+                ("blkdelay_ticks", Value::U64(30)),
+                ("read_bytes", Value::U64(700)),
+            ]),
+        );
+        if let Some(clock) = clock {
+            input.push(
+                "instance_metadata",
+                out_row(&[
+                    ("ts", Value::Ts(20_000_000)),
+                    ("clock_ticks_per_sec", Value::I64(clock)),
+                ]),
+            );
+        }
+        input.push_previous(
+            10_000_000,
+            "os_process",
+            out_row(&[
+                ("ts", Value::Ts(10_000_000)),
+                ("pid", Value::I64(7)),
+                ("starttime", Value::Ts(2_000_000)),
+                ("utime", Value::U64(10)),
+                ("stime", Value::U64(0)),
+                ("blkdelay_ticks", Value::U64(10)),
+                ("read_bytes", Value::U64(100)),
+            ]),
+        );
+
+        let frame = project_input(&request, &catalog(), input).expect("projection");
+        assert_eq!(
+            frame.rows[0].cells,
+            vec![
+                DtoFrameValue::Null,
+                DtoFrameValue::Null,
+                DtoFrameValue::Number(60.0),
+            ],
+            "clock={clock:?}"
+        );
+    }
 }
 
 #[test]
@@ -1013,6 +1352,208 @@ fn reset_counter_classifies_with_the_reset_reason() {
 }
 
 #[test]
+fn exact_statement_reset_invalidates_increasing_counters() {
+    let request =
+        FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(20)),
+            ("total_exec_time", Value::F64(200.0)),
+        ]),
+    );
+    input.push_previous(
+        10,
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(10)),
+            ("total_exec_time", Value::F64(100.0)),
+        ]),
+    );
+    input.push(
+        "reset_metadata",
+        out_row(&[
+            ("ts", Value::Ts(18)),
+            ("pg_stat_statements_reset_at", Value::Ts(15)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    let body = serde_json::to_value(
+        FrameResponse::from_projected(&request, &catalog(), &frame).expect("response"),
+    )
+    .expect("serialize");
+
+    assert_eq!(body["rows"][0]["cells"][0], serde_json::Value::Null);
+    assert_eq!(
+        body["rows"][0]["classifications"][0]["result"]["reason"],
+        "reset"
+    );
+}
+
+#[test]
+fn exact_plan_reset_invalidates_increasing_counters() {
+    let request = FrameRequest::parse("plans", Some("at=20&columns=calls,mean"), &catalog())
+        .expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_store_plans_vadv",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("dbid", Value::U64(20)),
+            ("userid", Value::U64(10)),
+            ("planid", Value::I64(1)),
+            ("queryid", Value::I64(2)),
+            ("calls", Value::I64(20)),
+            ("total_time", Value::F64(200.0)),
+            ("rows", Value::I64(20)),
+        ]),
+    );
+    input.push_previous(
+        10,
+        "pg_store_plans_vadv",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("dbid", Value::U64(20)),
+            ("userid", Value::U64(10)),
+            ("planid", Value::I64(1)),
+            ("queryid", Value::I64(2)),
+            ("calls", Value::I64(10)),
+            ("total_time", Value::F64(100.0)),
+            ("rows", Value::I64(10)),
+        ]),
+    );
+    input.push(
+        "reset_metadata",
+        out_row(&[
+            ("ts", Value::Ts(18)),
+            ("pg_store_plans_reset_at", Value::Ts(15)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![DtoFrameValue::Null, DtoFrameValue::Null]
+    );
+}
+
+#[test]
+fn lock_wait_age_requires_waitstart() {
+    let request = FrameRequest::parse("locks", Some("at=20&columns=wait_age_us"), &catalog())
+        .expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_locks",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(1)),
+            ("backend_start", Value::Ts(1)),
+            ("lock_granted", Value::Bool(false)),
+            ("waitstart", Value::Ts(5)),
+        ]),
+    );
+    input.push(
+        "pg_locks",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(2)),
+            ("backend_start", Value::Ts(2)),
+            ("lock_granted", Value::Bool(true)),
+            ("xact_start", Value::Ts(3)),
+            ("query_start", Value::Ts(4)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Number(15.0)]);
+    assert_eq!(frame.rows[1].cells, vec![DtoFrameValue::Null]);
+}
+
+#[test]
+fn plan_call_timestamps_keep_their_source_names() {
+    let request = FrameRequest::parse(
+        "plans",
+        Some("at=20&columns=first_call,last_call"),
+        &catalog(),
+    )
+    .expect("request");
+    let input = ProjectionInput::single(
+        20,
+        "pg_store_plans_vadv",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("dbid", Value::U64(3)),
+            ("userid", Value::U64(2)),
+            ("planid", Value::I64(9)),
+            ("queryid", Value::I64(8)),
+            ("first_call", Value::Ts(7)),
+            ("last_call", Value::Ts(18)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![
+            DtoFrameValue::String("7".to_owned()),
+            DtoFrameValue::String("18".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn reset_before_the_predecessor_does_not_break_the_interval() {
+    let request =
+        FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");
+    let mut input = ProjectionInput::empty(20);
+    input.push(
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(20)),
+            ("total_exec_time", Value::F64(200.0)),
+        ]),
+    );
+    input.push_previous(
+        10,
+        "pg_stat_statements",
+        out_row(&[
+            ("ts", Value::Ts(10)),
+            ("queryid", Value::I64(1)),
+            ("userid", Value::U64(10)),
+            ("dbid", Value::U64(20)),
+            ("calls", Value::I64(10)),
+            ("total_exec_time", Value::F64(100.0)),
+        ]),
+    );
+    input.push(
+        "reset_metadata",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("pg_stat_statements_reset_at", Value::Ts(5)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Number(10.0)]);
+}
+
+#[test]
 fn statement_time_percent_rejects_a_partial_reset_denominator() {
     let request = FrameRequest::parse("statements", Some("at=20"), &catalog()).expect("request");
     let mut input = ProjectionInput::empty(20);
@@ -1267,6 +1808,92 @@ fn statement_row(ts: i64, calls: i64, rows: i64, exec_ms: f64, plan_ms: f64) -> 
         wal_fpi: 0,
         wal_bytes: 0,
     }
+}
+
+fn reset_metadata_row(
+    ts: i64,
+    statement_reset_at: Option<i64>,
+    plan_reset_at: Option<i64>,
+) -> ResetMetadata {
+    ResetMetadata {
+        ts: Ts(ts),
+        postmaster_start_time: Ts(1),
+        pg_stat_database_reset_max_at: None,
+        pg_stat_statements_reset_at: statement_reset_at.map(Ts),
+        pg_store_plans_reset_at: plan_reset_at.map(Ts),
+        pg_stat_bgwriter_reset_at: None,
+        pg_stat_checkpointer_reset_at: None,
+        pg_stat_wal_reset_at: None,
+        pg_stat_archiver_reset_at: None,
+        pg_stat_io_reset_at: None,
+        ext_pg_stat_statements_version: None,
+        ext_pg_store_plans_version: None,
+        compute_query_id: None,
+        track_io_timing: None,
+        track_wal_io_timing: None,
+    }
+}
+
+fn frame_statement_reset_cadence_fixture() -> tempfile::TempDir {
+    let statements = PgStatStatementsV2::encode(&[
+        statement_row(10, 10, 10, 100.0, 0.0),
+        statement_row(20, 20, 20, 200.0, 0.0),
+    ])
+    .expect("encode statement reset fixture");
+    let resets = ResetMetadata::encode(&[
+        reset_metadata_row(12, Some(5), None),
+        reset_metadata_row(18, Some(15), None),
+    ])
+    .expect("encode reset metadata fixture");
+    let pgm = build_part(
+        &[
+            SectionInput {
+                type_id: 1_002_002,
+                rows: 2,
+                body: &statements,
+            },
+            SectionInput {
+                type_id: 1_020_001,
+                rows: 2,
+                body: &resets,
+            },
+        ],
+        PartMeta {
+            min_ts: 10,
+            max_ts: 20,
+        },
+    );
+    let directory = tempfile::tempdir().expect("tempdir");
+    crate::test_layout::write_named_pgm(directory.path(), "frame-statement-reset.pgm", &pgm);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish web index");
+    }
+    directory
+}
+
+#[test]
+fn frame_reads_latest_reset_metadata_before_statement_snapshot() {
+    let directory = frame_statement_reset_cadence_fixture();
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let request =
+        FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");
+
+    let frame = project_frame(&snapshot, &request, &catalog(), FrameLimits::default())
+        .expect("frame projection");
+    let body = serde_json::to_value(
+        FrameResponse::from_projected(&request, &catalog(), &frame).expect("response"),
+    )
+    .expect("serialize");
+
+    assert_eq!(body["rows"][0]["cells"][0], serde_json::Value::Null);
+    assert_eq!(
+        body["rows"][0]["classifications"][0]["result"]["reason"],
+        "reset"
+    );
 }
 
 fn frame_statement_planning_fixture() -> tempfile::TempDir {
