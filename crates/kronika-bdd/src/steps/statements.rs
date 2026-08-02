@@ -121,10 +121,6 @@ async fn pgss_row_with_counts(
             name: "rows".to_owned(),
             value: ExpectedValue::Cell(Cell::I64(expected_rows)),
         },
-        ExpectedColumn {
-            name: "query".to_owned(),
-            value: ExpectedValue::Cell(Cell::Null),
-        },
     ];
     assert_row(
         &segment,
@@ -140,23 +136,23 @@ async fn pgss_row_with_counts(
     )
 }
 
-/// Assert that a known source query keeps the required `query` field while
-/// withholding its value in both storage and the raw HTTP projection.
+/// Assert that a known source query carries its capped text in both storage
+/// and the raw HTTP projection.
 #[then(
-    regex = r"^section ([\w.+-]+) exposes a null query for pg_stat_statements query like '([^']+)' in PGM and the raw API$"
+    regex = r"^section ([\w.+-]+) exposes the query text for pg_stat_statements query like '([^']+)' in PGM and the raw API$"
 )]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-async fn pgss_null_query_row(world: &mut BddWorld, section: String, pattern: String) -> Result<()> {
+async fn pgss_query_text_row(world: &mut BddWorld, section: String, pattern: String) -> Result<()> {
     let section = parse_section_ref(&section)?;
     let client = oracle_client(world).await?;
     let (queryid, _calls, _rows) = pgss_row_by_like(&client, &pattern).await?;
 
     let segment = world.harness.segment()?.clone();
     let failure_log = world.harness.failure_log()?;
-    let (rows, _dict) = decode_section_labeled(&segment, section.type_id, &section.label)?;
+    let (rows, dict) = decode_section_labeled(&segment, section.type_id, &section.label)?;
 
     let row = rows
         .iter()
@@ -182,14 +178,15 @@ async fn pgss_null_query_row(world: &mut BddWorld, section: String, pattern: Str
             section.label
         )
     })?;
+    let marker = pattern.trim_matches('%');
+    let text = resolved_text(Some(query_cell), &dict).unwrap_or_default();
     ensure!(
-        query_cell == &Cell::Null,
+        query_cell != &Cell::Null && text.contains(marker),
         "{}",
         dump::section_dump(
             &format!(
-                "section {}: query cell for queryid={queryid} is {}, expected NULL",
-                section.label,
-                dump::render_cell(query_cell)
+                "section {}: query cell for queryid={queryid} must carry text with {marker:?}, got {text:?}",
+                section.label
             ),
             &rows,
             &failure_log,
@@ -216,8 +213,11 @@ async fn pgss_null_query_row(world: &mut BddWorld, section: String, pattern: Str
         .as_object()
         .context("raw statement API row is not an object")?;
     ensure!(
-        object.contains_key("query") && object["query"].is_null(),
-        "raw statement API row must contain `query: null`: {api_row}"
+        object["query"]
+            .as_str()
+            .or_else(|| object["query"]["text"].as_str())
+            .is_some_and(|text| text.contains(marker)),
+        "raw statement API row must carry query text with {marker:?}: {api_row}"
     );
     Ok(())
 }
@@ -232,13 +232,13 @@ async fn pgss_null_query_row(world: &mut BddWorld, section: String, pattern: Str
 async fn complete_statement_provenance(world: &mut BddWorld, section: String) -> Result<()> {
     let section = parse_section_ref(&section)?;
     let segment = world.harness.segment()?.clone();
-    let (rows, _dict) = decode_section_labeled(&segment, section.type_id, &section.label)?;
+    let (rows, dict) = decode_section_labeled(&segment, section.type_id, &section.label)?;
     ensure!(
         !rows.is_empty(),
         "section {} has no numeric statement rows",
         section.label
     );
-    assert_statement_rows_are_text_free(&rows, &section.label)?;
+    assert_statement_rows_capped_text(&rows, &dict, &section.label)?;
     assert_complete_coverage(&segment, section.type_id, &rows, &section.label)?;
     let dsn = world.harness.database_dsn()?;
     assert_statement_reset_context(&segment, &dsn).await
@@ -324,7 +324,6 @@ async fn duplicate_toplevel_identity(
             && matches.iter().all(|row| {
                 row.get("calls") == Some(&Cell::I64(expected_calls))
                     && row.get("rows") == Some(&Cell::I64(expected_rows))
-                    && row.get("query") == Some(&Cell::Null)
             }),
         "{}",
         dump::section_dump(
@@ -376,13 +375,13 @@ async fn bounded_masked_queryids(world: &mut BddWorld, section: String) -> Resul
     let (rows, _dict) = decode_section_labeled(&segment, section.type_id, &section.label)?;
     ensure!(
         rows.len() == 2
-            && rows.iter().all(|row| {
-                row.get("queryid") == Some(&Cell::Null) && row.get("query") == Some(&Cell::Null)
-            }),
+            && rows
+                .iter()
+                .all(|row| row.get("queryid") == Some(&Cell::Null)),
         "{}",
         dump::section_dump(
             &format!(
-                "section {} must contain exactly two rows with masked queryid and query",
+                "section {} must contain exactly two rows with masked queryid",
                 section.label
             ),
             &rows,
@@ -416,11 +415,12 @@ async fn bounded_masked_queryids(world: &mut BddWorld, section: String) -> Resul
                 row.as_object().is_some_and(|object| {
                     object.contains_key("queryid")
                         && object["queryid"].is_null()
-                        && object.contains_key("query")
-                        && object["query"].is_null()
+                        && object["query"]
+                            .as_str()
+                            .is_some_and(|text| text == "<insufficient privilege>")
                 })
             }),
-        "raw statement API did not preserve both nullable fields: {}",
+        "raw statement API must keep queryid masked and expose the privilege placeholder text: {}",
         page["rows"]
     );
     let dsn = world.harness.database_dsn()?;
@@ -490,7 +490,7 @@ async fn success_after_stale_failure(world: &mut BddWorld, section: String) -> R
         !rows.is_empty(),
         "rediscovered statements source returned no rows"
     );
-    assert_statement_rows_are_text_free(&rows, &section.label)?;
+    assert_statement_rows_capped_text(&rows, &dict, &section.label)?;
     assert_complete_coverage(&segment, section.type_id, &rows, &section.label)?;
     let second_database = world.harness.extra_database_name(0)?;
     ensure!(
@@ -525,11 +525,28 @@ async fn execute_sql(dsn: &str, sql: &str) -> Result<()> {
     result
 }
 
-fn assert_statement_rows_are_text_free(rows: &[Row], label: &str) -> Result<()> {
-    ensure!(
-        rows.iter().all(|row| row.get("query") == Some(&Cell::Null)),
-        "section {label} materialized query text in the numeric core"
-    );
+fn assert_statement_rows_capped_text(
+    rows: &[Row],
+    dictionary: &kronika_reader::Dictionary,
+    label: &str,
+) -> Result<()> {
+    // The collector caps the text server-side at KRONIKA_PG_MAX_QUERY_TEXT
+    // (default 5000); every materialized cell must resolve within that bound.
+    const QUERY_TEXT_CAP: usize = 5_000;
+    for row in rows {
+        let cell = row.get("query");
+        if cell == Some(&Cell::Null) || cell.is_none() {
+            continue;
+        }
+        let Some(text) = resolved_text(cell, dictionary) else {
+            bail!("section {label} carries a query cell that does not resolve to text: {cell:?}");
+        };
+        ensure!(
+            text.len() <= QUERY_TEXT_CAP,
+            "section {label} materialized query text past the server cap: {} > {QUERY_TEXT_CAP}",
+            text.len()
+        );
+    }
     Ok(())
 }
 

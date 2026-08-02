@@ -24,7 +24,7 @@ Feature: Collector seals bounded numeric pg_stat_statements snapshots
   must be sealed. A separate N=1 scenario pins overflow behavior.
 
   @serial @requires_extension
-  Scenario Outline: PostgreSQL <major> seals exact numeric statement rows without query text
+  Scenario Outline: PostgreSQL <major> seals exact statement rows with capped query text
     Given a fresh database on PostgreSQL <major>
     And a database seeded with:
       """
@@ -115,7 +115,7 @@ Feature: Collector seals bounded numeric pg_stat_statements snapshots
     Then section <section> has a row for pg_stat_statements query like '%kronika_calls_probe%' with calls = 3 and rows = 3
     And section <section> has a row for pg_stat_statements query like '%UPDATE kronika_pgss_t%' with calls = 1 and rows = 5
     And section <section> has a row for pg_stat_statements query like '%kronika_blob_probe%' with calls = 1 and rows = 1
-    And section <section> exposes a null query for pg_stat_statements query like '%kronika_blob_probe%' in PGM and the raw API
+    And section <section> exposes the query text for pg_stat_statements query like '%kronika_blob_probe%' in PGM and the raw API
     And section <section> has complete numeric statement provenance
 
     @pg15

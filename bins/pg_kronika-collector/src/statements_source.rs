@@ -265,7 +265,15 @@ async fn collect_statements_from_candidate(
         }
     };
     let version = statements_version(&extversion);
-    match collect_statements(candidate.client, major, version, config.max_statements).await {
+    match collect_statements(
+        candidate.client,
+        major,
+        version,
+        config.max_statements,
+        config.max_query_text,
+    )
+    .await
+    {
         Ok((rows, source_total)) => {
             let version = cache.store(candidate.source, extversion);
             let type_id = statements_type_id(version);
@@ -385,8 +393,14 @@ pub(crate) async fn collect_statements_cached(
         if let Some(client) = statement_client(pool, &cached.source) {
             match statements_extversion(client).await {
                 Ok(Some(extversion)) if cached.matches_extversion(&extversion) => {
-                    match collect_statements(client, major, cached.version, config.max_statements)
-                        .await
+                    match collect_statements(
+                        client,
+                        major,
+                        cached.version,
+                        config.max_statements,
+                        config.max_query_text,
+                    )
+                    .await
                     {
                         Ok((rows, source_total)) => {
                             let type_id = statements_type_id(cached.version);

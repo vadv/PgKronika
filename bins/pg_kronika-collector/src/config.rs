@@ -33,6 +33,8 @@ pub(crate) struct Config {
     pub(crate) max_plan_text: i32,
     /// Total plan-text bytes fetched per read.
     pub(crate) plan_text_budget: u64,
+    /// Per-query text truncation for `pg_stat_statements`, characters.
+    pub(crate) max_query_text: i32,
     /// Minimum interval between connection-pool refreshes, seconds.
     pub(crate) pool_refresh_secs: u64,
     /// Cap for the adaptive `statement_timeout` of the heavy per-table query, ms.
@@ -228,6 +230,8 @@ impl Config {
         let max_plan_text = i32::try_from(env_u64("KRONIKA_PG_MAX_PLAN_TEXT", 32_768)?)
             .context("KRONIKA_PG_MAX_PLAN_TEXT exceeds i32")?;
         let plan_text_budget = env_u64("KRONIKA_PG_PLAN_TEXT_BUDGET", 8 * 1024 * 1024)?;
+        let max_query_text = i32::try_from(env_u64("KRONIKA_PG_MAX_QUERY_TEXT", 5_000)?)
+            .context("KRONIKA_PG_MAX_QUERY_TEXT exceeds i32")?;
         let pool_refresh_secs = env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?;
         let heavy_timeout_cap_ms = env_u64("KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS", 60_000)?;
         let max_lock_rows = i64::try_from(env_u64("KRONIKA_PG_MAX_LOCK_ROWS", 1000)?)
@@ -275,7 +279,7 @@ impl Config {
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
         validate_max_plans(max_plans)?;
-        validate_plan_text_limits(max_plan_text, plan_text_budget)?;
+        validate_plan_text_limits(max_plan_text, plan_text_budget, max_query_text)?;
         Ok(Self {
             dsn,
             out_dir,
@@ -288,6 +292,7 @@ impl Config {
             plans_interval,
             max_plan_text,
             plan_text_budget,
+            max_query_text,
             pool_refresh_secs,
             heavy_timeout_cap_ms,
             max_lock_rows,
@@ -583,7 +588,11 @@ pub(crate) fn validate_heavy_cap(heavy_timeout_cap_ms: u64) -> Result<()> {
 ///
 /// # Errors
 /// Returns an error naming the env and the bound when out of range.
-pub(crate) fn validate_plan_text_limits(max_plan_text: i32, plan_text_budget: u64) -> Result<()> {
+pub(crate) fn validate_plan_text_limits(
+    max_plan_text: i32,
+    plan_text_budget: u64,
+    max_query_text: i32,
+) -> Result<()> {
     anyhow::ensure!(
         max_plan_text > 0 && max_plan_text <= 64 * 1024,
         "KRONIKA_PG_MAX_PLAN_TEXT must be in 1..=65536, got {max_plan_text}"
@@ -591,6 +600,10 @@ pub(crate) fn validate_plan_text_limits(max_plan_text: i32, plan_text_budget: u6
     anyhow::ensure!(
         plan_text_budget <= 16 * 1024 * 1024,
         "KRONIKA_PG_PLAN_TEXT_BUDGET must not exceed 16777216, got {plan_text_budget}"
+    );
+    anyhow::ensure!(
+        max_query_text > 0 && max_query_text <= 64 * 1024,
+        "KRONIKA_PG_MAX_QUERY_TEXT must be in 1..=65536, got {max_query_text}"
     );
     Ok(())
 }
