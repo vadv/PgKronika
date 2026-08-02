@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use kronika_reader::{
     DiffPoint, Gap, LocalDirSnapshot, LogicalSection, OutRow, QueryError, QueryLimits, Reason,
     SectionPage, SeriesDiff, SeriesValues, Value, diff_section, gauge_section, logical_section,
-    section_with_limits, sections_with_limits,
+    section_with_limits,
 };
 use kronika_registry::ColumnClass;
 
@@ -94,7 +94,7 @@ impl InputLimits {
         Self {
             units: 4_096,
             sections: 64,
-            materialized_cells: 2_000_000,
+            materialized_cells: 500_000,
             materialized_bytes: 32 * 1024 * 1024,
             series_points: 500_000,
             typed_gauge_points: 500_000,
@@ -256,43 +256,70 @@ pub(crate) fn prepare_input(
     if overlapping_units == 0 {
         return Err(InputError::NoData);
     }
-    let mut input = read_input_pages(snap, scan, sections, limits)?;
-    let log_events = build_log_events(
-        &input.pages,
-        &input.skipped,
-        EventInputLimits::production(),
-        scan.from,
-        scan.to,
-    );
-    let gates = Gates::from_pages(&input.logicals, &input.pages);
-    let snapshot_provenance = SnapshotProvenance::from_page(input.pages.get(SNAPSHOT_COVERAGE));
-    let mut state = BuildState::new(
-        limits,
-        limits.identity_bytes,
-        input.skipped,
-        snapshot_provenance,
-    );
-    for logical in &input.logicals {
-        let Some(page) = input.pages.remove(logical.name) else {
-            if state
-                .skipped
-                .iter()
-                .any(|skip| skip.section == logical.name)
-            {
-                continue;
-            }
-            return Err(InputError::Read(QueryError::UnknownSection(
-                logical.name.to_owned(),
-            )));
-        };
-        state.process(logical, page, &gates, scan, limits)?;
+
+    let names: BTreeSet<&'static str> = sections.iter().copied().collect();
+    if names.len() > limits.sections {
+        return Err(InputError::SectionLimit {
+            observed: names.len(),
+            limit: limits.sections,
+        });
     }
+    let logicals: Vec<LogicalSection> = names
+        .into_iter()
+        .map(|name| {
+            logical_section(name).ok_or_else(|| InputError::UnknownSection(name.to_owned()))
+        })
+        .collect::<Result<_, _>>()?;
+    let gate_names: BTreeSet<&str> = Gates::sections(&logicals).into_iter().collect();
+    let mut read_names = BTreeSet::new();
+    read_names.extend(logicals.iter().map(|logical| logical.name));
+    read_names.extend(gate_names.iter().copied());
+    read_names.insert(SNAPSHOT_COVERAGE);
+    let observed_sections = read_names.len();
+    if observed_sections > limits.sections {
+        return Err(InputError::SectionLimit {
+            observed: observed_sections,
+            limit: limits.sections,
+        });
+    }
+    let logical_by_name: BTreeMap<&str, &LogicalSection> = logicals
+        .iter()
+        .map(|logical| (logical.name, logical))
+        .collect();
+
+    // One page in flight: the peak is the largest single section plus the
+    // accumulated series, never every section materialized at once.
+    let mut remaining_cells = limits.materialized_cells;
+    let mut skipped = Vec::new();
+
+    let provenance_page = stream_page(
+        snap,
+        scan,
+        SNAPSHOT_COVERAGE,
+        &mut remaining_cells,
+        limits,
+        &mut skipped,
+    )?;
+    let snapshot_provenance = SnapshotProvenance::from_page(provenance_page.as_ref());
+    let mut state = BuildState::new(limits, limits.identity_bytes, skipped, snapshot_provenance);
+
+    let events = stream_sections(
+        snap,
+        scan,
+        &read_names,
+        &gate_names,
+        &logicals,
+        &logical_by_name,
+        &mut remaining_cells,
+        limits,
+        &mut state,
+    )?;
 
     Ok(PreparedInput {
         episodes: state.episodes,
         series: state.series,
         typed: state.typed,
-        log_events,
+        log_events: events,
         coverage_by_section: state.coverage_by_section,
         quality: state.quality,
         skipped: state.skipped,
@@ -300,48 +327,143 @@ pub(crate) fn prepare_input(
     })
 }
 
-const PG_LOG_ERRORS: &str = "pg_log_errors";
-const PG_LOG_LIFECYCLE: &str = "pg_log_lifecycle";
-const PG_LOG_GAP: &str = "pg_log_gap";
+/// Streams every section once: gates first, then each page is consumed and
+/// dropped before the next read, returning the assembled log events.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the streaming pass threads the scan context, budgets, and builder state through one loop"
+)]
+fn stream_sections(
+    snap: &mut LocalDirSnapshot,
+    scan: &ScanParams,
+    read_names: &BTreeSet<&str>,
+    gate_names: &BTreeSet<&str>,
+    logicals: &[LogicalSection],
+    logical_by_name: &BTreeMap<&str, &LogicalSection>,
+    remaining_cells: &mut usize,
+    limits: &InputLimits,
+    state: &mut BuildState,
+) -> Result<LogEventInputs, InputError> {
+    let mut gate_pages = BTreeMap::new();
+    for &name in gate_names {
+        if let Some(page) = stream_page(
+            snap,
+            scan,
+            name,
+            remaining_cells,
+            limits,
+            &mut state.skipped,
+        )? {
+            gate_pages.insert(name.to_owned(), page);
+        }
+    }
+    let gates = Gates::from_pages(logicals, &gate_pages);
 
-/// Extract bounded, typed log events from the already-materialized log-section
-/// pages, alongside — never through — the numeric series path.
-///
-/// A section that was skipped or not read is `NotCollected`, so a lens never
-/// reads its silence as health. Stored groups stay separate because their
-/// timestamps belong to one collector batch and cannot support a request-wide
-/// count or historical merge.
-fn build_log_events(
-    pages: &BTreeMap<String, SectionPage>,
-    skipped: &[SectionSkip],
-    limits: EventInputLimits,
-    from_us: i64,
-    to_us: i64,
-) -> LogEventInputs {
-    let mut events = LogEventInputs::new(limits);
-    ingest_log_errors(
-        pages.get(PG_LOG_ERRORS),
-        skipped,
-        &mut events,
-        from_us,
-        to_us,
-    );
-    ingest_log_lifecycle(
-        pages.get(PG_LOG_LIFECYCLE),
-        skipped,
-        &mut events,
-        from_us,
-        to_us,
-    );
-    if pages
-        .get(PG_LOG_GAP)
-        .is_some_and(|page| !page.rows.is_empty() || !page.gaps.is_empty())
-    {
+    let mut events = LogEventInputs::new(EventInputLimits::production());
+    let mut log_errors_seen = false;
+    let mut log_lifecycle_seen = false;
+    let mut log_gap_has_rows = false;
+    for &name in read_names {
+        if name == SNAPSHOT_COVERAGE {
+            continue;
+        }
+        let page = if gate_names.contains(name) {
+            gate_pages.remove(name)
+        } else {
+            stream_page(
+                snap,
+                scan,
+                name,
+                remaining_cells,
+                limits,
+                &mut state.skipped,
+            )?
+        };
+        let Some(page) = page else { continue };
+        match name {
+            PG_LOG_ERRORS => {
+                log_errors_seen = true;
+                ingest_log_errors(Some(&page), &state.skipped, &mut events, scan.from, scan.to);
+            }
+            PG_LOG_LIFECYCLE => {
+                log_lifecycle_seen = true;
+                ingest_log_lifecycle(Some(&page), &state.skipped, &mut events, scan.from, scan.to);
+            }
+            PG_LOG_GAP => {
+                log_gap_has_rows = !page.rows.is_empty() || !page.gaps.is_empty();
+            }
+            _ => {}
+        }
+        if let Some(logical) = logical_by_name.get(name) {
+            state.process(logical, page, &gates, scan, limits)?;
+        }
+    }
+    if !log_errors_seen {
+        ingest_log_errors(None, &state.skipped, &mut events, scan.from, scan.to);
+    }
+    if !log_lifecycle_seen {
+        ingest_log_lifecycle(None, &state.skipped, &mut events, scan.from, scan.to);
+    }
+    if log_gap_has_rows {
         events.set_coverage(PG_LOG_ERRORS, LogCoverage::Gap);
         events.set_coverage(PG_LOG_LIFECYCLE, LogCoverage::Gap);
     }
-    events
+    Ok(events)
 }
+
+/// Reads one section page under the remaining materialization budget,
+/// recording a typed skip when the budget denies the read.
+fn stream_page(
+    snap: &mut LocalDirSnapshot,
+    scan: &ScanParams,
+    name: &str,
+    remaining_cells: &mut usize,
+    limits: &InputLimits,
+    skipped: &mut Vec<SectionSkip>,
+) -> Result<Option<SectionPage>, InputError> {
+    if *remaining_cells == 0 {
+        skipped.push(materialization_skip(
+            name,
+            MaterializationKind::Cells,
+            limits.materialized_cells,
+        )?);
+        return Ok(None);
+    }
+    match section_with_limits(
+        snap,
+        name,
+        scan.from,
+        scan.to,
+        None,
+        QueryLimits::with_bytes(DIFF_MAX_ROWS, *remaining_cells, limits.materialized_bytes),
+    ) {
+        Ok(page) => {
+            charge_materialized_cells(&page, remaining_cells, limits.materialized_cells)?;
+            Ok(Some(page))
+        }
+        Err(QueryError::ResultTooLarge { .. }) => {
+            skipped.push(materialization_skip(
+                name,
+                MaterializationKind::Cells,
+                limits.materialized_cells,
+            )?);
+            Ok(None)
+        }
+        Err(QueryError::MaterializedBytesTooLarge { .. }) => {
+            skipped.push(materialization_skip(
+                name,
+                MaterializationKind::Bytes,
+                limits.materialized_bytes,
+            )?);
+            Ok(None)
+        }
+        Err(error) => Err(InputError::Read(error)),
+    }
+}
+
+const PG_LOG_ERRORS: &str = "pg_log_errors";
+const PG_LOG_LIFECYCLE: &str = "pg_log_lifecycle";
+const PG_LOG_GAP: &str = "pg_log_gap";
 
 /// `Gap` when the page is partial or has coverage gaps; otherwise `Unknown`,
 /// since effective log configuration is never proven from the rows alone.
@@ -508,129 +630,6 @@ fn read_str(row: &OutRow, name: &str) -> Option<String> {
         Value::Str(value) => Some(value.clone()),
         _ => None,
     }
-}
-
-struct InputPages {
-    logicals: Vec<LogicalSection>,
-    pages: BTreeMap<String, SectionPage>,
-    skipped: Vec<SectionSkip>,
-}
-
-fn read_input_pages(
-    snap: &mut LocalDirSnapshot,
-    scan: &ScanParams,
-    sections: &[&'static str],
-    limits: &InputLimits,
-) -> Result<InputPages, InputError> {
-    let names: BTreeSet<&'static str> = sections.iter().copied().collect();
-    if names.len() > limits.sections {
-        return Err(InputError::SectionLimit {
-            observed: names.len(),
-            limit: limits.sections,
-        });
-    }
-    let logicals: Vec<LogicalSection> = names
-        .into_iter()
-        .map(|name| {
-            logical_section(name).ok_or_else(|| InputError::UnknownSection(name.to_owned()))
-        })
-        .collect::<Result<_, _>>()?;
-
-    let mut read_names = BTreeSet::new();
-    read_names.extend(logicals.iter().map(|logical| logical.name));
-    read_names.extend(Gates::sections(&logicals));
-    read_names.insert(SNAPSHOT_COVERAGE);
-    let observed_sections = read_names.len();
-    if observed_sections > limits.sections {
-        return Err(InputError::SectionLimit {
-            observed: observed_sections,
-            limit: limits.sections,
-        });
-    }
-
-    let remaining_cells = limits.materialized_cells;
-    let read_names: Vec<&str> = read_names.into_iter().collect();
-    let batch = sections_with_limits(
-        snap,
-        scan.from,
-        scan.to,
-        &read_names,
-        &BTreeMap::new(),
-        QueryLimits::with_bytes(DIFF_MAX_ROWS, remaining_cells, limits.materialized_bytes),
-    );
-    let (pages, skipped) = match batch {
-        Ok(pages) => (pages, Vec::new()),
-        Err(QueryError::ResultTooLarge { .. }) => read_partial_pages(
-            snap,
-            scan,
-            &read_names,
-            remaining_cells,
-            limits.materialized_cells,
-            limits.materialized_bytes,
-        )?,
-        Err(QueryError::MaterializedBytesTooLarge { .. }) => {
-            return Err(InputError::MaterializationLimit {
-                resource: MaterializationKind::Bytes,
-                limit: limits.materialized_bytes,
-            });
-        }
-        Err(error) => return Err(InputError::Read(error)),
-    };
-
-    Ok(InputPages {
-        logicals,
-        pages,
-        skipped,
-    })
-}
-
-fn read_partial_pages(
-    snap: &mut LocalDirSnapshot,
-    scan: &ScanParams,
-    names: &[&str],
-    mut remaining_cells: usize,
-    materialization_limit: usize,
-    materialized_byte_limit: usize,
-) -> Result<(BTreeMap<String, SectionPage>, Vec<SectionSkip>), InputError> {
-    let mut pages = BTreeMap::new();
-    let mut skipped = Vec::new();
-    let per_section_bytes = materialized_byte_limit / names.len().max(1);
-    for &name in names {
-        if remaining_cells == 0 {
-            skipped.push(materialization_skip(
-                name,
-                MaterializationKind::Cells,
-                materialization_limit,
-            )?);
-            continue;
-        }
-        match section_with_limits(
-            snap,
-            name,
-            scan.from,
-            scan.to,
-            None,
-            QueryLimits::with_bytes(DIFF_MAX_ROWS, remaining_cells, per_section_bytes),
-        ) {
-            Ok(page) => {
-                charge_materialized_cells(&page, &mut remaining_cells, materialization_limit)?;
-                pages.insert(name.to_owned(), page);
-            }
-            Err(QueryError::ResultTooLarge { .. }) => {
-                skipped.push(materialization_skip(
-                    name,
-                    MaterializationKind::Cells,
-                    materialization_limit,
-                )?);
-                remaining_cells = 0;
-            }
-            Err(QueryError::MaterializedBytesTooLarge { .. }) => skipped.push(
-                materialization_skip(name, MaterializationKind::Bytes, per_section_bytes)?,
-            ),
-            Err(error) => return Err(InputError::Read(error)),
-        }
-    }
-    Ok((pages, skipped))
 }
 
 fn materialization_skip(
@@ -2715,28 +2714,19 @@ mod tests {
             .expect("metadata fits and oversized data is skipped");
         assert_eq!(
             prepared.skipped,
-            vec![
-                SectionSkip {
-                    section: "pg_stat_archiver",
-                    reason: SkipReason::MaterializationLimit {
-                        resource: MaterializationKind::Cells,
-                        limit: limits.materialized_cells,
-                    },
+            vec![SectionSkip {
+                section: "pg_stat_archiver",
+                reason: SkipReason::MaterializationLimit {
+                    resource: MaterializationKind::Cells,
+                    limit: limits.materialized_cells,
                 },
-                SectionSkip {
-                    section: SNAPSHOT_COVERAGE,
-                    reason: SkipReason::MaterializationLimit {
-                        resource: MaterializationKind::Cells,
-                        limit: limits.materialized_cells,
-                    },
-                },
-            ]
+            },]
         );
         assert!(prepared.episodes.is_empty());
     }
 
     #[test]
-    fn byte_materialization_is_typed_on_full_failure_and_partial_skip() {
+    fn byte_materialization_failure_is_a_typed_section_skip() {
         use kronika_registry::Ts;
         use kronika_registry::pg_stat_archiver::PgStatArchiver;
 
@@ -2764,35 +2754,24 @@ mod tests {
         let mut limits = InputLimits::for_test();
         limits.materialized_bytes = 1;
         let mut snap = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-        assert!(matches!(
-            prepare_input(&mut snap, &scan, &["pg_stat_archiver"], &limits),
-            Err(InputError::MaterializationLimit {
-                resource: MaterializationKind::Bytes,
-                limit: 1,
-            })
-        ));
-
-        let mut snap = LocalDirSnapshot::open(dir.path()).expect("reopen snapshot");
-        let (pages, skipped) = read_partial_pages(
+        let prepared = prepare_input(
             &mut snap,
             &scan,
             &["pg_stat_archiver", "pg_stat_wal"],
-            limits.materialized_cells,
-            limits.materialized_cells,
-            2,
+            &limits,
         )
-        .expect("a per-section byte failure is a successful partial read");
-        assert!(pages.contains_key("pg_stat_wal"));
-        assert_eq!(
-            skipped,
-            vec![SectionSkip {
-                section: "pg_stat_archiver",
-                reason: SkipReason::MaterializationLimit {
-                    resource: MaterializationKind::Bytes,
-                    limit: 1,
-                },
-            }]
-        );
+        .expect("a per-section byte failure degrades instead of failing the request");
+        assert!(prepared.episodes.is_empty());
+        assert!(prepared.skipped.iter().any(|skip| {
+            skip.section == "pg_stat_archiver"
+                && matches!(
+                    skip.reason,
+                    SkipReason::MaterializationLimit {
+                        resource: MaterializationKind::Bytes,
+                        limit: 1,
+                    }
+                )
+        }));
     }
 
     #[test]
@@ -3316,7 +3295,9 @@ mod tests {
 
     #[test]
     fn a_missing_page_is_not_collected() {
-        let events = build_log_events(&BTreeMap::new(), &[], EventInputLimits::production(), -1, 1);
+        let mut events = LogEventInputs::new(EventInputLimits::production());
+        ingest_log_errors(None, &[], &mut events, -1, 1);
+        ingest_log_lifecycle(None, &[], &mut events, -1, 1);
         assert_eq!(
             events.coverage().get("pg_log_errors"),
             Some(&LogCoverage::NotCollected),
@@ -3418,9 +3399,8 @@ mod tests {
         );
         assert_eq!(state.quality.evaluated_positions, 0);
 
-        let mut pages = BTreeMap::new();
-        pages.insert(PG_LOG_ERRORS.to_owned(), page);
-        let events = build_log_events(&pages, &[], EventInputLimits::production(), -1, 1);
+        let mut events = LogEventInputs::new(EventInputLimits::production());
+        ingest_log_errors(Some(&page), &[], &mut events, -1, 1);
         let rendered = format!("{:?}", event_findings(&events));
         assert!(!rendered.contains(secret));
         assert!(!rendered.contains("hunter2"));
