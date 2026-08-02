@@ -219,6 +219,7 @@ git commit -m "fix(web): convert process ticks with instance hz"
 - Modify: `bins/pg_kronika-web/src/tests/ui_frame.rs`
 - Modify: `web/src/i18n/en.json`
 - Modify: `web/src/i18n/ru.json`
+- Modify: `web/scripts/demo-stub.mjs`
 - Modify if references exist: `web/src/**/*.{ts,tsx}`
 
 **Interfaces:**
@@ -254,7 +255,7 @@ Expected: catalog codes are old and lock projection fabricates a hold duration.
 
 - [ ] **Step 3: Rename codes, formulas, presets, and bilingual copy**
 
-Replace all public `first_seen`/`last_seen` usages with `first_call`/`last_call`. Replace `wait_or_hold_us` with `wait_age_us`, compute it only from `waitstart`, and remove every claim that it measures lock hold time. Bump plan and lock view revisions to `2`, lock metric revision to `2`, and keep numeric codes stable.
+Replace all public `first_seen`/`last_seen` usages with `first_call`/`last_call`. Replace `wait_or_hold_us` with `wait_age_us`, compute it only from `waitstart`, and remove every claim that it measures lock hold time. Update the demo stub's row keys/classifications at the same time; the checked-in generated catalog fixture is synchronized in Task 5. Bump plan and lock view revisions to `2`, lock metric revision to `2`, and keep numeric codes stable.
 
 Update EN/RU labels and descriptions. Also make all statement/plan/table/index buffer-read copy explicit that `*_blks_read` is a PostgreSQL-buffer read which may be served from the OS page cache; do not call it physical disk I/O. Describe `/proc/<pid>/io` byte rates as storage-accounted process I/O.
 
@@ -273,7 +274,7 @@ Expected: Rust tests PASS; frontend tests PASS with no missing EN/RU keys. If th
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/kronika-analytics/src/web_projection.rs bins/pg_kronika-web/src/ui/catalog.rs bins/pg_kronika-web/src/ui/frame/projection.rs bins/pg_kronika-web/src/tests/ui_catalog.rs bins/pg_kronika-web/src/tests/ui_frame.rs web/src
+git add crates/kronika-analytics/src/web_projection.rs bins/pg_kronika-web/src/ui/catalog.rs bins/pg_kronika-web/src/ui/frame/projection.rs bins/pg_kronika-web/src/tests/ui_catalog.rs bins/pg_kronika-web/src/tests/ui_frame.rs web/src web/scripts/demo-stub.mjs
 git commit -m "fix(web): align labels with collected evidence"
 ```
 
