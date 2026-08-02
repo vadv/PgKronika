@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   makeEventFact,
   makeEventsResponse,
@@ -13,6 +13,16 @@ import {
 } from "../testkit/apiFixtures";
 import { Spine, type SpineProps } from "./Spine";
 
+class TestPointerEvent extends MouseEvent {
+  readonly pointerId: number;
+
+  constructor(type: string, init: PointerEventInit = {}) {
+    super(type, init);
+    this.pointerId = init.pointerId ?? 0;
+  }
+}
+
+beforeEach(() => vi.stubGlobal("PointerEvent", TestPointerEvent));
 afterEach(() => vi.unstubAllGlobals());
 
 /** Fixed cursor; the spine window follows the zoom span (1 h here). */
@@ -252,6 +262,93 @@ test("a health-less window renders honest gap markers, not silence", async () =>
     screen.getAllByTestId("spine-ribbon-gap")[0]?.querySelector("title")
       ?.textContent,
   ).toContain("spine.missing");
+  expect(screen.getByTestId("spine-score").textContent).toContain("—");
+  expect(screen.getByTestId("health-line-quality").textContent).toContain(
+    "0/96",
+  );
+});
+
+test("selection overlays share one SVG grid while gap hatch remains on top", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href;
+      const body = url.includes("/v1/timeline/health")
+        ? makeHealthResponse({ points: [] })
+        : url.includes("/v1/timeline/events")
+          ? makeEventsResponse({ events: [] })
+          : url.includes("/v1/incidents")
+            ? makeIncidentsResponse()
+            : spineFixture;
+      return Promise.resolve(jsonResponse(body));
+    }),
+  );
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+  render(
+    <Spine
+      at={String(AT_US)}
+      span={3600}
+      baseline={String(FROM_US + WINDOW_US / 2)}
+      range={{ fromUs: String(FROM_US), toUs: String(AT_US) }}
+      hoverUs={String(FROM_US + WINDOW_US / 4)}
+      brushDraft={{
+        fromUs: String(FROM_US + WINDOW_US / 5),
+        toUs: String(FROM_US + (WINDOW_US * 7) / 10),
+      }}
+      onSelectAt={() => {}}
+      onSelectBaseline={() => {}}
+    />,
+    { wrapper },
+  );
+
+  await waitFor(() =>
+    expect(screen.getAllByTestId("spine-ribbon-gap")).toHaveLength(96),
+  );
+  const selected = screen.getByTestId("health-selected-range");
+  const draft = screen.getByTestId("health-brush-draft");
+  const baseline = screen.getByTestId("spine-baseline");
+  const hover = screen.getByTestId("health-hover-cursor");
+  const firstHatch = screen.getAllByTestId("spine-gap-hatch")[0];
+
+  expect(selected.getAttribute("x")).toBe("0");
+  expect(selected.getAttribute("width")).toBe("1000");
+  expect(draft.getAttribute("x")).toBe("200");
+  expect(draft.getAttribute("width")).toBe("500");
+  expect(baseline.getAttribute("x1")).toBe("500");
+  expect(hover.getAttribute("x1")).toBe("250");
+  expect(
+    selected.compareDocumentPosition(firstHatch as Node) &
+      Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+  expect(
+    draft.compareDocumentPosition(firstHatch as Node) &
+      Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+});
+
+test("server verdicts have text alternatives independent of ribbon color", async () => {
+  renderSpine();
+  await waitFor(() =>
+    expect(screen.getAllByTestId("spine-ribbon-crit").length).toBeGreaterThan(
+      0,
+    ),
+  );
+  expect(
+    screen.getAllByTestId("spine-ribbon-ok")[0]?.getAttribute("aria-label"),
+  ).toContain("spine.verdict.ok");
+  expect(
+    screen.getAllByTestId("spine-ribbon-warn")[0]?.getAttribute("aria-label"),
+  ).toContain("spine.verdict.warn");
+  expect(
+    screen.getAllByTestId("spine-ribbon-crit")[0]?.getAttribute("aria-label"),
+  ).toContain("spine.verdict.crit");
 });
 
 test("an empty window shows the no-data line instead of a blank chart", async () => {
@@ -298,7 +395,7 @@ test("an empty window shows the no-data line instead of a blank chart", async ()
   expect(screen.queryByRole("slider")).toBeNull();
 });
 
-test("click on the strip reports the cursor µs at that position", async () => {
+test("pointer click on the strip reports the cursor µs at that position", async () => {
   const onSelectAt = vi.fn();
   renderSpine({ onSelectAt });
   await waitFor(() =>
@@ -306,7 +403,12 @@ test("click on the strip reports the cursor µs at that position", async () => {
   );
   const svg = screen.getByRole("slider");
   stubRect(svg);
-  fireEvent.click(svg, { clientX: 500 });
+  Object.assign(svg, {
+    setPointerCapture: vi.fn(),
+    releasePointerCapture: vi.fn(),
+  });
+  fireEvent.pointerDown(svg, { clientX: 500, pointerId: 1, button: 0 });
+  fireEvent.pointerUp(svg, { clientX: 500, pointerId: 1, button: 0 });
   expect(onSelectAt).toHaveBeenCalledWith(String(FROM_US + WINDOW_US / 2));
 });
 
@@ -321,37 +423,97 @@ test("shift+click sets the baseline, a repeat nearby clears it", async () => {
   );
   const svg = screen.getByRole("slider");
   stubRect(svg);
-  fireEvent.click(svg, { clientX: 100, shiftKey: true });
+  Object.assign(svg, {
+    setPointerCapture: vi.fn(),
+    releasePointerCapture: vi.fn(),
+  });
+  fireEvent.pointerDown(svg, {
+    clientX: 100,
+    pointerId: 1,
+    button: 0,
+    shiftKey: true,
+  });
+  fireEvent.pointerUp(svg, {
+    clientX: 100,
+    pointerId: 1,
+    button: 0,
+    shiftKey: true,
+  });
   expect(onSelectBaseline).toHaveBeenCalledWith(
     String(FROM_US + WINDOW_US / 10),
   );
   // 500px == the current baseline position; repeat shift-click clears it.
-  fireEvent.click(svg, { clientX: 500, shiftKey: true });
+  fireEvent.pointerDown(svg, {
+    clientX: 500,
+    pointerId: 2,
+    button: 0,
+    shiftKey: true,
+  });
+  fireEvent.pointerUp(svg, {
+    clientX: 500,
+    pointerId: 2,
+    button: 0,
+    shiftKey: true,
+  });
   expect(onSelectBaseline).toHaveBeenLastCalledWith(null);
 });
 
-test("mode button delegates LIVE and REPLAY changes to the shared clock", async () => {
-  const onToggleLive = vi.fn();
-  const { unmount } = renderSpine({ at: null, onToggleLive });
-  const liveButton = await screen.findByRole("button", { name: /live/i });
-  fireEvent.click(liveButton);
-  expect(onToggleLive).toHaveBeenCalledTimes(1);
-  unmount();
-
-  renderSpine({ at: String(AT_US), onToggleLive });
-  const replayButton = await screen.findByRole("button", { name: /replay/i });
-  fireEvent.click(replayButton);
-  expect(onToggleLive).toHaveBeenCalledTimes(2);
-});
-
-test("zoom group reports the selected span", async () => {
-  const onSelectSpan = vi.fn();
-  renderSpine({ onSelectSpan });
+test("timeline contains no embedded mode or zoom controls", async () => {
+  renderSpine();
   await waitFor(() =>
     expect(screen.getAllByTestId("spine-ribbon-ok").length).toBeGreaterThan(0),
   );
-  fireEvent.click(screen.getByRole("button", { name: /86400/ }));
-  expect(onSelectSpan).toHaveBeenCalledWith(86400);
+  expect(screen.queryByRole("button")).toBeNull();
+  expect(screen.queryByRole("group", { name: /spine\.zoom/i })).toBeNull();
+});
+
+test("pointer brush previews immediately and commits exactly once on pointer up", async () => {
+  const onBrushDraft = vi.fn();
+  const onCommitRange = vi.fn();
+  const setPointerCapture = vi.fn();
+  const releasePointerCapture = vi.fn();
+  renderSpine({ onBrushDraft, onCommitRange });
+  const svg = await screen.findByRole("slider");
+  stubRect(svg);
+  Object.assign(svg, { setPointerCapture, releasePointerCapture });
+
+  fireEvent.pointerDown(svg, { clientX: 200, pointerId: 7, button: 0 });
+  fireEvent.pointerMove(svg, { clientX: 650, pointerId: 7, buttons: 1 });
+  expect(setPointerCapture).toHaveBeenCalledWith(7);
+  expect(onBrushDraft).toHaveBeenLastCalledWith({
+    fromUs: String(FROM_US + WINDOW_US * 0.2),
+    toUs: String(FROM_US + WINDOW_US * 0.65),
+  });
+  expect(onCommitRange).not.toHaveBeenCalled();
+
+  fireEvent.pointerUp(svg, { clientX: 650, pointerId: 7, button: 0 });
+  expect(onCommitRange).toHaveBeenCalledTimes(1);
+  expect(onCommitRange).toHaveBeenCalledWith({
+    fromUs: String(FROM_US + WINDOW_US * 0.2),
+    toUs: String(FROM_US + WINDOW_US * 0.65),
+  });
+  expect(releasePointerCapture).toHaveBeenCalledWith(7);
+});
+
+test("sub-threshold pointer movement remains a cursor click", async () => {
+  const onSelectAt = vi.fn();
+  const onCommitRange = vi.fn();
+  renderSpine({ onSelectAt, onCommitRange });
+  const svg = await screen.findByRole("slider");
+  stubRect(svg);
+  Object.assign(svg, {
+    setPointerCapture: vi.fn(),
+    releasePointerCapture: vi.fn(),
+  });
+
+  fireEvent.pointerDown(svg, { clientX: 500, pointerId: 9, button: 0 });
+  fireEvent.pointerMove(svg, { clientX: 503, pointerId: 9, buttons: 1 });
+  fireEvent.pointerUp(svg, { clientX: 503, pointerId: 9, button: 0 });
+
+  expect(onCommitRange).not.toHaveBeenCalled();
+  expect(onSelectAt).toHaveBeenCalledWith(
+    String(FROM_US + Math.round(WINDOW_US * 0.503)),
+  );
 });
 
 test("live mode anchors the grid and hatches the forming tail bucket", async () => {

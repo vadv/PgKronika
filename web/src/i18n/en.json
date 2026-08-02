@@ -515,6 +515,8 @@
   "spine.verdict.warn": "warn",
   "spine.verdict.crit": "crit",
   "spine.error": "strip unavailable",
+  "healthLine.coincidence": "PostgreSQL and OS signals observed in the same window with collection quality; coincidence is not proof of causality.",
+  "healthLine.quality": "Health verdict coverage: {{observed}} of {{total}} buckets",
   "health.domain.database_error_pressure": "database errors",
   "health.domain.connection_capacity": "connection capacity",
   "health.domain.contention": "contention",

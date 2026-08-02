@@ -515,6 +515,8 @@
   "spine.verdict.warn": "варн",
   "spine.verdict.crit": "крит",
   "spine.error": "лента недоступна",
+  "healthLine.coincidence": "Сигналы PostgreSQL и ОС в одном окне вместе с качеством сбора; совпадение не доказывает причинную связь.",
+  "healthLine.quality": "Покрытие health-вердиктами: {{observed}} из {{total}} бакетов",
   "health.domain.database_error_pressure": "ошибки БД",
   "health.domain.connection_capacity": "ёмкость подключений",
   "health.domain.contention": "конкуренция за ресурсы",

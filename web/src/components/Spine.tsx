@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { eventKindLabel, metricLabel } from "../api/codes";
 import { isWarmingUp } from "../api/client";
@@ -11,7 +11,6 @@ import {
   formatDurationUs,
   formatTimestampUs,
 } from "../design/format";
-import { SPANS } from "../state/url";
 import type { TimeRange } from "../state/timeGeometry";
 import { Tooltip } from "./Tooltip";
 import {
@@ -34,12 +33,22 @@ export interface SpineProps {
   baseline: string | null;
   /** Canonical provider-owned selected range. */
   range: TimeRange;
-  /** The forensic shell owns these controls in its primary navigation. */
-  controls?: "embedded" | "external";
+  /** Provider-owned ephemeral hover and draft selection. */
+  hoverUs?: string | null;
+  brushDraft?: TimeRange | null;
   onSelectAt: (at: string) => void;
-  onSelectSpan: (span: number) => void;
   onSelectBaseline: (baseline: string | null) => void;
-  onToggleLive: () => void;
+  onHover?: (hoverUs: string | null) => void;
+  onBrushDraft?: (range: TimeRange | null) => void;
+  onCommitRange?: (range: TimeRange) => void;
+  /** Accessible explanation: coincidence and collection quality, not cause. */
+  meaning?: string;
+  /** @deprecated Navigation owns mode and prepared spans. */
+  controls?: "embedded" | "external";
+  /** @deprecated Navigation owns prepared spans. */
+  onSelectSpan?: (span: number) => void;
+  /** @deprecated Navigation owns Live/Replay. */
+  onToggleLive?: () => void;
 }
 
 const SVG_HEIGHT = 40;
@@ -53,11 +62,21 @@ const GLYPH_Y = 20;
 const SPARK_Y = 26;
 const SPARK_H = 12;
 const LIVE_REFRESH_MS = 5000;
-const KEYBOARD_STEP_US = 300 * 1_000_000;
+const HOUR_US = 3_600_000_000n;
+const CURSOR_STEP_DIVISOR = 48n;
 /** Grid resolution requested from `/v1/timeline/spine` and the ribbon. */
 const SPINE_BUCKETS = 96;
 /** Repeat shift-click within this share of the window clears the baseline. */
 const BASELINE_CLEAR_FRACTION = 0.02;
+/** Pointer jitter below this distance is a click, not a fabricated range. */
+const BRUSH_THRESHOLD_PX = 4;
+
+interface PointerGesture {
+  pointerId: number;
+  startClientX: number;
+  startUs: string;
+  dragging: boolean;
+}
 
 // Primary series: the first one that carries at least one real sample. The
 // API orders series by relevance (host load first, PSI after it), so we do
@@ -155,7 +174,7 @@ function formatMin(minutes: number): string {
 export function Spine(props: SpineProps) {
   const { t } = useTranslation();
   const live = props.at === null;
-  const [hoverUs, setHoverUs] = useState<number | null>(null);
+  const gestureRef = useRef<PointerGesture | null>(null);
   // Wire range follows the zoom span (exact BigInt math); the URL codec
   // enforces the public 1 second..24 hour bound.
   const windowUs = BigInt(props.span) * 1_000_000n;
@@ -170,8 +189,8 @@ export function Spine(props: SpineProps) {
   const prevFrom = (fromBig - windowUs).toString();
   // Absolute timestamps are converted only for the existing bounded SVG
   // geometry; every API query above keeps the exact provider-owned strings.
-  const toUs = Number(toBig);
-  const fromUs = toUs - windowNum;
+  const fromUs = Number(fromBig);
+  const toUs = fromUs + windowNum;
   // LIVE: the last bucket is still forming — hatched, out of the score.
   const hasFormingTail = live;
 
@@ -193,7 +212,13 @@ export function Spine(props: SpineProps) {
   const events = useTimelineEvents({ from, to, limit: 50 }, liveOpts);
   const incidents = useIncidents({ from: prevFrom, to }, liveOpts);
 
-  const cursorX = (us: number) => ((us - fromUs) / windowNum) * SVG_WIDTH;
+  const timestampX = (timestampUs: string | number): number => {
+    const value =
+      typeof timestampUs === "number"
+        ? BigInt(Math.round(timestampUs))
+        : BigInt(timestampUs);
+    return (Number(value - fromBig) / windowNum) * SVG_WIDTH;
+  };
   const allSeries = spine.data?.series ?? [];
   const primary = pickPrimarySeries(allSeries);
   const geom: BucketGeometry | null = spine.data
@@ -208,7 +233,7 @@ export function Spine(props: SpineProps) {
     primary !== null && geom !== null
       ? sparkSegments(primary, geom, fromUs, windowNum)
       : { lines: [], dots: [] };
-  const baselineUs = props.baseline !== null ? Number(props.baseline) : null;
+  const baselineUs = props.baseline;
   const visibleEvents = (events.data?.events ?? []).filter((e) => {
     const ts = e.occurred_at_us ?? e.sort_ts_us;
     return ts >= fromUs && ts <= toUs;
@@ -242,8 +267,11 @@ export function Spine(props: SpineProps) {
     props.span,
     countWindowIncidents(allIncidents, fromUs - windowNum, fromUs),
   );
+  const observedBuckets = scored.filter((verdict) => verdict !== "gap").length;
+  const hasCurrent = observedBuckets > 0;
   const hasPrevious = previousVerdicts.some((v) => v !== "gap");
-  const delta = hasPrevious ? score.score - previousScore.score : null;
+  const delta =
+    hasCurrent && hasPrevious ? score.score - previousScore.score : null;
   const tone = chipTone(score.score);
 
   const currentValue = (() => {
@@ -283,25 +311,89 @@ export function Spine(props: SpineProps) {
     );
   };
 
-  const pickUs = (e: React.MouseEvent<SVGSVGElement>): number => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const fraction = (e.clientX - rect.left) / rect.width;
-    return Math.round(fromUs + fraction * windowNum);
+  const pickUs = (target: SVGSVGElement, clientX: number): string => {
+    const rect = target.getBoundingClientRect();
+    const fraction = Math.min(
+      1,
+      Math.max(0, rect.width > 0 ? (clientX - rect.left) / rect.width : 0),
+    );
+    return (fromBig + BigInt(Math.round(fraction * windowNum))).toString();
   };
 
-  const onStripClick = (e: React.MouseEvent<SVGSVGElement>) => {
-    const us = pickUs(e);
-    if (e.shiftKey) {
+  const selectPoint = (us: string, shiftKey: boolean) => {
+    if (shiftKey) {
       if (
         baselineUs !== null &&
-        Math.abs(us - baselineUs) <= BASELINE_CLEAR_FRACTION * windowNum
+        Number(
+          BigInt(us) >= BigInt(baselineUs)
+            ? BigInt(us) - BigInt(baselineUs)
+            : BigInt(baselineUs) - BigInt(us),
+        ) <=
+          BASELINE_CLEAR_FRACTION * windowNum
       ) {
         props.onSelectBaseline(null);
       } else {
-        props.onSelectBaseline(String(us));
+        props.onSelectBaseline(us);
       }
     } else {
-      props.onSelectAt(String(us));
+      props.onSelectAt(us);
+    }
+  };
+
+  const rangeBetween = (leftUs: string, rightUs: string): TimeRange =>
+    BigInt(leftUs) <= BigInt(rightUs)
+      ? { fromUs: leftUs, toUs: rightUs }
+      : { fromUs: rightUs, toUs: leftUs };
+
+  const onStripPointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0) return;
+    const startUs = pickUs(e.currentTarget, e.clientX);
+    gestureRef.current = {
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startUs,
+      dragging: false,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const onStripPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const currentUs = pickUs(e.currentTarget, e.clientX);
+    props.onHover?.(currentUs);
+    const gesture = gestureRef.current;
+    if (gesture === null || gesture.pointerId !== e.pointerId) return;
+    if (
+      !gesture.dragging &&
+      Math.abs(e.clientX - gesture.startClientX) >= BRUSH_THRESHOLD_PX
+    ) {
+      gesture.dragging = true;
+    }
+    if (gesture.dragging) {
+      props.onBrushDraft?.(rangeBetween(gesture.startUs, currentUs));
+    }
+  };
+
+  const finishPointer = (e: React.PointerEvent<SVGSVGElement>) => {
+    const gesture = gestureRef.current;
+    if (gesture === null || gesture.pointerId !== e.pointerId) return;
+    const currentUs = pickUs(e.currentTarget, e.clientX);
+    gestureRef.current = null;
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId) ?? true) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    if (gesture.dragging) {
+      props.onCommitRange?.(rangeBetween(gesture.startUs, currentUs));
+    } else {
+      selectPoint(currentUs, e.shiftKey);
+    }
+  };
+
+  const cancelPointer = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (gestureRef.current?.pointerId !== e.pointerId) return;
+    gestureRef.current = null;
+    props.onBrushDraft?.(null);
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId) ?? true) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
     }
   };
 
@@ -310,9 +402,11 @@ export function Spine(props: SpineProps) {
       // Own the key fully: the global handler must not also apply its step.
       e.preventDefault();
       e.stopPropagation();
-      const delta =
-        e.key === "ArrowLeft" ? -KEYBOARD_STEP_US : KEYBOARD_STEP_US;
-      props.onSelectAt(String(toUs + delta));
+      const step = e.shiftKey
+        ? HOUR_US
+        : (BigInt(Math.max(1, props.span)) * 1_000_000n) / CURSOR_STEP_DIVISOR;
+      const delta = e.key === "ArrowLeft" ? -step : step;
+      props.onSelectAt((toBig + delta).toString());
     }
   };
 
@@ -343,12 +437,18 @@ export function Spine(props: SpineProps) {
   return (
     <section
       aria-label={t("spine.caption")}
+      aria-describedby="health-line-meaning"
+      data-testid="health-line"
+      data-shell-region="health-line"
       style={{
         display: "flex",
         alignItems: "center",
         gap: "8px",
-        flexWrap: "wrap",
-        padding: "4px 12px",
+        flexWrap: "nowrap",
+        height: "60px",
+        minHeight: "60px",
+        boxSizing: "border-box",
+        padding: "4px 8px",
         background: "var(--bg-raised)",
         border: "1px solid var(--border)",
         borderRadius: "var(--radius-md)",
@@ -366,63 +466,23 @@ export function Spine(props: SpineProps) {
       >
         {t("spine.caption")}
       </span>
-      {props.controls !== "external" && (
-        <>
-          <button
-            type="button"
-            aria-pressed={!live}
-            onClick={props.onToggleLive}
-            style={{
-              fontSize: "var(--text-xs)",
-              fontWeight: 600,
-              letterSpacing: "var(--tracking-caps)",
-              color: live ? "var(--sev-ok-fg)" : "var(--sev-warn-fg)",
-              background: live ? "var(--sev-ok-bg)" : "var(--sev-warn-bg)",
-              border: `1px solid ${live ? "var(--sev-ok)" : "var(--sev-warn)"}`,
-              borderRadius: "var(--radius-sm)",
-              padding: "1px 8px",
-              cursor: "pointer",
-            }}
-          >
-            {live ? t("spine.live") : t("spine.replay")}
-          </button>
-          <div
-            role="group"
-            aria-label={t("spine.zoom")}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              background: "var(--bg)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius-sm)",
-              overflow: "hidden",
-            }}
-          >
-            {SPANS.map((s) => (
-              <button
-                key={s}
-                type="button"
-                aria-pressed={props.span === s}
-                onClick={() => props.onSelectSpan(s)}
-                style={{
-                  fontSize: "var(--text-xs)",
-                  padding: "2px 8px",
-                  border: "none",
-                  background:
-                    props.span === s ? "var(--active-bg)" : "transparent",
-                  color:
-                    props.span === s ? "var(--accent-strong)" : "var(--fg-dim)",
-                  cursor: "pointer",
-                  transition:
-                    "color var(--transition-fast), background var(--transition-fast)",
-                }}
-              >
-                {t(`spine.span.${s}`)}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
+      <span
+        id="health-line-meaning"
+        data-testid="health-line-meaning"
+        style={{
+          position: "absolute",
+          width: "1px",
+          height: "1px",
+          padding: 0,
+          margin: "-1px",
+          overflow: "hidden",
+          clip: "rect(0, 0, 0, 0)",
+          whiteSpace: "nowrap",
+          border: 0,
+        }}
+      >
+        {props.meaning ?? t("healthLine.coincidence")}
+      </span>
       {!warming && !failed && !empty && (
         <Tooltip
           content={
@@ -464,7 +524,7 @@ export function Spine(props: SpineProps) {
                   color: CHIP_FG[tone],
                 }}
               >
-                {score.score}
+                {hasCurrent ? score.score : "—"}
               </span>
               <span
                 style={{
@@ -528,19 +588,25 @@ export function Spine(props: SpineProps) {
           role="slider"
           tabIndex={0}
           aria-label={t("spine.timeline")}
-          aria-valuemin={fromUs}
-          aria-valuemax={toUs}
-          aria-valuenow={toUs}
+          {...({
+            // React's ARIA types only admit `number`, but converting an int64
+            // µs timestamp would lose precision. Attribute values are strings
+            // in the DOM, so preserve the provider-owned decimal boundary.
+            "aria-valuemin": from,
+            "aria-valuemax": to,
+            "aria-valuenow": to,
+          } as unknown as React.AriaAttributes)}
+          aria-valuetext={cursorLabel}
           viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
           preserveAspectRatio="none"
-          onClick={onStripClick}
+          onPointerDown={onStripPointerDown}
+          onPointerMove={onStripPointerMove}
+          onPointerUp={finishPointer}
+          onPointerCancel={cancelPointer}
           onKeyDown={onStripKeyDown}
-          onMouseMove={(e) => {
-            const rect = e.currentTarget.getBoundingClientRect();
-            const fraction = (e.clientX - rect.left) / rect.width;
-            setHoverUs(Math.round(fromUs + fraction * windowNum));
+          onPointerLeave={() => {
+            if (gestureRef.current === null) props.onHover?.(null);
           }}
-          onMouseLeave={() => setHoverUs(null)}
           style={{
             flex: 1,
             minWidth: "200px",
@@ -570,7 +636,36 @@ export function Spine(props: SpineProps) {
                 opacity="0.6"
               />
             </pattern>
+            <pattern
+              id="spine-gap-hatch"
+              width="5"
+              height="5"
+              patternUnits="userSpaceOnUse"
+              patternTransform="rotate(45)"
+            >
+              <line
+                x1="0"
+                y1="0"
+                x2="0"
+                y2="5"
+                stroke="var(--fg-dim)"
+                strokeWidth="0.45"
+                opacity="0.45"
+              />
+            </pattern>
           </defs>
+          {!live && (
+            <rect
+              data-testid="health-selected-range"
+              x={0}
+              y={0}
+              width={SVG_WIDTH}
+              height={SVG_HEIGHT}
+              fill="var(--active-bg)"
+              opacity="0.16"
+              pointerEvents="none"
+            />
+          )}
           {/* Verdict ribbon: one cell per bucket, calm cells quiet, warn/crit
               full-saturation; a bucket with no server verdict is an explicit
               gap substrate (raised band + hairline), never a silent hole. */}
@@ -621,6 +716,7 @@ export function Spine(props: SpineProps) {
                 {v === "gap" ? (
                   <rect
                     data-testid="spine-ribbon-gap"
+                    aria-label={verdictLabel}
                     x={x}
                     y={RIBBON_Y}
                     width={cellW}
@@ -634,6 +730,7 @@ export function Spine(props: SpineProps) {
                 ) : (
                   <rect
                     data-testid={`spine-ribbon-${v}`}
+                    aria-label={verdictLabel}
                     x={x}
                     y={RIBBON_Y}
                     width={cellW}
@@ -682,13 +779,43 @@ export function Spine(props: SpineProps) {
               fill="var(--accent)"
             />
           ))}
+          {props.brushDraft !== null && props.brushDraft !== undefined && (
+            <rect
+              data-testid="health-brush-draft"
+              x={Math.max(0, timestampX(props.brushDraft.fromUs))}
+              y={0}
+              width={Math.max(
+                0,
+                Math.min(SVG_WIDTH, timestampX(props.brushDraft.toUs)) -
+                  Math.max(0, timestampX(props.brushDraft.fromUs)),
+              )}
+              height={SVG_HEIGHT}
+              fill="var(--accent)"
+              opacity="0.18"
+              pointerEvents="none"
+            />
+          )}
+          {verdicts.map((verdict, index) =>
+            verdict === "gap" ? (
+              <rect
+                key={`gap-hatch-${index}`}
+                data-testid="spine-gap-hatch"
+                x={(index * SVG_WIDTH) / SPINE_BUCKETS}
+                y={RIBBON_Y}
+                width={Math.max(SVG_WIDTH / SPINE_BUCKETS - 1, 0.5)}
+                height={RIBBON_H}
+                fill="url(#spine-gap-hatch)"
+                pointerEvents="none"
+              />
+            ) : null,
+          )}
           {baselineUs !== null &&
-            baselineUs >= fromUs &&
-            baselineUs <= toUs && (
+            BigInt(baselineUs) >= fromBig &&
+            BigInt(baselineUs) <= toBig && (
               <line
                 data-testid="spine-baseline"
-                x1={cursorX(baselineUs)}
-                x2={cursorX(baselineUs)}
+                x1={timestampX(baselineUs)}
+                x2={timestampX(baselineUs)}
                 y1={0}
                 y2={SVG_HEIGHT}
                 stroke="var(--accent)"
@@ -709,10 +836,11 @@ export function Spine(props: SpineProps) {
               vectorEffect="non-scaling-stroke"
             />
           )}
-          {hoverUs !== null && (
+          {props.hoverUs !== null && props.hoverUs !== undefined && (
             <line
-              x1={cursorX(hoverUs)}
-              x2={cursorX(hoverUs)}
+              data-testid="health-hover-cursor"
+              x1={timestampX(props.hoverUs)}
+              x2={timestampX(props.hoverUs)}
               y1={0}
               y2={SVG_HEIGHT}
               stroke="var(--fg-dim)"
@@ -728,7 +856,7 @@ export function Spine(props: SpineProps) {
               <text
                 key={e.event_instance_id}
                 data-event-kind={e.event_kind}
-                x={cursorX(ts)}
+                x={timestampX(ts)}
                 y={GLYPH_Y}
                 fontSize="10"
                 textAnchor="middle"
@@ -764,6 +892,16 @@ export function Spine(props: SpineProps) {
               ok: counts.ok,
             })}
           >
+            <span
+              data-testid="health-line-quality"
+              aria-label={t("healthLine.quality", {
+                observed: observedBuckets,
+                total: scored.length,
+              })}
+            >
+              {`Q ${observedBuckets}/${scored.length}`}
+            </span>{" "}
+            ·{" "}
             {primary !== null && currentValue !== null && (
               <>
                 {metricLabel(t, "os", primary.code)}{" "}

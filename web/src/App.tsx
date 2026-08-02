@@ -13,7 +13,7 @@ import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
 import { PrimaryNavigation } from "./components/PrimaryNavigation";
 import { ShellLayout } from "./components/ShellLayout";
-import { Spine } from "./components/Spine";
+import { HealthLine } from "./components/HealthLine";
 import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
 import { TableView } from "./components/TableView";
@@ -75,7 +75,6 @@ function Shell() {
     patchUiState: patch,
     setCursor,
     setSpan,
-    setBaseline,
     toggleLive,
   } = useTimeGeometry();
   const [dataHealthOpen, setDataHealthOpen] = useState(false);
@@ -326,17 +325,7 @@ function Shell() {
             padding: "var(--space-2) var(--space-3)",
           }}
         >
-          <Spine
-            at={state.at}
-            span={state.span}
-            baseline={state.baseline}
-            range={range}
-            controls="external"
-            onSelectAt={setCursor}
-            onSelectSpan={setSpan}
-            onSelectBaseline={setBaseline}
-            onToggleLive={toggleLive}
-          />
+          <HealthLine />
           {(state.view === "locks" || state.view === "processes") && (
             <aside
               data-testid="contextual-deep-link"

@@ -413,9 +413,9 @@ test("arrow keys on the spine slider step by its own delta, not the global one",
   const slider = await screen.findByRole("slider");
   fireEvent.keyDown(slider, { key: "ArrowRight" });
   const stepped = new URLSearchParams(location.hash.slice(1)).get("at");
-  // The slider owns the key (5 min step); the global handler must not apply
-  // its span/48 step on top — exactly one patch, slider-sized.
-  expect(BigInt(stepped ?? "0") - 1_722_400_000_000_000n).toBe(300_000_000n);
+  // The slider owns the shared span/48 step; the global handler must not add
+  // a second step on top — exactly one 75 s patch.
+  expect(BigInt(stepped ?? "0") - 1_722_400_000_000_000n).toBe(75_000_000n);
 });
 
 test("Enter on a focused button belongs to the button, not global shortcuts", async () => {
