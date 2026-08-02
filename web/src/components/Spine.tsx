@@ -34,6 +34,8 @@ export interface SpineProps {
   baseline: string | null;
   /** Canonical provider-owned selected range. */
   range: TimeRange;
+  /** The forensic shell owns these controls in its primary navigation. */
+  controls?: "embedded" | "external";
   onSelectAt: (at: string) => void;
   onSelectSpan: (span: number) => void;
   onSelectBaseline: (baseline: string | null) => void;
@@ -364,58 +366,63 @@ export function Spine(props: SpineProps) {
       >
         {t("spine.caption")}
       </span>
-      <button
-        type="button"
-        aria-pressed={!live}
-        onClick={props.onToggleLive}
-        style={{
-          fontSize: "var(--text-xs)",
-          fontWeight: 600,
-          letterSpacing: "var(--tracking-caps)",
-          color: live ? "var(--sev-ok-fg)" : "var(--sev-warn-fg)",
-          background: live ? "var(--sev-ok-bg)" : "var(--sev-warn-bg)",
-          border: `1px solid ${live ? "var(--sev-ok)" : "var(--sev-warn)"}`,
-          borderRadius: "var(--radius-sm)",
-          padding: "1px 8px",
-          cursor: "pointer",
-        }}
-      >
-        {live ? t("spine.live") : t("spine.replay")}
-      </button>
-      <div
-        role="group"
-        aria-label={t("spine.zoom")}
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          background: "var(--bg)",
-          border: "1px solid var(--border)",
-          borderRadius: "var(--radius-sm)",
-          overflow: "hidden",
-        }}
-      >
-        {SPANS.map((s) => (
+      {props.controls !== "external" && (
+        <>
           <button
-            key={s}
             type="button"
-            aria-pressed={props.span === s}
-            onClick={() => props.onSelectSpan(s)}
+            aria-pressed={!live}
+            onClick={props.onToggleLive}
             style={{
               fontSize: "var(--text-xs)",
-              padding: "2px 8px",
-              border: "none",
-              background: props.span === s ? "var(--active-bg)" : "transparent",
-              color:
-                props.span === s ? "var(--accent-strong)" : "var(--fg-dim)",
+              fontWeight: 600,
+              letterSpacing: "var(--tracking-caps)",
+              color: live ? "var(--sev-ok-fg)" : "var(--sev-warn-fg)",
+              background: live ? "var(--sev-ok-bg)" : "var(--sev-warn-bg)",
+              border: `1px solid ${live ? "var(--sev-ok)" : "var(--sev-warn)"}`,
+              borderRadius: "var(--radius-sm)",
+              padding: "1px 8px",
               cursor: "pointer",
-              transition:
-                "color var(--transition-fast), background var(--transition-fast)",
             }}
           >
-            {t(`spine.span.${s}`)}
+            {live ? t("spine.live") : t("spine.replay")}
           </button>
-        ))}
-      </div>
+          <div
+            role="group"
+            aria-label={t("spine.zoom")}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              background: "var(--bg)",
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-sm)",
+              overflow: "hidden",
+            }}
+          >
+            {SPANS.map((s) => (
+              <button
+                key={s}
+                type="button"
+                aria-pressed={props.span === s}
+                onClick={() => props.onSelectSpan(s)}
+                style={{
+                  fontSize: "var(--text-xs)",
+                  padding: "2px 8px",
+                  border: "none",
+                  background:
+                    props.span === s ? "var(--active-bg)" : "transparent",
+                  color:
+                    props.span === s ? "var(--accent-strong)" : "var(--fg-dim)",
+                  cursor: "pointer",
+                  transition:
+                    "color var(--transition-fast), background var(--transition-fast)",
+                }}
+              >
+                {t(`spine.span.${s}`)}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
       {!warming && !failed && !empty && (
         <Tooltip
           content={

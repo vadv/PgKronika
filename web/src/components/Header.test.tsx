@@ -70,6 +70,13 @@ test("instance chip falls back to local, shows the context hostname", () => {
   expect(screen.getByTestId("instance-chip").textContent).toContain("prod-1");
 });
 
+test("fits the fixed Global context shell region", () => {
+  renderHeader();
+  const content = screen.getByTestId("global-context-content");
+  expect(content.style.height).toBe("100%");
+  expect(content.style.minWidth).toBe("0");
+});
+
 test("role chip shows an honest dash with the reason in the title", () => {
   const { unmount } = renderHeader();
   expect(screen.getByTestId("role-chip").textContent).toBe("—");

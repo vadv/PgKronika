@@ -192,12 +192,15 @@ export function Header(props: HeaderProps) {
   }
 
   return (
-    <header
+    <div
+      data-testid="global-context-content"
       style={{
+        height: "100%",
+        minWidth: 0,
         display: "flex",
         alignItems: "center",
         gap: "6px",
-        flexWrap: "wrap",
+        flexWrap: "nowrap",
         padding: "6px 12px",
         background: "var(--bg)",
         borderBottom: "1px solid var(--border)",
@@ -282,6 +285,6 @@ export function Header(props: HeaderProps) {
       <span style={{ flex: 1 }} />
       <Clock />
       <CopyLinkButton url={props.shareUrl} />
-    </header>
+    </div>
   );
 }

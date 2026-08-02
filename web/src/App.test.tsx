@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
@@ -50,6 +51,7 @@ const catalogBody = {
     makeViewSpec({
       code: "statements",
       view_code: 2,
+      availability: "gated",
       presets: [
         {
           code: "memory",
@@ -83,6 +85,22 @@ const catalogBody = {
         },
       ],
     }),
+    makeViewSpec({ code: "plans", view_code: 4 }),
+    makeViewSpec({
+      code: "tables",
+      view_code: 5,
+      presets: [
+        {
+          code: "memory",
+          columns: ["total"],
+          sort: { column: "total", order: "desc" },
+        },
+      ],
+    }),
+    makeViewSpec({ code: "indexes", view_code: 6 }),
+    makeViewSpec({ code: "vacuum", view_code: 7 }),
+    makeViewSpec({ code: "processes", view_code: 8 }),
+    makeViewSpec({ code: "events", view_code: 9 }),
   ],
 };
 
@@ -159,15 +177,60 @@ test("renders the shell regions from fixtures", async () => {
   expect(screen.getByTestId("instance-chip")).toBeDefined();
   expect(screen.getByLabelText("spine.caption")).toBeDefined();
   expect(screen.getByText(/statusbar\.hints/)).toBeDefined();
+  expect(screen.getByRole("banner").dataset.shellRegion).toBe("global-context");
+  expect(screen.getByRole("navigation").dataset.shellRegion).toBe(
+    "primary-navigation",
+  );
+  expect(screen.getByRole("main").dataset.shellRegion).toBe("main");
+  expect(screen.getByRole("contentinfo").dataset.shellRegion).toBe("status");
 });
 
-test("digit key selects the nth catalog view", async () => {
+test("mobile keeps incident triage in normal flow without permanent navigation", async () => {
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn().mockReturnValue({
+      matches: true,
+      media: "(max-width: 760px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }),
+  );
+  renderApp();
+
+  expect(await screen.findByTestId("mobile-triage")).toBeDefined();
+  expect(screen.getByTestId("app-shell").dataset.shellLayout).toBe("mobile");
+  expect(screen.getByRole("main").style.overflow).toBe("visible");
+  expect(screen.queryByRole("navigation")).toBeNull();
+});
+
+test("digit key follows visible available destination order, not catalog order", async () => {
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+    expect(screen.getAllByText("tabs.plans").length).toBeGreaterThan(0),
   );
-  fireEvent.keyDown(window, { key: "3" });
-  expect(location.hash).toContain("view=locks");
+  fireEvent.keyDown(window, { key: "2" });
+  expect(location.hash).toContain("view=plans");
+});
+
+test("primary navigation is the sole shell owner of Live and prepared spans", async () => {
+  renderApp();
+  const navigation = await screen.findByTestId("primary-navigation");
+
+  expect(screen.getAllByRole("button", { name: /spine\.live/i })).toHaveLength(
+    1,
+  );
+  fireEvent.click(
+    within(navigation).getByRole("button", { name: /spine\.live/i }),
+  );
+  expect(location.hash).toContain("at=");
+  fireEvent.click(
+    within(navigation).getByRole("button", { name: /spine\.span\.86400/i }),
+  );
+  expect(new URLSearchParams(location.hash.slice(1)).get("span")).toBe("86400");
 });
 
 test("space toggles LIVE: the hash gains and then loses the cursor", async () => {
@@ -193,19 +256,40 @@ test("Escape closes an open dock", async () => {
   expect(location.hash).not.toContain("dock=");
 });
 
-test("hashchange re-parses the state", async () => {
+test("a Locks hash renders its contextual deep-link surface without selecting OS", async () => {
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+    expect(
+      screen.getAllByText("navigation.destination.os").length,
+    ).toBeGreaterThan(0),
   );
   act(() => {
     location.hash = "#view=locks";
     window.dispatchEvent(new Event("hashchange"));
   });
-  await waitFor(() => {
-    const tab = screen.getAllByText("tabs.locks")[0]?.closest("[role=tab]");
-    expect(tab?.getAttribute("aria-selected")).toBe("true");
+  await waitFor(() =>
+    expect(screen.getByTestId("contextual-deep-link").textContent).toContain(
+      "navigation.deepLink.locks",
+    ),
+  );
+  expect(
+    screen
+      .getAllByRole("tab")
+      .every((tab) => tab.getAttribute("aria-selected") === "false"),
+  ).toBe(true);
+});
+
+test("a Processes hash explicitly selects OS while retaining deep-link context", async () => {
+  history.replaceState(null, "", `${location.pathname}#view=processes`);
+  renderApp();
+
+  const os = await screen.findByRole("tab", {
+    name: /navigation\.destination\.os/i,
   });
+  expect(os.getAttribute("aria-selected")).toBe("true");
+  expect(screen.getByTestId("contextual-deep-link").textContent).toContain(
+    "navigation.deepLink.processes",
+  );
 });
 
 test("arrow keys step the cursor; shift+arrow jumps an hour", async () => {
@@ -388,12 +472,12 @@ test("switching view drops preset and sort the next view does not have", async (
   );
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+    expect(screen.getAllByText("tabs.plans").length).toBeGreaterThan(0),
   );
   expect(location.hash).toContain("preset=stmt_only");
-  fireEvent.keyDown(window, { key: "3" });
+  fireEvent.keyDown(window, { key: "2" });
   const params = new URLSearchParams(location.hash.slice(1));
-  expect(params.get("view")).toBe("locks");
+  expect(params.get("view")).toBe("plans");
   expect(params.get("preset")).toBeNull();
   expect(params.get("sort")).toBeNull();
   expect(params.get("order")).toBeNull();
@@ -407,9 +491,12 @@ test("switching view keeps a preset both views share", async () => {
   );
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+    expect(screen.getAllByText("tabs.tables").length).toBeGreaterThan(0),
   );
   fireEvent.keyDown(window, { key: "3" });
+  expect(new URLSearchParams(location.hash.slice(1)).get("view")).toBe(
+    "tables",
+  );
   expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBe(
     "memory",
   );

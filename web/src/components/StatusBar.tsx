@@ -11,8 +11,9 @@ export function StatusBar(props: StatusBarProps) {
   const { t } = useTranslation();
   const notable = props.summary?.views.filter((v) => v.notable).length ?? 0;
   return (
-    <footer
+    <div
       style={{
+        height: "100%",
         display: "flex",
         alignItems: "center",
         gap: "8px",
@@ -50,6 +51,6 @@ export function StatusBar(props: StatusBarProps) {
           {t("statusbar.notable")}: {notable}
         </span>
       )}
-    </footer>
+    </div>
   );
 }

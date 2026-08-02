@@ -11,12 +11,17 @@ import { DockOverlay } from "./components/DockOverlay";
 import { FocusBar } from "./components/FocusBar";
 import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
+import { PrimaryNavigation } from "./components/PrimaryNavigation";
+import { ShellLayout } from "./components/ShellLayout";
 import { Spine } from "./components/Spine";
 import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
-import { TabBar } from "./components/TabBar";
 import { TableView } from "./components/TableView";
 import { Toolbar } from "./components/Toolbar";
+import {
+  availableDestinations,
+  buildNavigationGroups,
+} from "./navigation/model";
 import { TimeGeometryProvider, useTimeGeometry } from "./state/timeGeometry";
 import { toHash } from "./state/url";
 
@@ -93,6 +98,8 @@ function Shell() {
   const incidents = useIncidents(incidentsRange);
 
   const views = catalog.data?.views ?? [];
+  const navigationGroups = buildNavigationGroups(views);
+  const shortcutDestinations = availableDestinations(navigationGroups);
   const activeView = views.find((v) => v.code === state.view);
   const focusedIncident = state.focus
     ? incidents.data?.incidents.find((i) => i.incident_key === state.focus)
@@ -128,10 +135,9 @@ function Shell() {
     const onButton =
       e.target instanceof HTMLElement && e.target.tagName === "BUTTON";
     if (e.key >= "1" && e.key <= "9") {
-      const view = views[Number(e.key) - 1];
-      if (view !== undefined && view.availability === "available") {
-        selectView(view.code);
-      }
+      if (mobile) return;
+      const destination = shortcutDestinations[Number(e.key) - 1];
+      if (destination !== undefined) selectView(destination.viewCode);
       return;
     }
     if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
@@ -171,33 +177,54 @@ function Shell() {
   const tableReady = activeView !== undefined;
   const heatmapReady = tableReady && activeView.availability === "available";
 
-  return (
-    <div
-      data-testid="app-shell"
-      style={{
-        background: "var(--bg)",
-        color: "var(--fg)",
-        // Desktop pins the status bar to the viewport bottom; on mobile the
-        // same stretch reads as a giant void under short content.
-        minHeight: mobile ? undefined : "100dvh",
-        display: "flex",
-        flexDirection: "column",
-      }}
-    >
-      <Header
-        range={range}
-        context={context.data}
-        incidents={incidents.data}
-        // Share always carries the absolute cursor time: a LIVE link must
-        // reproduce this exact screen for the recipient.
-        shareUrl={`${location.origin}${location.pathname}${toHash({ ...state, at: range.toUs })}`}
-        dataHealthOpen={dataHealthOpen}
-        onToggleDataHealth={() => setDataHealthOpen((open) => !open)}
-        onOpenIncidents={() => patch({ dock: "incidents" })}
+  const globalContext = (
+    <Header
+      range={range}
+      context={context.data}
+      incidents={incidents.data}
+      // Share always carries the absolute cursor time: a LIVE link must
+      // reproduce this exact screen for the recipient.
+      shareUrl={`${location.origin}${location.pathname}${toHash({ ...state, at: range.toUs })}`}
+      dataHealthOpen={dataHealthOpen}
+      onToggleDataHealth={() => setDataHealthOpen((open) => !open)}
+      onOpenIncidents={() => patch({ dock: "incidents" })}
+    />
+  );
+  const primaryNavigation =
+    !mobile && catalog.isSuccess ? (
+      <PrimaryNavigation
+        groups={navigationGroups}
+        activeView={state.view}
+        isLive={state.at === null}
+        span={state.span}
+        onSelect={selectView}
+        onToggleLive={toggleLive}
+        onSelectSpan={setSpan}
       />
+    ) : null;
+
+  return (
+    <ShellLayout
+      mobile={mobile}
+      globalContext={globalContext}
+      primaryNavigation={primaryNavigation}
+      primaryNavigationLabel={t("navigation.primary")}
+      status={<StatusBar state={state} summary={summary.data} />}
+      overlay={
+        <DockOverlay
+          state={state}
+          view={activeView}
+          at={at}
+          mobile={mobile}
+          onClose={() => patch({ dock: null })}
+          onSelectIncident={(focus) => patch({ focus })}
+          onPatch={patch}
+        />
+      }
+    >
       <AlertBar live={state.at === null} summary={summary.data} />
       {mobile ? (
-        <main
+        <div
           data-testid="mobile-triage"
           style={{
             display: "flex",
@@ -287,9 +314,10 @@ function Shell() {
               </span>
             </button>
           ))}
-        </main>
+        </div>
       ) : (
-        <main
+        <div
+          data-testid="desktop-forensic-content"
           style={{
             display: "flex",
             flexDirection: "column",
@@ -297,26 +325,34 @@ function Shell() {
             padding: "var(--space-2) var(--space-3)",
           }}
         >
-          {catalog.isSuccess && (
-            <TabBar
-              views={views}
-              active={state.view}
-              onSelect={selectView}
-              summaries={
-                new Map((summary.data?.views ?? []).map((v) => [v.view, v]))
-              }
-            />
-          )}
           <Spine
             at={state.at}
             span={state.span}
             baseline={state.baseline}
             range={range}
+            controls="external"
             onSelectAt={setCursor}
             onSelectSpan={setSpan}
             onSelectBaseline={setBaseline}
             onToggleLive={toggleLive}
           />
+          {(state.view === "locks" || state.view === "processes") && (
+            <aside
+              data-testid="contextual-deep-link"
+              role="status"
+              style={{
+                padding: "6px 10px",
+                color: "var(--fg-dim)",
+                background: "var(--bg-raised)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-sm)",
+                fontFamily: "var(--ui-font)",
+                fontSize: "var(--text-sm)",
+              }}
+            >
+              {t(`navigation.deepLink.${state.view}`)}
+            </aside>
+          )}
           {focusedIncident !== undefined && (
             <FocusBar
               incident={focusedIncident}
@@ -393,20 +429,9 @@ function Shell() {
               onMatched={setMatched}
             />
           )}
-        </main>
+        </div>
       )}
-      {mobile === false && <div style={{ flex: 1 }} />}
-      <StatusBar state={state} summary={summary.data} />
-      <DockOverlay
-        state={state}
-        view={activeView}
-        at={at}
-        mobile={mobile}
-        onClose={() => patch({ dock: null })}
-        onSelectIncident={(focus) => patch({ focus })}
-        onPatch={patch}
-      />
-    </div>
+    </ShellLayout>
   );
 }
 
