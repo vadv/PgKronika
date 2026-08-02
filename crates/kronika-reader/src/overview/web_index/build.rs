@@ -108,6 +108,18 @@ struct EvaluatedMetric {
 
 type GroupedRows<'a> = BTreeMap<Vec<u8>, (String, Vec<IndexedRow<'a>>)>;
 
+struct HzTimeline {
+    samples: Vec<(i64, Option<f64>)>,
+}
+
+#[derive(Clone, Copy)]
+enum ProcessEvidence<'a> {
+    Unique(IndexedRow<'a>),
+    Ambiguous,
+}
+
+type ProcessEvidenceIndex<'a> = BTreeMap<(i64, i32), ProcessEvidence<'a>>;
+
 enum Evaluation {
     Complete(Vec<Candidate>),
     Unsupported,
@@ -1119,12 +1131,13 @@ fn evaluate_tick_rate(
     let instance = input_by_code(view, "instance").ok_or(BuildError::Internal)?;
     let process_rows = rows_for_input(decoded, process)?;
     let metadata_rows = rows_for_input(decoded, instance)?;
+    let clock_ticks = HzTimeline::from_rows(&metadata_rows);
     match view.name {
         "processes" => evaluate_process_tick_rate(
             view,
             metric,
             &process_rows,
-            &metadata_rows,
+            &clock_ticks,
             dictionary,
             grid,
             field_sets,
@@ -1132,12 +1145,13 @@ fn evaluate_tick_rate(
         "activity" => {
             let activity = input_by_code(view, "activity").ok_or(BuildError::Internal)?;
             let activity_rows = rows_for_input(decoded, activity)?;
+            let process_evidence = process_evidence_index(&process_rows);
             evaluate_activity_tick_rate(
                 view,
                 metric,
                 &activity_rows,
-                &process_rows,
-                &metadata_rows,
+                &process_evidence,
+                &clock_ticks,
                 dictionary,
                 grid,
                 field_sets,
@@ -1155,7 +1169,7 @@ fn evaluate_process_tick_rate(
     view: &'static WebView,
     metric: &'static WebMetric,
     process_rows: &[IndexedRow<'_>],
-    metadata_rows: &[IndexedRow<'_>],
+    clock_ticks: &HzTimeline,
     dictionary: &Dictionary,
     grid: TimeGrid,
     field_sets: &[&[&str]],
@@ -1176,7 +1190,7 @@ fn evaluate_process_tick_rate(
         let mut previous = None;
         for indexed in entity_rows {
             let ts = row_ts(indexed.row)?;
-            let Some(clock) = clock_ticks_per_sec(metadata_rows, ts) else {
+            let Some(clock) = clock_ticks.at(ts) else {
                 previous = None;
                 continue;
             };
@@ -1189,11 +1203,9 @@ fn evaluate_process_tick_rate(
                 continue;
             };
             if let Some((previous_ts, previous_value)) = previous
-                && ts > previous_ts
-                && current >= previous_value
+                && let Some(value) =
+                    tick_rate_value(view, previous_ts, previous_value, ts, current, clock)
             {
-                let elapsed_seconds = (ts - previous_ts) as f64 / 1_000_000.0;
-                let value = (current - previous_value) / (clock * elapsed_seconds);
                 insert_bucket(&mut buckets, grid, ts, value, metric.aggregation)?;
             }
             previous = Some((ts, current));
@@ -1218,8 +1230,8 @@ fn evaluate_activity_tick_rate(
     view: &'static WebView,
     metric: &'static WebMetric,
     activity_rows: &[IndexedRow<'_>],
-    process_rows: &[IndexedRow<'_>],
-    metadata_rows: &[IndexedRow<'_>],
+    process_evidence: &ProcessEvidenceIndex<'_>,
+    clock_ticks: &HzTimeline,
     dictionary: &Dictionary,
     grid: TimeGrid,
     field_sets: &[&[&str]],
@@ -1232,11 +1244,11 @@ fn evaluate_activity_tick_rate(
         let mut previous = None;
         for activity in entity_rows {
             let ts = row_ts(activity.row)?;
-            let Some(process) = activity_process_candidate(activity, process_rows) else {
+            let Some(process) = activity_process_candidate(activity, process_evidence) else {
                 previous = None;
                 continue;
             };
-            let Some(clock) = clock_ticks_per_sec(metadata_rows, ts) else {
+            let Some(clock) = clock_ticks.at(ts) else {
                 previous = None;
                 continue;
             };
@@ -1252,11 +1264,9 @@ fn evaluate_activity_tick_rate(
                 cell_timestamp(process.row.get("starttime")).ok_or(BuildError::Internal)?;
             if let Some((previous_ts, previous_value, previous_starttime)) = previous
                 && starttime == previous_starttime
-                && ts > previous_ts
-                && current >= previous_value
+                && let Some(value) =
+                    tick_rate_value(view, previous_ts, previous_value, ts, current, clock)
             {
-                let elapsed_seconds = (ts - previous_ts) as f64 / 1_000_000.0;
-                let value = (current - previous_value) / (clock * elapsed_seconds);
                 insert_bucket(&mut buckets, grid, ts, value, metric.aggregation)?;
             }
             previous = Some((ts, current, starttime));
@@ -1275,26 +1285,80 @@ fn evaluate_activity_tick_rate(
 
 fn activity_process_candidate<'a>(
     activity: &IndexedRow<'_>,
-    process_rows: &'a [IndexedRow<'a>],
+    process_evidence: &ProcessEvidenceIndex<'a>,
 ) -> Option<IndexedRow<'a>> {
     let ts = row_ts(activity.row).ok()?;
-    let pid = cell_number(activity.row.get("pid"))?;
-    let mut candidates = process_rows.iter().copied().filter(|process| {
-        row_ts(process.row).ok() == Some(ts) && cell_number(process.row.get("pid")) == Some(pid)
-    });
-    let candidate = candidates.next()?;
-    candidates.next().is_none().then_some(candidate)
+    let pid = row_pid(activity.row)?;
+    match process_evidence.get(&(ts, pid))? {
+        ProcessEvidence::Unique(process) => Some(*process),
+        ProcessEvidence::Ambiguous => None,
+    }
 }
 
-fn clock_ticks_per_sec(metadata_rows: &[IndexedRow<'_>], snapshot_ts_us: i64) -> Option<f64> {
-    metadata_rows
-        .iter()
-        .copied()
-        .filter_map(|metadata| row_ts(metadata.row).ok().map(|ts| (ts, metadata)))
-        .filter(|(ts, _metadata)| *ts <= snapshot_ts_us)
-        .max_by_key(|(ts, _metadata)| *ts)
-        .and_then(|(_ts, metadata)| cell_number(metadata.row.get("clock_ticks_per_sec")))
-        .filter(|clock| clock.is_finite() && *clock > 0.0)
+impl HzTimeline {
+    fn from_rows(metadata_rows: &[IndexedRow<'_>]) -> Self {
+        let mut samples = metadata_rows
+            .iter()
+            .copied()
+            .filter_map(|metadata| {
+                row_ts(metadata.row).ok().map(|ts| {
+                    let clock = cell_number(metadata.row.get("clock_ticks_per_sec"))
+                        .filter(|clock| clock.is_finite() && *clock > 0.0);
+                    (ts, clock)
+                })
+            })
+            .collect::<Vec<_>>();
+        samples.sort_by_key(|(ts, _clock)| *ts);
+        Self { samples }
+    }
+
+    fn at(&self, snapshot_ts_us: i64) -> Option<f64> {
+        let end = self
+            .samples
+            .partition_point(|(ts, _clock)| *ts <= snapshot_ts_us);
+        end.checked_sub(1).and_then(|index| self.samples[index].1)
+    }
+}
+
+fn process_evidence_index<'a>(process_rows: &[IndexedRow<'a>]) -> ProcessEvidenceIndex<'a> {
+    let mut evidence = ProcessEvidenceIndex::new();
+    for process in process_rows {
+        let (Ok(ts), Some(pid)) = (row_ts(process.row), row_pid(process.row)) else {
+            continue;
+        };
+        match evidence.entry((ts, pid)) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(ProcessEvidence::Unique(*process));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                slot.insert(ProcessEvidence::Ambiguous);
+            }
+        }
+    }
+    evidence
+}
+
+fn row_pid(row: &Row) -> Option<i32> {
+    match row.get("pid")? {
+        Cell::I32(pid) => Some(*pid),
+        _ => None,
+    }
+}
+
+fn tick_rate_value(
+    view: &WebView,
+    previous_ts: i64,
+    previous_value: f64,
+    ts: i64,
+    current: f64,
+    clock_ticks_per_sec: f64,
+) -> Option<f64> {
+    let elapsed_us = ts.checked_sub(previous_ts)?;
+    if elapsed_us <= 0 || elapsed_us > view.max_rate_gap_us? || current < previous_value {
+        return None;
+    }
+    let elapsed_seconds = elapsed_us as f64 / 1_000_000.0;
+    Some((current - previous_value) / (clock_ticks_per_sec * elapsed_seconds))
 }
 
 #[allow(
@@ -1973,6 +2037,8 @@ mod tests {
     const COVERAGE_TS: i64 = 100;
     const PROCESS_FIRST_TS: i64 = 10_000_000;
     const PROCESS_SECOND_TS: i64 = 20_000_000;
+    const PROCESS_OVER_GAP_TS: i64 = PROCESS_FIRST_TS + 1_000_000_000;
+    const PROCESS_AFTER_GAP_TS: i64 = PROCESS_OVER_GAP_TS + 100_000_000;
 
     fn process_row(ts: i64, starttime: i64, utime: i64) -> OsProcess {
         OsProcess {
@@ -2058,6 +2124,20 @@ mod tests {
         processes: &[OsProcess],
         metadata: &[InstanceMetadata],
     ) -> Vec<u8> {
+        let min_ts = activity
+            .iter()
+            .map(|row| row.ts.0)
+            .chain(processes.iter().map(|row| row.ts.0))
+            .chain(metadata.iter().map(|row| row.ts.0))
+            .min()
+            .expect("non-empty tick-rate fixture");
+        let max_ts = activity
+            .iter()
+            .map(|row| row.ts.0)
+            .chain(processes.iter().map(|row| row.ts.0))
+            .chain(metadata.iter().map(|row| row.ts.0))
+            .max()
+            .expect("non-empty tick-rate fixture");
         let mut bodies = vec![
             (
                 1_021_001,
@@ -2086,13 +2166,7 @@ mod tests {
                 body,
             })
             .collect::<Vec<_>>();
-        build_part(
-            &inputs,
-            PartMeta {
-                min_ts: 5_000_000,
-                max_ts: PROCESS_SECOND_TS,
-            },
-        )
+        build_part(&inputs, PartMeta { min_ts, max_ts })
     }
 
     #[test]
@@ -2153,6 +2227,39 @@ mod tests {
     }
 
     #[test]
+    fn process_cpu_web_index_rejects_an_over_limit_rate_gap() {
+        let bytes = tick_rate_pgm(
+            &[],
+            &[
+                process_row(PROCESS_FIRST_TS, 2_000_000, 10),
+                process_row(PROCESS_OVER_GAP_TS, 2_000_000, 100),
+                process_row(PROCESS_AFTER_GAP_TS, 2_000_000, 101),
+            ],
+            &[instance_metadata(5_000_000, 100)],
+        );
+        let unit = PgmUnit::open(bytes).expect("open over-gap process PGM");
+        let blocks = build_web_index(&unit, &[], 5_000_000, PROCESS_AFTER_GAP_TS, &LIMIT)
+            .expect("build over-gap process index");
+        let processes = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 7)
+            .expect("process series");
+        let cpu = processes
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 1)
+            .expect("process CPU metric");
+
+        assert_eq!(cpu.status(), MetricStatus::Complete);
+        let values = cpu.series()[0]
+            .observed_values()
+            .map(|(_bucket, value)| value)
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0.0001]);
+    }
+
+    #[test]
     fn activity_cpu_web_index_uses_unique_same_snapshot_pid_attribution() {
         let bytes = tick_rate_pgm(
             &[
@@ -2181,6 +2288,43 @@ mod tests {
 
         assert_eq!(cpu.status(), MetricStatus::Complete);
         assert_eq!(cpu.series()[0].value_at(0), Some(0.09));
+    }
+
+    #[test]
+    fn activity_cpu_web_index_rejects_an_over_limit_rate_gap() {
+        let bytes = tick_rate_pgm(
+            &[
+                activity_row(PROCESS_FIRST_TS),
+                activity_row(PROCESS_OVER_GAP_TS),
+                activity_row(PROCESS_AFTER_GAP_TS),
+            ],
+            &[
+                process_row(PROCESS_FIRST_TS, 2_000_000, 10),
+                process_row(PROCESS_OVER_GAP_TS, 2_000_000, 100),
+                process_row(PROCESS_AFTER_GAP_TS, 2_000_000, 101),
+            ],
+            &[instance_metadata(5_000_000, 100)],
+        );
+        let unit = PgmUnit::open(bytes).expect("open over-gap activity PGM");
+        let blocks = build_web_index(&unit, &[], 5_000_000, PROCESS_AFTER_GAP_TS, &LIMIT)
+            .expect("build over-gap activity index");
+        let activity = blocks
+            .series
+            .iter()
+            .find(|block| block.view_code() == 1)
+            .expect("activity series");
+        let cpu = activity
+            .metrics()
+            .iter()
+            .find(|metric| metric.metric_code() == 2)
+            .expect("activity CPU metric");
+
+        assert_eq!(cpu.status(), MetricStatus::Complete);
+        let values = cpu.series()[0]
+            .observed_values()
+            .map(|(_bucket, value)| value)
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0.0001]);
     }
 
     #[test]
