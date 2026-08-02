@@ -1135,6 +1135,8 @@ impl TypedInputs {
     /// Whether scalar fields make this OS process a possible `PostgreSQL`
     /// backend. This is not a cross-domain identity relation: the current
     /// adapter has no canonical session-to-process bridge or lifetime coverage.
+    /// `starttime` validates the OS identity but is never compared with
+    /// `backend_start`, which belongs to a different clock and lifecycle event.
     pub(crate) fn process_matches_postgres_backend_candidate(
         &self,
         pid: i64,
@@ -1142,12 +1144,11 @@ impl TypedInputs {
         from_us: i64,
         to_us: i64,
     ) -> bool {
-        self.activity_window(from_us, to_us).any(|snapshot| {
-            snapshot
-                .backends
-                .iter()
-                .any(|backend| backend.pid == pid && backend.backend_start == starttime)
-        })
+        if pid <= 0 || starttime <= 0 {
+            return false;
+        }
+        self.activity_window(from_us, to_us)
+            .any(|snapshot| snapshot.backends.iter().any(|backend| backend.pid == pid))
     }
 
     pub(crate) fn insert_process_cgroups(&mut self, samples: Vec<ProcessCgroupSample>) {
@@ -2157,6 +2158,27 @@ mod tests {
             .map(|snapshot| snapshot.backends[0].state.as_deref().expect("state"))
             .collect();
         assert_eq!(states, ["start", "inside"], "the end bound is excluded");
+    }
+
+    #[test]
+    fn postgres_process_candidate_does_not_compare_cross_domain_start_times() {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 10,
+            backends: vec![ActivityBackend {
+                pid: 7,
+                backend_start: 200,
+                xid_age: None,
+                xmin_age: None,
+                state: None,
+                wait_event_type: None,
+                wait_event: None,
+                xact_age_us: None,
+            }],
+            completeness: SnapshotCompleteness::Complete,
+        });
+
+        assert!(typed.process_matches_postgres_backend_candidate(7, 100, 10, 11));
     }
 
     #[test]

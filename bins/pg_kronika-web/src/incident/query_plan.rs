@@ -8,8 +8,8 @@ use super::dispatch::{LimitHit, SectionColumn};
 use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
-    ConfidenceCap, EntityJoinEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity,
-    GaugeEvidence, GaugeRatio, GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
+    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
+    GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
 };
 use super::lens::Lens;
 use super::model::IdentityValue;
@@ -390,7 +390,7 @@ impl Lens for PlanChurnLens {
             return Ok(());
         };
         let fork = match candidate.bridge.fork {
-            PlanFork::Ossc => "ossc_exact_queryid",
+            PlanFork::Ossc => "ossc_queryid_attribution",
             PlanFork::Vadv => "vadv_plan_identity",
         };
         let identity: Arc<[IdentityValue]> = Arc::from(vec![
@@ -449,22 +449,10 @@ impl Lens for PlanChurnLens {
         let Some(evidence) = evidence else {
             return Ok(());
         };
-        let mut evidence: Vec<_> = evidence
+        let evidence: Vec<_> = evidence
             .into_iter()
             .map(Evidence::GaugeObservation)
             .collect();
-        if candidate.bridge.fork == PlanFork::Ossc && candidate.bridge.queryid != 0 {
-            evidence.push(Evidence::EntityJoin(EntityJoinEvidence::new(
-                "statement_plan",
-                &["queryid", "dbid", "userid"],
-                STATEMENTS,
-                Arc::from(vec![
-                    IdentityValue::I64(candidate.bridge.queryid),
-                    IdentityValue::U64(candidate.bridge.userid),
-                    IdentityValue::U64(candidate.bridge.dbid),
-                ]),
-            )));
-        }
         sink.emit(FindingDraft::new(
             Role::Coincident,
             FindingScope::from_episode(member),
@@ -682,7 +670,34 @@ mod tests {
     }
 
     #[test]
-    fn exact_statement_plan_join_publishes_one_proven_relation() {
+    fn ossc_queryid_attribution_never_claims_cross_extension_identity() {
+        let mut typed = TypedInputs::new();
+        typed.insert_plan_samples(vec![
+            plan(1, PlanFork::Ossc, 1, 10.0, 100.0),
+            plan(2, PlanFork::Ossc, 1, 20.0, 200.0),
+            plan(2, PlanFork::Ossc, 2, 1.0, 10.0),
+            plan(3, PlanFork::Ossc, 1, 25.0, 250.0),
+            plan(3, PlanFork::Ossc, 2, 11.0, 510.0),
+        ]);
+        let detected = outcome(&PlanChurnLens, episode(PLANS_OSSC, "planid"), &typed);
+        let evidence = detected.incidents[0].findings[0].evidence();
+        let Evidence::GaugeObservation(gauge) = &evidence[0] else {
+            panic!("plan churn starts with gauge evidence");
+        };
+
+        assert_eq!(
+            gauge.entity().identity()[0],
+            IdentityValue::Text("ossc_queryid_attribution".to_owned())
+        );
+        assert!(
+            evidence
+                .iter()
+                .all(|item| !matches!(item, Evidence::EntityJoin(_)))
+        );
+    }
+
+    #[test]
+    fn ossc_queryid_attribution_publishes_no_proven_relation() {
         use crate::anomaly::ScanParams;
         use crate::incident::{EventOutcome, Lens, LogCoverage};
         use crate::incident_input::InputQuality;
@@ -735,12 +750,6 @@ mod tests {
                 capability_by_section: &BTreeMap::new(),
             },
         );
-        let relation = &response["incidents"][0]["relations"][0];
-        assert_eq!(relation["kind"], "proven");
-        assert_eq!(relation["provenance"]["contract"], "statement_plan");
-        assert_eq!(
-            relation["provenance"]["fields"],
-            serde_json::json!(["queryid", "dbid", "userid"])
-        );
+        assert_eq!(response["incidents"][0]["relations"], serde_json::json!([]));
     }
 }

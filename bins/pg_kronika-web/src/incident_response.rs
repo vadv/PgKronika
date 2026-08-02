@@ -1020,34 +1020,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entity_join_matches_only_the_proven_scope() {
+    fn entity_join_requires_the_complete_target_identity_prefix() {
         use crate::incident::{EntityJoinEvidence, FindingScope};
         use std::sync::Arc;
 
         let join = EntityJoinEvidence::new(
-            "statement_plan",
-            &["queryid", "dbid", "userid"],
-            "pg_store_plans_ossc",
-            Arc::from(vec![IdentityValue::I64(7)]),
+            "three_field_exact_fixture",
+            &["a", "b", "c"],
+            "target_section",
+            Arc::from(vec![
+                IdentityValue::I64(7),
+                IdentityValue::I64(100),
+                IdentityValue::I64(10),
+            ]),
         );
         let prefixed = FindingScope::from_parts(
-            "pg_store_plans_ossc",
-            "total_time",
-            Arc::from(vec![IdentityValue::I64(7), IdentityValue::I64(20)]),
+            "target_section",
+            "target_dimension",
+            Arc::from(vec![
+                IdentityValue::I64(7),
+                IdentityValue::I64(100),
+                IdentityValue::I64(10),
+                IdentityValue::I64(20),
+            ]),
         );
-        let other_identity = FindingScope::from_parts(
-            "pg_store_plans_ossc",
-            "total_time",
-            Arc::from(vec![IdentityValue::I64(8)]),
-        );
+        let scope = |identity| {
+            FindingScope::from_parts("target_section", "target_dimension", Arc::from(identity))
+        };
+        let wrong_first = scope(vec![
+            IdentityValue::I64(8),
+            IdentityValue::I64(100),
+            IdentityValue::I64(10),
+        ]);
+        let wrong_second = scope(vec![
+            IdentityValue::I64(7),
+            IdentityValue::I64(101),
+            IdentityValue::I64(10),
+        ]);
+        let wrong_third = scope(vec![
+            IdentityValue::I64(7),
+            IdentityValue::I64(100),
+            IdentityValue::I64(11),
+        ]);
         let other_section = FindingScope::from_parts(
-            "pg_stat_statements",
-            "c",
-            Arc::from(vec![IdentityValue::I64(7)]),
+            "other_section",
+            "target_dimension",
+            Arc::from(vec![
+                IdentityValue::I64(7),
+                IdentityValue::I64(100),
+                IdentityValue::I64(10),
+            ]),
         );
 
         assert!(join.matches(&prefixed));
-        assert!(!join.matches(&other_identity), "coincidence is not a link");
+        assert!(!join.matches(&wrong_first));
+        assert!(!join.matches(&wrong_second));
+        assert!(!join.matches(&wrong_third));
         assert!(!join.matches(&other_section), "cross-section is not a link");
     }
 

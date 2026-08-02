@@ -227,7 +227,7 @@ SQL и другие чувствительные свободные строки
 - Evidence lanes: CPU saturation, memory pressure, storage pressure и error/event lane.
 - Heatmap: строки — CPU, memory, devices, cgroups или процессы; метрика переключается без изменения оси времени.
 - Ranked matrix: resource, utilization, saturation, errors, Δ baseline, coverage, top contributor.
-- При выборе процесса Detail совмещает `/proc`, cgroup и `pg_stat_activity`, если collector сохранил relation token или доказан однозначный lifetime. Совпадение одного PID всегда остаётся candidate.
+- При выборе процесса Detail совмещает `/proc`, cgroup и `pg_stat_activity`, если collector сохранил relation token или доказан однозначный lifetime. Совпадение одного PID всегда остаётся связью `best_effort`.
 
 `rchar`/`wchar` показываются как логические байты, которые могут обслуживаться page cache. `read_bytes`/`write_bytes` показываются как storage-accounted bytes. Разность может называться только приблизительной оценкой cache-served I/O, но не «page-cache hits».
 
@@ -241,13 +241,13 @@ OS evidence inspector всегда разделяет: «Наблюдалось�
 
 ### 8.1. Главный вопрос
 
-Что выполнялось в выбранном снимке, чего ожидали backend-процессы и какие процессы ОС можно точно связать с этими backend?
+Что выполнялось в выбранном снимке, чего ожидали backend-процессы, с какими процессами ОС они могли быть связаны и насколько надёжна эта связь?
 
 ### 8.2. Разрезы
 
 | Разрез | Смысловой центр | Основное ранжирование |
 | --- | --- | --- |
-| Overview | PostgreSQL context + точная PID-связь + OS process metrics | Query age, wait duration или CPU. |
+| Overview | PostgreSQL context + качество связи по PID + OS process metrics | Query age, wait duration или CPU. |
 | Waits & Locks | Wait classes, blocking tree, waiter lanes | Суммарное blocked time и число downstream waiters. |
 | Duration | Query age, transaction age, state timeline | Длительность запроса или транзакции. |
 | CPU | Backend CPU, run state, cgroup throttle, query context | CPU time в окне. |
@@ -264,7 +264,7 @@ OS evidence inspector всегда разделяет: «Наблюдалось�
 - Activity обозначается как point snapshot. Короткие запросы между циклами сбора могли не попасть в данные.
 - Длительность heavyweight lock wait считается доказанной только при сохранённом `waitstart`. `query_start` и `xact_start` не называются временем удержания блокировки.
 - Heatmap для activity отображает только наблюдавшиеся состояния и интервалы. Она не должна создавать иллюзию непрерывного исполнения между снимками.
-- Переход по `queryid` открывает candidate Statement Detail в том же интервале; точная identity statement сейчас невозможна без `datid`, `usesysid` и семантики `toplevel`. Переход по PID открывает Process Detail с качеством relation; wait event — Waits & Locks.
+- Переход по `queryid` открывает Statement Detail с атрибуцией `best_effort` в том же интервале; точная identity statement сейчас невозможна без `datid`, `usesysid` и семантики `toplevel`. Переход по PID открывает Process Detail с качеством relation; wait event — Waits & Locks.
 
 ## 9. Statements
 
@@ -321,9 +321,9 @@ Identity statement: `(queryid, userid, dbid, toplevel)` для `pg_stat_statemen
 - Низ: ranked queries with plan changes; справа — compact plan diff preview.
 - Полноэкранный Plan Detail показывает дерево, changed nodes, связанные tables/indexes, окно before/after и provenance.
 
-Связь `queryid` зависит от варианта `pg_store_plans`. Exact bridge и best-effort bridge должны визуально и текстово различаться.
+Поля и метод атрибуции по `queryid` зависят от варианта `pg_store_plans`. Для обоих вариантов связь со statement остаётся `best_effort` и не доказывает общую identity.
 
-Для OSSC identity включает `(dbid, userid, queryid, planid)`, а bridge к statement прямой. Для vadv identity включает `(dbid, userid, planid)`; `queryid_stat_statements` означает последний исполнивший запрос и не является надёжной per-query attribution. Gauge `mean_time` нельзя дифференцировать.
+Для OSSC identity включает `(dbid, userid, queryid, planid)`, а атрибуция к statement использует `queryid`, `dbid` и `userid`. Для vadv identity включает `(dbid, userid, planid)`; `queryid_stat_statements` означает последний исполнивший запрос и не является надёжной per-query attribution. Gauge `mean_time` нельзя дифференцировать.
 
 ## 11. Tables
 
@@ -491,7 +491,7 @@ Same timestamp не доказывает общий producer snapshot. PostgreSQ
 Дизайн требует или выигрывает от следующих контрактов:
 
 - общий bucket grid и coverage по каждому источнику;
-- cross-entity links с типом `exact | lifetime | attributed | candidate | temporal | unavailable` и reason;
+- cross-entity links с типом `exact | lifetime | temporal | best_effort | unavailable` и reason;
 - collector-produced `collection_cycle_id`/snapshot token и host boot/PID namespace context;
 - reset markers для всех накопительных серий;
 - server-side глобальный поиск с group, match reason, continuation и scope;
@@ -513,7 +513,7 @@ Same timestamp не доказывает общий producer snapshot. PostgreSQ
 - PG shared-buffer reads не подписаны как physical disk reads.
 - Statement CPU не показывается как точная атрибуция без соответствующего источника.
 - Process page-cache estimate помечен как приблизительный.
-- Plan link помечает exact или best effort.
+- Связь plan→statement всегда помечена как `best_effort` и показывает provenance конкретного форка.
 - Поиск показывает scope, match reason, число результатов и происхождение.
 - `null`, gap, partial, gated, unsupported, reset и top-N truncation различимы.
 - Здоровые состояния не создают зелёный визуальный шум.
