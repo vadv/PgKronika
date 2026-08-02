@@ -12,10 +12,11 @@
 //!
 //! Reader and adapter ceilings bound rows, materialized cells, scan positions,
 //! scoring work, identity bytes, and output. One semaphore slot admits heavy
-//! anomaly or incident work; another request receives `503` instead of
-//! queueing. Incident diagnosis is a first slice: the endpoint clusters
-//! episodes, runs the active diagnostic lenses, still reports `complete=false`,
-//! and reports request-specific evaluator and requirement status.
+//! anomaly or incident work; contenders wait for it up to a bounded deadline,
+//! past which they receive `503`. Incident diagnosis is a first slice: the
+//! endpoint clusters episodes, runs the active diagnostic lenses, still reports
+//! `complete=false`, and reports request-specific evaluator and requirement
+//! status.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "metrics-exporter-prometheus and axum pull duplicate transitive versions outside our control"
@@ -83,7 +84,9 @@ use kronika_reader::{
     FallbackConfig, GcCategoryUsage, GcConfig, GcOutcome, GcSkipReason, LocalDirSnapshot,
 };
 use metrics_exporter_prometheus::PrometheusHandle;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+#[cfg(test)]
+use tokio::sync::TryAcquireError;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 // These crates are used by the binary target. Keep the imports here so the
 // library target satisfies `unused_crate_dependencies`.
 use mimalloc as _;
@@ -352,6 +355,11 @@ pub struct AppState {
 const RESPONSE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Secondary response-cache ceiling for small bodies.
 const RESPONSE_CACHE_ENTRIES: usize = 4_096;
+/// How long an analytic request waits for the shared slot before a 503.
+///
+/// Well under the 5 s health-strip refetch cadence, so a queued poll still
+/// lands inside its own tick.
+const ANALYTIC_SLOT_WAIT: Duration = Duration::from_secs(2);
 
 /// Numeric encoding of the persistence write mode for the mode gauge:
 /// `0` read-write, `1` read-only backoff, `2` unavailable backoff.
@@ -612,8 +620,30 @@ impl AppState {
     }
 
     /// Reserve the server's single heavy-analysis slot without queuing.
+    #[cfg(test)]
     pub(crate) fn try_acquire_analytic(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
         Arc::clone(&self.analytic_requests).try_acquire_owned()
+    }
+
+    /// Reserve the analytic slot, waiting up to [`ANALYTIC_SLOT_WAIT`] for it.
+    ///
+    /// One-tick pollers (health + events fire together) would otherwise
+    /// reject each other fail-fast; only a slot held past the deadline is
+    /// reported as genuine overload. Waiters park on the semaphore's FIFO
+    /// queue and their number is bounded by in-flight HTTP requests.
+    pub(crate) async fn acquire_analytic(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, api_error::ApiError> {
+        match tokio::time::timeout(
+            ANALYTIC_SLOT_WAIT,
+            Arc::clone(&self.analytic_requests).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_closed)) => Err(api_error::ApiError::internal_error()),
+            Err(_elapsed) => Err(api_error::ApiError::analytic_capacity_unavailable()),
+        }
     }
 
     pub(crate) fn timeline_flight(&self, key: &overview::cache::ResponseKey) -> TimelineFlightRole {
