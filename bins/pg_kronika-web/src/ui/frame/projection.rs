@@ -564,24 +564,27 @@ fn statement_plan_relations(
     reject_internal_continuation(&pages, limits.rows)?;
     let mut relations = Vec::new();
     for section in ["pg_store_plans_ossc", "pg_store_plans_vadv"] {
-        for row in pages.get(section).into_iter().flat_map(|page| &page.rows) {
-            let (plan_queryid, method, fields) = match section {
+        // Fork-specific attribution is a per-section constant: resolve it once
+        // instead of allocating the field list for every scanned row.
+        let (queryid_column, method, fields): (&str, &'static str, [&'static str; 3]) =
+            match section {
                 "pg_store_plans_ossc" => (
-                    value(row, "queryid"),
+                    "queryid",
                     "ossc_queryid_dbid_userid_attribution",
-                    vec!["queryid", "dbid", "userid"],
+                    ["queryid", "dbid", "userid"],
                 ),
                 "pg_store_plans_vadv" => (
-                    value(row, "queryid_stat_statements"),
+                    "queryid_stat_statements",
                     "vadv_queryid_stat_statements_dbid_userid_attribution",
-                    vec!["queryid_stat_statements", "dbid", "userid"],
+                    ["queryid_stat_statements", "dbid", "userid"],
                 ),
                 _ => continue,
             };
+        for row in pages.get(section).into_iter().flat_map(|page| &page.rows) {
             if timestamp(row, "ts")? != Some(snapshot_ts_us)
                 || value(row, "dbid") != Some(statement_dbid)
                 || value(row, "userid") != Some(statement_userid)
-                || plan_queryid != Some(statement_queryid)
+                || value(row, queryid_column) != Some(statement_queryid)
             {
                 continue;
             }
@@ -591,7 +594,7 @@ fn statement_plan_relations(
                 entity: entity_for(plan_view, section, row, snapshot_ts_us)?,
                 kind: RelationKind::BestEffort,
                 method,
-                fields,
+                fields: fields.to_vec(),
             });
         }
     }
