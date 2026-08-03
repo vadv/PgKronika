@@ -152,11 +152,14 @@ function parseTerms(raw: string): SearchTerm[] | ForensicSearchError {
 }
 
 /** Encode one user value in the server frame glob grammar. Wildcards remain
- * intentional; quotes and backslashes are escaped. */
+ * intentional. Any char the server reads outside quotes — whitespace (term
+ * split), `=` (field split), `"`/`\` (quote grammar) — forces a quoted,
+ * escaped literal so the value can never break out of its own term. */
 function encodeGlob(value: string, substring: boolean): string {
   const bounded = `${substring ? "*" : ""}${value}${substring ? "*" : ""}`;
+  if (!/[\s="\\]/u.test(bounded)) return bounded;
   const escaped = bounded.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-  return /\s/u.test(escaped) ? `"${escaped}"` : escaped;
+  return `"${escaped}"`;
 }
 
 function termReason(term: SearchTerm): string {

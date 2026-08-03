@@ -104,6 +104,16 @@ test("rejects unknown keys, empty values, more than 16 terms and over 256 bytes"
   );
 });
 
+test("quotes values with the server's field/term separators so they stay literal", () => {
+  const keyed = compileForensicSearch("app:web=prod", views);
+  expect(keyed.groups.map((group) => group.q)).toEqual([
+    'application="web=prod"',
+  ]);
+  const free = compileForensicSearch("shared_buffers=128MB", views);
+  expect(free.error).toBeNull();
+  expect(free.groups[0]?.q).toBe('"*shared_buffers=128MB*"');
+});
+
 test("excludes unavailable views and preserves explicit user globs", () => {
   const unavailable = makeViewSpec({
     code: "activity",
