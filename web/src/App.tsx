@@ -354,13 +354,63 @@ function Shell() {
             />
           )}
           {tableReady && (
-            <PageHeader
-              view={activeView}
-              summary={summary.data?.views.find((v) => v.view === state.view)}
-              matched={matched}
-              live={state.at === null}
-              onOpenIncidents={() => patch({ dock: "incidents" })}
-            />
+            <section
+              data-shell-region="screen-context"
+              style={{
+                display: "flex",
+                flex: "0 0 72px",
+                flexDirection: "column",
+                justifyContent: "center",
+                gap: "var(--space-1)",
+                height: "72px",
+                minHeight: "72px",
+                minWidth: 0,
+                overflow: "hidden",
+                padding: "var(--space-1) 2px",
+              }}
+            >
+              <PageHeader
+                view={activeView}
+                summary={summary.data?.views.find((v) => v.view === state.view)}
+                matched={matched}
+                live={state.at === null}
+                onOpenIncidents={() => patch({ dock: "incidents" })}
+              />
+              {heatmapReady ? (
+                <Toolbar
+                  view={activeView}
+                  preset={state.preset}
+                  q={state.q}
+                  matched={matched}
+                  onSelectPreset={(preset) => patch({ preset })}
+                  onFilter={(q) => patch({ q })}
+                />
+              ) : (
+                <div
+                  role="status"
+                  style={{
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    padding: "4px 8px",
+                    color: "var(--fg-dim)",
+                    background: "var(--bg-raised)",
+                    border: "1px solid var(--border)",
+                    borderRadius: "var(--radius-sm)",
+                    fontFamily: "var(--ui-font)",
+                    fontSize: "var(--text-sm)",
+                  }}
+                >
+                  {t("view.gated")} ·{" "}
+                  {t("view.gatedHint", {
+                    reason: t(`availability.${activeView.availability}`, {
+                      defaultValue: activeView.availability,
+                    }),
+                  })}
+                </div>
+              )}
+            </section>
           )}
           {heatmapReady && (
             <div
@@ -383,38 +433,6 @@ function Shell() {
                 onSelectEntity={(entity) => patch({ entity, dock: "row" })}
               />
             </div>
-          )}
-          {/* A gated view renders its availability reason, never an empty
-              table — the tab may still be active from a shared link. */}
-          {tableReady && activeView.availability !== "available" && (
-            <section
-              role="status"
-              style={{
-                background: "var(--bg-raised)",
-                border: "1px solid var(--border)",
-                borderRadius: "var(--radius-md)",
-                padding: "12px",
-                fontFamily: "var(--ui-font)",
-                color: "var(--fg-dim)",
-              }}
-            >
-              {t("view.gated")} ·{" "}
-              {t("view.gatedHint", {
-                reason: t(`availability.${activeView.availability}`, {
-                  defaultValue: activeView.availability,
-                }),
-              })}
-            </section>
-          )}
-          {heatmapReady && (
-            <Toolbar
-              view={activeView}
-              preset={state.preset}
-              q={state.q}
-              matched={matched}
-              onSelectPreset={(preset) => patch({ preset })}
-              onFilter={(q) => patch({ q })}
-            />
           )}
           {heatmapReady && (
             <TableView

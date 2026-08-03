@@ -1528,5 +1528,11 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`demo stub: http://127.0.0.1:${PORT} (static: ${STATIC_DIR})`);
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("demo stub did not expose a TCP address");
+  }
+  console.log(
+    `demo stub: http://127.0.0.1:${address.port} (static: ${STATIC_DIR})`,
+  );
 });

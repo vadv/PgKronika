@@ -407,6 +407,7 @@ export function TableView(props: TableViewProps) {
                   }
                   style={{
                     cursor: "pointer",
+                    height: "28px",
                     background:
                       selected === true
                         ? "var(--active-bg)"

@@ -108,6 +108,9 @@ test("exposes a bounded ranked matrix with an independent scroll body", async ()
   expect(body.style.minHeight).toBe("0");
   expect(body.style.overflow).toBe("auto");
   expect(body.querySelector("table")).not.toBeNull();
+  expect(body.querySelector("tbody tr")?.getAttribute("style")).toContain(
+    "height: 28px",
+  );
 });
 
 test("sort header click cycles desc, asc, cleared", async () => {

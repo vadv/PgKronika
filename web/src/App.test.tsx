@@ -291,6 +291,35 @@ test("marks every desktop analytical boundary for bounded viewport layout", asyn
   expect(
     document.querySelector('[data-shell-region="ranked-matrix"]'),
   ).not.toBeNull();
+
+  const screenContext = document.querySelector(
+    '[data-shell-region="screen-context"]',
+  );
+  expect(screenContext).not.toBeNull();
+  expect((screenContext as HTMLElement).style.height).toBe("72px");
+  expect(
+    within(screenContext as HTMLElement).getByRole("searchbox"),
+  ).toBeDefined();
+  expect(screen.getAllByRole("searchbox")).toHaveLength(1);
+});
+
+test("keeps a gated view reason inside the fixed screen context", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=statements&at=1722400000000000`,
+  );
+  renderApp();
+  const context = await waitFor(() => {
+    const element = document.querySelector(
+      '[data-shell-region="screen-context"]',
+    );
+    expect(element).not.toBeNull();
+    return element as HTMLElement;
+  });
+
+  expect(within(context).getByRole("status")).toBeDefined();
+  expect(within(context).queryByRole("searchbox")).toBeNull();
 });
 
 test("mobile keeps incident triage in normal flow without permanent navigation", async () => {

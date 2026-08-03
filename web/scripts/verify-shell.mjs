@@ -8,8 +8,7 @@ import puppeteer from "puppeteer-core";
 
 const WEB_DIR = fileURLToPath(new URL("../", import.meta.url));
 const OUT_DIR = fileURLToPath(new URL("../demo/shots/", import.meta.url));
-const PORT = Number(process.env.PGK_SHELL_PORT ?? 18444);
-const BASE = `http://127.0.0.1:${PORT}`;
+const REQUESTED_PORT = Number(process.env.PGK_SHELL_PORT ?? 0);
 const VIEWPORT = { width: 1920, height: 1080, deviceScaleFactor: 1 };
 const SUCCESS_SHOT = `${OUT_DIR}forensic-shell-1920x1080.png`;
 const FAILURE_SHOT = `${OUT_DIR}forensic-shell-1920x1080-failure.png`;
@@ -38,23 +37,56 @@ async function executableChrome() {
   );
 }
 
-async function waitForStub(child) {
+async function waitForStub(child, output) {
   const deadline = Date.now() + 15_000;
   let lastError;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
-      throw new Error(`demo stub exited early with code ${child.exitCode}`);
+      throw new Error(
+        `demo stub exited before its readiness line with code ${child.exitCode}`,
+      );
     }
-    try {
-      const response = await fetch(`${BASE}/v1/ui/catalog`);
-      if (response.ok) return;
-      lastError = new Error(`demo stub returned HTTP ${response.status}`);
-    } catch (error) {
-      lastError = error;
+    const ready = output().match(
+      /demo stub: http:\/\/127\.0\.0\.1:(\d+) \(static:/,
+    );
+    if (ready !== null) {
+      const base = `http://127.0.0.1:${ready[1]}`;
+      try {
+        const response = await fetch(`${base}/v1/ui/catalog`);
+        if (response.ok && child.exitCode === null) return base;
+        lastError = new Error(`demo stub returned HTTP ${response.status}`);
+      } catch (error) {
+        lastError = error;
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`demo stub did not become ready: ${String(lastError)}`);
+}
+
+function exitedWithin(child, timeoutMs) {
+  if (child.exitCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      resolve(false);
+    }, timeoutMs);
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    child.once("exit", onExit);
+  });
+}
+
+async function stopChild(child) {
+  if (child.exitCode !== null) return;
+  child.kill("SIGTERM");
+  if (await exitedWithin(child, 2_000)) return;
+  child.kill("SIGKILL");
+  if (!(await exitedWithin(child, 2_000))) {
+    throw new Error(`demo stub process ${child.pid ?? "unknown"} did not exit`);
+  }
 }
 
 async function measure(page) {
@@ -80,16 +112,21 @@ async function measure(page) {
 
     const matrixBody = required('[data-testid="ranked-matrix-body"]');
     const matrixRect = matrixBody.getBoundingClientRect();
-    const visibleRows = [...matrixBody.querySelectorAll("tbody tr")].filter(
-      (row) => {
-        const rowRect = row.getBoundingClientRect();
-        return (
-          rowRect.top >= matrixRect.top &&
-          rowRect.bottom <= matrixRect.bottom &&
-          rowRect.height > 0
-        );
-      },
-    ).length;
+    const tableHead = required('[data-testid="ranked-matrix-body"] thead');
+    const evidenceTop = Math.max(
+      matrixRect.top,
+      tableHead.getBoundingClientRect().bottom,
+    );
+    const visibleRowHeights = [
+      ...matrixBody.querySelectorAll("tbody tr"),
+    ].flatMap((row) => {
+      const rowRect = row.getBoundingClientRect();
+      return rowRect.top >= evidenceTop &&
+        rowRect.bottom <= matrixRect.bottom &&
+        rowRect.height > 0
+        ? [rowRect.height]
+        : [];
+    });
     const matrixStyle = getComputedStyle(matrixBody);
     const root = document.documentElement;
     const motionProbe = document.createElement("div");
@@ -118,6 +155,7 @@ async function measure(page) {
         global: rect('[data-shell-region="global-context"]'),
         navigation: rect('[data-shell-region="primary-navigation"]'),
         health: rect('[data-shell-region="health-line"]'),
+        screenContext: rect('[data-shell-region="screen-context"]'),
         analyticalCenter: rect('[data-shell-region="analytical-center"]'),
         matrix: rect('[data-shell-region="ranked-matrix"]'),
         matrixBody: rect('[data-testid="ranked-matrix-body"]'),
@@ -127,7 +165,9 @@ async function measure(page) {
         overflowY: matrixStyle.overflowY,
         clientHeight: matrixBody.clientHeight,
         scrollHeight: matrixBody.scrollHeight,
-        visibleRows,
+        evidenceTop,
+        visibleRows: visibleRowHeights.length,
+        visibleRowHeights,
       },
       motion,
       rowCount: matrixBody.querySelectorAll("tbody tr").length,
@@ -237,6 +277,14 @@ function assertContract(metrics, keyboard) {
   exactHeight("navigation", 32);
   exactHeight("health", 60);
   exactHeight("status", 24);
+  if (
+    metrics.regions.screenContext.height < 68 ||
+    metrics.regions.screenContext.height > 76
+  ) {
+    failures.push(
+      `screenContext height ${metrics.regions.screenContext.height}, expected 68..76`,
+    );
+  }
   if (metrics.viewport.width !== 1920 || metrics.viewport.height !== 1080) {
     failures.push(
       `viewport ${metrics.viewport.width}x${metrics.viewport.height}, expected 1920x1080`,
@@ -249,7 +297,13 @@ function assertContract(metrics, keyboard) {
       `root scrollHeight ${metrics.root.scrollHeight}, expected <= 1080`,
     );
   }
-  for (const name of ["health", "analyticalCenter", "matrix", "status"]) {
+  for (const name of [
+    "health",
+    "screenContext",
+    "analyticalCenter",
+    "matrix",
+    "status",
+  ]) {
     const region = metrics.regions[name];
     if (region.top < 0 || region.bottom > 1080 || region.height <= 0) {
       failures.push(`${name} is not fully visible: ${JSON.stringify(region)}`);
@@ -268,6 +322,11 @@ function assertContract(metrics, keyboard) {
   if (metrics.matrix.visibleRows < 16) {
     failures.push(
       `visible matrix rows ${metrics.matrix.visibleRows}, expected >= 16`,
+    );
+  }
+  if (metrics.matrix.visibleRowHeights.some((height) => height < 28)) {
+    failures.push(
+      `visible matrix row below 28px: ${Math.min(...metrics.matrix.visibleRowHeights)}`,
     );
   }
   const durationMs = (value) =>
@@ -304,7 +363,7 @@ function assertContract(metrics, keyboard) {
 await mkdir(OUT_DIR, { recursive: true });
 const stub = spawn(process.execPath, ["scripts/demo-stub.mjs"], {
   cwd: WEB_DIR,
-  env: { ...process.env, PGK_DEMO_PORT: String(PORT) },
+  env: { ...process.env, PGK_DEMO_PORT: String(REQUESTED_PORT) },
   stdio: ["ignore", "pipe", "pipe"],
 });
 let stubOutput = "";
@@ -318,7 +377,7 @@ stub.stderr.on("data", (chunk) => {
 let browser;
 let page;
 try {
-  await waitForStub(stub);
+  const base = await waitForStub(stub, () => stubOutput);
   browser = await puppeteer.launch({
     executablePath: await executableChrome(),
     headless: true,
@@ -337,7 +396,7 @@ try {
     localStorage.setItem("pgk-theme", "dark");
   });
   const at = Date.now() * 1000;
-  await page.goto(`${BASE}/#source=local&view=statements&at=${at}&span=3600`, {
+  await page.goto(`${base}/#source=local&view=statements&at=${at}&span=3600`, {
     waitUntil: "networkidle0",
   });
   await page.waitForSelector('table[aria-label="statements"] tbody tr', {
@@ -374,5 +433,5 @@ try {
   process.exitCode = 1;
 } finally {
   if (browser !== undefined) await browser.close();
-  stub.kill("SIGTERM");
+  await stopChild(stub);
 }
