@@ -119,12 +119,12 @@
 .event-range-row {
   width: 100%;
   min-height: 38px;
-  padding: 3px var(--space-3);
+  padding: var(--space-1) var(--space-3);
   color: var(--fg);
   background: transparent;
   border: 0;
   border-bottom: 1px solid var(--border);
-  box-shadow: inset 3px 0 var(--event-tone, var(--border));
+  box-shadow: inset var(--space-1) 0 var(--event-tone, var(--border));
   cursor: pointer;
   font: inherit;
   text-align: start;
@@ -262,7 +262,7 @@
 
 .event-family__bar {
   height: 4px;
-  margin-block: 3px;
+  margin-block: var(--space-1);
   overflow: hidden;
   background: var(--bg);
   border-radius: 2px;
