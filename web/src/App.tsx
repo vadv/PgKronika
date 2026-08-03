@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useCatalog } from "./api/catalog";
 import { apiRetryDelay, isWarmingUp, retryApiRequest } from "./api/client";
@@ -125,6 +131,16 @@ function Shell() {
       ...(keepSort || state.sort === null ? {} : { sort: null, order: null }),
     });
   };
+
+  const onTableSort = useCallback(
+    (sort: string | null, order: "asc" | "desc" | null) =>
+      patch({ sort, order }),
+    [patch],
+  );
+  const onSelectRow = useCallback(
+    (entity: string) => patch({ entity, dock: "row" }),
+    [patch],
+  );
 
   const shortcutRef = useRef<(event: KeyboardEvent) => void>(() => {});
   shortcutRef.current = (e: KeyboardEvent) => {
@@ -451,8 +467,8 @@ function Shell() {
               sort={state.sort}
               order={state.order}
               entity={state.entity}
-              onSort={(sort, order) => patch({ sort, order })}
-              onSelectRow={(entity) => patch({ entity, dock: "row" })}
+              onSort={onTableSort}
+              onSelectRow={onSelectRow}
               onMatched={setMatched}
             />
           )}

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
 import { colDesc, colLabel } from "../api/codes";
@@ -102,7 +102,7 @@ function Sparkline(props: { spark: SparkDto }) {
   );
 }
 
-export function TableView(props: TableViewProps) {
+function TableViewImpl(props: TableViewProps) {
   const { t } = useTranslation();
   // The continuation cursor belongs to the intent (frameKey) it was taken
   // from; a stale cursor must never ride along with new key arguments.
@@ -603,3 +603,5 @@ export function TableView(props: TableViewProps) {
     </section>
   );
 }
+
+export const TableView = memo(TableViewImpl);
