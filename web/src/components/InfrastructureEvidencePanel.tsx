@@ -1,7 +1,6 @@
 import type { CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { useFrame } from "../api/frame";
-import { useTimelineSpine } from "../api/spine";
 import type {
   ContextResponse,
   FrameColumnDto,
@@ -12,7 +11,6 @@ import type {
 import {
   formatByUnit,
   formatDurationUs,
-  formatNumber,
   formatTimestampUs,
 } from "../design/format";
 
@@ -77,96 +75,6 @@ function heading(title: string, provenance: string) {
         {provenance}
       </span>
     </div>
-  );
-}
-
-function latest(values: (number | null)[]): number | null {
-  for (let index = values.length - 1; index >= 0; index -= 1) {
-    const value = values[index];
-    if (value !== null && value !== undefined && Number.isFinite(value)) {
-      return value;
-    }
-  }
-  return null;
-}
-
-function maximum(values: (number | null)[]): number | null {
-  const observed = values.filter((value): value is number => value !== null);
-  return observed.length === 0 ? null : Math.max(...observed);
-}
-
-function HostEvidence(props: InfrastructureEvidencePanelProps) {
-  const { t } = useTranslation();
-  const spine = useTimelineSpine({
-    from: props.from,
-    to: props.to,
-    buckets: 24,
-  });
-  const load = spine.data?.series.find(
-    (series) => series.code === "load_per_cpu",
-  );
-  const psi = spine.data?.series.find(
-    (series) => series.code === "psi_io_some",
-  );
-  const loadValue = load === undefined ? null : latest(load.values);
-  const psiValue = psi === undefined ? null : maximum(psi.values);
-  const quality = spine.data?.quality;
-  const host = props.context?.host;
-  return (
-    <aside
-      data-testid="infrastructure-evidence-panel"
-      data-view="processes"
-      style={panel}
-    >
-      {heading(
-        t(`hostEvidence.lens.${props.preset ?? "pressure"}`),
-        t("hostEvidence.scope.host"),
-      )}
-      <div
-        data-testid="host-pressure-evidence"
-        style={{
-          display: "grid",
-          gridTemplateColumns: "1fr 1fr",
-          gap: "var(--space-1)",
-          marginBlockEnd: "var(--space-1)",
-        }}
-      >
-        <span style={{ padding: "var(--space-1)", background: "var(--bg)" }}>
-          <span style={dim}>{t("hostEvidence.loadPerCpu")}</span>{" "}
-          <strong style={{ fontFamily: "var(--mono-font)" }}>
-            {loadValue === null ? "—" : formatNumber(loadValue)}
-          </strong>
-        </span>
-        <span style={{ padding: "var(--space-1)", background: "var(--bg)" }}>
-          <span style={dim}>{t("hostEvidence.psiIo")}</span>{" "}
-          <strong style={{ fontFamily: "var(--mono-font)" }}>
-            {psiValue === null ? "—" : formatByUnit(psiValue, "percent")}
-          </strong>
-        </span>
-      </div>
-      <div
-        data-testid="host-scope-guard"
-        data-cpus={host?.logical_cpu_count ?? "unknown"}
-        style={dim}
-      >
-        {t("hostEvidence.scopeGuard", {
-          cpus: host?.logical_cpu_count ?? "—",
-          kernel: host?.kernel_version ?? "—",
-        })}
-      </div>
-      <div style={{ marginBlockStart: "var(--space-1)" }}>
-        {t(`hostEvidence.note.${props.preset ?? "pressure"}`)}
-      </div>
-      <div
-        data-testid="host-quality"
-        data-limited={quality?.resource_limited.length ?? 0}
-        style={{ ...dim, marginBlockStart: "var(--space-1)" }}
-      >
-        {quality === undefined
-          ? t("table.loading")
-          : `${quality.status} · gaps ${quality.gaps.length} · gated ${quality.gated.length} · resource_limited ${quality.resource_limited.length}`}
-      </div>
-    </aside>
   );
 }
 
@@ -371,7 +279,6 @@ function VacuumEvidence(props: InfrastructureEvidencePanelProps) {
 export function InfrastructureEvidencePanel(
   props: InfrastructureEvidencePanelProps,
 ) {
-  if (props.view.code === "processes") return <HostEvidence {...props} />;
   if (props.view.code === "tables") return <TablesEvidence {...props} />;
   if (props.view.code === "indexes") return <IndexEvidence {...props} />;
   if (props.view.code === "vacuum") return <VacuumEvidence {...props} />;

@@ -22,6 +22,7 @@ import { ForensicSearch } from "./components/ForensicSearch";
 import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
 import { InfrastructureEvidencePanel } from "./components/InfrastructureEvidencePanel";
+import { OsWorkspace, osMetricForPreset } from "./components/OsWorkspace";
 import { PrimaryNavigation } from "./components/PrimaryNavigation";
 import { ShellLayout } from "./components/ShellLayout";
 import { HealthLine } from "./components/HealthLine";
@@ -351,7 +352,7 @@ function Shell() {
   const vacuumScreen = activeView?.code === "vacuum";
   const eventsScreen = activeView?.code === "events";
   const infrastructureEvidenceScreen =
-    processesScreen || tablesScreen || indexesScreen || vacuumScreen;
+    tablesScreen || indexesScreen || vacuumScreen;
   const evidencePanelScreen = infrastructureEvidenceScreen || eventsScreen;
   const denseHeatmapScreen =
     activityScreen || infrastructureEvidenceScreen || eventsScreen;
@@ -382,13 +383,24 @@ function Shell() {
           metric.availability === "available",
       ))
       ? activityPresetMetric
-      : activeView?.canonical_metric;
+      : undefined;
+  const osPresetMetric = osMetricForPreset(effectivePreset);
+  const osDefaultMetric =
+    processesScreen &&
+    (activeView?.metrics.length === 0 ||
+      activeView?.metrics.some(
+        (metric) =>
+          metric.code === osPresetMetric && metric.availability === "available",
+      ))
+      ? osPresetMetric
+      : undefined;
   const metricContext = activeView
     ? `${activeView.code}:${effectivePreset ?? ""}`
     : "";
   const selectedMetric = activeView
     ? (metricByContext[metricContext] ??
       activityDefaultMetric ??
+      osDefaultMetric ??
       activeView.canonical_metric)
     : "";
   const selectMetric = (metric: string) => {
@@ -965,6 +977,69 @@ function Shell() {
               </div>
             </section>
           )}
+          {processesScreen && heatmapReady && (
+            <section
+              data-testid="mobile-os-workspace"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "var(--space-2)",
+                minWidth: 0,
+              }}
+            >
+              <HealthLine />
+              <PageHeader
+                view={activeView}
+                summary={summary.data?.views.find(
+                  (view) => view.view === state.view,
+                )}
+                matched={matched}
+                live={state.at === null}
+                onOpenIncidents={() => patch({ dock: "incidents" })}
+              />
+              <Toolbar
+                view={activeView}
+                preset={effectivePreset}
+                q={state.q}
+                matched={matched}
+                onSelectPreset={selectPreset}
+                onFilter={(q) => patch({ q })}
+                lenses={preparedLenses}
+                contextNote={evidenceNote}
+                filterHint={filterHint}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  height: "70dvh",
+                  minHeight: "520px",
+                  minWidth: 0,
+                }}
+              >
+                <OsWorkspace
+                  view={activeView}
+                  at={at}
+                  span={state.span}
+                  from={heatmapRange.from}
+                  to={heatmapRange.to}
+                  metric={selectedMetric}
+                  preset={effectivePreset}
+                  q={state.q}
+                  sort={state.sort}
+                  order={state.order}
+                  entity={state.entity}
+                  matched={matched}
+                  mobile
+                  context={context.data}
+                  onMetricChange={selectMetric}
+                  onSort={onTableSort}
+                  onSelectRow={onSelectRow}
+                  onMatched={setMatched}
+                />
+              </div>
+            </section>
+          )}
         </div>
       ) : (
         <div
@@ -1069,7 +1144,8 @@ function Shell() {
           {heatmapReady &&
             !statementsScreen &&
             !activityScreen &&
-            !plansScreen && (
+            !plansScreen &&
+            !processesScreen && (
               <div
                 data-shell-region="analytical-center"
                 data-testid={
@@ -1246,6 +1322,27 @@ function Shell() {
                         }),
                   })
                 }
+                onMatched={setMatched}
+              />
+            ) : processesScreen ? (
+              <OsWorkspace
+                view={activeView}
+                at={at}
+                span={state.span}
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                metric={selectedMetric}
+                preset={effectivePreset}
+                q={frameQuery}
+                sort={state.sort}
+                order={state.order}
+                entity={state.entity}
+                matched={matched}
+                mobile={false}
+                context={context.data}
+                onMetricChange={selectMetric}
+                onSort={onTableSort}
+                onSelectRow={onSelectRow}
                 onMatched={setMatched}
               />
             ) : (

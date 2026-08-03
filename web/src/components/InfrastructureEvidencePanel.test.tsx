@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import {
@@ -7,7 +7,6 @@ import {
   makeFrameColumn,
   makeFrameResponse,
   makeFrameRow,
-  makeSpineResponse,
   makeViewSpec,
 } from "../testkit/apiFixtures";
 import { InfrastructureEvidencePanel } from "./InfrastructureEvidencePanel";
@@ -32,71 +31,6 @@ function response(body: unknown): Response {
     headers: { "content-type": "application/json" },
   });
 }
-
-test("OS panel keeps host pressure, process evidence and quality scopes separate", async () => {
-  const fetchMock = vi.fn().mockResolvedValue(
-    response(
-      makeSpineResponse({
-        series: [
-          {
-            code: "load_per_cpu",
-            unit: "ratio",
-            aggregation: "max",
-            values: [0.4, 1.2],
-          },
-          {
-            code: "psi_io_some",
-            unit: "percent",
-            aggregation: "max",
-            values: [4, 18],
-          },
-        ],
-        quality: {
-          status: "partial",
-          snapshots: 2,
-          gaps: [],
-          gated: [],
-          resource_limited: ["host_signals"],
-          active_tail: true,
-        },
-      }),
-    ),
-  );
-  vi.stubGlobal("fetch", fetchMock);
-  render(
-    <InfrastructureEvidencePanel
-      view={makeViewSpec({ code: "processes", scope: "host" })}
-      preset="pressure"
-      at="1722400000000000"
-      span={3600}
-      from="1722396400000000"
-      to="1722400000000000"
-      context={makeContextResponse({
-        host: { logical_cpu_count: 32, kernel_version: "6.8.0" },
-      })}
-      onOpenEntity={() => {}}
-    />,
-    { wrapper },
-  );
-
-  expect(await screen.findByTestId("host-pressure-evidence")).toBeDefined();
-  expect(screen.getByText(/load.*CPU/i)).toBeDefined();
-  expect(screen.getByText(/psiIo/i)).toBeDefined();
-  expect(screen.getByTestId("host-scope-guard").getAttribute("data-cpus")).toBe(
-    "32",
-  );
-  await waitFor(() => {
-    expect(screen.getByTestId("host-pressure-evidence").textContent).toContain(
-      "1.2",
-    );
-    expect(
-      screen.getByTestId("host-quality").getAttribute("data-limited"),
-    ).toBe("1");
-  });
-  const url = new URL((fetchMock.mock.calls[0]?.[0] as Request).url);
-  expect(url.pathname).toBe("/v1/timeline/spine");
-  expect(url.searchParams.get("buckets")).toBe("24");
-});
 
 test("Tables panel fetches only a bounded active-vacuum lane set", async () => {
   const onOpenEntity = vi.fn();

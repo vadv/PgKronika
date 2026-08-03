@@ -135,7 +135,11 @@ export function OsWorkspace(props: OsWorkspaceProps) {
 
   return (
     <section className="os-workspace" data-testid="os-workspace">
-      <aside className="os-host-rail" data-testid="host-pressure-evidence">
+      <aside
+        className="os-host-rail"
+        data-testid="host-pressure-evidence"
+        data-view="processes"
+      >
         <div className="os-host-rail__heading">
           <strong>
             {t(`hostEvidence.lens.${props.preset ?? "pressure"}`)}

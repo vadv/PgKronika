@@ -582,7 +582,7 @@ test("a Processes hash explicitly selects OS while retaining deep-link context",
   expect(screen.getByTestId("contextual-deep-link").textContent).toContain(
     "navigation.deepLink.processes",
   );
-  expect(screen.getByTestId("os-workspace")).toBeDefined();
+  expect(await screen.findByTestId("os-workspace")).toBeDefined();
   expect(screen.getByTestId("processes-time-matrix")).toBeDefined();
   expect(
     document.querySelector('[data-shell-region="analytical-center"]'),
