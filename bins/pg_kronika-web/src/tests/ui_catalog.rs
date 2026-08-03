@@ -177,6 +177,33 @@ fn workload_views_publish_distinct_prepared_lenses_and_fork_provenance() {
     ] {
         assert_serialized_preset(&catalog, "activity", preset);
     }
+    for column in ["queryid", "rss", "threads", "command"] {
+        assert_serialized_column(&catalog, "activity", column);
+    }
+    let activity_presets = activity["presets"].as_array().expect("activity presets");
+    let overview = activity_presets
+        .iter()
+        .find(|preset| preset["code"] == "overview")
+        .expect("activity overview preset");
+    assert_eq!(
+        overview["columns"],
+        json!([
+            "pid",
+            "user",
+            "database",
+            "application",
+            "state",
+            "wait_event",
+            "queryid",
+            "query_duration_us",
+            "process_link",
+            "cpu",
+            "rss",
+            "read_bytes_per_second",
+            "write_bytes_per_second",
+            "command"
+        ])
+    );
     assert_serialized_preset(&catalog, "plans", "change_timeline");
 
     let plan_joins = plans["joins"].as_array().expect("plan joins");

@@ -277,7 +277,7 @@ test("renders the shell regions from fixtures", async () => {
   expect(screen.getByRole("contentinfo").dataset.shellRegion).toBe("status");
 });
 
-test("marks every desktop analytical boundary for bounded viewport layout", async () => {
+test("marks the integrated Activity matrix boundary for bounded viewport layout", async () => {
   renderApp();
   await waitFor(() =>
     expect(screen.getByRole("table", { name: "activity" })).toBeDefined(),
@@ -289,7 +289,8 @@ test("marks every desktop analytical boundary for bounded viewport layout", asyn
   expect(content.style.overflow).toBe("hidden");
   expect(
     document.querySelector('[data-shell-region="analytical-center"]'),
-  ).not.toBeNull();
+  ).toBeNull();
+  expect(screen.getByTestId("activity-workspace")).toBeDefined();
   expect(
     document.querySelector('[data-shell-region="ranked-matrix"]'),
   ).not.toBeNull();
@@ -909,7 +910,9 @@ test("Activity owns prepared forensic lenses, point evidence and a 96-bucket hea
   });
   renderApp(fetchImpl);
 
-  expect(await screen.findByTestId("activity-point-evidence")).toBeDefined();
+  expect(await screen.findByTestId("activity-workspace")).toBeDefined();
+  expect(screen.getByTestId("activity-point-evidence")).toBeDefined();
+  expect(screen.queryByTestId("workload-analytical-center")).toBeNull();
   const overview = screen.getByRole("button", { name: /^overview$/i });
   expect(overview.getAttribute("aria-pressed")).toBe("true");
   expect(
@@ -924,10 +927,10 @@ test("Activity owns prepared forensic lenses, point evidence and a 96-bucket hea
   ).toBe("true");
   fireEvent.click(screen.getByRole("button", { name: /^cpu$/i }));
   expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBe("cpu");
-  expect(screen.getByTestId("activity-process-evidence")).toBeDefined();
+  expect(screen.getByTestId("activity-process-provenance")).toBeDefined();
 
   await waitFor(() => {
-    const heatmap = fetchImpl.mock.calls
+    const heatmaps = fetchImpl.mock.calls
       .map(
         ([input]) =>
           new URL(
@@ -938,12 +941,18 @@ test("Activity owns prepared forensic lenses, point evidence and a 96-bucket hea
                 : input.href,
           ),
       )
-      .find(
+      .filter(
         (url) =>
           url.pathname === "/v1/timeline/heatmap" &&
           url.searchParams.get("view") === "activity",
       );
-    expect(heatmap?.searchParams.get("buckets")).toBe("96");
+    expect(
+      heatmaps.some(
+        (heatmap) =>
+          heatmap.searchParams.get("buckets") === "96" &&
+          heatmap.searchParams.get("metric") === "cpu",
+      ),
+    ).toBe(true);
   });
 });
 

@@ -480,6 +480,9 @@ test("row dock drills down via server related provenance and clears", async () =
     view: "plans",
     entity: "plan:9",
     dock: "row",
+    preset: null,
+    sort: null,
+    order: null,
   });
   fireEvent.click(screen.getByRole("button", { name: "dock.row.clear" }));
   expect(onPatch).toHaveBeenCalledWith({ entity: null, dock: null });

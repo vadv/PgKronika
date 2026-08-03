@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import {
@@ -30,70 +30,6 @@ function response(body: unknown): Response {
     headers: { "content-type": "application/json" },
   });
 }
-
-test("Activity always identifies point evidence and fetches bounded lock lanes only for Waits & Locks", async () => {
-  const fetchMock = vi.fn((input: RequestInfo | URL) => {
-    void input;
-    return Promise.resolve(
-      response(
-        makeFrameResponse({
-          view: "locks",
-          columns: [
-            makeFrameColumn({ code: "pid", type: "i64" }),
-            makeFrameColumn({ code: "blocked_by", type: "text" }),
-            makeFrameColumn({ code: "wait_age_us", type: "f64" }),
-            makeFrameColumn({ code: "target", type: "text" }),
-          ],
-          rows: [
-            makeFrameRow({
-              entity: "lock:18422",
-              label: "pid 18422",
-              cells: [18422, "18111", 1_200_000, "public.orders"],
-            }),
-          ],
-          page: { matched: 1, returned: 1, next: null },
-        }),
-      ),
-    );
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  render(
-    <WorkloadEvidencePanel
-      view={makeViewSpec({ code: "activity" })}
-      preset="waits_locks"
-      at="1722400000000000"
-      span={3600}
-      onOpenEntity={() => {}}
-    />,
-    { wrapper },
-  );
-
-  expect(screen.getByTestId("activity-point-evidence")).toBeDefined();
-  expect(await screen.findByText(/18422.*18111/)).toBeDefined();
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-  const url = new URL((fetchMock.mock.calls[0]?.[0] as Request).url);
-  expect(url.pathname).toBe("/v1/frame/locks");
-  expect(url.searchParams.get("preset")).toBe("tree");
-  expect(url.searchParams.get("limit")).toBe("3");
-  expect(url.searchParams.get("span")).toBe("3600s");
-});
-
-test("Activity non-lock lenses do not spend a lock-frame request", () => {
-  const fetchMock = vi.fn();
-  vi.stubGlobal("fetch", fetchMock);
-  render(
-    <WorkloadEvidencePanel
-      view={makeViewSpec({ code: "activity" })}
-      preset="cpu"
-      at="1722400000000000"
-      span={3600}
-      onOpenEntity={() => {}}
-    />,
-    { wrapper },
-  );
-  expect(screen.getByTestId("activity-process-evidence")).toBeDefined();
-  expect(fetchMock).not.toHaveBeenCalled();
-});
 
 test("Plans change timeline is bounded and publishes both fork attribution methods", async () => {
   const fetchMock = vi.fn().mockResolvedValue(

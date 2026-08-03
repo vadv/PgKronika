@@ -13,6 +13,7 @@ import { useUiContext } from "./api/context";
 import { useIncidents } from "./api/incidents";
 import { useSummary } from "./api/summary";
 import type { ViewSpec } from "./api/types";
+import { ActivityWorkspace } from "./components/ActivityWorkspace";
 import { AlertBar } from "./components/AlertBar";
 import { DockOverlay } from "./components/DockOverlay";
 import { EventsSignalPanel } from "./components/EventsSignalPanel";
@@ -71,6 +72,19 @@ const ACTIVITY_LENSES = [
   ["replication", "replication"],
   ["sampling", "sampling"],
 ] as const;
+
+function activityMetricForPreset(preset: string | null): string {
+  switch (preset) {
+    case "waits_locks":
+      return "wait";
+    case "cpu":
+      return "cpu";
+    case "disk_io":
+      return "io";
+    default:
+      return "active_fraction";
+  }
+}
 const PLAN_LENSES = [
   ["planExecution", "time"],
   ["planBuffers", "io"],
@@ -332,7 +346,7 @@ function Shell() {
   const indexesScreen = activeView?.code === "indexes";
   const vacuumScreen = activeView?.code === "vacuum";
   const eventsScreen = activeView?.code === "events";
-  const workloadEvidenceScreen = activityScreen || plansScreen;
+  const workloadEvidenceScreen = plansScreen;
   const infrastructureEvidenceScreen =
     processesScreen || tablesScreen || indexesScreen || vacuumScreen;
   const evidencePanelScreen =
@@ -359,6 +373,22 @@ function Shell() {
                 : eventsScreen
                   ? (state.preset ?? "timeline")
                   : state.preset;
+  const activityPresetMetric = activityMetricForPreset(effectivePreset);
+  const activityDefaultMetric =
+    activityScreen &&
+    (activeView?.metrics.length === 0 ||
+      activeView?.metrics.some(
+        (metric) =>
+          metric.code === activityPresetMetric &&
+          metric.availability === "available",
+      ))
+      ? activityPresetMetric
+      : activeView?.canonical_metric;
+  const selectedMetric = activeView
+    ? (metricByView[activeView.code] ??
+      activityDefaultMetric ??
+      activeView.canonical_metric)
+    : "";
   const preparedLenses: PreparedLens[] | undefined = statementsScreen
     ? [
         ...STATEMENT_LENSES.map(([code, preset]) =>
@@ -550,8 +580,24 @@ function Shell() {
       : state.q;
   // A preset owns its default ranking. Carrying an explicit sort from the
   // previous lens can leave the matrix invisibly ranked by a hidden column.
-  const selectPreset = (preset: string | null) =>
+  const selectPreset = (preset: string | null) => {
+    if (activityScreen && activeView !== undefined) {
+      const metric = activityMetricForPreset(preset);
+      if (
+        activeView.metrics.length === 0 ||
+        activeView.metrics.some(
+          (candidate) =>
+            candidate.code === metric && candidate.availability === "available",
+        )
+      ) {
+        setMetricByView((previous) => ({
+          ...previous,
+          [activeView.code]: metric,
+        }));
+      }
+    }
     patch({ preset, sort: null, order: null });
+  };
 
   const globalContext = (
     <Header
@@ -760,9 +806,7 @@ function Shell() {
                   span={state.span}
                   from={heatmapRange.from}
                   to={heatmapRange.to}
-                  metric={
-                    metricByView[activeView.code] ?? activeView.canonical_metric
-                  }
+                  metric={selectedMetric}
                   baselineUs={state.baseline}
                   preset={effectivePreset}
                   q={state.q}
@@ -779,6 +823,84 @@ function Shell() {
                   }
                   onSort={onTableSort}
                   onSelectRow={onSelectRow}
+                  onMatched={setMatched}
+                />
+              </div>
+            </section>
+          )}
+          {activityScreen && heatmapReady && (
+            <section
+              data-testid="mobile-activity-workspace"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "var(--space-2)",
+                minWidth: 0,
+              }}
+            >
+              <HealthLine />
+              <PageHeader
+                view={activeView}
+                summary={summary.data?.views.find(
+                  (view) => view.view === state.view,
+                )}
+                matched={matched}
+                live={state.at === null}
+                onOpenIncidents={() => patch({ dock: "incidents" })}
+              />
+              <Toolbar
+                view={activeView}
+                preset={effectivePreset}
+                q={state.q}
+                matched={matched}
+                onSelectPreset={selectPreset}
+                onFilter={(q) => patch({ q })}
+                lenses={preparedLenses}
+                contextNote={evidenceNote}
+                filterHint={filterHint}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  height: "70dvh",
+                  minHeight: "520px",
+                  minWidth: 0,
+                }}
+              >
+                <ActivityWorkspace
+                  view={activeView}
+                  at={at}
+                  span={state.span}
+                  from={heatmapRange.from}
+                  to={heatmapRange.to}
+                  metric={selectedMetric}
+                  baselineUs={state.baseline}
+                  preset={effectivePreset}
+                  q={state.q}
+                  sort={state.sort}
+                  order={state.order}
+                  entity={state.entity}
+                  matched={matched}
+                  mobile
+                  onMetricChange={(metric) =>
+                    setMetricByView((previous) => ({
+                      ...previous,
+                      [activeView.code]: metric,
+                    }))
+                  }
+                  onSort={onTableSort}
+                  onSelectRow={onSelectRow}
+                  onOpenEntity={(view, entity) =>
+                    patch({
+                      view,
+                      entity,
+                      dock: "row",
+                      preset: null,
+                      sort: null,
+                      order: null,
+                    })
+                  }
                   onMatched={setMatched}
                 />
               </div>
@@ -885,7 +1007,7 @@ function Shell() {
               )}
             </section>
           )}
-          {heatmapReady && !statementsScreen && (
+          {heatmapReady && !statementsScreen && !activityScreen && (
             <div
               data-shell-region="analytical-center"
               data-testid={
@@ -912,9 +1034,7 @@ function Shell() {
               <div style={{ minWidth: 0, overflow: "hidden" }}>
                 <HeatmapStrip
                   view={activeView}
-                  metric={
-                    metricByView[activeView.code] ?? activeView.canonical_metric
-                  }
+                  metric={selectedMetric}
                   from={heatmapRange.from}
                   to={heatmapRange.to}
                   selectedRange={range}
@@ -1000,9 +1120,7 @@ function Shell() {
                 span={state.span}
                 from={heatmapRange.from}
                 to={heatmapRange.to}
-                metric={
-                  metricByView[activeView.code] ?? activeView.canonical_metric
-                }
+                metric={selectedMetric}
                 baselineUs={state.baseline}
                 preset={effectivePreset}
                 q={frameQuery}
@@ -1019,6 +1137,42 @@ function Shell() {
                 }
                 onSort={onTableSort}
                 onSelectRow={onSelectRow}
+                onMatched={setMatched}
+              />
+            ) : activityScreen ? (
+              <ActivityWorkspace
+                view={activeView}
+                at={at}
+                span={state.span}
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                metric={selectedMetric}
+                baselineUs={state.baseline}
+                preset={effectivePreset}
+                q={frameQuery}
+                sort={state.sort}
+                order={state.order}
+                entity={state.entity}
+                matched={matched}
+                mobile={false}
+                onMetricChange={(metric) =>
+                  setMetricByView((previous) => ({
+                    ...previous,
+                    [activeView.code]: metric,
+                  }))
+                }
+                onSort={onTableSort}
+                onSelectRow={onSelectRow}
+                onOpenEntity={(view, entity) =>
+                  patch({
+                    view,
+                    entity,
+                    dock: "row",
+                    ...(view === state.view
+                      ? {}
+                      : { preset: null, sort: null, order: null }),
+                  })
+                }
                 onMatched={setMatched}
               />
             ) : (

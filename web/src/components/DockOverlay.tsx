@@ -1026,6 +1026,9 @@ function RowDock(props: {
                           view: relation.view,
                           entity: relation.entity,
                           dock: "row",
+                          ...(relation.view === props.state.view
+                            ? {}
+                            : { preset: null, sort: null, order: null }),
                         })
                       }
                       style={{

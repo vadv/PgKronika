@@ -12,6 +12,8 @@ const REQUESTED_PORT = Number(process.env.PGK_SHELL_PORT ?? 0);
 const VIEWPORT = { width: 1920, height: 1080, deviceScaleFactor: 1 };
 const SUCCESS_SHOT = `${OUT_DIR}forensic-shell-1920x1080.png`;
 const ACTIVITY_SHOT = `${OUT_DIR}forensic-activity-1920x1080.png`;
+const ACTIVITY_CPU_SHOT = `${OUT_DIR}forensic-activity-cpu-1920x1080.png`;
+const ACTIVITY_WAITS_SHOT = `${OUT_DIR}forensic-activity-waits-1920x1080.png`;
 const PLANS_SHOT = `${OUT_DIR}forensic-plans-1920x1080.png`;
 const OS_SHOT = `${OUT_DIR}forensic-os-1920x1080.png`;
 const TABLES_SHOT = `${OUT_DIR}forensic-tables-1920x1080.png`;
@@ -906,49 +908,67 @@ async function heatmapBucketsFor(page, view) {
 
 async function verifyActivityPlansWorkspaces(page, base, at) {
   await page.goto(
-    `${base}/#source=local&view=activity&at=${at}&span=3600&preset=waits_locks`,
+    `${base}/#source=local&view=activity&at=${at}&span=3600&preset=overview`,
     { waitUntil: "networkidle0" },
   );
-  await page.waitForSelector(
-    '[data-testid="workload-evidence-panel"][data-view="activity"]',
-    { timeout: 15_000 },
-  );
-  await page.waitForSelector('[data-testid="activity-lock-lanes"] button', {
-    timeout: 10_000,
+  await page.waitForSelector('[data-testid="activity-workspace"]', {
+    timeout: 15_000,
   });
+  await page.waitForSelector(
+    'table[aria-label="activity"] tbody tr[data-entity]',
+    { timeout: 10_000 },
+  );
   await page.evaluate(() => window.scrollTo(0, 0));
   const activity = await page.evaluate(() => {
-    const center = document.querySelector(
-      '[data-testid="workload-analytical-center"]',
+    const workspace = document.querySelector(
+      '[data-testid="activity-workspace"]',
     );
-    const panel = document.querySelector(
-      '[data-testid="workload-evidence-panel"][data-view="activity"]',
+    const matrix = document.querySelector('table[aria-label="activity"]');
+    const sample = document.querySelector(
+      'table[aria-label="activity"] [data-testid="activity-sample-row"]',
     );
-    if (!(center instanceof HTMLElement) || !(panel instanceof HTMLElement)) {
-      throw new Error("Activity analytical center is incomplete");
+    if (
+      !(workspace instanceof HTMLElement) ||
+      !(matrix instanceof HTMLElement) ||
+      !(sample instanceof HTMLElement)
+    ) {
+      throw new Error("Activity point-sample matrix is incomplete");
     }
-    const centerRect = center.getBoundingClientRect();
-    const panelRect = panel.getBoundingClientRect();
-    const lockLanes = [
-      ...panel.querySelectorAll('[data-testid="activity-lock-lanes"] button'),
-    ];
-    const lastLaneRect = lockLanes.at(-1)?.getBoundingClientRect();
+    const workspaceRect = workspace.getBoundingClientRect();
+    const matrixRect = matrix.getBoundingClientRect();
     const gated = [...document.querySelectorAll('button[aria-disabled="true"]')]
       .map((button) => button.textContent?.trim() ?? "")
       .filter(Boolean);
     return {
       rootHeight: document.documentElement.scrollHeight,
       scrollY: window.scrollY,
-      centerHeight: centerRect.height,
-      panelInside:
-        panelRect.top >= centerRect.top &&
-        panelRect.bottom <= centerRect.bottom,
+      detachedCenter:
+        document.querySelector('[data-testid="workload-analytical-center"]') !==
+        null,
+      workspaceInsideViewport:
+        workspaceRect.top >= 0 && workspaceRect.bottom <= window.innerHeight,
+      matrixInsideWorkspace:
+        matrixRect.top >= workspaceRect.top &&
+        matrixRect.bottom >= workspaceRect.top,
+      visibleRows: matrix.querySelectorAll("tbody tr[data-entity]").length,
+      sampleBuckets: sample.querySelectorAll(
+        '[data-testid="time-matrix-bucket"]',
+      ).length,
       pointEvidence:
         document.querySelector('[data-testid="activity-point-evidence"]')
           ?.textContent ?? "",
-      lockLanes: lockLanes.length,
-      lastLaneInside:
-        lastLaneRect !== undefined && lastLaneRect.bottom <= panelRect.bottom,
+      processProvenance:
+        document
+          .querySelector('[data-testid="activity-process-provenance"]')
+          ?.textContent?.trim() ?? "",
+      processCaveat:
+        document
+          .querySelector('[data-testid="activity-process-provenance"]')
+          ?.getAttribute("title") ?? "",
+      activeMetric:
+        [...document.querySelectorAll(".activity-workspace__metric")]
+          .find((button) => button.getAttribute("aria-pressed") === "true")
+          ?.textContent?.trim() ?? "",
       gated,
     };
   });
@@ -958,14 +978,24 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     activityFailures.push(`root height ${activity.rootHeight}`);
   if (activity.scrollY !== 0)
     activityFailures.push(`shell scroll offset ${activity.scrollY}`);
-  if (activity.centerHeight !== 156)
-    activityFailures.push(`analytical center ${activity.centerHeight}`);
-  if (!activity.panelInside) activityFailures.push("panel escapes center");
-  if (activity.lockLanes < 1) activityFailures.push("no lock lanes");
-  if (!activity.lastLaneInside)
-    activityFailures.push("last lock lane is clipped");
+  if (activity.detachedCenter)
+    activityFailures.push("legacy detached analytical center is present");
+  if (!activity.workspaceInsideViewport)
+    activityFailures.push("workspace escapes the 1920x1080 viewport");
+  if (!activity.matrixInsideWorkspace)
+    activityFailures.push("row matrix is detached from Activity evidence");
+  if (activity.visibleRows < 18)
+    activityFailures.push(`only ${activity.visibleRows} rows are visible`);
+  if (activity.sampleBuckets !== 96)
+    activityFailures.push(`row sample buckets ${activity.sampleBuckets}`);
   if (!activity.pointEvidence.includes("Short queries"))
     activityFailures.push("point-snapshot sampling caveat is missing");
+  if (!activity.processProvenance.includes("same_snapshot_pid_only"))
+    activityFailures.push(
+      `process provenance is incomplete: ${activity.processProvenance}`,
+    );
+  if (!/best[- ]effort/i.test(activity.processCaveat))
+    activityFailures.push("process attribution caveat is missing");
   if (
     !activity.gated.includes("Memory") ||
     !activity.gated.includes("XID / Horizon")
@@ -979,7 +1009,98 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   await page.screenshot({ path: ACTIVITY_SHOT });
 
   await page.evaluate(() => {
-    const search = document.querySelector('input[type="search"]');
+    const cpu = [...document.querySelectorAll("button")].find(
+      (button) =>
+        button.textContent?.trim() === "CPU" &&
+        button.closest('[aria-label="lenses"]') !== null,
+    );
+    if (!(cpu instanceof HTMLButtonElement)) {
+      throw new Error("Activity CPU lens is missing");
+    }
+    cpu.click();
+  });
+  await page.waitForFunction(
+    () =>
+      document
+        .querySelector('[data-testid="activity-workspace"]')
+        ?.getAttribute("data-lens") === "cpu" &&
+      [...document.querySelectorAll(".activity-workspace__metric")].some(
+        (button) =>
+          button.textContent?.trim() === "CPU" &&
+          button.getAttribute("aria-pressed") === "true",
+      ),
+    { timeout: 10_000 },
+  );
+  await page.waitForFunction(
+    () =>
+      performance
+        .getEntriesByType("resource")
+        .map((entry) => entry.name)
+        .some((name) => {
+          if (!name.includes("/v1/timeline/heatmap")) return false;
+          const request = new URL(name);
+          return (
+            request.searchParams.get("view") === "activity" &&
+            request.searchParams.get("metric") === "cpu" &&
+            request.searchParams.get("buckets") === "96"
+          );
+        }),
+    { timeout: 10_000 },
+  );
+  await page.screenshot({ path: ACTIVITY_CPU_SHOT });
+
+  await page.evaluate(() => {
+    const waits = [...document.querySelectorAll("button")].find((button) =>
+      /waits.*locks/i.test(button.textContent?.trim() ?? ""),
+    );
+    if (!(waits instanceof HTMLButtonElement)) {
+      throw new Error("Activity Waits & Locks lens is missing");
+    }
+    waits.click();
+  });
+  await page.waitForSelector(
+    '[data-testid="activity-workspace"][data-lens="waits_locks"] [data-testid="activity-lock-evidence"] button',
+    { timeout: 10_000 },
+  );
+  const waits = await page.evaluate(() => {
+    const strip = document.querySelector(
+      '[data-testid="activity-lock-evidence"]',
+    );
+    if (!(strip instanceof HTMLElement)) {
+      throw new Error("Activity lock evidence is missing");
+    }
+    const buttons = [...strip.querySelectorAll("button")];
+    const last = buttons.at(-1)?.getBoundingClientRect();
+    const stripRect = strip.getBoundingClientRect();
+    const metric = [
+      ...document.querySelectorAll(".activity-workspace__metric"),
+    ].find((button) => button.getAttribute("aria-pressed") === "true");
+    return {
+      edges: buttons.length,
+      provenance: strip.getAttribute("data-provenance"),
+      lastInside:
+        last !== undefined &&
+        last.top >= stripRect.top &&
+        last.bottom <= stripRect.bottom,
+      metric: metric?.textContent?.trim() ?? "",
+      rootHeight: document.documentElement.scrollHeight,
+      scrollY: window.scrollY,
+    };
+  });
+  if (
+    waits.edges < 1 ||
+    waits.provenance !== "edge_only" ||
+    !waits.lastInside ||
+    !/wait/i.test(waits.metric) ||
+    waits.rootHeight > 1080 ||
+    waits.scrollY !== 0
+  ) {
+    throw new Error(`Activity Waits & Locks: ${JSON.stringify(waits)}`);
+  }
+  await page.screenshot({ path: ACTIVITY_WAITS_SHOT });
+
+  await page.evaluate(() => {
+    const search = document.querySelector('input[name="view-filter"]');
     if (!(search instanceof HTMLInputElement)) {
       throw new Error("Activity filter is missing");
     }
@@ -1015,6 +1136,27 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     !/best[_ ]effort/.test(processRelation)
   ) {
     throw new Error(`Activity process provenance: ${processRelation}`);
+  }
+  await page.click('[data-dock="row"] [role="tabpanel"] button');
+  await page.waitForFunction(
+    () => {
+      const params = new URLSearchParams(location.hash.slice(1));
+      return (
+        params.get("view") === "processes" &&
+        params.get("entity") === "proc:12041" &&
+        params.get("preset") === null
+      );
+    },
+    { timeout: 10_000 },
+  );
+  const processDetail = await page.$eval(
+    '[data-dock="row"]',
+    (element) => element.textContent ?? "",
+  );
+  if (processDetail.includes("saved by this deep link")) {
+    throw new Error(
+      "Activity process drill-down kept an invalid Activity lens",
+    );
   }
 
   await page.goto(
@@ -1107,7 +1249,13 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   }
   await page.screenshot({ path: PLANS_SHOT });
   return {
-    activity: { ...activity, processRelationVerified: true },
+    activity: {
+      ...activity,
+      cpuMetricVerified: true,
+      waits,
+      processRelationVerified: true,
+      processDetailVerified: true,
+    },
     plans,
   };
 }
@@ -1811,6 +1959,8 @@ try {
   console.log(`approved screenshot: ${SUCCESS_SHOT}`);
   console.log(`approved screenshot: ${STATEMENTS_COMPACT_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_SHOT}`);
+  console.log(`approved screenshot: ${ACTIVITY_CPU_SHOT}`);
+  console.log(`approved screenshot: ${ACTIVITY_WAITS_SHOT}`);
   console.log(`approved screenshot: ${PLANS_SHOT}`);
   console.log(`approved screenshot: ${OS_SHOT}`);
   console.log(`approved screenshot: ${TABLES_SHOT}`);

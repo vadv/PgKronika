@@ -29,6 +29,7 @@ import type {
 import { TemporalBucketRow } from "./TemporalBucketRow";
 
 export interface TimeMatrixColumn {
+  kind?: "statements" | "activity";
   data: HeatmapResponse | undefined;
   pending: boolean;
   error: boolean;
@@ -73,9 +74,61 @@ const SORTABLE_TYPES = new Set(["i64", "u64", "f64", "timestamp"]);
 const NUMERIC_TYPES = new Set(["i64", "u64", "f64"]);
 const ROW_HEIGHT = 28;
 const TIME_MATRIX_ROW_HEIGHT = 27;
+const ACTIVITY_MATRIX_ROW_HEIGHT = 34;
 const ROW_OVERSCAN = 5;
 const FALLBACK_VIEWPORT_HEIGHT = 650;
 const STATEMENT_IDENTITY_COLUMNS = new Set(["queryid", "database", "user"]);
+const ACTIVITY_IDENTITY_COLUMNS = new Set([
+  "pid",
+  "database",
+  "user",
+  "application",
+]);
+const ACTIVITY_OS_COLUMNS = new Set([
+  "cpu",
+  "rss",
+  "threads",
+  "read_bytes_per_second",
+  "write_bytes_per_second",
+  "command",
+]);
+
+type ActivityEvidenceGroup = "pg" | "relation" | "os";
+
+function activityEvidenceGroup(code: string): ActivityEvidenceGroup {
+  if (code === "process_link") return "relation";
+  return ACTIVITY_OS_COLUMNS.has(code) ? "os" : "pg";
+}
+
+function activityColumnWidth(code: string): string | undefined {
+  switch (code) {
+    case "state":
+      return "110px";
+    case "wait_event":
+      return "132px";
+    case "queryid":
+      return "108px";
+    case "query_duration_us":
+    case "transaction_duration_us":
+      return "96px";
+    case "process_link":
+      return "90px";
+    case "cpu":
+      return "70px";
+    case "rss":
+      return "76px";
+    case "threads":
+      return "64px";
+    case "read_bytes_per_second":
+    case "write_bytes_per_second":
+      return "84px";
+    case "command":
+    case "query":
+      return "240px";
+    default:
+      return undefined;
+  }
+}
 
 function boundedUniqueRows(
   existing: FrameRowDto[],
@@ -330,17 +383,35 @@ function TableViewImpl(props: TableViewProps) {
   const loadingMore = cursor !== null && frame.isLoading;
   const timeMatrix = props.timeMatrix ?? null;
   const timeMatrixMode = timeMatrix !== null;
-  const rowHeight = timeMatrixMode ? TIME_MATRIX_ROW_HEIGHT : ROW_HEIGHT;
+  const matrixKind = timeMatrix?.kind ?? "statements";
+  const activityMatrixMode = timeMatrixMode && matrixKind === "activity";
+  const matrixClass = `${matrixKind}-time-matrix`;
+  const matrixIdentityClass = `${matrixClass}__identity`;
+  const matrixTimelineClass = `${matrixClass}__timeline`;
+  const matrixTimelineCellClass = `${matrixClass}__timeline-cell`;
+  const identityCodes = activityMatrixMode
+    ? ACTIVITY_IDENTITY_COLUMNS
+    : STATEMENT_IDENTITY_COLUMNS;
+  const rowHeight = activityMatrixMode
+    ? ACTIVITY_MATRIX_ROW_HEIGHT
+    : timeMatrixMode
+      ? TIME_MATRIX_ROW_HEIGHT
+      : ROW_HEIGHT;
   const identityColumns = timeMatrixMode
-    ? columns.filter(({ column }) =>
-        STATEMENT_IDENTITY_COLUMNS.has(column.code),
-      )
+    ? columns.filter(({ column }) => identityCodes.has(column.code))
     : [];
   const displayColumns = timeMatrixMode
-    ? columns.filter(
-        ({ column }) => !STATEMENT_IDENTITY_COLUMNS.has(column.code),
-      )
+    ? columns.filter(({ column }) => !identityCodes.has(column.code))
     : columns;
+  const activityColumnGroups = displayColumns.reduce<
+    { code: ActivityEvidenceGroup; span: number }[]
+  >((groups, { column }) => {
+    const code = activityEvidenceGroup(column.code);
+    const previous = groups.at(-1);
+    if (previous?.code === code) previous.span += 1;
+    else groups.push({ code, span: 1 });
+    return groups;
+  }, []);
   const renderedColumnCount =
     displayColumns.length +
     (timeMatrixMode && identityColumns.length > 0 ? 1 : 0);
@@ -457,24 +528,50 @@ function TableViewImpl(props: TableViewProps) {
         <table
           aria-label={props.view.code}
           aria-rowcount={(matched || rows.length) + 1}
-          className={timeMatrixMode ? "statements-time-matrix" : undefined}
-          data-testid={timeMatrixMode ? "statements-time-matrix" : undefined}
+          className={timeMatrixMode ? matrixClass : undefined}
+          data-testid={timeMatrixMode ? matrixClass : undefined}
           style={{ borderCollapse: "collapse", width: "100%" }}
         >
           <thead>
+            {activityMatrixMode && (
+              <tr className="activity-time-matrix__groups">
+                <th className={matrixIdentityClass}>
+                  {t("activity.matrix.group.pg")}
+                </th>
+                {activityColumnGroups.map((group, index) => (
+                  <th
+                    key={`${group.code}-${index}`}
+                    colSpan={group.span}
+                    data-evidence-group={group.code}
+                  >
+                    {group.code === "relation"
+                      ? t("activity.matrix.group.link")
+                      : group.code === "os"
+                        ? t("activity.matrix.group.os")
+                        : t("activity.matrix.group.pgContext")}
+                  </th>
+                ))}
+                <th className={matrixTimelineClass}>
+                  {t("activity.matrix.group.samples")}
+                </th>
+              </tr>
+            )}
             <tr>
               {timeMatrixMode && identityColumns.length > 0 && (
                 <th
-                  className="statements-time-matrix__identity"
+                  className={matrixIdentityClass}
                   style={{
                     ...headerCellStyle("queryid"),
                     left: 0,
+                    top: activityMatrixMode ? "18px" : 0,
                     zIndex: 3,
                   }}
                 >
                   <button
                     type="button"
-                    onClick={() => cycleSort("queryid")}
+                    onClick={() =>
+                      cycleSort(activityMatrixMode ? "pid" : "queryid")
+                    }
                     style={{
                       color: "inherit",
                       background: "none",
@@ -483,8 +580,10 @@ function TableViewImpl(props: TableViewProps) {
                       cursor: "pointer",
                     }}
                   >
-                    {t("statements.matrix.identity")}
-                    {sortArrow("queryid")}
+                    {activityMatrixMode
+                      ? t("activity.matrix.identity")
+                      : t("statements.matrix.identity")}
+                    {sortArrow(activityMatrixMode ? "pid" : "queryid")}
                   </button>
                 </th>
               )}
@@ -542,8 +641,19 @@ function TableViewImpl(props: TableViewProps) {
                 return (
                   <th
                     key={column.code}
+                    data-evidence-group={
+                      activityMatrixMode
+                        ? activityEvidenceGroup(column.code)
+                        : undefined
+                    }
                     style={{
                       ...headerCellStyle(column.code),
+                      ...(activityMatrixMode
+                        ? {
+                            top: "18px",
+                            width: activityColumnWidth(column.code),
+                          }
+                        : undefined),
                       ...(!timeMatrixMode && columnIndex === 0
                         ? { left: 0, zIndex: 3 }
                         : undefined),
@@ -577,24 +687,29 @@ function TableViewImpl(props: TableViewProps) {
               })}
               {timeMatrix !== null ? (
                 <th
-                  className="statements-time-matrix__timeline"
-                  style={headerCellStyle("")}
+                  className={matrixTimelineClass}
+                  style={{
+                    ...headerCellStyle(""),
+                    ...(activityMatrixMode ? { top: "18px" } : undefined),
+                  }}
                 >
                   <span>
-                    {t("statements.matrix.heatmap", { count: bucketCount })}
+                    {activityMatrixMode
+                      ? t("activity.matrix.samples", { count: bucketCount })
+                      : t("statements.matrix.heatmap", { count: bucketCount })}
                   </span>
-                  <span className="statements-time-matrix__metric">
+                  <span className={`${matrixClass}__metric`}>
                     {timeMatrix.metricLabel}
                   </span>
                   {timeMatrix.pending && (
-                    <span className="statements-time-matrix__status">
+                    <span className={`${matrixClass}__status`}>
                       {t("statements.matrix.loading")}
                     </span>
                   )}
                   {timeMatrix.error && (
                     <button
                       type="button"
-                      className="statements-time-matrix__retry"
+                      className={`${matrixClass}__retry`}
                       onClick={timeMatrix.onRetry}
                     >
                       {t("table.retry")}
@@ -676,7 +791,9 @@ function TableViewImpl(props: TableViewProps) {
                     (() => {
                       const primary =
                         identityColumns.find(
-                          ({ column }) => column.code === "queryid",
+                          ({ column }) =>
+                            column.code ===
+                            (activityMatrixMode ? "pid" : "queryid"),
                         ) ?? identityColumns[0];
                       if (primary === undefined) return null;
                       const primaryValue: FrameValue =
@@ -695,7 +812,7 @@ function TableViewImpl(props: TableViewProps) {
                         .filter((value) => value !== "—");
                       return (
                         <td
-                          className="statements-time-matrix__identity"
+                          className={matrixIdentityClass}
                           title={
                             [
                               fullCellValue(primaryValue, primary.column),
@@ -705,11 +822,11 @@ function TableViewImpl(props: TableViewProps) {
                               .join(" · ") || undefined
                           }
                         >
-                          <span className="statements-time-matrix__identity-primary">
+                          <span className={`${matrixClass}__identity-primary`}>
                             {formatCellValue(primaryValue, primary.column, t)}
                           </span>
                           {secondary.length > 0 && (
-                            <span className="statements-time-matrix__identity-meta">
+                            <span className={`${matrixClass}__identity-meta`}>
                               {secondary.join(" · ")}
                             </span>
                           )}
@@ -747,6 +864,9 @@ function TableViewImpl(props: TableViewProps) {
                         }
                         style={{
                           padding: "2px 10px",
+                          ...(activityMatrixMode
+                            ? { width: activityColumnWidth(column.code) }
+                            : undefined),
                           borderBottom: "1px solid var(--border)",
                           fontSize: "var(--text-md)",
                           textAlign: numeric ? "end" : "start",
@@ -779,7 +899,7 @@ function TableViewImpl(props: TableViewProps) {
                     );
                   })}
                   {timeMatrix !== null ? (
-                    <td className="statements-time-matrix__timeline-cell">
+                    <td className={matrixTimelineCellClass}>
                       <TemporalBucketRow
                         row={heatmapRows.get(row.entity) ?? null}
                         bucketCount={bucketCount}
@@ -789,6 +909,7 @@ function TableViewImpl(props: TableViewProps) {
                         baselineUs={timeMatrix.baselineUs}
                         metricLabel={timeMatrix.metricLabel}
                         max={heatmapMax}
+                        mode={activityMatrixMode ? "point_samples" : "range"}
                       />
                     </td>
                   ) : (

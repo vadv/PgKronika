@@ -6,7 +6,7 @@ import type {
   FrameValue,
   ViewSpec,
 } from "../api/types";
-import { formatByUnit, shortIdToken } from "../design/format";
+import { shortIdToken } from "../design/format";
 
 interface WorkloadEvidencePanelProps {
   view: ViewSpec;
@@ -78,132 +78,6 @@ function PanelHeading(props: { title: string; provenance: string }) {
         {props.provenance}
       </span>
     </div>
-  );
-}
-
-function LockLanes(props: {
-  at: string;
-  span: number;
-  onOpenEntity: (view: string, entity: string) => void;
-}) {
-  const { t } = useTranslation();
-  const frame = useFrame({
-    view: "locks",
-    at: props.at,
-    span: props.span,
-    preset: "tree",
-    limit: 3,
-  });
-  if (frame.isPending) {
-    return <span style={{ color: "var(--fg-dim)" }}>{t("table.loading")}</span>;
-  }
-  if (frame.isError) {
-    return (
-      <span style={{ color: "var(--sev-warn-fg)" }}>{t("table.error")}</span>
-    );
-  }
-  if (frame.data.rows.length === 0) {
-    return (
-      <span style={{ color: "var(--fg-dim)" }}>
-        {t("activity.locks.empty")}
-      </span>
-    );
-  }
-  return (
-    <div
-      data-testid="activity-lock-lanes"
-      style={{ display: "grid", gap: "var(--space-1)" }}
-    >
-      {frame.data.rows.map((row) => {
-        const pid = evidenceText(cell(frame.data.columns, row, "pid"));
-        const blockedBy = evidenceText(
-          cell(frame.data.columns, row, "blocked_by"),
-        );
-        const waitAge = cell(frame.data.columns, row, "wait_age_us");
-        const target = evidenceText(cell(frame.data.columns, row, "target"));
-        return (
-          <button
-            key={row.entity}
-            type="button"
-            onClick={() => props.onOpenEntity("locks", row.entity)}
-            aria-label={`${pid} → ${blockedBy} · ${target}`}
-            style={{
-              display: "grid",
-              gridTemplateColumns: "minmax(0, 1fr) auto",
-              gap: "var(--space-2)",
-              minWidth: 0,
-              padding: "var(--space-1) var(--space-2)",
-              color: "var(--fg)",
-              background: "var(--bg)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius-sm)",
-              cursor: "pointer",
-              fontFamily: "var(--mono-font)",
-              fontSize: "var(--text-xs)",
-              textAlign: "start",
-            }}
-          >
-            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
-              {pid} → {blockedBy} · {target}
-            </span>
-            <span style={{ color: "var(--fg-dim)" }}>
-              {typeof waitAge === "number"
-                ? formatByUnit(waitAge, "us")
-                : evidenceText(waitAge)}
-            </span>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function ActivityPanel(props: WorkloadEvidencePanelProps) {
-  const { t } = useTranslation();
-  const processLens = props.preset === "cpu" || props.preset === "disk_io";
-  return (
-    <aside
-      data-testid="workload-evidence-panel"
-      data-view="activity"
-      style={panelStyle()}
-    >
-      <PanelHeading
-        title={t(`activity.lens.${props.preset ?? "overview"}`)}
-        provenance={t("activity.snapshotBadge")}
-      />
-      <div
-        data-testid="activity-point-evidence"
-        style={{
-          color: "var(--fg-dim)",
-          fontSize: "var(--text-xs)",
-          marginBlockEnd: "var(--space-2)",
-        }}
-      >
-        {t("activity.pointEvidence")}
-      </div>
-      {props.preset === "waits_locks" ? (
-        <LockLanes
-          at={props.at}
-          span={props.span}
-          onOpenEntity={props.onOpenEntity}
-        />
-      ) : processLens ? (
-        <div
-          data-testid="activity-process-evidence"
-          style={{ fontSize: "var(--text-xs)" }}
-        >
-          {t("activity.processEvidence")}
-        </div>
-      ) : props.preset === "sampling" ? (
-        <div style={{ fontSize: "var(--text-xs)" }}>
-          {t("activity.samplingEvidence")}
-        </div>
-      ) : (
-        <div style={{ fontSize: "var(--text-xs)" }}>
-          {t(`activity.lensNote.${props.preset ?? "overview"}`)}
-        </div>
-      )}
-    </aside>
   );
 }
 
@@ -381,7 +255,6 @@ function PlansPanel(props: WorkloadEvidencePanelProps) {
 }
 
 export function WorkloadEvidencePanel(props: WorkloadEvidencePanelProps) {
-  if (props.view.code === "activity") return <ActivityPanel {...props} />;
   if (props.view.code === "plans") return <PlansPanel {...props} />;
   return null;
 }

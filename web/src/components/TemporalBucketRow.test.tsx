@@ -36,4 +36,23 @@ describe("TemporalBucketRow", () => {
         .every((cell) => cell.dataset.empty === "true"),
     ).toBe(true);
   });
+
+  test("marks Activity evidence as separated point samples", () => {
+    render(
+      <TemporalBucketRow
+        row={null}
+        bucketCount={4}
+        gridFromUs="100"
+        gridToUs="200"
+        cursorUs={null}
+        baselineUs={null}
+        metricLabel="observed activity"
+        mode="point_samples"
+      />,
+    );
+
+    const row = screen.getByTestId("activity-sample-row");
+    expect(row.dataset.mode).toBe("point_samples");
+    expect(row.querySelector("svg, polyline, path")).toBeNull();
+  });
 });

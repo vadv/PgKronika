@@ -1139,7 +1139,13 @@ fn project_activity(
     let needs_process = columns.iter().any(|column| {
         matches!(
             column.code,
-            "process_link" | "cpu" | "read_bytes_per_second" | "write_bytes_per_second"
+            "process_link"
+                | "cpu"
+                | "rss"
+                | "threads"
+                | "read_bytes_per_second"
+                | "write_bytes_per_second"
+                | "command"
         )
     });
     let current_process = if needs_process {
@@ -1162,64 +1168,75 @@ fn project_activity(
         None
     };
     for column in columns {
-        let value = match column.code {
-            "pid" => raw_frame(row, "pid", column.value_type),
-            "user" => raw_frame(row, "usename", column.value_type),
-            "database" => raw_frame(row, "datname", column.value_type),
-            "application" => raw_frame(row, "application_name", column.value_type),
-            "backend_type" => raw_frame(row, "backend_type", column.value_type),
-            "state" => raw_frame(row, "state", column.value_type),
-            "wait_event" => joined(row, "wait_event_type", ":", "wait_event"),
-            "query" => raw_frame(row, "query", column.value_type),
-            "query_duration_us" => duration_us(input.snapshot_ts_us, row, "query_start")?,
-            "transaction_duration_us" => duration_us(input.snapshot_ts_us, row, "xact_start")?,
-            "process_link" => current_process.map_or(FrameValue::Null, |_process| {
-                FrameValue::String("best_effort".to_owned())
-            }),
-            "cpu" => current_process.map_or(FrameValue::Null, |current| {
-                tick_rate_sum(
-                    current,
-                    previous_process,
-                    &["utime", "stime"],
-                    input,
-                    continuity,
-                )
-            }),
-            "read_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
-                rate_sum(
-                    current,
-                    previous_process,
-                    &["read_bytes"],
-                    input,
-                    continuity,
-                )
-            }),
-            "write_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
-                rate_sum(
-                    current,
-                    previous_process,
-                    &["write_bytes"],
-                    input,
-                    continuity,
-                )
-            }),
-            "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
-                .map_or(FrameValue::Null, |replica| {
-                    raw_frame(replica, "state", column.value_type)
-                }),
-            "sync_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
-                .map_or(FrameValue::Null, |replica| {
-                    raw_frame(replica, "sync_state", column.value_type)
-                }),
-            "replay_lag_us" => activity_replica(row, &input.current, input.snapshot_ts_us)
-                .map_or(FrameValue::Null, |replica| {
-                    raw_frame(replica, "replay_lag_us", column.value_type)
-                }),
-            _ => FrameValue::Null,
+        let value = if let Some(value) =
+            activity_process_value(column, current_process, previous_process, input, continuity)
+        {
+            value
+        } else {
+            match column.code {
+                "pid" => raw_frame(row, "pid", column.value_type),
+                "user" => raw_frame(row, "usename", column.value_type),
+                "database" => raw_frame(row, "datname", column.value_type),
+                "application" => raw_frame(row, "application_name", column.value_type),
+                "backend_type" => raw_frame(row, "backend_type", column.value_type),
+                "state" => raw_frame(row, "state", column.value_type),
+                "wait_event" => joined(row, "wait_event_type", ":", "wait_event"),
+                "query" => raw_frame(row, "query", column.value_type),
+                "queryid" => raw_frame(row, "query_id", column.value_type),
+                "query_duration_us" => duration_us(input.snapshot_ts_us, row, "query_start")?,
+                "transaction_duration_us" => duration_us(input.snapshot_ts_us, row, "xact_start")?,
+                "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                    .map_or(FrameValue::Null, |replica| {
+                        raw_frame(replica, "state", column.value_type)
+                    }),
+                "sync_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                    .map_or(FrameValue::Null, |replica| {
+                        raw_frame(replica, "sync_state", column.value_type)
+                    }),
+                "replay_lag_us" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                    .map_or(FrameValue::Null, |replica| {
+                        raw_frame(replica, "replay_lag_us", column.value_type)
+                    }),
+                _ => FrameValue::Null,
+            }
         };
         out.values.push((column.code, value));
     }
     Ok(out)
+}
+
+fn activity_process_value(
+    column: &ColumnSpec,
+    current: Option<&OutRow>,
+    previous: Option<&OutRow>,
+    input: &ProjectionInput,
+    continuity: ContinuityVerdict,
+) -> Option<FrameValue> {
+    let value = match column.code {
+        "process_link" => current.map_or(FrameValue::Null, |_process| {
+            FrameValue::String("best_effort".to_owned())
+        }),
+        "cpu" => current.map_or(FrameValue::Null, |row| {
+            tick_rate_sum(row, previous, &["utime", "stime"], input, continuity)
+        }),
+        "rss" => current.map_or(FrameValue::Null, |row| {
+            raw_frame(row, "rmem_kb", column.value_type)
+        }),
+        "threads" => current.map_or(FrameValue::Null, |row| {
+            raw_frame(row, "num_threads", column.value_type)
+        }),
+        "read_bytes_per_second" => current.map_or(FrameValue::Null, |row| {
+            rate_sum(row, previous, &["read_bytes"], input, continuity)
+        }),
+        "write_bytes_per_second" => current.map_or(FrameValue::Null, |row| {
+            rate_sum(row, previous, &["write_bytes"], input, continuity)
+        }),
+        "command" => current.map_or(FrameValue::Null, |row| {
+            raw_frame(row, "cmdline", column.value_type)
+        }),
+        _ => return None,
+    };
+    Some(value)
 }
 
 fn activity_replica<'a>(
