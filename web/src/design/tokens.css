@@ -27,6 +27,13 @@
   --shadow-pop-light:
     0 8px 24px rgb(140 149 159 / 0.25), 0 0 0 1px rgb(27 31 36 / 0.06);
   --transition-fast: 120ms ease-out;
+
+  /* Dense statement/time matrix geometry. */
+  --statement-matrix-min-width: 1420px;
+  --statement-identity-width: 272px;
+  --statement-timeline-min-width: 620px;
+  --time-bucket-min-width: 4px;
+  --time-bucket-height: 12px;
 }
 
 [data-theme="dark"] {

@@ -80,6 +80,14 @@ test("numeric cells honor the catalog unit", () => {
   expect(formatCellValue("select 1", text, t)).toBe("select 1");
 });
 
+test("dense statement counters stay compact while the exact value remains in the tooltip", () => {
+  const calls = { code: "calls", type: "f64" };
+  const rows = { code: "rows", type: "f64" };
+  expect(formatCellValue(12_400_000, calls, t)).toBe("12.4M");
+  expect(formatCellValue(9_920_000, rows, t)).toBe("9.92M");
+  expect(fullCellValue(12_400_000, calls)).toBe("12400000");
+});
+
 function classified(
   level: string,
   evidence: EvidenceDto,

@@ -453,6 +453,10 @@ test("localized evidence summary exposes verdicts outside the slider leaf", asyn
   expect(summary.textContent).toContain("0 gaps");
   expect(summary.textContent).toContain("Current bucket: critical");
   expect(summary.textContent).toContain("All Health line sources available");
+  expect(screen.getByText("Health · PostgreSQL + OS")).toBeDefined();
+  expect(screen.getByTestId("spine-score").textContent).toContain(
+    "now critical",
+  );
   expect(screen.getByRole("slider").getAttribute("aria-describedby")).toContain(
     summary.id,
   );

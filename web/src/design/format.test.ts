@@ -2,11 +2,21 @@ import { describe, expect, test } from "vitest";
 import {
   breakableCode,
   formatByUnit,
+  formatCompactNumber,
   formatDurationUs,
   formatTimestampUs,
   isIdentityColumn,
   shortIdToken,
 } from "./format";
+
+describe("formatCompactNumber", () => {
+  test("keeps dense counters readable without clipping their magnitude", () => {
+    expect(formatCompactNumber(12_400_000)).toBe("12.4M");
+    expect(formatCompactNumber(9_920_000)).toBe("9.92M");
+    expect(formatCompactNumber(12_400)).toBe("12.4k");
+    expect(formatCompactNumber(842)).toBe("842");
+  });
+});
 
 describe("formatDurationUs", () => {
   test("picks the unit a human reads fastest", () => {

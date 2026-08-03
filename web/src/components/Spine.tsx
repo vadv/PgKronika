@@ -182,6 +182,13 @@ const CHIP_FG = {
   crit: "var(--sev-crit-fg)",
 } as const;
 
+const VERDICT_FG: Record<BucketVerdict, string> = {
+  ok: "var(--sev-ok-fg)",
+  warn: "var(--sev-warn-fg)",
+  crit: "var(--sev-crit-fg)",
+  gap: "var(--fg-dim)",
+};
+
 function formatMin(minutes: number): string {
   return new Intl.NumberFormat(undefined, {
     maximumFractionDigits: minutes < 10 ? 1 : 0,
@@ -653,10 +660,10 @@ export function Spine(props: SpineProps) {
                 style={{
                   display: "block",
                   fontSize: "var(--text-xs)",
-                  color: "var(--fg-dim)",
+                  color: VERDICT_FG[currentVerdict],
                 }}
               >
-                {t("spine.score.caption")}
+                {`${t("spine.score.caption")} · ${t("healthLine.currentVerdict", { verdict: currentVerdictLabel })}`}
               </span>
               {scoreState !== null && (
                 <span

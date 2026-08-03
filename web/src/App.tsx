@@ -26,6 +26,7 @@ import { ShellLayout } from "./components/ShellLayout";
 import { HealthLine } from "./components/HealthLine";
 import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
+import { StatementsWorkspace } from "./components/StatementsWorkspace";
 import { TableView } from "./components/TableView";
 import { Toolbar, type PreparedLens } from "./components/Toolbar";
 import { WorkloadEvidencePanel } from "./components/WorkloadEvidencePanel";
@@ -338,7 +339,6 @@ function Shell() {
     workloadEvidenceScreen || infrastructureEvidenceScreen || eventsScreen;
   const denseHeatmapScreen =
     activityScreen ||
-    statementsScreen ||
     plansScreen ||
     infrastructureEvidenceScreen ||
     eventsScreen;
@@ -745,32 +745,6 @@ function Shell() {
                 contextNote={evidenceNote}
                 filterHint={filterHint}
               />
-              <div style={{ minWidth: 0, overflowX: "auto" }}>
-                <div style={{ minWidth: "1040px" }}>
-                  <HeatmapStrip
-                    view={activeView}
-                    metric={
-                      metricByView[activeView.code] ??
-                      activeView.canonical_metric
-                    }
-                    from={heatmapRange.from}
-                    to={heatmapRange.to}
-                    selectedRange={range}
-                    cursorUs={at}
-                    hoverUs={hoverUs}
-                    brushDraft={brushDraft}
-                    baselineUs={state.baseline}
-                    buckets={48}
-                    onMetricChange={(metric) =>
-                      setMetricByView((previous) => ({
-                        ...previous,
-                        [activeView.code]: metric,
-                      }))
-                    }
-                    onSelectEntity={(entity) => patch({ entity, dock: "row" })}
-                  />
-                </div>
-              </div>
               <div
                 style={{
                   display: "flex",
@@ -780,15 +754,29 @@ function Shell() {
                   minWidth: 0,
                 }}
               >
-                <TableView
+                <StatementsWorkspace
                   view={activeView}
                   at={at}
                   span={state.span}
+                  from={heatmapRange.from}
+                  to={heatmapRange.to}
+                  metric={
+                    metricByView[activeView.code] ?? activeView.canonical_metric
+                  }
+                  baselineUs={state.baseline}
                   preset={effectivePreset}
                   q={state.q}
                   sort={state.sort}
                   order={state.order}
                   entity={state.entity}
+                  matched={matched}
+                  mobile
+                  onMetricChange={(metric) =>
+                    setMetricByView((previous) => ({
+                      ...previous,
+                      [activeView.code]: metric,
+                    }))
+                  }
                   onSort={onTableSort}
                   onSelectRow={onSelectRow}
                   onMatched={setMatched}
@@ -897,7 +885,7 @@ function Shell() {
               )}
             </section>
           )}
-          {heatmapReady && (
+          {heatmapReady && !statementsScreen && (
             <div
               data-shell-region="analytical-center"
               data-testid={
@@ -1004,21 +992,50 @@ function Shell() {
               )}
             </div>
           )}
-          {heatmapReady && (
-            <TableView
-              view={activeView}
-              at={at}
-              span={state.span}
-              preset={effectivePreset}
-              q={frameQuery}
-              sort={state.sort}
-              order={state.order}
-              entity={state.entity}
-              onSort={onTableSort}
-              onSelectRow={onSelectRow}
-              onMatched={setMatched}
-            />
-          )}
+          {heatmapReady &&
+            (statementsScreen ? (
+              <StatementsWorkspace
+                view={activeView}
+                at={at}
+                span={state.span}
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                metric={
+                  metricByView[activeView.code] ?? activeView.canonical_metric
+                }
+                baselineUs={state.baseline}
+                preset={effectivePreset}
+                q={frameQuery}
+                sort={state.sort}
+                order={state.order}
+                entity={state.entity}
+                matched={matched}
+                mobile={false}
+                onMetricChange={(metric) =>
+                  setMetricByView((previous) => ({
+                    ...previous,
+                    [activeView.code]: metric,
+                  }))
+                }
+                onSort={onTableSort}
+                onSelectRow={onSelectRow}
+                onMatched={setMatched}
+              />
+            ) : (
+              <TableView
+                view={activeView}
+                at={at}
+                span={state.span}
+                preset={effectivePreset}
+                q={frameQuery}
+                sort={state.sort}
+                order={state.order}
+                entity={state.entity}
+                onSort={onTableSort}
+                onSelectRow={onSelectRow}
+                onMatched={setMatched}
+              />
+            ))}
         </div>
       )}
     </ShellLayout>

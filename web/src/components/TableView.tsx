@@ -22,9 +22,21 @@ import type {
   FrameColumnDto,
   FrameRowDto,
   FrameValue,
+  HeatmapResponse,
   SparkDto,
   ViewSpec,
 } from "../api/types";
+import { TemporalBucketRow } from "./TemporalBucketRow";
+
+export interface TimeMatrixColumn {
+  data: HeatmapResponse | undefined;
+  pending: boolean;
+  error: boolean;
+  metricLabel: string;
+  cursorUs: string | null;
+  baselineUs: string | null;
+  onRetry: () => void;
+}
 
 export interface TableViewProps {
   view: ViewSpec;
@@ -38,6 +50,7 @@ export interface TableViewProps {
   onSort: (sort: string | null, order: "asc" | "desc" | null) => void;
   onSelectRow: (entity: string) => void;
   onMatched?: (matched: number) => void;
+  timeMatrix?: TimeMatrixColumn | null;
 }
 
 interface DisplayColumn {
@@ -59,8 +72,10 @@ const SORTABLE_TYPES = new Set(["i64", "u64", "f64", "timestamp"]);
 /** Column types whose wire value may arrive as a decimal string. */
 const NUMERIC_TYPES = new Set(["i64", "u64", "f64"]);
 const ROW_HEIGHT = 28;
-const ROW_OVERSCAN = 6;
+const TIME_MATRIX_ROW_HEIGHT = 27;
+const ROW_OVERSCAN = 5;
 const FALLBACK_VIEWPORT_HEIGHT = 650;
+const STATEMENT_IDENTITY_COLUMNS = new Set(["queryid", "database", "user"]);
 
 function boundedUniqueRows(
   existing: FrameRowDto[],
@@ -313,15 +328,44 @@ function TableViewImpl(props: TableViewProps) {
   const nextCursor =
     pages !== null && pages.key === frameKey ? pages.next : null;
   const loadingMore = cursor !== null && frame.isLoading;
+  const timeMatrix = props.timeMatrix ?? null;
+  const timeMatrixMode = timeMatrix !== null;
+  const rowHeight = timeMatrixMode ? TIME_MATRIX_ROW_HEIGHT : ROW_HEIGHT;
+  const identityColumns = timeMatrixMode
+    ? columns.filter(({ column }) =>
+        STATEMENT_IDENTITY_COLUMNS.has(column.code),
+      )
+    : [];
+  const displayColumns = timeMatrixMode
+    ? columns.filter(
+        ({ column }) => !STATEMENT_IDENTITY_COLUMNS.has(column.code),
+      )
+    : columns;
+  const renderedColumnCount =
+    displayColumns.length +
+    (timeMatrixMode && identityColumns.length > 0 ? 1 : 0);
+  const heatmapRows = new Map(
+    (timeMatrix?.data?.rows ?? []).map((row) => [row.entity, row]),
+  );
+  const bucketCount = timeMatrix?.data?.grid.bucket_count ?? 96;
+  const gridFromUs = timeMatrix?.data?.grid.from_us ?? "0";
+  const gridToUs =
+    timeMatrix?.data?.grid.to_us ?? String(Math.max(1, bucketCount));
+  const heatmapMax = Math.max(
+    0,
+    ...(timeMatrix?.data?.rows ?? []).flatMap((row) =>
+      row.values.filter((value): value is number => value !== null),
+    ),
+  );
   const startIndex = Math.max(
     0,
-    Math.floor(scrollTop / ROW_HEIGHT) - ROW_OVERSCAN,
+    Math.floor(scrollTop / rowHeight) - ROW_OVERSCAN,
   );
-  const windowSize = Math.ceil(viewportHeight / ROW_HEIGHT) + ROW_OVERSCAN * 2;
+  const windowSize = Math.ceil(viewportHeight / rowHeight) + ROW_OVERSCAN * 2;
   const endIndex = Math.min(rows.length, startIndex + windowSize);
   const visibleRows = rows.slice(startIndex, endIndex);
-  const topSpacerHeight = startIndex * ROW_HEIGHT;
-  const bottomSpacerHeight = (rows.length - endIndex) * ROW_HEIGHT;
+  const topSpacerHeight = startIndex * rowHeight;
+  const bottomSpacerHeight = (rows.length - endIndex) * rowHeight;
 
   useEffect(() => {
     if (pendingFocusEntity === null || scrollBody.current === null) return;
@@ -345,17 +389,17 @@ function TableViewImpl(props: TableViewProps) {
     const index = rows.findIndex((row) => row.entity === props.entity);
     if (index < 0) return;
     scrolledEntity.current = props.entity;
-    const rowTop = index * ROW_HEIGHT;
-    const rowBottom = rowTop + ROW_HEIGHT;
+    const rowTop = index * rowHeight;
+    const rowBottom = rowTop + rowHeight;
     if (
       rowTop >= body.scrollTop &&
       rowBottom <= body.scrollTop + body.clientHeight
     )
       return;
-    const nextTop = Math.max(0, rowTop - ROW_HEIGHT * 2);
+    const nextTop = Math.max(0, rowTop - rowHeight * 2);
     body.scrollTop = nextTop;
     setScrollTop(nextTop);
-  }, [props.entity, rows]);
+  }, [props.entity, rowHeight, rows]);
 
   const headerCellStyle = (code: string): React.CSSProperties => ({
     position: "sticky",
@@ -413,11 +457,38 @@ function TableViewImpl(props: TableViewProps) {
         <table
           aria-label={props.view.code}
           aria-rowcount={(matched || rows.length) + 1}
+          className={timeMatrixMode ? "statements-time-matrix" : undefined}
+          data-testid={timeMatrixMode ? "statements-time-matrix" : undefined}
           style={{ borderCollapse: "collapse", width: "100%" }}
         >
           <thead>
             <tr>
-              {columns.map(({ column }, columnIndex) => {
+              {timeMatrixMode && identityColumns.length > 0 && (
+                <th
+                  className="statements-time-matrix__identity"
+                  style={{
+                    ...headerCellStyle("queryid"),
+                    left: 0,
+                    zIndex: 3,
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => cycleSort("queryid")}
+                    style={{
+                      color: "inherit",
+                      background: "none",
+                      border: "none",
+                      padding: 0,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {t("statements.matrix.identity")}
+                    {sortArrow("queryid")}
+                  </button>
+                </th>
+              )}
+              {displayColumns.map(({ column }, columnIndex) => {
                 const meta = columnMeta.get(column.code);
                 const unavailable =
                   meta !== undefined && meta.availability !== "available";
@@ -473,7 +544,7 @@ function TableViewImpl(props: TableViewProps) {
                     key={column.code}
                     style={{
                       ...headerCellStyle(column.code),
-                      ...(columnIndex === 0
+                      ...(!timeMatrixMode && columnIndex === 0
                         ? { left: 0, zIndex: 3 }
                         : undefined),
                       color: unavailable
@@ -504,14 +575,42 @@ function TableViewImpl(props: TableViewProps) {
                   </th>
                 );
               })}
-              <th style={headerCellStyle("")}>{t("table.spark")}</th>
+              {timeMatrix !== null ? (
+                <th
+                  className="statements-time-matrix__timeline"
+                  style={headerCellStyle("")}
+                >
+                  <span>
+                    {t("statements.matrix.heatmap", { count: bucketCount })}
+                  </span>
+                  <span className="statements-time-matrix__metric">
+                    {timeMatrix.metricLabel}
+                  </span>
+                  {timeMatrix.pending && (
+                    <span className="statements-time-matrix__status">
+                      {t("statements.matrix.loading")}
+                    </span>
+                  )}
+                  {timeMatrix.error && (
+                    <button
+                      type="button"
+                      className="statements-time-matrix__retry"
+                      onClick={timeMatrix.onRetry}
+                    >
+                      {t("table.retry")}
+                    </button>
+                  )}
+                </th>
+              ) : (
+                <th style={headerCellStyle("")}>{t("table.spark")}</th>
+              )}
             </tr>
           </thead>
           <tbody>
             {topSpacerHeight > 0 && (
               <tr aria-hidden="true" data-virtual-spacer="top">
                 <td
-                  colSpan={columns.length + 1}
+                  colSpan={renderedColumnCount + 1}
                   style={{ height: `${topSpacerHeight}px`, padding: 0 }}
                 />
               </tr>
@@ -540,13 +639,13 @@ function TableViewImpl(props: TableViewProps) {
                       const target = rows[targetIndex];
                       const body = scrollBody.current;
                       if (target === undefined || body === null) return;
-                      const targetTop = targetIndex * ROW_HEIGHT;
+                      const targetTop = targetIndex * rowHeight;
                       if (
                         targetTop < body.scrollTop ||
-                        targetTop + ROW_HEIGHT >
+                        targetTop + rowHeight >
                           body.scrollTop + body.clientHeight
                       ) {
-                        const nextTop = Math.max(0, targetTop - ROW_HEIGHT * 2);
+                        const nextTop = Math.max(0, targetTop - rowHeight * 2);
                         body.scrollTop = nextTop;
                         setScrollTop(nextTop);
                       }
@@ -559,7 +658,7 @@ function TableViewImpl(props: TableViewProps) {
                   }
                   style={{
                     cursor: "pointer",
-                    height: "28px",
+                    height: `${rowHeight}px`,
                     background:
                       selected === true
                         ? "var(--active-bg)"
@@ -572,7 +671,52 @@ function TableViewImpl(props: TableViewProps) {
                     transition: "background var(--transition-fast)",
                   }}
                 >
-                  {columns.map(({ column, cellIndex }, columnIndex) => {
+                  {timeMatrixMode &&
+                    identityColumns.length > 0 &&
+                    (() => {
+                      const primary =
+                        identityColumns.find(
+                          ({ column }) => column.code === "queryid",
+                        ) ?? identityColumns[0];
+                      if (primary === undefined) return null;
+                      const primaryValue: FrameValue =
+                        row.cells[primary.cellIndex] ?? null;
+                      const secondary = identityColumns
+                        .filter(
+                          ({ column }) => column.code !== primary.column.code,
+                        )
+                        .map(({ column, cellIndex }) =>
+                          formatCellValue(
+                            row.cells[cellIndex] ?? null,
+                            column,
+                            t,
+                          ),
+                        )
+                        .filter((value) => value !== "—");
+                      return (
+                        <td
+                          className="statements-time-matrix__identity"
+                          title={
+                            [
+                              fullCellValue(primaryValue, primary.column),
+                              ...secondary,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ") || undefined
+                          }
+                        >
+                          <span className="statements-time-matrix__identity-primary">
+                            {formatCellValue(primaryValue, primary.column, t)}
+                          </span>
+                          {secondary.length > 0 && (
+                            <span className="statements-time-matrix__identity-meta">
+                              {secondary.join(" · ")}
+                            </span>
+                          )}
+                        </td>
+                      );
+                    })()}
+                  {displayColumns.map(({ column, cellIndex }, columnIndex) => {
                     const value: FrameValue = row.cells[cellIndex] ?? null;
                     const classification = row.classifications.find(
                       (c) => c.column === column.code,
@@ -610,7 +754,7 @@ function TableViewImpl(props: TableViewProps) {
                             color:
                               value === null ? "var(--fg-dim)" : "var(--fg)",
                           }),
-                          ...(columnIndex === 0
+                          ...(!timeMatrixMode && columnIndex === 0
                             ? {
                                 position: "sticky",
                                 left: 0,
@@ -634,21 +778,36 @@ function TableViewImpl(props: TableViewProps) {
                       </td>
                     );
                   })}
-                  <td
-                    style={{
-                      padding: "2px 8px",
-                      borderBottom: "1px solid var(--border)",
-                    }}
-                  >
-                    <Sparkline spark={row.spark} />
-                  </td>
+                  {timeMatrix !== null ? (
+                    <td className="statements-time-matrix__timeline-cell">
+                      <TemporalBucketRow
+                        row={heatmapRows.get(row.entity) ?? null}
+                        bucketCount={bucketCount}
+                        gridFromUs={gridFromUs}
+                        gridToUs={gridToUs}
+                        cursorUs={timeMatrix.cursorUs}
+                        baselineUs={timeMatrix.baselineUs}
+                        metricLabel={timeMatrix.metricLabel}
+                        max={heatmapMax}
+                      />
+                    </td>
+                  ) : (
+                    <td
+                      style={{
+                        padding: "2px 8px",
+                        borderBottom: "1px solid var(--border)",
+                      }}
+                    >
+                      <Sparkline spark={row.spark} />
+                    </td>
+                  )}
                 </tr>
               );
             })}
             {bottomSpacerHeight > 0 && (
               <tr aria-hidden="true" data-virtual-spacer="bottom">
                 <td
-                  colSpan={columns.length + 1}
+                  colSpan={renderedColumnCount + 1}
                   style={{ height: `${bottomSpacerHeight}px`, padding: 0 }}
                 />
               </tr>

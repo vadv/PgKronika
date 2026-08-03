@@ -1,0 +1,299 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-03T12:49:30+03:00",
+  "title": "Design System: PgKronika",
+  "extensions": {
+    "colorMeta": {
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Void Canvas",
+        "canonical": "#0d1117",
+        "tonalRamp": ["oklch(15% 0.014 258.4)", "oklch(27% 0.014 258.4)", "oklch(39% 0.014 258.4)", "oklch(51% 0.014 258.4)", "oklch(63% 0.014 258.4)", "oklch(75% 0.014 258.4)", "oklch(87% 0.014 258.4)", "oklch(95% 0.014 258.4)"]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Raised Graphite",
+        "canonical": "#161b22",
+        "tonalRamp": ["oklch(15% 0.016 256.8)", "oklch(27% 0.016 256.8)", "oklch(39% 0.016 256.8)", "oklch(51% 0.016 256.8)", "oklch(63% 0.016 256.8)", "oklch(75% 0.016 256.8)", "oklch(87% 0.016 256.8)", "oklch(95% 0.016 256.8)"]
+      },
+      "overlay": {
+        "role": "neutral",
+        "displayName": "Overlay Slate",
+        "canonical": "#1c2129",
+        "tonalRamp": ["oklch(15% 0.017 259.8)", "oklch(27% 0.017 259.8)", "oklch(39% 0.017 259.8)", "oklch(51% 0.017 259.8)", "oklch(63% 0.017 259.8)", "oklch(75% 0.017 259.8)", "oklch(87% 0.017 259.8)", "oklch(95% 0.017 259.8)"]
+      },
+      "rule": {
+        "role": "neutral",
+        "displayName": "Grid Rule",
+        "canonical": "#30363d",
+        "tonalRamp": ["oklch(15% 0.015 252.3)", "oklch(27% 0.015 252.3)", "oklch(39% 0.015 252.3)", "oklch(51% 0.015 252.3)", "oklch(63% 0.015 252.3)", "oklch(75% 0.015 252.3)", "oklch(87% 0.015 252.3)", "oklch(95% 0.015 252.3)"]
+      },
+      "rule-strong": {
+        "role": "neutral",
+        "displayName": "Strong Grid Rule",
+        "canonical": "#444c56",
+        "tonalRamp": ["oklch(15% 0.020 254.1)", "oklch(27% 0.020 254.1)", "oklch(39% 0.020 254.1)", "oklch(51% 0.020 254.1)", "oklch(63% 0.020 254.1)", "oklch(75% 0.020 254.1)", "oklch(87% 0.020 254.1)", "oklch(95% 0.020 254.1)"]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Steel Text",
+        "canonical": "#c9d1d9",
+        "tonalRamp": ["oklch(15% 0.014 248.0)", "oklch(27% 0.014 248.0)", "oklch(39% 0.014 248.0)", "oklch(51% 0.014 248.0)", "oklch(63% 0.014 248.0)", "oklch(75% 0.014 248.0)", "oklch(87% 0.014 248.0)", "oklch(95% 0.014 248.0)"]
+      },
+      "text-strong": {
+        "role": "neutral",
+        "displayName": "Evidence White",
+        "canonical": "#e6edf3",
+        "tonalRamp": ["oklch(15% 0.011 243.7)", "oklch(27% 0.011 243.7)", "oklch(39% 0.011 243.7)", "oklch(51% 0.011 243.7)", "oklch(63% 0.011 243.7)", "oklch(75% 0.011 243.7)", "oklch(87% 0.011 243.7)", "oklch(95% 0.011 243.7)"]
+      },
+      "text-muted": {
+        "role": "neutral",
+        "displayName": "Muted Slate",
+        "canonical": "#8b949e",
+        "tonalRamp": ["oklch(15% 0.018 250.9)", "oklch(27% 0.018 250.9)", "oklch(39% 0.018 250.9)", "oklch(51% 0.018 250.9)", "oklch(63% 0.018 250.9)", "oklch(75% 0.018 250.9)", "oklch(87% 0.018 250.9)", "oklch(95% 0.018 250.9)"]
+      },
+      "evidence": {
+        "role": "primary",
+        "displayName": "Evidence Blue",
+        "canonical": "#58a6ff",
+        "tonalRamp": ["oklch(15% 0.152 253.3)", "oklch(27% 0.152 253.3)", "oklch(39% 0.152 253.3)", "oklch(51% 0.152 253.3)", "oklch(63% 0.152 253.3)", "oklch(75% 0.152 253.3)", "oklch(87% 0.152 253.3)", "oklch(95% 0.152 253.3)"]
+      },
+      "evidence-strong": {
+        "role": "primary",
+        "displayName": "Bright Evidence Blue",
+        "canonical": "#79c0ff",
+        "tonalRamp": ["oklch(15% 0.115 246.7)", "oklch(27% 0.115 246.7)", "oklch(39% 0.115 246.7)", "oklch(51% 0.115 246.7)", "oklch(63% 0.115 246.7)", "oklch(75% 0.115 246.7)", "oklch(87% 0.115 246.7)", "oklch(95% 0.115 246.7)"]
+      },
+      "heat-low": {
+        "role": "primary",
+        "displayName": "Low Heat Blue",
+        "canonical": "#1f6feb",
+        "tonalRamp": ["oklch(15% 0.202 259.7)", "oklch(27% 0.202 259.7)", "oklch(39% 0.202 259.7)", "oklch(51% 0.202 259.7)", "oklch(63% 0.202 259.7)", "oklch(75% 0.202 259.7)", "oklch(87% 0.202 259.7)", "oklch(95% 0.202 259.7)"]
+      },
+      "heat-mid": {
+        "role": "primary",
+        "displayName": "Mid Heat Blue",
+        "canonical": "#3090ff",
+        "tonalRamp": ["oklch(15% 0.187 255.0)", "oklch(27% 0.187 255.0)", "oklch(39% 0.187 255.0)", "oklch(51% 0.187 255.0)", "oklch(63% 0.187 255.0)", "oklch(75% 0.187 255.0)", "oklch(87% 0.187 255.0)", "oklch(95% 0.187 255.0)"]
+      },
+      "healthy": {
+        "role": "secondary",
+        "displayName": "Healthy Green",
+        "canonical": "#3fb950",
+        "tonalRamp": ["oklch(15% 0.181 145.6)", "oklch(27% 0.181 145.6)", "oklch(39% 0.181 145.6)", "oklch(51% 0.181 145.6)", "oklch(63% 0.181 145.6)", "oklch(75% 0.181 145.6)", "oklch(87% 0.181 145.6)", "oklch(95% 0.181 145.6)"]
+      },
+      "warning": {
+        "role": "secondary",
+        "displayName": "Warning Amber",
+        "canonical": "#d29922",
+        "tonalRamp": ["oklch(15% 0.140 79.9)", "oklch(27% 0.140 79.9)", "oklch(39% 0.140 79.9)", "oklch(51% 0.140 79.9)", "oklch(63% 0.140 79.9)", "oklch(75% 0.140 79.9)", "oklch(87% 0.140 79.9)", "oklch(95% 0.140 79.9)"]
+      },
+      "critical": {
+        "role": "secondary",
+        "displayName": "Critical Red",
+        "canonical": "#f85149",
+        "tonalRamp": ["oklch(15% 0.205 27.0)", "oklch(27% 0.205 27.0)", "oklch(39% 0.205 27.0)", "oklch(51% 0.205 27.0)", "oklch(63% 0.205 27.0)", "oklch(75% 0.205 27.0)", "oklch(87% 0.205 27.0)", "oklch(95% 0.205 27.0)"]
+      },
+      "critical-strong": {
+        "role": "secondary",
+        "displayName": "Bright Critical Red",
+        "canonical": "#ff7b72",
+        "tonalRamp": ["oklch(15% 0.163 25.8)", "oklch(27% 0.163 25.8)", "oklch(39% 0.163 25.8)", "oklch(51% 0.163 25.8)", "oklch(63% 0.163 25.8)", "oklch(75% 0.163 25.8)", "oklch(87% 0.163 25.8)", "oklch(95% 0.163 25.8)"]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Health Score",
+        "purpose": "The compact Health Line score only; never a marketing hero."
+      },
+      "title": {
+        "displayName": "Surface Title",
+        "purpose": "Page and evidence-surface titles."
+      },
+      "body": {
+        "displayName": "Interface Body",
+        "purpose": "Default chrome, explanations, and normal interface copy."
+      },
+      "label": {
+        "displayName": "Compact Label",
+        "purpose": "Uppercase region names, column headings, state captions, and dense controls."
+      },
+      "technical": {
+        "displayName": "Technical Evidence",
+        "purpose": "Identifiers, measures, timestamps, ranks, and database metadata."
+      }
+    },
+    "shadows": [
+      {
+        "name": "overlay-pop",
+        "value": "0 8px 24px rgb(0 0 0 / 0.45), 0 0 0 1px rgb(240 246 252 / 0.06)",
+        "purpose": "Separates transient overlays from the dark evidence plane."
+      },
+      {
+        "name": "overlay-pop-light",
+        "value": "0 8px 24px rgb(140 149 159 / 0.3), 0 0 0 1px rgb(27 31 36 / 0.06)",
+        "purpose": "Equivalent overlay separation in the alternate light theme."
+      },
+      {
+        "name": "focus-ring",
+        "value": "0 0 0 2px rgb(88 166 255 / 0.55)",
+        "purpose": "Keyboard focus on dark-theme interactive targets; a state cue, not elevation."
+      }
+    ],
+    "motion": [
+      {
+        "name": "fast-state",
+        "value": "120ms ease-out",
+        "purpose": "Hover and selection-state transitions."
+      },
+      {
+        "name": "skeleton-pulse",
+        "value": "1.4s ease-in-out infinite",
+        "purpose": "Loading skeleton opacity pulse; reduced-motion collapses it to an effectively static state."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "mobile-max",
+        "value": "760px"
+      },
+      {
+        "name": "desktop-owned-viewport",
+        "value": "761px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Compact Action Button",
+      "kind": "button",
+      "refersTo": "button-compact",
+      "description": "A small bordered action for retry and evidence utilities.",
+      "html": "<button class=\"ds-button-compact\" type=\"button\">Retry</button>",
+      "css": ".ds-button-compact { font-family: var(--ui-font); font-size: var(--text-sm); color: var(--fg); background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 2px 8px; cursor: pointer; transition: background var(--transition-fast), border-color var(--transition-fast); } .ds-button-compact:hover { color: var(--fg-strong); background: var(--hover-bg); border-color: var(--border-strong); } .ds-button-compact:focus-visible { outline: none; box-shadow: var(--focus-ring); } .ds-button-compact:active { background: var(--active-bg); }"
+    },
+    {
+      "name": "Metric Toggle Group",
+      "kind": "button",
+      "refersTo": "metric-toggle-selected",
+      "description": "A compact segmented control for changing the evidence metric without leaving the matrix.",
+      "html": "<div class=\"ds-metric-group\" role=\"group\" aria-label=\"Metric\"><button class=\"ds-metric-toggle ds-is-selected\" type=\"button\" aria-pressed=\"true\">time</button><button class=\"ds-metric-toggle\" type=\"button\" aria-pressed=\"false\">calls</button><button class=\"ds-metric-toggle\" type=\"button\" aria-pressed=\"false\">blocks</button></div>",
+      "css": ".ds-metric-group { display: inline-flex; overflow: hidden; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); } .ds-metric-toggle { padding: 2px var(--space-2); color: var(--fg-dim); font: 600 var(--text-xs)/1.2 var(--ui-font); background: transparent; border: 0; border-inline-end: 1px solid var(--border); cursor: pointer; transition: background var(--transition-fast), color var(--transition-fast); } .ds-metric-toggle:last-child { border-inline-end: 0; } .ds-metric-toggle:hover { color: var(--fg); background: var(--hover-bg); } .ds-metric-toggle.ds-is-selected, .ds-metric-toggle[aria-pressed=\"true\"] { color: var(--accent-strong); background: var(--active-bg); } .ds-metric-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }"
+    },
+    {
+      "name": "Statements Context Bar",
+      "kind": "nav",
+      "refersTo": "statements-context",
+      "description": "The compact matrix title, lens, metric controls, retained count, and evidence quality line.",
+      "html": "<div class=\"ds-statements-context\"><strong>RANKED HISTORY</strong><span>lens time</span><span class=\"ds-context-grow\"></span><span>series 64 / 1000</span><span class=\"ds-context-warning\">partial · 47 samples</span></div>",
+      "css": ".ds-statements-context { display: flex; align-items: center; gap: var(--space-2); min-height: var(--space-6); padding: var(--space-1) var(--space-2); color: var(--fg-dim); font-family: var(--ui-font); font-size: var(--text-xs); background: var(--bg-raised); border: 1px solid var(--border); border-block-end: 0; border-radius: var(--radius-md) var(--radius-md) 0 0; white-space: nowrap; } .ds-statements-context strong { color: var(--fg-strong); font-weight: 700; letter-spacing: var(--tracking-caps); text-transform: uppercase; } .ds-context-grow { flex: 1; } .ds-context-warning { color: var(--sev-warn-fg); }"
+    },
+    {
+      "name": "Ranked Matrix Container",
+      "kind": "card",
+      "refersTo": "matrix-container",
+      "description": "The viewport-owned, internally scrolling evidence table.",
+      "html": "<section class=\"ds-ranked-matrix\"><table><thead><tr><th>statement / database / role</th><th>calls</th><th>total time</th></tr></thead><tbody><tr><td>209d…68bd</td><td>12.4M</td><td>2.34 h</td></tr><tr><td>209d…8fd5</td><td>12.3M</td><td>2.32 h</td></tr></tbody></table></section>",
+      "css": ".ds-ranked-matrix { overflow: hidden; width: 100%; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius-md); font-family: var(--mono-font); } .ds-ranked-matrix table { width: 100%; border-collapse: collapse; } .ds-ranked-matrix th { padding: 6px 10px 4px; color: var(--fg-dim); background: var(--bg-raised); border-bottom: 1px solid var(--border-strong); font: 600 var(--text-xs)/1.2 var(--ui-font); text-align: start; white-space: nowrap; } .ds-ranked-matrix td { height: 28px; padding: 2px 10px; border-bottom: 1px solid var(--border); font-size: var(--text-md); white-space: nowrap; } .ds-ranked-matrix tr:hover td { background: var(--hover-bg); }"
+    },
+    {
+      "name": "Selected Evidence Row",
+      "kind": "custom",
+      "refersTo": "table-row-selected",
+      "description": "A ranked row whose pale blue wash and inset bar make selection explicit.",
+      "html": "<div class=\"ds-selected-row\"><strong>209d…68bd</strong><span>orders · app_rw</span><b>12.4M</b><b>2.34 h</b></div>",
+      "css": ".ds-selected-row { display: grid; grid-template-columns: minmax(180px, 1fr) repeat(2, auto); align-items: center; column-gap: var(--space-3); height: 27px; padding: 1px var(--space-3); color: var(--fg); background: var(--active-bg); box-shadow: inset 2px 0 0 var(--accent); border-bottom: 1px solid var(--border); font-family: var(--mono-font); font-size: var(--text-md); cursor: pointer; transition: background var(--transition-fast); } .ds-selected-row strong { color: var(--fg-strong); } .ds-selected-row span { overflow: hidden; color: var(--fg-dim); font: var(--text-xs)/1.2 var(--ui-font); text-overflow: ellipsis; white-space: nowrap; } .ds-selected-row:hover { background: var(--hover-bg); } .ds-selected-row:focus-visible { outline: none; box-shadow: var(--focus-ring), inset 2px 0 0 var(--accent); }"
+    },
+    {
+      "name": "Temporal Evidence Buckets",
+      "kind": "custom",
+      "refersTo": "temporal-bucket",
+      "description": "A dense sample row that distinguishes low heat, warning, critical, and missing evidence.",
+      "html": "<div class=\"ds-temporal-row\" aria-label=\"96-bucket evidence sample\"><span></span><span></span><span class=\"ds-is-missing\"></span><span></span><span class=\"ds-is-warning\"></span><span class=\"ds-is-critical\"></span><span class=\"ds-is-critical\"></span><span class=\"ds-is-warning\"></span><span></span><span></span><i aria-hidden=\"true\"></i></div>",
+      "css": ".ds-temporal-row { position: relative; display: grid; grid-template-columns: repeat(10, minmax(4px, 1fr)); gap: 1px; align-items: center; min-width: 240px; padding: var(--space-1) var(--space-2); background: var(--bg-raised); } .ds-temporal-row span { min-width: 4px; height: 12px; background: var(--heat-0); border-radius: 2px; } .ds-temporal-row span:nth-child(even) { background: var(--heat-1); } .ds-temporal-row .ds-is-warning { background: var(--heat-2); } .ds-temporal-row .ds-is-critical { background: var(--heat-3); } .ds-temporal-row .ds-is-missing { background: var(--state-muted-bg); } .ds-temporal-row i { position: absolute; inset-block: var(--space-1); left: 72%; width: 1px; background: var(--accent-strong); box-shadow: 0 0 0 1px var(--bg-raised); }"
+    },
+    {
+      "name": "Warning Status Chip",
+      "kind": "chip",
+      "refersTo": "status-chip-warning",
+      "description": "A compact semantic state with text or count retained alongside color.",
+      "html": "<span class=\"ds-status-warning\"><span aria-hidden=\"true\">●</span> warnings: 1</span>",
+      "css": ".ds-status-warning { display: inline-flex; align-items: center; gap: var(--space-1); padding: 2px var(--space-2); color: var(--sev-warn-fg); background: var(--sev-warn-bg); border: 1px solid var(--border); border-radius: var(--radius-sm); font: 600 var(--text-xs)/1.2 var(--ui-font); white-space: nowrap; }"
+    },
+    {
+      "name": "Health Line",
+      "kind": "custom",
+      "refersTo": "health-line",
+      "description": "The fixed 60px signature band for score, verdicts, gaps, load shape, events, and time quality.",
+      "html": "<section class=\"ds-health-line\"><strong>HEALTH · POSTGRESQL + OS</strong><b>59</b><span>health · calm</span><div class=\"ds-health-ribbon\"><i></i><i></i><i></i><i class=\"ds-warn\"></i><i class=\"ds-warn\"></i><i class=\"ds-crit\"></i><i class=\"ds-crit\"></i><i></i><i class=\"ds-gap\"></i><i></i></div><code>Q 96/96 · load/CPU 12.3%</code></section>",
+      "css": ".ds-health-line { display: flex; align-items: center; gap: var(--space-2); box-sizing: border-box; height: 60px; min-height: 60px; padding: var(--space-1) var(--space-2); color: var(--fg); background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius-md); font-family: var(--ui-font); } .ds-health-line strong { color: var(--fg-dim); font-size: var(--text-xs); font-weight: 600; letter-spacing: var(--tracking-caps); text-transform: uppercase; white-space: nowrap; } .ds-health-line b { color: var(--sev-crit-fg); font: 600 20px/1.2 var(--mono-font); } .ds-health-line > span { color: var(--sev-crit-fg); font-size: var(--text-xs); white-space: nowrap; } .ds-health-ribbon { display: grid; grid-template-columns: repeat(10, 1fr); gap: 1px; flex: 1; min-width: 200px; height: 40px; padding-block: 2px 30px; background: var(--bg); } .ds-health-ribbon i { background: var(--sev-ok-quiet); border-radius: 1px; } .ds-health-ribbon .ds-warn { background: var(--sev-warn); } .ds-health-ribbon .ds-crit { background: var(--sev-crit); } .ds-health-ribbon .ds-gap { background: repeating-linear-gradient(45deg, var(--bg-raised), var(--bg-raised) 2px, var(--border) 2px, var(--border) 3px); border: 1px solid var(--border); } .ds-health-line code { color: var(--fg-dim); font: var(--text-xs)/1.4 var(--mono-font); white-space: nowrap; } .ds-health-line:focus-within { box-shadow: var(--focus-ring); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Forensic Cockpit",
+    "overview": "PgKronika is a matte, near-black evidence board built for concentrated incident replay. PostgreSQL and operating-system signals share one time geometry, while rules, labels, quality states, and provenance keep temporal coincidence from masquerading as cause. The interface is compact, technical, and calm even when the evidence is not.\n\nThe system favors one continuous analytical field over dashboard-card sprawl. Crisp ruled rows, small labels, monospaced values, restrained evidence blue, and explicit semantic color let the operator scan from window health to workload shape, ranking, lens, search, and detail without decoration displacing evidence. The dark theme is the canonical visual world; the implemented light token map preserves the same semantic roles when an alternate theme is required.",
+    "keyCharacteristics": [
+      "Matte near-black surfaces separated by tonal steps and crisp 1px rules.",
+      "Shared time geometry with provenance, gaps, and uncertainty kept visible.",
+      "Compact sans-serif chrome paired with monospaced technical evidence.",
+      "Restrained blue interaction and temporal cues beside semantic green, amber, and red.",
+      "Viewport-owned desktop density with a ranked matrix as the dominant working surface."
+    ],
+    "rules": [
+      {
+        "name": "The Evidence-Not-Decoration Rule",
+        "body": "Blue marks selection, interaction, or temporal evidence; it does not become an ambient panel fill or ornamental gradient.",
+        "section": "colors"
+      },
+      {
+        "name": "The Semantic Status Rule",
+        "body": "Green, amber, and red keep their health meanings and are reinforced by text, glyphs, counts, or hatching so color is never the only carrier.",
+        "section": "colors"
+      },
+      {
+        "name": "The Two-Voice Rule",
+        "body": "Use Inter for interface language and JetBrains Mono for values whose alignment, provenance, or machine identity matters.",
+        "section": "typography"
+      },
+      {
+        "name": "The Viewport Ownership Rule",
+        "body": "On desktop, keep investigation-critical context and the ranked evidence surface inside the first viewport; put overflow inside the matrix or detail surface, never on the root page.",
+        "section": "layout"
+      },
+      {
+        "name": "The Structural Depth Rule",
+        "body": "Use tonal layering and rules for persistent surfaces; reserve cast shadows for overlays that truly sit above the evidence plane.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Ruled Board Rule",
+        "body": "Preserve straight runs, aligned row edges, and modest corner radii; rounded-card mosaics do not belong in this cockpit.",
+        "section": "shapes"
+      },
+      {
+        "name": "The One-Axis Rule",
+        "body": "Temporal components may layer PostgreSQL, OS, event, and workload evidence only when they share an explicit time geometry and retain their own provenance.",
+        "section": "components"
+      },
+      {
+        "name": "The State-Is-Evidence Rule",
+        "body": "Loading, warming, partial, empty, missing, unavailable, selected, and expired states receive intentional treatments; none may collapse into a silent blank cell.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "Do keep desktop investigation-critical context inside the viewport and place long evidence inside component-owned scrolling regions.",
+      "Do use the 4px spacing rhythm, 1px ruled separators, and compact 11–13px text scale to preserve expert density.",
+      "Do pair semantic color with labels, counts, markers, or patterns, especially for warnings, critical states, gaps, and selection.",
+      "Do keep query identifiers, timestamps, measurements, and database or role metadata monospaced.",
+      "Do preserve zero, missing, not-retained, partial, and unavailable as distinct evidence states."
+    ],
+    "donts": [
+      "Don't split one investigation surface into a mosaic of decorative dashboard cards.",
+      "Don't use gradients, large accent fields, or generic blue decoration where no evidence or interaction is being encoded.",
+      "Don't promote amber, red, or green to brand decoration; they are reserved for semantic status.",
+      "Don't add generous marketing-scale whitespace, hero typography, or oversized controls to the operational cockpit.",
+      "Don't imply causality through proximity, shared color, or a merged score when the implementation only establishes temporal coincidence."
+    ]
+  }
+}

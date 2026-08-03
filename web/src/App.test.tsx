@@ -324,6 +324,58 @@ test("keeps a gated view reason inside the fixed screen context", async () => {
   expect(within(context).queryByRole("searchbox")).toBeNull();
 });
 
+test("Statements replaces the detached analytical center with one ranked time matrix", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=statements&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const statements = availableCatalog.views.find(
+    (view) => view.code === "statements",
+  );
+  if (statements !== undefined) statements.availability = "available";
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("statements-workspace")).toBeDefined();
+  expect(screen.getByTestId("statements-time-matrix")).toBeDefined();
+  expect(
+    document.querySelector('[data-shell-region="analytical-center"]'),
+  ).toBeNull();
+  await waitFor(() => {
+    const heatmap = fetchImpl.mock.calls
+      .map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      )
+      .find(
+        (url) =>
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("view") === "statements",
+      );
+    expect(heatmap?.searchParams.get("buckets")).toBe("96");
+    expect(heatmap?.searchParams.get("top")).toBe("64");
+  });
+});
+
 test("mobile keeps incident triage in normal flow without permanent navigation", async () => {
   vi.stubGlobal(
     "matchMedia",
@@ -346,7 +398,7 @@ test("mobile keeps incident triage in normal flow without permanent navigation",
   expect(screen.queryByRole("navigation")).toBeNull();
 });
 
-test("mobile statements keeps the heatmap and ranked table available", async () => {
+test("mobile statements keeps the integrated heatmap and ranked table available", async () => {
   history.replaceState(null, "", `${location.pathname}#view=statements`);
   vi.stubGlobal(
     "matchMedia",
@@ -393,8 +445,29 @@ test("mobile statements keeps the heatmap and ranked table available", async () 
   expect(
     within(workspace).getByRole("table", { name: "statements" }),
   ).toBeDefined();
-  expect(within(workspace).getByText("heatmap.metric")).toBeDefined();
+  expect(within(workspace).getByTestId("statements-time-matrix")).toBeDefined();
+  expect(within(workspace).queryByTestId("heatmap-time-grid")).toBeNull();
   expect(screen.getByTestId("app-shell").dataset.shellLayout).toBe("mobile");
+  await waitFor(() => {
+    const heatmap = fetchImpl.mock.calls
+      .map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      )
+      .find(
+        (url) =>
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("view") === "statements",
+      );
+    expect(heatmap?.searchParams.get("buckets")).toBe("48");
+    expect(heatmap?.searchParams.get("top")).toBe("64");
+  });
 });
 
 test("digit key follows visible available destination order, not catalog order", async () => {

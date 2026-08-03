@@ -23,6 +23,17 @@ function trim(value: number): string {
   return numberFormat.format(rounded);
 }
 
+/** Compact high-volume counters for dense matrices; exact values stay in the
+ * cell tooltip. Stable technical suffixes avoid locale-dependent width. */
+export function formatCompactNumber(value: number): string {
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000_000_000) return `${trim(value / 1_000_000_000_000)}T`;
+  if (abs >= 1_000_000_000) return `${trim(value / 1_000_000_000)}B`;
+  if (abs >= 1_000_000) return `${trim(value / 1_000_000)}M`;
+  if (abs >= 1_000) return `${trim(value / 1_000)}k`;
+  return formatNumber(value);
+}
+
 export function formatBytes(value: number): string {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let scaled = value;
