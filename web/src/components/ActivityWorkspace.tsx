@@ -242,11 +242,6 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
     (metric) => metric.availability === "available",
   );
   const metricText = metricLabel(t, props.view.code, props.metric);
-  const hasProcessLink = props.view.joins.some(
-    (join) =>
-      (join.left === "activity" && join.right === "process") ||
-      (join.left === "process" && join.right === "activity"),
-  );
 
   return (
     <section
@@ -279,15 +274,13 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
             </button>
           ))}
         </div>
-        {hasProcessLink && (
-          <span
-            className="activity-workspace__process-link"
-            data-testid="activity-process-link"
-            title={t("relation.kind.pid.desc")}
-          >
-            {t("relation.activityProcess.pid")}
-          </span>
-        )}
+        <span
+          className="activity-workspace__process-link"
+          data-testid="activity-process-link"
+          title={t("relation.kind.pid.desc")}
+        >
+          {t("relation.activityProcess.pid")}
+        </span>
         <span
           className="activity-workspace__population"
           data-testid="activity-population"

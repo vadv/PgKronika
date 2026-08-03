@@ -288,6 +288,42 @@ test("renders verdict ribbon, score chip, event density, sparkline and summary",
   expect(screen.getByTestId("spine-cursor")).toBeDefined();
 });
 
+test("keeps current and previous incident requests inside the 24 hour API bound", async () => {
+  const dayUs = 86_400_000_000;
+  renderSpine({
+    span: 86_400,
+    range: {
+      fromUs: String(AT_US - dayUs),
+      toUs: String(AT_US),
+    },
+  });
+
+  await waitFor(() => {
+    const incidentRequests = vi
+      .mocked(fetch)
+      .mock.calls.map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      )
+      .filter((url) => url.pathname === "/v1/incidents");
+    expect(incidentRequests).toHaveLength(2);
+    expect(
+      incidentRequests.every(
+        (url) =>
+          Number(url.searchParams.get("to")) -
+            Number(url.searchParams.get("from")) <=
+          dayUs,
+      ),
+    ).toBe(true);
+  });
+});
+
 test("discloses a lower-bound event total when the bounded cursor budget is exhausted", async () => {
   let eventPage = 0;
   await renderLocalizedSpine({}, (input) => {
@@ -822,7 +858,11 @@ test("a 503 during revalidation keeps the ribbon — warming is cold-start only"
     spineFixture,
   );
   client.setQueryData(
-    ["incidents", String(FROM_US - WINDOW_US), String(AT_US)],
+    ["incidents", String(FROM_US), String(AT_US)],
+    incidentsFixture,
+  );
+  client.setQueryData(
+    ["incidents", String(FROM_US - WINDOW_US), String(FROM_US)],
     incidentsFixture,
   );
   client.setQueryData(

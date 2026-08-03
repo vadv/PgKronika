@@ -323,25 +323,6 @@ export function HeatmapStrip(props: {
             );
           })}
         </div>
-        {heatmap.data?.ranking.exact === false && (
-          <span
-            role="status"
-            title={`${t("heatmap.ranking.partialHint", {
-              count: heatmap.data.ranking.unseen_upper,
-            })} · unseen_upper=${heatmap.data.ranking.unseen_upper}`}
-            style={{
-              fontFamily: "var(--ui-font)",
-              fontSize: "var(--text-xs)",
-              fontWeight: 600,
-              color: "var(--sev-warn-fg)",
-              background: "var(--sev-warn-bg)",
-              borderRadius: "var(--radius-sm)",
-              padding: "1px 8px",
-            }}
-          >
-            {t("heatmap.ranking.partial")}
-          </span>
-        )}
         {/* Verdict legend: the colors mean thresholds, not decoration. */}
         <span
           style={{

@@ -111,13 +111,13 @@ test("partial quality stays out of the normal heatmap surface", async () => {
   expect(screen.queryByText(/partial/)).toBeNull();
 });
 
-test("partial ranking exposes the unseen candidate bound", async () => {
+test("partial ranking stays out of the normal heatmap surface", async () => {
   const original = fixture.ranking;
   fixture.ranking = { exact: false, unseen_upper: 17 };
   renderStrip();
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
-  const ranking = screen.getByText("heatmap.ranking.partial");
-  expect(ranking.getAttribute("title")).toContain("17");
+  expect(screen.queryByText("heatmap.ranking.partial")).toBeNull();
+  expect(screen.queryByText(/unseen_upper|17/)).toBeNull();
   fixture.ranking = original;
 });
 

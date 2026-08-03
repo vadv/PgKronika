@@ -222,8 +222,8 @@ export function Spine(props: SpineProps) {
   // (the snapshot cadence), and keepPreviousData holds the last answer
   // across a boundary — no placeholder flash.
   const liveOpts = { refetchInterval: live ? LIVE_REFRESH_MS : undefined };
-  // Health and incidents are queried over the doubled window so the score
-  // delta against the previous window costs no extra requests.
+  // Health accepts the doubled comparison window. Incidents are intentionally
+  // split because that endpoint enforces the public 24 hour query bound.
   const health = useTimelineHealth(
     { from: prevFrom, to, step: bucketSpanUs },
     liveOpts,
@@ -236,7 +236,11 @@ export function Spine(props: SpineProps) {
     { from, to, limit: 50, maxPages: 4 },
     liveOpts,
   );
-  const incidents = useIncidents({ from: prevFrom, to }, liveOpts);
+  const currentIncidents = useIncidents({ from, to }, liveOpts);
+  const previousIncidents = useIncidents(
+    { from: prevFrom, to: from },
+    liveOpts,
+  );
 
   const timestampX = (timestampUs: string | number): number => {
     const value =
@@ -293,19 +297,20 @@ export function Spine(props: SpineProps) {
     fromUs,
     SPINE_BUCKETS,
   );
-  const allIncidents = incidents.data?.incidents ?? [];
+  const currentWindowIncidents = currentIncidents.data?.incidents ?? [];
+  const previousWindowIncidents = previousIncidents.data?.incidents ?? [];
   // Score input excludes the forming tail bucket: the score only moves on a
   // completed-bucket boundary or an incident opening/closing (variant 2A).
   const scored = scoreVerdicts(verdicts, hasFormingTail);
   const score = windowScore(
     scored,
     (props.span * scored.length) / SPINE_BUCKETS,
-    countWindowIncidents(allIncidents, fromUs, toUs),
+    countWindowIncidents(currentWindowIncidents, fromUs, toUs),
   );
   const previousScore = windowScore(
     previousVerdicts,
     props.span,
-    countWindowIncidents(allIncidents, fromUs - windowNum, fromUs),
+    countWindowIncidents(previousWindowIncidents, fromUs - windowNum, fromUs),
   );
   const observedBuckets = scored.filter((verdict) => verdict !== "gap").length;
   const hasCurrent = observedBuckets > 0;
@@ -456,9 +461,11 @@ export function Spine(props: SpineProps) {
   // a real ribbon with honest gap cells, never a placeholder.
   const evidenceQueries = [health, spine, events] as const;
   const cold = evidenceQueries.every((query) => query.data === undefined);
-  const retrying = [...evidenceQueries, incidents].some(
-    (q) => q.isPending || (q.error !== null && isWarmingUp(q.error)),
-  );
+  const retrying = [
+    ...evidenceQueries,
+    currentIncidents,
+    previousIncidents,
+  ].some((q) => q.isPending || (q.error !== null && isWarmingUp(q.error)));
   const warming = cold && retrying;
   const scoreHealthUnavailable =
     health.error !== null && !isWarmingUp(health.error);

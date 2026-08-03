@@ -34,7 +34,7 @@
 .statements-workspace__lens,
 .statements-workspace__count,
 .statements-workspace__missing,
-.statements-workspace__quality {
+.statements-workspace__samples {
   text-wrap: nowrap;
 }
 
@@ -74,16 +74,11 @@
   color: var(--fg-dim);
 }
 
-.statements-workspace__quality {
-  color: var(--sev-ok-fg);
+.statements-workspace__samples {
+  color: var(--fg-dim);
 }
 
-.statements-workspace__quality:not([data-quality="complete"]) {
-  color: var(--sev-warn-fg);
-}
-
-.statements-workspace__metric-tip,
-.statements-workspace__quality-tip {
+.statements-workspace__metric-tip {
   display: grid;
   gap: 2px;
 }

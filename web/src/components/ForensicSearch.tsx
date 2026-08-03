@@ -7,6 +7,7 @@ import {
   type ForensicSearchGroup as SearchGroupPlan,
 } from "../search/compile";
 import { useForensicSearchGroup } from "../search/group";
+import { formatCellValue } from "./cellFormat";
 import { formatIntervalTime } from "./FocusBar";
 import "./ForensicSearch.css";
 
@@ -126,9 +127,17 @@ function SearchResultGroup(props: {
             <strong>{row.label}</strong>
             <span>
               {row.cells
-                .filter((value) => value !== null)
+                .map((value, index) => ({
+                  value,
+                  column: search.columns[index],
+                }))
+                .filter(({ value }) => value !== null)
                 .slice(0, 3)
-                .map(String)
+                .map(({ value, column }) =>
+                  column === undefined
+                    ? String(value)
+                    : formatCellValue(value, column, t),
+                )
                 .join(" · ")}
             </span>
           </span>

@@ -296,7 +296,7 @@ export function Header(props: HeaderProps) {
           onClick={props.onOpenSearch}
           style={{ ...button, fontFamily: "var(--mono-font)" }}
         >
-          {t("search.open")} <kbd>/</kbd>
+          {t("search.trigger")} <kbd>/</kbd>
         </button>
       )}
       <Clock />

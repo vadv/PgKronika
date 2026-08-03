@@ -972,7 +972,7 @@ test("Activity owns prepared forensic lenses, point evidence and a 96-bucket hea
   ).toBe("true");
   fireEvent.click(screen.getByRole("button", { name: /^cpu$/i }));
   expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBe("cpu");
-  expect(screen.getByTestId("activity-process-provenance")).toBeDefined();
+  expect(screen.getByTestId("activity-process-link")).toBeDefined();
 
   await waitFor(() => {
     const heatmaps = fetchImpl.mock.calls
@@ -1209,9 +1209,12 @@ test("Plans owns one row-coupled workspace, change evidence and gated Compare", 
 
   expect(await screen.findByTestId("plans-workspace")).toBeDefined();
   expect(screen.queryByTestId("workload-analytical-center")).toBeNull();
-  expect(
-    screen.getByTestId("plans-attribution-provenance").textContent,
-  ).toContain("ossc_queryid_dbid_userid_attribution");
+  const attribution = screen.getByTestId("plans-attribution-provenance");
+  expect(attribution.textContent).toContain("plans.attribution.ossc");
+  expect(attribution.textContent).toContain("plans.attribution.vadv");
+  expect(attribution.textContent).not.toMatch(
+    /best_effort|queryid|dbid|userid|_attribution/i,
+  );
   expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBeNull();
   expect(screen.getByTestId("plans-workspace").dataset.lens).toBe("regression");
   expect(
@@ -1407,8 +1410,14 @@ test("Tables and Indexes expose same-snapshot context while unsupported analysis
   ).toBe("true");
   fireEvent.click(screen.getByRole("tab", { name: /tabs\.indexes/i }));
   expect(
-    (await screen.findByTestId("index-table-provenance")).textContent,
-  ).toContain("same_snapshot_database_relation_oid");
+    await screen.findByTestId("infrastructure-evidence-panel"),
+  ).toBeDefined();
+  expect(screen.queryByTestId("index-table-provenance")).toBeNull();
+  expect(
+    screen.getByTestId("infrastructure-evidence-panel").textContent,
+  ).not.toMatch(
+    /same_snapshot_database_relation_oid|best_effort|temporal|proof|claim/i,
+  );
   for (const name of [
     /^indexSizeGrowth /i,
     /^indexDuplication /i,
@@ -1420,7 +1429,7 @@ test("Tables and Indexes expose same-snapshot context while unsupported analysis
   }
 });
 
-test("Vacuum defaults to point progress and discloses unsafe lifetime joins", async () => {
+test("Vacuum defaults to point progress and keeps linked table context calm", async () => {
   history.replaceState(
     null,
     "",
@@ -1459,7 +1468,11 @@ test("Vacuum defaults to point progress and discloses unsafe lifetime joins", as
   });
   renderApp(fetchImpl);
 
-  expect(await screen.findByTestId("vacuum-lifetime-warning")).toBeDefined();
+  expect(await screen.findByTestId("vacuum-context-summary")).toBeDefined();
+  expect(screen.queryByTestId("vacuum-lifetime-warning")).toBeNull();
+  expect(
+    screen.getByTestId("infrastructure-evidence-panel").textContent,
+  ).not.toMatch(/provenance|proof|lifetime|PID reuse|datid|relid/i);
   expect(
     screen
       .getByRole("button", { name: /^vacuumProgress$/i })

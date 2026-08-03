@@ -233,3 +233,38 @@ test("keeps ranked frame evidence usable when the heatmap fails", async () => {
   expect(screen.getByTestId("statements-time-matrix")).toBeDefined();
   expect(screen.getByRole("button", { name: /table\.retry/i })).toBeDefined();
 });
+
+test("keeps collection diagnostics out of the normal matrix chrome", async () => {
+  const original = heatmap.quality;
+  heatmap.quality = makeHeatmapQuality({
+    status: "partial",
+    snapshots: 82,
+    gaps: [{ from_us: "120", to_us: "130" }],
+    gated: ["optional_source"],
+  });
+  try {
+    stubWorkspaceRequests();
+    render(<Harness />, { wrapper: Wrapper });
+    await screen.findByTestId("statements-time-matrix");
+    await waitFor(() =>
+      expect(
+        document
+          .querySelector(".statements-workspace__count")
+          ?.getAttribute("data-retained"),
+      ).toBe("1"),
+    );
+
+    const controls = document.querySelector(".statements-workspace__controls");
+    expect(controls?.textContent).not.toMatch(
+      /partial|gaps|gated|provenance|optional_source/i,
+    );
+    expect(
+      controls?.querySelector(".statements-workspace__quality"),
+    ).toBeNull();
+    expect(
+      controls?.querySelector(".statements-workspace__samples"),
+    ).toBeDefined();
+  } finally {
+    heatmap.quality = original;
+  }
+});

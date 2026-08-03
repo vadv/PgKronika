@@ -126,7 +126,7 @@ test("prepared lenses map display names to presets and expose gated reasons", ()
   fireEvent.click(regression);
   expect(onSelectPreset).not.toHaveBeenCalled();
   act(() => regression.blur());
-  expect(screen.getByText(/reset-aware/)).toBeDefined();
+  expect(screen.queryByText(/reset-aware/)).toBeNull();
   expect(screen.getByRole("searchbox").getAttribute("title")).toContain(
     "full decimal queryid",
   );

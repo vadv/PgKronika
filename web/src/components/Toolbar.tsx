@@ -151,11 +151,11 @@ export function Toolbar(props: ToolbarProps) {
           {props.filterHint}
         </span>
       )}
-      {(focusedLensReason ?? props.contextNote) !== undefined && (
+      {focusedLensReason !== null && (
         <span
-          role={focusedLensReason === null ? "note" : "status"}
-          aria-live={focusedLensReason === null ? undefined : "polite"}
-          title={focusedLensReason ?? props.contextNote}
+          role="status"
+          aria-live="polite"
+          title={focusedLensReason}
           style={{
             minWidth: 0,
             maxWidth: "320px",
@@ -166,7 +166,7 @@ export function Toolbar(props: ToolbarProps) {
             whiteSpace: "nowrap",
           }}
         >
-          {focusedLensReason ?? props.contextNote}
+          {focusedLensReason}
         </span>
       )}
       {props.matched !== null && (

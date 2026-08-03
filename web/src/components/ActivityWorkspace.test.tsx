@@ -287,9 +287,9 @@ test("builds one dense Activity matrix with a positive PID relation", async () =
 
   expect(await screen.findByTestId("activity-time-matrix")).toBeDefined();
   expect(screen.getByTestId("activity-point-evidence")).toBeDefined();
-  expect(
-    screen.getByTestId("activity-process-link").textContent,
-  ).toContain("relation.activityProcess.pid");
+  expect(screen.getByTestId("activity-process-link").textContent).toContain(
+    "relation.activityProcess.pid",
+  );
   const workspace = screen.getByTestId("activity-workspace");
   expect(workspace.textContent).not.toMatch(
     /best_effort|edge.only|point.snapshot|series \d+ \/|gaps|gated/i,

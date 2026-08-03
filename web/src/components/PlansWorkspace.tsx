@@ -86,7 +86,6 @@ function PlanChangeEvidence(props: {
     <section
       className="plan-change-evidence"
       data-testid="plan-change-evidence"
-      data-provenance="first_last_observed_only"
       aria-label={t("plans.changes.title")}
     >
       <div className="plan-change-evidence__context">
@@ -247,32 +246,17 @@ export function PlansWorkspace(props: PlansWorkspaceProps) {
                 <span
                   key={join.provenance}
                   className="plans-workspace__fork"
-                  title={`${join.provenance} · ${join.fields.join(", ")}`}
+                  title={t("plans.matrix.attributionHint")}
                 >
                   {ossc
                     ? t("plans.attribution.ossc")
                     : t("plans.attribution.vadv")}
-                  <span className="plans-workspace__sr-only">
-                    {join.provenance}
-                  </span>
                 </span>
               );
             })
           )}
         </div>
-        <span
-          className="plans-workspace__coverage"
-          data-quality={quality?.status ?? "loading"}
-          title={t(
-            filteredFrame
-              ? "plans.matrix.coverageFilteredDetail"
-              : "plans.matrix.coverageDetail",
-            {
-              gaps: quality?.gaps.length ?? "—",
-              unseen: heatmap.data?.ranking.unseen_upper ?? "—",
-            },
-          )}
-        >
+        <span className="plans-workspace__coverage">
           {t(
             filteredFrame
               ? "plans.matrix.coverageFiltered"
