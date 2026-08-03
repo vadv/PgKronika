@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { parseHash, toHash, type UiState } from "./url";
+import { isTimestampUs, parseHash, SPANS, toHash, type UiState } from "./url";
 
 function fullState(overrides: Partial<UiState> = {}): UiState {
   return {
@@ -44,8 +44,18 @@ test("q is transient: neither parsed nor serialized", () => {
   expect(parseHash(toHash(state))).toEqual(fullState({ q: null }));
 });
 
-test("invalid at/baseline fall back to null instead of crashing BigInt", () => {
-  for (const bad of ["abc", "1e15", "12.5", "2024-01-01", "", " "]) {
+test("invalid and out-of-int64 timestamps fall back to null", () => {
+  for (const bad of [
+    "abc",
+    "1e15",
+    "12.5",
+    "2024-01-01",
+    "",
+    " ",
+    "+1722400000000000",
+    "9223372036854775808",
+    "-9223372036854775809",
+  ]) {
     expect(parseHash(`#at=${encodeURIComponent(bad)}`).at).toBeNull();
     expect(
       parseHash(`#baseline=${encodeURIComponent(bad)}`).baseline,
@@ -53,6 +63,13 @@ test("invalid at/baseline fall back to null instead of crashing BigInt", () => {
   }
   expect(parseHash("#at=1722400000000000").at).toBe("1722400000000000");
   expect(parseHash("#baseline=-3600000000").baseline).toBe("-3600000000");
+  expect(parseHash("#at=9223372036854775807").at).toBe("9223372036854775807");
+  expect(parseHash("#at=-9223372036854775808").at).toBe("-9223372036854775808");
+});
+
+test("rejects overlong decimal input before BigInt parsing", () => {
+  expect(isTimestampUs("9".repeat(100_000))).toBe(false);
+  expect(isTimestampUs(`-${"0".repeat(100_000)}`)).toBe(false);
 });
 
 test("source is not part of the URL contract", () => {
@@ -65,9 +82,22 @@ test("defaults when hash empty", () => {
   expect(parseHash("")).toEqual(fullState({ view: "activity", at: null }));
 });
 
-test("rejects out-of-list span and invalid enum values", () => {
-  const parsed = parseHash("#span=123&order=sideways&dock=panel");
-  expect(parsed.span).toBe(3600);
+test("accepts integer spans from one second through 24 hours", () => {
+  for (const span of [1, 37, 899, 900, 3600, 21600, 86400]) {
+    expect(parseHash(`#span=${span}`).span).toBe(span);
+    expect(parseHash(toHash(fullState({ span }))).span).toBe(span);
+  }
+});
+
+test("keeps the four prepared span controls", () => {
+  expect(SPANS).toEqual([900, 3600, 21600, 86400]);
+});
+
+test("rejects invalid spans and invalid enum values", () => {
+  for (const span of ["0", "-1", "86401", "1.5", "1e3", "", " "]) {
+    expect(parseHash(`#span=${encodeURIComponent(span)}`).span).toBe(3600);
+  }
+  const parsed = parseHash("#order=sideways&dock=panel");
   expect(parsed.order).toBeNull();
   expect(parsed.dock).toBeNull();
 });

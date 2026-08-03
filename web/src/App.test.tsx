@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
@@ -26,6 +27,7 @@ import { App } from "./App";
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -49,6 +51,7 @@ const catalogBody = {
     makeViewSpec({
       code: "statements",
       view_code: 2,
+      availability: "gated",
       presets: [
         {
           code: "memory",
@@ -82,6 +85,22 @@ const catalogBody = {
         },
       ],
     }),
+    makeViewSpec({ code: "plans", view_code: 4 }),
+    makeViewSpec({
+      code: "tables",
+      view_code: 5,
+      presets: [
+        {
+          code: "memory",
+          columns: ["total"],
+          sort: { column: "total", order: "desc" },
+        },
+      ],
+    }),
+    makeViewSpec({ code: "indexes", view_code: 6 }),
+    makeViewSpec({ code: "vacuum", view_code: 7 }),
+    makeViewSpec({ code: "processes", view_code: 8 }),
+    makeViewSpec({ code: "events", view_code: 9 }),
   ],
 };
 
@@ -144,10 +163,100 @@ function summaryFetchCount(): number {
   }).length;
 }
 
-function renderApp() {
-  vi.stubGlobal("fetch", stubFetch());
+function renderApp(fetchImpl = stubFetch()) {
+  vi.stubGlobal("fetch", fetchImpl);
   return render(<App />);
 }
+
+test("keeps the 32px navigation and time controls on a cold catalog error", async () => {
+  const baseFetch = stubFetch();
+  const failedFetch = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    if (new URL(url).pathname === "/v1/ui/catalog") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ code: "catalog_unavailable" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return baseFetch(input);
+  });
+
+  renderApp(failedFetch);
+  await waitFor(() =>
+    expect(
+      failedFetch.mock.calls.some(([input]) =>
+        String(input instanceof Request ? input.url : input).includes(
+          "/v1/ui/catalog",
+        ),
+      ),
+    ).toBe(true),
+  );
+
+  const navigation = screen.getByRole("navigation");
+  expect(navigation.style.height).toBe("32px");
+  expect(screen.getAllByRole("tab")).toHaveLength(8);
+  expect(
+    screen
+      .getAllByRole("tab")
+      .every((tab) => tab.getAttribute("aria-disabled") === "true"),
+  ).toBe(true);
+  expect(
+    within(navigation).getByRole("button", { name: /spine\.live/i }),
+  ).toBeDefined();
+  expect(
+    within(navigation).getByRole("button", { name: /spine\.span\.86400/i }),
+  ).toBeDefined();
+});
+
+test("keeps unavailable destinations and time controls while catalog is pending", async () => {
+  const baseFetch = stubFetch();
+  let resolveCatalog: ((response: Response) => void) | undefined;
+  const pendingCatalog = new Promise<Response>((resolve) => {
+    resolveCatalog = resolve;
+  });
+  const pendingFetch = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? pendingCatalog
+      : baseFetch(input);
+  });
+
+  renderApp(pendingFetch);
+  const navigation = screen.getByRole("navigation");
+  expect(navigation.style.height).toBe("32px");
+  expect(screen.getAllByRole("tab")).toHaveLength(8);
+  expect(
+    screen
+      .getAllByRole("tab")
+      .every((tab) => tab.getAttribute("aria-disabled") === "true"),
+  ).toBe(true);
+  expect(
+    within(navigation).getByRole("button", { name: /spine\.live/i }),
+  ).toBeDefined();
+
+  await act(async () => {
+    resolveCatalog?.(jsonResponse(catalogBody));
+  });
+  await waitFor(() =>
+    expect(
+      screen
+        .getByRole("tab", { name: /tabs\.activity/i })
+        .getAttribute("aria-disabled"),
+    ).toBe("false"),
+  );
+});
 
 test("renders the shell regions from fixtures", async () => {
   renderApp();
@@ -158,15 +267,107 @@ test("renders the shell regions from fixtures", async () => {
   expect(screen.getByTestId("instance-chip")).toBeDefined();
   expect(screen.getByLabelText("spine.caption")).toBeDefined();
   expect(screen.getByText(/statusbar\.hints/)).toBeDefined();
+  expect(screen.getByRole("banner").dataset.shellRegion).toBe("global-context");
+  expect(screen.getByRole("navigation").dataset.shellRegion).toBe(
+    "primary-navigation",
+  );
+  expect(screen.getByRole("main").dataset.shellRegion).toBe("main");
+  expect(screen.getByRole("contentinfo").dataset.shellRegion).toBe("status");
 });
 
-test("digit key selects the nth catalog view", async () => {
+test("marks every desktop analytical boundary for bounded viewport layout", async () => {
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+    expect(screen.getByRole("table", { name: "activity" })).toBeDefined(),
   );
-  fireEvent.keyDown(window, { key: "3" });
-  expect(location.hash).toContain("view=locks");
+
+  const content = screen.getByTestId("desktop-forensic-content");
+  expect(content.dataset.layoutBoundary).toBe("analytical-content");
+  expect(content.style.minHeight).toBe("0");
+  expect(content.style.overflow).toBe("hidden");
+  expect(
+    document.querySelector('[data-shell-region="analytical-center"]'),
+  ).not.toBeNull();
+  expect(
+    document.querySelector('[data-shell-region="ranked-matrix"]'),
+  ).not.toBeNull();
+
+  const screenContext = document.querySelector(
+    '[data-shell-region="screen-context"]',
+  );
+  expect(screenContext).not.toBeNull();
+  expect((screenContext as HTMLElement).style.height).toBe("72px");
+  expect(
+    within(screenContext as HTMLElement).getByRole("searchbox"),
+  ).toBeDefined();
+  expect(screen.getAllByRole("searchbox")).toHaveLength(1);
+});
+
+test("keeps a gated view reason inside the fixed screen context", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=statements&at=1722400000000000`,
+  );
+  renderApp();
+  const context = await waitFor(() => {
+    const element = document.querySelector(
+      '[data-shell-region="screen-context"]',
+    );
+    expect(element).not.toBeNull();
+    return element as HTMLElement;
+  });
+
+  expect(within(context).getByRole("status")).toBeDefined();
+  expect(within(context).queryByRole("searchbox")).toBeNull();
+});
+
+test("mobile keeps incident triage in normal flow without permanent navigation", async () => {
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn().mockReturnValue({
+      matches: true,
+      media: "(max-width: 760px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }),
+  );
+  renderApp();
+
+  expect(await screen.findByTestId("mobile-triage")).toBeDefined();
+  expect(screen.getByTestId("app-shell").dataset.shellLayout).toBe("mobile");
+  expect(screen.getByRole("main").style.overflow).toBe("visible");
+  expect(screen.queryByRole("navigation")).toBeNull();
+});
+
+test("digit key follows visible available destination order, not catalog order", async () => {
+  renderApp();
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.plans").length).toBeGreaterThan(0),
+  );
+  fireEvent.keyDown(window, { key: "2" });
+  expect(location.hash).toContain("view=plans");
+});
+
+test("primary navigation is the sole shell owner of Live and prepared spans", async () => {
+  renderApp();
+  const navigation = await screen.findByTestId("primary-navigation");
+
+  expect(screen.getAllByRole("button", { name: /spine\.live/i })).toHaveLength(
+    1,
+  );
+  fireEvent.click(
+    within(navigation).getByRole("button", { name: /spine\.live/i }),
+  );
+  expect(location.hash).toContain("at=");
+  fireEvent.click(
+    within(navigation).getByRole("button", { name: /spine\.span\.86400/i }),
+  );
+  expect(new URLSearchParams(location.hash.slice(1)).get("span")).toBe("86400");
 });
 
 test("space toggles LIVE: the hash gains and then loses the cursor", async () => {
@@ -192,19 +393,40 @@ test("Escape closes an open dock", async () => {
   expect(location.hash).not.toContain("dock=");
 });
 
-test("hashchange re-parses the state", async () => {
+test("a Locks hash renders its contextual deep-link surface without selecting OS", async () => {
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+    expect(
+      screen.getAllByText("navigation.destination.os").length,
+    ).toBeGreaterThan(0),
   );
   act(() => {
     location.hash = "#view=locks";
     window.dispatchEvent(new Event("hashchange"));
   });
-  await waitFor(() => {
-    const tab = screen.getAllByText("tabs.locks")[0]?.closest("[role=tab]");
-    expect(tab?.getAttribute("aria-selected")).toBe("true");
+  await waitFor(() =>
+    expect(screen.getByTestId("contextual-deep-link").textContent).toContain(
+      "navigation.deepLink.locks",
+    ),
+  );
+  expect(
+    screen
+      .getAllByRole("tab")
+      .every((tab) => tab.getAttribute("aria-selected") === "false"),
+  ).toBe(true);
+});
+
+test("a Processes hash explicitly selects OS while retaining deep-link context", async () => {
+  history.replaceState(null, "", `${location.pathname}#view=processes`);
+  renderApp();
+
+  const os = await screen.findByRole("tab", {
+    name: /navigation\.destination\.os/i,
   });
+  expect(os.getAttribute("aria-selected")).toBe("true");
+  expect(screen.getByTestId("contextual-deep-link").textContent).toContain(
+    "navigation.deepLink.processes",
+  );
 });
 
 test("arrow keys step the cursor; shift+arrow jumps an hour", async () => {
@@ -238,9 +460,9 @@ test("arrow keys on the spine slider step by its own delta, not the global one",
   const slider = await screen.findByRole("slider");
   fireEvent.keyDown(slider, { key: "ArrowRight" });
   const stepped = new URLSearchParams(location.hash.slice(1)).get("at");
-  // The slider owns the key (5 min step); the global handler must not apply
-  // its span/48 step on top — exactly one patch, slider-sized.
-  expect(BigInt(stepped ?? "0") - 1_722_400_000_000_000n).toBe(300_000_000n);
+  // The slider owns the shared span/48 step; the global handler must not add
+  // a second step on top — exactly one 75 s patch.
+  expect(BigInt(stepped ?? "0") - 1_722_400_000_000_000n).toBe(75_000_000n);
 });
 
 test("Enter on a focused button belongs to the button, not global shortcuts", async () => {
@@ -278,6 +500,107 @@ test("LIVE cursor advances on the tick, not on every render", async () => {
   vi.useRealTimers();
 });
 
+test("an arbitrary replay span reaches heatmap consumers exactly", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000&span=37`,
+  );
+  renderApp();
+
+  await waitFor(() => {
+    const heatmapCall = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map(([input]) =>
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href,
+      )
+      .find((url) => new URL(url).pathname === "/v1/timeline/heatmap");
+    expect(heatmapCall).toBeDefined();
+    const params = new URL(heatmapCall ?? location.href).searchParams;
+    expect(params.get("from")).toBe("1722399963000000");
+    expect(params.get("to")).toBe("1722400000000000");
+
+    const healthCall = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map(([input]) =>
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href,
+      )
+      .find((url) => new URL(url).pathname === "/v1/timeline/health");
+    expect(healthCall).toBeDefined();
+    expect(new URL(healthCall ?? location.href).searchParams.get("step")).toBe(
+      "385417",
+    );
+  });
+});
+
+test("real timeline and data-health endpoints share the pinned LIVE geometry", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-08-03T12:00:00.123Z"));
+  renderApp();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(50);
+  });
+  fireEvent.click(screen.getByTestId("data-health-chip"));
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(50);
+  });
+
+  const expectedTo = "1785758400123000";
+  const expectedFrom = "1785754800123000";
+  const expectedPreviousFrom = "1785751200123000";
+  const calls = () =>
+    vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      );
+  const latest = (path: string) =>
+    calls()
+      .filter((url) => url.pathname === path)
+      .at(-1) ?? new URL(location.href);
+
+  for (const path of [
+    "/v1/timeline/spine",
+    "/v1/timeline/events",
+    "/v1/timeline/heatmap",
+    "/v1/data/quality",
+  ]) {
+    expect(latest(path).searchParams.get("from")).toBe(expectedFrom);
+    expect(latest(path).searchParams.get("to")).toBe(expectedTo);
+  }
+  expect(latest("/v1/timeline/health").searchParams.get("from")).toBe(
+    expectedPreviousFrom,
+  );
+  expect(latest("/v1/timeline/health").searchParams.get("to")).toBe(expectedTo);
+
+  const qualityCalls = calls().filter(
+    (url) => url.pathname === "/v1/data/quality",
+  ).length;
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2_000);
+  });
+  expect(
+    calls().filter((url) => url.pathname === "/v1/data/quality").length,
+  ).toBe(qualityCalls);
+  expect(latest("/v1/data/quality").searchParams.get("to")).toBe(expectedTo);
+  vi.useRealTimers();
+});
+
 test("switching view drops preset and sort the next view does not have", async () => {
   history.replaceState(
     null,
@@ -286,12 +609,12 @@ test("switching view drops preset and sort the next view does not have", async (
   );
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+    expect(screen.getAllByText("tabs.plans").length).toBeGreaterThan(0),
   );
   expect(location.hash).toContain("preset=stmt_only");
-  fireEvent.keyDown(window, { key: "3" });
+  fireEvent.keyDown(window, { key: "2" });
   const params = new URLSearchParams(location.hash.slice(1));
-  expect(params.get("view")).toBe("locks");
+  expect(params.get("view")).toBe("plans");
   expect(params.get("preset")).toBeNull();
   expect(params.get("sort")).toBeNull();
   expect(params.get("order")).toBeNull();
@@ -305,9 +628,12 @@ test("switching view keeps a preset both views share", async () => {
   );
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.locks").length).toBeGreaterThan(0),
+    expect(screen.getAllByText("tabs.tables").length).toBeGreaterThan(0),
   );
   fireEvent.keyDown(window, { key: "3" });
+  expect(new URLSearchParams(location.hash.slice(1)).get("view")).toBe(
+    "tables",
+  );
   expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBe(
     "memory",
   );

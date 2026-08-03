@@ -2,7 +2,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { act, createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
-import type { UiState } from "../state/url";
 import {
   makeContextResponse,
   makeDataQualityResponse,
@@ -12,20 +11,6 @@ import {
   makeStorageResponse,
 } from "../testkit/apiFixtures";
 import { Header, type HeaderProps } from "./Header";
-
-const state: UiState = {
-  view: "activity",
-  at: null,
-  span: 3600,
-  baseline: null,
-  preset: null,
-  q: null,
-  sort: null,
-  order: null,
-  focus: null,
-  dock: null,
-  entity: null,
-};
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -57,7 +42,7 @@ function renderHeader(overrides: Partial<HeaderProps> = {}) {
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client }, children);
   const props: HeaderProps = {
-    state,
+    range: { fromUs: "1722396400000000", toUs: "1722400000000000" },
     context: undefined,
     incidents: undefined,
     shareUrl: "https://pgkronika.local/#view=activity&at=1722400000000000",
@@ -83,6 +68,43 @@ test("instance chip falls back to local, shows the context hostname", () => {
     context: makeContextResponse({ instance: { hostname: "prod-1" } }),
   });
   expect(screen.getByTestId("instance-chip").textContent).toContain("prod-1");
+});
+
+test("preserves its standalone banner landmark and wrapping flow", () => {
+  renderHeader();
+  const content = screen.getByRole("banner");
+  expect(content).toBe(screen.getByTestId("global-context-content"));
+  expect(content.style.height).toBe("");
+  expect(content.style.flexWrap).toBe("wrap");
+});
+
+test("fits the fixed desktop Global context region when embedded", () => {
+  renderHeader({ embedded: true, mobile: false });
+  const content = screen.getByTestId("global-context-content");
+  expect(screen.queryByRole("banner")).toBeNull();
+  expect(content.style.height).toBe("100%");
+  expect(content.style.minWidth).toBe("0");
+  expect(content.style.flexWrap).toBe("nowrap");
+});
+
+test("embedded mobile Header wraps incident chips at natural height", () => {
+  renderHeader({
+    embedded: true,
+    mobile: true,
+    incidents: makeIncidentsResponse({
+      incidents: [
+        makeIncident({ incident_key: "crit", level: "critical" }),
+        makeIncident({ incident_key: "warn", level: "warning" }),
+      ],
+    }),
+  });
+
+  const content = screen.getByTestId("global-context-content");
+  expect(screen.queryByRole("banner")).toBeNull();
+  expect(content.style.height).toBe("");
+  expect(content.style.flexWrap).toBe("wrap");
+  expect(screen.getByTestId("incidents-critical")).toBeDefined();
+  expect(screen.getByTestId("incidents-warning")).toBeDefined();
 });
 
 test("role chip shows an honest dash with the reason in the title", () => {

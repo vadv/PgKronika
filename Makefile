@@ -6,7 +6,7 @@ SCHEMATHESIS_VERSION ?= 4.24.3
 # what macOS ships as `tar`. `brew install gnu-tar` provides gtar.
 TAR ?= $(shell command -v gtar 2>/dev/null || echo tar)
 
-.PHONY: build collector web web-frontend web-frontend-check web-bundle-budget web-codegen dump openapi openapi-bundle openapi-lint test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
+.PHONY: build collector web web-frontend web-frontend-check web-shell-check web-bundle-budget web-codegen dump openapi openapi-bundle openapi-lint test-bdd demo-build demo-up demo-down demo-run demo-clean demo-api-smoke
 
 build: ## Build collector, web, and dump for the selected target.
 	@$(CARGO_BUILD) -p pg_kronika-collector -p pg_kronika-web -p pg_kronika-dump
@@ -25,6 +25,9 @@ web-frontend: ## Install, build the SPA and pack deterministic static.tar.gz for
 web-frontend-check: ## Typecheck, lint, format-check and test the SPA without building.
 	python3 -B scripts/check-design-tokens.py
 	cd web && npm ci && npm run typecheck && npm run lint && npm run format:check && npm run test
+
+web-shell-check: ## Verify the forensic shell at 1920x1080 in a real browser.
+	cd web && npm ci && npm run verify:shell
 
 # The SPA tarball is embedded into the web binary shipped to DB hosts, so its
 # size is a contract, not a coincidence. Bump deliberately, with the PR.

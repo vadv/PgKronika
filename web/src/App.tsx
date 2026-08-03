@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useCatalog } from "./api/catalog";
 import { apiRetryDelay, isWarmingUp, retryApiRequest } from "./api/client";
@@ -11,13 +17,19 @@ import { DockOverlay } from "./components/DockOverlay";
 import { FocusBar } from "./components/FocusBar";
 import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
-import { Spine } from "./components/Spine";
+import { PrimaryNavigation } from "./components/PrimaryNavigation";
+import { ShellLayout } from "./components/ShellLayout";
+import { HealthLine } from "./components/HealthLine";
 import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
-import { TabBar } from "./components/TabBar";
 import { TableView } from "./components/TableView";
 import { Toolbar } from "./components/Toolbar";
-import { parseHash, toHash, type UiState } from "./state/url";
+import {
+  availableDestinations,
+  buildNavigationGroups,
+} from "./navigation/model";
+import { TimeGeometryProvider, useTimeGeometry } from "./state/timeGeometry";
+import { toHash } from "./state/url";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -35,11 +47,6 @@ const HOUR_US = 3_600_000_000n;
 /** Arrow keys step through 1/48 of the active span. */
 const STEP_DIVISOR = 48n;
 const MOBILE_QUERY = "(max-width: 760px)";
-/** LIVE cursor tick: the shared `at` advances on this interval, not per
- * render — query keys stay stable between ticks and all panels read the
- * same snapshot time. */
-const LIVE_TICK_MS = 15_000;
-
 function useMobile(): boolean {
   return useSyncExternalStore(
     (onChange) => {
@@ -67,52 +74,29 @@ function isEditableTarget(target: EventTarget | null): boolean {
 
 function Shell() {
   const { t } = useTranslation();
-  const [state, setState] = useState(() => parseHash(location.hash));
+  const {
+    state,
+    range,
+    cursorUs: at,
+    hoverUs,
+    brushDraft,
+    patchUiState: patch,
+    setCursor,
+    setSpan,
+    toggleLive,
+  } = useTimeGeometry();
   const [dataHealthOpen, setDataHealthOpen] = useState(false);
   const [matched, setMatched] = useState<number | null>(null);
   const [metricByView, setMetricByView] = useState<Record<string, string>>({});
   const mobile = useMobile();
 
-  const patch = (p: Partial<UiState>) => {
-    setState((prev) => {
-      const next = { ...prev, ...p };
-      location.hash = toHash(next);
-      return next;
-    });
-  };
-
-  // Back/Forward: adopt the hash — unless it is the one `patch` just wrote.
-  useEffect(() => {
-    const onHashChange = () => {
-      setState((prev) =>
-        location.hash === toHash(prev) ? prev : parseHash(location.hash),
-      );
-    };
-    window.addEventListener("hashchange", onHashChange);
-    return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
-
-  // int64 µs cursors travel as decimal strings; all math goes through BigInt.
-  // LIVE `at` is pinned to a tick: recomputing Date.now() per render would
-  // give summary and heatmap different times and storm refetches on any
-  // unrelated setState.
-  const [liveAt, setLiveAt] = useState(() => String(Date.now() * 1000));
-  useEffect(() => {
-    const id = setInterval(
-      () => setLiveAt(String(Date.now() * 1000)),
-      LIVE_TICK_MS,
-    );
-    return () => clearInterval(id);
-  }, []);
-  const at = state.at ?? liveAt;
   const incidentsRange = {
     from: (BigInt(at) - INCIDENTS_WINDOW_US).toString(),
     to: at,
   };
-  // Heatmap/spine window follows the zoom span (capped at the 24 h API bound).
   const heatmapRange = {
-    from: (BigInt(at) - BigInt(state.span) * 1_000_000n).toString(),
-    to: at,
+    from: range.fromUs,
+    to: range.toUs,
   };
 
   const catalog = useCatalog();
@@ -121,6 +105,8 @@ function Shell() {
   const incidents = useIncidents(incidentsRange);
 
   const views = catalog.data?.views ?? [];
+  const navigationGroups = buildNavigationGroups(views);
+  const shortcutDestinations = availableDestinations(navigationGroups);
   const activeView = views.find((v) => v.code === state.view);
   const focusedIncident = state.focus
     ? incidents.data?.incidents.find((i) => i.incident_key === state.focus)
@@ -146,83 +132,117 @@ function Shell() {
     });
   };
 
+  const onTableSort = useCallback(
+    (sort: string | null, order: "asc" | "desc" | null) =>
+      patch({ sort, order }),
+    [patch],
+  );
+  const onSelectRow = useCallback(
+    (entity: string) => patch({ entity, dock: "row" }),
+    [patch],
+  );
+
+  const shortcutRef = useRef<(event: KeyboardEvent) => void>(() => {});
+  shortcutRef.current = (e: KeyboardEvent) => {
+    // A component that already handled the key (slider, button) owns it.
+    if (e.defaultPrevented) return;
+    if (isEditableTarget(e.target)) return;
+    // Enter/Space on a focused button belong to the button, not to
+    // global shortcuts.
+    const onButton =
+      e.target instanceof HTMLElement && e.target.tagName === "BUTTON";
+    if (e.key >= "1" && e.key <= "9") {
+      if (mobile) return;
+      const destination = shortcutDestinations[Number(e.key) - 1];
+      if (destination !== undefined) selectView(destination.viewCode);
+      return;
+    }
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      if (onButton) return;
+      e.preventDefault();
+      const step = e.shiftKey
+        ? HOUR_US
+        : (BigInt(state.span) * 1_000_000n) / STEP_DIVISOR;
+      const delta = e.key === "ArrowLeft" ? -step : step;
+      setCursor((BigInt(at) + delta).toString());
+      return;
+    }
+    if (e.key === " ") {
+      if (onButton) return;
+      e.preventDefault();
+      toggleLive();
+      return;
+    }
+    if (e.key === "Enter") {
+      if (onButton) return;
+      if (state.entity !== null) patch({ dock: "row" });
+      return;
+    }
+    if (e.key === "Escape") {
+      if (dataHealthOpen) setDataHealthOpen(false);
+      else if (state.dock !== null) patch({ dock: null });
+      else if (state.focus !== null) patch({ focus: null });
+    }
+  };
+
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      // A component that already handled the key (slider, button) owns it.
-      if (e.defaultPrevented) return;
-      if (isEditableTarget(e.target)) return;
-      // Enter/Space on a focused button belong to the button, not to
-      // global shortcuts.
-      const onButton =
-        e.target instanceof HTMLElement && e.target.tagName === "BUTTON";
-      if (e.key >= "1" && e.key <= "9") {
-        const view = views[Number(e.key) - 1];
-        if (view !== undefined && view.availability === "available") {
-          selectView(view.code);
-        }
-        return;
-      }
-      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-        if (onButton) return;
-        e.preventDefault();
-        const step = e.shiftKey
-          ? HOUR_US
-          : (BigInt(state.span) * 1_000_000n) / STEP_DIVISOR;
-        const delta = e.key === "ArrowLeft" ? -step : step;
-        patch({ at: (BigInt(at) + delta).toString() });
-        return;
-      }
-      if (e.key === " ") {
-        if (onButton) return;
-        e.preventDefault();
-        patch({ at: state.at === null ? at : null });
-        return;
-      }
-      if (e.key === "Enter") {
-        if (onButton) return;
-        if (state.entity !== null) patch({ dock: "row" });
-        return;
-      }
-      if (e.key === "Escape") {
-        if (dataHealthOpen) setDataHealthOpen(false);
-        else if (state.dock !== null) patch({ dock: null });
-        else if (state.focus !== null) patch({ focus: null });
-      }
-    };
+    const onKeyDown = (event: KeyboardEvent) => shortcutRef.current(event);
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  });
+  }, []);
 
   const tableReady = activeView !== undefined;
   const heatmapReady = tableReady && activeView.availability === "available";
 
+  const globalContext = (
+    <Header
+      embedded
+      mobile={mobile}
+      range={range}
+      context={context.data}
+      incidents={incidents.data}
+      // Share always carries the absolute cursor time: a LIVE link must
+      // reproduce this exact screen for the recipient.
+      shareUrl={`${location.origin}${location.pathname}${toHash({ ...state, at: range.toUs })}`}
+      dataHealthOpen={dataHealthOpen}
+      onToggleDataHealth={() => setDataHealthOpen((open) => !open)}
+      onOpenIncidents={() => patch({ dock: "incidents" })}
+    />
+  );
+  const primaryNavigation = !mobile ? (
+    <PrimaryNavigation
+      groups={navigationGroups}
+      activeView={state.view}
+      isLive={state.at === null}
+      span={state.span}
+      onSelect={selectView}
+      onToggleLive={toggleLive}
+      onSelectSpan={setSpan}
+    />
+  ) : null;
+
   return (
-    <div
-      data-testid="app-shell"
-      style={{
-        background: "var(--bg)",
-        color: "var(--fg)",
-        // Desktop pins the status bar to the viewport bottom; on mobile the
-        // same stretch reads as a giant void under short content.
-        minHeight: mobile ? undefined : "100dvh",
-        display: "flex",
-        flexDirection: "column",
-      }}
+    <ShellLayout
+      mobile={mobile}
+      globalContext={globalContext}
+      primaryNavigation={primaryNavigation}
+      primaryNavigationLabel={t("navigation.primary")}
+      status={<StatusBar embedded state={state} summary={summary.data} />}
+      overlay={
+        <DockOverlay
+          state={state}
+          view={activeView}
+          at={at}
+          mobile={mobile}
+          onClose={() => patch({ dock: null })}
+          onSelectIncident={(focus) => patch({ focus })}
+          onPatch={patch}
+        />
+      }
     >
-      <Header
-        state={state}
-        context={context.data}
-        incidents={incidents.data}
-        // Share always carries the absolute cursor time: a LIVE link must
-        // reproduce this exact screen for the recipient.
-        shareUrl={`${location.origin}${location.pathname}${toHash({ ...state, at })}`}
-        dataHealthOpen={dataHealthOpen}
-        onToggleDataHealth={() => setDataHealthOpen((open) => !open)}
-        onOpenIncidents={() => patch({ dock: "incidents" })}
-      />
       <AlertBar live={state.at === null} summary={summary.data} />
       {mobile ? (
-        <main
+        <div
           data-testid="mobile-triage"
           style={{
             display: "flex",
@@ -312,34 +332,39 @@ function Shell() {
               </span>
             </button>
           ))}
-        </main>
+        </div>
       ) : (
-        <main
+        <div
+          data-testid="desktop-forensic-content"
+          data-layout-boundary="analytical-content"
           style={{
             display: "flex",
             flexDirection: "column",
+            flex: "1 1 auto",
+            minHeight: 0,
+            overflow: "hidden",
             gap: "var(--space-2)",
             padding: "var(--space-2) var(--space-3)",
           }}
         >
-          {catalog.isSuccess && (
-            <TabBar
-              views={views}
-              active={state.view}
-              onSelect={selectView}
-              summaries={
-                new Map((summary.data?.views ?? []).map((v) => [v.view, v]))
-              }
-            />
+          <HealthLine />
+          {(state.view === "locks" || state.view === "processes") && (
+            <aside
+              data-testid="contextual-deep-link"
+              role="status"
+              style={{
+                padding: "6px 10px",
+                color: "var(--fg-dim)",
+                background: "var(--bg-raised)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-sm)",
+                fontFamily: "var(--ui-font)",
+                fontSize: "var(--text-sm)",
+              }}
+            >
+              {t(`navigation.deepLink.${state.view}`)}
+            </aside>
           )}
-          <Spine
-            at={state.at}
-            span={state.span}
-            baseline={state.baseline}
-            onSelectAt={(nextAt) => patch({ at: nextAt })}
-            onSelectSpan={(span) => patch({ span })}
-            onSelectBaseline={(baseline) => patch({ baseline })}
-          />
           {focusedIncident !== undefined && (
             <FocusBar
               incident={focusedIncident}
@@ -347,59 +372,90 @@ function Shell() {
             />
           )}
           {tableReady && (
-            <PageHeader
-              view={activeView}
-              summary={summary.data?.views.find((v) => v.view === state.view)}
-              matched={matched}
-              live={state.at === null}
-              onOpenIncidents={() => patch({ dock: "incidents" })}
-            />
-          )}
-          {heatmapReady && (
-            <HeatmapStrip
-              view={activeView}
-              metric={
-                metricByView[activeView.code] ?? activeView.canonical_metric
-              }
-              from={heatmapRange.from}
-              to={heatmapRange.to}
-              onMetricChange={(m) =>
-                setMetricByView((prev) => ({ ...prev, [activeView.code]: m }))
-              }
-              onSelectEntity={(entity) => patch({ entity, dock: "row" })}
-            />
-          )}
-          {/* A gated view renders its availability reason, never an empty
-              table — the tab may still be active from a shared link. */}
-          {tableReady && activeView.availability !== "available" && (
             <section
-              role="status"
+              data-shell-region="screen-context"
               style={{
-                background: "var(--bg-raised)",
-                border: "1px solid var(--border)",
-                borderRadius: "var(--radius-md)",
-                padding: "12px",
-                fontFamily: "var(--ui-font)",
-                color: "var(--fg-dim)",
+                display: "flex",
+                flex: "0 0 72px",
+                flexDirection: "column",
+                justifyContent: "center",
+                gap: "var(--space-1)",
+                height: "72px",
+                minHeight: "72px",
+                minWidth: 0,
+                overflow: "hidden",
+                padding: "var(--space-1) 2px",
               }}
             >
-              {t("view.gated")} ·{" "}
-              {t("view.gatedHint", {
-                reason: t(`availability.${activeView.availability}`, {
-                  defaultValue: activeView.availability,
-                }),
-              })}
+              <PageHeader
+                view={activeView}
+                summary={summary.data?.views.find((v) => v.view === state.view)}
+                matched={matched}
+                live={state.at === null}
+                onOpenIncidents={() => patch({ dock: "incidents" })}
+              />
+              {heatmapReady ? (
+                <Toolbar
+                  view={activeView}
+                  preset={state.preset}
+                  q={state.q}
+                  matched={matched}
+                  onSelectPreset={(preset) => patch({ preset })}
+                  onFilter={(q) => patch({ q })}
+                />
+              ) : (
+                <div
+                  role="status"
+                  style={{
+                    minWidth: 0,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    padding: "4px 8px",
+                    color: "var(--fg-dim)",
+                    background: "var(--bg-raised)",
+                    border: "1px solid var(--border)",
+                    borderRadius: "var(--radius-sm)",
+                    fontFamily: "var(--ui-font)",
+                    fontSize: "var(--text-sm)",
+                  }}
+                >
+                  {t("view.gated")} ·{" "}
+                  {t("view.gatedHint", {
+                    reason: t(`availability.${activeView.availability}`, {
+                      defaultValue: activeView.availability,
+                    }),
+                  })}
+                </div>
+              )}
             </section>
           )}
           {heatmapReady && (
-            <Toolbar
-              view={activeView}
-              preset={state.preset}
-              q={state.q}
-              matched={matched}
-              onSelectPreset={(preset) => patch({ preset })}
-              onFilter={(q) => patch({ q })}
-            />
+            <div
+              data-shell-region="analytical-center"
+              style={{ flex: "0 0 auto", minHeight: 0 }}
+            >
+              <HeatmapStrip
+                view={activeView}
+                metric={
+                  metricByView[activeView.code] ?? activeView.canonical_metric
+                }
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                selectedRange={range}
+                cursorUs={at}
+                hoverUs={hoverUs}
+                brushDraft={brushDraft}
+                baselineUs={state.baseline}
+                onMetricChange={(m) =>
+                  setMetricByView((prev) => ({
+                    ...prev,
+                    [activeView.code]: m,
+                  }))
+                }
+                onSelectEntity={(entity) => patch({ entity, dock: "row" })}
+              />
+            </div>
           )}
           {heatmapReady && (
             <TableView
@@ -411,32 +467,23 @@ function Shell() {
               sort={state.sort}
               order={state.order}
               entity={state.entity}
-              onSort={(sort, order) => patch({ sort, order })}
-              onSelectRow={(entity) => patch({ entity, dock: "row" })}
+              onSort={onTableSort}
+              onSelectRow={onSelectRow}
               onMatched={setMatched}
             />
           )}
-        </main>
+        </div>
       )}
-      {mobile === false && <div style={{ flex: 1 }} />}
-      <StatusBar state={state} summary={summary.data} />
-      <DockOverlay
-        state={state}
-        view={activeView}
-        at={at}
-        mobile={mobile}
-        onClose={() => patch({ dock: null })}
-        onSelectIncident={(focus) => patch({ focus })}
-        onPatch={patch}
-      />
-    </div>
+    </ShellLayout>
   );
 }
 
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <Shell />
+      <TimeGeometryProvider>
+        <Shell />
+      </TimeGeometryProvider>
     </QueryClientProvider>
   );
 }

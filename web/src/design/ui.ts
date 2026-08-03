@@ -1,5 +1,23 @@
 import type { CSSProperties } from "react";
 
+/** Metric meaning is separate from its unit. These compact codes are shared
+ * by OS, PostgreSQL and derived evidence surfaces. */
+export const SEMANTIC_KINDS = ["G", "ΔC", "R", "S", "E", "EST"] as const;
+export type SemanticKind = (typeof SEMANTIC_KINDS)[number];
+
+/** Successful responses can still carry an incomplete or unavailable value.
+ * Keep these states typed so callers cannot silently collapse one into zero. */
+export const DATA_STATES = [
+  "null",
+  "partial",
+  "gated",
+  "reset",
+  "gap",
+  "unsupported",
+  "top_n",
+] as const;
+export type DataState = (typeof DATA_STATES)[number];
+
 /** Shared visual primitives for the v2 chrome — single source so every
  * panel, chip and button speaks the same design language. */
 
