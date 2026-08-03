@@ -23,7 +23,7 @@ use crate::ui::frame::cursor::{FrameCursor, SortKey};
 use crate::ui::frame::dto::{ClassificationResultDto, FrameResponse, FrameValue as DtoFrameValue};
 use crate::ui::frame::projection::{
     DeltaOperand, FrameLimits, ProjectedRow, RowOperands, StatementOperands, TableOperands,
-    activity_process_relations, project_frame,
+    activity_process_relations, object_relations, project_frame,
 };
 use crate::ui::frame::projection::{ProjectionInput, project_input};
 use crate::ui::frame::spark::attach_sparks;
@@ -608,7 +608,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
                 ("n_live_tup", Value::I64(90)),
                 ("n_dead_tup", Value::I64(10)),
             ]),
-            6,
+            5,
         ),
         (
             "indexes",
@@ -813,6 +813,94 @@ fn activity_process_relation_keeps_unique_pid_evidence_best_effort() {
             .expect("ambiguous relation")
             .is_empty(),
         "a same-snapshot PID collision must not choose a process lifetime"
+    );
+}
+
+#[test]
+fn object_relations_require_same_snapshot_database_and_relation_oid() {
+    let table = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("datid", Value::U64(16_384)),
+        ("relid", Value::U64(20_001)),
+    ]);
+    let index = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("datid", Value::U64(16_384)),
+        ("relid", Value::U64(20_001)),
+        ("indexrelid", Value::U64(20_002)),
+    ]);
+    let vacuum = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("pid", Value::I64(7)),
+        ("datid", Value::U64(16_384)),
+        ("relid", Value::U64(20_001)),
+    ]);
+    let mut input = ProjectionInput::single(20_000_000, "pg_stat_user_tables", table.clone());
+    input.push("pg_stat_user_indexes", index.clone());
+    input.push("pg_stat_progress_vacuum", vacuum.clone());
+
+    let table_relations = object_relations("tables", &table, &input).expect("table relations");
+    assert_eq!(table_relations.len(), 1);
+    assert_eq!(table_relations[0].relation, "table_active_vacuum");
+    assert_eq!(table_relations[0].view, "vacuum");
+
+    let index_relations = object_relations("indexes", &index, &input).expect("index relations");
+    assert_eq!(index_relations.len(), 1);
+    assert_eq!(index_relations[0].relation, "index_table");
+    assert_eq!(index_relations[0].view, "tables");
+
+    let vacuum_relations = object_relations("vacuum", &vacuum, &input).expect("vacuum relations");
+    assert_eq!(vacuum_relations.len(), 1);
+    assert_eq!(vacuum_relations[0].relation, "vacuum_table");
+    assert_eq!(vacuum_relations[0].view, "tables");
+
+    for relation in table_relations
+        .iter()
+        .chain(index_relations.iter())
+        .chain(vacuum_relations.iter())
+    {
+        assert_eq!(relation.kind, crate::ui::catalog::RelationKind::Temporal);
+        assert_eq!(relation.method, "same_snapshot_database_relation_oid");
+        assert_eq!(relation.fields, vec!["datid", "relid", "ts"]);
+        assert!(!relation.entity.is_empty());
+    }
+
+    let cross_database = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("datid", Value::U64(16_402)),
+        ("relid", Value::U64(20_001)),
+        ("indexrelid", Value::U64(20_003)),
+    ]);
+    assert!(
+        object_relations("indexes", &cross_database, &input)
+            .expect("cross-database relation")
+            .is_empty(),
+        "relation OIDs are only meaningful inside one database"
+    );
+}
+
+#[test]
+fn object_relations_reject_ambiguous_single_target_matches() {
+    let index = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("datid", Value::U64(16_384)),
+        ("relid", Value::U64(20_001)),
+        ("indexrelid", Value::U64(20_002)),
+    ]);
+    let table = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("datid", Value::U64(16_384)),
+        ("relid", Value::U64(20_001)),
+    ]);
+    let mut input = ProjectionInput::single(20_000_000, "pg_stat_user_indexes", index.clone());
+    input.push("pg_stat_user_tables", table.clone());
+    input.push("pg_stat_user_tables", table);
+
+    assert!(
+        object_relations("indexes", &index, &input)
+            .expect("ambiguous relation")
+            .is_empty(),
+        "a duplicate same-snapshot target must not be chosen arbitrarily"
     );
 }
 

@@ -524,7 +524,10 @@ fn view(
                 projection.name.as_bytes(),
                 b"activity" | b"statements" | b"plans" | b"tables" | b"indexes" | b"processes"
             ),
-            related: matches!(projection.name.as_bytes(), b"activity" | b"statements"),
+            related: matches!(
+                projection.name.as_bytes(),
+                b"activity" | b"statements" | b"tables" | b"indexes" | b"vacuum"
+            ),
         },
         inputs: projection_inputs(projection),
         joins,
@@ -1191,7 +1194,14 @@ fn tables_view() -> ViewSpec {
     view(
         projection("tables"),
         Scope::Database,
-        Vec::new(),
+        vec![JoinSpec {
+            left: "tables",
+            right: "vacuum",
+            kind: RelationKind::Temporal,
+            fields: vec!["datid", "relid", "ts"],
+            cardinality: "zero_or_many",
+            provenance: "same_snapshot_database_relation_oid",
+        }],
         vec![
             derived_column(
                 "relation",
@@ -1310,6 +1320,32 @@ fn tables_view() -> ViewSpec {
         ],
         vec![
             preset(
+                "health",
+                &[
+                    "relation",
+                    "dead_pct",
+                    "dead_tuples",
+                    "seq_scan_pct",
+                    "autovacuum_age_seconds",
+                ],
+                "dead_pct",
+                "desc",
+            ),
+            preset(
+                "vacuum_risk",
+                &[
+                    "relation",
+                    "dead_pct",
+                    "dead_tuples",
+                    "modified_since_analyze",
+                    "inserted_since_vacuum",
+                    "last_autovacuum",
+                    "autovacuum_age_seconds",
+                ],
+                "autovacuum_age_seconds",
+                "desc",
+            ),
+            preset(
                 "activity",
                 &[
                     "relation",
@@ -1361,9 +1397,33 @@ fn tables_view() -> ViewSpec {
                 "desc",
             ),
             preset(
+                "scan_pattern",
+                &[
+                    "relation",
+                    "seq_scan",
+                    "idx_scan",
+                    "seq_scan_pct",
+                    "dead_pct",
+                ],
+                "seq_scan_pct",
+                "desc",
+            ),
+            preset(
                 "size",
                 &["relation", "size", "dead_pct", "xid_age", "mxid_age"],
                 "size",
+                "desc",
+            ),
+            preset(
+                "size_growth",
+                &["relation", "size", "dead_pct", "xid_age", "mxid_age"],
+                "size",
+                "desc",
+            ),
+            preset(
+                "xid_mxid",
+                &["relation", "xid_age", "mxid_age", "dead_pct", "size"],
+                "xid_age",
                 "desc",
             ),
         ],
@@ -1374,7 +1434,14 @@ fn indexes_view() -> ViewSpec {
     view(
         projection("indexes"),
         Scope::Database,
-        Vec::new(),
+        vec![JoinSpec {
+            left: "indexes",
+            right: "tables",
+            kind: RelationKind::Temporal,
+            fields: vec!["datid", "relid", "ts"],
+            cardinality: "zero_or_one",
+            provenance: "same_snapshot_database_relation_oid",
+        }],
         vec![
             raw_column(
                 "index",
@@ -1445,10 +1512,22 @@ fn indexes_view() -> ViewSpec {
                 "desc",
             ),
             preset(
+                "size_growth",
+                &["index", "table", "size", "scans", "last_idx_scan"],
+                "size",
+                "desc",
+            ),
+            preset(
                 "io",
                 &["index", "table", "scans", "io_hit_pct"],
                 "io_hit_pct",
                 "desc",
+            ),
+            preset(
+                "table_context",
+                &["index", "table", "scans", "rows_per_scan", "size"],
+                "table",
+                "asc",
             ),
         ],
     )
@@ -1584,6 +1663,26 @@ fn vacuum_presets() -> Vec<PresetSpec> {
             ],
             "dead_tuples",
             "desc",
+        ),
+        preset(
+            "dead_items",
+            &[
+                "pid",
+                "relation",
+                "dead_tuples",
+                "dead_item_ids",
+                "dead_tuple_bytes",
+                "progress",
+                "elapsed",
+            ],
+            "dead_tuples",
+            "desc",
+        ),
+        preset(
+            "wraparound_context",
+            &["pid", "relation", "phase", "progress", "elapsed"],
+            "relation",
+            "asc",
         ),
     ]
 }
@@ -1724,6 +1823,12 @@ fn processes_view() -> ViewSpec {
                 "threads",
                 &["pid", "type", "threads", "cpu", "rss", "command"],
                 "threads",
+                "desc",
+            ),
+            preset(
+                "processes",
+                &["pid", "type", "cpu", "rss", "threads", "cgroup", "command"],
+                "cpu",
                 "desc",
             ),
         ],

@@ -114,8 +114,8 @@ fn metric_semantics_publish_revision_four_with_stable_numeric_ids() {
             (1, 2, vec![(1, 1), (2, 2), (3, 1), (4, 1)]),
             (2, 3, vec![(1, 3), (2, 2), (3, 2), (4, 2)]),
             (3, 2, vec![(1, 2), (2, 2)]),
-            (4, 1, vec![(1, 1), (2, 1), (3, 1)]),
-            (5, 1, vec![(1, 1), (2, 1)]),
+            (4, 2, vec![(1, 1), (2, 1), (3, 1)]),
+            (5, 2, vec![(1, 1), (2, 1)]),
             (6, 2, vec![(1, 2)]),
             (7, 2, vec![(1, 2), (2, 1)]),
             (8, 2, vec![(1, 2)]),
@@ -190,6 +190,81 @@ fn workload_views_publish_distinct_prepared_lenses_and_fork_provenance() {
             && join["provenance"] == "vadv_queryid_stat_statements_dbid_userid_attribution"
             && join["fields"] == json!(["queryid_stat_statements", "dbid", "userid"])
     }));
+}
+
+#[test]
+fn host_and_object_views_publish_prepared_lenses_and_temporal_relations() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+
+    for (view, presets) in [
+        (
+            "processes",
+            &["cpu", "memory", "disk_io", "cgroup", "processes"][..],
+        ),
+        (
+            "tables",
+            &[
+                "health",
+                "vacuum_risk",
+                "io",
+                "scan_pattern",
+                "size_growth",
+                "xid_mxid",
+            ][..],
+        ),
+        (
+            "indexes",
+            &["usage", "io", "size_growth", "unused", "table_context"][..],
+        ),
+        (
+            "vacuum",
+            &["progress", "phase", "dead_items", "wraparound_context"][..],
+        ),
+    ] {
+        for preset in presets {
+            assert_serialized_preset(&catalog, view, preset);
+        }
+    }
+
+    for view in ["tables", "indexes", "vacuum"] {
+        assert_eq!(
+            serialized_view(&catalog, view)["capabilities"]["related"],
+            true,
+            "{view} exposes bounded same-snapshot relations"
+        );
+    }
+
+    for (view, left, right, provenance) in [
+        (
+            "tables",
+            "tables",
+            "vacuum",
+            "same_snapshot_database_relation_oid",
+        ),
+        (
+            "indexes",
+            "indexes",
+            "tables",
+            "same_snapshot_database_relation_oid",
+        ),
+        (
+            "vacuum",
+            "vacuum",
+            "tables",
+            "same_snapshot_database_relation_oid",
+        ),
+    ] {
+        let join = serialized_view(&catalog, view)["joins"]
+            .as_array()
+            .expect("joins")
+            .iter()
+            .find(|join| join["left"] == left && join["right"] == right)
+            .unwrap_or_else(|| panic!("missing {view}: {left} -> {right}"));
+        assert_eq!(join["kind"], "temporal");
+        assert_eq!(join["fields"], json!(["datid", "relid", "ts"]));
+        assert_eq!(join["provenance"], provenance);
+    }
 }
 
 #[test]

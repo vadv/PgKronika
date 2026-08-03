@@ -239,14 +239,26 @@ const PLANS_INPUTS: &[WebInput] = &[
         sections: &["reset_metadata"],
     },
 ];
-const TABLES_INPUTS: &[WebInput] = &[WebInput {
-    code: "tables",
-    sections: &["pg_stat_user_tables"],
-}];
-const INDEXES_INPUTS: &[WebInput] = &[WebInput {
-    code: "indexes",
-    sections: &["pg_stat_user_indexes"],
-}];
+const TABLES_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "tables",
+        sections: &["pg_stat_user_tables"],
+    },
+    WebInput {
+        code: "vacuum",
+        sections: &["pg_stat_progress_vacuum"],
+    },
+];
+const INDEXES_INPUTS: &[WebInput] = &[
+    WebInput {
+        code: "indexes",
+        sections: &["pg_stat_user_indexes"],
+    },
+    WebInput {
+        code: "tables",
+        sections: &["pg_stat_user_tables"],
+    },
+];
 const VACUUM_INPUTS: &[WebInput] = &[
     WebInput {
         code: "vacuum",
@@ -615,7 +627,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 4,
         name: "tables",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: TABLES_INPUTS,
@@ -624,7 +636,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 5,
         name: "indexes",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: INDEXES_INPUTS,
