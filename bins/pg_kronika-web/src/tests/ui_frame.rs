@@ -1062,6 +1062,243 @@ fn process_cpu_and_block_delay_are_divided_by_clock_ticks() {
 }
 
 #[test]
+fn process_detail_projects_gauges_rates_and_cache_path() {
+    let columns = [
+        "state",
+        "parent_pid",
+        "uid",
+        "effective_uid",
+        "started_at",
+        "current_cpu",
+        "nice",
+        "priority",
+        "realtime_priority",
+        "scheduler_policy",
+        "cpu_user",
+        "cpu_system",
+        "run_delay",
+        "virtual_memory",
+        "swap",
+        "voluntary_context_switches_per_second",
+        "involuntary_context_switches_per_second",
+        "minor_faults_per_second",
+        "major_faults_per_second",
+        "read_syscalls_per_second",
+        "write_syscalls_per_second",
+        "logical_read_bytes_per_second",
+        "logical_write_bytes_per_second",
+        "read_bytes_per_second",
+        "write_bytes_per_second",
+        "cache_served_read_bytes_per_second",
+    ];
+    let query = format!("at=20000000&columns={}", columns.join(","));
+    let request = FrameRequest::parse("processes", Some(&query), &catalog()).expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("ppid", Value::I64(1)),
+            ("uid", Value::U64(999)),
+            ("euid", Value::U64(998)),
+            ("state", Value::U64(u64::from(b'R'))),
+            ("curcpu", Value::I64(6)),
+            ("nice", Value::I64(-5)),
+            ("prio", Value::I64(15)),
+            ("rtprio", Value::I64(0)),
+            ("policy", Value::U64(0)),
+            ("utime", Value::U64(410)),
+            ("stime", Value::U64(210)),
+            ("rundelay_ns", Value::U64(5_000_000_000)),
+            ("nvcsw", Value::U64(150)),
+            ("nivcsw", Value::U64(33)),
+            ("minflt", Value::U64(1_050)),
+            ("majflt", Value::U64(21)),
+            ("vmem_kb", Value::I64(1_048_576)),
+            ("vswap_kb", Value::I64(16_384)),
+            ("syscr", Value::U64(240)),
+            ("syscw", Value::U64(160)),
+            ("rchar", Value::U64(104_857_600)),
+            ("wchar", Value::U64(60_000_000)),
+            ("read_bytes", Value::U64(24_857_600)),
+            ("write_bytes", Value::U64(30_000_000)),
+        ]),
+    );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("clock_ticks_per_sec", Value::I64(100)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(110)),
+            ("stime", Value::U64(10)),
+            ("rundelay_ns", Value::U64(1_000_000_000)),
+            ("nvcsw", Value::U64(50)),
+            ("nivcsw", Value::U64(3)),
+            ("minflt", Value::U64(50)),
+            ("majflt", Value::U64(1)),
+            ("syscr", Value::U64(40)),
+            ("syscw", Value::U64(10)),
+            ("rchar", Value::U64(4_857_600)),
+            ("wchar", Value::U64(10_000_000)),
+            ("read_bytes", Value::U64(4_857_600)),
+            ("write_bytes", Value::U64(10_000_000)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    let values = columns
+        .into_iter()
+        .zip(frame.rows[0].cells.iter().cloned())
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(values["state"], DtoFrameValue::String("R".to_owned()));
+    assert_eq!(values["parent_pid"], DtoFrameValue::Number(1.0));
+    assert_eq!(values["uid"], DtoFrameValue::Number(999.0));
+    assert_eq!(values["effective_uid"], DtoFrameValue::Number(998.0));
+    assert_eq!(
+        values["started_at"],
+        DtoFrameValue::String("2000000".to_owned())
+    );
+    assert_eq!(values["current_cpu"], DtoFrameValue::Number(6.0));
+    assert_eq!(values["nice"], DtoFrameValue::Number(-5.0));
+    assert_eq!(values["priority"], DtoFrameValue::Number(15.0));
+    assert_eq!(values["realtime_priority"], DtoFrameValue::Number(0.0));
+    assert_eq!(
+        values["scheduler_policy"],
+        DtoFrameValue::String("NORMAL".to_owned())
+    );
+    assert_eq!(values["cpu_user"], DtoFrameValue::Number(0.3));
+    assert_eq!(values["cpu_system"], DtoFrameValue::Number(0.2));
+    assert_eq!(values["run_delay"], DtoFrameValue::Number(0.4));
+    assert_eq!(values["virtual_memory"], DtoFrameValue::Number(1_048_576.0));
+    assert_eq!(values["swap"], DtoFrameValue::Number(16_384.0));
+    assert_eq!(
+        values["voluntary_context_switches_per_second"],
+        DtoFrameValue::Number(10.0)
+    );
+    assert_eq!(
+        values["involuntary_context_switches_per_second"],
+        DtoFrameValue::Number(3.0)
+    );
+    assert_eq!(
+        values["minor_faults_per_second"],
+        DtoFrameValue::Number(100.0)
+    );
+    assert_eq!(
+        values["major_faults_per_second"],
+        DtoFrameValue::Number(2.0)
+    );
+    assert_eq!(
+        values["read_syscalls_per_second"],
+        DtoFrameValue::Number(20.0)
+    );
+    assert_eq!(
+        values["write_syscalls_per_second"],
+        DtoFrameValue::Number(15.0)
+    );
+    assert_eq!(
+        values["logical_read_bytes_per_second"],
+        DtoFrameValue::Number(10_000_000.0)
+    );
+    assert_eq!(
+        values["logical_write_bytes_per_second"],
+        DtoFrameValue::Number(5_000_000.0)
+    );
+    assert_eq!(
+        values["read_bytes_per_second"],
+        DtoFrameValue::Number(2_000_000.0)
+    );
+    assert_eq!(
+        values["write_bytes_per_second"],
+        DtoFrameValue::Number(2_000_000.0)
+    );
+    assert_eq!(
+        values["cache_served_read_bytes_per_second"],
+        DtoFrameValue::Number(8_000_000.0)
+    );
+}
+
+#[test]
+fn process_detail_keeps_gauges_but_drops_rates_across_pid_reuse() {
+    let rate_columns = [
+        "cpu_user",
+        "cpu_system",
+        "run_delay",
+        "voluntary_context_switches_per_second",
+        "minor_faults_per_second",
+        "logical_read_bytes_per_second",
+        "read_bytes_per_second",
+        "cache_served_read_bytes_per_second",
+    ];
+    let query = format!(
+        "at=20000000&columns=current_cpu,rss,{}",
+        rate_columns.join(",")
+    );
+    let request = FrameRequest::parse("processes", Some(&query), &catalog()).expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(3_000_000)),
+            ("curcpu", Value::I64(4)),
+            ("rmem_kb", Value::I64(65_536)),
+            ("utime", Value::U64(500)),
+            ("stime", Value::U64(300)),
+            ("rundelay_ns", Value::U64(5_000_000_000)),
+            ("nvcsw", Value::U64(500)),
+            ("minflt", Value::U64(500)),
+            ("rchar", Value::U64(50_000_000)),
+            ("read_bytes", Value::U64(10_000_000)),
+        ]),
+    );
+    input.push(
+        "instance_metadata",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("clock_ticks_per_sec", Value::I64(100)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("utime", Value::U64(10)),
+            ("stime", Value::U64(10)),
+            ("rundelay_ns", Value::U64(10)),
+            ("nvcsw", Value::U64(10)),
+            ("minflt", Value::U64(10)),
+            ("rchar", Value::U64(10)),
+            ("read_bytes", Value::U64(10)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells[0], DtoFrameValue::Number(4.0));
+    assert_eq!(frame.rows[0].cells[1], DtoFrameValue::Number(65_536.0));
+    assert!(
+        frame.rows[0].cells[2..]
+            .iter()
+            .all(|value| *value == DtoFrameValue::Null),
+        "rate continuity must stop across process starttime"
+    );
+}
+
+#[test]
 fn tick_rates_preserve_multi_core_cpu() {
     let request = FrameRequest::parse("processes", Some("at=20000000&columns=cpu"), &catalog())
         .expect("request");
