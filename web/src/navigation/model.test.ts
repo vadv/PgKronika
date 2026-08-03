@@ -38,7 +38,7 @@ test("builds the approved groups and destinations independently of catalog order
       group.destinations.map((destination) => destination.id),
     ),
   ).toEqual([
-    ["activity", "statements", "plans"],
+    ["statements", "activity", "plans"],
     ["tables", "indexes", "vacuum"],
     ["os"],
     ["events"],
@@ -56,8 +56,8 @@ test("propagates catalog availability and maps OS to the processes API view", ()
       availability,
     })),
   ).toEqual([
-    { id: "activity", viewCode: "activity", availability: "available" },
     { id: "statements", viewCode: "statements", availability: "gated" },
+    { id: "activity", viewCode: "activity", availability: "available" },
     { id: "plans", viewCode: "plans", availability: "unsupported_type" },
     { id: "tables", viewCode: "tables", availability: "available" },
     { id: "indexes", viewCode: "indexes", availability: "available" },

@@ -482,7 +482,7 @@ async function verifyStatementsWorkspace(page) {
     bodySelector,
   );
 
-  const inputLatencyMs = await page.evaluate(async () => {
+  const inputLatency = await page.evaluate(async () => {
     const search = document.querySelector('input[type="search"]');
     if (!(search instanceof HTMLInputElement)) {
       throw new Error("statement filter is missing");
@@ -503,10 +503,20 @@ async function verifyStatementsWorkspace(page) {
       return performance.now() - started;
     };
     search.focus();
-    const latency = await update("analytics");
+    // Warm the controlled input once, then use a median: a browser GC pause
+    // must not masquerade as slow search, while sustained slow renders still
+    // fail the 100 ms interaction contract.
+    await update("warmup");
     await update("");
-    return latency;
+    const samples = [];
+    for (const value of ["a", "an", "ana", "analy", "analytics"]) {
+      samples.push(await update(value));
+    }
+    await update("");
+    const ordered = [...samples].sort((left, right) => left - right);
+    return { samples, medianMs: ordered[Math.floor(ordered.length / 2)] };
   });
+  const inputLatencyMs = inputLatency.medianMs;
 
   const firstEntity = await page.$eval(
     `${bodySelector} tr[data-entity]`,
@@ -626,6 +636,7 @@ async function verifyStatementsWorkspace(page) {
     pages,
     final,
     inputLatencyMs,
+    inputLatencySamples: inputLatency.samples,
     filterSemantics,
     bufferHitRange,
     keyboard: { firstEntity, arrowEntity },
@@ -1547,14 +1558,14 @@ function assertContract(metrics, keyboard) {
       `matrix is not independently scrollable: ${metrics.matrix.scrollHeight} <= ${metrics.matrix.clientHeight}`,
     );
   }
-  if (metrics.matrix.visibleRows < 18 || metrics.matrix.visibleRows > 40) {
+  if (metrics.matrix.visibleRows < 28 || metrics.matrix.visibleRows > 32) {
     failures.push(
-      `visible matrix rows ${metrics.matrix.visibleRows}, expected 18..40`,
+      `visible matrix rows ${metrics.matrix.visibleRows}, expected 28..32`,
     );
   }
-  if (metrics.matrix.visibleRowHeights.some((height) => height < 28)) {
+  if (metrics.matrix.visibleRowHeights.some((height) => height < 27)) {
     failures.push(
-      `visible matrix row below 28px: ${Math.min(...metrics.matrix.visibleRowHeights)}`,
+      `visible matrix row below 27px: ${Math.min(...metrics.matrix.visibleRowHeights)}`,
     );
   }
   if (metrics.statements.detachedHeatmap) {

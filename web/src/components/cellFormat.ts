@@ -14,6 +14,7 @@ import type {
 } from "../api/types";
 import {
   formatByUnit,
+  formatCompactNumber,
   formatDurationUs,
   formatNumber,
   formatTimestampUs,
@@ -32,6 +33,7 @@ export interface CellColumn {
 }
 
 const NUMERIC_TYPES = new Set(["i64", "u64", "f64"]);
+const COMPACT_QUANTITY_COLUMNS = new Set(["calls", "rows"]);
 
 function numericText(value: string): boolean {
   return value.trim() !== "" && !Number.isNaN(Number(value));
@@ -80,10 +82,14 @@ export function formatCellValue(
   }
   if (typeof value === "number") {
     if (isPlainIntegerColumn(column.code)) return String(value);
+    if (COMPACT_QUANTITY_COLUMNS.has(column.code))
+      return formatCompactNumber(value);
     return formatByUnit(value, column.unit);
   }
   if (NUMERIC_TYPES.has(column.type) && numericText(value)) {
     if (isPlainIntegerColumn(column.code)) return String(value);
+    if (COMPACT_QUANTITY_COLUMNS.has(column.code))
+      return formatCompactNumber(Number(value));
     return formatByUnit(Number(value), column.unit);
   }
   return value;
@@ -98,6 +104,7 @@ export function fullCellValue(
   if (value === null || typeof value === "boolean") return null;
   if (
     isIdentityColumn(column.code) ||
+    COMPACT_QUANTITY_COLUMNS.has(column.code) ||
     column.code === "severity_code" ||
     column.code === "category_code" ||
     column.code === "state" ||

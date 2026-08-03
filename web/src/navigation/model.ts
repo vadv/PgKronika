@@ -39,12 +39,12 @@ const GROUP_DEFINITIONS: readonly GroupDefinition[] = [
     id: "workload",
     labelKey: "navigation.group.workload",
     destinations: [
-      { id: "activity", labelKey: "tabs.activity", viewCode: "activity" },
       {
         id: "statements",
         labelKey: "tabs.statements",
         viewCode: "statements",
       },
+      { id: "activity", labelKey: "tabs.activity", viewCode: "activity" },
       { id: "plans", labelKey: "tabs.plans", viewCode: "plans" },
     ],
   },

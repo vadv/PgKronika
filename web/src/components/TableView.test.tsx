@@ -246,6 +246,7 @@ test("couples each virtualized statement row to its exact temporal evidence", as
   );
   const renderedRows = body.querySelectorAll("tr[data-entity]").length;
   expect(screen.getAllByTestId("temporal-row")).toHaveLength(renderedRows);
+  expect(screen.getByText("statements.matrix.heatmap")).toBeDefined();
   expect(renderedRows).toBeLessThanOrEqual(24);
   expect(
     body
@@ -263,7 +264,7 @@ test("couples each virtualized statement row to its exact temporal evidence", as
   expect(screen.queryByText("table.spark")).toBeNull();
   expect(
     body.querySelector('[data-entity="stmt:0"]')?.getAttribute("style"),
-  ).toContain("height: 34px");
+  ).toContain("height: 27px");
 });
 
 test("five server pages stay deduplicated and DOM-bounded", async () => {

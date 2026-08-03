@@ -106,7 +106,7 @@ td.statements-time-matrix__identity {
   position: sticky;
   left: 0;
   z-index: 1;
-  padding: 2px var(--space-3);
+  padding: 1px var(--space-3);
   overflow: hidden;
   color: var(--fg);
   background: var(--bg-raised);
@@ -133,14 +133,14 @@ tr[aria-selected="true"] > td.statements-time-matrix__identity {
   color: var(--fg-strong);
   font-size: var(--text-md);
   font-weight: 600;
-  line-height: 14px;
+  line-height: 12px;
 }
 
 .statements-time-matrix__identity-meta {
   color: var(--fg-dim);
   font-family: var(--ui-font);
   font-size: var(--text-xs);
-  line-height: 12px;
+  line-height: var(--text-xs);
 }
 
 .statements-time-matrix__timeline {

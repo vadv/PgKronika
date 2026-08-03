@@ -72,8 +72,8 @@ const SORTABLE_TYPES = new Set(["i64", "u64", "f64", "timestamp"]);
 /** Column types whose wire value may arrive as a decimal string. */
 const NUMERIC_TYPES = new Set(["i64", "u64", "f64"]);
 const ROW_HEIGHT = 28;
-const TIME_MATRIX_ROW_HEIGHT = 34;
-const ROW_OVERSCAN = 6;
+const TIME_MATRIX_ROW_HEIGHT = 27;
+const ROW_OVERSCAN = 5;
 const FALLBACK_VIEWPORT_HEIGHT = 650;
 const STATEMENT_IDENTITY_COLUMNS = new Set(["queryid", "database", "user"]);
 
@@ -580,7 +580,9 @@ function TableViewImpl(props: TableViewProps) {
                   className="statements-time-matrix__timeline"
                   style={headerCellStyle("")}
                 >
-                  <span>{t("statements.matrix.timeline")}</span>
+                  <span>
+                    {t("statements.matrix.heatmap", { count: bucketCount })}
+                  </span>
                   <span className="statements-time-matrix__metric">
                     {timeMatrix.metricLabel}
                   </span>
