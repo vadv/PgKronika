@@ -288,7 +288,13 @@ test("copy link writes the canonical share URL and shows a toast for 1.7s", () =
   expect(screen.queryByTestId("toast")).toBeNull();
 });
 
-test("database chip opens a menu of context.databases, selects one, closes outside", () => {
+test("database chip states what exists, read-only — scoping stays a per-workspace filter", () => {
+  const { unmount } = renderHeader();
+  expect(screen.getByTestId("database-chip").textContent).toContain(
+    "header.databaseAll",
+  );
+  unmount();
+
   renderHeader({
     context: makeContextResponse({
       databases: [
@@ -298,22 +304,9 @@ test("database chip opens a menu of context.databases, selects one, closes outsi
     }),
   });
   const chip = screen.getByTestId("database-chip");
-  expect(chip.textContent).toContain("header.databaseAll");
-  expect(screen.queryByTestId("database-menu")).toBeNull();
-
-  fireEvent.click(chip);
-  const menu = screen.getByTestId("database-menu");
-  expect(menu.textContent).toContain("orders");
-  expect(menu.textContent).toContain("billing");
-
-  fireEvent.click(screen.getByRole("option", { name: "billing" }));
-  expect(screen.queryByTestId("database-menu")).toBeNull();
-  expect(chip.textContent).toContain("billing");
-
-  fireEvent.click(chip);
-  expect(screen.getByTestId("database-menu")).toBeDefined();
-  fireEvent.mouseDown(document.body);
-  expect(screen.queryByTestId("database-menu")).toBeNull();
+  expect(chip.textContent).toContain("header.databaseCount");
+  expect(chip.getAttribute("title")).toBe("orders, billing");
+  expect(chip.tagName).not.toBe("BUTTON");
 });
 
 test("instance chip tooltip shows host, pg version and cpu from context", async () => {

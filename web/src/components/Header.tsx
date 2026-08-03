@@ -1,14 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ContextResponse, IncidentsResponse } from "../api/types";
-import {
-  button,
-  chip,
-  chipInteractive,
-  overlay,
-  text,
-  verdictTint,
-} from "../design/ui";
+import { button, chip, chipInteractive, text, verdictTint } from "../design/ui";
 import type { TimeRange } from "../state/timeGeometry";
 import { DataHealthPopover } from "./DataHealthPopover";
 import { TipRow, Tooltip } from "./Tooltip";
@@ -151,84 +144,25 @@ function Dot(props: { color: string; square?: boolean }) {
   );
 }
 
+/** Read-only, like RoleChip: database scoping already happens per-workspace
+ * via the `database=<name>` filter term, so this states what exists rather
+ * than offering a second, disconnected way to select one. */
 function DatabaseChip(props: { context: ContextResponse | undefined }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
-  const ref = useRef<HTMLSpanElement | null>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onOutside = (event: MouseEvent) => {
-      if (!(event.target instanceof Node)) return;
-      if (ref.current !== null && !ref.current.contains(event.target)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onOutside);
-    return () => document.removeEventListener("mousedown", onOutside);
-  }, [open]);
   const databases = props.context?.databases ?? [];
+  const names = databases.map((db) => db.name);
   return (
-    <span ref={ref} style={{ position: "relative" }}>
-      <button
-        type="button"
-        data-testid="database-chip"
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        onClick={() => setOpen((value) => !value)}
-        style={chipInteractive}
-      >
-        {t("header.database")}{" "}
-        <span style={{ color: "var(--fg-strong)", fontWeight: 600 }}>
-          {selected ?? t("header.databaseAll")}
-        </span>
-        <span style={{ color: "var(--fg-dim)" }}>⌄</span>
-      </button>
-      {open && (
-        <span
-          role="listbox"
-          data-testid="database-menu"
-          style={{
-            ...overlay,
-            position: "absolute",
-            top: "100%",
-            left: 0,
-            marginTop: "4px",
-            display: "grid",
-            padding: "4px",
-            minWidth: "160px",
-            zIndex: 20,
-          }}
-        >
-          <button
-            type="button"
-            role="option"
-            aria-selected={selected === null}
-            onClick={() => {
-              setSelected(null);
-              setOpen(false);
-            }}
-            style={{ ...button, border: "none", justifyContent: "start" }}
-          >
-            {t("header.databaseAll")}
-          </button>
-          {databases.map((db) => (
-            <button
-              key={db.entity}
-              type="button"
-              role="option"
-              aria-selected={selected === db.name}
-              onClick={() => {
-                setSelected(db.name);
-                setOpen(false);
-              }}
-              style={{ ...button, border: "none", justifyContent: "start" }}
-            >
-              {db.name}
-            </button>
-          ))}
-        </span>
-      )}
+    <span
+      style={chip}
+      data-testid="database-chip"
+      title={names.length > 0 ? names.join(", ") : undefined}
+    >
+      {t("header.database")}{" "}
+      <span style={{ color: "var(--fg-strong)", fontWeight: 600 }}>
+        {names.length > 0
+          ? t("header.databaseCount", { count: names.length })
+          : t("header.databaseAll")}
+      </span>
     </span>
   );
 }
