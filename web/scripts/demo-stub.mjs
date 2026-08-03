@@ -1285,22 +1285,6 @@ function rowsVacuum() {
 }
 
 function rowsProcesses() {
-  const defs = [
-    ["postgres: backend api-worker", 0.42, 412_884, 88_220_000, 12_440_000],
-    ["postgres: backend api-worker", 0.38, 398_220, 64_880_000, 8_220_000],
-    ["postgres: backend reports", 0.31, 884_220, 12_440_000, 220_884],
-    ["postgres: backend etl/loader", 0.27, 640_118, 220_884_000, 88_440_000],
-    ["postgres: checkpointer", 0.04, 44_220, 8_440_000, 120_884_000],
-    ["postgres: background writer", 0.02, 22_884, 0, 44_220_000],
-    ["postgres: walwriter", 0.06, 18_441, 0, 88_884_000],
-    ["postgres: autovacuum launcher", 0.0, 12_220, 220_884, 0],
-    ["postgres: autovacuum worker", 0.18, 220_441, 44_220_000, 4_884_000],
-    ["postgres: archiver", 0.01, 8_884, 0, 2_220_000],
-    ["postgres: stats collector", 0.01, 14_220, 1_220_000, 440_000],
-    ["postgres: logical replication launcher", 0.0, 9_884, 0, 0],
-    ["pgbouncer", 0.09, 88_441, 4_440_000, 1_220_000],
-    ["node_exporter", 0.02, 22_118, 88_884_000, 12_220_000],
-  ];
   // Mirror the activity demo's backend PIDs so a claimed best-effort
   // same-snapshot association always resolves to an inspectable process.
   // The ninth row in each group remains deliberately unmatched in
@@ -1308,8 +1292,26 @@ function rowsProcesses() {
   return Array.from({ length: 36 }, (_, i) => i)
     .filter((i) => i % 9 !== 4)
     .map((i) => {
-      const [type, cpu, rss, readBps, writeBps] = defs[i % defs.length];
+      const [user, application, activityState] =
+        BACKENDS[i % BACKENDS.length];
       const pid = 12041 + i * 13;
+      const active = activityState === "active";
+      const type =
+        application === "autovacuum worker" || application === "walwriter"
+          ? `postgres: ${application}`
+          : user === "pgbouncer"
+            ? "pgbouncer"
+            : `postgres: backend ${application}`;
+      const cpu = active ? r2(0.12 + (i % 7) * 0.14) : 0.01;
+      const rss = 8_192 + (i % 10) * 24_576;
+      const readBps = active ? 82_000 + i * 11_400 : 0;
+      const writeBps = active ? 16_000 + i * 4_200 : 0;
+      const logicalReadBps = Math.round(readBps * (2.4 + (i % 4) * 0.55));
+      const logicalWriteBps = Math.round(writeBps * (1.35 + (i % 3) * 0.2));
+      const command =
+        user === "pgbouncer"
+          ? "pgbouncer /etc/pgbouncer/pgbouncer.ini"
+          : `postgres: ${user} ${application} ${activityState === "idle" ? "idle" : "worker"}`;
       const cls =
         cpu > 0.4
           ? [verdict("cpu", "os.process.cpu", cpu, "warning", 0.4)]
@@ -1320,13 +1322,47 @@ function rowsProcesses() {
         data: {
           pid,
           type,
+          state:
+            activityState === "idle"
+              ? "S"
+              : i % 6 === 3
+                ? "D"
+                : active
+                  ? "R"
+                  : "S",
+          parent_pid: user === "pgbouncer" ? 1 : 713,
+          uid: user === "pgbouncer" ? 997 : 999,
+          effective_uid: user === "pgbouncer" ? 997 : 999,
+          started_at: String(1_754_000_000_000_000 + i * 7_300_000),
           cpu,
+          cpu_user: r2(cpu * 0.72),
+          cpu_system: r2(cpu * 0.28),
+          run_delay: r2(active ? 0.04 + (i % 5) * 0.09 : 0.002),
+          current_cpu: i % 16,
+          nice: application === "autovacuum worker" ? 5 : 0,
+          priority: application === "autovacuum worker" ? 25 : 20,
+          realtime_priority: 0,
+          scheduler_policy: "NORMAL",
           rss,
           threads: 1 + (i % 7),
+          virtual_memory: Math.round(rss * (3.6 + (i % 4) * 0.45)),
+          swap: i % 8 === 0 ? 4_096 + i * 128 : 0,
+          voluntary_context_switches_per_second: r2(18 + i * 1.7),
+          involuntary_context_switches_per_second: r2(0.4 + (i % 6) * 0.7),
+          minor_faults_per_second: r2(4 + (i % 9) * 3.2),
+          major_faults_per_second: i % 11 === 3 ? 0.2 : 0,
+          read_syscalls_per_second: r2(logicalReadBps / 8_192),
+          write_syscalls_per_second: r2(logicalWriteBps / 6_144),
+          logical_read_bytes_per_second: logicalReadBps,
+          logical_write_bytes_per_second: logicalWriteBps,
           read_bytes_per_second: readBps,
           write_bytes_per_second: writeBps,
+          cache_served_read_bytes_per_second: Math.max(
+            logicalReadBps - readBps,
+            0,
+          ),
           block_delay: r2(i % 4 === 0 ? 0.8 : 0.05),
-          command: type,
+          command,
           cgroup: i < 12 ? "/system.slice/postgresql.service" : "/system.slice",
         },
         cls,
@@ -1810,6 +1846,22 @@ function entityResponse(viewCode, entity, params) {
         related.push({
           view: "processes",
           entity: process.entity,
+          relation: "activity_process",
+          provenance: {
+            kind: "best_effort",
+            method: "pid",
+            fields: ["pid"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "processes") {
+      for (const activity of rowsActivity().filter(
+        (candidate) => candidate.data.pid === row.data.pid,
+      )) {
+        related.push({
+          view: "activity",
+          entity: activity.entity,
           relation: "activity_process",
           provenance: {
             kind: "best_effort",
