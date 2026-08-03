@@ -24,6 +24,22 @@ export interface EntityHistoryArgs {
   enabled?: boolean;
 }
 
+export async function fetchEntityPoint(args: EntityPointArgs) {
+  const response = await apiGet("/v1/entity/{view}/{entity}", {
+    params: {
+      path: { view: args.view, entity: args.entity },
+      query: {
+        at: Number(args.at),
+        ...(args.includeRelated ? { include: "related" } : {}),
+      },
+    },
+  });
+  if (!("fields" in response)) {
+    throw new Error("entity point endpoint returned history mode");
+  }
+  return response;
+}
+
 export function useEntityPoint(args: EntityPointArgs) {
   return useQuery({
     queryKey: [
@@ -33,21 +49,7 @@ export function useEntityPoint(args: EntityPointArgs) {
       args.at,
       args.includeRelated ?? false,
     ],
-    queryFn: async () => {
-      const response = await apiGet("/v1/entity/{view}/{entity}", {
-        params: {
-          path: { view: args.view, entity: args.entity },
-          query: {
-            at: Number(args.at),
-            ...(args.includeRelated ? { include: "related" } : {}),
-          },
-        },
-      });
-      if (!("fields" in response)) {
-        throw new Error("entity point endpoint returned history mode");
-      }
-      return response;
-    },
+    queryFn: () => fetchEntityPoint(args),
     enabled: args.entity !== "",
   });
 }

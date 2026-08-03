@@ -52,16 +52,16 @@ test("severity and category codes route through the dictionary", () => {
   expect(fullCellValue("plain", { code: "query", type: "text" })).toBeNull();
 });
 
-test("process_link renders the direct PID link, machine form in tooltip", () => {
+test("process_link renders a compact link, machine form in tooltip", () => {
   const column = { code: "process_link", type: "text" };
   const dict: Record<string, string> = {
-    "relation.kind.pid.label": "Связано по PID",
+    "relation.kind.pid.label": "Связано",
   };
   const localized = ((key: string, opts?: Record<string, unknown>) =>
     dict[key] ??
     (opts?.defaultValue as string | undefined) ??
     key) as TFunction<"translation", undefined>;
-  expect(formatCellValue("pid", column, localized)).toBe("Связано по PID");
+  expect(formatCellValue("pid", column, localized)).toBe("Связано");
   // Missing dictionary falls back to the honest machine code, never blank.
   expect(formatCellValue("pid", column, t)).toBe("pid");
   expect(fullCellValue("pid", column)).toBe("pid");

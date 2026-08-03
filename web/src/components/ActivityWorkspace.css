@@ -40,6 +40,13 @@
   letter-spacing: var(--tracking-caps);
 }
 
+.activity-workspace__snapshot-hint {
+  max-width: 360px;
+  overflow: hidden;
+  color: var(--fg-dim);
+  text-overflow: ellipsis;
+}
+
 .activity-workspace__metrics {
   display: inline-flex;
   flex: 0 0 auto;

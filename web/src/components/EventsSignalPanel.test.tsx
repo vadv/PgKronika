@@ -64,7 +64,7 @@ test("Signals keeps newest lanes human and free of collection quality codes", as
   );
 
   const lanes = await screen.findAllByTestId("event-signal-lane");
-  expect(lanes).toHaveLength(6);
+  expect(lanes).toHaveLength(5);
   expect(lanes[0]?.getAttribute("data-event-instance")).toBe("event-7");
   expect(screen.getByTestId("event-signals-summary").textContent).toContain(
     "eventsSignals.summary",

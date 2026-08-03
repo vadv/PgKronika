@@ -56,6 +56,7 @@ function renderStrip(
     brushDraft: { fromUs: string; toUs: string } | null;
     baselineUs: string | null;
     buckets: number;
+    presentation: "heatmap" | "events";
   }> = {},
 ) {
   vi.stubGlobal(
@@ -82,6 +83,7 @@ function renderStrip(
       brushDraft={overrides.brushDraft}
       baselineUs={overrides.baselineUs}
       buckets={overrides.buckets}
+      presentation={overrides.presentation}
       onMetricChange={overrides.onMetricChange ?? (() => {})}
       onSelectEntity={overrides.onSelectEntity ?? (() => {})}
     />,
@@ -103,6 +105,17 @@ test("renders row labels and one cell per bucket, null cell marked empty", async
       "data.noSnapshotInterval",
     ),
   );
+});
+
+test("event presentation keeps 96 buckets but renders quiet observations as thin lane marks", async () => {
+  const { container } = renderStrip({ presentation: "events" });
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  const zero = container.querySelector('[data-cell][data-value="zero"]');
+  const quiet = container.querySelector('[data-cell][data-value="quiet"]');
+  const peak = container.querySelector('[data-cell][data-value="peak"]');
+  expect((zero as HTMLElement | null)?.style.opacity).toBe("0");
+  expect((quiet as HTMLElement | null)?.style.height).toBe("2px");
+  expect((peak as HTMLElement | null)?.style.height).toBe("8px");
 });
 
 test("partial quality stays out of the normal heatmap surface", async () => {

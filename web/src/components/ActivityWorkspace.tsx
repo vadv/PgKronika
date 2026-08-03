@@ -3,6 +3,7 @@ import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { apiGet } from "../api/client";
 import { metricDesc, metricLabel } from "../api/codes";
+import { fetchEntityPoint } from "../api/entity";
 import { useHeatmap } from "../api/heatmap";
 import type {
   FrameColumnDto,
@@ -230,6 +231,7 @@ function ActivityLockEvidence(props: {
 export function ActivityWorkspace(props: ActivityWorkspaceProps) {
   const { t } = useTranslation();
   const buckets = props.mobile ? 48 : 96;
+  const temporalLens = props.preset !== "overview";
   const heatmap = useHeatmap({
     view: "activity",
     metric: props.metric,
@@ -237,11 +239,32 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
     to: props.to,
     buckets,
     top: 64,
+    enabled: temporalLens,
   });
   const metrics = props.view.metrics.filter(
     (metric) => metric.availability === "available",
   );
   const metricText = metricLabel(t, props.view.code, props.metric);
+  const openLinkedProcess = async (activityEntity: string) => {
+    try {
+      const point = await fetchEntityPoint({
+        view: "activity",
+        entity: activityEntity,
+        at: props.at,
+        includeRelated: true,
+      });
+      const process = point.related.find(
+        (related) => related.view === "processes",
+      );
+      if (process !== undefined) {
+        props.onOpenEntity("processes", process.entity);
+        return;
+      }
+    } catch {
+      // The Activity detail remains useful when the related lookup is absent.
+    }
+    props.onSelectRow(activityEntity);
+  };
 
   return (
     <section
@@ -255,6 +278,11 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
           data-testid="activity-point-evidence"
         >
           <strong>{t("activity.snapshotBadge")}</strong>
+          {!temporalLens && (
+            <span className="activity-workspace__snapshot-hint">
+              {t("activity.pointEvidence")}
+            </span>
+          )}
         </div>
         <div
           className="activity-workspace__metrics"
@@ -307,21 +335,29 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
         entity={props.entity}
         onSort={props.onSort}
         onSelectRow={props.onSelectRow}
+        onOpenActivityProcess={(activityEntity) =>
+          void openLinkedProcess(activityEntity)
+        }
         onMatched={props.onMatched}
-        timeMatrix={{
-          kind: "activity",
-          evidenceMode:
-            props.metric === "active_fraction"
-              ? "point_samples"
-              : "interval_estimates",
-          data: heatmap.data,
-          pending: heatmap.isPending,
-          error: heatmap.isError,
-          metricLabel: metricText,
-          cursorUs: props.at,
-          baselineUs: props.baselineUs,
-          onRetry: () => void heatmap.refetch(),
-        }}
+        activitySnapshot={!temporalLens}
+        timeMatrix={
+          temporalLens
+            ? {
+                kind: "activity",
+                evidenceMode:
+                  props.metric === "active_fraction"
+                    ? "point_samples"
+                    : "interval_estimates",
+                data: heatmap.data,
+                pending: heatmap.isPending,
+                error: heatmap.isError,
+                metricLabel: metricText,
+                cursorUs: props.at,
+                baselineUs: props.baselineUs,
+                onRetry: () => void heatmap.refetch(),
+              }
+            : null
+        }
       />
     </section>
   );

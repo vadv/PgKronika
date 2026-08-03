@@ -707,7 +707,7 @@ async function verifyGlobalSearchDetail(page) {
 
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
-  await page.waitForSelector('[data-dock="row"] [data-detail-provenance]', {
+  await page.waitForSelector('[data-dock="row"] [data-forensic-summary]', {
     timeout: 10_000,
   });
   const pointState = await page.evaluate((selector) => {
@@ -722,8 +722,11 @@ async function verifyGlobalSearchDetail(page) {
     return {
       dock: {
         left: dockRect.left,
+        top: dockRect.top,
         right: dockRect.right,
+        bottom: dockRect.bottom,
         width: dockRect.width,
+        height: dockRect.height,
       },
       matrix: {
         left: matrixRect.left,
@@ -733,7 +736,12 @@ async function verifyGlobalSearchDetail(page) {
       },
       hashView: params.get("view"),
       hashHasQuery: params.has("q"),
-      provenance: dock.querySelector("[data-detail-provenance]")?.textContent,
+      summary: dock.querySelector('[data-detail-tab="summary"]')?.textContent,
+      tokenInSummary:
+        dock
+          .querySelector('[data-detail-tab="summary"]')
+          ?.textContent?.includes(params.get("entity") ?? "") ?? false,
+      grouped: dock.querySelectorAll("[data-forensic-group]").length,
     };
   }, matrixSelector);
 
@@ -744,10 +752,6 @@ async function verifyGlobalSearchDetail(page) {
       timeout: 10_000,
     },
   );
-  const initialHistoryQuality = await page.$(
-    '[data-dock="row"] [data-history-quality]',
-  );
-  const initialHistoryQualityVisible = initialHistoryQuality !== null;
   for (const expectedRows of [8, 12]) {
     await page.click('[data-dock="row"] [data-testid="history-load-more"]');
     await page.waitForFunction(
@@ -758,13 +762,8 @@ async function verifyGlobalSearchDetail(page) {
       { timeout: 10_000 },
       expectedRows,
     );
-    if (expectedRows === 8) {
-      await page.waitForSelector('[data-dock="row"] [data-history-quality]', {
-        timeout: 5_000,
-      });
-    }
   }
-  const historyState = await page.evaluate((initialQualityVisible) => {
+  const historyState = await page.evaluate(() => {
     const requests = performance
       .getEntriesByType("resource")
       .map((entry) => entry.name)
@@ -782,30 +781,23 @@ async function verifyGlobalSearchDetail(page) {
       ).length,
       request,
       cursors: requests.map((name) => new URL(name).searchParams.get("cursor")),
-      quality:
-        document.querySelector('[data-dock="row"] [data-history-quality]')
+      normalChrome:
+        document.querySelector('[data-dock="row"] [role="tabpanel"]')
           ?.textContent ?? "",
-      qualityGaps: document
-        .querySelector('[data-dock="row"] [data-history-quality]')
-        ?.getAttribute("data-gaps"),
-      qualityGated: document
-        .querySelector('[data-dock="row"] [data-history-quality]')
-        ?.getAttribute("data-gated"),
-      initialQualityVisible,
+      qualityBanner:
+        document.querySelector('[data-dock="row"] [data-history-quality]') !==
+        null,
       hasPointAt: url?.searchParams.has("at") ?? null,
       hasRange:
         url?.searchParams.has("from") === true &&
         url.searchParams.has("to") &&
         url.searchParams.has("columns"),
     };
-  }, initialHistoryQualityVisible);
+  });
 
   await page.click('[data-detail-tab-trigger="relationships"]');
-  await page.waitForFunction(
-    () =>
-      document
-        .querySelector('[data-dock="row"] [role="tabpanel"]')
-        ?.textContent?.includes("statement_plan") === true,
+  await page.waitForSelector(
+    '[data-dock="row"] [data-detail-tab="relationships"] .entity-detail__relation',
     { timeout: 5_000 },
   );
   const relationship = await page.$eval(
@@ -837,9 +829,13 @@ async function verifyGlobalSearchDetail(page) {
   if (pointState.hashView !== "statements") {
     failures.push(`search opened ${pointState.hashView}, expected statements`);
   }
-  if (Math.abs(pointState.dock.width - 520) > 0.5) {
+  if (
+    Math.abs(pointState.dock.width - 1920) > 0.5 ||
+    Math.abs(pointState.dock.top - 136) > 0.5 ||
+    Math.abs(pointState.dock.bottom - 1056) > 0.5
+  ) {
     failures.push(
-      `desktop detail width ${pointState.dock.width}, expected 520`,
+      `desktop detail workspace ${JSON.stringify(pointState.dock)}`,
     );
   }
   for (const key of ["left", "top", "width", "height"]) {
@@ -849,17 +845,19 @@ async function verifyGlobalSearchDetail(page) {
       );
     }
   }
-  if (!pointState.provenance?.includes("point projection")) {
-    failures.push("summary omitted point projection provenance");
+  if (
+    pointState.grouped < 1 ||
+    pointState.tokenInSummary ||
+    /point projection|best[_ ]effort|gaps|gated/i.test(pointState.summary ?? "")
+  ) {
+    failures.push(`summary chrome is noisy: ${JSON.stringify(pointState)}`);
   }
   if (
     historyState.rows !== 12 ||
     historyState.hasRange !== true ||
     historyState.cursors.join(",") !== ",page-2,page-3" ||
-    !historyState.quality.includes("partial") ||
-    historyState.qualityGaps !== "1" ||
-    historyState.qualityGated !== "1" ||
-    historyState.initialQualityVisible !== false
+    historyState.qualityBanner ||
+    /partial|gaps|gated/i.test(historyState.normalChrome)
   ) {
     failures.push(`history contract failed: ${JSON.stringify(historyState)}`);
   }
@@ -867,10 +865,10 @@ async function verifyGlobalSearchDetail(page) {
     failures.push("history request incorrectly mixed point at with range mode");
   }
   if (
-    !/(best[_ ]effort)/.test(relationship) ||
-    !relationship.includes("ossc_queryid_dbid_userid_attribution")
+    !/plans/i.test(relationship) ||
+    /best[_ ]effort|statement_plan|ossc_queryid|proof|exact/i.test(relationship)
   ) {
-    failures.push(`relationship provenance is incomplete: ${relationship}`);
+    failures.push(`relationship chrome is noisy: ${relationship}`);
   }
   if (!rawProjection.includes('"mode": "point"')) {
     failures.push("raw tab did not expose the bounded point projection");
@@ -924,15 +922,15 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       '[data-testid="activity-workspace"]',
     );
     const matrix = document.querySelector('table[aria-label="activity"]');
-    const sample = document.querySelector(
-      'table[aria-label="activity"] [data-testid="activity-sample-row"]',
+    const snapshot = document.querySelector(
+      '[data-testid="activity-snapshot-table"]',
     );
     if (
       !(workspace instanceof HTMLElement) ||
       !(matrix instanceof HTMLElement) ||
-      !(sample instanceof HTMLElement)
+      !(snapshot instanceof HTMLElement)
     ) {
-      throw new Error("Activity point-sample matrix is incomplete");
+      throw new Error("Activity joined snapshot is incomplete");
     }
     const workspaceRect = workspace.getBoundingClientRect();
     const matrixRect = matrix.getBoundingClientRect();
@@ -951,25 +949,29 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
         matrixRect.top >= workspaceRect.top &&
         matrixRect.bottom >= workspaceRect.top,
       visibleRows: matrix.querySelectorAll("tbody tr[data-entity]").length,
-      sampleBuckets: sample.querySelectorAll(
+      sampleBuckets: snapshot.querySelectorAll(
         '[data-testid="time-matrix-bucket"]',
       ).length,
       pointEvidence:
         document.querySelector('[data-testid="activity-point-evidence"]')
           ?.textContent ?? "",
-      processProvenance:
+      processLink:
         document
-          .querySelector('[data-testid="activity-process-provenance"]')
+          .querySelector('[data-testid="activity-process-link"]')
           ?.textContent?.trim() ?? "",
       processCaveat:
         document
-          .querySelector('[data-testid="activity-process-provenance"]')
+          .querySelector('[data-testid="activity-process-link"]')
           ?.getAttribute("title") ?? "",
       activeMetric:
         [...document.querySelectorAll(".activity-workspace__metric")]
           .find((button) => button.getAttribute("aria-pressed") === "true")
           ?.textContent?.trim() ?? "",
       gated,
+      relationHeaders: snapshot.querySelectorAll(
+        '[data-evidence-group="relation"]',
+      ).length,
+      osHeaders: snapshot.querySelectorAll('[data-evidence-group="os"]').length,
     };
   });
   activity.heatmapBuckets = await heatmapBucketsFor(page, "activity");
@@ -986,26 +988,26 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     activityFailures.push("row matrix is detached from Activity evidence");
   if (activity.visibleRows < 18)
     activityFailures.push(`only ${activity.visibleRows} rows are visible`);
-  if (activity.sampleBuckets !== 96)
-    activityFailures.push(`row sample buckets ${activity.sampleBuckets}`);
+  if (activity.sampleBuckets !== 0)
+    activityFailures.push(`overview unexpectedly rendered heatmap buckets`);
   if (!activity.pointEvidence.includes("Short queries"))
     activityFailures.push("point-snapshot sampling caveat is missing");
   if (
-    !/linked by PID/i.test(activity.processProvenance) ||
-    /best[_ ]effort/i.test(activity.processProvenance)
+    !/linked process/i.test(activity.processLink) ||
+    /best[_ ]effort|exact|proof/i.test(activity.processLink)
   )
-    activityFailures.push(
-      `process provenance is incomplete: ${activity.processProvenance}`,
-    );
-  if (!/linked by PID/i.test(activity.processCaveat))
+    activityFailures.push(`process link is noisy: ${activity.processLink}`);
+  if (!/share this PID/i.test(activity.processCaveat))
     activityFailures.push("PID link explanation is missing");
   if (
     !activity.gated.includes("Memory") ||
     !activity.gated.includes("XID / Horizon")
   )
     activityFailures.push(`gated lenses missing: ${activity.gated.join(", ")}`);
-  if (activity.heatmapBuckets !== 96)
-    activityFailures.push(`heatmap buckets ${activity.heatmapBuckets}`);
+  if (activity.heatmapBuckets !== null)
+    activityFailures.push("overview requested a temporal heatmap");
+  if (activity.relationHeaders < 1 || activity.osHeaders < 1)
+    activityFailures.push("joined PG / PID / OS column groups are missing");
   if (activityFailures.length > 0) {
     throw new Error(`Activity workspace: ${activityFailures.join("; ")}`);
   }
@@ -1032,6 +1034,10 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
           button.textContent?.trim() === "CPU" &&
           button.getAttribute("aria-pressed") === "true",
       ),
+    { timeout: 10_000 },
+  );
+  await page.waitForSelector(
+    '[data-testid="activity-time-matrix"] [data-testid="time-matrix-bucket"]',
     { timeout: 10_000 },
   );
   await page.waitForFunction(
@@ -1092,7 +1098,7 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   });
   if (
     waits.edges < 1 ||
-    waits.provenance !== "edge_only" ||
+    waits.provenance !== null ||
     !waits.lastInside ||
     !/wait/i.test(waits.metric) ||
     waits.rootHeight > 1080 ||
@@ -1102,6 +1108,14 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   }
   await page.screenshot({ path: ACTIVITY_WAITS_SHOT });
 
+  await page.goto(
+    `${base}/#source=local&view=activity&at=${at}&span=3600&preset=overview`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector(
+    'table[aria-label="activity"] [data-testid="activity-process-link-cell"]',
+    { timeout: 10_000 },
+  );
   await page.evaluate(() => {
     const search = document.querySelector('input[name="view-filter"]');
     if (!(search instanceof HTMLInputElement)) {
@@ -1120,27 +1134,9 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   await page.waitForSelector('table[aria-label="activity"] tr[data-entity]', {
     timeout: 10_000,
   });
-  await page.click('table[aria-label="activity"] tr[data-entity]');
-  await page.waitForSelector('[data-dock="row"]', { timeout: 10_000 });
-  await page.click('[data-detail-tab-trigger="relationships"]');
-  await page.waitForFunction(
-    () =>
-      document
-        .querySelector('[data-dock="row"] [role="tabpanel"]')
-        ?.textContent?.includes("activity_process") === true,
-    { timeout: 5_000 },
+  await page.click(
+    'table[aria-label="activity"] [data-testid="activity-process-link-cell"]',
   );
-  const processRelation = await page.$eval(
-    '[data-dock="row"] [role="tabpanel"]',
-    (element) => element.textContent ?? "",
-  );
-  if (
-    !processRelation.includes("Linked by PID") ||
-    /best[_ ]effort/.test(processRelation)
-  ) {
-    throw new Error(`Activity process provenance: ${processRelation}`);
-  }
-  await page.click('[data-dock="row"] [role="tabpanel"] button');
   await page.waitForFunction(
     () => {
       const params = new URLSearchParams(location.hash.slice(1));
@@ -1212,7 +1208,7 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       ),
     ];
     const lastRecordRect = records.at(-1)?.getBoundingClientRect();
-    const provenanceText =
+    const attributionText =
       document.querySelector('[data-testid="plans-attribution-provenance"]')
         ?.textContent ?? "";
     const compare = [...document.querySelectorAll("button")].find(
@@ -1247,11 +1243,9 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       lastRecordInside:
         lastRecordRect !== undefined &&
         lastRecordRect.bottom <= changeEvidence.getBoundingClientRect().bottom,
-      recordProvenance: changeEvidence.dataset.provenance ?? "",
-      ossc: provenanceText.includes("ossc_queryid_dbid_userid_attribution"),
-      vadv: provenanceText.includes(
-        "vadv_queryid_stat_statements_dbid_userid_attribution",
-      ),
+      changeText: changeEvidence.textContent ?? "",
+      attributionText,
+      workspaceText: workspace.textContent ?? "",
       activeLens: workspace.dataset.lens ?? "",
       regressionBoundary:
         document.querySelector('[data-testid="plans-regression-boundary"]')
@@ -1293,13 +1287,18 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     plansFailures.push(`bounded change records ${plans.records}`);
   if (!plans.lastRecordInside)
     plansFailures.push("last observed plan record is clipped");
-  if (plans.recordProvenance !== "first_last_observed_only")
-    plansFailures.push(`change provenance ${plans.recordProvenance}`);
-  if (!plans.ossc || !plans.vadv) plansFailures.push("fork provenance missing");
+  if (!plans.attributionText.includes("Statements"))
+    plansFailures.push("human plan-to-statement link is missing");
+  if (
+    /best[_ -]?effort|exact match|ossc_queryid|vadv_queryid|\bprovenance\b|\bgaps?\b|\bgated\b/i.test(
+      `${plans.changeText} ${plans.attributionText}`,
+    )
+  )
+    plansFailures.push("technical linkage jargon escaped into normal Plans UI");
   if (plans.activeLens !== "regression")
     plansFailures.push(`default lens ${plans.activeLens}`);
-  if (!plans.regressionBoundary.includes("no before/after baseline"))
-    plansFailures.push("regression evidence boundary is missing");
+  if (!/baseline|before|after/i.test(plans.regressionBoundary))
+    plansFailures.push("baseline comparison hint is missing");
   if (!/1[,. ]?000/.test(plans.coverage))
     plansFailures.push(`dense population coverage missing: ${plans.coverage}`);
   if (!plans.compareGated) plansFailures.push("Compare is not gated");
@@ -1493,25 +1492,16 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   const os = await osWorkspaceGeometry(page);
   assertOsWorkspaceGeometry(os);
   if (
-    !os.hostText.includes("Load per CPU is runnable demand") ||
-    !os.hostText.includes("host values are not summed")
+    !/CPU/i.test(os.hostText) ||
+    !/kernel/i.test(os.hostText) ||
+    !/load\s*\/\s*CPU/i.test(os.hostText) ||
+    /partial|gaps|gated|resource.?limited|independent.scopes/i.test(os.hostText)
   ) {
-    throw new Error(`OS scope/gating contract: ${JSON.stringify(os)}`);
+    throw new Error(`OS compact host context: ${JSON.stringify(os)}`);
   }
-  const osQuality = await page.$eval(
-    '[data-testid="host-quality"]',
-    (element) => ({
-      limited: element.getAttribute("data-limited"),
-      text: element.textContent ?? "",
-    }),
-  );
-  if (
-    osQuality.limited === null ||
-    !osQuality.text.includes("resource_limited")
-  ) {
-    throw new Error(
-      `OS quality evidence missing: ${JSON.stringify(osQuality)}`,
-    );
+  const osQualityVisible = await page.$('[data-testid="host-quality"]');
+  if (osQualityVisible !== null) {
+    throw new Error("OS collection diagnostics escaped into the normal UI");
   }
   await page.screenshot({ path: OS_SHOT });
 
@@ -1526,7 +1516,8 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   const tables = await infrastructureGeometry(page, "tables");
   assertInfrastructureGeometry("Tables", tables);
   if (
-    !tables.panelText.includes("independently resolved") ||
+    !tables.panelText.includes("Vacuum activity") ||
+    /independent|not joined|lifetime|provenance/i.test(tables.panelText) ||
     !tables.gated.includes("Growth") ||
     !tables.gated.includes("Dependencies")
   ) {
@@ -1538,23 +1529,20 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   await page.click('[data-testid="table-vacuum-lanes"] button');
   await page.waitForSelector('[data-dock="row"]', { timeout: 10_000 });
   await page.click('[data-detail-tab-trigger="relationships"]');
-  await page.waitForFunction(
-    () =>
-      document
-        .querySelector('[data-dock="row"] [role="tabpanel"]')
-        ?.textContent?.includes("vacuum_table") === true,
-    { timeout: 5_000 },
-  );
+  await page.waitForSelector('[data-dock="row"] [role="tabpanel"] button', {
+    timeout: 5_000,
+  });
   const vacuumRelation = await page.$eval(
     '[data-dock="row"] [role="tabpanel"]',
     (element) => element.textContent ?? "",
   );
   if (
-    !vacuumRelation.includes("same_snapshot_database_relation_oid") ||
-    !vacuumRelation.includes("vacuum_table")
-  ) {
-    throw new Error(`Vacuum table provenance: ${vacuumRelation}`);
-  }
+    !/table|vacuum|relation/i.test(vacuumRelation) ||
+    /same_snapshot_database_relation_oid|best_effort|temporal|provenance|proof/i.test(
+      vacuumRelation,
+    )
+  )
+    throw new Error(`Vacuum/table human relation: ${vacuumRelation}`);
 
   await page.goto(
     `${base}/#source=local&view=indexes&at=${at}&span=3600&preset=table_context`,
@@ -1568,7 +1556,10 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   const indexes = await infrastructureGeometry(page, "indexes");
   assertInfrastructureGeometry("Indexes", indexes);
   if (
-    !indexes.panelText.includes("same_snapshot_database_relation_oid") ||
+    !/table context/i.test(indexes.panelText) ||
+    /same_snapshot_database_relation_oid|best_effort|temporal|provenance|proof/i.test(
+      indexes.panelText,
+    ) ||
     !indexes.gated.includes("Growth") ||
     !indexes.gated.includes("Duplication") ||
     !indexes.gated.includes("Invalid / build")
@@ -1583,22 +1574,20 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
     `${base}/#source=local&view=vacuum&at=${at}&span=3600&preset=progress`,
     { waitUntil: "networkidle0" },
   );
-  await page.waitForSelector('[data-testid="vacuum-lifetime-warning"]', {
+  await page.waitForSelector('[data-testid="vacuum-context-summary"]', {
     timeout: 15_000,
   });
   await page.evaluate(() => window.scrollTo(0, 0));
   const vacuum = await infrastructureGeometry(page, "vacuum");
   assertInfrastructureGeometry("Vacuum", vacuum);
   if (
-    !vacuum.panelText.includes("PID reuse") ||
+    /provenance|proof|lifetime|PID reuse|datid|relid/i.test(vacuum.panelText) ||
     !vacuum.gated.includes("Wraparound") ||
     !vacuum.gated.includes("Throughput") ||
     !vacuum.gated.includes("Blockers") ||
     !vacuum.gated.includes("History")
   ) {
-    throw new Error(
-      `Vacuum lifetime/gating contract: ${JSON.stringify(vacuum)}`,
-    );
+    throw new Error(`Vacuum compact context: ${JSON.stringify(vacuum)}`);
   }
   await page.screenshot({ path: VACUUM_SHOT });
   return { os, tables, indexes, vacuum, vacuumRelationVerified: true };
@@ -1656,6 +1645,7 @@ async function eventGeometry(page) {
       quality:
         document.querySelector('[data-testid="event-signals-quality"]')
           ?.textContent ?? "",
+      workspaceText: workspace.textContent ?? "",
       gated,
     };
   });
@@ -1672,7 +1662,7 @@ function assertEventsGeometry(name, geometry) {
   if (geometry.scrollY !== 0) failures.push(`scrollY ${geometry.scrollY}`);
   if (geometry.healthHeight !== 60)
     failures.push(`Health line ${geometry.healthHeight}px`);
-  if (geometry.overviewHeight !== 156)
+  if (geometry.overviewHeight !== 176)
     failures.push(`events overview ${geometry.overviewHeight}px`);
   if (!geometry.panelInside) failures.push("Signals escapes events overview");
   if (!geometry.bodyInside) failures.push("Events body escapes workspace");
@@ -1689,11 +1679,14 @@ function assertEventsGeometry(name, geometry) {
     failures.push(
       `Health event density buckets ${geometry.eventDensityBuckets}, expected 1..48`,
     );
+  if (geometry.quality !== "")
+    failures.push(`quality diagnostics visible: ${geometry.quality}`);
   if (
-    !geometry.quality.includes("partial") ||
-    !geometry.quality.includes("lower_bound")
+    /partial|lower_bound|completeness|retention|known loss|\bgated\b/i.test(
+      geometry.workspaceText,
+    )
   )
-    failures.push(`quality disclosure ${geometry.quality}`);
+    failures.push("technical collection jargon escaped into Events UI");
   if (!geometry.gated.includes("Config changes"))
     failures.push("Config changes is not visibly gated");
   if (failures.length > 0) {
@@ -2010,12 +2003,9 @@ async function verifyStatementsCompact(page, base, at) {
   ) {
     failures.push(`root owns overflow ${JSON.stringify(compact.root)}`);
   }
-  if (
-    compact.matrixBody.scrollWidth <= compact.matrixBody.clientWidth ||
-    !["auto", "scroll"].includes(compact.matrixBody.overflowX)
-  ) {
+  if (!["auto", "scroll"].includes(compact.matrixBody.overflowX)) {
     failures.push(
-      `matrix does not own horizontal overflow ${JSON.stringify(compact.matrixBody)}`,
+      `matrix cannot own horizontal overflow ${JSON.stringify(compact.matrixBody)}`,
     );
   }
   if (
