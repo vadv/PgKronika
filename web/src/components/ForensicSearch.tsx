@@ -8,6 +8,7 @@ import {
 } from "../search/compile";
 import { useForensicSearchGroup } from "../search/group";
 import { formatIntervalTime } from "./FocusBar";
+import "./ForensicSearch.css";
 
 export interface ForensicSearchProps {
   open: boolean;
@@ -21,12 +22,7 @@ export interface ForensicSearchProps {
 interface SearchGroupStatus {
   state: "pending" | "success" | "error";
   matched: number;
-  qualityStatus: string | null;
-  gaps: number;
-  gated: number;
-  unavailable: number;
-  limited: number;
-  activeTail: boolean;
+  unavailable: boolean;
 }
 
 function errorText(
@@ -77,65 +73,30 @@ function SearchResultGroup(props: {
       : "success";
   const reportStatus = props.onStatus;
   const statusKey = props.groupKey;
-  const qualityStatus = search.quality?.status ?? null;
-  const gaps = search.quality?.gaps.length ?? 0;
-  const gated = search.quality?.gated.length ?? 0;
-  const unavailable = search.quality?.unavailable_revision.length ?? 0;
-  const limited = search.quality?.resource_limited.length ?? 0;
-  const activeTail = search.quality?.active_tail ?? false;
+  const unavailable =
+    search.isError ||
+    (search.matched === 0 &&
+      (search.quality?.unavailable_revision.length ?? 0) > 0);
   useEffect(() => {
     reportStatus(statusKey, {
       state: status,
       matched: search.matched,
-      qualityStatus,
-      gaps,
-      gated,
       unavailable,
-      limited,
-      activeTail,
     });
-  }, [
-    gaps,
-    gated,
-    unavailable,
-    limited,
-    activeTail,
-    qualityStatus,
-    reportStatus,
-    search.matched,
-    status,
-    statusKey,
-  ]);
-  if (!search.isPending && !search.isError && search.matched === 0) return null;
+  }, [unavailable, reportStatus, search.matched, status, statusKey]);
+  if (!search.isPending && search.matched === 0 && !unavailable) return null;
   return (
     <section
       data-search-group={props.plan.view.code}
-      style={{
-        borderBlockStart: "1px solid var(--border)",
-        paddingBlock: "var(--space-2)",
-      }}
+      className="forensic-search__group"
     >
-      <div
-        style={{
-          display: "flex",
-          alignItems: "baseline",
-          gap: "var(--space-2)",
-          paddingInline: "var(--space-2)",
-          marginBlockEnd: "var(--space-1)",
-        }}
-      >
-        <strong style={{ fontFamily: "var(--ui-font)" }}>
+      <header className="forensic-search__group-header">
+        <strong>
           {t(`tabs.${props.plan.view.code}`, {
             defaultValue: props.plan.view.code,
           })}
         </strong>
-        <span
-          style={{
-            fontFamily: "var(--mono-font)",
-            color: "var(--fg-dim)",
-            fontSize: "var(--text-xs)",
-          }}
-        >
+        <span className="forensic-search__group-count">
           {search.isPending
             ? t("search.searching", { defaultValue: "searching…" })
             : t("search.count", {
@@ -144,34 +105,13 @@ function SearchResultGroup(props: {
                 defaultValue: `${search.rows.length} / ${search.matched}`,
               })}
         </span>
-        <span
-          style={{
-            marginInlineStart: "auto",
-            color: "var(--fg-dim)",
-            fontFamily: "var(--mono-font)",
-            fontSize: "var(--text-xs)",
-          }}
-        >
-          {props.plan.reason}
-          {search.quality !== undefined && (
-            <span>
-              {" · "}
-              {t("search.quality", {
-                status: search.quality.status,
-                gaps: search.quality.gaps.length,
-                gated: search.quality.gated.length,
-                unavailable: search.quality.unavailable_revision.length,
-                limited: search.quality.resource_limited.length,
-                tail: search.quality.active_tail ? t("search.activeTail") : "",
-                defaultValue: `${search.quality.status} · gaps ${search.quality.gaps.length} · gated ${search.quality.gated.length} · unavailable ${search.quality.unavailable_revision.length} · limited ${search.quality.resource_limited.length}${search.quality.active_tail ? " · active tail" : ""}`,
-              })}
-            </span>
-          )}
-        </span>
-      </div>
-      {search.isError && (
-        <div role="alert" style={{ color: "var(--sev-warn-fg)" }}>
-          {t("search.error.group", { defaultValue: "Search group failed" })}
+        <span className="forensic-search__reason">{props.plan.reason}</span>
+      </header>
+      {unavailable && (
+        <div role="status" className="forensic-search__source-empty">
+          {t("search.sourceUnavailable", {
+            defaultValue: "No data for this source in the selected period",
+          })}
         </div>
       )}
       {search.rows.map((row) => (
@@ -180,45 +120,11 @@ function SearchResultGroup(props: {
           type="button"
           data-search-result
           onClick={() => props.onSelect(props.plan.view.code, row.entity)}
-          style={{
-            display: "grid",
-            gridTemplateColumns: "minmax(220px, 1fr) minmax(160px, 0.7fr)",
-            gap: "var(--space-3)",
-            width: "100%",
-            minHeight: "44px",
-            padding: "var(--space-2)",
-            color: "var(--fg)",
-            background: "transparent",
-            border: "none",
-            borderRadius: "var(--radius-sm)",
-            textAlign: "start",
-            cursor: "pointer",
-          }}
+          className="forensic-search__result"
         >
-          <span style={{ minWidth: 0 }}>
-            <span
-              style={{
-                display: "block",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-                fontFamily: "var(--ui-font)",
-                fontWeight: 600,
-              }}
-            >
-              {row.label}
-            </span>
-            <span
-              style={{
-                display: "block",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-                color: "var(--fg-dim)",
-                fontFamily: "var(--mono-font)",
-                fontSize: "var(--text-xs)",
-              }}
-            >
+          <span className="forensic-search__result-main">
+            <strong>{row.label}</strong>
+            <span>
               {row.cells
                 .filter((value) => value !== null)
                 .slice(0, 3)
@@ -226,22 +132,13 @@ function SearchResultGroup(props: {
                 .join(" · ")}
             </span>
           </span>
-          <span
-            style={{
-              minWidth: 0,
-              color: "var(--fg-dim)",
-              fontFamily: "var(--mono-font)",
-              fontSize: "var(--text-xs)",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-          >
-            frame:{props.plan.view.code}
-            {search.snapshotTsUs !== null
-              ? ` · ${formatIntervalTime(Number(search.snapshotTsUs))}`
-              : ""}
-            {search.quality !== undefined ? ` · ${search.quality.status}` : ""}
+          <span className="forensic-search__result-time">
+            {search.snapshotTsUs === null
+              ? t("search.selectedPeriod", { defaultValue: "selected period" })
+              : formatIntervalTime(Number(search.snapshotTsUs))}
+          </span>
+          <span className="forensic-search__open-result">
+            {t("search.openResult", { defaultValue: "Open" })}
           </span>
         </button>
       ))}
@@ -250,14 +147,7 @@ function SearchResultGroup(props: {
           type="button"
           disabled={search.isFetchingNextPage}
           onClick={() => void search.fetchNextPage()}
-          style={{
-            marginInlineStart: "var(--space-2)",
-            color: "var(--accent)",
-            background: "none",
-            border: "none",
-            fontFamily: "var(--mono-font)",
-            cursor: "pointer",
-          }}
+          className="forensic-search__load-more"
         >
           {search.isFetchingNextPage
             ? t("table.loading")
@@ -316,12 +206,7 @@ export function ForensicSearch(props: ForensicSearchProps) {
         if (
           current?.state === status.state &&
           current.matched === status.matched &&
-          current.qualityStatus === status.qualityStatus &&
-          current.gaps === status.gaps &&
-          current.gated === status.gated &&
-          current.unavailable === status.unavailable &&
-          current.limited === status.limited &&
-          current.activeTail === status.activeTail
+          current.unavailable === status.unavailable
         ) {
           return previous;
         }
@@ -340,18 +225,11 @@ export function ForensicSearch(props: ForensicSearchProps) {
   const noMatches =
     statuses.length > 0 &&
     statuses.every(
-      (status) => status?.state === "success" && status.matched === 0,
+      (status) =>
+        status?.state === "success" &&
+        status.matched === 0 &&
+        !status.unavailable,
     );
-  const noMatchCoverage = statuses.reduce(
-    (total, status) => ({
-      gaps: total.gaps + (status?.gaps ?? 0),
-      gated: total.gated + (status?.gated ?? 0),
-      unavailable: total.unavailable + (status?.unavailable ?? 0),
-      limited: total.limited + (status?.limited ?? 0),
-      activeTail: total.activeTail || (status?.activeTail ?? false),
-    }),
-    { gaps: 0, gated: 0, unavailable: 0, limited: 0, activeTail: false },
-  );
   const resultButtons = () =>
     Array.from(
       dialogRef.current?.querySelectorAll<HTMLButtonElement>(
@@ -412,16 +290,7 @@ export function ForensicSearch(props: ForensicSearchProps) {
   keyHandlerRef.current = onKeyDown;
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 30,
-        display: "grid",
-        placeItems: "start center",
-        paddingBlockStart: "8vh",
-      }}
-    >
+    <div className="forensic-search">
       <button
         type="button"
         tabIndex={-1}
@@ -430,16 +299,7 @@ export function ForensicSearch(props: ForensicSearchProps) {
           defaultValue: "Dismiss forensic search backdrop",
         })}
         onClick={props.onClose}
-        style={{
-          position: "absolute",
-          inset: 0,
-          width: "100%",
-          height: "100%",
-          padding: 0,
-          background: "color-mix(in srgb, var(--bg) 58%, transparent)",
-          border: "none",
-          cursor: "default",
-        }}
+        className="forensic-search__backdrop"
       />
       <form
         ref={dialogRef}
@@ -448,33 +308,9 @@ export function ForensicSearch(props: ForensicSearchProps) {
         aria-modal="true"
         aria-label={t("search.title", { defaultValue: "Forensic search" })}
         onSubmit={(event) => event.preventDefault()}
-        style={{
-          position: "relative",
-          zIndex: 1,
-          width: "min(920px, calc(100vw - 32px))",
-          maxHeight: "min(760px, 84vh)",
-          display: "flex",
-          flexDirection: "column",
-          color: "var(--fg)",
-          background: "var(--bg-overlay)",
-          border: "1px solid var(--border-strong)",
-          borderRadius: "var(--radius-md)",
-          boxShadow: "var(--shadow-pop)",
-          overflow: "hidden",
-        }}
+        className="forensic-search__dialog"
       >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "var(--space-2)",
-            padding: "var(--space-3)",
-            borderBlockEnd: "1px solid var(--border)",
-          }}
-        >
-          <span aria-hidden="true" style={{ color: "var(--accent)" }}>
-            ⌕
-          </span>
+        <div className="forensic-search__input-row">
           <input
             ref={inputRef}
             type="search"
@@ -490,78 +326,38 @@ export function ForensicSearch(props: ForensicSearchProps) {
             aria-label={t("search.label", {
               defaultValue: "Search forensic entities",
             })}
-            style={{
-              flex: "1 1 auto",
-              minWidth: 0,
-              color: "var(--fg)",
-              background: "transparent",
-              border: "none",
-              outline: "none",
-              fontFamily: "var(--mono-font)",
-              fontSize: "var(--text-lg)",
-            }}
+            className="forensic-search__input"
           />
-          <kbd style={{ color: "var(--fg-dim)" }}>esc</kbd>
           <button
             type="button"
             aria-label={t("search.close", {
               defaultValue: "Close forensic search",
             })}
             onClick={props.onClose}
-            style={{
-              color: "var(--fg-dim)",
-              background: "none",
-              border: "none",
-              fontFamily: "var(--mono-font)",
-              fontSize: "var(--text-lg)",
-              cursor: "pointer",
-            }}
+            className="forensic-search__close"
           >
-            ×
+            Esc
           </button>
         </div>
-        <div
-          id="forensic-search-help"
-          style={{
-            padding: "var(--space-2) var(--space-3)",
-            color: "var(--fg-dim)",
-            fontFamily: "var(--mono-font)",
-            fontSize: "var(--text-xs)",
-          }}
-        >
-          pid · queryid · planid · rel · index · wait · event · db · user · app
-          · cgroup
-          {" · "}
-          {t("search.serverScope", {
-            defaultValue: "server snapshot; lazy SQL excluded",
-          })}
+        <div id="forensic-search-help" className="forensic-search__help">
+          <span>
+            pid · queryid · planid · rel · index · wait · event · db · user ·
+            app · cgroup
+          </span>
+          <span className="forensic-search__scope">
+            {t("search.serverScope", {
+              defaultValue: "selected period · available sources",
+            })}
+          </span>
         </div>
-        <div style={{ overflowY: "auto", minHeight: "120px" }}>
+        <div className="forensic-search__results">
           {visiblePlan.error !== null && (
-            <div
-              role="alert"
-              style={{
-                margin: "var(--space-3)",
-                padding: "var(--space-2)",
-                color: "var(--sev-warn-fg)",
-                background: "var(--sev-warn-bg)",
-                border: "1px solid var(--sev-warn)",
-                borderRadius: "var(--radius-sm)",
-                fontFamily: "var(--ui-font)",
-              }}
-            >
+            <div role="alert" className="forensic-search__error">
               {errorText(visiblePlan.error, t)}
             </div>
           )}
           {visiblePlan.error === null && draft.trim() === "" && (
-            <div
-              style={{
-                padding: "var(--space-5)",
-                color: "var(--fg-dim)",
-                fontFamily: "var(--ui-font)",
-                textAlign: "center",
-              }}
-            >
+            <div className="forensic-search__empty">
               {t("search.emptyPrompt", {
                 defaultValue: "Search every materialized evidence projection",
               })}
@@ -579,41 +375,10 @@ export function ForensicSearch(props: ForensicSearchProps) {
             />
           ))}
           {noMatches && (
-            <div
-              role="status"
-              style={{
-                padding: "var(--space-5)",
-                color: "var(--fg-dim)",
-                fontFamily: "var(--ui-font)",
-                textAlign: "center",
-              }}
-            >
-              <span style={{ display: "block" }}>
-                {t("search.noMatches", {
-                  defaultValue:
-                    "No matches in retained snapshot candidates; absence is not proof",
-                })}
-              </span>
-              <span
-                style={{
-                  display: "block",
-                  marginBlockStart: "var(--space-1)",
-                  fontFamily: "var(--mono-font)",
-                  fontSize: "var(--text-xs)",
-                }}
-              >
-                {t("search.quality", {
-                  status: "retained",
-                  gaps: noMatchCoverage.gaps,
-                  gated: noMatchCoverage.gated,
-                  unavailable: noMatchCoverage.unavailable,
-                  limited: noMatchCoverage.limited,
-                  tail: noMatchCoverage.activeTail
-                    ? t("search.activeTail")
-                    : "",
-                  defaultValue: `retained · gaps ${noMatchCoverage.gaps} · gated ${noMatchCoverage.gated} · unavailable ${noMatchCoverage.unavailable} · limited ${noMatchCoverage.limited}${noMatchCoverage.activeTail ? " · active tail" : ""}`,
-                })}
-              </span>
+            <div role="status" className="forensic-search__empty">
+              {t("search.noMatches", {
+                defaultValue: "No matches for the selected period",
+              })}
             </div>
           )}
         </div>
