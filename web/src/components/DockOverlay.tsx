@@ -557,6 +557,7 @@ function EntityHistoryView(props: {
   return (
     <div>
       <table
+        data-detail-history
         style={{
           borderCollapse: "collapse",
           fontFamily: "var(--mono-font)",
@@ -867,6 +868,7 @@ function RowDock(props: {
                 key={tab}
                 type="button"
                 role="tab"
+                data-detail-tab-trigger={tab}
                 aria-selected={detailTab === tab}
                 onClick={() => setDetailTab(tab)}
                 style={tabButtonStyle(detailTab === tab)}
