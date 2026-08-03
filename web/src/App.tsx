@@ -15,6 +15,7 @@ import { useSummary } from "./api/summary";
 import type { ViewSpec } from "./api/types";
 import { AlertBar } from "./components/AlertBar";
 import { DockOverlay } from "./components/DockOverlay";
+import { EventsSignalPanel } from "./components/EventsSignalPanel";
 import { FocusBar } from "./components/FocusBar";
 import { ForensicSearch } from "./components/ForensicSearch";
 import { Header } from "./components/Header";
@@ -104,6 +105,31 @@ const VACUUM_LENSES = [
   ["vacuumPhase", "phase"],
   ["vacuumDeadItems", "dead_items"],
 ] as const;
+const EVENT_LENSES = [
+  ["eventTimeline", "timeline"],
+  ["eventErrors", "errors"],
+  ["eventCheckpoints", "checkpoints"],
+  ["eventAutovacuum", "vacuum"],
+  ["eventSlowQueries", "slow"],
+  ["eventCollectorHealth", "collector_health"],
+] as const;
+
+function eventFrameFilter(preset: string | null): string | null {
+  switch (preset) {
+    case "errors":
+      return "category_code=*error*";
+    case "checkpoints":
+      return "category_code=pg.checkpoint.*";
+    case "vacuum":
+      return "category_code=pg.maintenance.*";
+    case "slow":
+      return "category_code=pg.query.slow_*";
+    case "collector_health":
+      return "category_code=collector.*";
+    default:
+      return null;
+  }
+}
 
 function catalogPreparedLens(
   view: ViewSpec | undefined,
@@ -304,16 +330,18 @@ function Shell() {
   const tablesScreen = activeView?.code === "tables";
   const indexesScreen = activeView?.code === "indexes";
   const vacuumScreen = activeView?.code === "vacuum";
+  const eventsScreen = activeView?.code === "events";
   const workloadEvidenceScreen = activityScreen || plansScreen;
   const infrastructureEvidenceScreen =
     processesScreen || tablesScreen || indexesScreen || vacuumScreen;
   const evidencePanelScreen =
-    workloadEvidenceScreen || infrastructureEvidenceScreen;
+    workloadEvidenceScreen || infrastructureEvidenceScreen || eventsScreen;
   const denseHeatmapScreen =
     activityScreen ||
     statementsScreen ||
     plansScreen ||
-    infrastructureEvidenceScreen;
+    infrastructureEvidenceScreen ||
+    eventsScreen;
   const effectivePreset = statementsScreen
     ? (state.preset ?? "time")
     : activityScreen
@@ -328,7 +356,9 @@ function Shell() {
               ? (state.preset ?? "usage")
               : vacuumScreen
                 ? (state.preset ?? "progress")
-                : state.preset;
+                : eventsScreen
+                  ? (state.preset ?? "timeline")
+                  : state.preset;
   const preparedLenses: PreparedLens[] | undefined = statementsScreen
     ? [
         ...STATEMENT_LENSES.map(([code, preset]) =>
@@ -467,7 +497,19 @@ function Shell() {
                       reason: t("vacuum.lens.history.reason"),
                     },
                   ]
-                : undefined;
+                : eventsScreen
+                  ? [
+                      ...EVENT_LENSES.map(([code, preset]) =>
+                        catalogPreparedLens(activeView, code, preset),
+                      ),
+                      {
+                        code: "eventConfigChanges",
+                        preset: null,
+                        availability: "gated" as const,
+                        reason: t("events.lens.configChanges.reason"),
+                      },
+                    ]
+                  : undefined;
   const evidenceNote = statementsScreen
     ? t("statements.evidenceNote")
     : activityScreen
@@ -482,7 +524,9 @@ function Shell() {
               ? t("indexes.evidenceNote")
               : vacuumScreen
                 ? t("vacuum.evidenceNote")
-                : undefined;
+                : eventsScreen
+                  ? t("events.evidenceNote")
+                  : undefined;
   const filterHint = statementsScreen
     ? t("statements.filterHint")
     : activityScreen
@@ -497,7 +541,13 @@ function Shell() {
               ? t("indexes.filterHint")
               : vacuumScreen
                 ? t("vacuum.filterHint")
-                : undefined;
+                : eventsScreen
+                  ? t("events.filterHint")
+                  : undefined;
+  const frameQuery =
+    eventsScreen && state.q === null
+      ? eventFrameFilter(effectivePreset)
+      : state.q;
   // A preset owns its default ranking. Carrying an explicit sort from the
   // previous lens can leave the matrix invisibly ranked by a hidden column.
   const selectPreset = (preset: string | null) =>
@@ -537,6 +587,7 @@ function Shell() {
       globalContext={globalContext}
       primaryNavigation={primaryNavigation}
       primaryNavigationLabel={t("navigation.primary")}
+      skipToMainLabel={t("shell.skipToMain")}
       status={<StatusBar embedded state={state} summary={summary.data} />}
       overlay={
         <>
@@ -854,7 +905,9 @@ function Shell() {
                   ? "workload-analytical-center"
                   : infrastructureEvidenceScreen
                     ? "infrastructure-analytical-center"
-                    : undefined
+                    : eventsScreen
+                      ? "events-analytical-center"
+                      : undefined
               }
               style={{
                 display: "grid",
@@ -930,6 +983,25 @@ function Shell() {
                   }
                 />
               )}
+              {eventsScreen && (
+                <EventsSignalPanel
+                  from={range.fromUs}
+                  to={range.toUs}
+                  preset={effectivePreset}
+                  onInvestigate={(view, atUs) =>
+                    patch({
+                      view,
+                      at: atUs,
+                      preset: null,
+                      sort: null,
+                      order: null,
+                      q: null,
+                      entity: null,
+                      dock: null,
+                    })
+                  }
+                />
+              )}
             </div>
           )}
           {heatmapReady && (
@@ -938,7 +1010,7 @@ function Shell() {
               at={at}
               span={state.span}
               preset={effectivePreset}
-              q={state.q}
+              q={frameQuery}
               sort={state.sort}
               order={state.order}
               entity={state.entity}

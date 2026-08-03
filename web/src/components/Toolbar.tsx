@@ -117,6 +117,9 @@ export function Toolbar(props: ToolbarProps) {
       </div>
       <input
         type="search"
+        name="view-filter"
+        autoComplete="off"
+        spellCheck={false}
         aria-label={t("toolbar.filter")}
         aria-describedby={props.filterHint ? filterHintId : undefined}
         placeholder={t("toolbar.filter")}

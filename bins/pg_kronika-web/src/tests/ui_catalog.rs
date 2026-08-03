@@ -119,7 +119,7 @@ fn metric_semantics_publish_revision_four_with_stable_numeric_ids() {
             (6, 2, vec![(1, 2)]),
             (7, 2, vec![(1, 2), (2, 1)]),
             (8, 2, vec![(1, 2)]),
-            (9, 1, vec![(1, 1)]),
+            (9, 2, vec![(1, 1)]),
         ]
     );
 }
@@ -270,6 +270,40 @@ fn host_and_object_views_publish_prepared_lenses_and_temporal_relations() {
         assert_eq!(join["fields"], json!(["datid", "relid", "ts"]));
         assert_eq!(join["provenance"], provenance);
     }
+}
+
+#[test]
+fn events_publish_bounded_signal_lenses_without_claiming_config_evidence() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let events = serialized_view(&catalog, "events");
+
+    assert_eq!(events["view_revision"], 2);
+    assert_eq!(events["capabilities"]["history"], false);
+    assert_eq!(events["capabilities"]["related"], false);
+    assert_eq!(
+        events["presets"]
+            .as_array()
+            .expect("event presets")
+            .iter()
+            .map(|preset| preset["code"].as_str().expect("preset code"))
+            .collect::<Vec<_>>(),
+        vec![
+            "timeline",
+            "errors",
+            "checkpoints",
+            "vacuum",
+            "slow",
+            "collector_health",
+        ]
+    );
+    assert!(
+        events["presets"]
+            .as_array()
+            .expect("event presets")
+            .iter()
+            .all(|preset| preset["code"] != "config_changes")
+    );
 }
 
 #[test]

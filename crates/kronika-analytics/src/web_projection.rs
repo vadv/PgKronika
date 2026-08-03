@@ -672,7 +672,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 9,
         name: "events",
-        revision: 1,
+        revision: 2,
         identity_revision: 1,
         max_rate_gap_us: None,
         inputs: EVENT_INPUTS,

@@ -308,6 +308,22 @@ if (vacuumCatalog !== undefined) {
   );
 }
 
+const eventsCatalog = catalog.views.find((view) => view.code === "events");
+if (eventsCatalog !== undefined) {
+  replacePreset(
+    eventsCatalog,
+    "timeline",
+    ["time", "severity_code", "category_code", "duration"],
+    "time",
+  );
+  replacePreset(
+    eventsCatalog,
+    "collector_health",
+    ["time", "severity_code", "category_code", "message"],
+    "time",
+  );
+}
+
 // --- summary ---------------------------------------------------------------
 
 // Populations per plan: activity..events in stable view_code order.
@@ -602,10 +618,31 @@ function demoEvents(fromUs, toUs) {
     ],
     [0.6, "pg.lock.wait_reported", "lock", { kind: "lock_wait" }],
     [0.74, "pg.checkpoint.completed", "info", { kind: "checkpoint" }],
+    [
+      0.81,
+      "pg.query.slow_group_reported",
+      "warning",
+      { kind: "counter_delta", delta: 4 },
+    ],
+    [0.86, "collector.pg_log_gap", "warning", { kind: "marker" }],
     [0.9, "pg.maintenance.autovacuum_reported", "info", { kind: "autovacuum" }],
+    [
+      0.96,
+      "pg.log.error_group_observed",
+      "error",
+      {
+        kind: "error",
+        category: "integrity_constraint_violation",
+        severity: "ERROR",
+        sqlstate: "23505",
+        dropped_field_count: 0,
+      },
+    ],
   ];
   return spec.map(([fraction, kind, cls, payload], i) => {
     const ts = at(fraction);
+    const collectorGap = kind === "collector.pg_log_gap";
+    const errorGroup = kind === "pg.log.error_group_observed";
     return {
       event_id: `demo-${kind}`,
       event_instance_id: `demo-${kind}-${i}`,
@@ -614,15 +651,31 @@ function demoEvents(fromUs, toUs) {
       sort_ts_us: ts,
       occurred_at_us: ts,
       occurrence_count: 1,
-      entity: null,
+      entity: errorGroup
+        ? { kind: "database", id: "content-derived-orders-db" }
+        : collectorGap
+          ? { kind: "host", id: "content-derived-host" }
+          : null,
       payload,
-      evidence_quality: "exact",
-      identity_quality: "exact",
+      evidence_quality: errorGroup ? "derived_exact" : "exact",
+      identity_quality: errorGroup ? "content_derived" : "exact",
       quality_flags: 0,
       section_type_id: null,
       observed_interval: null,
-      loss: null,
-      supporting_evidence: [],
+      loss: collectorGap
+        ? { lost_count_lower_bound: 3, reasons: ["producer_gap"] }
+        : null,
+      supporting_evidence: errorGroup
+        ? [
+            {
+              observation_id: "demo-error-observation",
+              section_body_id: "demo-pg-log-body",
+              dictionary_context_id: null,
+              catalog_entry_ordinal: 0,
+              row_ordinal: 0,
+            },
+          ]
+        : [],
     };
   });
 }
@@ -631,8 +684,8 @@ function eventsResponse(params) {
   const fromUs = Number(params.get("from") ?? String(nowUs() - 86_400 * US));
   const toUs = Number(params.get("to") ?? String(nowUs()));
   return {
-    completeness: "complete",
-    retained_exactness: "exact",
+    completeness: "partial",
+    retained_exactness: "lower_bound",
     physical_count_semantics: "exact",
     notable_policy_version: 1,
     omitted_by_response_filter: 0,
@@ -1278,6 +1331,13 @@ function rowsLocks() {
 function rowsEventsView() {
   const now = nowUs();
   const defs = [
+    [
+      1,
+      "WARNING",
+      6,
+      null,
+      "collector pg_log source gap: at least 3 rows lost",
+    ],
     [2, "ERROR", 1, null, "deadlock detected: pid 12055 waiting on ShareLock"],
     [5, "LOG", 2, 4_220_000, "checkpoint complete: wrote 41208 buffers"],
     [9, "LOG", 3, 12_880_000, "automatic vacuum of table orders.public.events"],
@@ -1354,15 +1414,17 @@ function rowsEventsView() {
           ? "warning"
           : "log";
     const categoryCode =
-      type === 1
-        ? "pg.log.error_group_observed"
-        : type === 2
-          ? "pg.checkpoint.completed"
-          : type === 4
-            ? "pg.query.slow_group_reported"
-            : message.includes("analyze")
-              ? "pg.maintenance.autoanalyze_reported"
-              : "pg.maintenance.autovacuum_reported";
+      type === 6
+        ? "collector.pg_log_gap"
+        : type === 1
+          ? "pg.log.error_group_observed"
+          : type === 2
+            ? "pg.checkpoint.completed"
+            : type === 4
+              ? "pg.query.slow_group_reported"
+              : message.includes("analyze")
+                ? "pg.maintenance.autoanalyze_reported"
+                : "pg.maintenance.autovacuum_reported";
     return {
       entity: `evt:${i + 1}`,
       label: message,

@@ -8,6 +8,7 @@ export interface ShellLayoutProps {
   globalContext: ReactNode;
   primaryNavigation: ReactNode;
   primaryNavigationLabel: string;
+  skipToMainLabel: string;
   status: ReactNode;
   overlay?: ReactNode;
   children: ReactNode;
@@ -29,6 +30,18 @@ export function ShellLayout(props: ShellLayoutProps) {
         color: "var(--fg)",
       }}
     >
+      <a
+        className="skip-link"
+        href="#main-content"
+        onClick={(event) => {
+          // UI state is encoded in location.hash; native fragment navigation
+          // would replace the forensic route. Move focus without mutating it.
+          event.preventDefault();
+          document.getElementById("main-content")?.focus();
+        }}
+      >
+        {props.skipToMainLabel}
+      </a>
       <header
         data-shell-region="global-context"
         style={{
@@ -54,6 +67,8 @@ export function ShellLayout(props: ShellLayoutProps) {
         </nav>
       )}
       <main
+        id="main-content"
+        tabIndex={-1}
         data-shell-region="main"
         style={{
           minHeight: desktop ? 0 : undefined,

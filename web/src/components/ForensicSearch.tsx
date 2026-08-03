@@ -478,12 +478,18 @@ export function ForensicSearch(props: ForensicSearchProps) {
           <input
             ref={inputRef}
             type="search"
+            name="forensic-search"
+            autoComplete="off"
+            spellCheck={false}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             placeholder={t("search.placeholder", {
               defaultValue: "pid:18422 · queryid:… · rel:public.orders",
             })}
             aria-describedby="forensic-search-help"
+            aria-label={t("search.label", {
+              defaultValue: "Search forensic entities",
+            })}
             style={{
               flex: "1 1 auto",
               minWidth: 0,

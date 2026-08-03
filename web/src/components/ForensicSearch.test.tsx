@@ -122,6 +122,9 @@ test("groups a server result with reason and keyboard-opens its detail", async (
     { wrapper },
   );
   const input = screen.getByRole("searchbox");
+  expect(input.getAttribute("name")).toBe("forensic-search");
+  expect(input.getAttribute("autocomplete")).toBe("off");
+  expect(input.getAttribute("spellcheck")).toBe("false");
   fireEvent.change(input, { target: { value: "pid:18422" } });
   const result = await screen.findByRole("button", {
     name: /pid 18422 · api@orders/,

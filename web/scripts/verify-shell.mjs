@@ -17,6 +17,8 @@ const OS_SHOT = `${OUT_DIR}forensic-os-1920x1080.png`;
 const TABLES_SHOT = `${OUT_DIR}forensic-tables-1920x1080.png`;
 const INDEXES_SHOT = `${OUT_DIR}forensic-indexes-1920x1080.png`;
 const VACUUM_SHOT = `${OUT_DIR}forensic-vacuum-1920x1080.png`;
+const EVENTS_SHOT = `${OUT_DIR}forensic-events-1920x1080.png`;
+const EVENTS_COMPACT_SHOT = `${OUT_DIR}forensic-events-1440x900.png`;
 const FAILURE_SHOT = `${OUT_DIR}forensic-shell-1920x1080-failure.png`;
 
 const chromeCandidates = [
@@ -1227,6 +1229,200 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   return { os, tables, indexes, vacuum, vacuumRelationVerified: true };
 }
 
+async function eventGeometry(page) {
+  const geometry = await page.evaluate(() => {
+    const center = document.querySelector(
+      '[data-testid="events-analytical-center"]',
+    );
+    const panel = document.querySelector('[data-testid="events-signal-panel"]');
+    const health = document.querySelector('[data-shell-region="health-line"]');
+    if (
+      !(center instanceof HTMLElement) ||
+      !(panel instanceof HTMLElement) ||
+      !(health instanceof HTMLElement)
+    ) {
+      throw new Error("Events analytical shell is incomplete");
+    }
+    const centerRect = center.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    const lanes = [
+      ...panel.querySelectorAll('[data-testid="event-signal-lane"]'),
+    ];
+    const lastLane = lanes.at(-1)?.getBoundingClientRect();
+    const gated = [...document.querySelectorAll('button[aria-disabled="true"]')]
+      .map((button) => button.textContent?.trim() ?? "")
+      .filter(Boolean);
+    return {
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      rootHeight: document.documentElement.scrollHeight,
+      scrollY: window.scrollY,
+      healthHeight: health.getBoundingClientRect().height,
+      centerHeight: centerRect.height,
+      panelInside:
+        panelRect.top >= centerRect.top &&
+        panelRect.bottom <= centerRect.bottom,
+      lastLaneInside:
+        lastLane === undefined || lastLane.bottom <= panelRect.bottom,
+      lanes: lanes.length,
+      quality:
+        document.querySelector('[data-testid="event-signals-quality"]')
+          ?.textContent ?? "",
+      gated,
+    };
+  });
+  geometry.heatmapBuckets = await heatmapBucketsFor(page, "events");
+  return geometry;
+}
+
+function assertEventsGeometry(name, geometry) {
+  const failures = [];
+  if (geometry.rootHeight > geometry.viewport.height)
+    failures.push(
+      `document height ${geometry.rootHeight} > ${geometry.viewport.height}`,
+    );
+  if (geometry.scrollY !== 0) failures.push(`scrollY ${geometry.scrollY}`);
+  if (geometry.healthHeight !== 60)
+    failures.push(`Health line ${geometry.healthHeight}px`);
+  if (geometry.centerHeight !== 156)
+    failures.push(`analytical center ${geometry.centerHeight}px`);
+  if (!geometry.panelInside) failures.push("Signals escapes analytical center");
+  if (!geometry.lastLaneInside) failures.push("last Signal lane is clipped");
+  if (geometry.lanes < 1 || geometry.lanes > 6)
+    failures.push(`Signal lanes ${geometry.lanes}, expected 1..6`);
+  if (geometry.heatmapBuckets !== 96)
+    failures.push(`heatmap buckets ${geometry.heatmapBuckets}`);
+  if (
+    !geometry.quality.includes("partial") ||
+    !geometry.quality.includes("lower_bound")
+  )
+    failures.push(`quality disclosure ${geometry.quality}`);
+  if (!geometry.gated.includes("Config changes"))
+    failures.push("Config changes is not visibly gated");
+  if (failures.length > 0) {
+    throw new Error(`${name}: ${failures.join("; ")}`);
+  }
+}
+
+async function clickButtonByText(page, label) {
+  const clicked = await page.evaluate((text) => {
+    const button = [...document.querySelectorAll("button")].find(
+      (candidate) => candidate.textContent?.trim() === text,
+    );
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  }, label);
+  if (!clicked) throw new Error(`button not found: ${label}`);
+}
+
+async function verifyEventsWorkspace(page, base, at) {
+  await page.setViewport(VIEWPORT);
+  await page.goto(
+    `${base}/#source=local&view=events&at=${at}&span=3600&preset=timeline`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector('[data-testid="event-signal-lane"]', {
+    timeout: 15_000,
+  });
+  await page.evaluate(() => {
+    window.scrollTo(0, 0);
+    if (document.activeElement instanceof HTMLElement)
+      document.activeElement.blur();
+  });
+  await page.keyboard.press("Tab");
+  const skipFocused = await page.evaluate(
+    () => document.activeElement?.classList.contains("skip-link") === true,
+  );
+  await page.keyboard.press("Enter");
+  const mainFocused = await page.evaluate(
+    () => document.activeElement?.id === "main-content",
+  );
+  if (!skipFocused || !mainFocused)
+    throw new Error(
+      `Events skip link contract: ${JSON.stringify({ skipFocused, mainFocused })}`,
+    );
+
+  const desktop = await eventGeometry(page);
+  assertEventsGeometry("Events 1920x1080", desktop);
+  const eventRequest = await page.evaluate(() =>
+    performance
+      .getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .find((name) => name.includes("/v1/timeline/events")),
+  );
+  if (
+    eventRequest === undefined ||
+    new URL(eventRequest).searchParams.get("limit") !== "50"
+  ) {
+    throw new Error(`Events request is not bounded: ${String(eventRequest)}`);
+  }
+  await page.screenshot({ path: EVENTS_SHOT });
+
+  await clickButtonByText(page, "Checkpoints");
+  await page.waitForFunction(
+    () => location.hash.includes("preset=checkpoints"),
+    { timeout: 5_000 },
+  );
+  await page.waitForFunction(
+    () =>
+      performance
+        .getEntriesByType("resource")
+        .some(
+          (entry) =>
+            entry.name.includes("/v1/frame/events") &&
+            new URL(entry.name).searchParams.get("q") ===
+              "category_code=pg.checkpoint.*",
+        ),
+    { timeout: 5_000 },
+  );
+  const checkpointLanes = await page.$$eval(
+    '[data-testid="event-signal-lane"]',
+    (lanes) => lanes.length,
+  );
+  if (checkpointLanes !== 2)
+    throw new Error(`checkpoint Signal lanes ${checkpointLanes}, expected 2`);
+
+  await page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1 });
+  await page.goto(
+    `${base}/#source=local&view=events&at=${at}&span=3600&preset=timeline`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector('[data-testid="event-signal-lane"]', {
+    timeout: 15_000,
+  });
+  const compact = await eventGeometry(page);
+  assertEventsGeometry("Events 1440x900", compact);
+  await page.screenshot({ path: EVENTS_COMPACT_SHOT });
+
+  await clickButtonByText(page, "Errors");
+  await page.waitForSelector('[data-testid="event-signal-lane"]', {
+    timeout: 5_000,
+  });
+  await page.click('[data-testid="event-signal-lane"]');
+  await page.waitForFunction(() => location.hash.includes("view=tables"), {
+    timeout: 5_000,
+  });
+  const investigationHash = await page.evaluate(() => location.hash);
+  if (
+    investigationHash.includes("content-derived-orders-db") ||
+    investigationHash.includes("entity=") ||
+    investigationHash.includes("dock=")
+  ) {
+    throw new Error(
+      `opaque Event identity leaked into route: ${investigationHash}`,
+    );
+  }
+  return {
+    desktop,
+    compact,
+    eventRequest,
+    checkpointLanes,
+    skipFocused,
+    mainFocused,
+    investigationHash,
+  };
+}
+
 function assertContract(metrics, keyboard) {
   const failures = [];
   const exactHeight = (name, expected) => {
@@ -1337,6 +1533,7 @@ stub.stderr.on("data", (chunk) => {
 
 let browser;
 let page;
+const browserDiagnostics = [];
 try {
   const base = await waitForStub(stub, () => stubOutput);
   browser = await puppeteer.launch({
@@ -1349,6 +1546,13 @@ try {
     ],
   });
   page = await browser.newPage();
+  page.on("pageerror", (error) => {
+    browserDiagnostics.push(`pageerror: ${error.stack ?? error.message}`);
+  });
+  page.on("console", (message) => {
+    if (message.type() === "error")
+      browserDiagnostics.push(`console: ${message.text()}`);
+  });
   await page.setViewport(VIEWPORT);
   await page.emulateMediaFeatures([
     { name: "prefers-reduced-motion", value: "reduce" },
@@ -1379,6 +1583,7 @@ try {
   await page.screenshot({ path: SUCCESS_SHOT });
   const activityPlans = await verifyActivityPlansWorkspaces(page, base, at);
   const infrastructure = await verifyInfrastructureWorkspaces(page, base, at);
+  const events = await verifyEventsWorkspace(page, base, at);
   console.log(
     `forensic shell PASS\n${JSON.stringify(
       {
@@ -1388,6 +1593,7 @@ try {
         globalSearchDetail,
         activityPlans,
         infrastructure,
+        events,
       },
       null,
       2,
@@ -1400,6 +1606,8 @@ try {
   console.log(`approved screenshot: ${TABLES_SHOT}`);
   console.log(`approved screenshot: ${INDEXES_SHOT}`);
   console.log(`approved screenshot: ${VACUUM_SHOT}`);
+  console.log(`approved screenshot: ${EVENTS_SHOT}`);
+  console.log(`approved screenshot: ${EVENTS_COMPACT_SHOT}`);
 } catch (error) {
   if (page !== undefined) {
     console.error(
@@ -1410,6 +1618,8 @@ try {
   console.error(`forensic shell FAIL\n${String(error)}`);
   if (stubOutput.trim() !== "")
     console.error(`demo stub output:\n${stubOutput.trim()}`);
+  if (browserDiagnostics.length > 0)
+    console.error(`browser diagnostics:\n${browserDiagnostics.join("\n")}`);
   if (page !== undefined)
     console.error(`diagnostic screenshot: ${FAILURE_SHOT}`);
   process.exitCode = 1;

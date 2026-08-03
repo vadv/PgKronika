@@ -676,7 +676,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
                 ("category", Value::U64(2)),
                 ("sample", Value::Str("secret".to_owned())),
             ]),
-            3,
+            4,
         ),
     ];
 
@@ -2326,9 +2326,10 @@ async fn frame_http_returns_bounded_classified_shape_and_rejects_before_io() {
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(body["view"], "events");
     assert_eq!(body["snapshot_ts_us"], "1600");
-    assert_eq!(body["columns"].as_array().map(Vec::len), Some(3));
+    assert_eq!(body["columns"].as_array().map(Vec::len), Some(4));
+    assert_eq!(body["columns"][3]["code"], "duration");
     assert_eq!(body["rows"].as_array().map(Vec::len), Some(1));
-    assert_eq!(body["rows"][0]["cells"].as_array().map(Vec::len), Some(3));
+    assert_eq!(body["rows"][0]["cells"].as_array().map(Vec::len), Some(4));
     assert_eq!(
         body["rows"][0]["classifications"].as_array().map(Vec::len),
         Some(0)
