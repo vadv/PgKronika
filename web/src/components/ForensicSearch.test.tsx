@@ -75,6 +75,15 @@ function stubNoResults() {
             columns: [makeFrameColumn({ code: "pid", type: "i64" })],
             rows: [],
             page: { matched: 0, returned: 0, next: null },
+            quality: {
+              status: "partial",
+              snapshots: 1,
+              gaps: [],
+              gated: [],
+              unavailable_revision: [],
+              resource_limited: ["source_limit"],
+              active_tail: true,
+            },
           }),
         ),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -163,6 +172,35 @@ test("shows an honest aggregate empty state after every group settles", async ()
     target: { value: "pid:99999" },
   });
   expect(
-    await screen.findByText("No server-side matches in this time window"),
+    await screen.findByText(
+      "No matches in retained snapshot candidates; absence is not proof",
+    ),
   ).toBeDefined();
+  expect(screen.getByText(/limited 1/)).toBeDefined();
+});
+
+test("has a visible close control, traps Tab and dismisses via the backdrop", async () => {
+  const onClose = vi.fn();
+  render(
+    <ForensicSearch
+      open
+      views={views}
+      at="1722400000000000"
+      span={3600}
+      onClose={onClose}
+      onSelect={() => {}}
+    />,
+    { wrapper },
+  );
+  const input = screen.getByRole("searchbox");
+  const close = screen.getByRole("button", { name: "Close forensic search" });
+  await waitFor(() => expect(document.activeElement).toBe(input));
+  fireEvent.keyDown(input, { key: "Tab", shiftKey: true });
+  expect(document.activeElement).toBe(close);
+  fireEvent.keyDown(close, { key: "Tab" });
+  expect(document.activeElement).toBe(input);
+  fireEvent.click(close);
+  expect(onClose).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByTestId("forensic-search-backdrop"));
+  expect(onClose).toHaveBeenCalledTimes(2);
 });

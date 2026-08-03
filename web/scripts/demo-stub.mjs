@@ -1253,12 +1253,13 @@ function frameResponse(viewCode, params) {
     page: { matched, returned: pageRows.length, next },
     neighbors: {},
     quality: {
-      status: "complete",
+      status: viewCode === "statements" ? "partial" : "complete",
       snapshots: 42,
       gaps: [],
       gated: [],
       unavailable_revision: [],
-      resource_limited: [],
+      resource_limited:
+        viewCode === "statements" ? ["source_limit:1000/1453"] : [],
       active_tail: true,
     },
   };
@@ -1326,11 +1327,17 @@ function entityResponse(viewCode, entity, params) {
   const columns = requestedColumns.filter((code) => availableColumns.has(code));
   const rand = mulberry32(hashCode(entity));
   const snapshots = [];
-  const sampleCount = 12;
-  const step = Math.max(1, Math.floor((to - from) / sampleCount));
-  for (let i = 0; i < sampleCount; i++) {
+  const totalSamples = 12;
+  const pageSize = 4;
+  const pageIndex = Math.max(
+    0,
+    Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
+  );
+  const step = Math.max(1, Math.floor((to - from) / totalSamples));
+  for (let i = 0; i < pageSize; i++) {
+    const sampleIndex = pageIndex * pageSize + i;
     snapshots.push({
-      ts_us: String(from + i * step),
+      ts_us: String(from + sampleIndex * step),
       values: columns.map((code) => {
         const value = row.data[code] ?? null;
         if (typeof value === "number") return r2(value * (0.8 + rand() * 0.4));
@@ -1345,8 +1352,12 @@ function entityResponse(viewCode, entity, params) {
     mode: "history",
     columns,
     snapshots,
-    page: { next: null },
-    quality: { status: "complete", gaps: [], gated: [] },
+    page: { next: pageIndex < 2 ? `page-${pageIndex + 2}` : null },
+    quality: {
+      status: "partial",
+      gaps: [{ from_us: String(from + step), to_us: String(from + 2 * step) }],
+      gated: [],
+    },
   };
 }
 

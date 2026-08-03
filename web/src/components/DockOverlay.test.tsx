@@ -247,6 +247,81 @@ test("row dock fetches bounded history only after selecting the History tab", as
   expect(screen.getAllByText("—").length).toBeGreaterThan(0);
 });
 
+test("history preserves quality and follows every opaque continuation", async () => {
+  const point = makeEntityPointResponse({
+    fields: [{ code: "tup", value: 12 }],
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      let body: unknown = point;
+      if (!url.searchParams.has("at")) {
+        const cursor = url.searchParams.get("cursor");
+        const page = cursor === null ? 1 : cursor === "page-2" ? 2 : 3;
+        body = makeEntityHistoryResponse({
+          columns: ["tup"],
+          snapshots: [
+            {
+              ts_us: String(1722400000000000 + page * 1_000_000),
+              values: [page],
+            },
+          ],
+          page: { next: page < 3 ? `page-${page + 1}` : null },
+          quality: {
+            status: "partial",
+            gaps: [{ from_us: "1", to_us: "2" }],
+            gated: ["os_process"],
+          },
+        });
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }),
+  );
+  renderDock({
+    state: { ...baseState, dock: "row", entity: "db:1" },
+    view: makeViewSpec({
+      code: "activity",
+      capabilities: { detail: true, history: true, related: false },
+      columns: [
+        {
+          code: "tup",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+      ],
+    }),
+  });
+
+  await waitFor(() => expect(screen.getByText("12")).toBeDefined());
+  fireEvent.click(screen.getByRole("tab", { name: "dock.detail.history" }));
+  expect(await screen.findByText("dock.detail.historyQuality")).toBeDefined();
+  fireEvent.click(screen.getByRole("button", { name: "dock.row.loadMore" }));
+  await waitFor(() => expect(screen.getByText("2")).toBeDefined());
+  fireEvent.click(screen.getByRole("button", { name: "dock.row.loadMore" }));
+  await waitFor(() => expect(screen.getByText("3")).toBeDefined());
+  expect(
+    screen.queryByRole("button", { name: "dock.row.loadMore" }),
+  ).toBeNull();
+
+  const historyUrls = vi
+    .mocked(fetch)
+    .mock.calls.map(([input]) => new URL((input as Request).url))
+    .filter((url) => url.searchParams.has("from"));
+  expect(historyUrls.map((url) => url.searchParams.get("cursor"))).toEqual([
+    null,
+    "page-2",
+    "page-3",
+  ]);
+});
+
 test("mobile dock docks to the bottom as a capped sheet", () => {
   renderDock({
     state: { ...baseState, dock: "incidents" },

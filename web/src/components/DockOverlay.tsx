@@ -614,6 +614,7 @@ function EntityHistoryView(props: {
       {data.page.next !== null && (
         <button
           type="button"
+          data-testid="history-load-more"
           disabled={props.loadingMore === true}
           onClick={props.onLoadMore}
           style={{
@@ -731,7 +732,6 @@ function RowDock(props: {
         uniqueSnapshots(previous, data.snapshots),
       );
       setNextCursor(data.page.next ?? null);
-      setHistoryCursor(null);
     } else {
       setHistoryBase((previous) => previous ?? data);
       setNextCursor(data.page.next ?? null);
@@ -936,17 +936,36 @@ function RowDock(props: {
                     {t("dock.detail.historyError")}
                   </div>
                 ) : combinedHistory !== undefined ? (
-                  <EntityHistoryView
-                    data={combinedHistory}
-                    columns={columnSpecs}
-                    viewCode={viewCode}
-                    loadingMore={historyCursor !== null && history.isLoading}
-                    onLoadMore={
-                      nextCursor !== null
-                        ? () => setHistoryCursor(nextCursor)
-                        : undefined
-                    }
-                  />
+                  <>
+                    {combinedHistory.quality.status !== "complete" && (
+                      <div
+                        data-history-quality
+                        role="note"
+                        style={{
+                          color: "var(--sev-warn-fg)",
+                          fontFamily: "var(--mono-font)",
+                          marginBlockEnd: "var(--space-2)",
+                        }}
+                      >
+                        {t("dock.detail.historyQuality", {
+                          status: combinedHistory.quality.status,
+                          gaps: combinedHistory.quality.gaps.length,
+                          gated: combinedHistory.quality.gated.length,
+                        })}
+                      </div>
+                    )}
+                    <EntityHistoryView
+                      data={combinedHistory}
+                      columns={columnSpecs}
+                      viewCode={viewCode}
+                      loadingMore={historyCursor !== null && history.isLoading}
+                      onLoadMore={
+                        nextCursor !== null
+                          ? () => setHistoryCursor(nextCursor)
+                          : undefined
+                      }
+                    />
+                  </>
                 ) : (
                   <div role="status" style={{ color: "var(--fg-dim)" }}>
                     {t("table.loading")}

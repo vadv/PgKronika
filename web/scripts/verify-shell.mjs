@@ -576,11 +576,26 @@ async function verifyGlobalSearchDetail(page) {
   const forensicInput = await page.$('[role="dialog"] input[type="search"]');
   if (forensicInput === null)
     throw new Error("forensic search input is missing");
+  await page.keyboard.down("Shift");
+  await page.keyboard.press("Tab");
+  await page.keyboard.up("Shift");
+  const trappedBackward = await page.evaluate(
+    () =>
+      document.activeElement?.getAttribute("aria-label") ===
+      "Close forensic search",
+  );
+  await page.keyboard.press("Tab");
+  const trappedForward = await page.evaluate(
+    () =>
+      document.activeElement?.matches(
+        '[role="dialog"] input[type="search"]',
+      ) === true,
+  );
   await forensicInput.type("queryid:9180220441127101");
   await page.waitForSelector('[role="dialog"] [data-search-result]', {
     timeout: 10_000,
   });
-  const searchState = await page.evaluate(() => {
+  const searchResultState = await page.evaluate(() => {
     const dialog = document.querySelector('[role="dialog"]');
     const results = dialog?.querySelectorAll("[data-search-result]") ?? [];
     const resources = performance
@@ -595,6 +610,11 @@ async function verifyGlobalSearchDetail(page) {
       resources,
     };
   });
+  const searchState = {
+    ...searchResultState,
+    trappedBackward,
+    trappedForward,
+  };
 
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
@@ -635,22 +655,41 @@ async function verifyGlobalSearchDetail(page) {
       timeout: 10_000,
     },
   );
+  await page.waitForSelector('[data-dock="row"] [data-history-quality]', {
+    timeout: 5_000,
+  });
+  for (const expectedRows of [8, 12]) {
+    await page.click('[data-dock="row"] [data-testid="history-load-more"]');
+    await page.waitForFunction(
+      (rows) =>
+        document.querySelectorAll(
+          '[data-dock="row"] [data-detail-history] tbody tr',
+        ).length === rows,
+      { timeout: 10_000 },
+      expectedRows,
+    );
+  }
   const historyState = await page.evaluate(() => {
-    const request = performance
+    const requests = performance
       .getEntriesByType("resource")
       .map((entry) => entry.name)
-      .find(
+      .filter(
         (name) =>
           name.includes("/v1/entity/statements/") &&
           name.includes("from=") &&
           name.includes("columns="),
       );
+    const request = requests[0];
     const url = request === undefined ? null : new URL(request);
     return {
       rows: document.querySelectorAll(
         '[data-dock="row"] [data-detail-history] tbody tr',
       ).length,
       request,
+      cursors: requests.map((name) => new URL(name).searchParams.get("cursor")),
+      quality:
+        document.querySelector('[data-dock="row"] [data-history-quality]')
+          ?.textContent ?? "",
       hasPointAt: url?.searchParams.has("at") ?? null,
       hasRange:
         url?.searchParams.has("from") === true &&
@@ -684,6 +723,9 @@ async function verifyGlobalSearchDetail(page) {
   const failures = [];
   if (searchState.resultCount < 1)
     failures.push("global search returned no result");
+  if (!searchState.trappedBackward || !searchState.trappedForward) {
+    failures.push("forensic search did not trap keyboard focus");
+  }
   if (searchState.resources.length < 2) {
     failures.push("global search did not fan out through server frame queries");
   }
@@ -708,7 +750,12 @@ async function verifyGlobalSearchDetail(page) {
   if (!pointState.provenance?.includes("point projection")) {
     failures.push("summary omitted point projection provenance");
   }
-  if (historyState.rows < 2 || historyState.hasRange !== true) {
+  if (
+    historyState.rows !== 12 ||
+    historyState.hasRange !== true ||
+    historyState.cursors.join(",") !== ",page-2,page-3" ||
+    !historyState.quality.includes("partial")
+  ) {
     failures.push(`history contract failed: ${JSON.stringify(historyState)}`);
   }
   if (historyState.hasPointAt !== false) {

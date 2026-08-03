@@ -18,6 +18,17 @@ export interface ForensicSearchProps {
   onSelect: (view: string, entity: string) => void;
 }
 
+interface SearchGroupStatus {
+  state: "pending" | "success" | "error";
+  matched: number;
+  qualityStatus: string | null;
+  gaps: number;
+  gated: number;
+  unavailable: number;
+  limited: number;
+  activeTail: boolean;
+}
+
 function errorText(
   error: ForensicSearchError,
   t: (key: string, options?: Record<string, unknown>) => string,
@@ -49,11 +60,7 @@ function SearchResultGroup(props: {
   at: string;
   span: number;
   onSelect: (view: string, entity: string) => void;
-  onResultKeyDown: React.KeyboardEventHandler<HTMLButtonElement>;
-  onStatus: (
-    key: string,
-    status: { state: "pending" | "success" | "error"; matched: number },
-  ) => void;
+  onStatus: (key: string, status: SearchGroupStatus) => void;
 }) {
   const { t } = useTranslation();
   const search = useForensicSearchGroup({
@@ -70,9 +77,35 @@ function SearchResultGroup(props: {
       : "success";
   const reportStatus = props.onStatus;
   const statusKey = props.groupKey;
+  const qualityStatus = search.quality?.status ?? null;
+  const gaps = search.quality?.gaps.length ?? 0;
+  const gated = search.quality?.gated.length ?? 0;
+  const unavailable = search.quality?.unavailable_revision.length ?? 0;
+  const limited = search.quality?.resource_limited.length ?? 0;
+  const activeTail = search.quality?.active_tail ?? false;
   useEffect(() => {
-    reportStatus(statusKey, { state: status, matched: search.matched });
-  }, [reportStatus, search.matched, status, statusKey]);
+    reportStatus(statusKey, {
+      state: status,
+      matched: search.matched,
+      qualityStatus,
+      gaps,
+      gated,
+      unavailable,
+      limited,
+      activeTail,
+    });
+  }, [
+    gaps,
+    gated,
+    unavailable,
+    limited,
+    activeTail,
+    qualityStatus,
+    reportStatus,
+    search.matched,
+    status,
+    statusKey,
+  ]);
   if (!search.isPending && !search.isError && search.matched === 0) return null;
   return (
     <section
@@ -120,6 +153,20 @@ function SearchResultGroup(props: {
           }}
         >
           {props.plan.reason}
+          {search.quality !== undefined && (
+            <span>
+              {" · "}
+              {t("search.quality", {
+                status: search.quality.status,
+                gaps: search.quality.gaps.length,
+                gated: search.quality.gated.length,
+                unavailable: search.quality.unavailable_revision.length,
+                limited: search.quality.resource_limited.length,
+                tail: search.quality.active_tail ? t("search.activeTail") : "",
+                defaultValue: `${search.quality.status} · gaps ${search.quality.gaps.length} · gated ${search.quality.gated.length} · unavailable ${search.quality.unavailable_revision.length} · limited ${search.quality.resource_limited.length}${search.quality.active_tail ? " · active tail" : ""}`,
+              })}
+            </span>
+          )}
         </span>
       </div>
       {search.isError && (
@@ -133,7 +180,6 @@ function SearchResultGroup(props: {
           type="button"
           data-search-result
           onClick={() => props.onSelect(props.plan.view.code, row.entity)}
-          onKeyDown={props.onResultKeyDown}
           style={{
             display: "grid",
             gridTemplateColumns: "minmax(220px, 1fr) minmax(160px, 0.7fr)",
@@ -227,11 +273,12 @@ export function ForensicSearch(props: ForensicSearchProps) {
   const [draft, setDraft] = useState("");
   const [committed, setCommitted] = useState("");
   const [groupStatus, setGroupStatus] = useState<
-    Record<string, { state: "pending" | "success" | "error"; matched: number }>
+    Record<string, SearchGroupStatus>
   >({});
   const inputRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLFormElement>(null);
   const restoreFocus = useRef<HTMLElement | null>(null);
+  const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => {});
 
   useEffect(() => {
     if (!props.open) return;
@@ -248,16 +295,33 @@ export function ForensicSearch(props: ForensicSearchProps) {
     return () => window.clearTimeout(timeout);
   }, [draft]);
 
+  useEffect(() => {
+    if (!props.open) return;
+    const listener = (event: KeyboardEvent) => {
+      if (
+        event.target instanceof Node &&
+        dialogRef.current?.contains(event.target)
+      ) {
+        keyHandlerRef.current(event);
+      }
+    };
+    document.addEventListener("keydown", listener);
+    return () => document.removeEventListener("keydown", listener);
+  }, [props.open]);
+
   const onGroupStatus = useCallback(
-    (
-      key: string,
-      status: { state: "pending" | "success" | "error"; matched: number },
-    ) => {
+    (key: string, status: SearchGroupStatus) => {
       setGroupStatus((previous) => {
         const current = previous[key];
         if (
           current?.state === status.state &&
-          current.matched === status.matched
+          current.matched === status.matched &&
+          current.qualityStatus === status.qualityStatus &&
+          current.gaps === status.gaps &&
+          current.gated === status.gated &&
+          current.unavailable === status.unavailable &&
+          current.limited === status.limited &&
+          current.activeTail === status.activeTail
         ) {
           return previous;
         }
@@ -278,17 +342,45 @@ export function ForensicSearch(props: ForensicSearchProps) {
     statuses.every(
       (status) => status?.state === "success" && status.matched === 0,
     );
+  const noMatchCoverage = statuses.reduce(
+    (total, status) => ({
+      gaps: total.gaps + (status?.gaps ?? 0),
+      gated: total.gated + (status?.gated ?? 0),
+      unavailable: total.unavailable + (status?.unavailable ?? 0),
+      limited: total.limited + (status?.limited ?? 0),
+      activeTail: total.activeTail || (status?.activeTail ?? false),
+    }),
+    { gaps: 0, gated: 0, unavailable: 0, limited: 0, activeTail: false },
+  );
   const resultButtons = () =>
     Array.from(
       dialogRef.current?.querySelectorAll<HTMLButtonElement>(
         "button[data-search-result]",
       ) ?? [],
     );
-  const onKeyDown = (event: React.KeyboardEvent) => {
+  const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
       props.onClose();
+      return;
+    }
+    if (event.key === "Tab") {
+      const focusable = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLElement>(
+          'input:not([disabled]), button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (first === undefined || last === undefined) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
       return;
     }
     const buttons = resultButtons();
@@ -317,6 +409,7 @@ export function ForensicSearch(props: ForensicSearchProps) {
         : (current + direction + buttons.length) % buttons.length;
     buttons[next]?.focus();
   };
+  keyHandlerRef.current = onKeyDown;
 
   return (
     <div
@@ -327,16 +420,37 @@ export function ForensicSearch(props: ForensicSearchProps) {
         display: "grid",
         placeItems: "start center",
         paddingBlockStart: "8vh",
-        background: "color-mix(in srgb, var(--bg) 58%, transparent)",
       }}
     >
+      <button
+        type="button"
+        tabIndex={-1}
+        data-testid="forensic-search-backdrop"
+        aria-label={t("search.dismiss", {
+          defaultValue: "Dismiss forensic search backdrop",
+        })}
+        onClick={props.onClose}
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          padding: 0,
+          background: "color-mix(in srgb, var(--bg) 58%, transparent)",
+          border: "none",
+          cursor: "default",
+        }}
+      />
       <form
         ref={dialogRef}
         role="dialog"
+        tabIndex={-1}
         aria-modal="true"
         aria-label={t("search.title", { defaultValue: "Forensic search" })}
         onSubmit={(event) => event.preventDefault()}
         style={{
+          position: "relative",
+          zIndex: 1,
           width: "min(920px, calc(100vw - 32px))",
           maxHeight: "min(760px, 84vh)",
           display: "flex",
@@ -366,7 +480,6 @@ export function ForensicSearch(props: ForensicSearchProps) {
             type="search"
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={onKeyDown}
             placeholder={t("search.placeholder", {
               defaultValue: "pid:18422 · queryid:… · rel:public.orders",
             })}
@@ -383,6 +496,23 @@ export function ForensicSearch(props: ForensicSearchProps) {
             }}
           />
           <kbd style={{ color: "var(--fg-dim)" }}>esc</kbd>
+          <button
+            type="button"
+            aria-label={t("search.close", {
+              defaultValue: "Close forensic search",
+            })}
+            onClick={props.onClose}
+            style={{
+              color: "var(--fg-dim)",
+              background: "none",
+              border: "none",
+              fontFamily: "var(--mono-font)",
+              fontSize: "var(--text-lg)",
+              cursor: "pointer",
+            }}
+          >
+            ×
+          </button>
         </div>
         <div
           id="forensic-search-help"
@@ -439,7 +569,6 @@ export function ForensicSearch(props: ForensicSearchProps) {
               at={props.at}
               span={props.span}
               onSelect={props.onSelect}
-              onResultKeyDown={onKeyDown}
               onStatus={onGroupStatus}
             />
           ))}
@@ -453,9 +582,32 @@ export function ForensicSearch(props: ForensicSearchProps) {
                 textAlign: "center",
               }}
             >
-              {t("search.noMatches", {
-                defaultValue: "No server-side matches in this time window",
-              })}
+              <span style={{ display: "block" }}>
+                {t("search.noMatches", {
+                  defaultValue:
+                    "No matches in retained snapshot candidates; absence is not proof",
+                })}
+              </span>
+              <span
+                style={{
+                  display: "block",
+                  marginBlockStart: "var(--space-1)",
+                  fontFamily: "var(--mono-font)",
+                  fontSize: "var(--text-xs)",
+                }}
+              >
+                {t("search.quality", {
+                  status: "retained",
+                  gaps: noMatchCoverage.gaps,
+                  gated: noMatchCoverage.gated,
+                  unavailable: noMatchCoverage.unavailable,
+                  limited: noMatchCoverage.limited,
+                  tail: noMatchCoverage.activeTail
+                    ? t("search.activeTail")
+                    : "",
+                  defaultValue: `retained · gaps ${noMatchCoverage.gaps} · gated ${noMatchCoverage.gated} · unavailable ${noMatchCoverage.unavailable} · limited ${noMatchCoverage.limited}${noMatchCoverage.activeTail ? " · active tail" : ""}`,
+                })}
+              </span>
             </div>
           )}
         </div>
