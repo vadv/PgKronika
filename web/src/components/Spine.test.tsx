@@ -1,7 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { createInstance } from "i18next";
 import { createElement, type ReactNode } from "react";
+import { I18nextProvider } from "react-i18next";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import en from "../i18n/en.json";
 import {
   makeEventFact,
   makeEventsResponse,
@@ -181,6 +184,75 @@ function renderSpine(overrides: Partial<SpineProps> = {}) {
   return render(<Spine {...props} />, { wrapper });
 }
 
+type FetchImplementation = (input: RequestInfo | URL) => Promise<Response>;
+
+async function renderLocalizedSpine(
+  overrides: Partial<SpineProps> = {},
+  fetchImplementation: FetchImplementation = stubFetch(),
+) {
+  vi.stubGlobal("fetch", vi.fn(fetchImplementation));
+  const localized = createInstance();
+  await localized.init({
+    lng: "en",
+    resources: { en: { translation: en } },
+    interpolation: { escapeValue: false },
+  });
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const props: SpineProps = {
+    at: String(AT_US),
+    span: 3600,
+    baseline: null,
+    range: { fromUs: String(FROM_US), toUs: String(AT_US) },
+    onSelectAt: () => {},
+    onSelectBaseline: () => {},
+    ...overrides,
+  };
+  return render(
+    <I18nextProvider i18n={localized}>
+      <QueryClientProvider client={client}>
+        <Spine {...props} />
+      </QueryClientProvider>
+    </I18nextProvider>,
+  );
+}
+
+function stubPartialFetch(failedSources: ReadonlySet<string>) {
+  return (input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    const source = url.includes("/v1/timeline/events")
+      ? "events"
+      : url.includes("/v1/timeline/health")
+        ? "health"
+        : url.includes("/v1/incidents")
+          ? "incidents"
+          : "spine";
+    if (failedSources.has(source)) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ code: `${source}_transport_failed` }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    const body =
+      source === "events"
+        ? eventsFixture
+        : source === "health"
+          ? healthFixture
+          : source === "incidents"
+            ? incidentsFixture
+            : spineFixture;
+    return Promise.resolve(jsonResponse(body));
+  };
+}
+
 test("renders verdict ribbon, score chip, glyphs, sparkline and summary", async () => {
   renderSpine();
   await waitFor(() =>
@@ -333,22 +405,72 @@ test("selection overlays share one SVG grid while gap hatch remains on top", asy
   ).toBeTruthy();
 });
 
-test("server verdicts have text alternatives independent of ribbon color", async () => {
-  renderSpine();
+test("localized evidence summary exposes verdicts outside the slider leaf", async () => {
+  await renderLocalizedSpine();
   await waitFor(() =>
     expect(screen.getAllByTestId("spine-ribbon-crit").length).toBeGreaterThan(
       0,
     ),
   );
-  expect(
-    screen.getAllByTestId("spine-ribbon-ok")[0]?.getAttribute("aria-label"),
-  ).toContain("spine.verdict.ok");
-  expect(
-    screen.getAllByTestId("spine-ribbon-warn")[0]?.getAttribute("aria-label"),
-  ).toContain("spine.verdict.warn");
-  expect(
-    screen.getAllByTestId("spine-ribbon-crit")[0]?.getAttribute("aria-label"),
-  ).toContain("spine.verdict.crit");
+  const summary = screen.getByRole("status");
+  expect(summary.textContent).toContain("48 calm");
+  expect(summary.textContent).toContain("24 warning");
+  expect(summary.textContent).toContain("24 critical");
+  expect(summary.textContent).toContain("0 gaps");
+  expect(summary.textContent).toContain("Current bucket: critical");
+  expect(summary.textContent).toContain("All Health line sources available");
+  expect(screen.getByRole("slider").getAttribute("aria-describedby")).toContain(
+    summary.id,
+  );
+});
+
+test("health transport failure is a visible partial state while OS evidence remains", async () => {
+  await renderLocalizedSpine({}, stubPartialFetch(new Set(["health"])));
+  const partial = await screen.findByTestId("health-line-source-state");
+  expect(partial.textContent).toContain("Partial: health verdicts unavailable");
+  expect(screen.getByTestId("spine-load-line")).toBeDefined();
+  expect(screen.getByRole("slider")).toBeDefined();
+  expect(screen.getByRole("status").textContent).toContain(
+    "Partial sources: health verdicts",
+  );
+});
+
+test("spine and event failures are disclosed while health verdicts remain", async () => {
+  await renderLocalizedSpine(
+    {},
+    stubPartialFetch(new Set(["spine", "events"])),
+  );
+  const partial = await screen.findByTestId("health-line-source-state");
+  expect(partial.textContent).toContain(
+    "Partial: OS signals, timeline events unavailable",
+  );
+  expect(screen.getAllByTestId("spine-ribbon-crit").length).toBeGreaterThan(0);
+  expect(screen.getByRole("status").textContent).toContain(
+    "Partial sources: OS signals, timeline events",
+  );
+});
+
+test("event evidence remains visible when health and spine responses are empty", async () => {
+  await renderLocalizedSpine({}, (input) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    const body = url.includes("/v1/timeline/events")
+      ? eventsFixture
+      : url.includes("/v1/timeline/health")
+        ? makeHealthResponse({ points: [] })
+        : url.includes("/v1/incidents")
+          ? incidentsFixture
+          : makeSpineResponse({ series: [] });
+    return Promise.resolve(jsonResponse(body));
+  });
+
+  expect(await screen.findByRole("slider")).toBeDefined();
+  expect(screen.getByText("◆")).toBeDefined();
+  expect(screen.queryByTestId("spine-state")).toBeNull();
 });
 
 test("an empty window shows the no-data line instead of a blank chart", async () => {
@@ -493,6 +615,77 @@ test("pointer brush previews immediately and commits exactly once on pointer up"
     toUs: String(FROM_US + WINDOW_US * 0.65),
   });
   expect(releasePointerCapture).toHaveBeenCalledWith(7);
+});
+
+test("captured far pointer-up commits a brush without an intermediate move", async () => {
+  const onSelectAt = vi.fn();
+  const onBrushDraft = vi.fn();
+  const onHover = vi.fn();
+  const onCommitRange = vi.fn();
+  renderSpine({ onSelectAt, onBrushDraft, onHover, onCommitRange });
+  const svg = await screen.findByRole("slider");
+  stubRect(svg);
+  Object.assign(svg, {
+    setPointerCapture: vi.fn(),
+    releasePointerCapture: vi.fn(),
+  });
+
+  fireEvent.pointerDown(svg, { clientX: 200, pointerId: 12, button: 0 });
+  fireEvent.pointerUp(svg, { clientX: 1200, pointerId: 12, button: 0 });
+
+  expect(onSelectAt).not.toHaveBeenCalled();
+  expect(onCommitRange).toHaveBeenCalledTimes(1);
+  expect(onCommitRange).toHaveBeenCalledWith({
+    fromUs: String(FROM_US + WINDOW_US * 0.2),
+    toUs: String(AT_US),
+  });
+  expect(onBrushDraft).toHaveBeenLastCalledWith(null);
+  expect(onHover).toHaveBeenLastCalledWith(null);
+});
+
+test("pointer cancel and lost capture clear ephemeral state without committing", async () => {
+  const onBrushDraft = vi.fn();
+  const onHover = vi.fn();
+  const onCommitRange = vi.fn();
+  renderSpine({ onBrushDraft, onHover, onCommitRange });
+  const svg = await screen.findByRole("slider");
+  stubRect(svg);
+  Object.assign(svg, {
+    setPointerCapture: vi.fn(),
+    releasePointerCapture: vi.fn(),
+  });
+
+  fireEvent.pointerDown(svg, { clientX: 200, pointerId: 13, button: 0 });
+  fireEvent.pointerMove(svg, { clientX: 650, pointerId: 13, buttons: 1 });
+  fireEvent.pointerCancel(svg, { clientX: 650, pointerId: 13 });
+  expect(onBrushDraft).toHaveBeenLastCalledWith(null);
+  expect(onHover).toHaveBeenLastCalledWith(null);
+  expect(onCommitRange).not.toHaveBeenCalled();
+
+  fireEvent.pointerDown(svg, { clientX: 300, pointerId: 14, button: 0 });
+  fireEvent.pointerMove(svg, { clientX: 700, pointerId: 14, buttons: 1 });
+  fireEvent.lostPointerCapture(svg, { clientX: 700, pointerId: 14 });
+  expect(onBrushDraft).toHaveBeenLastCalledWith(null);
+  expect(onHover).toHaveBeenLastCalledWith(null);
+  expect(onCommitRange).not.toHaveBeenCalled();
+});
+
+test("lost capture after pointer-up does not commit the finished brush twice", async () => {
+  const onCommitRange = vi.fn();
+  renderSpine({ onCommitRange });
+  const svg = await screen.findByRole("slider");
+  stubRect(svg);
+  Object.assign(svg, {
+    setPointerCapture: vi.fn(),
+    releasePointerCapture: vi.fn(),
+  });
+
+  fireEvent.pointerDown(svg, { clientX: 200, pointerId: 15, button: 0 });
+  fireEvent.pointerMove(svg, { clientX: 650, pointerId: 15, buttons: 1 });
+  fireEvent.pointerUp(svg, { clientX: 650, pointerId: 15, button: 0 });
+  fireEvent.lostPointerCapture(svg, { clientX: 650, pointerId: 15 });
+
+  expect(onCommitRange).toHaveBeenCalledTimes(1);
 });
 
 test("sub-threshold pointer movement remains a cursor click", async () => {

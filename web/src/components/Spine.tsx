@@ -76,7 +76,20 @@ interface PointerGesture {
   startClientX: number;
   startUs: string;
   dragging: boolean;
+  maxDisplacementPx: number;
 }
+
+const VISUALLY_HIDDEN: React.CSSProperties = {
+  position: "absolute",
+  width: "1px",
+  height: "1px",
+  padding: 0,
+  margin: "-1px",
+  overflow: "hidden",
+  clip: "rect(0, 0, 0, 0)",
+  whiteSpace: "nowrap",
+  border: 0,
+};
 
 // Primary series: the first one that carries at least one real sample. The
 // API orders series by relevance (host load first, PSI after it), so we do
@@ -353,6 +366,7 @@ export function Spine(props: SpineProps) {
       startClientX: e.clientX,
       startUs,
       dragging: false,
+      maxDisplacementPx: 0,
     };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
@@ -362,10 +376,11 @@ export function Spine(props: SpineProps) {
     props.onHover?.(currentUs);
     const gesture = gestureRef.current;
     if (gesture === null || gesture.pointerId !== e.pointerId) return;
-    if (
-      !gesture.dragging &&
-      Math.abs(e.clientX - gesture.startClientX) >= BRUSH_THRESHOLD_PX
-    ) {
+    gesture.maxDisplacementPx = Math.max(
+      gesture.maxDisplacementPx,
+      Math.abs(e.clientX - gesture.startClientX),
+    );
+    if (!gesture.dragging && gesture.maxDisplacementPx >= BRUSH_THRESHOLD_PX) {
       gesture.dragging = true;
     }
     if (gesture.dragging) {
@@ -377,11 +392,18 @@ export function Spine(props: SpineProps) {
     const gesture = gestureRef.current;
     if (gesture === null || gesture.pointerId !== e.pointerId) return;
     const currentUs = pickUs(e.currentTarget, e.clientX);
+    const finalDisplacementPx = Math.abs(e.clientX - gesture.startClientX);
+    const dragging =
+      gesture.dragging ||
+      Math.max(gesture.maxDisplacementPx, finalDisplacementPx) >=
+        BRUSH_THRESHOLD_PX;
     gestureRef.current = null;
     if (e.currentTarget.hasPointerCapture?.(e.pointerId) ?? true) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    if (gesture.dragging) {
+    props.onBrushDraft?.(null);
+    props.onHover?.(null);
+    if (dragging) {
       props.onCommitRange?.(rangeBetween(gesture.startUs, currentUs));
     } else {
       selectPoint(currentUs, e.shiftKey);
@@ -391,10 +413,11 @@ export function Spine(props: SpineProps) {
   const cancelPointer = (e: React.PointerEvent<SVGSVGElement>) => {
     if (gestureRef.current?.pointerId !== e.pointerId) return;
     gestureRef.current = null;
-    props.onBrushDraft?.(null);
     if (e.currentTarget.hasPointerCapture?.(e.pointerId) ?? true) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
+    props.onBrushDraft?.(null);
+    props.onHover?.(null);
   };
 
   const onStripKeyDown = (e: React.KeyboardEvent<SVGSVGElement>) => {
@@ -415,29 +438,64 @@ export function Spine(props: SpineProps) {
   // "Warming up" is only honest on a cold start — not one successful
   // response yet. With any data on screen (kept or fresh), a 503 window is
   // a real ribbon with honest gap cells, never a placeholder.
-  const cold = health.data === undefined && spine.data === undefined;
-  const retrying = [health, spine, incidents].some(
+  const evidenceQueries = [health, spine, events] as const;
+  const cold = evidenceQueries.every((query) => query.data === undefined);
+  const retrying = [...evidenceQueries, incidents].some(
     (q) => q.isPending || (q.error !== null && isWarmingUp(q.error)),
   );
   const warming = cold && retrying;
+  const sourceFailures = [
+    { code: "health", query: health },
+    { code: "spine", query: spine },
+    { code: "events", query: events },
+  ].filter(({ query }) => query.error !== null && !isWarmingUp(query.error));
   const failed =
-    cold &&
-    !warming &&
-    [health, spine].some((q) => q.error !== null && !isWarmingUp(q.error));
+    cold && !warming && sourceFailures.length === evidenceQueries.length;
   const empty =
     !cold &&
     !failed &&
     health.data !== undefined &&
     spine.data !== undefined &&
+    events.data !== undefined &&
     verdicts.every((v) => v === "gap") &&
-    allSeries.every((s) => s.values.every((v) => v === null));
+    allSeries.every((s) => s.values.every((v) => v === null)) &&
+    visibleEvents.length === 0;
+
+  const sourceNames = sourceFailures.map(({ code }) =>
+    t(`healthLine.source.${code}`),
+  );
+  const sourceList = sourceNames.join(", ");
+  const sourcesLoading = evidenceQueries.some(
+    (query) => query.isPending && query.data === undefined,
+  );
+  const sourceStatus = failed
+    ? t("healthLine.sources.unavailable")
+    : sourceFailures.length > 0
+      ? t("healthLine.sources.partial", { sources: sourceList })
+      : sourcesLoading
+        ? t("healthLine.sources.loading")
+        : t("healthLine.sources.complete");
+  const currentVerdict = verdicts[verdicts.length - 1] ?? "gap";
+  const currentVerdictLabel = t(`healthLine.verdict.${currentVerdict}`);
+  const gapCount = scored.filter((verdict) => verdict === "gap").length;
+  const evidenceSummary = t("healthLine.evidenceSummary", {
+    ok: counts.ok,
+    warn: counts.warn,
+    crit: counts.crit,
+    gap: gapCount,
+    current: currentVerdictLabel,
+    window: hasFormingTail
+      ? t("healthLine.window.forming")
+      : t("healthLine.window.complete"),
+    sources: sourceStatus,
+  });
 
   const glyphOf = (e: EventFact) => eventGlyph(e);
 
   return (
     <section
       aria-label={t("spine.caption")}
-      aria-describedby="health-line-meaning"
+      aria-describedby="health-line-meaning health-line-evidence-summary"
       data-testid="health-line"
       data-shell-region="health-line"
       style={{
@@ -469,20 +527,33 @@ export function Spine(props: SpineProps) {
       <span
         id="health-line-meaning"
         data-testid="health-line-meaning"
-        style={{
-          position: "absolute",
-          width: "1px",
-          height: "1px",
-          padding: 0,
-          margin: "-1px",
-          overflow: "hidden",
-          clip: "rect(0, 0, 0, 0)",
-          whiteSpace: "nowrap",
-          border: 0,
-        }}
+        style={VISUALLY_HIDDEN}
       >
         {props.meaning ?? t("healthLine.coincidence")}
       </span>
+      <span
+        id="health-line-evidence-summary"
+        role="status"
+        style={VISUALLY_HIDDEN}
+      >
+        {evidenceSummary}
+      </span>
+      {sourceFailures.length > 0 && !failed && (
+        <span
+          data-testid="health-line-source-state"
+          title={t("healthLine.partial", { sources: sourceList })}
+          style={{
+            maxWidth: "220px",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            color: "var(--sev-warn-fg)",
+            fontSize: "var(--text-xs)",
+          }}
+        >
+          {`⚠ ${t("healthLine.partial", { sources: sourceList })}`}
+        </span>
+      )}
       {!warming && !failed && !empty && (
         <Tooltip
           content={
@@ -588,6 +659,7 @@ export function Spine(props: SpineProps) {
           role="slider"
           tabIndex={0}
           aria-label={t("spine.timeline")}
+          aria-describedby="health-line-evidence-summary"
           {...({
             // React's ARIA types only admit `number`, but converting an int64
             // µs timestamp would lose precision. Attribute values are strings
@@ -603,6 +675,7 @@ export function Spine(props: SpineProps) {
           onPointerMove={onStripPointerMove}
           onPointerUp={finishPointer}
           onPointerCancel={cancelPointer}
+          onLostPointerCapture={cancelPointer}
           onKeyDown={onStripKeyDown}
           onPointerLeave={() => {
             if (gestureRef.current === null) props.onHover?.(null);
@@ -716,7 +789,6 @@ export function Spine(props: SpineProps) {
                 {v === "gap" ? (
                   <rect
                     data-testid="spine-ribbon-gap"
-                    aria-label={verdictLabel}
                     x={x}
                     y={RIBBON_Y}
                     width={cellW}
@@ -730,7 +802,6 @@ export function Spine(props: SpineProps) {
                 ) : (
                   <rect
                     data-testid={`spine-ribbon-${v}`}
-                    aria-label={verdictLabel}
                     x={x}
                     y={RIBBON_Y}
                     width={cellW}
