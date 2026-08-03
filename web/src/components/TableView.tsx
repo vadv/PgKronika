@@ -963,13 +963,17 @@ function TableViewImpl(props: TableViewProps) {
                       <td
                         key={column.code}
                         title={
-                          value === null && notClassified !== undefined
-                            ? nullReasonTitle(
-                                notClassified.status,
-                                notClassified.reason,
-                                t,
-                              )
-                            : (full ?? whyTitle(classification?.result, t))
+                          column.code === "process_link" && value !== null
+                            ? (colDesc(t, props.view.code, column.code) ??
+                              full ??
+                              undefined)
+                            : value === null && notClassified !== undefined
+                              ? nullReasonTitle(
+                                  notClassified.status,
+                                  notClassified.reason,
+                                  t,
+                                )
+                              : (full ?? whyTitle(classification?.result, t))
                         }
                         style={{
                           padding: "2px 10px",
@@ -983,6 +987,14 @@ function TableViewImpl(props: TableViewProps) {
                             color:
                               value === null ? "var(--fg-dim)" : "var(--fg)",
                           }),
+                          ...(activityGroupedMode &&
+                          column.code === "process_link" &&
+                          value !== null
+                            ? {
+                                color: "var(--accent-strong)",
+                                fontWeight: 600,
+                              }
+                            : undefined),
                           ...(!timeMatrixMode &&
                           !activitySnapshotMode &&
                           columnIndex === 0

@@ -435,7 +435,11 @@ function EntityPointView(props: {
   viewCode: string;
 }) {
   const { t } = useTranslation();
-  const meaningful = props.data.fields.filter((field) => field.value !== null);
+  const meaningful = props.data.fields.filter((field) => {
+    const availability =
+      props.columns.get(field.code)?.availability ?? "available";
+    return field.value !== null || availability !== "available";
+  });
   const identityCodes = new Set(
     props.viewCode === "activity"
       ? ["pid", "database", "user", "application", "process_link"]
@@ -495,14 +499,22 @@ function EntityPointView(props: {
     };
     const label = colLabel(t, props.viewCode, field.code);
     const desc = colDesc(t, props.viewCode, field.code);
+    const availability = spec?.availability ?? "available";
+    const notCollected = field.value === null && availability !== "available";
     const isSql =
       typeof field.value === "string" &&
       (field.value.length > 60 || field.value.includes("\n"));
-    const fullIdentity = isIdentityColumn(field.code);
-    const display = fullIdentity
-      ? String(field.value)
-      : formatCellValue(field.value, cellColumn, t);
-    return isSql && !compact ? (
+    const fullIdentity = field.value !== null && isIdentityColumn(field.code);
+    const unavailableFallback =
+      availability === "available" ? "—" : "not collected";
+    const display = notCollected
+      ? t(`availability.${availability}`, {
+          defaultValue: unavailableFallback,
+        })
+      : fullIdentity
+        ? String(field.value)
+        : formatCellValue(field.value, cellColumn, t);
+    return isSql && !compact && !notCollected ? (
       <div
         key={field.code}
         data-field={field.code}
@@ -525,7 +537,7 @@ function EntityPointView(props: {
           {label}
         </span>
         <span
-          className="entity-detail__value"
+          className={`entity-detail__value${notCollected ? " entity-detail__value--missing" : ""}`}
           style={fullIdentity ? { userSelect: "all" } : undefined}
         >
           {display}

@@ -39,6 +39,8 @@ The deterministic shell verifier also captured Statements, Activity CPU, Activit
 - P2 — Events heatmap read as a solid blue carpet. Quiet cells are now subdued and event peaks remain visually prominent.
 - P2 — The last Signals row clipped in the 176 px overview. Limited the bounded rail to five dense 24 px rows and verified both desktop sizes.
 - P2 — Shell QA still required internal provenance and collection-quality jargon. Updated the contract to verify human links and keep internals out of ordinary UI.
+- P1 review — Detail grouping suppressed unavailable catalog fields together with ordinary nulls. Ordinary nulls remain quiet; unavailable fields now stay visible with a calm `not collected / нет данных` value.
+- P2 review — `Linked by PID` repeated across every Activity row. The dense relation cell now says only `Linked / Связано`; the shared PID remains an explanatory tooltip and Relationships keeps a human `Linked process` target.
 
 ## Automated verification
 

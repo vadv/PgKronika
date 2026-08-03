@@ -193,16 +193,45 @@ test("row dock renders point fields from the entity endpoint", async () => {
       fields: [
         { code: "tup", value: 42 },
         { code: "locks", value: null },
+        { code: "rss", value: null },
       ],
       quality: { status: "partial", gaps: [], gated: [] },
     }),
   );
   renderDock({
     state: { ...baseState, dock: "row", entity: "db:1" },
+    view: makeViewSpec({
+      code: "activity",
+      columns: [
+        {
+          code: "tup",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+        {
+          code: "locks",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+        {
+          code: "rss",
+          type: "i64",
+          lazy: false,
+          requires: ["os_process"],
+          availability: "gated",
+        },
+      ],
+    }),
   });
   await waitFor(() => expect(screen.getByText("42")).toBeDefined());
   expect(screen.getByText("tup")).toBeDefined();
   expect(screen.queryByText("locks")).toBeNull();
+  expect(screen.getByText("rss")).toBeDefined();
+  expect(screen.getByText("not collected")).toBeDefined();
   expect(document.querySelector("[data-forensic-summary]")).not.toBeNull();
   const summary = screen.getByRole("tabpanel");
   expect(summary.textContent).not.toMatch(

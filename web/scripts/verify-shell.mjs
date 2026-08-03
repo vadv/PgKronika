@@ -993,11 +993,11 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   if (!activity.pointEvidence.includes("Short queries"))
     activityFailures.push("point-snapshot sampling caveat is missing");
   if (
-    !/linked by PID/i.test(activity.processLink) ||
+    !/linked process/i.test(activity.processLink) ||
     /best[_ ]effort|exact|proof/i.test(activity.processLink)
   )
     activityFailures.push(`process link is noisy: ${activity.processLink}`);
-  if (!/(same|linked by) PID/i.test(activity.processCaveat))
+  if (!/share this PID/i.test(activity.processCaveat))
     activityFailures.push("PID link explanation is missing");
   if (
     !activity.gated.includes("Memory") ||
@@ -1138,7 +1138,7 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     (element) => element.textContent ?? "",
   );
   if (
-    !processRelation.includes("Linked by PID") ||
+    !processRelation.includes("Linked process") ||
     /best[_ ]effort|activity_process|proof|exact/i.test(processRelation)
   ) {
     throw new Error(`Activity process link: ${processRelation}`);
