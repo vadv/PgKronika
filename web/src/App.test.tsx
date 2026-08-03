@@ -1113,7 +1113,7 @@ test("Activity resource lenses inherit partial-source availability from the cata
   expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBeNull();
 });
 
-test("Plans owns change lanes, fork provenance and keeps Compare explicitly gated", async () => {
+test("Plans owns one row-coupled workspace, change evidence and gated Compare", async () => {
   history.replaceState(
     null,
     "",
@@ -1122,7 +1122,13 @@ test("Plans owns change lanes, fork provenance and keeps Compare explicitly gate
   const availableCatalog = structuredClone(catalogBody);
   const plans = availableCatalog.views.find((view) => view.code === "plans");
   if (plans !== undefined) {
-    plans.presets = ["time", "io", "rows", "change_timeline"].map((code) => ({
+    plans.presets = [
+      "regression",
+      "time",
+      "io",
+      "rows",
+      "change_timeline",
+    ].map((code) => ({
       code,
       columns: [],
       sort: { column: "metric", order: "desc" as const },
@@ -1160,9 +1166,13 @@ test("Plans owns change lanes, fork provenance and keeps Compare explicitly gate
   });
   renderApp(fetchImpl);
 
-  expect(
-    await screen.findByText("ossc_queryid_dbid_userid_attribution"),
-  ).toBeDefined();
+  expect(await screen.findByTestId("plans-workspace")).toBeDefined();
+  expect(screen.queryByTestId("workload-analytical-center")).toBeNull();
+  expect(screen.getByTestId("plans-attribution-provenance").textContent).toContain(
+    "ossc_queryid_dbid_userid_attribution",
+  );
+  expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBeNull();
+  expect(screen.getByTestId("plans-workspace").dataset.lens).toBe("regression");
   expect(
     screen
       .getByRole("button", { name: /^planCompare /i })

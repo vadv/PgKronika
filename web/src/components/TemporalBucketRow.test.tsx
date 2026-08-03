@@ -85,4 +85,35 @@ describe("TemporalBucketRow", () => {
       "activity.matrix.intervalValue",
     );
   });
+
+  test("labels Plans buckets as interval deltas without drawing continuity", () => {
+    render(
+      <TemporalBucketRow
+        row={{
+          entity: "plan:77",
+          label: "plan 77",
+          unit: "us",
+          score: { lower: 0, upper: 10 },
+          values: [10, null, 30, 40],
+        }}
+        bucketCount={4}
+        gridFromUs="100"
+        gridToUs="200"
+        cursorUs="150"
+        baselineUs={null}
+        metricLabel="time"
+        mode="plan_intervals"
+      />,
+    );
+
+    const row = screen.getByTestId("plans-interval-row");
+    expect(row.dataset.mode).toBe("plan_intervals");
+    expect(row.getAttribute("aria-label")).toContain(
+      "plans.matrix.intervalRowLabel",
+    );
+    expect(row.querySelector("svg, polyline, path")).toBeNull();
+    expect(screen.getAllByTestId("time-matrix-bucket")[0]?.title).toContain(
+      "plans.matrix.bucketValue",
+    );
+  });
 });
