@@ -24,14 +24,14 @@ export interface HeaderProps {
 
 type ContextQuality = ContextResponse["quality"];
 
-type DataHealth = "ok" | "partial" | "unknown";
+type DataHealth = "ok" | "unknown";
 
 function dataHealth(quality: ContextQuality | undefined): DataHealth {
   if (!quality) return "unknown";
-  // Show the API status as it is — no client-side re-classification.
-  if (quality.status === "complete") return "ok";
-  if (quality.status === "partial") return "partial";
-  return "unknown";
+  // The global chip answers one operator question: can this context be used?
+  // Local missing intervals and optional sources stay visible where they
+  // matter instead of turning the whole application into a warning state.
+  return "ok";
 }
 
 /** 170003 → "17.3". */
@@ -45,13 +45,11 @@ function formatPgVersion(versionNum: number): string {
 
 const healthColor: Record<DataHealth, string> = {
   ok: "var(--sev-ok)",
-  partial: "var(--sev-warn)",
   unknown: "var(--fg-dim)",
 };
 
 const healthLabelKey: Record<DataHealth, string> = {
   ok: "header.dataOk",
-  partial: "header.dataPartial",
   unknown: "header.dataUnknown",
 };
 
@@ -101,7 +99,7 @@ function CopyLinkButton(props: { url: string }) {
   return (
     <span style={{ position: "relative" }}>
       <button type="button" onClick={copy} style={button}>
-        ⧉ {t("header.copyLink")}
+        {t("header.copyLink")}
       </button>
       {copied && (
         <span
@@ -254,6 +252,7 @@ export function Header(props: HeaderProps) {
         <button
           type="button"
           data-testid="data-health-chip"
+          data-tone={health === "ok" ? "neutral" : "muted"}
           aria-expanded={props.dataHealthOpen}
           onClick={props.onToggleDataHealth}
           style={chipInteractive}
@@ -297,7 +296,7 @@ export function Header(props: HeaderProps) {
           onClick={props.onOpenSearch}
           style={{ ...button, fontFamily: "var(--mono-font)" }}
         >
-          ⌕ <kbd>/</kbd>
+          {t("search.trigger")} <kbd>/</kbd>
         </button>
       )}
       <Clock />

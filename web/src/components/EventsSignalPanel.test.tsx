@@ -37,7 +37,7 @@ function response(body: unknown): Response {
   });
 }
 
-test("Signals requests a bounded range and renders at most six newest lanes", async () => {
+test("Signals keeps newest lanes human and free of collection quality codes", async () => {
   const events = Array.from({ length: 8 }, (_, index) =>
     makeEventFact({
       event_instance_id: `event-${index}`,
@@ -66,7 +66,16 @@ test("Signals requests a bounded range and renders at most six newest lanes", as
   const lanes = await screen.findAllByTestId("event-signal-lane");
   expect(lanes).toHaveLength(6);
   expect(lanes[0]?.getAttribute("data-event-instance")).toBe("event-7");
-  expect(lanes[0]?.textContent).toContain("derived_exact");
+  expect(screen.getByTestId("event-signals-summary").textContent).toContain(
+    "eventsSignals.summary",
+  );
+  expect(lanes[0]?.textContent).toContain("×8");
+  expect(lanes[0]?.textContent).not.toMatch(
+    /derived_exact|content_derived|quality/i,
+  );
+  expect(lanes[0]?.getAttribute("aria-label")).not.toMatch(
+    /derived_exact|content_derived|quality/i,
+  );
   const url = new URL((fetchMock.mock.calls[0]?.[0] as Request).url);
   expect(url.pathname).toBe("/v1/timeline/events");
   expect(url.searchParams.get("from")).toBe("1722396400000000");
@@ -121,7 +130,7 @@ test("a family lens filters Signals and routes opaque entity identity only to an
   expect(onInvestigate.mock.calls[0]).not.toContain("opaque-content-id");
 });
 
-test("Signals discloses partial, loss and empty evidence without fabricating lanes", async () => {
+test("Signals keeps retained facts visible without collection diagnostics", async () => {
   const fetchMock = vi.fn().mockResolvedValue(
     response(
       makeEventsResponse({
@@ -152,12 +161,12 @@ test("Signals discloses partial, loss and empty evidence without fabricating lan
   );
 
   await waitFor(() =>
-    expect(screen.getByTestId("event-signals-quality").textContent).toMatch(
-      /partial.*lower_bound/i,
+    expect(screen.getByTestId("event-signals-summary").textContent).toContain(
+      "eventsSignals.summary",
     ),
   );
-  expect(screen.getByTestId("event-signal-lane").textContent).toContain(
-    "producer_gap",
+  expect(screen.getByTestId("events-signal-panel").textContent).not.toMatch(
+    /partial|lower_bound|producer_gap/i,
   );
 
   fetchMock.mockResolvedValueOnce(response(makeEventsResponse({ events: [] })));

@@ -100,24 +100,9 @@
 
 .plans-workspace__coverage {
   margin-inline-start: auto;
-  color: var(--sev-ok-fg);
+  color: var(--fg-dim);
   font-family: var(--mono-font);
   text-wrap: nowrap;
-}
-
-.plans-workspace__coverage:not([data-quality="complete"]) {
-  color: var(--sev-warn-fg);
-}
-
-.plans-workspace__sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  border: 0;
 }
 
 .plan-change-evidence {
@@ -222,7 +207,7 @@
   align-self: center;
   max-width: 170px;
   margin-inline: var(--space-3);
-  color: var(--sev-warn-fg);
+  color: var(--fg-dim);
   font-family: var(--mono-font);
   font-size: var(--text-xs);
   text-transform: uppercase;

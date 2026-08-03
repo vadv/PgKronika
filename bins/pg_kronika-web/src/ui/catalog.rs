@@ -526,7 +526,7 @@ fn view(
             ),
             related: matches!(
                 projection.name.as_bytes(),
-                b"activity" | b"statements" | b"tables" | b"indexes" | b"vacuum"
+                b"activity" | b"statements" | b"tables" | b"indexes" | b"vacuum" | b"processes"
             ),
         },
         inputs: projection_inputs(projection),
@@ -1808,14 +1808,24 @@ fn processes_view() -> ViewSpec {
     view(
         projection("processes"),
         Scope::Host,
-        vec![JoinSpec {
-            left: "process",
-            right: "cgroup_mapping",
-            kind: RelationKind::Exact,
-            fields: vec!["pid", "starttime", "ts"],
-            cardinality: "zero_or_one",
-            provenance: "same_snapshot_pid_and_process_start",
-        }],
+        vec![
+            JoinSpec {
+                left: "process",
+                right: "cgroup_mapping",
+                kind: RelationKind::Exact,
+                fields: vec!["pid", "starttime", "ts"],
+                cardinality: "zero_or_one",
+                provenance: "same_snapshot_pid_and_process_start",
+            },
+            JoinSpec {
+                left: "process",
+                right: "activity",
+                kind: RelationKind::BestEffort,
+                fields: vec!["pid"],
+                cardinality: "zero_or_many",
+                provenance: "pid",
+            },
+        ],
         columns,
         vec![
             preset(

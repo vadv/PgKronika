@@ -260,13 +260,24 @@ fn host_and_object_views_publish_prepared_lenses_and_temporal_relations() {
         }
     }
 
-    for view in ["tables", "indexes", "vacuum"] {
+    for view in ["processes", "tables", "indexes", "vacuum"] {
         assert_eq!(
             serialized_view(&catalog, view)["capabilities"]["related"],
             true,
             "{view} exposes bounded same-snapshot relations"
         );
     }
+
+    let process_activity = serialized_view(&catalog, "processes")["joins"]
+        .as_array()
+        .expect("process joins")
+        .iter()
+        .find(|join| join["left"] == "process" && join["right"] == "activity")
+        .expect("process to activity join");
+    assert_eq!(process_activity["kind"], "best_effort");
+    assert_eq!(process_activity["fields"], json!(["pid"]));
+    assert_eq!(process_activity["cardinality"], "zero_or_many");
+    assert_eq!(process_activity["provenance"], "pid");
 
     for (view, left, right, provenance) in [
         (

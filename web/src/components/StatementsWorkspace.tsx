@@ -115,35 +115,13 @@ export function StatementsWorkspace(props: StatementsWorkspaceProps) {
             {t("statements.matrix.missing", { count: missing })}
           </span>
         )}
-        {quality !== undefined && (
-          <Tooltip
-            content={
-              <span className="statements-workspace__quality-tip">
-                <TipRow
-                  label={t("statements.matrix.quality")}
-                  value={`${quality.status} · ${quality.snapshots}`}
-                />
-                <TipRow
-                  label={t("statements.matrix.gaps")}
-                  value={String(quality.gaps.length)}
-                />
-                <TipRow
-                  label={t("statements.matrix.provenanceLabel")}
-                  value={t("statements.matrix.provenance")}
-                />
-              </span>
-            }
-          >
-            <span
-              className="statements-workspace__quality"
-              data-quality={quality.status}
-            >
-              {t("statements.matrix.qualitySummary", {
-                status: quality.status,
-                snapshots: quality.snapshots,
-              })}
-            </span>
-          </Tooltip>
+        {quality !== undefined && quality.snapshots > 0 && (
+          <span className="statements-workspace__samples">
+            {t("statements.matrix.samples", {
+              count: quality.snapshots,
+              defaultValue: `${quality.snapshots} snapshots`,
+            })}
+          </span>
         )}
       </div>
       <TableView

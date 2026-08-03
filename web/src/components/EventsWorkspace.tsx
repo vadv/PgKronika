@@ -55,18 +55,6 @@ export function groupEventFamilies(events: EventFact[]): EventFamilySummary[] {
   );
 }
 
-function lossSummary(events: EventFact[]): number {
-  return events.reduce(
-    (total, event) =>
-      total + Math.max(0, event.loss?.lost_count_lower_bound ?? 0),
-    0,
-  );
-}
-
-function qualityLabel(event: EventFact): string {
-  return `${event.identity_quality}/${event.evidence_quality}`;
-}
-
 export interface EventsWorkspaceProps {
   view: ViewSpec;
   from: string;
@@ -104,7 +92,6 @@ export function EventsWorkspace(props: EventsWorkspaceProps) {
     0,
   );
   const maxFamilyCount = Math.max(1, ...families.map((family) => family.count));
-  const lost = lossSummary(events);
 
   return (
     <section className="events-workspace" data-testid="events-workspace">
@@ -155,7 +142,7 @@ export function EventsWorkspace(props: EventsWorkspaceProps) {
             <span>{t("eventsWorkspace.time")}</span>
             <span>{t("eventsWorkspace.event")}</span>
             <span>{t("eventsWorkspace.entity")}</span>
-            <span>{t("eventsWorkspace.quality")}</span>
+            <span>{t("eventsWorkspace.occurrences")}</span>
           </div>
           <div className="events-range__rows" data-testid="event-range-rows">
             {query.isPending ? (
@@ -204,16 +191,20 @@ export function EventsWorkspace(props: EventsWorkspaceProps) {
                     </time>
                     <span className="event-range-row__event">
                       <span>{eventKindLabel(t, event.event_kind)}</span>
-                      <small>{event.event_kind}</small>
+                      <small>
+                        {t("eventsWorkspace.openIn", {
+                          target:
+                            target === "processes"
+                              ? "OS"
+                              : t(`tabs.${target}`, { defaultValue: target }),
+                        })}
+                      </small>
                     </span>
                     <span className="event-range-row__entity">
                       {event.entity?.kind ?? t("eventsWorkspace.cluster")}
                     </span>
-                    <span className="event-range-row__quality">
-                      {qualityLabel(event)}
-                      {event.occurrence_count > 1
-                        ? ` · ×${formatNumber(event.occurrence_count)}`
-                        : ""}
+                    <span className="event-range-row__occurrences">
+                      ×{formatNumber(Math.max(1, event.occurrence_count))}
                     </span>
                   </button>
                 );
@@ -248,30 +239,12 @@ export function EventsWorkspace(props: EventsWorkspaceProps) {
                     }}
                   />
                 </div>
-                <small>{family.code}</small>
+                <small>
+                  {t("eventsWorkspace.familyFacts", { count: family.facts })}
+                </small>
               </div>
             ))}
           </div>
-          <footer className="event-families__quality">
-            <div>
-              <span>{t("eventsWorkspace.completeness")}</span>
-              <strong>{query.data?.completeness ?? "—"}</strong>
-            </div>
-            <div>
-              <span>{t("eventsWorkspace.retention")}</span>
-              <strong>{query.data?.retained_exactness ?? "—"}</strong>
-            </div>
-            <div>
-              <span>{t("eventsWorkspace.omitted")}</span>
-              <strong>
-                {formatNumber(query.data?.omitted_by_response_filter ?? 0)}
-              </strong>
-            </div>
-            <div>
-              <span>{t("eventsWorkspace.lost")}</span>
-              <strong>{lost > 0 ? `≥${formatNumber(lost)}` : "0"}</strong>
-            </div>
-          </footer>
         </aside>
       </div>
     </section>

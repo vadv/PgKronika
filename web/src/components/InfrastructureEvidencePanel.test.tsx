@@ -93,8 +93,9 @@ test("Tables panel fetches only a bounded active-vacuum lane set", async () => {
   expect(panel.getAttribute("data-snapshot-ts")).toBe("1722399999000000");
   expect(panel.getAttribute("data-snapshot-match")).toBe("false");
   expect(panel.getAttribute("data-snapshot-delta-us")).toBe("1000000");
-  expect(panel.getAttribute("data-snapshot-provenance")).toBe(
-    "independent_nearest_vacuum_snapshot",
+  expect(panel.getAttribute("data-snapshot-provenance")).toBeNull();
+  expect(panel.textContent).not.toMatch(
+    /independent|not joined|lifetime|provenance/i,
   );
 });
 
@@ -126,8 +127,11 @@ test("Index and Vacuum panels disclose temporal context and lifetime limits", ()
     />,
     { wrapper },
   );
-  expect(screen.getByTestId("index-table-provenance").textContent).toContain(
-    "same_snapshot_database_relation_oid",
+  expect(screen.queryByTestId("index-table-provenance")).toBeNull();
+  expect(
+    screen.getByTestId("infrastructure-evidence-panel").textContent,
+  ).not.toMatch(
+    /same_snapshot_database_relation_oid|best_effort|temporal|proof|claim/i,
   );
 
   rerender(
@@ -165,7 +169,11 @@ test("Index and Vacuum panels disclose temporal context and lifetime limits", ()
       onOpenEntity={() => {}}
     />,
   );
-  expect(screen.getByTestId("vacuum-lifetime-warning")).toBeDefined();
+  expect(screen.queryByTestId("vacuum-lifetime-warning")).toBeNull();
+  expect(screen.getByTestId("vacuum-context-summary")).toBeDefined();
+  expect(
+    screen.getByTestId("infrastructure-evidence-panel").textContent,
+  ).not.toMatch(/provenance|proof|lifetime|PID reuse|datid|relid/i);
   expect(
     screen.getByTestId("vacuum-pre17-generation").getAttribute("data-status"),
   ).toBe("available");

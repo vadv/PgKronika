@@ -89,7 +89,7 @@ function HostSignalLane(props: {
               data-missing={value === null ? "true" : undefined}
               title={
                 value === null
-                  ? t("spine.missing")
+                  ? t("data.noSnapshotInterval")
                   : formatByUnit(value, props.series?.unit)
               }
             />
@@ -122,13 +122,11 @@ export function OsWorkspace(props: OsWorkspaceProps) {
   const psi = spine.data?.series.find(
     (series) => series.code === "psi_io_some",
   );
-  const quality = spine.data?.quality;
   const metrics = props.view.metrics.filter(
     (metric) =>
       metric.availability === "available" &&
       (metric.code === "cpu" || metric.code === "io"),
   );
-  const retained = heatmap.data?.rows.length ?? 0;
   const metricText = metricLabel(t, props.view.code, props.metric);
   const host = props.context?.host;
   const scopeFiltered = props.q !== null && props.q.trim() !== "";
@@ -144,8 +142,15 @@ export function OsWorkspace(props: OsWorkspaceProps) {
           <strong>
             {t(`hostEvidence.lens.${props.preset ?? "pressure"}`)}
           </strong>
-          <span className="os-host-rail__scope">
-            {t("hostEvidence.scope.host")}
+          <span
+            className="os-host-rail__facts"
+            data-testid="host-facts"
+            data-cpus={host?.logical_cpu_count ?? "unknown"}
+          >
+            {t("hostEvidence.facts", {
+              cpus: host?.logical_cpu_count ?? "—",
+              kernel: host?.kernel_version ?? "—",
+            })}
           </span>
         </div>
 
@@ -178,36 +183,6 @@ export function OsWorkspace(props: OsWorkspaceProps) {
             />
           </div>
         )}
-
-        <div
-          className="os-host-rail__guard"
-          data-testid="host-scope-guard"
-          data-cpus={host?.logical_cpu_count ?? "unknown"}
-        >
-          {t("hostEvidence.scopeGuard", {
-            cpus: host?.logical_cpu_count ?? "—",
-            kernel: host?.kernel_version ?? "—",
-          })}
-        </div>
-        <div className="os-host-rail__note">
-          {t(`hostEvidence.note.${props.preset ?? "pressure"}`)}
-        </div>
-        <div
-          className="os-host-rail__quality"
-          data-testid="host-quality"
-          data-limited={quality?.resource_limited.length ?? 0}
-          data-status={quality?.status ?? "pending"}
-        >
-          {quality === undefined
-            ? t("host.matrix.qualityPending")
-            : t("host.matrix.quality", {
-                status: quality.status,
-                snapshots: quality.snapshots,
-                gaps: quality.gaps.length,
-                gated: quality.gated.length,
-                limited: quality.resource_limited.length,
-              })}
-        </div>
       </aside>
 
       <div className="os-workspace__controls">
@@ -259,20 +234,6 @@ export function OsWorkspace(props: OsWorkspaceProps) {
                 matched: props.matched ?? "—",
               })
             : t("host.matrix.frame", { matched: props.matched ?? "—" })}
-        </span>
-        <span
-          className="os-workspace__population"
-          data-testid="os-heatmap-population"
-          data-retained={retained}
-        >
-          {t("host.matrix.globalHeatmap", { retained })}
-        </span>
-        <span className="os-workspace__scope-note">
-          {t(
-            scopeFiltered
-              ? "host.matrix.independentFilteredScopes"
-              : "host.matrix.independentScopes",
-          )}
         </span>
       </div>
 

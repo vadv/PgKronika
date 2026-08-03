@@ -28,7 +28,7 @@ const fixture: HeatmapResponse = {
   ranking: { exact: true, unseen_upper: 0 },
   rows: [
     {
-      entity: "e1",
+      entity: "AQACLQAAAAhAEHmW1IgGAA",
       label: "alpha",
       unit: "ms",
       score: { lower: 0, upper: 4 },
@@ -100,24 +100,24 @@ test("renders row labels and one cell per bucket, null cell marked empty", async
   fireEvent.mouseEnter(empty as Element);
   await waitFor(() =>
     expect(container.querySelector("[role='tooltip']")?.textContent).toContain(
-      "spine.missing",
+      "data.noSnapshotInterval",
     ),
   );
 });
 
-test("partial quality renders a warning badge", async () => {
+test("partial quality stays out of the normal heatmap surface", async () => {
   renderStrip();
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
-  expect(screen.getByText(/partial/)).toBeDefined();
+  expect(screen.queryByText(/partial/)).toBeNull();
 });
 
-test("partial ranking exposes the unseen candidate bound", async () => {
+test("partial ranking stays out of the normal heatmap surface", async () => {
   const original = fixture.ranking;
   fixture.ranking = { exact: false, unseen_upper: 17 };
   renderStrip();
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
-  const ranking = screen.getByText("heatmap.ranking.partial");
-  expect(ranking.getAttribute("title")).toContain("17");
+  expect(screen.queryByText("heatmap.ranking.partial")).toBeNull();
+  expect(screen.queryByText(/unseen_upper|17/)).toBeNull();
   fixture.ranking = original;
 });
 
@@ -144,10 +144,23 @@ test("row label click reports the entity", async () => {
   renderStrip({ onSelectEntity });
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
   fireEvent.click(screen.getByText("alpha"));
-  expect(onSelectEntity).toHaveBeenCalledWith("e1");
+  expect(onSelectEntity).toHaveBeenCalledWith("AQACLQAAAAhAEHmW1IgGAA");
 });
 
-test("partial chip tooltip lists localized quality reasons", async () => {
+test("row tooltip shows the human label without the routing token", async () => {
+  const { container } = renderStrip();
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  fireEvent.mouseEnter(screen.getByText("alpha"));
+  await waitFor(() =>
+    expect(container.querySelector("[role='tooltip']")).not.toBeNull(),
+  );
+  const tip = container.querySelector("[role='tooltip']")?.textContent ?? "";
+  expect(tip).toContain("alpha");
+  expect(tip).not.toContain("AQACLQAAAAhAEHmW1IgGAA");
+  expect(tip).not.toContain("tooltip.entity");
+});
+
+test("partial quality reasons stay in explicit diagnostics", async () => {
   const original = fixture.quality;
   fixture.quality = makeHeatmapQuality({
     status: "partial",
@@ -156,16 +169,10 @@ test("partial chip tooltip lists localized quality reasons", async () => {
     resource_limited: [],
     active_tail: true,
   });
-  const { container } = renderStrip();
+  renderStrip();
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
-  const chip = screen.getByText("heatmap.partial");
-  fireEvent.mouseEnter(chip);
-  await waitFor(() =>
-    expect(container.querySelector("[role='tooltip']")).not.toBeNull(),
-  );
-  const tip = container.querySelector("[role='tooltip']")?.textContent ?? "";
-  expect(tip).toContain("heatmap.quality.gated");
-  expect(tip).toContain("heatmap.quality.active_tail");
+  expect(screen.queryByText("heatmap.partial")).toBeNull();
+  expect(screen.queryByText(/heatmap\.quality\./)).toBeNull();
   fixture.quality = original;
 });
 

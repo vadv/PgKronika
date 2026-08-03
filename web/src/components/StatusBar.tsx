@@ -15,7 +15,6 @@ export function StatusBar(props: StatusBarProps) {
   const notable = props.summary?.views.filter((v) => v.notable).length ?? 0;
   const replay = props.state.at !== null;
   const cursor = props.state.at ?? props.summary?.at_us ?? null;
-  const quality = props.summary?.quality.status ?? null;
   const selected = props.state.entity === null ? 0 : 1;
   const Root = props.embedded === true ? "div" : "footer";
   return (
@@ -61,13 +60,6 @@ export function StatusBar(props: StatusBarProps) {
             : "statusbar.baseline.present",
         )}
       </span>
-      <span aria-hidden="true">·</span>
-      <span data-status-field="quality">
-        {quality === null
-          ? t("statusbar.quality.unknown")
-          : `${t("statusbar.quality")}: ${quality}`}
-      </span>
-      <span aria-hidden="true">·</span>
       <span data-status-field="selection">
         {t("statusbar.selection")}: {selected}
       </span>

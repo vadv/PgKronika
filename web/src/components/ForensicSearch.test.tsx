@@ -55,6 +55,15 @@ function stubResult() {
               }),
             ],
             page: { matched: 1, returned: 1, next: null },
+            quality: {
+              status: "partial",
+              snapshots: 1,
+              gaps: [{ from_us: "1", to_us: "2" }],
+              gated: ["optional_source"],
+              unavailable_revision: [],
+              resource_limited: ["source_limit"],
+              active_tail: true,
+            },
           }),
         ),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -84,6 +93,67 @@ function stubNoResults() {
               resource_limited: ["source_limit"],
               active_tail: true,
             },
+          }),
+        ),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ),
+  );
+}
+
+function stubUnavailableSource() {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify(
+          makeFrameResponse({
+            view: "activity",
+            rows: [],
+            page: { matched: 0, returned: 0, next: null },
+            quality: {
+              status: "partial",
+              snapshots: 0,
+              gaps: [],
+              gated: [],
+              unavailable_revision: ["pg_stat_activity_revision"],
+              resource_limited: [],
+              active_tail: false,
+            },
+          }),
+        ),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ),
+  );
+}
+
+function stubFormattedProcessResult() {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify(
+          makeFrameResponse({
+            view: "processes",
+            snapshot_ts_us: "1722400000000000",
+            columns: [
+              makeFrameColumn({ code: "pid", type: "i64" }),
+              makeFrameColumn({ code: "cpu", type: "f64" }),
+              makeFrameColumn({
+                code: "read_bytes_per_second",
+                type: "f64",
+                unit: "bytes_per_second",
+              }),
+            ],
+            rows: [
+              makeFrameRow({
+                entity: "process:45",
+                label: "pg_kronika-web / 45",
+                cells: [45, 0.33992881890532123, 4096],
+              }),
+            ],
+            page: { matched: 1, returned: 1, next: null },
           }),
         ),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -131,11 +201,60 @@ test("groups a server result with reason and keyboard-opens its detail", async (
   });
   expect(screen.getByText("pid = 18422")).toBeDefined();
   expect(screen.getByText(/1.*1/)).toBeDefined();
+  expect(screen.getByRole("dialog").textContent).not.toMatch(
+    /partial|gaps|gated|optional_source|source_limit|active tail/i,
+  );
 
   fireEvent.keyDown(input, { key: "ArrowDown" });
   await waitFor(() => expect(document.activeElement).toBe(result));
   fireEvent.keyDown(result, { key: "Enter" });
   expect(onSelect).toHaveBeenCalledWith("activity", "AQBwaWQtMTg0MjI");
+});
+
+test("formats compact search evidence with the response column metadata", async () => {
+  stubFormattedProcessResult();
+  render(
+    <ForensicSearch
+      open
+      views={[
+        makeViewSpec({
+          code: "processes",
+          columns: [
+            pidColumn,
+            {
+              code: "cpu",
+              type: "f64",
+              lazy: false,
+              requires: [],
+              availability: "available",
+            },
+            {
+              code: "read_bytes_per_second",
+              type: "f64",
+              unit: "bytes_per_second",
+              lazy: false,
+              requires: [],
+              availability: "available",
+            },
+          ],
+        }),
+      ]}
+      at="1722400000000000"
+      span={3600}
+      onClose={() => {}}
+      onSelect={() => {}}
+    />,
+    { wrapper },
+  );
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "pid:45" },
+  });
+
+  const result = await screen.findByRole("button", {
+    name: /pg_kronika-web \/ 45/,
+  });
+  expect(result.textContent).toContain("45 · 0.34 · 4 KiB/s");
+  expect(result.textContent).not.toContain("0.33992881890532123");
 });
 
 test("shows unsupported evidence keys and Escape closes", () => {
@@ -158,7 +277,7 @@ test("shows unsupported evidence keys and Escape closes", () => {
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
-test("shows an honest aggregate empty state after every group settles", async () => {
+test("shows a simple empty state after every group settles", async () => {
   stubNoResults();
   render(
     <ForensicSearch
@@ -175,11 +294,35 @@ test("shows an honest aggregate empty state after every group settles", async ()
     target: { value: "pid:99999" },
   });
   expect(
-    await screen.findByText(
-      "No matches in retained snapshot candidates; absence is not proof",
-    ),
+    await screen.findByText("No matches for the selected period"),
   ).toBeDefined();
-  expect(screen.getByText(/limited 1/)).toBeDefined();
+  expect(screen.getByRole("dialog").textContent).not.toMatch(
+    /partial|gaps|gated|limited|active tail|proof/i,
+  );
+});
+
+test("shows a calm per-source message when that source has no data", async () => {
+  stubUnavailableSource();
+  render(
+    <ForensicSearch
+      open
+      views={views}
+      at="1722400000000000"
+      span={3600}
+      onClose={() => {}}
+      onSelect={() => {}}
+    />,
+    { wrapper },
+  );
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "pid:18422" },
+  });
+  expect(
+    await screen.findByText("No data for this source in the selected period"),
+  ).toBeDefined();
+  expect(screen.getByRole("dialog").textContent).not.toMatch(
+    /unavailable_revision|pg_stat_activity_revision|partial|gated/i,
+  );
 });
 
 test("has a visible close control, traps Tab and dismisses via the backdrop", async () => {

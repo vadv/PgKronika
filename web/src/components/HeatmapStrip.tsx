@@ -2,7 +2,7 @@ import { Fragment, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { metricDesc, metricLabel } from "../api/codes";
 import { useHeatmap } from "../api/heatmap";
-import type { HeatmapQuality, HeatmapRow, ViewSpec } from "../api/types";
+import type { HeatmapRow, ViewSpec } from "../api/types";
 import { breakableCode, formatByUnit, shortIdToken } from "../design/format";
 import { heatColor } from "./heatmapColor";
 import { HEATMAP_LABEL_COL_PX } from "../design/ui";
@@ -30,27 +30,6 @@ function timePercent(
   } catch {
     return null;
   }
-}
-
-/** Localized breakdown of heatmap quality reasons for the partial chip:
- * a bare "partial data" gives the operator nothing to act on. */
-function qualityReasonRows(
-  quality: HeatmapQuality,
-  t: (key: string, opts?: Record<string, unknown>) => string,
-): Array<{ code: string; label: string }> {
-  const rows: Array<{ code: string; label: string }> = [];
-  const push = (code: string, count: number) => {
-    if (count > 0)
-      rows.push({ code, label: t(`heatmap.quality.${code}`, { count }) });
-  };
-  push("gaps", quality.gaps.length);
-  push("gated", quality.gated.length);
-  push("unavailable_revision", quality.unavailable_revision.length);
-  push("resource_limited", quality.resource_limited.length);
-  push("unbounded_segments", quality.unbounded_segments.length);
-  if (quality.active_tail)
-    rows.push({ code: "active_tail", label: t("heatmap.quality.active_tail") });
-  return rows;
 }
 
 /** Heatmap row labels for token views are raw uint64 decimals — shorten to
@@ -94,18 +73,7 @@ function HeatmapRowView(props: {
   const label = displayLabel(props.view, r.label);
   return (
     <Fragment>
-      <Tooltip
-        content={
-          <span style={{ display: "grid", gap: "2px" }}>
-            <span>{breakableCode(r.label)}</span>
-            <TipRow
-              label={t("tooltip.entity")}
-              value={breakableCode(r.entity)}
-              mono
-            />
-          </span>
-        }
-      >
+      <Tooltip content={<span>{breakableCode(r.label)}</span>}>
         <button
           onClick={() => props.onSelectEntity(r.entity)}
           style={{
@@ -148,7 +116,9 @@ function HeatmapRowView(props: {
                 <TipRow
                   label={props.metricText}
                   value={
-                    v === null ? t("spine.missing") : formatByUnit(v, r.unit)
+                    v === null
+                      ? t("data.noSnapshotInterval")
+                      : formatByUnit(v, r.unit)
                   }
                   mono
                 />
@@ -353,53 +323,6 @@ export function HeatmapStrip(props: {
             );
           })}
         </div>
-        {heatmap.data &&
-          (heatmap.data.quality.gaps.length > 0 ||
-            (heatmap.data.quality.status !== "complete" &&
-              !heatmap.data.quality.active_tail)) && (
-            <Tooltip
-              content={
-                <span style={{ display: "grid", gap: "2px" }}>
-                  {qualityReasonRows(heatmap.data.quality, t).map((row) => (
-                    <TipRow key={row.code} label={row.code} value={row.label} />
-                  ))}
-                </span>
-              }
-            >
-              <span
-                style={{
-                  fontFamily: "var(--ui-font)",
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 600,
-                  color: "var(--sev-warn-fg)",
-                  background: "var(--sev-warn-bg)",
-                  borderRadius: "var(--radius-sm)",
-                  padding: "1px 8px",
-                }}
-              >
-                {t("heatmap.partial")}
-              </span>
-            </Tooltip>
-          )}
-        {heatmap.data?.ranking.exact === false && (
-          <span
-            role="status"
-            title={`${t("heatmap.ranking.partialHint", {
-              count: heatmap.data.ranking.unseen_upper,
-            })} · unseen_upper=${heatmap.data.ranking.unseen_upper}`}
-            style={{
-              fontFamily: "var(--ui-font)",
-              fontSize: "var(--text-xs)",
-              fontWeight: 600,
-              color: "var(--sev-warn-fg)",
-              background: "var(--sev-warn-bg)",
-              borderRadius: "var(--radius-sm)",
-              padding: "1px 8px",
-            }}
-          >
-            {t("heatmap.ranking.partial")}
-          </span>
-        )}
         {/* Verdict legend: the colors mean thresholds, not decoration. */}
         <span
           style={{

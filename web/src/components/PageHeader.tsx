@@ -1,12 +1,7 @@
 import { useTranslation } from "react-i18next";
 import type { ViewSpec, ViewSummaryItem } from "../api/types";
 import { formatTimestampUs } from "../design/format";
-import { DATA_STATES, verdictTint, type DataState } from "../design/ui";
-import { ProvenancePopover } from "./ProvenancePopover";
-
-function knownDataState(value: string): DataState | undefined {
-  return DATA_STATES.find((state) => state === value);
-}
+import { verdictTint } from "../design/ui";
 
 export function PageHeader(props: {
   view: ViewSpec;
@@ -21,24 +16,12 @@ export function PageHeader(props: {
   const s = props.summary;
   const snapshotLabel =
     s?.snapshot_ts_us != null ? formatTimestampUs(s.snapshot_ts_us) : null;
-  const collection = s?.collection;
-  const collectionState =
-    s !== undefined && s.status !== "complete"
-      ? knownDataState(s.status)
-      : collection !== undefined && collection !== null
-        ? knownDataState(collection.read_state)
-        : undefined;
 
   // One context line instead of boxed KPI chips: population, collection
   // coverage and the live filter count, each with its meaning in the title.
   const contextParts: string[] = [];
   if (s?.population != null) {
     contextParts.push(`${t("pageheader.population")}: ${s.population}`);
-  }
-  if (collection != null) {
-    contextParts.push(
-      `${t("pageheader.collection")}: ${collection.collected}/${collection.source_total ?? "?"}`,
-    );
   }
   if (props.matched !== null) {
     contextParts.push(`${t("pageheader.matched")}: ${props.matched}`);
@@ -73,9 +56,15 @@ export function PageHeader(props: {
       >
         {snapshotLabel !== null
           ? t("pageheader.snapshot", { at: snapshotLabel })
-          : props.live
-            ? t("pageheader.livePending")
-            : t("pageheader.noSnapshot")}
+          : props.matched !== null
+            ? t(
+                props.live
+                  ? "pageheader.liveRetained"
+                  : "pageheader.retainedSnapshot",
+              )
+            : props.live
+              ? t("pageheader.livePending")
+              : t("pageheader.noSnapshot")}
       </span>
       {contextParts.length > 0 && (
         <span
@@ -88,30 +77,6 @@ export function PageHeader(props: {
         >
           {contextParts.join(" · ")}
         </span>
-      )}
-      {s !== undefined && collection !== null && collection !== undefined && (
-        <ProvenancePopover
-          triggerLabel={t("pageheader.provenance.trigger")}
-          renderTrigger={() => t("pageheader.provenance.short")}
-          record={{
-            definition: t("pageheader.provenance.definition"),
-            value: `${collection.collected}/${collection.source_total ?? "?"}`,
-            snapshot: s.snapshot_ts_us ?? undefined,
-            source:
-              props.view.inputs.length > 0
-                ? props.view.inputs.map((input) => input.code).join(", ")
-                : undefined,
-            coverage: t("pageheader.provenance.coverage", {
-              readState: collection.read_state,
-              visibility: collection.visibility,
-            }),
-            state: collectionState,
-            reason:
-              collectionState !== undefined
-                ? `${s.status} · ${collection.read_state} · ${collection.visibility}`
-                : undefined,
-          }}
-        />
       )}
       {s?.notable === true && (
         <button

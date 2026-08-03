@@ -155,7 +155,7 @@ test("tab switches the dock kind and close calls onClose", () => {
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
-test("row dock: no visible token line — the token rides tooltip and copy", async () => {
+test("row dock keeps the technical id out of the human heading", async () => {
   stubFetch(
     makeEntityPointResponse({ view: "activity", entity: "AQAEBQAAx9" }),
   );
@@ -168,10 +168,14 @@ test("row dock: no visible token line — the token rides tooltip and copy", asy
   await waitFor(() =>
     expect(screen.getByTestId("dock-copy-token")).toBeDefined(),
   );
-  // The raw token never renders as its own line; the heading carries it.
+  // The raw token never renders as its own line or native tooltip.
   expect(screen.queryByText("AQAEBQAA…")).toBeNull();
-  expect(screen.getByTitle("AQAEBQAAx9")).toBeDefined();
-  fireEvent.click(screen.getByTestId("dock-copy-token"));
+  expect(
+    screen.getByTestId("dock-entity-heading").getAttribute("title"),
+  ).toBeNull();
+  const copy = screen.getByTestId("dock-copy-token");
+  expect(copy.getAttribute("aria-label")).toBe("dock.row.copyTechnicalId");
+  fireEvent.click(copy);
   expect(writeText).toHaveBeenCalledWith("AQAEBQAAx9");
 });
 
@@ -192,7 +196,11 @@ test("row dock renders point fields from the entity endpoint", async () => {
   });
   await waitFor(() => expect(screen.getByText("42")).toBeDefined());
   expect(screen.getByText("tup")).toBeDefined();
-  expect(screen.getByText("dock.row.partial")).toBeDefined();
+  const summary = screen.getByRole("tabpanel");
+  expect(summary.textContent).not.toMatch(
+    /partial|complete|gaps|gated|point projection|\/v1\/entity/i,
+  );
+  expect(document.querySelector("[data-detail-provenance]")).toBeNull();
   const missing = screen.getByText("—");
   expect(missing.dataset.status).toBeUndefined();
   expect(missing.title).toBe("");
@@ -247,7 +255,7 @@ test("row dock fetches bounded history only after selecting the History tab", as
   expect(screen.getAllByText("—").length).toBeGreaterThan(0);
 });
 
-test("history preserves quality and follows every opaque continuation", async () => {
+test("history follows every continuation without a window quality banner", async () => {
   const point = makeEntityPointResponse({
     fields: [{ code: "tup", value: 12 }],
   });
@@ -317,14 +325,12 @@ test("history preserves quality and follows every opaque continuation", async ()
   expect(screen.queryByText("dock.detail.historyQuality")).toBeNull();
   fireEvent.click(firstLoadMore);
   await waitFor(() => expect(screen.getByText("2")).toBeDefined());
-  const pageTwoQuality = screen.getByText("dock.detail.historyQuality");
-  expect(pageTwoQuality.dataset.gaps).toBe("1");
-  expect(pageTwoQuality.dataset.gated).toBe("0");
+  expect(document.querySelector("[data-history-quality]")).toBeNull();
+  expect(screen.getAllByTestId("history-snapshot")).toHaveLength(2);
   fireEvent.click(screen.getByRole("button", { name: "dock.row.loadMore" }));
   await waitFor(() => expect(screen.getByText("3")).toBeDefined());
-  const pageThreeQuality = screen.getByText("dock.detail.historyQuality");
-  expect(pageThreeQuality.dataset.gaps).toBe("1");
-  expect(pageThreeQuality.dataset.gated).toBe("1");
+  expect(document.querySelector("[data-history-quality]")).toBeNull();
+  expect(screen.getAllByTestId("history-snapshot")).toHaveLength(3);
   expect(
     screen.queryByRole("button", { name: "dock.row.loadMore" }),
   ).toBeNull();
@@ -378,10 +384,12 @@ test("row dock in LIVE mode sends the resolved at (point shape), not a bare toke
   expect(url).toContain("/v1/entity/activity/db%3A1");
   expect(url).toContain("at=1722400000000000");
   // No label from the API: the view name heads the dock, the token stays a
-  // short secondary line — never the raw token as the title.
+  // routing material is not exposed as the title.
   const heading = screen.getByText("tabs.activity");
   expect(heading.parentElement?.textContent).not.toContain("db:1");
-  expect(screen.getByTitle("db:1")).toBeDefined();
+  expect(
+    screen.getByTestId("dock-entity-heading").getAttribute("title"),
+  ).toBeNull();
 });
 
 test("statements row dock: query heading fallback, uncut id, bounded query detail", async () => {
@@ -428,9 +436,11 @@ test("statements row dock: query heading fallback, uncut id, bounded query detai
   expect(screen.getByText("select * from orders where id = $1")).toBeDefined();
   fireEvent.click(screen.getByRole("tab", { name: "dock.detail.raw" }));
   expect(screen.getByText("dock.detail.rawProjectedOnly")).toBeDefined();
-  expect(document.querySelector("[data-raw-evidence]")?.textContent).toContain(
-    "select * from orders where id = $1",
-  );
+  const raw = document.querySelector("[data-raw-evidence]")?.textContent ?? "";
+  expect(raw).toContain("select * from orders where id = $1");
+  expect(raw).toContain("stmt:1");
+  expect(raw).toContain("/v1/entity/statements/");
+  expect(raw).toContain('"quality"');
 });
 
 test("row dock drills down via server related provenance and clears", async () => {
@@ -471,11 +481,12 @@ test("row dock drills down via server related provenance and clears", async () =
   );
   // The drill target comes from the API related list — typed identity, no
   // client-side join by name/queryid.
-  const drill = screen.getByRole("button", { name: /statement_plan/ });
-  // Relation kind, method and fields are visible evidence, not tooltip-only.
-  expect(drill.textContent).toContain("best_effort");
-  expect(drill.textContent).toContain("ossc_queryid_dbid_userid_attribution");
-  expect(drill.textContent).toContain("queryid, dbid, userid");
+  const drill = screen.getByRole("button", { name: /dock\.relation\.query/ });
+  expect(drill.textContent).toContain("dock.relation.query");
+  expect(drill.textContent).toContain("plans");
+  expect(drill.textContent).not.toMatch(
+    /statement_plan|best_effort|exact|ossc_queryid|queryid|dbid|userid/,
+  );
   fireEvent.click(drill);
   expect(onPatch).toHaveBeenCalledWith({
     view: "plans",
@@ -490,11 +501,16 @@ test("row dock drills down via server related provenance and clears", async () =
   expect(onPatch).toHaveBeenCalledWith({ entity: null, dock: null });
 });
 
-test("activity-process relationship is presented as a direct PID link", async () => {
+test("activity-process relationship stays positive across partial collection", async () => {
   stubFetch(
     makeEntityPointResponse({
       view: "activity",
       entity: "activity:44",
+      quality: {
+        status: "partial",
+        gaps: [{ from_us: "1722399999000000", to_us: "1722400000000000" }],
+        gated: [],
+      },
       related: [
         {
           view: "processes",
@@ -522,8 +538,9 @@ test("activity-process relationship is presented as a direct PID link", async ()
   fireEvent.click(
     await screen.findByRole("tab", { name: "dock.detail.relationships" }),
   );
-  const link = screen.getByRole("button", { name: /activity_process/ });
-  expect(link.textContent).toContain("relation.activityProcess.pid");
-  expect(link.textContent).not.toContain("best_effort");
-  expect(link.textContent).not.toContain("proof");
+  const link = screen.getByRole("button", { name: /dock\.relation\.pid/ });
+  expect(link.textContent).toContain("dock.relation.pid");
+  expect(link.textContent).not.toMatch(
+    /activity_process|best_effort|exact|partial|gaps|proof/,
+  );
 });

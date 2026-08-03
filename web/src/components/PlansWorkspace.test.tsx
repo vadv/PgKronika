@@ -242,18 +242,20 @@ test("builds one dense Plans matrix with bounded regression evidence", async () 
   expect(screen.getByTestId("plans-regression-boundary")).toBeDefined();
   expect(screen.queryByTestId("plans-detached-heatmap")).toBeNull();
   const provenance = screen.getByTestId("plans-attribution-provenance");
-  expect(provenance.textContent).toContain(
-    "ossc_queryid_dbid_userid_attribution",
-  );
-  expect(provenance.textContent).toContain(
-    "vadv_queryid_stat_statements_dbid_userid_attribution",
+  expect(provenance.textContent).toContain("plans.attribution.ossc");
+  expect(provenance.textContent).toContain("plans.attribution.vadv");
+  expect(provenance.textContent).not.toMatch(
+    /best_effort|queryid|dbid|userid|_attribution/i,
   );
   expect(
     await screen.findAllByTestId("plan-observation-envelope"),
   ).toHaveLength(3);
-  expect(screen.getByTestId("plan-change-evidence").dataset.provenance).toBe(
-    "first_last_observed_only",
-  );
+  expect(
+    screen.getByTestId("plan-change-evidence").dataset.provenance,
+  ).toBeUndefined();
+  const coverage = document.querySelector(".plans-workspace__coverage");
+  expect(coverage?.getAttribute("data-quality")).toBeNull();
+  expect(coverage?.getAttribute("title")).toBeNull();
 
   const calls = vi.mocked(fetch).mock.calls.map(([input]) => requestUrl(input));
   const heatmapCall = calls.find(

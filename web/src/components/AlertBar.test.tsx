@@ -30,8 +30,8 @@ test("renders nothing when live and quality is complete without gaps", () => {
   expect(container.firstChild).toBeNull();
 });
 
-test("shows a stale alert when live and quality is not complete", () => {
-  render(
+test("keeps partial collection out of the normal live chrome", () => {
+  const { container } = render(
     <AlertBar
       live={true}
       summary={makeViewSummaryResponse({
@@ -39,11 +39,11 @@ test("shows a stale alert when live and quality is not complete", () => {
       })}
     />,
   );
-  expect(screen.getByRole("alert").textContent).toContain("alertbar.stale");
+  expect(container.firstChild).toBeNull();
 });
 
-test("shows a stale alert when live and gaps exist", () => {
-  render(
+test("keeps collection gaps in explicit diagnostics", () => {
+  const { container } = render(
     <AlertBar
       live={true}
       summary={makeViewSummaryResponse({
@@ -51,7 +51,7 @@ test("shows a stale alert when live and gaps exist", () => {
       })}
     />,
   );
-  expect(screen.getByRole("alert")).toBeDefined();
+  expect(container.firstChild).toBeNull();
 });
 
 test("renders nothing when live but summary is undefined", () => {

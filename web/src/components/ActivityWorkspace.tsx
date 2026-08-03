@@ -170,12 +170,10 @@ function ActivityLockEvidence(props: {
     <section
       className="activity-lock-evidence"
       data-testid="activity-lock-evidence"
-      data-provenance="edge_only"
       aria-label={t("activity.matrix.locks.title")}
     >
       <div className="activity-lock-evidence__context">
         <strong>{t("activity.matrix.locks.title")}</strong>
-        <span>{t("activity.matrix.locks.note")}</span>
       </div>
       <div className="activity-lock-evidence__edges">
         {isSearchingForEdges && (
@@ -225,9 +223,6 @@ function ActivityLockEvidence(props: {
           );
         })}
       </div>
-      <span className="activity-lock-evidence__badge">
-        {t("activity.matrix.locks.provenance")}
-      </span>
     </section>
   );
 }
@@ -246,15 +241,7 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
   const metrics = props.view.metrics.filter(
     (metric) => metric.availability === "available",
   );
-  const quality = heatmap.data?.quality;
-  const retained = heatmap.data?.rows.length ?? 0;
   const metricText = metricLabel(t, props.view.code, props.metric);
-  const processJoin = props.view.joins.find(
-    (join) =>
-      join.left === "activity" &&
-      join.right === "process" &&
-      join.kind === "best_effort",
-  );
 
   return (
     <section
@@ -268,7 +255,6 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
           data-testid="activity-point-evidence"
         >
           <strong>{t("activity.snapshotBadge")}</strong>
-          <span>{t("activity.pointEvidence")}</span>
         </div>
         <div
           className="activity-workspace__metrics"
@@ -289,23 +275,18 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
           ))}
         </div>
         <span
-          className="activity-workspace__provenance"
-          data-testid="activity-process-provenance"
-          title={t("activity.processEvidence")}
+          className="activity-workspace__process-link"
+          data-testid="activity-process-link"
+          title={t("relation.kind.pid.desc")}
         >
-          {processJoin === undefined
-            ? t("relation.kind.unavailable.label")
-            : t("relation.activityProcess.pid")}
+          {t("relation.activityProcess.pid")}
         </span>
         <span
-          className="activity-workspace__coverage"
-          data-quality={quality?.status ?? "loading"}
+          className="activity-workspace__population"
+          data-testid="activity-population"
+          data-matched={props.matched ?? undefined}
         >
-          {t("activity.matrix.coverage", {
-            retained,
-            matched: props.matched ?? "—",
-            snapshots: quality?.snapshots ?? "—",
-          })}
+          {t("activity.matrix.backends", { count: props.matched ?? "—" })}
         </span>
       </div>
       {props.preset === "waits_locks" && (

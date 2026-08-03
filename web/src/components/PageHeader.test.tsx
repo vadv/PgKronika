@@ -33,6 +33,12 @@ test("missing snapshot in live mode reads as pending, not an error", () => {
   expect(screen.getByText("pageheader.livePending")).toBeDefined();
 });
 
+test("loaded live rows read as retained evidence while summary catches up", () => {
+  render(<PageHeader view={view} summary={undefined} matched={504} live />);
+  expect(screen.getByText("pageheader.liveRetained")).toBeDefined();
+  expect(screen.queryByText("pageheader.livePending")).toBeNull();
+});
+
 test("missing snapshot on a pinned cursor keeps the honest no-snapshot", () => {
   render(
     <PageHeader view={view} summary={undefined} matched={null} live={false} />,
@@ -63,7 +69,7 @@ test("notable button carries the level text and drills into incidents", () => {
   expect(onOpenIncidents).toHaveBeenCalledTimes(1);
 });
 
-test("collection coverage joins the context line when present", () => {
+test("collection coverage stays out of the normal page header", () => {
   render(
     <PageHeader
       view={view}
@@ -80,10 +86,11 @@ test("collection coverage joins the context line when present", () => {
     />,
   );
   const context = screen.getByTitle("pageheader.matchedHint");
-  expect(context.textContent).toContain("pageheader.collection: 42/45");
+  expect(context.textContent).not.toContain("pageheader.collection");
+  expect(context.textContent).not.toContain("42/45");
 });
 
-test("collection coverage opens exact source and snapshot provenance", () => {
+test("source provenance stays in explicit diagnostics instead of the page header", () => {
   render(
     <PageHeader
       view={makeViewSpec({
@@ -111,13 +118,9 @@ test("collection coverage opens exact source and snapshot provenance", () => {
       live={false}
     />,
   );
-  fireEvent.click(
-    screen.getByRole("button", { name: "pageheader.provenance.trigger" }),
-  );
-  const dialog = screen.getByRole("dialog");
-  expect(dialog.textContent).toContain("42/45");
-  expect(dialog.textContent).toContain("1722400000000123");
-  expect(dialog.textContent).toContain("pg.stat_statements");
-  expect(dialog.textContent).toContain("partial");
-  expect(dialog.textContent).toContain("bounded");
+  expect(
+    screen.queryByRole("button", { name: "pageheader.provenance.trigger" }),
+  ).toBeNull();
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(screen.getByText("tabs.statements")).toBeDefined();
 });

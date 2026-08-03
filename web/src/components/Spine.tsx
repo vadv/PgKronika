@@ -13,7 +13,6 @@ import {
 } from "../design/format";
 import type { TimeRange } from "../state/timeGeometry";
 import { Tooltip } from "./Tooltip";
-import { ProvenancePopover } from "./ProvenancePopover";
 import {
   aggregateEventBuckets,
   bucketReason,
@@ -25,6 +24,7 @@ import {
   windowScore,
   type BucketVerdict,
 } from "./spineHealth";
+import "./Spine.css";
 
 export interface SpineProps {
   /** Cursor timestamp (int64 µs, decimal string); null = LIVE. */
@@ -43,11 +43,8 @@ export interface SpineProps {
   onHover?: (hoverUs: string | null) => void;
   onBrushDraft?: (range: TimeRange | null) => void;
   onCommitRange?: (range: TimeRange) => void;
-  /** Accessible explanation: coincidence and collection quality, not cause. */
+  /** Accessible explanation of the shared PostgreSQL and OS time scale. */
   meaning?: string;
-  /** The public HealthLine opts into persistent score provenance; direct
-   * Spine consumers remain a query/render backend without extra chrome. */
-  showProvenance?: boolean;
   /** @deprecated Navigation owns mode and prepared spans. */
   controls?: "embedded" | "external";
   /** @deprecated Navigation owns prepared spans. */
@@ -225,8 +222,8 @@ export function Spine(props: SpineProps) {
   // (the snapshot cadence), and keepPreviousData holds the last answer
   // across a boundary — no placeholder flash.
   const liveOpts = { refetchInterval: live ? LIVE_REFRESH_MS : undefined };
-  // Health and incidents are queried over the doubled window so the score
-  // delta against the previous window costs no extra requests.
+  // Health accepts the doubled comparison window. Incidents are intentionally
+  // split because that endpoint enforces the public 24 hour query bound.
   const health = useTimelineHealth(
     { from: prevFrom, to, step: bucketSpanUs },
     liveOpts,
@@ -239,7 +236,11 @@ export function Spine(props: SpineProps) {
     { from, to, limit: 50, maxPages: 4 },
     liveOpts,
   );
-  const incidents = useIncidents({ from: prevFrom, to }, liveOpts);
+  const currentIncidents = useIncidents({ from, to }, liveOpts);
+  const previousIncidents = useIncidents(
+    { from: prevFrom, to: from },
+    liveOpts,
+  );
 
   const timestampX = (timestampUs: string | number): number => {
     const value =
@@ -296,19 +297,20 @@ export function Spine(props: SpineProps) {
     fromUs,
     SPINE_BUCKETS,
   );
-  const allIncidents = incidents.data?.incidents ?? [];
+  const currentWindowIncidents = currentIncidents.data?.incidents ?? [];
+  const previousWindowIncidents = previousIncidents.data?.incidents ?? [];
   // Score input excludes the forming tail bucket: the score only moves on a
   // completed-bucket boundary or an incident opening/closing (variant 2A).
   const scored = scoreVerdicts(verdicts, hasFormingTail);
   const score = windowScore(
     scored,
     (props.span * scored.length) / SPINE_BUCKETS,
-    countWindowIncidents(allIncidents, fromUs, toUs),
+    countWindowIncidents(currentWindowIncidents, fromUs, toUs),
   );
   const previousScore = windowScore(
     previousVerdicts,
     props.span,
-    countWindowIncidents(allIncidents, fromUs - windowNum, fromUs),
+    countWindowIncidents(previousWindowIncidents, fromUs - windowNum, fromUs),
   );
   const observedBuckets = scored.filter((verdict) => verdict !== "gap").length;
   const hasCurrent = observedBuckets > 0;
@@ -330,17 +332,6 @@ export function Spine(props: SpineProps) {
     crit: scored.filter((v) => v === "crit").length,
     warn: scored.filter((v) => v === "warn").length,
     ok: scored.filter((v) => v === "ok").length,
-  };
-
-  // Gap reason from the spine quality report: a hole carries its cause
-  // (producer restart, index build), never a bare "no data".
-  const gapReasonFor = (bucketStart: number, bucketEnd: number): string => {
-    const gaps = spine.data?.quality.gaps ?? [];
-    const hit = gaps.find(
-      (g) => Number(g.from_us) < bucketEnd && Number(g.to_us) > bucketStart,
-    );
-    if (hit === undefined) return "";
-    return t(`spine.gap.${hit.reason}`, { defaultValue: "" });
   };
 
   /** Health point covering a bucket (for the tooltip reason). */
@@ -470,28 +461,16 @@ export function Spine(props: SpineProps) {
   // a real ribbon with honest gap cells, never a placeholder.
   const evidenceQueries = [health, spine, events] as const;
   const cold = evidenceQueries.every((query) => query.data === undefined);
-  const retrying = [...evidenceQueries, incidents].some(
-    (q) => q.isPending || (q.error !== null && isWarmingUp(q.error)),
-  );
+  const retrying = [
+    ...evidenceQueries,
+    currentIncidents,
+    previousIncidents,
+  ].some((q) => q.isPending || (q.error !== null && isWarmingUp(q.error)));
   const warming = cold && retrying;
-  const sourceFailures = [
-    health.error !== null && !isWarmingUp(health.error) ? "health" : null,
-    spine.error !== null && !isWarmingUp(spine.error) ? "spine" : null,
-    events.error !== null && !isWarmingUp(events.error) ? "events" : null,
-    incidents.error !== null && !isWarmingUp(incidents.error)
-      ? "incidents"
-      : null,
-  ].filter((code): code is string => code !== null);
-  // Score provenance is narrower than the persistent Health-line evidence:
-  // the local formula consumes only server health verdicts and incidents.
-  // Spine series and event glyph availability cannot change this score.
   const scoreHealthUnavailable =
     health.error !== null && !isWarmingUp(health.error);
-  const scoreIncidentsUnavailable = incidents.error !== null;
   const scoreHealthPending =
     health.data === undefined && !scoreHealthUnavailable;
-  const scoreIncidentsPending =
-    incidents.data === undefined && !scoreIncidentsUnavailable;
   const failed =
     cold &&
     !warming &&
@@ -508,100 +487,32 @@ export function Spine(props: SpineProps) {
     allSeries.every((s) => s.values.every((v) => v === null)) &&
     visibleEvents.length === 0;
 
-  const sourceNames = sourceFailures.map((code) =>
-    t(`healthLine.source.${code}`),
-  );
-  const sourceList = sourceNames.join(", ");
-  const sourcesLoading = [...evidenceQueries, incidents].some(
-    (query) => query.isPending && query.data === undefined,
-  );
-  const scoreCoverageComplete =
-    scored.length > 0 && observedBuckets === scored.length;
   const scoreDisplayable =
-    hasCurrent &&
-    scoreCoverageComplete &&
-    !scoreHealthUnavailable &&
-    !scoreIncidentsUnavailable &&
-    !scoreHealthPending &&
-    !scoreIncidentsPending;
-  const scoreState = scoreDisplayable
-    ? null
-    : scoreHealthUnavailable ||
-        scoreIncidentsUnavailable ||
-        scoreHealthPending ||
-        scoreIncidentsPending ||
-        hasCurrent
-      ? "partial"
-      : "gap";
-  const scoreStateReason = scoreHealthUnavailable
-    ? t("healthLine.provenance.healthUnavailable")
-    : scoreIncidentsUnavailable
-      ? t("spine.score.incidentsUnavailable")
-      : scoreHealthPending || scoreIncidentsPending
-        ? t("healthLine.provenance.inputsLoading")
-        : hasCurrent && !scoreCoverageComplete
-          ? t("healthLine.provenance.incompleteCoverage", {
-              observed: observedBuckets,
-              total: scored.length,
-            })
-          : t("healthLine.provenance.noVerdicts");
+    hasCurrent && !scoreHealthUnavailable && !scoreHealthPending;
+  const scoreState = scoreDisplayable ? null : "gap";
   const delta = scoreDisplayable ? rawDelta : null;
-  const sourceStatus = failed
-    ? t("healthLine.sources.unavailable")
-    : sourceFailures.length > 0
-      ? t("healthLine.sources.partial", { sources: sourceList })
-      : sourcesLoading
-        ? t("healthLine.sources.loading")
-        : t("healthLine.sources.complete");
   const currentVerdict = verdicts[verdicts.length - 1] ?? "gap";
   const currentVerdictLabel = t(`healthLine.verdict.${currentVerdict}`);
-  const gapCount = scored.filter((verdict) => verdict === "gap").length;
-  const evidenceSummary = t("healthLine.evidenceSummary", {
+  const evidenceSummary = t("healthLine.observationSummary", {
     ok: counts.ok,
     warn: counts.warn,
     crit: counts.crit,
-    gap: gapCount,
     current: currentVerdictLabel,
-    window: hasFormingTail
-      ? t("healthLine.window.forming")
-      : t("healthLine.window.complete"),
-    sources: sourceStatus,
+    events: visibleEventCount,
   });
 
   const glyphOf = (e: EventFact) => eventGlyph(e);
 
   return (
     <section
+      className="health-navigator"
       aria-label={t("spine.caption")}
       aria-describedby="health-line-meaning health-line-evidence-summary"
       data-testid="health-line"
       data-shell-region="health-line"
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: "8px",
-        flexWrap: "nowrap",
-        height: "60px",
-        minHeight: "60px",
-        boxSizing: "border-box",
-        padding: "4px 8px",
-        background: "var(--bg-raised)",
-        border: "1px solid var(--border)",
-        borderRadius: "var(--radius-md)",
-        fontFamily: "var(--ui-font)",
-      }}
+      style={{ height: "60px", minHeight: "60px", boxSizing: "border-box" }}
     >
-      <span
-        style={{
-          fontSize: "var(--text-xs)",
-          fontWeight: 600,
-          textTransform: "uppercase",
-          letterSpacing: "var(--tracking-caps)",
-          color: "var(--fg-dim)",
-        }}
-      >
-        {t("spine.caption")}
-      </span>
+      <span className="health-navigator__title">{t("spine.caption")}</span>
       <span
         id="health-line-meaning"
         data-testid="health-line-meaning"
@@ -616,22 +527,6 @@ export function Spine(props: SpineProps) {
       >
         {evidenceSummary}
       </span>
-      {sourceFailures.length > 0 && !failed && (
-        <span
-          data-testid="health-line-source-state"
-          title={t("healthLine.partial", { sources: sourceList })}
-          style={{
-            maxWidth: "220px",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            color: "var(--sev-warn-fg)",
-            fontSize: "var(--text-xs)",
-          }}
-        >
-          {`⚠ ${t("healthLine.partial", { sources: sourceList })}`}
-        </span>
-      )}
       {!warming && !failed && !empty && (
         <Tooltip
           content={
@@ -643,16 +538,11 @@ export function Spine(props: SpineProps) {
                 warn: formatMin(score.warnMin),
                 count: score.incidents,
               })}
-              {incidents.error !== null && (
-                <>
-                  <br />
-                  {t("spine.score.incidentsUnavailable")}
-                </>
-              )}
             </span>
           }
         >
           <span
+            className="health-navigator__score"
             data-testid="spine-score"
             aria-label={t("spine.score.aria")}
             style={{
@@ -686,18 +576,10 @@ export function Spine(props: SpineProps) {
               </span>
               {scoreState !== null && (
                 <span
+                  className="health-navigator__missing"
                   data-testid="health-score-state"
-                  title={scoreStateReason}
-                  style={{
-                    display: "block",
-                    color:
-                      scoreState === "partial"
-                        ? "var(--sev-warn-fg)"
-                        : "var(--fg-dim)",
-                    fontSize: "var(--text-xs)",
-                  }}
                 >
-                  {t(`semantic.state.${scoreState}.label`)}
+                  {t("data.noSnapshotCurrent")}
                 </span>
               )}
             </span>
@@ -732,40 +614,8 @@ export function Spine(props: SpineProps) {
           </span>
         </Tooltip>
       )}
-      {!warming && !failed && !empty && props.showProvenance === true && (
-        <ProvenancePopover
-          triggerLabel={t("healthLine.provenance.trigger")}
-          renderTrigger={() => t("healthLine.provenance.short")}
-          record={{
-            definition: `${t("healthLine.provenance.definition")} ${props.meaning ?? t("healthLine.coincidence")}`,
-            value: scoreDisplayable ? score.score : "—",
-            unit: t("healthLine.provenance.unit"),
-            window: `${from}–${to}`,
-            aggregation: t("healthLine.provenance.localAggregate"),
-            formula: t("spine.score.formula"),
-            // This comparison belongs to the score itself: the preceding
-            // same-width window. It is not the operator's heatmap baseline.
-            baseline: `${prevFrom}–${from}`,
-            source: t("healthLine.provenance.source"),
-            coverage: `${observedBuckets}/${scored.length} · ${t("healthLine.provenance.completedBuckets")}`,
-            sampling: `${bucketSpanUs} µs · ${t("healthLine.provenance.formingTailExcluded")}`,
-            verdictRule: t("healthLine.provenance.verdictRule"),
-            revision: health.data?.health_policy_version,
-            state: scoreState ?? undefined,
-            reason: scoreState === null ? undefined : scoreStateReason,
-          }}
-        />
-      )}
       {warming || failed || empty ? (
-        <span
-          data-testid="spine-state"
-          style={{
-            flex: 1,
-            minWidth: "200px",
-            fontSize: "var(--text-xs)",
-            color: "var(--fg-dim)",
-          }}
-        >
+        <span className="health-navigator__state" data-testid="spine-state">
           {failed
             ? t("spine.error")
             : empty
@@ -774,6 +624,7 @@ export function Spine(props: SpineProps) {
         </span>
       ) : (
         <svg
+          className="health-navigator__plot"
           role="slider"
           tabIndex={0}
           aria-label={t("spine.timeline")}
@@ -797,14 +648,6 @@ export function Spine(props: SpineProps) {
           onKeyDown={onStripKeyDown}
           onPointerLeave={() => {
             if (gestureRef.current === null) props.onHover?.(null);
-          }}
-          style={{
-            flex: 1,
-            minWidth: "200px",
-            height: `${SVG_HEIGHT}px`,
-            display: "block",
-            background: "var(--bg)",
-            cursor: "crosshair",
           }}
         >
           {/* Forming-bucket hatch: diagonal hairlines over the dimmed
@@ -889,11 +732,9 @@ export function Spine(props: SpineProps) {
               const ts = e.occurred_at_us ?? e.sort_ts_us;
               return ts >= bucketStart && ts < bucketEnd;
             });
-            const gapReason =
-              v === "gap" ? gapReasonFor(bucketStart, bucketEnd) : "";
             const verdictLabel =
               v === "gap"
-                ? `${t("spine.missing")}${gapReason !== "" ? `: ${gapReason}` : ""}`
+                ? t("data.noSnapshotInterval")
                 : t(`spine.verdict.${v}`);
             const tip = [
               when,
@@ -1079,19 +920,7 @@ export function Spine(props: SpineProps) {
         </svg>
       )}
       {!warming && !failed && !empty && (
-        <span
-          data-testid="spine-right"
-          style={{
-            display: "inline-flex",
-            flexDirection: "column",
-            alignItems: "flex-end",
-            color: "var(--fg-dim)",
-            fontFamily: "var(--mono-font)",
-            fontSize: "var(--text-xs)",
-            lineHeight: 1.4,
-            whiteSpace: "nowrap",
-          }}
-        >
+        <span className="health-navigator__right" data-testid="spine-right">
           <span data-testid="spine-cursor-time">{cursorLabel}</span>
           <span
             data-testid="spine-summary"
@@ -1101,16 +930,6 @@ export function Spine(props: SpineProps) {
               ok: counts.ok,
             })}
           >
-            <span
-              data-testid="health-line-quality"
-              aria-label={t("healthLine.quality", {
-                observed: observedBuckets,
-                total: scored.length,
-              })}
-            >
-              {`Q ${observedBuckets}/${scored.length}`}
-            </span>{" "}
-            ·{" "}
             <span style={{ color: "var(--fg)" }}>
               {t(
                 events.data?.truncated

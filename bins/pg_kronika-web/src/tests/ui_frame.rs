@@ -25,7 +25,8 @@ use crate::ui::frame::cursor::{FrameCursor, SortKey};
 use crate::ui::frame::dto::{ClassificationResultDto, FrameResponse, FrameValue as DtoFrameValue};
 use crate::ui::frame::projection::{
     DeltaOperand, FrameLimits, ProjectedRow, RowOperands, StatementOperands, TableOperands,
-    activity_process_relations, object_relations, project_frame,
+    activity_process_relations, object_relations, process_activity_relations, project_entity_at,
+    project_frame,
 };
 use crate::ui::frame::projection::{ProjectionInput, project_input};
 use crate::ui::frame::spark::attach_sparks;
@@ -865,6 +866,36 @@ fn activity_process_relation_keeps_unique_pid_evidence_best_effort() {
     assert_eq!(candidates.len(), 2, "all same-PID processes stay linked");
     assert!(candidates.iter().all(|relation| relation.method == "pid"));
     assert_ne!(candidates[0].entity, candidates[1].entity);
+}
+
+#[test]
+fn process_activity_relation_keeps_every_same_pid_activity_record() {
+    let process = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("pid", Value::I64(7)),
+        ("starttime", Value::Ts(2_000_000)),
+    ]);
+    let mut input = ProjectionInput::single(20_000_000, "os_process", process.clone());
+    for backend_start in [1_000_000, 3_000_000] {
+        input.push(
+            "pg_stat_activity",
+            out_row(&[
+                ("ts", Value::Ts(20_000_000)),
+                ("pid", Value::I64(7)),
+                ("backend_start", Value::Ts(backend_start)),
+            ]),
+        );
+    }
+
+    let relations = process_activity_relations(&process, &input).expect("PID links");
+    assert_eq!(relations.len(), 2, "all same-PID activity stays linked");
+    assert!(relations.iter().all(|relation| {
+        relation.relation == "activity_process"
+            && relation.view == "activity"
+            && relation.method == "pid"
+            && relation.fields == vec!["pid"]
+    }));
+    assert_ne!(relations[0].entity, relations[1].entity);
 }
 
 #[test]
@@ -2316,6 +2347,77 @@ fn process_gap_row(ts: i64) -> OsProcess {
         exit_signal: 0,
         scope: 0,
     }
+}
+
+fn frame_activity_process_fixture() -> tempfile::TempDir {
+    let timestamp = 20_000_000;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let activity =
+        PgStatActivityV3::encode(&[activity_gap_row(timestamp)]).expect("encode activity fixture");
+    let process = OsProcess::encode(&[process_gap_row(timestamp)]).expect("encode process fixture");
+    let pgm = build_part(
+        &[
+            SectionInput {
+                type_id: 1_001_003,
+                rows: 1,
+                body: &activity,
+            },
+            SectionInput {
+                type_id: 1_100_001,
+                rows: 1,
+                body: &process,
+            },
+        ],
+        PartMeta {
+            min_ts: timestamp,
+            max_ts: timestamp,
+        },
+    );
+    crate::test_layout::write_named_pgm(directory.path(), "frame-activity-process.pgm", &pgm);
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish web index");
+    }
+    directory
+}
+
+#[test]
+fn process_entity_detail_loads_reverse_activity_links_by_pid() {
+    let directory = frame_activity_process_fixture();
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let catalog = catalog();
+    let request = FrameRequest::parse("processes", Some("at=20000000&columns=pid,type"), &catalog)
+        .expect("process frame request");
+    let frame = project_frame(&snapshot, &request, &catalog, FrameLimits::default())
+        .expect("process frame");
+    let process = frame.rows.first().expect("process row");
+    let view = web_view_by_name("processes").expect("processes view");
+    let view_spec = catalog
+        .views()
+        .iter()
+        .find(|candidate| candidate.code == "processes")
+        .expect("processes catalog view");
+    let columns = view_spec.columns.iter().collect::<Vec<_>>();
+
+    let detail = project_entity_at(
+        &snapshot,
+        view,
+        20_000_000,
+        &process.entity,
+        &columns,
+        &catalog,
+        true,
+        FrameLimits::default(),
+    )
+    .expect("process detail");
+
+    assert_eq!(detail.relations.len(), 1);
+    assert_eq!(detail.relations[0].relation, "activity_process");
+    assert_eq!(detail.relations[0].view, "activity");
+    assert_eq!(detail.relations[0].method, "pid");
 }
 
 fn frame_activity_relation_gap_fixture() -> (tempfile::TempDir, i64) {

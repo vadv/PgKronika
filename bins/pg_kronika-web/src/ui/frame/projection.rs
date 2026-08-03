@@ -232,7 +232,8 @@ struct ActivityProcessIndex<'a> {
 #[derive(Debug, Clone, Copy)]
 struct ProjectionInputNeeds {
     rate_predecessor: bool,
-    activity_relation_previous: bool,
+    pid_relation_previous: bool,
+    process_relation_activity: bool,
 }
 
 impl<'a> ActivityProcessIndex<'a> {
@@ -608,7 +609,8 @@ pub(crate) fn project_frame(
         request.view,
         ProjectionInputNeeds {
             rate_predecessor: needs_predecessor,
-            activity_relation_previous: needs_activity_relation_previous,
+            pid_relation_previous: needs_activity_relation_previous,
+            process_relation_activity: false,
         },
         false,
         limits,
@@ -669,8 +671,9 @@ pub(crate) fn project_entity_at(
         view,
         ProjectionInputNeeds {
             rate_predecessor: columns_require_predecessor(view, columns),
-            activity_relation_previous: view.name == "activity"
+            pid_relation_previous: matches!(view.name, "activity" | "processes")
                 && (include_related || columns.iter().any(|column| column.code == "process_link")),
+            process_relation_activity: view.name == "processes" && include_related,
         },
         false,
         limits,
@@ -772,6 +775,7 @@ pub(crate) fn project_entity_at(
         resolved.current_descriptor.as_ref(),
     ) {
         (true, "activity", Some((_section, row)), _) => activity_process_relations(row, &input)?,
+        (true, "processes", Some((_section, row)), _) => process_activity_relations(row, &input)?,
         (true, "tables" | "indexes" | "vacuum", Some((_section, row)), _) => {
             object_relations(view.name, row, &input)?
         }
@@ -909,11 +913,14 @@ fn read_projection_input(
     resolved: &ResolvedViewSnapshot,
     neighbors: SnapshotNeighbors,
 ) -> Result<ProjectionInput, FrameError> {
-    let section_names = view
+    let mut section_names = view
         .inputs
         .iter()
         .flat_map(|input| input.sections.iter().copied())
         .collect::<Vec<_>>();
+    if needs.process_relation_activity && !section_names.contains(&"pg_stat_activity") {
+        section_names.push("pg_stat_activity");
+    }
     let exact_section_names = section_names
         .iter()
         .copied()
@@ -979,11 +986,8 @@ fn read_projection_input(
         reject_internal_continuation(&pages, limits.rows)?;
         current.extend(pages);
     }
-    let previous_to_load = rate_previous.or_else(|| {
-        neighbors
-            .previous
-            .filter(|_| needs.activity_relation_previous)
-    });
+    let previous_to_load =
+        rate_previous.or_else(|| neighbors.previous.filter(|_| needs.pid_relation_previous));
     let previous = match (previous_to_load, resolved.previous_descriptor.as_ref()) {
         (Some(previous), Some(previous_descriptor)) => {
             let pages = query.sections(
@@ -1477,6 +1481,43 @@ pub(crate) fn activity_process_relations(
         relations.push(ProjectedRelation {
             relation: "activity_process",
             view: "processes",
+            entity,
+            kind: RelationKind::BestEffort,
+            method: "pid",
+            fields: vec!["pid"],
+        });
+    }
+    Ok(relations)
+}
+
+pub(crate) fn process_activity_relations(
+    process: &OutRow,
+    input: &ProjectionInput,
+) -> Result<Vec<ProjectedRelation>, ProjectionError> {
+    let Some(pid) = process_pid_key(process) else {
+        return Ok(Vec::new());
+    };
+    let activity_view = web_view_by_name("activity").ok_or(ProjectionError::MissingCatalogView)?;
+    let mut seen = BTreeSet::new();
+    let mut relations = Vec::new();
+    for activity in input
+        .current
+        .get("pg_stat_activity")
+        .into_iter()
+        .flatten()
+        .chain(input.previous.get("pg_stat_activity").into_iter().flatten())
+    {
+        if process_pid_key(activity) != Some(pid) {
+            continue;
+        }
+        let at_us = timestamp(activity, "ts")?.unwrap_or(input.snapshot_ts_us);
+        let entity = entity_for(activity_view, "pg_stat_activity", activity, at_us)?;
+        if !seen.insert(entity.clone()) {
+            continue;
+        }
+        relations.push(ProjectedRelation {
+            relation: "activity_process",
+            view: "activity",
             entity,
             kind: RelationKind::BestEffort,
             method: "pid",

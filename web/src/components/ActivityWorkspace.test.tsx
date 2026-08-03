@@ -281,18 +281,19 @@ function renderWorkspace(
   );
 }
 
-test("builds one dense Activity point-sample matrix with explicit process provenance", async () => {
+test("builds one dense Activity matrix with a positive PID relation", async () => {
   stubRequests();
   renderWorkspace("overview");
 
   expect(await screen.findByTestId("activity-time-matrix")).toBeDefined();
   expect(screen.getByTestId("activity-point-evidence")).toBeDefined();
-  expect(
-    screen.getByTestId("activity-process-provenance").textContent,
-  ).toContain("relation.activityProcess.pid");
-  expect(
-    screen.getByTestId("activity-process-provenance").textContent,
-  ).not.toContain("best_effort");
+  expect(screen.getByTestId("activity-process-link").textContent).toContain(
+    "relation.activityProcess.pid",
+  );
+  const workspace = screen.getByTestId("activity-workspace");
+  expect(workspace.textContent).not.toMatch(
+    /best_effort|edge.only|point.snapshot|series \d+ \/|gaps|gated/i,
+  );
   expect(screen.queryByTestId("activity-detached-heatmap")).toBeNull();
   await waitFor(() =>
     expect(screen.getAllByTestId("activity-sample-row")).toHaveLength(2),
@@ -315,13 +316,14 @@ test("builds one dense Activity point-sample matrix with explicit process proven
   expect(heatmapCall?.searchParams.get("top")).toBe("64");
 });
 
-test("adds bounded edge-only lock evidence only to Waits & Locks", async () => {
+test("adds compact waiter to blocker relations only to Waits & Locks", async () => {
   stubRequests();
   const onOpenEntity = vi.fn();
   renderWorkspace("waits_locks", onOpenEntity);
 
   const strip = await screen.findByTestId("activity-lock-evidence");
-  expect(strip.getAttribute("data-provenance")).toBe("edge_only");
+  expect(strip.getAttribute("data-provenance")).toBeNull();
+  expect(strip.querySelector(".activity-lock-evidence__badge")).toBeNull();
   expect(
     await screen.findByRole("button", { name: /18422.*19041/ }),
   ).toBeDefined();

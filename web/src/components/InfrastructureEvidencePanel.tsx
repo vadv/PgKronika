@@ -40,7 +40,7 @@ const panel: CSSProperties = {
 
 const dim: CSSProperties = { color: "var(--fg-dim)" };
 
-function heading(title: string, provenance: string) {
+function heading(title: string, context: string) {
   return (
     <div
       style={{
@@ -62,7 +62,7 @@ function heading(title: string, provenance: string) {
         {title}
       </strong>
       <span
-        title={provenance}
+        title={context}
         style={{
           ...dim,
           marginInlineStart: "auto",
@@ -72,7 +72,7 @@ function heading(title: string, provenance: string) {
           whiteSpace: "nowrap",
         }}
       >
-        {provenance}
+        {context}
       </span>
     </div>
   );
@@ -111,13 +111,9 @@ function TablesEvidence(props: InfrastructureEvidencePanelProps) {
         snapshot === undefined ? undefined : snapshotMatchesCursor
       }
       data-snapshot-delta-us={snapshotDeltaUs ?? undefined}
-      data-snapshot-provenance="independent_nearest_vacuum_snapshot"
       style={panel}
     >
-      {heading(
-        t("tableEvidence.activeVacuum"),
-        t("tableEvidence.independentSnapshot"),
-      )}
+      {heading(t("tableEvidence.activeVacuum"), t("tableEvidence.nearCursor"))}
       <div style={{ ...dim, marginBlockEnd: "var(--space-1)" }}>
         {snapshot === undefined
           ? t("tableEvidence.snapshotPending")
@@ -183,26 +179,13 @@ function TablesEvidence(props: InfrastructureEvidencePanelProps) {
 
 function IndexEvidence(props: InfrastructureEvidencePanelProps) {
   const { t } = useTranslation();
-  const provenance =
-    props.view.joins.find(
-      (join) => join.left === "indexes" && join.right === "tables",
-    )?.provenance ?? "unavailable";
   return (
     <aside
       data-testid="infrastructure-evidence-panel"
       data-view="indexes"
       style={panel}
     >
-      {heading(
-        t("indexEvidence.tableContext"),
-        t("relation.kind.temporal.label"),
-      )}
-      <div
-        data-testid="index-table-provenance"
-        style={{ fontFamily: "var(--mono-font)" }}
-      >
-        {provenance}
-      </div>
+      {heading(t("indexEvidence.tableContext"), t("indexEvidence.linked"))}
       <div style={{ ...dim, marginBlockStart: "var(--space-1)" }}>
         {t("indexEvidence.sameSnapshotOnly")}
       </div>
@@ -215,9 +198,6 @@ function IndexEvidence(props: InfrastructureEvidencePanelProps) {
 
 function VacuumEvidence(props: InfrastructureEvidencePanelProps) {
   const { t } = useTranslation();
-  const temporal = props.view.joins.find(
-    (join) => join.left === "vacuum" && join.right === "tables",
-  );
   const pre17 = props.view.columns.find(
     (column) => column.code === "dead_tuples",
   );
@@ -242,10 +222,10 @@ function VacuumEvidence(props: InfrastructureEvidencePanelProps) {
     >
       {heading(
         t(`vacuumEvidence.lens.${props.preset ?? "progress"}`),
-        temporal?.provenance ?? "unavailable",
+        t("vacuumEvidence.tableLinked"),
       )}
-      <div data-testid="vacuum-lifetime-warning" style={dim}>
-        {t("vacuumEvidence.lifetimeWarning")}
+      <div data-testid="vacuum-context-summary" style={dim}>
+        {t("vacuumEvidence.contextSummary")}
       </div>
       <div
         style={{

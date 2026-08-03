@@ -48,6 +48,7 @@ export function useForensicSearchGroup(args: ForensicSearchGroupArgs) {
   return {
     ...query,
     rows,
+    columns: query.data?.pages[0]?.columns ?? [],
     matched: query.data?.pages[0]?.page.matched ?? 0,
     snapshotTsUs: query.data?.pages[0]?.snapshot_ts_us ?? null,
     quality: query.data?.pages[0]?.quality,

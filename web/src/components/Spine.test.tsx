@@ -288,6 +288,42 @@ test("renders verdict ribbon, score chip, event density, sparkline and summary",
   expect(screen.getByTestId("spine-cursor")).toBeDefined();
 });
 
+test("keeps current and previous incident requests inside the 24 hour API bound", async () => {
+  const dayUs = 86_400_000_000;
+  renderSpine({
+    span: 86_400,
+    range: {
+      fromUs: String(AT_US - dayUs),
+      toUs: String(AT_US),
+    },
+  });
+
+  await waitFor(() => {
+    const incidentRequests = vi
+      .mocked(fetch)
+      .mock.calls.map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      )
+      .filter((url) => url.pathname === "/v1/incidents");
+    expect(incidentRequests).toHaveLength(2);
+    expect(
+      incidentRequests.every(
+        (url) =>
+          Number(url.searchParams.get("to")) -
+            Number(url.searchParams.get("from")) <=
+          dayUs,
+      ),
+    ).toBe(true);
+  });
+});
+
 test("discloses a lower-bound event total when the bounded cursor budget is exhausted", async () => {
   let eventPage = 0;
   await renderLocalizedSpine({}, (input) => {
@@ -367,24 +403,22 @@ test("a health-less window renders honest gap markers, not silence", async () =>
     { wrapper },
   );
   // Health has no points but the load series has values: the strip renders,
-  // every ribbon bucket an explicit gap marker with a "no data" tooltip.
+  // every ribbon bucket an explicit local no-snapshot marker.
   await waitFor(() =>
     expect(screen.getAllByTestId("spine-ribbon-gap")).toHaveLength(96),
   );
   expect(
     screen.getAllByTestId("spine-ribbon-gap")[0]?.querySelector("title")
       ?.textContent,
-  ).toContain("spine.missing");
+  ).toContain("data.noSnapshotInterval");
   expect(screen.getByTestId("spine-score").textContent).toContain("—");
   expect(screen.getByTestId("health-score-state").textContent).toContain(
-    "semantic.state.gap.label",
+    "data.noSnapshotCurrent",
   );
-  expect(screen.getByTestId("health-line-quality").textContent).toContain(
-    "0/96",
-  );
+  expect(screen.queryByTestId("health-line-quality")).toBeNull();
 });
 
-test("a partial health window cannot render a healthy numeric score", async () => {
+test("a missing health interval does not suppress the score from observed points", async () => {
   await renderLocalizedSpine({}, (input) => {
     const url =
       typeof input === "string"
@@ -407,12 +441,9 @@ test("a partial health window cannot render a healthy numeric score", async () =
     return Promise.resolve(jsonResponse(body));
   });
   await waitFor(() =>
-    expect(screen.getByTestId("health-score-state").textContent).toContain(
-      "Partial",
-    ),
+    expect(screen.getByTestId("spine-score").textContent).toContain("44"),
   );
-  expect(screen.getByTestId("spine-score").textContent).toContain("—");
-  expect(screen.getByTestId("spine-score").textContent).not.toContain("100");
+  expect(screen.queryByTestId("health-score-state")).toBeNull();
 });
 
 test("selection overlays share one SVG grid while gap hatch remains on top", async () => {
@@ -491,9 +522,8 @@ test("localized evidence summary exposes verdicts outside the slider leaf", asyn
   expect(summary.textContent).toContain("48 calm");
   expect(summary.textContent).toContain("24 warning");
   expect(summary.textContent).toContain("24 critical");
-  expect(summary.textContent).toContain("0 gaps");
-  expect(summary.textContent).toContain("Current bucket: critical");
-  expect(summary.textContent).toContain("All Health line sources available");
+  expect(summary.textContent).toContain("Current interval: critical");
+  expect(summary.textContent).not.toContain(/gaps|sources|coverage/i);
   expect(screen.getByText("Health · PostgreSQL + OS")).toBeDefined();
   expect(screen.getByTestId("spine-score").textContent).toContain(
     "now critical",
@@ -503,29 +533,33 @@ test("localized evidence summary exposes verdicts outside the slider leaf", asyn
   );
 });
 
-test("health transport failure is a visible partial state while OS evidence remains", async () => {
+test("health transport failure keeps OS evidence without a source warning", async () => {
   await renderLocalizedSpine({}, stubPartialFetch(new Set(["health"])));
-  const partial = await screen.findByTestId("health-line-source-state");
-  expect(partial.textContent).toContain("Partial: health verdicts unavailable");
+  await waitFor(() =>
+    expect(screen.getByTestId("spine-load-line")).toBeDefined(),
+  );
+  expect(screen.queryByTestId("health-line-source-state")).toBeNull();
   expect(screen.getByTestId("spine-load-line")).toBeDefined();
   expect(screen.getByRole("slider")).toBeDefined();
-  expect(screen.getByRole("status").textContent).toContain(
-    "Partial sources: health verdicts",
+  expect(screen.getByRole("status").textContent).not.toContain(
+    /partial|source/i,
   );
 });
 
-test("spine and event failures are disclosed while health verdicts remain", async () => {
+test("spine and event failures do not weaken retained health observations", async () => {
   await renderLocalizedSpine(
     {},
     stubPartialFetch(new Set(["spine", "events"])),
   );
-  const partial = await screen.findByTestId("health-line-source-state");
-  expect(partial.textContent).toContain(
-    "Partial: OS signals, timeline events unavailable",
+  await waitFor(() =>
+    expect(screen.getAllByTestId("spine-ribbon-crit").length).toBeGreaterThan(
+      0,
+    ),
   );
+  expect(screen.queryByTestId("health-line-source-state")).toBeNull();
   expect(screen.getAllByTestId("spine-ribbon-crit").length).toBeGreaterThan(0);
-  expect(screen.getByRole("status").textContent).toContain(
-    "Partial sources: OS signals, timeline events",
+  expect(screen.getByRole("status").textContent).not.toContain(
+    /partial|source/i,
   );
 });
 
@@ -824,7 +858,11 @@ test("a 503 during revalidation keeps the ribbon — warming is cold-start only"
     spineFixture,
   );
   client.setQueryData(
-    ["incidents", String(FROM_US - WINDOW_US), String(AT_US)],
+    ["incidents", String(FROM_US), String(AT_US)],
+    incidentsFixture,
+  );
+  client.setQueryData(
+    ["incidents", String(FROM_US - WINDOW_US), String(FROM_US)],
     incidentsFixture,
   );
   client.setQueryData(

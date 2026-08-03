@@ -176,7 +176,9 @@ const spine = makeSpineResponse({
       code: "load_per_cpu",
       unit: "ratio",
       aggregation: "max",
-      values: Array.from({ length: 24 }, (_, index) => index / 10),
+      values: Array.from({ length: 24 }, (_, index) =>
+        index === 5 ? null : index / 10,
+      ),
     },
     {
       code: "psi_io_some",
@@ -266,17 +268,16 @@ test("maps Storage I/O to I/O and keeps other prepared OS lenses on CPU", () => 
   }
 });
 
-test("builds one dense OS workspace from independently scoped evidence", async () => {
+test("builds one dense OS workspace with host measurements and local missing cells", async () => {
   stubRequests();
   render(<Harness />, { wrapper: Wrapper });
 
   expect(await screen.findByTestId("os-workspace")).toBeDefined();
   expect(screen.queryByTestId("infrastructure-analytical-center")).toBeNull();
   expect(screen.getByTestId("host-pressure-evidence")).toBeDefined();
-  expect(screen.getByTestId("host-scope-guard").dataset.cpus).toBe("32");
-  await waitFor(() =>
-    expect(screen.getByTestId("host-quality").dataset.limited).toBe("1"),
-  );
+  expect(screen.getByTestId("host-facts").dataset.cpus).toBe("32");
+  expect(screen.queryByTestId("host-quality")).toBeNull();
+  expect(screen.queryByTestId("host-scope-guard")).toBeNull();
   expect(screen.getByTestId("processes-time-matrix")).toBeDefined();
   await waitFor(() =>
     expect(screen.getAllByTestId("process-interval-row")[0]?.dataset.mode).toBe(
@@ -285,8 +286,13 @@ test("builds one dense OS workspace from independently scoped evidence", async (
   );
   expect(screen.getAllByTestId("time-matrix-bucket")).toHaveLength(24 * 96);
   expect(screen.getByTestId("os-frame-population").dataset.matched).toBe("218");
-  expect(screen.getByTestId("os-heatmap-population").dataset.retained).toBe(
-    "1",
+  expect(screen.queryByTestId("os-heatmap-population")).toBeNull();
+  const missingHostCell = document.querySelector<HTMLMeterElement>(
+    '.os-host-signal__buckets meter[data-missing="true"]',
+  );
+  expect(missingHostCell?.title).toBe("data.noSnapshotInterval");
+  expect(screen.getByTestId("os-workspace").textContent).not.toMatch(
+    /partial|gaps|gated|resource.?limited|independent.scopes/i,
   );
 
   const calls = vi.mocked(fetch).mock.calls.map(([input]) => requestUrl(input));
