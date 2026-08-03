@@ -37,6 +37,22 @@ function stubFetch(body: unknown) {
   );
 }
 
+function stubEntityModes(point: unknown, history: unknown) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const body = url.searchParams.has("at") ? point : history;
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }),
+  );
+}
+
 const baseState: UiState = {
   view: "activity",
   at: "1722400000000000",
@@ -182,29 +198,52 @@ test("row dock renders point fields from the entity endpoint", async () => {
   expect(missing.title).toBe("");
 });
 
-test("row dock renders history snapshots when the API answers history mode", async () => {
-  stubFetch(
-    makeEntityHistoryResponse({
-      columns: ["tup", "locks"],
-      snapshots: [
+test("row dock fetches bounded history only after selecting the History tab", async () => {
+  const point = makeEntityPointResponse({
+    fields: [{ code: "tup", value: 12 }],
+  });
+  const history = makeEntityHistoryResponse({
+    columns: ["tup", "locks"],
+    snapshots: [
+      {
+        ts_us: "1722400000000000",
+        values: [10, 0],
+      },
+      {
+        ts_us: "1722400060000000",
+        values: [12, null],
+      },
+    ],
+  });
+  stubEntityModes(point, history);
+  renderDock({
+    state: { ...baseState, dock: "row", entity: "db:1" },
+    view: makeViewSpec({
+      code: "activity",
+      capabilities: { detail: true, history: true, related: false },
+      columns: [
         {
-          ts_us: "1722400000000000",
-          values: [10, 0],
+          code: "tup",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
         },
         {
-          ts_us: "1722400060000000",
-          values: [12, null],
+          code: "locks",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
         },
       ],
     }),
-  );
-  renderDock({
-    state: { ...baseState, dock: "row", entity: "db:1" },
   });
-  await waitFor(() => expect(screen.getByText("tup")).toBeDefined());
+  await waitFor(() => expect(screen.getByText("12")).toBeDefined());
+  fireEvent.click(screen.getByRole("tab", { name: "dock.detail.history" }));
+  await waitFor(() => expect(screen.getByText("10")).toBeDefined());
+  expect(screen.getByText("tup")).toBeDefined();
   expect(screen.getByText("locks")).toBeDefined();
-  expect(screen.getByText("10")).toBeDefined();
-  expect(screen.getByText("12")).toBeDefined();
   expect(screen.getAllByText("—").length).toBeGreaterThan(0);
 });
 
@@ -294,6 +333,11 @@ test("statements row dock: query heading fallback, uncut id, bounded query detai
   // Query text is detail-only and server-bounded, but available when the
   // connected PostgreSQL role may see it.
   expect(screen.getByText("select * from orders where id = $1")).toBeDefined();
+  fireEvent.click(screen.getByRole("tab", { name: "dock.detail.raw" }));
+  expect(screen.getByText("dock.detail.rawProjectedOnly")).toBeDefined();
+  expect(document.querySelector("[data-raw-evidence]")?.textContent).toContain(
+    "select * from orders where id = $1",
+  );
 });
 
 test("row dock drills down via server related provenance and clears", async () => {
@@ -328,15 +372,16 @@ test("row dock drills down via server related provenance and clears", async () =
     onPatch,
   });
   await waitFor(() => expect(screen.getByText("select 1")).toBeDefined());
+  fireEvent.click(
+    screen.getByRole("tab", { name: "dock.detail.relationships" }),
+  );
   // The drill target comes from the API related list — typed identity, no
   // client-side join by name/queryid.
-  const drill = screen.getByRole("button", { name: "dock.row.drill" });
-  // Provenance tooltip: kind through the relation-kind dictionary (tests run
-  // without a dictionary, so the honest machine code falls through), plus the
-  // fork-specific method and fields — never a bare DSL dump.
-  expect(drill.title).toContain("best_effort");
-  expect(drill.title).toContain("ossc_queryid_dbid_userid_attribution");
-  expect(drill.title).toContain("queryid, dbid, userid");
+  const drill = screen.getByRole("button", { name: /statement_plan/ });
+  // Relation kind, method and fields are visible evidence, not tooltip-only.
+  expect(drill.textContent).toContain("best_effort");
+  expect(drill.textContent).toContain("ossc_queryid_dbid_userid_attribution");
+  expect(drill.textContent).toContain("queryid, dbid, userid");
   fireEvent.click(drill);
   expect(onPatch).toHaveBeenCalledWith({
     view: "plans",
