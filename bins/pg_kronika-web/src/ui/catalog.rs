@@ -1415,12 +1415,6 @@ fn tables_view() -> ViewSpec {
                 "desc",
             ),
             preset(
-                "size_growth",
-                &["relation", "size", "dead_pct", "xid_age", "mxid_age"],
-                "size",
-                "desc",
-            ),
-            preset(
                 "xid_mxid",
                 &["relation", "xid_age", "mxid_age", "dead_pct", "size"],
                 "xid_age",
@@ -1507,12 +1501,6 @@ fn indexes_view() -> ViewSpec {
             preset("unused", &["index", "table", "scans"], "scans", "asc"),
             preset(
                 "size",
-                &["index", "table", "size", "scans", "last_idx_scan"],
-                "size",
-                "desc",
-            ),
-            preset(
-                "size_growth",
                 &["index", "table", "size", "scans", "last_idx_scan"],
                 "size",
                 "desc",
@@ -1677,12 +1665,6 @@ fn vacuum_presets() -> Vec<PresetSpec> {
             ],
             "dead_tuples",
             "desc",
-        ),
-        preset(
-            "wraparound_context",
-            &["pid", "relation", "phase", "progress", "elapsed"],
-            "relation",
-            "asc",
         ),
     ]
 }

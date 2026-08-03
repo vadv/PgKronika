@@ -217,18 +217,15 @@ fn host_and_object_views_publish_prepared_lenses_and_temporal_relations() {
                 "vacuum_risk",
                 "io",
                 "scan_pattern",
-                "size_growth",
+                "size",
                 "xid_mxid",
             ][..],
         ),
         (
             "indexes",
-            &["usage", "io", "size_growth", "unused", "table_context"][..],
+            &["usage", "io", "size", "unused", "table_context"][..],
         ),
-        (
-            "vacuum",
-            &["progress", "phase", "dead_items", "wraparound_context"][..],
-        ),
+        ("vacuum", &["progress", "phase", "dead_items"][..]),
     ] {
         for preset in presets {
             assert_serialized_preset(&catalog, view, preset);

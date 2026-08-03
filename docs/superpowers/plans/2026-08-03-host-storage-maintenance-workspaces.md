@@ -1,7 +1,7 @@
 # PR7 — Host, storage objects, and maintenance workspaces
 
-**Stack base:** `codex/pr06-activity-plans`  
-**Branch:** `codex/pr07-host-storage-maintenance`  
+**Stack base:** `codex/pr06-activity-plans`
+**Branch:** `codex/pr07-host-storage-maintenance`
 **Baseline viewport:** 1920×1080
 
 ## Outcome
@@ -70,4 +70,3 @@ server-side identity or same-snapshot rule supports it.
   bundle budget, and static/auth tests.
 - Repack `static.tar.gz` twice and compare byte-for-byte.
 - Open a ready PR on top of PR6 and request independent review.
-

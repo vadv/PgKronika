@@ -1149,7 +1149,8 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   const tables = await infrastructureGeometry(page, "tables");
   assertInfrastructureGeometry("Tables", tables);
   if (
-    !tables.panelText.includes("same snapshot") ||
+    !tables.panelText.includes("independently resolved") ||
+    !tables.gated.includes("Growth") ||
     !tables.gated.includes("Dependencies")
   ) {
     throw new Error(
@@ -1191,6 +1192,7 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   assertInfrastructureGeometry("Indexes", indexes);
   if (
     !indexes.panelText.includes("same_snapshot_database_relation_oid") ||
+    !indexes.gated.includes("Growth") ||
     !indexes.gated.includes("Duplication") ||
     !indexes.gated.includes("Invalid / build")
   ) {
@@ -1201,7 +1203,7 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   await page.screenshot({ path: INDEXES_SHOT });
 
   await page.goto(
-    `${base}/#source=local&view=vacuum&at=${at}&span=3600&preset=wraparound_context`,
+    `${base}/#source=local&view=vacuum&at=${at}&span=3600&preset=progress`,
     { waitUntil: "networkidle0" },
   );
   await page.waitForSelector('[data-testid="vacuum-lifetime-warning"]', {
@@ -1212,6 +1214,7 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   assertInfrastructureGeometry("Vacuum", vacuum);
   if (
     !vacuum.panelText.includes("PID reuse") ||
+    !vacuum.gated.includes("Wraparound") ||
     !vacuum.gated.includes("Throughput") ||
     !vacuum.gated.includes("Blockers") ||
     !vacuum.gated.includes("History")
