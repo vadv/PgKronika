@@ -177,6 +177,156 @@ if (plansCatalog !== undefined) {
   });
 }
 
+function replacePreset(view, code, columns, sort, order = "desc") {
+  view.presets = view.presets.filter((preset) => preset.code !== code);
+  view.presets.push({ code, columns, sort: { column: sort, order } });
+}
+
+const processesCatalog = catalog.views.find(
+  (view) => view.code === "processes",
+);
+if (processesCatalog !== undefined) {
+  replacePreset(
+    processesCatalog,
+    "pressure",
+    [
+      "pid",
+      "type",
+      "cpu",
+      "rss",
+      "read_bytes_per_second",
+      "write_bytes_per_second",
+    ],
+    "cpu",
+  );
+  replacePreset(
+    processesCatalog,
+    "processes",
+    ["pid", "type", "cpu", "rss", "threads", "cgroup", "command"],
+    "cpu",
+  );
+  replacePreset(
+    processesCatalog,
+    "data_quality",
+    ["pid", "type", "cpu", "rss", "cgroup"],
+    "pid",
+    "asc",
+  );
+}
+
+const tablesCatalog = catalog.views.find((view) => view.code === "tables");
+if (tablesCatalog !== undefined) {
+  tablesCatalog.capabilities.related = true;
+  tablesCatalog.joins = [
+    {
+      left: "tables",
+      right: "vacuum",
+      kind: "temporal",
+      fields: ["datid", "relid", "ts"],
+      cardinality: "zero_or_many",
+      provenance: "same_snapshot_database_relation_oid",
+    },
+  ];
+  replacePreset(
+    tablesCatalog,
+    "health",
+    [
+      "relation",
+      "dead_pct",
+      "dead_tuples",
+      "seq_scan_pct",
+      "autovacuum_age_seconds",
+    ],
+    "dead_pct",
+  );
+  replacePreset(
+    tablesCatalog,
+    "vacuum_risk",
+    [
+      "relation",
+      "dead_pct",
+      "dead_tuples",
+      "modified_since_analyze",
+      "inserted_since_vacuum",
+      "last_autovacuum",
+      "autovacuum_age_seconds",
+    ],
+    "autovacuum_age_seconds",
+  );
+  replacePreset(
+    tablesCatalog,
+    "scan_pattern",
+    ["relation", "seq_scan", "idx_scan", "seq_scan_pct", "dead_pct"],
+    "seq_scan_pct",
+  );
+  replacePreset(
+    tablesCatalog,
+    "size_growth",
+    ["relation", "size", "dead_pct", "xid_age", "mxid_age"],
+    "size",
+  );
+  replacePreset(
+    tablesCatalog,
+    "xid_mxid",
+    ["relation", "xid_age", "mxid_age", "dead_pct", "size"],
+    "xid_age",
+  );
+}
+
+const indexesCatalog = catalog.views.find((view) => view.code === "indexes");
+if (indexesCatalog !== undefined) {
+  indexesCatalog.capabilities.related = true;
+  indexesCatalog.joins = [
+    {
+      left: "indexes",
+      right: "tables",
+      kind: "temporal",
+      fields: ["datid", "relid", "ts"],
+      cardinality: "zero_or_one",
+      provenance: "same_snapshot_database_relation_oid",
+    },
+  ];
+  replacePreset(
+    indexesCatalog,
+    "size_growth",
+    ["index", "table", "size", "scans", "last_idx_scan"],
+    "size",
+  );
+  replacePreset(
+    indexesCatalog,
+    "table_context",
+    ["index", "table", "scans", "rows_per_scan", "size"],
+    "table",
+    "asc",
+  );
+}
+
+const vacuumCatalog = catalog.views.find((view) => view.code === "vacuum");
+if (vacuumCatalog !== undefined) {
+  vacuumCatalog.capabilities.related = true;
+  replacePreset(
+    vacuumCatalog,
+    "dead_items",
+    [
+      "pid",
+      "relation",
+      "dead_tuples",
+      "dead_item_ids",
+      "dead_tuple_bytes",
+      "progress",
+      "elapsed",
+    ],
+    "dead_tuples",
+  );
+  replacePreset(
+    vacuumCatalog,
+    "wraparound_context",
+    ["pid", "relation", "phase", "progress", "elapsed"],
+    "relation",
+    "asc",
+  );
+}
+
 // --- summary ---------------------------------------------------------------
 
 // Populations per plan: activity..events in stable view_code order.
@@ -911,10 +1061,14 @@ function rowsTables() {
         label: `public.${name}`,
         data: {
           relation: `public.${name}`,
+          size: 48_000_000 + i * 384_000_000 + idx * 24,
           seq_scan: seq,
           idx_scan: idx,
           dead_pct: deadPct,
           dead_tuples: dead,
+          io_hit_pct: r2(Math.max(72, 99.7 - i * 1.4)),
+          xid_age: 18_400_000 + i * 7_220_000,
+          mxid_age: 1_220_000 + i * 884_000,
           seq_scan_pct: r2((100 * seq) / Math.max(seq + idx, 1)),
           modified_since_analyze: modSince,
           inserted_since_vacuum: insSince,
@@ -946,10 +1100,19 @@ function rowsIndexes() {
     ["events_ts_idx", "events", 44_102, 88.4],
     ["audit_log_actor_idx", "audit_log", 0, 0.0],
   ];
-  return defs.map(([index, table, scans, rps]) => ({
+  const now = nowUs();
+  return defs.map(([index, table, scans, rps], i) => ({
     entity: `index:${index}`,
     label: index,
-    data: { index, table, scans, rows_per_scan: rps },
+    data: {
+      index,
+      table,
+      size: 24_000_000 + i * 118_000_000,
+      scans,
+      rows_per_scan: rps,
+      io_hit_pct: r2(Math.max(68, 99.8 - i * 2.1)),
+      last_idx_scan: scans === 0 ? null : String(now - (i + 1) * 1_800 * US),
+    },
     cls: [],
   }));
 }
@@ -971,6 +1134,9 @@ function rowsVacuum() {
       is_autovacuum: isAuto,
       progress,
       dead_tuples: dead,
+      dead_item_ids: i < 2 ? null : dead,
+      dead_tuple_bytes: i < 2 ? dead * 72 : null,
+      elapsed: null,
     },
     cls: [],
   }));
@@ -1005,10 +1171,12 @@ function rowsProcesses() {
         type,
         cpu,
         rss,
+        threads: 1 + (i % 7),
         read_bytes_per_second: readBps,
         write_bytes_per_second: writeBps,
         block_delay: r2(i % 4 === 0 ? 0.8 : 0.05),
         command: type,
+        cgroup: i < 12 ? "/system.slice/postgresql.service" : "/system.slice",
       },
       cls,
     };
@@ -1483,6 +1651,56 @@ function entityResponse(viewCode, entity, params) {
             kind: "best_effort",
             method: "same_snapshot_unique_pid",
             fields: ["pid", "ts"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "tables") {
+      for (const vacuum of rowsVacuum().filter(
+        (candidate) => candidate.data.relation === row.data.relation,
+      )) {
+        related.push({
+          view: "vacuum",
+          entity: vacuum.entity,
+          relation: "table_active_vacuum",
+          provenance: {
+            kind: "temporal",
+            method: "same_snapshot_database_relation_oid",
+            fields: ["datid", "relid", "ts"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "indexes") {
+      const table = rowsTables().find(
+        (candidate) => candidate.data.relation === `public.${row.data.table}`,
+      );
+      if (table !== undefined) {
+        related.push({
+          view: "tables",
+          entity: table.entity,
+          relation: "index_table",
+          provenance: {
+            kind: "temporal",
+            method: "same_snapshot_database_relation_oid",
+            fields: ["datid", "relid", "ts"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "vacuum") {
+      const table = rowsTables().find(
+        (candidate) => candidate.data.relation === row.data.relation,
+      );
+      if (table !== undefined) {
+        related.push({
+          view: "tables",
+          entity: table.entity,
+          relation: "vacuum_table",
+          provenance: {
+            kind: "temporal",
+            method: "same_snapshot_database_relation_oid",
+            fields: ["datid", "relid", "ts"],
           },
         });
       }

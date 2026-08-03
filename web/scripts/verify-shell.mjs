@@ -13,6 +13,10 @@ const VIEWPORT = { width: 1920, height: 1080, deviceScaleFactor: 1 };
 const SUCCESS_SHOT = `${OUT_DIR}forensic-shell-1920x1080.png`;
 const ACTIVITY_SHOT = `${OUT_DIR}forensic-activity-1920x1080.png`;
 const PLANS_SHOT = `${OUT_DIR}forensic-plans-1920x1080.png`;
+const OS_SHOT = `${OUT_DIR}forensic-os-1920x1080.png`;
+const TABLES_SHOT = `${OUT_DIR}forensic-tables-1920x1080.png`;
+const INDEXES_SHOT = `${OUT_DIR}forensic-indexes-1920x1080.png`;
+const VACUUM_SHOT = `${OUT_DIR}forensic-vacuum-1920x1080.png`;
 const FAILURE_SHOT = `${OUT_DIR}forensic-shell-1920x1080-failure.png`;
 
 const chromeCandidates = [
@@ -1027,6 +1031,199 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   };
 }
 
+async function infrastructureGeometry(page, view) {
+  const geometry = await page.evaluate((expectedView) => {
+    const center = document.querySelector(
+      '[data-testid="infrastructure-analytical-center"]',
+    );
+    const panel = document.querySelector(
+      `[data-testid="infrastructure-evidence-panel"][data-view="${expectedView}"]`,
+    );
+    const global = document.querySelector(
+      '[data-shell-region="global-context"]',
+    );
+    const health = document.querySelector('[data-shell-region="health-line"]');
+    if (
+      !(center instanceof HTMLElement) ||
+      !(panel instanceof HTMLElement) ||
+      !(global instanceof HTMLElement) ||
+      !(health instanceof HTMLElement)
+    ) {
+      throw new Error(`${expectedView} infrastructure shell is incomplete`);
+    }
+    const centerRect = center.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    const lastPanelControl = [...panel.querySelectorAll("button")]
+      .at(-1)
+      ?.getBoundingClientRect();
+    const gated = [...document.querySelectorAll('button[aria-disabled="true"]')]
+      .map((button) => button.textContent?.trim() ?? "")
+      .filter(Boolean);
+    return {
+      rootHeight: document.documentElement.scrollHeight,
+      scrollY: window.scrollY,
+      globalHeight: global.getBoundingClientRect().height,
+      healthHeight: health.getBoundingClientRect().height,
+      centerHeight: centerRect.height,
+      panelInside:
+        panelRect.top >= centerRect.top &&
+        panelRect.bottom <= centerRect.bottom,
+      lastPanelControlInside:
+        lastPanelControl === undefined ||
+        lastPanelControl.bottom <= panelRect.bottom,
+      panelText: panel.textContent ?? "",
+      gated,
+    };
+  }, view);
+  geometry.heatmapBuckets = await heatmapBucketsFor(page, view);
+  return geometry;
+}
+
+function assertInfrastructureGeometry(name, geometry) {
+  const failures = [];
+  if (geometry.rootHeight > 1080)
+    failures.push(`root height ${geometry.rootHeight}`);
+  if (geometry.scrollY !== 0)
+    failures.push(`shell scroll offset ${geometry.scrollY}`);
+  if (geometry.globalHeight !== 44)
+    failures.push(`global region ${geometry.globalHeight}px`);
+  if (geometry.healthHeight !== 60)
+    failures.push(`Health line ${geometry.healthHeight}px`);
+  if (geometry.centerHeight !== 156)
+    failures.push(`analytical center ${geometry.centerHeight}px`);
+  if (!geometry.panelInside) failures.push("panel escapes analytical center");
+  if (!geometry.lastPanelControlInside)
+    failures.push("last evidence control is clipped");
+  if (geometry.heatmapBuckets !== 96)
+    failures.push(`heatmap buckets ${geometry.heatmapBuckets}`);
+  if (failures.length > 0) {
+    throw new Error(`${name} workspace: ${failures.join("; ")}`);
+  }
+}
+
+async function verifyInfrastructureWorkspaces(page, base, at) {
+  await page.goto(
+    `${base}/#source=local&view=processes&at=${at}&span=3600&preset=pressure`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector(
+    '[data-testid="infrastructure-evidence-panel"][data-view="processes"]',
+    { timeout: 15_000 },
+  );
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const os = await infrastructureGeometry(page, "processes");
+  assertInfrastructureGeometry("OS", os);
+  if (
+    !os.panelText.includes("Load per CPU is runnable demand") ||
+    !os.panelText.includes("host values are not summed") ||
+    !os.gated.includes("Network") ||
+    !os.gated.includes("Filesystems")
+  ) {
+    throw new Error(`OS scope/gating contract: ${JSON.stringify(os)}`);
+  }
+  const osQuality = await page.$eval(
+    '[data-testid="host-quality"]',
+    (element) => ({
+      limited: element.getAttribute("data-limited"),
+      text: element.textContent ?? "",
+    }),
+  );
+  if (
+    osQuality.limited === null ||
+    !osQuality.text.includes("resource_limited")
+  ) {
+    throw new Error(
+      `OS quality evidence missing: ${JSON.stringify(osQuality)}`,
+    );
+  }
+  await page.screenshot({ path: OS_SHOT });
+
+  await page.goto(
+    `${base}/#source=local&view=tables&at=${at}&span=3600&preset=vacuum_risk`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector('[data-testid="table-vacuum-lanes"] button', {
+    timeout: 15_000,
+  });
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const tables = await infrastructureGeometry(page, "tables");
+  assertInfrastructureGeometry("Tables", tables);
+  if (
+    !tables.panelText.includes("same snapshot") ||
+    !tables.gated.includes("Dependencies")
+  ) {
+    throw new Error(
+      `Tables temporal/gating contract: ${JSON.stringify(tables)}`,
+    );
+  }
+  await page.screenshot({ path: TABLES_SHOT });
+  await page.click('[data-testid="table-vacuum-lanes"] button');
+  await page.waitForSelector('[data-dock="row"]', { timeout: 10_000 });
+  await page.click('[data-detail-tab-trigger="relationships"]');
+  await page.waitForFunction(
+    () =>
+      document
+        .querySelector('[data-dock="row"] [role="tabpanel"]')
+        ?.textContent?.includes("vacuum_table") === true,
+    { timeout: 5_000 },
+  );
+  const vacuumRelation = await page.$eval(
+    '[data-dock="row"] [role="tabpanel"]',
+    (element) => element.textContent ?? "",
+  );
+  if (
+    !vacuumRelation.includes("same_snapshot_database_relation_oid") ||
+    !vacuumRelation.includes("vacuum_table")
+  ) {
+    throw new Error(`Vacuum table provenance: ${vacuumRelation}`);
+  }
+
+  await page.goto(
+    `${base}/#source=local&view=indexes&at=${at}&span=3600&preset=table_context`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector(
+    '[data-testid="infrastructure-evidence-panel"][data-view="indexes"]',
+    { timeout: 15_000 },
+  );
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const indexes = await infrastructureGeometry(page, "indexes");
+  assertInfrastructureGeometry("Indexes", indexes);
+  if (
+    !indexes.panelText.includes("same_snapshot_database_relation_oid") ||
+    !indexes.gated.includes("Duplication") ||
+    !indexes.gated.includes("Invalid / build")
+  ) {
+    throw new Error(
+      `Indexes temporal/gating contract: ${JSON.stringify(indexes)}`,
+    );
+  }
+  await page.screenshot({ path: INDEXES_SHOT });
+
+  await page.goto(
+    `${base}/#source=local&view=vacuum&at=${at}&span=3600&preset=wraparound_context`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector('[data-testid="vacuum-lifetime-warning"]', {
+    timeout: 15_000,
+  });
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const vacuum = await infrastructureGeometry(page, "vacuum");
+  assertInfrastructureGeometry("Vacuum", vacuum);
+  if (
+    !vacuum.panelText.includes("PID reuse") ||
+    !vacuum.gated.includes("Throughput") ||
+    !vacuum.gated.includes("Blockers") ||
+    !vacuum.gated.includes("History")
+  ) {
+    throw new Error(
+      `Vacuum lifetime/gating contract: ${JSON.stringify(vacuum)}`,
+    );
+  }
+  await page.screenshot({ path: VACUUM_SHOT });
+  return { os, tables, indexes, vacuum, vacuumRelationVerified: true };
+}
+
 function assertContract(metrics, keyboard) {
   const failures = [];
   const exactHeight = (name, expected) => {
@@ -1178,9 +1375,17 @@ try {
   });
   await page.screenshot({ path: SUCCESS_SHOT });
   const activityPlans = await verifyActivityPlansWorkspaces(page, base, at);
+  const infrastructure = await verifyInfrastructureWorkspaces(page, base, at);
   console.log(
     `forensic shell PASS\n${JSON.stringify(
-      { ...metrics, keyboard, statements, globalSearchDetail, activityPlans },
+      {
+        ...metrics,
+        keyboard,
+        statements,
+        globalSearchDetail,
+        activityPlans,
+        infrastructure,
+      },
       null,
       2,
     )}`,
@@ -1188,6 +1393,10 @@ try {
   console.log(`approved screenshot: ${SUCCESS_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_SHOT}`);
   console.log(`approved screenshot: ${PLANS_SHOT}`);
+  console.log(`approved screenshot: ${OS_SHOT}`);
+  console.log(`approved screenshot: ${TABLES_SHOT}`);
+  console.log(`approved screenshot: ${INDEXES_SHOT}`);
+  console.log(`approved screenshot: ${VACUUM_SHOT}`);
 } catch (error) {
   if (page !== undefined) {
     console.error(

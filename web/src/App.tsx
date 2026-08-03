@@ -19,6 +19,7 @@ import { FocusBar } from "./components/FocusBar";
 import { ForensicSearch } from "./components/ForensicSearch";
 import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
+import { InfrastructureEvidencePanel } from "./components/InfrastructureEvidencePanel";
 import { PrimaryNavigation } from "./components/PrimaryNavigation";
 import { ShellLayout } from "./components/ShellLayout";
 import { HealthLine } from "./components/HealthLine";
@@ -73,6 +74,36 @@ const PLAN_LENSES = [
   ["planBuffers", "io"],
   ["planRows", "rows"],
   ["planChanges", "change_timeline"],
+] as const;
+const OS_LENSES = [
+  ["osPressure", "pressure"],
+  ["osCpu", "cpu"],
+  ["osMemory", "memory"],
+  ["osDiskIo", "disk_io"],
+  ["osCgroups", "cgroup"],
+  ["osProcesses", "processes"],
+  ["osDataQuality", "data_quality"],
+] as const;
+const TABLE_LENSES = [
+  ["tableHealth", "health"],
+  ["tableVacuumRisk", "vacuum_risk"],
+  ["tableIo", "io"],
+  ["tableScanPattern", "scan_pattern"],
+  ["tableSizeGrowth", "size_growth"],
+  ["tableXidMxid", "xid_mxid"],
+] as const;
+const INDEX_LENSES = [
+  ["indexUsage", "usage"],
+  ["indexIo", "io"],
+  ["indexSizeGrowth", "size_growth"],
+  ["indexUnused", "unused"],
+  ["indexTableContext", "table_context"],
+] as const;
+const VACUUM_LENSES = [
+  ["vacuumProgress", "progress"],
+  ["vacuumPhase", "phase"],
+  ["vacuumDeadItems", "dead_items"],
+  ["vacuumWraparound", "wraparound_context"],
 ] as const;
 
 function catalogPreparedLens(
@@ -270,15 +301,35 @@ function Shell() {
   const statementsScreen = activeView?.code === "statements";
   const activityScreen = activeView?.code === "activity";
   const plansScreen = activeView?.code === "plans";
-  const evidencePanelScreen = activityScreen || plansScreen;
-  const denseHeatmapScreen = activityScreen || statementsScreen || plansScreen;
+  const processesScreen = activeView?.code === "processes";
+  const tablesScreen = activeView?.code === "tables";
+  const indexesScreen = activeView?.code === "indexes";
+  const vacuumScreen = activeView?.code === "vacuum";
+  const workloadEvidenceScreen = activityScreen || plansScreen;
+  const infrastructureEvidenceScreen =
+    processesScreen || tablesScreen || indexesScreen || vacuumScreen;
+  const evidencePanelScreen =
+    workloadEvidenceScreen || infrastructureEvidenceScreen;
+  const denseHeatmapScreen =
+    activityScreen ||
+    statementsScreen ||
+    plansScreen ||
+    infrastructureEvidenceScreen;
   const effectivePreset = statementsScreen
     ? (state.preset ?? "time")
     : activityScreen
       ? (state.preset ?? "overview")
       : plansScreen
         ? (state.preset ?? "time")
-        : state.preset;
+        : processesScreen
+          ? (state.preset ?? "pressure")
+          : tablesScreen
+            ? (state.preset ?? "health")
+            : indexesScreen
+              ? (state.preset ?? "usage")
+              : vacuumScreen
+                ? (state.preset ?? "progress")
+                : state.preset;
   const preparedLenses: PreparedLens[] | undefined = statementsScreen
     ? [
         ...STATEMENT_LENSES.map(([code, preset]) =>
@@ -327,21 +378,109 @@ function Shell() {
               reason: t("plans.lens.compare.reason"),
             },
           ]
-        : undefined;
+        : processesScreen
+          ? [
+              ...OS_LENSES.map(([code, preset]) =>
+                catalogPreparedLens(activeView, code, preset),
+              ),
+              {
+                code: "osNetwork",
+                preset: null,
+                availability: "not_collected" as const,
+                reason: t("host.lens.network.reason"),
+              },
+              {
+                code: "osFilesystems",
+                preset: null,
+                availability: "not_collected" as const,
+                reason: t("host.lens.filesystems.reason"),
+              },
+            ]
+          : tablesScreen
+            ? [
+                ...TABLE_LENSES.map(([code, preset]) =>
+                  catalogPreparedLens(activeView, code, preset),
+                ),
+                {
+                  code: "tableDependencies",
+                  preset: null,
+                  availability: "gated" as const,
+                  reason: t("tables.lens.dependencies.reason"),
+                },
+              ]
+            : indexesScreen
+              ? [
+                  ...INDEX_LENSES.map(([code, preset]) =>
+                    catalogPreparedLens(activeView, code, preset),
+                  ),
+                  {
+                    code: "indexDuplication",
+                    preset: null,
+                    availability: "gated" as const,
+                    reason: t("indexes.lens.duplication.reason"),
+                  },
+                  {
+                    code: "indexInvalidBuild",
+                    preset: null,
+                    availability: "gated" as const,
+                    reason: t("indexes.lens.invalidBuild.reason"),
+                  },
+                ]
+              : vacuumScreen
+                ? [
+                    ...VACUUM_LENSES.map(([code, preset]) =>
+                      catalogPreparedLens(activeView, code, preset),
+                    ),
+                    {
+                      code: "vacuumThroughput",
+                      preset: null,
+                      availability: "not_collected" as const,
+                      reason: t("vacuum.lens.throughput.reason"),
+                    },
+                    {
+                      code: "vacuumBlockers",
+                      preset: null,
+                      availability: "gated" as const,
+                      reason: t("vacuum.lens.blockers.reason"),
+                    },
+                    {
+                      code: "vacuumHistory",
+                      preset: null,
+                      availability: "gated" as const,
+                      reason: t("vacuum.lens.history.reason"),
+                    },
+                  ]
+                : undefined;
   const evidenceNote = statementsScreen
     ? t("statements.evidenceNote")
     : activityScreen
       ? t("activity.evidenceNote")
       : plansScreen
         ? t("plans.evidenceNote")
-        : undefined;
+        : processesScreen
+          ? t("host.evidenceNote")
+          : tablesScreen
+            ? t("tables.evidenceNote")
+            : indexesScreen
+              ? t("indexes.evidenceNote")
+              : vacuumScreen
+                ? t("vacuum.evidenceNote")
+                : undefined;
   const filterHint = statementsScreen
     ? t("statements.filterHint")
     : activityScreen
       ? t("activity.filterHint")
       : plansScreen
         ? t("plans.filterHint")
-        : undefined;
+        : processesScreen
+          ? t("host.filterHint")
+          : tablesScreen
+            ? t("tables.filterHint")
+            : indexesScreen
+              ? t("indexes.filterHint")
+              : vacuumScreen
+                ? t("vacuum.filterHint")
+                : undefined;
   // A preset owns its default ranking. Carrying an explicit sort from the
   // previous lens can leave the matrix invisibly ranked by a hidden column.
   const selectPreset = (preset: string | null) =>
@@ -694,7 +833,11 @@ function Shell() {
             <div
               data-shell-region="analytical-center"
               data-testid={
-                evidencePanelScreen ? "workload-analytical-center" : undefined
+                workloadEvidenceScreen
+                  ? "workload-analytical-center"
+                  : infrastructureEvidenceScreen
+                    ? "infrastructure-analytical-center"
+                    : undefined
               }
               style={{
                 display: "grid",
@@ -731,12 +874,33 @@ function Shell() {
                   onSelectEntity={(entity) => patch({ entity, dock: "row" })}
                 />
               </div>
-              {evidencePanelScreen && (
+              {workloadEvidenceScreen && (
                 <WorkloadEvidencePanel
                   view={activeView}
                   preset={effectivePreset}
                   at={at}
                   span={state.span}
+                  onOpenEntity={(view, entity) =>
+                    patch({
+                      view,
+                      entity,
+                      dock: "row",
+                      ...(view === state.view
+                        ? {}
+                        : { preset: null, sort: null, order: null }),
+                    })
+                  }
+                />
+              )}
+              {infrastructureEvidenceScreen && (
+                <InfrastructureEvidencePanel
+                  view={activeView}
+                  preset={effectivePreset}
+                  at={at}
+                  span={state.span}
+                  from={range.fromUs}
+                  to={range.toUs}
+                  context={context.data}
                   onOpenEntity={(view, entity) =>
                     patch({
                       view,

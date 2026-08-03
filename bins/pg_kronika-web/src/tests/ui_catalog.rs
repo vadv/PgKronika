@@ -200,7 +200,15 @@ fn host_and_object_views_publish_prepared_lenses_and_temporal_relations() {
     for (view, presets) in [
         (
             "processes",
-            &["cpu", "memory", "disk_io", "cgroup", "processes"][..],
+            &[
+                "pressure",
+                "cpu",
+                "memory",
+                "disk_io",
+                "cgroup",
+                "processes",
+                "data_quality",
+            ][..],
         ),
         (
             "tables",
