@@ -14,6 +14,7 @@ const SUCCESS_SHOT = `${OUT_DIR}forensic-shell-1920x1080.png`;
 const ACTIVITY_SHOT = `${OUT_DIR}forensic-activity-1920x1080.png`;
 const ACTIVITY_CPU_SHOT = `${OUT_DIR}forensic-activity-cpu-1920x1080.png`;
 const ACTIVITY_WAITS_SHOT = `${OUT_DIR}forensic-activity-waits-1920x1080.png`;
+const PROCESS_DETAIL_SHOT = `${OUT_DIR}forensic-process-detail-1920x1080.png`;
 const PLANS_SHOT = `${OUT_DIR}forensic-plans-1920x1080.png`;
 const OS_SHOT = `${OUT_DIR}forensic-os-1920x1080.png`;
 const TABLES_SHOT = `${OUT_DIR}forensic-tables-1920x1080.png`;
@@ -1157,6 +1158,57 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       "Activity process drill-down kept an invalid Activity lens",
     );
   }
+  await page.waitForSelector(".entity-detail__inline-activity", {
+    timeout: 10_000,
+  });
+  const richProcessDetail = await page.$eval('[data-dock="row"]', (dock) => ({
+    groups: [...dock.querySelectorAll("[data-forensic-group]")].map((group) =>
+      group.getAttribute("data-forensic-group"),
+    ),
+    fields: [...dock.querySelectorAll("[data-field]")].map((field) =>
+      field.getAttribute("data-field"),
+    ),
+    semantics: [...dock.querySelectorAll("[data-semantic]")].map((field) =>
+      field.getAttribute("data-semantic"),
+    ),
+    text: dock.textContent ?? "",
+    inlineActivity:
+      dock.querySelector(".entity-detail__inline-activity") !== null,
+    rootHeight: document.documentElement.scrollHeight,
+    scrollY: window.scrollY,
+  }));
+  const requiredProcessFields = [
+    "cpu_user",
+    "cpu_system",
+    "run_delay",
+    "rss",
+    "virtual_memory",
+    "logical_read_bytes_per_second",
+    "cache_served_read_bytes_per_second",
+    "read_bytes_per_second",
+    "logical_write_bytes_per_second",
+    "write_bytes_per_second",
+    "command",
+  ];
+  if (
+    richProcessDetail.groups.join(",") !== "compute,ioCache,context" ||
+    requiredProcessFields.some(
+      (field) => !richProcessDetail.fields.includes(field),
+    ) ||
+    !richProcessDetail.semantics.includes("estimate") ||
+    !richProcessDetail.semantics.includes("R") ||
+    !richProcessDetail.inlineActivity ||
+    /page-cache hits|proof|confidence|exact match|gaps|gated/i.test(
+      richProcessDetail.text,
+    ) ||
+    richProcessDetail.rootHeight > 1080 ||
+    richProcessDetail.scrollY !== 0
+  ) {
+    throw new Error(
+      `rich Process Detail is incomplete: ${JSON.stringify(richProcessDetail)}`,
+    );
+  }
+  await page.screenshot({ path: PROCESS_DETAIL_SHOT });
 
   await page.goto(`${base}/#source=local&view=plans&at=${at}&span=3600`, {
     waitUntil: "networkidle0",
@@ -2120,6 +2172,7 @@ try {
   console.log(`approved screenshot: ${ACTIVITY_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_CPU_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_WAITS_SHOT}`);
+  console.log(`approved screenshot: ${PROCESS_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${PLANS_SHOT}`);
   console.log(`approved screenshot: ${OS_SHOT}`);
   console.log(`approved screenshot: ${TABLES_SHOT}`);

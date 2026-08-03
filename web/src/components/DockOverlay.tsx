@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
 import { colDesc, colLabel } from "../api/codes";
@@ -14,9 +14,14 @@ import type {
   ViewSpec,
 } from "../api/types";
 import type { DockKind, UiState } from "../state/url";
-import { isIdentityColumn, shortIdToken } from "../design/format";
+import {
+  formatDurationUs,
+  isIdentityColumn,
+  shortIdToken,
+} from "../design/format";
 import { formatCellValue } from "./cellFormat";
 import { formatIntervalTime } from "./FocusBar";
+import { SemanticBadge } from "./SemanticBadge";
 import "./DockOverlay.css";
 
 export interface DockOverlayProps {
@@ -433,18 +438,24 @@ function EntityPointView(props: {
   data: EntityPointResponse;
   columns: Map<string, ColumnSpec>;
   viewCode: string;
+  relatedActivity?: EntityPointResponse;
+  onPatch: (patch: Partial<UiState>) => void;
 }) {
   const { t } = useTranslation();
   const meaningful = props.data.fields.filter((field) => {
     const availability =
       props.columns.get(field.code)?.availability ?? "available";
-    return field.value !== null || availability !== "available";
+    return (
+      props.viewCode === "processes" ||
+      field.value !== null ||
+      availability !== "available"
+    );
   });
   const identityCodes = new Set(
     props.viewCode === "activity"
       ? ["pid", "database", "user", "application", "process_link"]
       : props.viewCode === "processes"
-        ? ["pid", "type", "cgroup"]
+        ? ["pid", "type", "state", "cgroup"]
         : props.viewCode === "statements"
           ? ["queryid", "database", "user"]
           : props.viewCode === "plans"
@@ -463,29 +474,156 @@ function EntityPointView(props: {
   const body = meaningful.filter(
     (field) => !identityCodes.has(field.code) && !stateCodes.has(field.code),
   );
-  const groups = [
-    {
-      code: "compute",
-      fields: body.filter((field) =>
-        /(cpu|rss|mem|thread|sched|delay|load|context)/i.test(field.code),
-      ),
-    },
-    {
-      code: "ioCache",
-      fields: body.filter((field) =>
-        /(read|write|(^|_)io|cache|hit|miss|block|wal|buffer|temp|disk)/i.test(
-          field.code,
-        ),
-      ),
-    },
-  ];
+  const ordered = (codes: readonly string[]) =>
+    codes.flatMap((code) => body.filter((field) => field.code === code));
+  const groups =
+    props.viewCode === "processes"
+      ? [
+          {
+            code: "compute",
+            fields: ordered([
+              "cpu",
+              "cpu_user",
+              "cpu_system",
+              "run_delay",
+              "block_delay",
+              "current_cpu",
+              "rss",
+              "virtual_memory",
+              "swap",
+              "threads",
+              "minor_faults_per_second",
+              "major_faults_per_second",
+              "voluntary_context_switches_per_second",
+              "involuntary_context_switches_per_second",
+              "scheduler_policy",
+              "nice",
+              "priority",
+              "realtime_priority",
+            ]),
+          },
+          {
+            code: "ioCache",
+            fields: ordered([
+              "logical_read_bytes_per_second",
+              "cache_served_read_bytes_per_second",
+              "read_bytes_per_second",
+              "logical_write_bytes_per_second",
+              "write_bytes_per_second",
+              "read_syscalls_per_second",
+              "write_syscalls_per_second",
+            ]),
+          },
+        ]
+      : [
+          {
+            code: "compute",
+            fields: body.filter((field) =>
+              /(cpu|rss|mem|thread|sched|delay|load|context)/i.test(field.code),
+            ),
+          },
+          {
+            code: "ioCache",
+            fields: body.filter((field) =>
+              /(read|write|(^|_)io|cache|hit|miss|block|wal|buffer|temp|disk)/i.test(
+                field.code,
+              ),
+            ),
+          },
+        ];
   const groupedCodes = new Set(
     groups.flatMap((group) => group.fields.map((field) => field.code)),
   );
   groups.push({
     code: "context",
-    fields: body.filter((field) => !groupedCodes.has(field.code)),
+    fields:
+      props.viewCode === "processes"
+        ? [
+            ...ordered([
+              "parent_pid",
+              "uid",
+              "effective_uid",
+              "started_at",
+              "command",
+            ]),
+            ...body
+              .filter((field) => !groupedCodes.has(field.code))
+              .filter(
+                (field) =>
+                  ![
+                    "parent_pid",
+                    "uid",
+                    "effective_uid",
+                    "started_at",
+                    "command",
+                  ].includes(field.code),
+              ),
+          ]
+        : body.filter((field) => !groupedCodes.has(field.code)),
   });
+
+  const processSemantics: Record<string, "S" | "G" | "R" | "EST"> = {
+    pid: "S",
+    type: "S",
+    state: "S",
+    cgroup: "S",
+    parent_pid: "S",
+    uid: "S",
+    effective_uid: "S",
+    started_at: "S",
+    command: "S",
+    current_cpu: "G",
+    rss: "G",
+    virtual_memory: "G",
+    swap: "G",
+    threads: "G",
+    scheduler_policy: "G",
+    nice: "G",
+    priority: "G",
+    realtime_priority: "G",
+    cpu: "R",
+    cpu_user: "R",
+    cpu_system: "R",
+    run_delay: "R",
+    block_delay: "R",
+    minor_faults_per_second: "R",
+    major_faults_per_second: "R",
+    voluntary_context_switches_per_second: "R",
+    involuntary_context_switches_per_second: "R",
+    logical_read_bytes_per_second: "R",
+    logical_write_bytes_per_second: "R",
+    read_bytes_per_second: "R",
+    write_bytes_per_second: "R",
+    read_syscalls_per_second: "R",
+    write_syscalls_per_second: "R",
+    cache_served_read_bytes_per_second: "EST",
+  };
+  const processSubgroupBefore: Record<string, string> = {
+    rss: "memory",
+    logical_read_bytes_per_second: "readPath",
+    logical_write_bytes_per_second: "ioRates",
+    parent_pid: "execution",
+  };
+  const relatedActivityRelation = props.data.related.find(
+    (relation) =>
+      props.viewCode === "processes" &&
+      relation.view === "activity" &&
+      relation.relation === "activity_process",
+  );
+  const relatedActivityField = (code: string) =>
+    props.relatedActivity?.fields.find((field) => field.code === code)?.value ??
+    null;
+  const relatedQuery = relatedActivityField("query");
+  const relatedDuration = relatedActivityField("query_duration_us");
+  const relatedMeta = [
+    relatedActivityField("database"),
+    relatedActivityField("user"),
+    relatedActivityField("application"),
+  ].filter(
+    (value): value is string => typeof value === "string" && value !== "",
+  );
+  const relatedState = relatedActivityField("state");
+  const relatedWait = relatedActivityField("wait_event");
 
   const renderField = (
     field: EntityPointResponse["fields"][number],
@@ -500,15 +638,23 @@ function EntityPointView(props: {
     const label = colLabel(t, props.viewCode, field.code);
     const desc = colDesc(t, props.viewCode, field.code);
     const availability = spec?.availability ?? "available";
-    const notCollected = field.value === null && availability !== "available";
+    const semantic =
+      props.viewCode === "processes" ? processSemantics[field.code] : undefined;
+    const notCollected =
+      field.value === null &&
+      (props.viewCode === "processes" || availability !== "available");
     const isSql =
       typeof field.value === "string" &&
       (field.value.length > 60 || field.value.includes("\n"));
     const fullIdentity = field.value !== null && isIdentityColumn(field.code);
+    const unavailableKind =
+      props.viewCode === "processes" && availability === "available"
+        ? "not_collected"
+        : availability;
     const unavailableFallback =
-      availability === "available" ? "—" : "not collected";
+      unavailableKind === "available" ? "—" : "not collected";
     const display = notCollected
-      ? t(`availability.${availability}`, {
+      ? t(`availability.${unavailableKind}`, {
           defaultValue: unavailableFallback,
         })
       : fullIdentity
@@ -518,10 +664,12 @@ function EntityPointView(props: {
       <div
         key={field.code}
         data-field={field.code}
+        data-semantic={semantic === "EST" ? "estimate" : semantic}
         className="entity-detail__measurement entity-detail__measurement--block"
       >
         <div title={desc ?? undefined} className="entity-detail__label">
-          {label}
+          <span>{label}</span>
+          {semantic && <SemanticBadge kind={semantic} />}
         </div>
         <pre data-sql className="entity-detail__code">
           {field.value}
@@ -531,10 +679,12 @@ function EntityPointView(props: {
       <div
         key={field.code}
         data-field={field.code}
+        data-semantic={semantic === "EST" ? "estimate" : semantic}
         className={`entity-detail__measurement${compact ? " entity-detail__measurement--compact" : ""}`}
       >
         <span title={desc ?? undefined} className="entity-detail__label">
-          {label}
+          <span>{label}</span>
+          {semantic && <SemanticBadge kind={semantic} />}
         </span>
         <span
           className={`entity-detail__value${notCollected ? " entity-detail__value--missing" : ""}`}
@@ -547,7 +697,12 @@ function EntityPointView(props: {
   };
 
   return (
-    <div data-kv data-forensic-summary className="entity-detail__forensic">
+    <div
+      data-kv
+      data-forensic-summary
+      data-view={props.viewCode}
+      className="entity-detail__forensic"
+    >
       {identity.length > 0 && (
         <div className="entity-detail__identity-strip">
           {identity.map((field) => renderField(field, true))}
@@ -567,9 +722,75 @@ function EntityPointView(props: {
               data-forensic-group={group.code}
               className="entity-detail__group"
             >
-              <h3>{t(`dock.detail.group.${group.code}`)}</h3>
+              <h3>
+                <span>
+                  {t(`dock.detail.group.${group.code}.${props.viewCode}`, {
+                    defaultValue: t(`dock.detail.group.${group.code}`),
+                  })}
+                </span>
+                {props.viewCode === "processes" && (
+                  <code>{t(`dock.detail.source.process.${group.code}`)}</code>
+                )}
+              </h3>
+              {group.code === "context" &&
+                relatedActivityRelation !== undefined &&
+                props.relatedActivity !== undefined && (
+                  <button
+                    type="button"
+                    className="entity-detail__inline-activity"
+                    aria-label={t("dock.detail.relatedActivity.open")}
+                    onClick={() =>
+                      props.onPatch({
+                        view: relatedActivityRelation.view,
+                        entity: relatedActivityRelation.entity,
+                        dock: "row",
+                        preset: null,
+                        q: null,
+                        sort: null,
+                        order: null,
+                        at: relatedActivityRelation.snapshot_ts_us,
+                      })
+                    }
+                  >
+                    <span className="entity-detail__inline-activity-heading">
+                      <strong>{t("dock.detail.relatedActivity.title")}</strong>
+                      <span>{t("dock.detail.relatedActivity.open")}</span>
+                    </span>
+                    {relatedMeta.length > 0 && (
+                      <code>{relatedMeta.join(" / ")}</code>
+                    )}
+                    {typeof relatedQuery === "string" &&
+                      relatedQuery !== "" && <pre>{relatedQuery}</pre>}
+                    <span className="entity-detail__inline-activity-state">
+                      {typeof relatedState === "string" && (
+                        <span>{relatedState}</span>
+                      )}
+                      {typeof relatedWait === "string" && (
+                        <span>{relatedWait}</span>
+                      )}
+                      {typeof relatedDuration === "number" && (
+                        <span>{formatDurationUs(relatedDuration)}</span>
+                      )}
+                    </span>
+                  </button>
+                )}
               <div className="entity-detail__measurements">
-                {group.fields.map((field) => renderField(field))}
+                {group.fields.map((field) => {
+                  const subgroup =
+                    props.viewCode === "processes"
+                      ? processSubgroupBefore[field.code]
+                      : undefined;
+                  return (
+                    <Fragment key={field.code}>
+                      {subgroup && (
+                        <h4 className="entity-detail__subgroup">
+                          {t(`dock.detail.subgroup.${subgroup}`)}
+                        </h4>
+                      )}
+                      {renderField(field)}
+                    </Fragment>
+                  );
+                })}
               </div>
             </section>
           ))}
@@ -757,6 +978,17 @@ function RowDock(props: {
     at: props.at,
     includeRelated: true,
   });
+  const activityRelation = entity.data?.related.find(
+    (relation) =>
+      props.state.view === "processes" &&
+      relation.view === "activity" &&
+      relation.relation === "activity_process",
+  );
+  const relatedActivity = useEntityPoint({
+    view: "activity",
+    entity: activityRelation?.entity ?? "",
+    at: activityRelation?.snapshot_ts_us ?? props.at,
+  });
   const historyColumns = detailHistoryColumns(props.view);
   const historySpan = Math.min(props.state.span, MAX_DETAIL_HISTORY_SECONDS);
   const historyFrom = (
@@ -917,6 +1149,8 @@ function RowDock(props: {
                   data={data}
                   columns={columnSpecs}
                   viewCode={viewCode}
+                  relatedActivity={relatedActivity.data}
+                  onPatch={props.onPatch}
                 />
               </div>
             )}
@@ -983,6 +1217,7 @@ function RowDock(props: {
                           view: relation.view,
                           entity: relation.entity,
                           dock: "row",
+                          at: relation.snapshot_ts_us,
                           ...(relation.view === props.state.view
                             ? {}
                             : {

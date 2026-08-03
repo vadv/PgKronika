@@ -115,6 +115,7 @@ pub(crate) struct ProjectedRelation {
     pub relation: &'static str,
     pub view: &'static str,
     pub entity: Vec<u8>,
+    pub snapshot_ts_us: i64,
     pub kind: RelationKind,
     pub method: &'static str,
     pub fields: Vec<&'static str>,
@@ -893,6 +894,7 @@ fn statement_plan_relations(
                 relation: "statement_plan",
                 view: "plans",
                 entity: entity_for(plan_view, section, row, snapshot_ts_us)?,
+                snapshot_ts_us,
                 kind: RelationKind::BestEffort,
                 method,
                 fields: fields.to_vec(),
@@ -1076,7 +1078,22 @@ fn column_requires_predecessor(view: &str, column: &str) -> bool {
             | ("indexes", "scans" | "rows_per_scan" | "io_hit_pct")
             | (
                 "processes",
-                "cpu" | "read_bytes_per_second" | "write_bytes_per_second" | "block_delay"
+                "cpu"
+                    | "cpu_user"
+                    | "cpu_system"
+                    | "run_delay"
+                    | "voluntary_context_switches_per_second"
+                    | "involuntary_context_switches_per_second"
+                    | "minor_faults_per_second"
+                    | "major_faults_per_second"
+                    | "read_syscalls_per_second"
+                    | "write_syscalls_per_second"
+                    | "logical_read_bytes_per_second"
+                    | "logical_write_bytes_per_second"
+                    | "read_bytes_per_second"
+                    | "write_bytes_per_second"
+                    | "cache_served_read_bytes_per_second"
+                    | "block_delay"
             )
     )
 }
@@ -1482,6 +1499,7 @@ pub(crate) fn activity_process_relations(
             relation: "activity_process",
             view: "processes",
             entity,
+            snapshot_ts_us: timestamp(process, "ts")?.unwrap_or(input.snapshot_ts_us),
             kind: RelationKind::BestEffort,
             method: "pid",
             fields: vec!["pid"],
@@ -1519,6 +1537,7 @@ pub(crate) fn process_activity_relations(
             relation: "activity_process",
             view: "activity",
             entity,
+            snapshot_ts_us: at_us,
             kind: RelationKind::BestEffort,
             method: "pid",
             fields: vec!["pid"],
@@ -1600,6 +1619,7 @@ pub(crate) fn object_relations(
                 relation,
                 view: target_view,
                 entity: entity_for(target, target_section, candidate, input.snapshot_ts_us)?,
+                snapshot_ts_us: input.snapshot_ts_us,
                 kind: RelationKind::Temporal,
                 method: "same_snapshot_database_relation_oid",
                 fields: vec!["datid", "relid", "ts"],
@@ -1891,12 +1911,53 @@ fn project_processes(
         let value = match column.code {
             "pid" => raw_frame(row, "pid", column.value_type),
             "type" => raw_frame(row, "comm", column.value_type),
+            "state" => process_state(row),
+            "parent_pid" => raw_frame(row, "ppid", column.value_type),
+            "uid" => raw_frame(row, "uid", column.value_type),
+            "effective_uid" => raw_frame(row, "euid", column.value_type),
+            "started_at" => raw_frame(row, "starttime", column.value_type),
+            "current_cpu" => raw_frame(row, "curcpu", column.value_type),
+            "nice" => raw_frame(row, "nice", column.value_type),
+            "priority" => raw_frame(row, "prio", column.value_type),
+            "realtime_priority" => raw_frame(row, "rtprio", column.value_type),
+            "scheduler_policy" => process_scheduler_policy(row),
             "cpu" => tick_rate_sum(row, previous, &["utime", "stime"], input, continuity),
+            "cpu_user" => tick_rate_sum(row, previous, &["utime"], input, continuity),
+            "cpu_system" => tick_rate_sum(row, previous, &["stime"], input, continuity),
+            "run_delay" => scaled_rate_sum(
+                row,
+                previous,
+                &["rundelay_ns"],
+                input,
+                continuity,
+                1_000_000_000.0,
+            ),
             "rss" => raw_frame(row, "rmem_kb", column.value_type),
             "threads" => raw_frame(row, "num_threads", column.value_type),
+            "virtual_memory" => raw_frame(row, "vmem_kb", column.value_type),
+            "swap" => raw_frame(row, "vswap_kb", column.value_type),
+            "voluntary_context_switches_per_second" => {
+                rate_sum(row, previous, &["nvcsw"], input, continuity)
+            }
+            "involuntary_context_switches_per_second" => {
+                rate_sum(row, previous, &["nivcsw"], input, continuity)
+            }
+            "minor_faults_per_second" => rate_sum(row, previous, &["minflt"], input, continuity),
+            "major_faults_per_second" => rate_sum(row, previous, &["majflt"], input, continuity),
+            "read_syscalls_per_second" => rate_sum(row, previous, &["syscr"], input, continuity),
+            "write_syscalls_per_second" => rate_sum(row, previous, &["syscw"], input, continuity),
+            "logical_read_bytes_per_second" => {
+                rate_sum(row, previous, &["rchar"], input, continuity)
+            }
+            "logical_write_bytes_per_second" => {
+                rate_sum(row, previous, &["wchar"], input, continuity)
+            }
             "read_bytes_per_second" => rate_sum(row, previous, &["read_bytes"], input, continuity),
             "write_bytes_per_second" => {
                 rate_sum(row, previous, &["write_bytes"], input, continuity)
+            }
+            "cache_served_read_bytes_per_second" => {
+                cache_served_read_rate(row, previous, input, continuity)
             }
             "block_delay" => tick_rate_sum(row, previous, &["blkdelay_ticks"], input, continuity),
             "command" => raw_frame(row, "cmdline", column.value_type),
@@ -1909,6 +1970,31 @@ fn project_processes(
         out.values.push((column.code, value));
     }
     Ok(out)
+}
+
+fn process_state(row: &OutRow) -> FrameValue {
+    let Some(state) = unsigned_integer(row, "state").and_then(|state| u8::try_from(state).ok())
+    else {
+        return FrameValue::Null;
+    };
+    if state.is_ascii_graphic() {
+        FrameValue::String(char::from(state).to_string())
+    } else {
+        FrameValue::Null
+    }
+}
+
+fn process_scheduler_policy(row: &OutRow) -> FrameValue {
+    let policy = match unsigned_integer(row, "policy") {
+        Some(0) => "NORMAL",
+        Some(1) => "FIFO",
+        Some(2) => "RR",
+        Some(3) => "BATCH",
+        Some(5) => "IDLE",
+        Some(6) => "DEADLINE",
+        Some(_) | None => return FrameValue::Null,
+    };
+    FrameValue::String(policy.to_owned())
 }
 
 fn process_cgroup<'a>(
@@ -2496,6 +2582,61 @@ fn rate_sum(
     }
     match delta_sum(current, previous, fields, continuity) {
         DeltaOperand::Value(value) => finite_frame(value / (elapsed as f64 / 1_000_000.0)),
+        _ => FrameValue::Null,
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "bounded microsecond elapsed time becomes the projection's scaled rate denominator"
+)]
+fn scaled_rate_sum(
+    current: &OutRow,
+    previous: Option<&OutRow>,
+    fields: &[&'static str],
+    input: &ProjectionInput,
+    continuity: ContinuityVerdict,
+    scale: f64,
+) -> FrameValue {
+    let Some(previous_ts) = input.predecessor_ts_us else {
+        return FrameValue::Null;
+    };
+    let elapsed = input.snapshot_ts_us - previous_ts;
+    if elapsed <= 0 || !scale.is_finite() || scale <= 0.0 {
+        return FrameValue::Null;
+    }
+    match delta_sum(current, previous, fields, continuity) {
+        DeltaOperand::Value(value) => {
+            finite_frame(value / (scale * (elapsed as f64 / 1_000_000.0)))
+        }
+        _ => FrameValue::Null,
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "bounded microsecond elapsed time becomes the projection's cache-path rate denominator"
+)]
+fn cache_served_read_rate(
+    current: &OutRow,
+    previous: Option<&OutRow>,
+    input: &ProjectionInput,
+    continuity: ContinuityVerdict,
+) -> FrameValue {
+    let Some(previous_ts) = input.predecessor_ts_us else {
+        return FrameValue::Null;
+    };
+    let elapsed = input.snapshot_ts_us - previous_ts;
+    if elapsed <= 0 {
+        return FrameValue::Null;
+    }
+    match (
+        delta(current, previous, "rchar", continuity),
+        delta(current, previous, "read_bytes", continuity),
+    ) {
+        (DeltaOperand::Value(logical), DeltaOperand::Value(storage)) => {
+            finite_frame((logical - storage).max(0.0) / (elapsed as f64 / 1_000_000.0))
+        }
         _ => FrameValue::Null,
     }
 }

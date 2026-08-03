@@ -116,6 +116,7 @@ struct RelatedEntityDto {
     relation: &'static str,
     view: &'static str,
     entity: String,
+    snapshot_ts_us: String,
     provenance: RelationProvenanceDto,
 }
 
@@ -401,6 +402,7 @@ fn entity_point(
             relation: relation.relation,
             view: relation.view,
             entity: URL_SAFE_NO_PAD.encode(&relation.entity),
+            snapshot_ts_us: relation.snapshot_ts_us.to_string(),
             provenance: RelationProvenanceDto {
                 kind: relation.kind,
                 method: relation.method,

@@ -258,6 +258,7 @@ function stubRequests() {
                   view: "processes",
                   entity: "proc:18422",
                   relation: "activity_process",
+                  snapshot_ts_us: "1722400000000000",
                   provenance: {
                     kind: "best_effort",
                     method: "pid",

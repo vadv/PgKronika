@@ -8,7 +8,11 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": true, "related": false },
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      },
       "inputs": [
         {
           "code": "activity",
@@ -173,6 +177,15 @@
           "unavailable_reason": "not_collected"
         },
         {
+          "code": "queryid",
+          "type": "i64",
+          "source": "activity.query_id",
+          "lazy": false,
+          "requires": ["activity"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
           "code": "query_duration_us",
           "type": "f64",
           "formula": "snapshot_ts - query_start",
@@ -213,6 +226,26 @@
           "unavailable_reason": "not_collected"
         },
         {
+          "code": "rss",
+          "type": "i64",
+          "formula": "process.rmem_kb through unique same-snapshot PID candidate",
+          "unit": "kib",
+          "lazy": false,
+          "requires": ["activity", "process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "threads",
+          "type": "u64",
+          "formula": "process.num_threads through unique same-snapshot PID candidate",
+          "unit": "count",
+          "lazy": false,
+          "requires": ["activity", "process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
           "code": "read_bytes_per_second",
           "type": "f64",
           "formula": "positive_delta(read_bytes) / elapsed",
@@ -227,6 +260,15 @@
           "type": "f64",
           "formula": "positive_delta(write_bytes) / elapsed",
           "unit": "bytes_per_second",
+          "lazy": false,
+          "requires": ["activity", "process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "command",
+          "type": "text",
+          "formula": "process.cmdline through unique same-snapshot PID candidate",
           "lazy": false,
           "requires": ["activity", "process"],
           "availability": "gated",
@@ -273,7 +315,10 @@
             "query",
             "query_duration_us"
           ],
-          "sort": { "column": "query_duration_us", "order": "desc" }
+          "sort": {
+            "column": "query_duration_us",
+            "order": "desc"
+          }
         },
         {
           "code": "waits",
@@ -285,12 +330,18 @@
             "query",
             "query_duration_us"
           ],
-          "sort": { "column": "query_duration_us", "order": "desc" }
+          "sort": {
+            "column": "query_duration_us",
+            "order": "desc"
+          }
         },
         {
           "code": "resources",
           "columns": ["pid", "user", "database", "cpu", "query"],
-          "sort": { "column": "cpu", "order": "desc" }
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
         },
         {
           "code": "transaction_age",
@@ -301,7 +352,10 @@
             "state",
             "transaction_duration_us"
           ],
-          "sort": { "column": "transaction_duration_us", "order": "desc" }
+          "sort": {
+            "column": "transaction_duration_us",
+            "order": "desc"
+          }
         },
         {
           "code": "replication",
@@ -314,7 +368,121 @@
             "sync_state",
             "replay_lag_us"
           ],
-          "sort": { "column": "replay_lag_us", "order": "desc" }
+          "sort": {
+            "column": "replay_lag_us",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "overview",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "application",
+            "state",
+            "wait_event",
+            "queryid",
+            "query_duration_us",
+            "process_link",
+            "cpu",
+            "rss",
+            "read_bytes_per_second",
+            "write_bytes_per_second",
+            "command"
+          ],
+          "sort": {
+            "column": "query_duration_us",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "waits_locks",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "state",
+            "wait_event",
+            "queryid",
+            "query_duration_us",
+            "process_link"
+          ],
+          "sort": {
+            "column": "query_duration_us",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "duration",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "queryid",
+            "query_duration_us",
+            "transaction_duration_us",
+            "query"
+          ],
+          "sort": {
+            "column": "query_duration_us",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "cpu",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "state",
+            "queryid",
+            "process_link",
+            "cpu",
+            "rss",
+            "threads",
+            "command"
+          ],
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "disk_io",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "state",
+            "wait_event",
+            "queryid",
+            "process_link",
+            "read_bytes_per_second",
+            "write_bytes_per_second",
+            "rss",
+            "command"
+          ],
+          "sort": {
+            "column": "read_bytes_per_second",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "sampling",
+          "columns": [
+            "pid",
+            "user",
+            "database",
+            "state",
+            "wait_event",
+            "query_duration_us",
+            "query"
+          ],
+          "sort": {
+            "column": "query_duration_us",
+            "order": "desc"
+          }
         }
       ],
       "canonical_metric": "active_fraction"
@@ -326,7 +494,11 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": true, "related": true },
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      },
       "inputs": [
         {
           "code": "statements",
@@ -554,7 +726,10 @@
             "plan_time_pct",
             "rows"
           ],
-          "sort": { "column": "total", "order": "desc" }
+          "sort": {
+            "column": "total",
+            "order": "desc"
+          }
         },
         {
           "code": "latency",
@@ -569,7 +744,10 @@
             "time_pct",
             "rows"
           ],
-          "sort": { "column": "mean", "order": "desc" }
+          "sort": {
+            "column": "mean",
+            "order": "desc"
+          }
         },
         {
           "code": "io",
@@ -581,7 +759,10 @@
             "hit_pct",
             "blks_read"
           ],
-          "sort": { "column": "blks_read", "order": "desc" }
+          "sort": {
+            "column": "blks_read",
+            "order": "desc"
+          }
         },
         {
           "code": "wal",
@@ -593,12 +774,18 @@
             "wal_bytes",
             "total"
           ],
-          "sort": { "column": "wal_bytes", "order": "desc" }
+          "sort": {
+            "column": "wal_bytes",
+            "order": "desc"
+          }
         },
         {
           "code": "temp",
           "columns": ["queryid", "database", "user", "calls", "temp_written"],
-          "sort": { "column": "temp_written", "order": "desc" }
+          "sort": {
+            "column": "temp_written",
+            "order": "desc"
+          }
         },
         {
           "code": "planning",
@@ -611,7 +798,10 @@
             "total",
             "mean"
           ],
-          "sort": { "column": "plan_time_pct", "order": "desc" }
+          "sort": {
+            "column": "plan_time_pct",
+            "order": "desc"
+          }
         }
       ],
       "canonical_metric": "time"
@@ -623,7 +813,11 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": true, "related": false },
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": false
+      },
       "inputs": [
         {
           "code": "plans",
@@ -640,7 +834,24 @@
           "unavailable_reason": "not_collected"
         }
       ],
-      "joins": [],
+      "joins": [
+        {
+          "left": "plans",
+          "right": "statements",
+          "kind": "best_effort",
+          "fields": ["queryid", "dbid", "userid"],
+          "cardinality": "many_to_one",
+          "provenance": "ossc_queryid_dbid_userid_attribution"
+        },
+        {
+          "left": "plans",
+          "right": "statements",
+          "kind": "best_effort",
+          "fields": ["queryid_stat_statements", "dbid", "userid"],
+          "cardinality": "many_to_one",
+          "provenance": "vadv_queryid_stat_statements_dbid_userid_attribution"
+        }
+      ],
       "metrics": [
         {
           "code": "time",
@@ -762,7 +973,10 @@
         {
           "code": "time",
           "columns": ["planid", "plan", "queryid", "calls", "mean", "rows"],
-          "sort": { "column": "mean", "order": "desc" }
+          "sort": {
+            "column": "mean",
+            "order": "desc"
+          }
         },
         {
           "code": "io",
@@ -774,17 +988,41 @@
             "shared_hit",
             "shared_read"
           ],
-          "sort": { "column": "shared_read", "order": "desc" }
+          "sort": {
+            "column": "shared_read",
+            "order": "desc"
+          }
         },
         {
           "code": "rows",
           "columns": ["planid", "plan", "queryid", "rows"],
-          "sort": { "column": "rows", "order": "desc" }
+          "sort": {
+            "column": "rows",
+            "order": "desc"
+          }
         },
         {
           "code": "regression",
           "columns": ["planid", "plan", "queryid", "mean"],
-          "sort": { "column": "mean", "order": "desc" }
+          "sort": {
+            "column": "mean",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "change_timeline",
+          "columns": [
+            "planid",
+            "queryid",
+            "first_call",
+            "last_call",
+            "calls",
+            "mean"
+          ],
+          "sort": {
+            "column": "last_call",
+            "order": "desc"
+          }
         }
       ],
       "canonical_metric": "time"
@@ -792,11 +1030,15 @@
     {
       "view_code": 4,
       "code": "tables",
-      "view_revision": 1,
+      "view_revision": 2,
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": true, "related": false },
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      },
       "inputs": [
         {
           "code": "tables",
@@ -804,9 +1046,25 @@
           "type_ids": [1013001, 1013002, 1013003, 1013004],
           "availability": "gated",
           "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "vacuum",
+          "logical_sections": ["pg_stat_progress_vacuum"],
+          "type_ids": [1012001],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
         }
       ],
-      "joins": [],
+      "joins": [
+        {
+          "left": "tables",
+          "right": "vacuum",
+          "kind": "temporal",
+          "fields": ["datid", "relid", "ts"],
+          "cardinality": "zero_or_many",
+          "provenance": "same_snapshot_database_relation_oid"
+        }
+      ],
       "metrics": [
         {
           "code": "io",
@@ -996,6 +1254,36 @@
       ],
       "presets": [
         {
+          "code": "health",
+          "columns": [
+            "relation",
+            "dead_pct",
+            "dead_tuples",
+            "seq_scan_pct",
+            "autovacuum_age_seconds"
+          ],
+          "sort": {
+            "column": "dead_pct",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "vacuum_risk",
+          "columns": [
+            "relation",
+            "dead_pct",
+            "dead_tuples",
+            "modified_since_analyze",
+            "inserted_since_vacuum",
+            "last_autovacuum",
+            "autovacuum_age_seconds"
+          ],
+          "sort": {
+            "column": "autovacuum_age_seconds",
+            "order": "desc"
+          }
+        },
+        {
           "code": "activity",
           "columns": [
             "relation",
@@ -1005,7 +1293,10 @@
             "dead_pct",
             "dead_tuples"
           ],
-          "sort": { "column": "dead_pct", "order": "desc" }
+          "sort": {
+            "column": "dead_pct",
+            "order": "desc"
+          }
         },
         {
           "code": "writes",
@@ -1015,7 +1306,10 @@
             "inserted_since_vacuum",
             "dead_pct"
           ],
-          "sort": { "column": "inserted_since_vacuum", "order": "desc" }
+          "sort": {
+            "column": "inserted_since_vacuum",
+            "order": "desc"
+          }
         },
         {
           "code": "maintenance",
@@ -1029,7 +1323,10 @@
             "autovacuum_age_seconds",
             "autoanalyze_age_seconds"
           ],
-          "sort": { "column": "autovacuum_age_seconds", "order": "desc" }
+          "sort": {
+            "column": "autovacuum_age_seconds",
+            "order": "desc"
+          }
         },
         {
           "code": "io",
@@ -1040,12 +1337,40 @@
             "seq_scan_pct",
             "io_hit_pct"
           ],
-          "sort": { "column": "io_hit_pct", "order": "desc" }
+          "sort": {
+            "column": "io_hit_pct",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "scan_pattern",
+          "columns": [
+            "relation",
+            "seq_scan",
+            "idx_scan",
+            "seq_scan_pct",
+            "dead_pct"
+          ],
+          "sort": {
+            "column": "seq_scan_pct",
+            "order": "desc"
+          }
         },
         {
           "code": "size",
           "columns": ["relation", "size", "dead_pct", "xid_age", "mxid_age"],
-          "sort": { "column": "size", "order": "desc" }
+          "sort": {
+            "column": "size",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "xid_mxid",
+          "columns": ["relation", "xid_age", "mxid_age", "dead_pct", "size"],
+          "sort": {
+            "column": "xid_age",
+            "order": "desc"
+          }
         }
       ],
       "canonical_metric": "writes"
@@ -1053,11 +1378,15 @@
     {
       "view_code": 5,
       "code": "indexes",
-      "view_revision": 1,
+      "view_revision": 2,
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": true, "related": false },
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      },
       "inputs": [
         {
           "code": "indexes",
@@ -1065,9 +1394,25 @@
           "type_ids": [1014001, 1014002],
           "availability": "gated",
           "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "tables",
+          "logical_sections": ["pg_stat_user_tables"],
+          "type_ids": [1013001, 1013002, 1013003, 1013004],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
         }
       ],
-      "joins": [],
+      "joins": [
+        {
+          "left": "indexes",
+          "right": "tables",
+          "kind": "temporal",
+          "fields": ["datid", "relid", "ts"],
+          "cardinality": "zero_or_one",
+          "provenance": "same_snapshot_database_relation_oid"
+        }
+      ],
       "metrics": [
         {
           "code": "io",
@@ -1161,22 +1506,42 @@
         {
           "code": "usage",
           "columns": ["index", "table", "scans", "rows_per_scan"],
-          "sort": { "column": "scans", "order": "desc" }
+          "sort": {
+            "column": "scans",
+            "order": "desc"
+          }
         },
         {
           "code": "unused",
           "columns": ["index", "table", "scans"],
-          "sort": { "column": "scans", "order": "asc" }
+          "sort": {
+            "column": "scans",
+            "order": "asc"
+          }
         },
         {
           "code": "size",
           "columns": ["index", "table", "size", "scans", "last_idx_scan"],
-          "sort": { "column": "size", "order": "desc" }
+          "sort": {
+            "column": "size",
+            "order": "desc"
+          }
         },
         {
           "code": "io",
           "columns": ["index", "table", "scans", "io_hit_pct"],
-          "sort": { "column": "io_hit_pct", "order": "desc" }
+          "sort": {
+            "column": "io_hit_pct",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "table_context",
+          "columns": ["index", "table", "scans", "rows_per_scan", "size"],
+          "sort": {
+            "column": "table",
+            "order": "asc"
+          }
         }
       ],
       "canonical_metric": "scans"
@@ -1188,7 +1553,11 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": false, "related": false },
+      "capabilities": {
+        "detail": true,
+        "history": false,
+        "related": true
+      },
       "inputs": [
         {
           "code": "vacuum",
@@ -1336,12 +1705,18 @@
             "dead_tuple_bytes",
             "elapsed"
           ],
-          "sort": { "column": "progress", "order": "desc" }
+          "sort": {
+            "column": "progress",
+            "order": "desc"
+          }
         },
         {
           "code": "phase",
           "columns": ["pid", "relation", "phase", "progress", "elapsed"],
-          "sort": { "column": "phase", "order": "asc" }
+          "sort": {
+            "column": "phase",
+            "order": "asc"
+          }
         },
         {
           "code": "dead_tuples",
@@ -1354,7 +1729,26 @@
             "progress",
             "elapsed"
           ],
-          "sort": { "column": "dead_tuples", "order": "desc" }
+          "sort": {
+            "column": "dead_tuples",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "dead_items",
+          "columns": [
+            "pid",
+            "relation",
+            "dead_tuples",
+            "dead_item_ids",
+            "dead_tuple_bytes",
+            "progress",
+            "elapsed"
+          ],
+          "sort": {
+            "column": "dead_tuples",
+            "order": "desc"
+          }
         }
       ],
       "canonical_metric": "progress"
@@ -1366,7 +1760,11 @@
       "scope": "host",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": true, "related": false },
+      "capabilities": {
+        "detail": true,
+        "history": true,
+        "related": true
+      },
       "inputs": [
         {
           "code": "process",
@@ -1398,6 +1796,14 @@
           "fields": ["pid", "starttime", "ts"],
           "cardinality": "zero_or_one",
           "provenance": "same_snapshot_pid_and_process_start"
+        },
+        {
+          "left": "process",
+          "right": "activity",
+          "kind": "best_effort",
+          "fields": ["pid"],
+          "cardinality": "zero_or_many",
+          "provenance": "pid"
         }
       ],
       "metrics": [
@@ -1445,8 +1851,129 @@
           "code": "cpu",
           "type": "f64",
           "formula": "positive_delta(utime + stime) / (clock_ticks_per_sec * elapsed_seconds)",
+          "unit": "ratio",
           "lazy": false,
           "requires": ["process", "instance"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "cpu_user",
+          "type": "f64",
+          "formula": "positive_delta(utime) / (clock_ticks_per_sec * elapsed_seconds)",
+          "unit": "ratio",
+          "lazy": false,
+          "requires": ["process", "instance"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "cpu_system",
+          "type": "f64",
+          "formula": "positive_delta(stime) / (clock_ticks_per_sec * elapsed_seconds)",
+          "unit": "ratio",
+          "lazy": false,
+          "requires": ["process", "instance"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "run_delay",
+          "type": "f64",
+          "formula": "positive_delta(rundelay_ns) / (1e9 * elapsed_seconds)",
+          "unit": "ratio",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "state",
+          "type": "text",
+          "formula": "ascii_process_state(state)",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "parent_pid",
+          "type": "i64",
+          "source": "process.ppid",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "uid",
+          "type": "u64",
+          "source": "process.uid",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "effective_uid",
+          "type": "u64",
+          "source": "process.euid",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "started_at",
+          "type": "timestamp",
+          "source": "process.starttime",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "current_cpu",
+          "type": "i64",
+          "source": "process.curcpu",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "nice",
+          "type": "i64",
+          "source": "process.nice",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "priority",
+          "type": "i64",
+          "source": "process.prio",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "realtime_priority",
+          "type": "i64",
+          "source": "process.rtprio",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "scheduler_policy",
+          "type": "text",
+          "formula": "linux_scheduler_policy(policy)",
+          "lazy": false,
+          "requires": ["process"],
           "availability": "gated",
           "unavailable_reason": "not_collected"
         },
@@ -1466,6 +1993,106 @@
           "type": "u64",
           "source": "process.num_threads",
           "unit": "count",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "virtual_memory",
+          "type": "i64",
+          "source": "process.vmem_kb",
+          "unit": "kib",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "swap",
+          "type": "i64",
+          "source": "process.vswap_kb",
+          "unit": "kib",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "voluntary_context_switches_per_second",
+          "type": "f64",
+          "formula": "positive_delta(nvcsw) / elapsed_seconds",
+          "unit": "per_second",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "involuntary_context_switches_per_second",
+          "type": "f64",
+          "formula": "positive_delta(nivcsw) / elapsed_seconds",
+          "unit": "per_second",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "minor_faults_per_second",
+          "type": "f64",
+          "formula": "positive_delta(minflt) / elapsed_seconds",
+          "unit": "per_second",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "major_faults_per_second",
+          "type": "f64",
+          "formula": "positive_delta(majflt) / elapsed_seconds",
+          "unit": "per_second",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "read_syscalls_per_second",
+          "type": "f64",
+          "formula": "positive_delta(syscr) / elapsed_seconds",
+          "unit": "per_second",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "write_syscalls_per_second",
+          "type": "f64",
+          "formula": "positive_delta(syscw) / elapsed_seconds",
+          "unit": "per_second",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "logical_read_bytes_per_second",
+          "type": "f64",
+          "formula": "positive_delta(rchar) / elapsed_seconds",
+          "unit": "bytes_per_second",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
+          "code": "logical_write_bytes_per_second",
+          "type": "f64",
+          "formula": "positive_delta(wchar) / elapsed_seconds",
+          "unit": "bytes_per_second",
           "lazy": false,
           "requires": ["process"],
           "availability": "gated",
@@ -1492,9 +2119,20 @@
           "unavailable_reason": "not_collected"
         },
         {
+          "code": "cache_served_read_bytes_per_second",
+          "type": "f64",
+          "formula": "max(rate(rchar) - rate(read_bytes), 0)",
+          "unit": "bytes_per_second",
+          "lazy": false,
+          "requires": ["process"],
+          "availability": "gated",
+          "unavailable_reason": "not_collected"
+        },
+        {
           "code": "block_delay",
           "type": "f64",
           "formula": "positive_delta(blkdelay_ticks) / (clock_ticks_per_sec * elapsed_seconds)",
+          "unit": "ratio",
           "lazy": false,
           "requires": ["process", "instance"],
           "availability": "gated",
@@ -1521,6 +2159,21 @@
       ],
       "presets": [
         {
+          "code": "pressure",
+          "columns": [
+            "pid",
+            "type",
+            "cpu",
+            "rss",
+            "read_bytes_per_second",
+            "write_bytes_per_second"
+          ],
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
+        },
+        {
           "code": "cpu",
           "columns": [
             "pid",
@@ -1532,12 +2185,18 @@
             "write_bytes_per_second",
             "command"
           ],
-          "sort": { "column": "cpu", "order": "desc" }
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
         },
         {
           "code": "memory",
           "columns": ["pid", "type", "rss", "command"],
-          "sort": { "column": "rss", "order": "desc" }
+          "sort": {
+            "column": "rss",
+            "order": "desc"
+          }
         },
         {
           "code": "disk_io",
@@ -1549,17 +2208,50 @@
             "block_delay",
             "command"
           ],
-          "sort": { "column": "read_bytes_per_second", "order": "desc" }
+          "sort": {
+            "column": "read_bytes_per_second",
+            "order": "desc"
+          }
         },
         {
           "code": "cgroup",
           "columns": ["pid", "type", "cgroup", "cpu", "rss", "command"],
-          "sort": { "column": "cpu", "order": "desc" }
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
         },
         {
           "code": "threads",
           "columns": ["pid", "type", "threads", "cpu", "rss", "command"],
-          "sort": { "column": "threads", "order": "desc" }
+          "sort": {
+            "column": "threads",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "processes",
+          "columns": [
+            "pid",
+            "type",
+            "cpu",
+            "rss",
+            "threads",
+            "cgroup",
+            "command"
+          ],
+          "sort": {
+            "column": "cpu",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "data_quality",
+          "columns": ["pid", "type", "cpu", "rss", "cgroup"],
+          "sort": {
+            "column": "pid",
+            "order": "asc"
+          }
         }
       ],
       "canonical_metric": "cpu"
@@ -1571,7 +2263,11 @@
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": false, "related": false },
+      "capabilities": {
+        "detail": true,
+        "history": false,
+        "related": false
+      },
       "inputs": [
         {
           "code": "locks",
@@ -1722,7 +2418,10 @@
             "wait_age_us",
             "query"
           ],
-          "sort": { "column": "wait_age_us", "order": "desc" }
+          "sort": {
+            "column": "wait_age_us",
+            "order": "desc"
+          }
         },
         {
           "code": "blockers",
@@ -1737,7 +2436,10 @@
             "target",
             "wait_age_us"
           ],
-          "sort": { "column": "wait_age_us", "order": "desc" }
+          "sort": {
+            "column": "wait_age_us",
+            "order": "desc"
+          }
         },
         {
           "code": "waiters",
@@ -1755,7 +2457,10 @@
             "query",
             "wait_age_us"
           ],
-          "sort": { "column": "wait_age_us", "order": "desc" }
+          "sort": {
+            "column": "wait_age_us",
+            "order": "desc"
+          }
         }
       ],
       "canonical_metric": "wait"
@@ -1763,11 +2468,15 @@
     {
       "view_code": 9,
       "code": "events",
-      "view_revision": 1,
+      "view_revision": 2,
       "scope": "instance",
       "identity_revision": 1,
       "availability": "gated",
-      "capabilities": { "detail": true, "history": false, "related": false },
+      "capabilities": {
+        "detail": true,
+        "history": false,
+        "related": false
+      },
       "inputs": [
         {
           "code": "events",
@@ -1880,24 +2589,52 @@
       ],
       "presets": [
         {
+          "code": "timeline",
+          "columns": ["time", "severity_code", "category_code", "duration"],
+          "sort": {
+            "column": "time",
+            "order": "desc"
+          }
+        },
+        {
           "code": "errors",
           "columns": ["time", "severity_code", "category_code", "message"],
-          "sort": { "column": "time", "order": "desc" }
+          "sort": {
+            "column": "time",
+            "order": "desc"
+          }
         },
         {
           "code": "checkpoints",
           "columns": ["time", "category_code", "duration", "message"],
-          "sort": { "column": "time", "order": "desc" }
+          "sort": {
+            "column": "time",
+            "order": "desc"
+          }
         },
         {
           "code": "vacuum",
           "columns": ["time", "category_code", "duration", "message"],
-          "sort": { "column": "time", "order": "desc" }
+          "sort": {
+            "column": "time",
+            "order": "desc"
+          }
         },
         {
           "code": "slow",
           "columns": ["time", "category_code", "duration", "message"],
-          "sort": { "column": "duration", "order": "desc" }
+          "sort": {
+            "column": "duration",
+            "order": "desc"
+          }
+        },
+        {
+          "code": "collector_health",
+          "columns": ["time", "severity_code", "category_code", "message"],
+          "sort": {
+            "column": "time",
+            "order": "desc"
+          }
         }
       ],
       "canonical_metric": "count"

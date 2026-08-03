@@ -342,6 +342,11 @@ async fn entity_point_returns_lazy_fields_and_fork_specific_best_effort_relation
             .all(|relation| relation["relation"] == "statement_plan")
     );
     assert!(related.iter().all(|relation| relation["view"] == "plans"));
+    assert!(
+        related
+            .iter()
+            .all(|relation| relation["snapshot_ts_us"] == "2000")
+    );
     assert!(related.iter().any(|relation| {
         relation["provenance"]
             == serde_json::json!({

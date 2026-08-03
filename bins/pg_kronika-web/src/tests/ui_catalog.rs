@@ -312,6 +312,81 @@ fn host_and_object_views_publish_prepared_lenses_and_temporal_relations() {
 }
 
 #[test]
+fn process_detail_catalog_exposes_collected_linux_evidence() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let processes = serialized_view(&catalog, "processes");
+    let columns = processes["columns"].as_array().expect("process columns");
+
+    for (code, value_type, unit) in [
+        ("state", "text", None),
+        ("parent_pid", "i64", None),
+        ("uid", "u64", None),
+        ("effective_uid", "u64", None),
+        ("started_at", "timestamp", None),
+        ("current_cpu", "i64", None),
+        ("nice", "i64", None),
+        ("priority", "i64", None),
+        ("realtime_priority", "i64", None),
+        ("scheduler_policy", "text", None),
+        ("cpu_user", "f64", Some("ratio")),
+        ("cpu_system", "f64", Some("ratio")),
+        ("run_delay", "f64", Some("ratio")),
+        ("virtual_memory", "i64", Some("kib")),
+        ("swap", "i64", Some("kib")),
+        (
+            "voluntary_context_switches_per_second",
+            "f64",
+            Some("per_second"),
+        ),
+        (
+            "involuntary_context_switches_per_second",
+            "f64",
+            Some("per_second"),
+        ),
+        ("minor_faults_per_second", "f64", Some("per_second")),
+        ("major_faults_per_second", "f64", Some("per_second")),
+        ("read_syscalls_per_second", "f64", Some("per_second")),
+        ("write_syscalls_per_second", "f64", Some("per_second")),
+        (
+            "logical_read_bytes_per_second",
+            "f64",
+            Some("bytes_per_second"),
+        ),
+        (
+            "logical_write_bytes_per_second",
+            "f64",
+            Some("bytes_per_second"),
+        ),
+        (
+            "cache_served_read_bytes_per_second",
+            "f64",
+            Some("bytes_per_second"),
+        ),
+    ] {
+        let column = columns
+            .iter()
+            .find(|column| column["code"] == code)
+            .unwrap_or_else(|| panic!("missing processes.{code}"));
+        assert_eq!(column["type"], value_type, "processes.{code} type");
+        match unit {
+            Some(unit) => assert_eq!(column["unit"], unit, "processes.{code} unit"),
+            None => assert!(column.get("unit").is_none(), "processes.{code} unit"),
+        }
+        assert_eq!(column["availability"], "available", "processes.{code}");
+    }
+
+    let cache_estimate = columns
+        .iter()
+        .find(|column| column["code"] == "cache_served_read_bytes_per_second")
+        .expect("cache-served estimate");
+    assert_eq!(
+        cache_estimate["formula"],
+        "max(rate(rchar) - rate(read_bytes), 0)"
+    );
+}
+
+#[test]
 fn events_publish_bounded_signal_lenses_without_claiming_config_evidence() {
     let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
         .expect("serialize catalog");
