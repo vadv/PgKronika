@@ -130,7 +130,7 @@ function PlanChangeEvidence(props: {
           );
           const mean = compactMetric(
             cell(data.columns, row, "mean"),
-            meanColumn?.unit ?? "us",
+            meanColumn?.unit ?? "ms",
           );
           return (
             <button
@@ -152,10 +152,6 @@ function PlanChangeEvidence(props: {
               </span>
               <span className="plan-change-evidence__window">
                 <span>{t("plans.changes.first", { time: first })}</span>
-                <span
-                  aria-hidden="true"
-                  className="plan-change-evidence__rule"
-                />
                 <span>{t("plans.changes.last", { time: last })}</span>
               </span>
               <span className="plan-change-evidence__metrics">
@@ -213,6 +209,7 @@ export function PlansWorkspace(props: PlansWorkspaceProps) {
             data-testid={
               lens === "regression" ? "plans-regression-boundary" : undefined
             }
+            title={t(`plans.lensNote.${lens}`)}
           >
             {t(`plans.lensNote.${lens}`)}
           </span>

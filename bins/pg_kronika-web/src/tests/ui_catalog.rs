@@ -419,7 +419,15 @@ fn plan_call_timestamps_keep_their_source_names() {
             .all(|column| !matches!(column["code"].as_str(), Some("first_seen" | "last_seen"))),
         "the catalog must not rename the collected call timestamps as observations"
     );
-    assert_eq!(plans["view_revision"], json!(2));
+    let mean = columns
+        .iter()
+        .find(|column| column["code"] == "mean")
+        .expect("plans.mean");
+    assert_eq!(
+        mean["unit"], "ms",
+        "pg_store_plans.total_time is milliseconds; the frame mean preserves that unit"
+    );
+    assert_eq!(plans["view_revision"], json!(3));
 
     let locks = serialized_view(&catalog, "locks");
     assert_eq!(locks["view_revision"], json!(2));

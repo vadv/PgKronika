@@ -576,7 +576,7 @@
   "col.mean.label": "среднее",
   "col.mean.desc": "Среднее время выполнения, мс",
   "col.plans.mean.label": "среднее",
-  "col.plans.mean.desc": "Среднее время выполнения плана, мкс",
+  "col.plans.mean.desc": "Среднее время выполнения плана на вызов, мс",
   "col.time_pct.label": "% времени",
   "col.time_pct.desc": "Доля запроса в суммарном времени выполнения инстанса",
   "col.plan_time_pct.label": "% планир.",

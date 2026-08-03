@@ -76,6 +76,123 @@ final result: passed
 
 ---
 
+# Plans visual convergence — design QA
+
+## Comparison target
+
+- Source visual truth: `/Users/vadv/Projects/PgKronika/output/playwright/pgkronika-plans-regression-refined.png`
+- Browser-rendered implementation: `/Users/vadv/Projects/PgKronika-worktrees/pr11-plans-visual-convergence/web/demo/shots/forensic-plans-1920x1080.png`
+- Viewport and density: both images are 1920 × 1080 pixels, rendered at
+  1920 × 1080 CSS px and DPR 1.
+- State: dark theme, one-hour replay range, Plans Regression evidence lens,
+  1,000 retained plan rows, 64 retained temporal series, 96 buckets per
+  rendered plan row and three bounded first/last-observed records.
+- Browser evidence: the production bundle was rendered by the deterministic
+  shell verifier. Root geometry is exactly 1920 × 1080 with no page scroll;
+  the plan matrix owns its vertical overflow. The verifier also exercised the
+  Changes lens, fork provenance, Compare gating, temporal request geometry and
+  the existing Activity, infrastructure, Events, search and detail flows.
+
+## Full-view comparison evidence
+
+The source and implementation were opened together at original resolution in
+one comparison input. Both keep the combined PostgreSQL + OS Health Line as the
+only upper chart, place Plans investigation context immediately below it, and
+make plan identity, cost and temporal position scannable in one horizontal
+flow.
+
+The implementation intentionally translates the source's three-row incident
+story into the user-required dense population view. The source's plan-mix,
+mean-latency and buffer charts become exact time/calls cells beside each of the
+1,000 ranked plans; 36 virtualized plan rows are visible at once. This keeps
+the heatmap as an at-a-glance relationship surface without separating it from
+the plan entity it describes.
+
+The source's A/B Plan Tree Diff and investigation finding are intentionally not
+rendered. The current server does not publish two bounded plan trees, a stable
+pairing contract, or a typed diff. Compare remains visible and gated with that
+reason. Likewise, Regression evidence says it is ranked by current interval
+mean and that temporal coincidence is not a computed before/after baseline.
+These are evidence-bound differences, not unfinished visual regions.
+
+## Required fidelity surfaces
+
+- Fonts and typography: the incumbent interface/monospace pairing preserves
+  the operational-console character of the source. Plan and query ids use
+  compact tokens with full values in the identity tooltip. Mean time now keeps
+  the source unit correctly as milliseconds per call.
+- Spacing and layout rhythm: 44 px global context, 32 px navigation, 60 px
+  Health Line, 72 px screen context, 38 px Plans evidence, 76 px observed-plan
+  rail and the viewport-owned matrix form a dense but legible hierarchy. The
+  root does not scroll.
+- Colors and visual tokens: blue expresses temporal intensity; amber and red
+  remain evidence pressure; cyan marks identifiers and fork attribution.
+  Missing series are distinct from zero and the selected/verdict tint does not
+  obscure the time lane.
+- Copy and content: `Regression evidence`, `first / last observed only`, both
+  fork-specific attribution methods, retained/matched coverage and the
+  explicit no-baseline statement bound the operator's inference. Long boundary
+  copy remains available in the title when compact layout ellipsizes it.
+- Controls and accessibility: lens, metric, plan row and observed-envelope
+  controls are keyboard reachable. The 96 individual evidence cells do not
+  become tab stops. Compare is visibly disabled instead of disappearing.
+- Density and resilience: the first 200 rows are server-paged, the DOM stays
+  virtualized, 36 temporal rows are rendered, each contains exactly 96 cells,
+  and heatmap failure leaves the ranked plan frame usable.
+
+## Comparison history
+
+1. Initial implementation comparison — fix.
+   - The old screen separated a generic heatmap from a generic plan table and
+     confined fork/change evidence to a small unrelated right card.
+   - The deterministic demo contained only ten plan rows and did not populate
+     the Buffers lens.
+2. Convergence fixes.
+   - Replaced the detached analytical center with one dedicated Plans
+     workspace and row-coupled temporal matrix.
+   - Added bounded first/last-observed records, current-interval regression
+     boundary, OSSC/vadv provenance, exact time/calls controls and a visible
+     gated Compare lens.
+   - Raised the representative population to 1,000 plans and populated calls,
+     rows, shared hits/reads and partial evidence.
+   - Corrected the public plan mean unit from unspecified/mislabeled µs to the
+     collected `pg_store_plans.total_time` millisecond unit and bumped the Plans
+     view revision.
+3. Final same-state comparison — passed.
+   - The 1920 × 1080 implementation shows Health Line, all Plans controls,
+     bounded plan observations and 36 ranked plan/time rows without root
+     scrolling.
+   - The shell verifier confirms 200 loaded rows, independent matrix scroll,
+     96 buckets per row, no detached center, at most three change records,
+     both fork attributions, default Regression evidence and gated Compare.
+
+## Findings
+
+No actionable P0, P1 or P2 visual mismatch remains. The omitted A/B diff,
+plan-node blame and synchronized buffer history require new typed backend
+contracts; presenting them now would make the UI more similar but less true.
+
+## Open questions
+
+None for this Plans convergence slice. A later backend stack may publish a
+typed two-tree comparison and stable baseline pairing; that should activate the
+existing Compare affordance rather than introducing a second screen.
+
+## Implementation checklist
+
+- [x] Health Line is the only upper chart.
+- [x] Plan identity and temporal evidence share one row.
+- [x] 1,000 plans remain paged and DOM-virtualized.
+- [x] Time/calls, lenses, filtering, selection and Plan Detail remain
+  functional.
+- [x] First/last observations do not claim continuous execution.
+- [x] OSSC and vadv attribution semantics remain distinct.
+- [x] 1920 × 1080 geometry, browser console and key interactions pass.
+
+final result: passed
+
+---
+
 # Activity visual convergence — design QA
 
 ## Comparison target

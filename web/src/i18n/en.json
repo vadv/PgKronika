@@ -576,7 +576,7 @@
   "col.mean.label": "mean",
   "col.mean.desc": "Mean execution time, ms",
   "col.plans.mean.label": "mean",
-  "col.plans.mean.desc": "Mean plan execution time, µs",
+  "col.plans.mean.desc": "Mean plan execution time per call, ms",
   "col.time_pct.label": "% time",
   "col.time_pct.desc": "Statement share of the instance's total execution time",
   "col.plan_time_pct.label": "% planning",

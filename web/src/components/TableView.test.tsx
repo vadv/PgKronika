@@ -289,7 +289,7 @@ test("couples plan identity to its exact 96-bucket interval evidence", async () 
       lazy: false,
       requires: ["plans"],
       type: "f64",
-      unit: "us",
+      unit: "ms",
     },
   ];
   stubFrame(
@@ -298,18 +298,18 @@ test("couples plan identity to its exact 96-bucket interval evidence", async () 
       columns: [
         makeFrameColumn({ code: "planid", type: "i64" }),
         makeFrameColumn({ code: "queryid", type: "i64" }),
-        makeFrameColumn({ code: "mean", type: "f64", unit: "us" }),
+        makeFrameColumn({ code: "mean", type: "f64", unit: "ms" }),
       ],
       rows: [
         makeFrameRow({
           entity: "plan:77",
           label: "plan 77",
-          cells: ["77", "42", 4_200],
+          cells: ["77", "42", 42],
         }),
         makeFrameRow({
           entity: "plan:78",
           label: "plan 78",
-          cells: ["78", "43", 2_100],
+          cells: ["78", "43", 21],
         }),
       ],
       page: { matched: 1_000, returned: 2 },
