@@ -389,6 +389,9 @@ function TableViewImpl(props: TableViewProps) {
   const activityMatrixMode = timeMatrixMode && matrixKind === "activity";
   const plansMatrixMode = timeMatrixMode && matrixKind === "plans";
   const matrixClass = `${matrixKind}-time-matrix`;
+  const matrixLoadError = timeMatrix?.error
+    ? t(`${matrixKind}.matrix.loadError`)
+    : null;
   const matrixIdentityClass = `${matrixClass}__identity`;
   const matrixTimelineClass = `${matrixClass}__timeline`;
   const matrixTimelineCellClass = `${matrixClass}__timeline-cell`;
@@ -736,10 +739,16 @@ function TableViewImpl(props: TableViewProps) {
                       {t("statements.matrix.loading")}
                     </span>
                   )}
+                  {matrixLoadError !== null && (
+                    <span role="alert" className={`${matrixClass}__status`}>
+                      {matrixLoadError}
+                    </span>
+                  )}
                   {timeMatrix.error && (
                     <button
                       type="button"
                       className={`${matrixClass}__retry`}
+                      aria-label={`${matrixLoadError}. ${t("table.retry")}`}
                       onClick={timeMatrix.onRetry}
                     >
                       {t("table.retry")}
@@ -947,6 +956,7 @@ function TableViewImpl(props: TableViewProps) {
                         cursorUs={timeMatrix.cursorUs}
                         baselineUs={timeMatrix.baselineUs}
                         metricLabel={timeMatrix.metricLabel}
+                        unavailableLabel={matrixLoadError ?? undefined}
                         max={heatmapMax}
                         mode={
                           activityMatrixMode

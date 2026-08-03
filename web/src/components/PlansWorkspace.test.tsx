@@ -203,7 +203,11 @@ function stubRequests(heatmapResponse: Response = json(heatmap)) {
   );
 }
 
-function Harness(props: { preset?: "regression" | "change_timeline" }) {
+function Harness(props: {
+  preset?: "regression" | "change_timeline";
+  q?: string | null;
+  matched?: number;
+}) {
   const [metric, setMetric] = useState("time");
   return (
     <PlansWorkspace
@@ -215,11 +219,11 @@ function Harness(props: { preset?: "regression" | "change_timeline" }) {
       metric={metric}
       baselineUs={null}
       preset={props.preset ?? "regression"}
-      q={null}
+      q={props.q ?? null}
       sort={null}
       order={null}
       entity={null}
-      matched={1_000}
+      matched={props.matched ?? 1_000}
       mobile={false}
       onMetricChange={setMetric}
       onSort={() => {}}
@@ -305,5 +309,36 @@ test("keeps ranked plan rows usable when temporal evidence fails", async () => {
     ),
   );
   expect(screen.getByTestId("plans-time-matrix")).toBeDefined();
+  expect(screen.getByRole("alert").textContent).toContain(
+    "plans.matrix.loadError",
+  );
+  expect(
+    screen
+      .getAllByTestId("plans-interval-row")
+      .every(
+        (row) => row.getAttribute("aria-label") === "plans.matrix.loadError",
+      ),
+  ).toBe(true);
   expect(screen.getByRole("button", { name: /table\.retry/i })).toBeDefined();
+});
+
+test("labels filtered frame matches separately from the unfiltered heatmap scope", async () => {
+  stubRequests();
+  render(<Harness q="queryid=42" matched={1} />, { wrapper: Wrapper });
+
+  expect(await screen.findByTestId("plans-time-matrix")).toBeDefined();
+  expect(screen.getByText("plans.matrix.coverageFiltered")).toBeDefined();
+
+  const calls = vi.mocked(fetch).mock.calls.map(([input]) => requestUrl(input));
+  const heatmapCall = calls.find(
+    (url) => url.pathname === "/v1/timeline/heatmap",
+  );
+  expect(heatmapCall?.searchParams.has("q")).toBe(false);
+  expect(
+    calls.some(
+      (url) =>
+        url.pathname === "/v1/frame/plans" &&
+        url.searchParams.get("q") === "queryid=42",
+    ),
+  ).toBe(true);
 });

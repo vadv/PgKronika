@@ -68,6 +68,7 @@ export function TemporalBucketRow(props: {
   cursorUs: string | null;
   baselineUs: string | null;
   metricLabel: string;
+  unavailableLabel?: string;
   max?: number;
   mode?: "range" | "point_samples" | "interval_estimates" | "plan_intervals";
 }) {
@@ -126,7 +127,8 @@ export function TemporalBucketRow(props: {
       data-evidence={props.row === null ? "unavailable" : "available"}
       aria-label={
         props.row === null
-          ? t(
+          ? (props.unavailableLabel ??
+            t(
               mode === "point_samples" || mode === "interval_estimates"
                 ? mode === "interval_estimates"
                   ? "activity.matrix.intervalUnavailable"
@@ -134,7 +136,7 @@ export function TemporalBucketRow(props: {
                 : mode === "plan_intervals"
                   ? "plans.matrix.seriesUnavailable"
                   : "statements.matrix.seriesUnavailable",
-            )
+            ))
           : availableLabel
       }
       style={

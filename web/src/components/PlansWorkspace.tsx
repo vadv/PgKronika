@@ -193,6 +193,7 @@ export function PlansWorkspace(props: PlansWorkspaceProps) {
   const retained = heatmap.data?.rows.length ?? 0;
   const metricText = metricLabel(t, props.view.code, props.metric);
   const lens = props.preset ?? "regression";
+  const filteredFrame = (props.q?.trim().length ?? 0) > 0;
   const showChangeEvidence =
     lens === "regression" || lens === "change_timeline";
 
@@ -262,16 +263,26 @@ export function PlansWorkspace(props: PlansWorkspaceProps) {
         <span
           className="plans-workspace__coverage"
           data-quality={quality?.status ?? "loading"}
-          title={t("plans.matrix.coverageDetail", {
-            gaps: quality?.gaps.length ?? "—",
-            unseen: heatmap.data?.ranking.unseen_upper ?? "—",
-          })}
+          title={t(
+            filteredFrame
+              ? "plans.matrix.coverageFilteredDetail"
+              : "plans.matrix.coverageDetail",
+            {
+              gaps: quality?.gaps.length ?? "—",
+              unseen: heatmap.data?.ranking.unseen_upper ?? "—",
+            },
+          )}
         >
-          {t("plans.matrix.coverage", {
-            retained,
-            matched: props.matched ?? "—",
-            snapshots: quality?.snapshots ?? "—",
-          })}
+          {t(
+            filteredFrame
+              ? "plans.matrix.coverageFiltered"
+              : "plans.matrix.coverage",
+            {
+              retained,
+              matched: props.matched ?? "—",
+              snapshots: quality?.snapshots ?? "—",
+            },
+          )}
         </span>
       </div>
       {showChangeEvidence && (
