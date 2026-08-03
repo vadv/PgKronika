@@ -445,8 +445,8 @@ function Shell() {
                   sort={state.sort}
                   order={state.order}
                   entity={state.entity}
-                  onSort={(sort, order) => patch({ sort, order })}
-                  onSelectRow={(entity) => patch({ entity, dock: "row" })}
+                  onSort={onTableSort}
+                  onSelectRow={onSelectRow}
                   onMatched={setMatched}
                 />
               </div>
