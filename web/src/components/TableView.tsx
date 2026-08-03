@@ -30,6 +30,7 @@ import { TemporalBucketRow } from "./TemporalBucketRow";
 
 export interface TimeMatrixColumn {
   kind?: "statements" | "activity";
+  evidenceMode?: "point_samples" | "interval_estimates";
   data: HeatmapResponse | undefined;
   pending: boolean;
   error: boolean;
@@ -527,7 +528,9 @@ function TableViewImpl(props: TableViewProps) {
       >
         <table
           aria-label={props.view.code}
-          aria-rowcount={(matched || rows.length) + 1}
+          aria-rowcount={
+            (matched || rows.length) + (activityMatrixMode ? 2 : 1)
+          }
           className={timeMatrixMode ? matrixClass : undefined}
           data-testid={timeMatrixMode ? matrixClass : undefined}
           style={{ borderCollapse: "collapse", width: "100%" }}
@@ -695,7 +698,12 @@ function TableViewImpl(props: TableViewProps) {
                 >
                   <span>
                     {activityMatrixMode
-                      ? t("activity.matrix.samples", { count: bucketCount })
+                      ? t(
+                          timeMatrix?.evidenceMode === "interval_estimates"
+                            ? "activity.matrix.intervals"
+                            : "activity.matrix.samples",
+                          { count: bucketCount },
+                        )
                       : t("statements.matrix.heatmap", { count: bucketCount })}
                   </span>
                   <span className={`${matrixClass}__metric`}>
@@ -738,7 +746,9 @@ function TableViewImpl(props: TableViewProps) {
                 <tr
                   key={row.entity}
                   tabIndex={0}
-                  aria-rowindex={startIndex + visibleIndex + 2}
+                  aria-rowindex={
+                    startIndex + visibleIndex + (activityMatrixMode ? 3 : 2)
+                  }
                   aria-selected={selected}
                   data-entity={row.entity}
                   onClick={() => props.onSelectRow(row.entity)}
@@ -909,7 +919,11 @@ function TableViewImpl(props: TableViewProps) {
                         baselineUs={timeMatrix.baselineUs}
                         metricLabel={timeMatrix.metricLabel}
                         max={heatmapMax}
-                        mode={activityMatrixMode ? "point_samples" : "range"}
+                        mode={
+                          activityMatrixMode
+                            ? (timeMatrix?.evidenceMode ?? "point_samples")
+                            : "range"
+                        }
                       />
                     </td>
                   ) : (

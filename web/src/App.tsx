@@ -226,7 +226,9 @@ function Shell() {
   const [dataHealthOpen, setDataHealthOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [matched, setMatched] = useState<number | null>(null);
-  const [metricByView, setMetricByView] = useState<Record<string, string>>({});
+  const [metricByContext, setMetricByContext] = useState<
+    Record<string, string>
+  >({});
   const mobile = useMobile();
 
   const incidentsRange = {
@@ -266,6 +268,7 @@ function Shell() {
       next.columns.some((c) => c.code === state.sort);
     patch({
       view: code,
+      ...(code === state.view ? {} : { q: null }),
       ...(keepPreset || state.preset === null ? {} : { preset: null }),
       ...(keepSort || state.sort === null ? {} : { sort: null, order: null }),
     });
@@ -384,11 +387,21 @@ function Shell() {
       ))
       ? activityPresetMetric
       : activeView?.canonical_metric;
+  const metricContext = activeView
+    ? `${activeView.code}:${effectivePreset ?? ""}`
+    : "";
   const selectedMetric = activeView
-    ? (metricByView[activeView.code] ??
+    ? (metricByContext[metricContext] ??
       activityDefaultMetric ??
       activeView.canonical_metric)
     : "";
+  const selectMetric = (metric: string) => {
+    if (activeView === undefined) return;
+    setMetricByContext((previous) => ({
+      ...previous,
+      [metricContext]: metric,
+    }));
+  };
   const preparedLenses: PreparedLens[] | undefined = statementsScreen
     ? [
         ...STATEMENT_LENSES.map(([code, preset]) =>
@@ -581,21 +594,6 @@ function Shell() {
   // A preset owns its default ranking. Carrying an explicit sort from the
   // previous lens can leave the matrix invisibly ranked by a hidden column.
   const selectPreset = (preset: string | null) => {
-    if (activityScreen && activeView !== undefined) {
-      const metric = activityMetricForPreset(preset);
-      if (
-        activeView.metrics.length === 0 ||
-        activeView.metrics.some(
-          (candidate) =>
-            candidate.code === metric && candidate.availability === "available",
-        )
-      ) {
-        setMetricByView((previous) => ({
-          ...previous,
-          [activeView.code]: metric,
-        }));
-      }
-    }
     patch({ preset, sort: null, order: null });
   };
 
@@ -815,12 +813,7 @@ function Shell() {
                   entity={state.entity}
                   matched={matched}
                   mobile
-                  onMetricChange={(metric) =>
-                    setMetricByView((previous) => ({
-                      ...previous,
-                      [activeView.code]: metric,
-                    }))
-                  }
+                  onMetricChange={selectMetric}
                   onSort={onTableSort}
                   onSelectRow={onSelectRow}
                   onMatched={setMatched}
@@ -883,12 +876,7 @@ function Shell() {
                   entity={state.entity}
                   matched={matched}
                   mobile
-                  onMetricChange={(metric) =>
-                    setMetricByView((previous) => ({
-                      ...previous,
-                      [activeView.code]: metric,
-                    }))
-                  }
+                  onMetricChange={selectMetric}
                   onSort={onTableSort}
                   onSelectRow={onSelectRow}
                   onOpenEntity={(view, entity) =>
@@ -897,6 +885,7 @@ function Shell() {
                       entity,
                       dock: "row",
                       preset: null,
+                      q: null,
                       sort: null,
                       order: null,
                     })
@@ -1043,12 +1032,7 @@ function Shell() {
                   brushDraft={brushDraft}
                   baselineUs={state.baseline}
                   buckets={denseHeatmapScreen ? 96 : undefined}
-                  onMetricChange={(m) =>
-                    setMetricByView((prev) => ({
-                      ...prev,
-                      [activeView.code]: m,
-                    }))
-                  }
+                  onMetricChange={selectMetric}
                   onSelectEntity={(entity) => patch({ entity, dock: "row" })}
                 />
               </div>
@@ -1065,7 +1049,12 @@ function Shell() {
                       dock: "row",
                       ...(view === state.view
                         ? {}
-                        : { preset: null, sort: null, order: null }),
+                        : {
+                            preset: null,
+                            q: null,
+                            sort: null,
+                            order: null,
+                          }),
                     })
                   }
                 />
@@ -1086,7 +1075,12 @@ function Shell() {
                       dock: "row",
                       ...(view === state.view
                         ? {}
-                        : { preset: null, sort: null, order: null }),
+                        : {
+                            preset: null,
+                            q: null,
+                            sort: null,
+                            order: null,
+                          }),
                     })
                   }
                 />
@@ -1129,12 +1123,7 @@ function Shell() {
                 entity={state.entity}
                 matched={matched}
                 mobile={false}
-                onMetricChange={(metric) =>
-                  setMetricByView((previous) => ({
-                    ...previous,
-                    [activeView.code]: metric,
-                  }))
-                }
+                onMetricChange={selectMetric}
                 onSort={onTableSort}
                 onSelectRow={onSelectRow}
                 onMatched={setMatched}
@@ -1155,12 +1144,7 @@ function Shell() {
                 entity={state.entity}
                 matched={matched}
                 mobile={false}
-                onMetricChange={(metric) =>
-                  setMetricByView((previous) => ({
-                    ...previous,
-                    [activeView.code]: metric,
-                  }))
-                }
+                onMetricChange={selectMetric}
                 onSort={onTableSort}
                 onSelectRow={onSelectRow}
                 onOpenEntity={(view, entity) =>
@@ -1170,7 +1154,12 @@ function Shell() {
                     dock: "row",
                     ...(view === state.view
                       ? {}
-                      : { preset: null, sort: null, order: null }),
+                      : {
+                          preset: null,
+                          q: null,
+                          sort: null,
+                          order: null,
+                        }),
                   })
                 }
                 onMatched={setMatched}

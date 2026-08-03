@@ -55,4 +55,34 @@ describe("TemporalBucketRow", () => {
     expect(row.dataset.mode).toBe("point_samples");
     expect(row.querySelector("svg, polyline, path")).toBeNull();
   });
+
+  test("labels Activity interval-derived metrics without calling them point samples", () => {
+    render(
+      <TemporalBucketRow
+        row={{
+          entity: "pid:1",
+          label: "pid 1",
+          unit: "us",
+          score: { lower: 0, upper: 10 },
+          values: [10, null],
+        }}
+        bucketCount={2}
+        gridFromUs="100"
+        gridToUs="200"
+        cursorUs="150"
+        baselineUs={null}
+        metricLabel="wait"
+        mode="interval_estimates"
+      />,
+    );
+
+    const row = screen.getByTestId("activity-interval-row");
+    expect(row.dataset.mode).toBe("interval_estimates");
+    expect(row.getAttribute("aria-label")).toContain(
+      "activity.matrix.intervalRowLabel",
+    );
+    expect(screen.getAllByTestId("time-matrix-bucket")[0]?.title).toContain(
+      "activity.matrix.intervalValue",
+    );
+  });
 });

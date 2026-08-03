@@ -1418,7 +1418,7 @@ function rowsLocks() {
         pid,
         depth: i === 0 ? 1 : 2,
         root_pid: 11991,
-        blocked_by: String(blocker),
+        blocked_by: i === 0 ? `${blocker}, 0` : String(blocker),
         user_application: ua,
         lock,
         granted: false,

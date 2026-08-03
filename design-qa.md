@@ -89,16 +89,16 @@ final result: passed
   - `/Users/vadv/Projects/PgKronika-worktrees/pr08-events-signals-polish/web/demo/shots/forensic-activity-cpu-1920x1080.png`
   - `/Users/vadv/Projects/PgKronika-worktrees/pr08-events-signals-polish/web/demo/shots/forensic-activity-waits-1920x1080.png`
 - Viewport and density: every source and implementation image is 1920 × 1080 pixels, rendered at 1920 × 1080 CSS px and DPR 1. No density normalization was required.
-- State: dark theme, one-hour replay range, Activity Overview / CPU / Waits & Locks lenses, 36 retained activity rows, 96 point-sample buckets per row.
+- State: dark theme, one-hour replay range, Activity Overview / CPU / Waits & Locks lenses, 36 retained activity rows, 96 temporal buckets per row. Active fraction is observation-derived; CPU, I/O, and wait values are interval-derived from consecutive observations.
 - Browser evidence: the production bundle was rendered by the deterministic shell verifier and separately exercised in the in-app browser. Root geometry is exactly 1920 × 1080 with no page scroll. The primary interactions tested were Activity lens switching, automatic lens-to-metric synchronization, row selection, entity summary/relationships, Activity → related OS process drill-down, and Waits & Locks edge inspection. Console errors and page errors were checked by the verifier; none were reported.
 
 ## Full-view comparison evidence
 
 The three source/implementation pairs were opened together at original resolution. The implementation preserves the target's investigation order: combined PostgreSQL + OS Health Line, Activity lens and point-snapshot context, PG identity/state, an explicit PID relationship boundary, OS process evidence where available, and dense rows filling the remaining viewport.
 
-The implementation intentionally adds the user-required temporal relationship surface that the Overview/CPU source captures do not yet show: every Activity row carries 96 observed point samples. Those cells disclose that they are samples rather than continuity and keep missing evidence distinct from zero. This is a product-correct extension, not design drift.
+The implementation intentionally adds the user-required temporal relationship surface that the Overview/CPU source captures do not yet show: every Activity row carries 96 aligned evidence cells. The surface names observation-derived cells as samples and CPU/I/O/wait cells as derived intervals, while keeping missing evidence distinct from zero. This is a product-correct extension, not design drift.
 
-The implementation deliberately does not reproduce two analytically unsafe parts of the visual sources. CPU does not invent user/system split, run-queue delay, or context-switch values absent from the public contract; it renders total observed CPU, RSS, threads, command, and the CPU sample lane. Waits & Locks does not turn sparse activity samples into continuous Gantt intervals or causal confidence. It presents independently bounded lock edges as `edge_only` above point-sampled wait lanes. These differences preserve PgKronika's evidence semantics and the user's explicit requirement that visual coincidence must not become asserted correlation.
+The implementation deliberately does not reproduce two analytically unsafe parts of the visual sources. CPU does not invent user/system split, run-queue delay, or context-switch values absent from the public contract; it renders total process CPU, RSS, threads, command, and an explicitly interval-derived CPU lane. Waits & Locks does not turn sparse observations into a causal Gantt or confidence score. It presents independently bounded lock edges as `edge_only` above interval-attributed wait lanes. These differences preserve PgKronika's evidence semantics and the user's explicit requirement that visual coincidence must not become asserted correlation.
 
 ## Focused-region comparison evidence
 
@@ -115,9 +115,9 @@ The focused comparison confirms that the two-level column grouping is readable o
 
 - Fonts and typography: the existing UI/monospace pairing matches the source's operations-console character. Uppercase evidence headers, compact labels, numeric alignment, 34 px two-line Activity identities, ellipsis, and optical weights remain readable without row-height expansion. Full values and provenance remain available through titles and Entity Detail.
 - Spacing and layout rhythm: the 44 px global header, 32 px navigation, 60 px Health Line, 72 px screen context, 38 px snapshot evidence strip, optional 72 px lock-edge strip, and viewport-owned matrix produce a stable hierarchy. Overview exposes 33 rendered rows and Waits exposes more than 18 at 1920 × 1080; the root never scrolls.
-- Colors and visual tokens: blue represents observed sample intensity, red/amber verdicts remain semantic, green labels distinguish OS evidence, and cyan labels distinguish the PID relation boundary. Missing process evidence renders as null rather than a zero or fabricated join.
+- Colors and visual tokens: blue represents temporal evidence intensity, red/amber verdicts remain semantic, green labels distinguish OS evidence, and cyan labels distinguish the PID relation boundary. Missing process evidence renders as null rather than a zero or fabricated join.
 - Image quality and asset fidelity: neither source uses photographic, illustrative, logo, or bespoke image assets. All visible data marks are native text, table, and chart rendering; no placeholder imagery, emoji, CSS illustration, or fake SVG replaces a source asset.
-- Copy and content: `point snapshot`, the short-query sampling caveat, `observed point samples — no continuity claim`, `best_effort`, `same_snapshot_pid_only`, and `edge only · point snapshot` explain what the operator can and cannot infer. English and Russian strings are supplied for the new surface.
+- Copy and content: `point snapshot`, the short-query sampling caveat, `observed samples`, `derived intervals`, `best_effort`, `same_snapshot_pid_only`, and `edge only · point snapshot` explain what the operator can and cannot infer. Cell tooltips state whether a value is an observation or is derived from consecutive observations. English and Russian strings are supplied for the surface.
 - Icons and controls: lens and metric controls retain the incumbent compact control language. Active, disabled, focus, and selected states are distinct; unavailable Memory and XID/Horizon lenses remain visible with reasons instead of disappearing.
 - Accessibility and resilience: Activity rows are keyboard selectable, 96 temporal cells do not become 96 tab stops, control groups have accessible labels, missing series have explicit unavailable semantics, reduced motion is honored, and persistent shell controls remain above the fold.
 
@@ -126,7 +126,13 @@ The focused comparison confirms that the two-level column grouping is readable o
 1. First same-state Activity comparison — passed.
    - No actionable P0, P1, or P2 visual mismatch was found across Overview, CPU, or Waits & Locks.
    - Before capture, browser verification caught and fixed three functional/visual convergence defects: CPU lens retained the active-fraction metric, repeated column-group labels created header noise, and related-process navigation retained an invalid Activity preset.
-   - Post-fix evidence shows one label per evidence group, CPU-selected sample lanes and requests, and an Activity → OS process detail transition with view-scoped parameters cleared.
+   - Post-fix evidence shows one label per evidence group, CPU-selected temporal lanes and requests, and an Activity → OS process detail transition with view-scoped parameters cleared.
+2. Independent review and post-review comparison — passed.
+   - Expanded list-valued `blocked_by` evidence into individual waiter → blocker edges, discarded root rows, preserved blocker PID `0` as the prepared-transaction holder marker, deduplicated edges, and retained a three-edge visual bound. The strip follows frame cursors until it finds three edges or exhausts the result, so leading root nodes cannot produce a false empty state.
+   - The fresh Waits capture shows a regular blocker, a prepared-transaction blocker, and a third independent edge without overflow.
+   - Preset-scoped metric state now follows URL history, cross-view relations clear incompatible filters, and the Activity grouped table reports both header rows to assistive technology.
+   - Active-fraction lanes remain labeled as observed samples; CPU, I/O, and wait lanes now say `derived intervals` and disclose consecutive-observation provenance in each cell tooltip.
+   - The three fresh source/implementation pairs were reopened together at original 1920 × 1080 resolution. No actionable P0, P1, or P2 mismatch was introduced.
 
 ## Findings
 
@@ -140,7 +146,7 @@ None for this Activity slice. Future backend contracts may add truthful CPU user
 
 - [x] Activity is one combined PG + process-evidence + temporal matrix.
 - [x] Overview, CPU, and Disk lenses select a relevant temporal metric.
-- [x] Waits & Locks keeps exact edges separate from point-sampled wait history.
+- [x] Waits & Locks keeps exact edges separate from interval-attributed wait history.
 - [x] Unique same-snapshot PID is the only process attribution path; ambiguous joins remain null.
 - [x] Activity → related process opens a real Entity Detail with invalid Activity lens state cleared.
 - [x] 1920 × 1080 root, 96 buckets, row density, browser console, and key interactions pass.

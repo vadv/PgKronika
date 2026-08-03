@@ -1,9 +1,12 @@
+import { useInfiniteQuery } from "@tanstack/react-query";
+import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { apiGet } from "../api/client";
 import { metricDesc, metricLabel } from "../api/codes";
-import { useFrame } from "../api/frame";
 import { useHeatmap } from "../api/heatmap";
 import type {
   FrameColumnDto,
+  FrameResponse,
   FrameRowDto,
   FrameValue,
   ViewSpec,
@@ -48,19 +51,111 @@ function evidenceText(value: FrameValue | null): string {
   return String(value);
 }
 
+function pidAtLeast(value: FrameValue | null, minimum: number): number | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^\d+$/.test(value.trim())
+        ? Number(value)
+        : Number.NaN;
+  return Number.isSafeInteger(parsed) && parsed >= minimum ? parsed : null;
+}
+
+function waiterPid(value: FrameValue | null): number | null {
+  return pidAtLeast(value, 1);
+}
+
+function blockerPids(value: FrameValue | null): number[] {
+  if (typeof value === "number") {
+    const pid = pidAtLeast(value, 0);
+    return pid === null ? [] : [pid];
+  }
+  if (typeof value !== "string") return [];
+  return value
+    .split(",")
+    .map((candidate) => pidAtLeast(candidate.trim(), 0))
+    .filter((pid): pid is number => pid !== null);
+}
+
+interface LockEdge {
+  key: string;
+  entity: string;
+  pid: number;
+  blockedBy: number;
+  target: string;
+  waitAge: FrameValue | null;
+}
+
+function expandLockEdges(pages: FrameResponse[]): LockEdge[] {
+  const expanded: LockEdge[] = [];
+  const seen = new Set<string>();
+  for (const page of pages) {
+    for (const row of page.rows) {
+      const pid = waiterPid(cell(page.columns, row, "pid"));
+      if (pid === null) continue;
+      const target = evidenceText(cell(page.columns, row, "target"));
+      const waitAge = cell(page.columns, row, "wait_age_us");
+      for (const blockedBy of blockerPids(
+        cell(page.columns, row, "blocked_by"),
+      )) {
+        const key = `${pid}:${blockedBy}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        expanded.push({
+          key,
+          entity: row.entity,
+          pid,
+          blockedBy,
+          target,
+          waitAge,
+        });
+        if (expanded.length === 3) return expanded;
+      }
+    }
+  }
+  return expanded;
+}
+
 function ActivityLockEvidence(props: {
   at: string;
   span: number;
   onOpenEntity: (view: string, entity: string) => void;
 }) {
   const { t } = useTranslation();
-  const frame = useFrame({
-    view: "locks",
-    at: props.at,
-    span: props.span,
-    preset: "tree",
-    limit: 3,
+  const frame = useInfiniteQuery({
+    queryKey: ["activity-lock-evidence", props.at, props.span],
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam }) =>
+      apiGet("/v1/frame/{view}", {
+        params: {
+          path: { view: "locks" },
+          query: {
+            at: Number(props.at),
+            span: `${props.span}s`,
+            preset: "tree",
+            limit: 16,
+            ...(pageParam !== null ? { cursor: pageParam } : {}),
+          },
+        },
+      }),
+    getNextPageParam: (lastPage) => lastPage.page.next ?? undefined,
   });
+  const edges = useMemo(
+    () => expandLockEdges(frame.data?.pages ?? []),
+    [frame.data?.pages],
+  );
+  const { fetchNextPage, hasNextPage, isFetchingNextPage } = frame;
+
+  useEffect(() => {
+    if (edges.length >= 3 || !hasNextPage || isFetchingNextPage) {
+      return;
+    }
+    void fetchNextPage();
+  }, [edges.length, fetchNextPage, hasNextPage, isFetchingNextPage]);
+
+  const isSearchingForEdges =
+    edges.length === 0 &&
+    (frame.isPending || hasNextPage || isFetchingNextPage);
 
   return (
     <section
@@ -74,7 +169,7 @@ function ActivityLockEvidence(props: {
         <span>{t("activity.matrix.locks.note")}</span>
       </div>
       <div className="activity-lock-evidence__edges">
-        {frame.isPending && (
+        {isSearchingForEdges && (
           <span className="activity-lock-evidence__state">
             {t("table.loading")}
           </span>
@@ -84,34 +179,34 @@ function ActivityLockEvidence(props: {
             {t("table.error")}
           </span>
         )}
-        {frame.data?.rows.length === 0 && (
-          <span className="activity-lock-evidence__state">
-            {t("activity.locks.empty")}
-          </span>
-        )}
-        {frame.data?.rows.map((row) => {
-          const pid = evidenceText(cell(frame.data.columns, row, "pid"));
-          const blockedBy = evidenceText(
-            cell(frame.data.columns, row, "blocked_by"),
-          );
-          const target = evidenceText(cell(frame.data.columns, row, "target"));
-          const waitAge = cell(frame.data.columns, row, "wait_age_us");
+        {frame.data !== undefined &&
+          edges.length === 0 &&
+          !hasNextPage &&
+          !isFetchingNextPage &&
+          !frame.isError && (
+            <span className="activity-lock-evidence__state">
+              {t("activity.locks.empty")}
+            </span>
+          )}
+        {edges.map((edge) => {
           return (
             <button
-              key={row.entity}
+              key={edge.key}
               type="button"
               className="activity-lock-evidence__edge"
-              onClick={() => props.onOpenEntity("locks", row.entity)}
-              aria-label={`${pid} → ${blockedBy} · ${target}`}
+              onClick={() => props.onOpenEntity("locks", edge.entity)}
+              aria-label={`${edge.pid} → ${edge.blockedBy} · ${edge.target}`}
             >
               <span className="activity-lock-evidence__pids">
-                {pid} → {blockedBy}
+                {edge.pid} → {edge.blockedBy}
               </span>
-              <span className="activity-lock-evidence__target">{target}</span>
+              <span className="activity-lock-evidence__target">
+                {edge.target}
+              </span>
               <span className="activity-lock-evidence__age">
-                {typeof waitAge === "number"
-                  ? formatByUnit(waitAge, "us")
-                  : evidenceText(waitAge)}
+                {typeof edge.waitAge === "number"
+                  ? formatByUnit(edge.waitAge, "us")
+                  : evidenceText(edge.waitAge)}
               </span>
             </button>
           );
@@ -221,6 +316,10 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
         onMatched={props.onMatched}
         timeMatrix={{
           kind: "activity",
+          evidenceMode:
+            props.metric === "active_fraction"
+              ? "point_samples"
+              : "interval_estimates",
           data: heatmap.data,
           pending: heatmap.isPending,
           error: heatmap.isError,

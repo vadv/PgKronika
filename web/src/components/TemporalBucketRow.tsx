@@ -69,7 +69,7 @@ export function TemporalBucketRow(props: {
   baselineUs: string | null;
   metricLabel: string;
   max?: number;
-  mode?: "range" | "point_samples";
+  mode?: "range" | "point_samples" | "interval_estimates";
 }) {
   const { t } = useTranslation();
   const mode = props.mode ?? "range";
@@ -92,23 +92,41 @@ export function TemporalBucketRow(props: {
     props.gridFromUs,
     props.gridToUs,
   );
+  const availableLabel =
+    mode === "point_samples"
+      ? t("activity.matrix.pointRowLabel", {
+          entity: props.row?.label,
+          metric: props.metricLabel,
+        })
+      : mode === "interval_estimates"
+        ? t("activity.matrix.intervalRowLabel", {
+            entity: props.row?.label,
+            metric: props.metricLabel,
+          })
+        : `${props.row?.label} · ${props.metricLabel}`;
 
   return (
     <div
       className={`temporal-bucket-row temporal-bucket-row--${mode}`}
       data-testid={
-        mode === "point_samples" ? "activity-sample-row" : "temporal-row"
+        mode === "point_samples"
+          ? "activity-sample-row"
+          : mode === "interval_estimates"
+            ? "activity-interval-row"
+            : "temporal-row"
       }
       data-mode={mode}
       data-evidence={props.row === null ? "unavailable" : "available"}
       aria-label={
         props.row === null
           ? t(
-              mode === "point_samples"
-                ? "activity.matrix.seriesUnavailable"
+              mode === "point_samples" || mode === "interval_estimates"
+                ? mode === "interval_estimates"
+                  ? "activity.matrix.intervalUnavailable"
+                  : "activity.matrix.seriesUnavailable"
                 : "statements.matrix.seriesUnavailable",
             )
-          : `${props.row.label} · ${props.metricLabel}`
+          : availableLabel
       }
       style={
         {
@@ -132,10 +150,17 @@ export function TemporalBucketRow(props: {
             data-observed={
               mode === "point_samples" && value !== null ? "true" : undefined
             }
+            data-derived={
+              mode === "interval_estimates" && value !== null
+                ? "true"
+                : undefined
+            }
             title={t(
               mode === "point_samples"
                 ? "activity.matrix.bucketValue"
-                : "statements.matrix.bucketValue",
+                : mode === "interval_estimates"
+                  ? "activity.matrix.intervalValue"
+                  : "statements.matrix.bucketValue",
               {
                 time,
                 metric: props.metricLabel,

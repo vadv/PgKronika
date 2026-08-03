@@ -956,6 +956,79 @@ test("Activity owns prepared forensic lenses, point evidence and a 96-bucket hea
   });
 });
 
+test("Activity URL preset changes restore the preset metric after another lens", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const activity = availableCatalog.views.find(
+    (view) => view.code === "activity",
+  );
+  if (activity !== undefined) {
+    activity.presets = ["overview", "waits_locks", "cpu"].map((code) => ({
+      code,
+      columns: [],
+      sort: { column: "metric", order: "desc" as const },
+    }));
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  fireEvent.click(await screen.findByRole("button", { name: /^waitsLocks$/i }));
+  await waitFor(() =>
+    expect(
+      fetchImpl.mock.calls.some(([input]) => {
+        const url = new URL(
+          typeof input === "string"
+            ? input
+            : input instanceof Request
+              ? input.url
+              : input.href,
+        );
+        return (
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("metric") === "wait"
+        );
+      }),
+    ).toBe(true),
+  );
+
+  act(() => {
+    location.hash = "#view=activity&at=1722400000000000&preset=cpu";
+    window.dispatchEvent(new Event("hashchange"));
+  });
+  await waitFor(() =>
+    expect(
+      fetchImpl.mock.calls.some(([input]) => {
+        const url = new URL(
+          typeof input === "string"
+            ? input
+            : input instanceof Request
+              ? input.url
+              : input.href,
+        );
+        return (
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("metric") === "cpu"
+        );
+      }),
+    ).toBe(true),
+  );
+});
+
 test("Activity resource lenses inherit partial-source availability from the catalog", async () => {
   history.replaceState(
     null,

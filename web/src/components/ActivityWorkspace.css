@@ -309,17 +309,21 @@ tr[aria-selected="true"] > td.activity-time-matrix__identity {
   border-block-end: 1px solid var(--border);
 }
 
-.temporal-bucket-row--point_samples {
+.temporal-bucket-row--point_samples,
+.temporal-bucket-row--interval_estimates {
   gap: 2px;
 }
 
-.temporal-bucket-row--point_samples .temporal-bucket-row__bucket {
+.temporal-bucket-row--point_samples .temporal-bucket-row__bucket,
+.temporal-bucket-row--interval_estimates .temporal-bucket-row__bucket {
   height: 8px;
   min-width: 2px;
   border-radius: 1px;
 }
 
 .temporal-bucket-row--point_samples
+  .temporal-bucket-row__bucket[data-empty="true"],
+.temporal-bucket-row--interval_estimates
   .temporal-bucket-row__bucket[data-empty="true"] {
   background: var(--bg) !important;
   outline: 1px solid var(--border);

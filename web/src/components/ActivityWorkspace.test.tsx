@@ -189,7 +189,7 @@ const heatmap: HeatmapResponse = {
   ],
 };
 
-const locksFrame = makeFrameResponse({
+const locksRootFrame = makeFrameResponse({
   view: "locks",
   columns: [
     makeFrameColumn({ code: "pid", type: "i64" }),
@@ -199,12 +199,35 @@ const locksFrame = makeFrameResponse({
   ],
   rows: [
     makeFrameRow({
-      entity: "lock:18422",
-      label: "pid 18422",
-      cells: [18422, "19041", 12_400_000, "public.orders"],
+      entity: "lock:root",
+      label: "pid 19041",
+      cells: [19041, "", null, "—"],
+    }),
+    makeFrameRow({
+      entity: "lock:root-two",
+      label: "pid 19042",
+      cells: [19042, "", null, "—"],
     }),
   ],
-  page: { matched: 1, returned: 1 },
+  page: { matched: 6, returned: 2, next: "locks-page-2" },
+});
+
+const locksEdgeFrame = makeFrameResponse({
+  view: "locks",
+  columns: locksRootFrame.columns,
+  rows: [
+    makeFrameRow({
+      entity: "lock:18422",
+      label: "pid 18422",
+      cells: [18422, "19041, 0", 12_400_000, "public.orders"],
+    }),
+    makeFrameRow({
+      entity: "lock:18425",
+      label: "pid 18425",
+      cells: [18425, "19043, 19044", 8_000_000, "public.accounts"],
+    }),
+  ],
+  page: { matched: 6, returned: 2 },
 });
 
 function stubRequests() {
@@ -214,14 +237,24 @@ function stubRequests() {
       const url = requestUrl(input);
       if (url.pathname === "/v1/timeline/heatmap")
         return Promise.resolve(json(heatmap));
-      if (url.pathname === "/v1/frame/locks")
-        return Promise.resolve(json(locksFrame));
+      if (url.pathname === "/v1/frame/locks") {
+        return Promise.resolve(
+          json(
+            url.searchParams.get("cursor") === "locks-page-2"
+              ? locksEdgeFrame
+              : locksRootFrame,
+          ),
+        );
+      }
       return Promise.resolve(json(activityFrame));
     }),
   );
 }
 
-function renderWorkspace(preset: "overview" | "waits_locks") {
+function renderWorkspace(
+  preset: "overview" | "waits_locks",
+  onOpenEntity: (view: string, entity: string) => void = () => {},
+) {
   return render(
     <ActivityWorkspace
       view={activityView}
@@ -241,7 +274,7 @@ function renderWorkspace(preset: "overview" | "waits_locks") {
       onMetricChange={() => {}}
       onSort={() => {}}
       onSelectRow={() => {}}
-      onOpenEntity={() => {}}
+      onOpenEntity={onOpenEntity}
       onMatched={() => {}}
     />,
     { wrapper: Wrapper },
@@ -262,6 +295,13 @@ test("builds one dense Activity point-sample matrix with explicit process proven
     expect(screen.getAllByTestId("activity-sample-row")).toHaveLength(2),
   );
   expect(screen.getAllByTestId("time-matrix-bucket")).toHaveLength(2 * 96);
+  const table = screen.getByRole("table", { name: "activity" });
+  expect(table.getAttribute("aria-rowcount")).toBe("30");
+  expect(
+    table
+      .querySelector('[data-entity="pid:18422"]')
+      ?.getAttribute("aria-rowindex"),
+  ).toBe("3");
 
   const heatmapCall = vi
     .mocked(fetch)
@@ -274,19 +314,33 @@ test("builds one dense Activity point-sample matrix with explicit process proven
 
 test("adds bounded edge-only lock evidence only to Waits & Locks", async () => {
   stubRequests();
-  renderWorkspace("waits_locks");
+  const onOpenEntity = vi.fn();
+  renderWorkspace("waits_locks", onOpenEntity);
 
   const strip = await screen.findByTestId("activity-lock-evidence");
   expect(strip.getAttribute("data-provenance")).toBe("edge_only");
   expect(
     await screen.findByRole("button", { name: /18422.*19041/ }),
   ).toBeDefined();
+  expect(screen.getByRole("button", { name: /^18422 → 0 ·/ })).toBeDefined();
+  expect(screen.getByRole("button", { name: /18425.*19043/ })).toBeDefined();
+  expect(strip.querySelectorAll("button")).toHaveLength(3);
+  expect(strip.textContent).not.toContain("19041 → —");
+  expect(strip.textContent).toContain("18422 → 0");
+  expect(strip.textContent).not.toContain("19044");
+  screen.getByRole("button", { name: /^18422 → 0 ·/ }).click();
+  expect(onOpenEntity).toHaveBeenCalledWith("locks", "lock:18422");
   await waitFor(() => {
-    const lockCall = vi
+    const lockCalls = vi
       .mocked(fetch)
       .mock.calls.map(([input]) => requestUrl(input))
-      .find((url) => url.pathname === "/v1/frame/locks");
-    expect(lockCall?.searchParams.get("limit")).toBe("3");
-    expect(lockCall?.searchParams.get("preset")).toBe("tree");
+      .filter((url) => url.pathname === "/v1/frame/locks");
+    expect(lockCalls[0]?.searchParams.get("limit")).toBe("16");
+    expect(lockCalls[0]?.searchParams.get("preset")).toBe("tree");
+    expect(
+      lockCalls.some(
+        (url) => url.searchParams.get("cursor") === "locks-page-2",
+      ),
+    ).toBe(true);
   });
 });

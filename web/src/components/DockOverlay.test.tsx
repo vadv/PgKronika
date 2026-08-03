@@ -460,6 +460,7 @@ test("row dock drills down via server related provenance and clears", async () =
       view: "statements",
       dock: "row",
       entity: "db:1",
+      q: "queryid=424242",
     },
     view: makeViewSpec({ code: "statements" }),
     onPatch,
@@ -481,6 +482,7 @@ test("row dock drills down via server related provenance and clears", async () =
     entity: "plan:9",
     dock: "row",
     preset: null,
+    q: null,
     sort: null,
     order: null,
   });
