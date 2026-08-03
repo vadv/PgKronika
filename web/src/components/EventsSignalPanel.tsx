@@ -10,6 +10,7 @@ interface EventsSignalPanelProps {
   from: string;
   to: string;
   preset: string | null;
+  q?: string | null;
   onInvestigate: (view: string, atUs: string, eventInstance: string) => void;
 }
 
@@ -29,7 +30,10 @@ const panel: CSSProperties = {
   fontSize: "var(--text-xs)",
 };
 
-function eventMatchesPreset(event: EventFact, preset: string | null): boolean {
+export function eventMatchesPreset(
+  event: EventFact,
+  preset: string | null,
+): boolean {
   const code = event.event_kind;
   switch (preset) {
     case "errors":
@@ -47,7 +51,173 @@ function eventMatchesPreset(event: EventFact, preset: string | null): boolean {
   }
 }
 
-function investigationView(event: EventFact): string {
+function eventField(event: EventFact, field: string): string | null {
+  switch (field) {
+    case "category_code":
+    case "event_kind":
+      return event.event_kind;
+    case "severity_code":
+      return "severity" in event.payload
+        ? String(event.payload.severity)
+        : event.notable_class;
+    case "entity_kind":
+      return event.entity?.kind ?? "";
+    case "identity_quality":
+      return event.identity_quality;
+    case "evidence_quality":
+      return event.evidence_quality;
+    default:
+      return null;
+  }
+}
+
+type EventGlobAtom =
+  { kind: "literal"; value: string } | { kind: "star" } | { kind: "one" };
+
+function splitEventTerms(raw: string): string[] | null {
+  const terms: string[] = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  const flush = () => {
+    if (current !== "" && current !== "&&") terms.push(current);
+    current = "";
+  };
+  for (const character of raw.trim()) {
+    if (/\s/u.test(character) && !quoted) {
+      flush();
+      continue;
+    }
+    current += character;
+    if (escaped) {
+      escaped = false;
+    } else if (quoted && character === "\\") {
+      escaped = true;
+    } else if (character === '"') {
+      quoted = !quoted;
+    }
+  }
+  if (quoted || escaped) return null;
+  flush();
+  return terms;
+}
+
+function splitEventField(term: string): [string | null, string] | null {
+  let quoted = false;
+  let escaped = false;
+  let separator = -1;
+  for (let index = 0; index < term.length; index += 1) {
+    const character = term[index];
+    if (escaped) {
+      escaped = false;
+    } else if (quoted && character === "\\") {
+      escaped = true;
+    } else if (character === '"') {
+      quoted = !quoted;
+    } else if (character === "=" && !quoted) {
+      if (separator >= 0) return null;
+      separator = index;
+    }
+  }
+  if (quoted || escaped) return null;
+  if (separator < 0) return [null, term];
+  const field = term.slice(0, separator).trim().toLowerCase();
+  const glob = term.slice(separator + 1).trim();
+  return field === "" || glob === "" ? null : [field, glob];
+}
+
+function parseEventGlob(
+  raw: string,
+  substring: boolean,
+): EventGlobAtom[] | null {
+  const quoted = raw.startsWith('"') && raw.endsWith('"');
+  if ((raw.startsWith('"') || raw.endsWith('"')) && !quoted) return null;
+  const value = quoted ? raw.slice(1, -1) : raw;
+  if (value === "") return null;
+  const atoms: EventGlobAtom[] = [];
+  let escaped = false;
+  for (const character of value) {
+    if (escaped) {
+      if (!['"', "\\", "*", "?"].includes(character)) return null;
+      atoms.push({ kind: "literal", value: character.toLowerCase() });
+      escaped = false;
+    } else if (quoted && character === "\\") {
+      escaped = true;
+    } else if (character === "*") {
+      atoms.push({ kind: "star" });
+    } else if (character === "?") {
+      atoms.push({ kind: "one" });
+    } else if (character === '"' || (!quoted && character === "\\")) {
+      return null;
+    } else {
+      for (const folded of character.toLowerCase()) {
+        atoms.push({ kind: "literal", value: folded });
+      }
+    }
+  }
+  if (escaped || atoms.length === 0) return null;
+  return substring && !atoms.some((atom) => atom.kind !== "literal")
+    ? [{ kind: "star" }, ...atoms, { kind: "star" }]
+    : atoms;
+}
+
+function eventGlobMatches(atoms: EventGlobAtom[], observed: string): boolean {
+  const value = [...observed.toLowerCase()];
+  let previous = Array.from(
+    { length: value.length + 1 },
+    (_, index) => index === 0,
+  );
+  for (const atom of atoms) {
+    const current = Array.from({ length: value.length + 1 }, () => false);
+    if (atom.kind === "star") {
+      current[0] = previous[0] ?? false;
+      for (let index = 1; index <= value.length; index += 1) {
+        current[index] =
+          (previous[index] ?? false) || (current[index - 1] ?? false);
+      }
+    } else if (atom.kind === "one") {
+      for (let index = 1; index <= value.length; index += 1) {
+        current[index] = previous[index - 1] ?? false;
+      }
+    } else {
+      for (let index = 1; index <= value.length; index += 1) {
+        current[index] =
+          (previous[index - 1] ?? false) && value[index - 1] === atom.value;
+      }
+    }
+    previous = current;
+  }
+  return previous[value.length] ?? false;
+}
+
+export function eventMatchesQuery(
+  event: EventFact,
+  query: string | null,
+): boolean {
+  const typed = query?.trim();
+  if (!typed) return true;
+  if (new TextEncoder().encode(typed).length > 256) return false;
+  const terms = splitEventTerms(typed);
+  if (terms === null || terms.length === 0 || terms.length > 16) return false;
+  return terms.every((term) => {
+    const split = splitEventField(term);
+    if (split === null) return false;
+    const [field, rawGlob] = split;
+    const glob = parseEventGlob(rawGlob, field === null);
+    if (glob === null) return false;
+    if (field !== null) {
+      const observed = eventField(event, field);
+      return observed !== null && eventGlobMatches(glob, observed);
+    }
+    return [
+      event.event_kind,
+      event.entity?.kind ?? "",
+      event.entity?.id ?? "",
+    ].some((value) => eventGlobMatches(glob, value));
+  });
+}
+
+export function investigationView(event: EventFact): string {
   switch (event.entity?.kind) {
     case "host":
     case "filesystem":
@@ -64,7 +234,7 @@ function investigationView(event: EventFact): string {
   }
 }
 
-function eventAt(event: EventFact): string {
+export function eventAt(event: EventFact): string {
   return String(event.occurred_at_us ?? event.sort_ts_us);
 }
 
@@ -88,7 +258,11 @@ export function EventsSignalPanel(props: EventsSignalPanelProps) {
     limit: EVENT_REQUEST_LIMIT,
   });
   const matching = [...(events.data?.events ?? [])]
-    .filter((event) => eventMatchesPreset(event, props.preset))
+    .filter((event) =>
+      props.q?.trim()
+        ? eventMatchesQuery(event, props.q)
+        : eventMatchesPreset(event, props.preset),
+    )
     .sort((left, right) => right.sort_ts_us - left.sort_ts_us);
   const visible = matching.slice(0, MAX_SIGNAL_LANES);
   const quality = events.data;

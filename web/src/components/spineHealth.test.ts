@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 import { makeEventFact, makeHealthPoint } from "../testkit/apiFixtures";
 import {
+  aggregateEventBuckets,
   anchorWindowEnd,
   bucketReason,
   bucketVerdicts,
@@ -121,6 +122,38 @@ test("eventGlyph maps kinds to the approved glyph set", () => {
     glyph: "▲",
     tone: "warn",
   });
+});
+
+test("aggregateEventBuckets collapses noisy events into one density cell", () => {
+  const events = [
+    makeEventFact({
+      event_instance_id: "deadlock-1",
+      event_kind: "pg.database.deadlock_delta",
+      occurred_at_us: FROM + 10,
+      sort_ts_us: FROM + 10,
+      occurrence_count: 2,
+    }),
+    makeEventFact({
+      event_instance_id: "lock-1",
+      event_kind: "pg.lock.wait_reported",
+      occurred_at_us: FROM + 20,
+      sort_ts_us: FROM + 20,
+      occurrence_count: 1,
+    }),
+    makeEventFact({
+      event_instance_id: "checkpoint-1",
+      event_kind: "pg.checkpoint.completed",
+      occurred_at_us: FROM + (TO - FROM) / 2,
+      sort_ts_us: FROM + (TO - FROM) / 2,
+    }),
+  ];
+
+  const buckets = aggregateEventBuckets(events, FROM, TO, 4);
+  expect(buckets).toHaveLength(4);
+  expect(buckets[0]).toMatchObject({ count: 3, tone: "crit" });
+  expect(buckets[0]?.events).toHaveLength(2);
+  expect(buckets[2]).toMatchObject({ count: 1, tone: "info" });
+  expect(buckets[1]).toBeNull();
 });
 
 test("bucketReason prefers the floor class, then the worst domain", () => {

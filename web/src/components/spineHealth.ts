@@ -123,6 +123,12 @@ export interface EventGlyph {
   tone: GlyphTone;
 }
 
+export interface EventBucket {
+  count: number;
+  tone: GlyphTone;
+  events: EventFact[];
+}
+
 /** Presentation-only mapping from the event kind code to a glyph:
  * ◆ errors, ▲ pressure signals, ● info/checkpoints, ○ background
  * maintenance. The API carries no per-event severity, so glyph tones reuse
@@ -162,6 +168,50 @@ export function eventGlyph(event: EventFact): EventGlyph {
     return { glyph: "▲", tone: "warn" };
   }
   return { glyph: "●", tone: "info" };
+}
+
+const GLYPH_TONE_RANK: Record<GlyphTone, number> = {
+  dim: 0,
+  info: 1,
+  warn: 2,
+  crit: 3,
+};
+
+/** Collapse all event facts onto a bounded visual grid. A noisy source gets
+ * one density cell per time bucket instead of a pile of overlapping glyphs. */
+export function aggregateEventBuckets(
+  events: EventFact[],
+  fromUs: number,
+  toUs: number,
+  buckets: number,
+): Array<EventBucket | null> {
+  const out: Array<EventBucket | null> = Array.from(
+    { length: Math.max(0, buckets) },
+    () => null,
+  );
+  const windowUs = toUs - fromUs;
+  if (windowUs <= 0 || buckets <= 0) return out;
+  for (const event of events) {
+    const ts = event.occurred_at_us ?? event.sort_ts_us;
+    if (ts < fromUs || ts > toUs) continue;
+    const index = Math.min(
+      buckets - 1,
+      Math.floor(((ts - fromUs) / windowUs) * buckets),
+    );
+    const tone = eventGlyph(event).tone;
+    const count = Math.max(1, event.occurrence_count);
+    const current = out[index];
+    if (current === null || current === undefined) {
+      out[index] = { count, tone, events: [event] };
+      continue;
+    }
+    current.count += count;
+    current.events.push(event);
+    if (GLYPH_TONE_RANK[tone] > GLYPH_TONE_RANK[current.tone]) {
+      current.tone = tone;
+    }
+  }
+  return out;
 }
 
 /** Short reason for a non-ok bucket: the floor class when present, else the

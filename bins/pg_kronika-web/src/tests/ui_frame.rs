@@ -10,8 +10,10 @@ use kronika_analytics::{
 };
 use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
 use kronika_reader::{FactStore, LIMIT, LocalDirSnapshot, OutRow, Value};
+use kronika_registry::os_process::OsProcess;
 use kronika_registry::pg_log::PgLogLifecycleV1;
 use kronika_registry::pg_settings::PgSettingsV1;
+use kronika_registry::pg_stat_activity::PgStatActivityV3;
 use kronika_registry::pg_stat_statements::PgStatStatementsV2;
 use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::{Section, StrId, Ts};
@@ -702,7 +704,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
 }
 
 #[test]
-fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
+fn activity_links_a_unique_same_snapshot_process_by_pid() {
     let request = FrameRequest::parse(
         "activity",
         Some("at=20000000&columns=queryid,process_link,cpu,rss,threads,read_bytes_per_second,write_bytes_per_second,command"),
@@ -760,7 +762,7 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
         frame.rows[0].cells,
         vec![
             DtoFrameValue::Number(424_242.0),
-            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Number(0.09),
             DtoFrameValue::Number(262_144.0),
             DtoFrameValue::Number(8.0),
@@ -772,7 +774,7 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
 }
 
 #[test]
-fn activity_leaves_every_process_scalar_null_for_an_ambiguous_pid() {
+fn activity_keeps_the_pid_link_visible_but_leaves_ambiguous_process_scalars_null() {
     let request = FrameRequest::parse(
         "activity",
         Some("at=20000000&columns=process_link,rss,threads,command"),
@@ -806,7 +808,7 @@ fn activity_leaves_every_process_scalar_null_for_an_ambiguous_pid() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
-            DtoFrameValue::Null,
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Null,
             DtoFrameValue::Null,
             DtoFrameValue::Null,
@@ -839,8 +841,8 @@ fn activity_process_relation_keeps_unique_pid_evidence_best_effort() {
         relations[0].kind,
         crate::ui::catalog::RelationKind::BestEffort
     );
-    assert_eq!(relations[0].method, "same_snapshot_unique_pid");
-    assert_eq!(relations[0].fields, vec!["pid", "ts"]);
+    assert_eq!(relations[0].method, "pid");
+    assert_eq!(relations[0].fields, vec!["pid"]);
     assert!(!relations[0].entity.is_empty());
 
     let absent = ProjectionInput::single(20_000_000, "pg_stat_activity", activity.clone());
@@ -859,12 +861,38 @@ fn activity_process_relation_keeps_unique_pid_evidence_best_effort() {
             ("starttime", Value::Ts(3_000_000)),
         ]),
     );
-    assert!(
-        activity_process_relations(&activity, &input)
-            .expect("ambiguous relation")
-            .is_empty(),
-        "a same-snapshot PID collision must not choose a process lifetime"
+    let candidates = activity_process_relations(&activity, &input).expect("PID links");
+    assert_eq!(candidates.len(), 2, "all same-PID processes stay linked");
+    assert!(candidates.iter().all(|relation| relation.method == "pid"));
+    assert_ne!(candidates[0].entity, candidates[1].entity);
+}
+
+#[test]
+fn activity_keeps_the_pid_link_across_a_collection_gap() {
+    let activity = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("pid", Value::I64(7)),
+        ("backend_start", Value::Ts(1_000_000)),
+    ]);
+    let mut input = ProjectionInput::single(20_000_000, "pg_stat_activity", activity.clone());
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+        ]),
     );
+
+    let relations = activity_process_relations(&activity, &input).expect("PID link");
+    assert_eq!(relations.len(), 1);
+    assert_eq!(
+        relations[0].kind,
+        crate::ui::catalog::RelationKind::BestEffort
+    );
+    assert_eq!(relations[0].method, "pid");
+    assert_eq!(relations[0].fields, vec!["pid"]);
 }
 
 #[test]
@@ -1128,7 +1156,7 @@ fn activity_cpu_uses_the_same_instance_clock() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
-            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Number(0.09),
         ]
     );
@@ -1193,7 +1221,7 @@ fn tick_rates_are_null_without_a_positive_clock() {
 }
 
 #[test]
-fn activity_rejects_ambiguous_same_snapshot_pid_process_evidence() {
+fn activity_keeps_ambiguous_pid_links_but_rejects_ambiguous_counter_deltas() {
     let request = FrameRequest::parse(
         "activity",
         Some("at=20000000&columns=process_link,cpu,read_bytes_per_second,write_bytes_per_second"),
@@ -1244,7 +1272,7 @@ fn activity_rejects_ambiguous_same_snapshot_pid_process_evidence() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
-            DtoFrameValue::Null,
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Null,
             DtoFrameValue::Null,
             DtoFrameValue::Null,
@@ -1329,7 +1357,7 @@ fn activity_does_not_bridge_process_counters_across_starttime() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
-            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Null,
             DtoFrameValue::Null,
             DtoFrameValue::Null,
@@ -2223,6 +2251,116 @@ fn frame_statement_two_segment_fixture(gap_us: i64) -> (tempfile::TempDir, i64) 
     (directory, current_ts)
 }
 
+fn activity_gap_row(ts: i64) -> PgStatActivityV3 {
+    PgStatActivityV3 {
+        ts: Ts(ts),
+        pid: 7,
+        leader_pid: None,
+        datname: None,
+        usename: None,
+        application_name: StrId(0),
+        client_addr: StrId(0),
+        backend_type: StrId(0),
+        state: None,
+        wait_event_type: None,
+        wait_event: None,
+        query: None,
+        query_id: None,
+        backend_xid_age: None,
+        backend_xmin_age: None,
+        backend_start: Ts(1),
+        xact_start: None,
+        query_start: None,
+        state_change: None,
+    }
+}
+
+fn process_gap_row(ts: i64) -> OsProcess {
+    OsProcess {
+        ts: Ts(ts),
+        pid: 7,
+        starttime: Ts(2),
+        ppid: 1,
+        uid: 1,
+        euid: 1,
+        gid: 1,
+        egid: 1,
+        state: b'S',
+        num_threads: 1,
+        tty: 0,
+        comm: StrId(0),
+        cmdline: None,
+        utime: 1,
+        stime: 1,
+        nice: 0,
+        prio: 0,
+        rtprio: 0,
+        policy: 0,
+        curcpu: 0,
+        rundelay_ns: 0,
+        blkdelay_ticks: 0,
+        nvcsw: 0,
+        nivcsw: 0,
+        minflt: 0,
+        majflt: 0,
+        vmem_kb: 0,
+        rmem_kb: 0,
+        vswap_kb: 0,
+        syscr: None,
+        syscw: None,
+        rchar: None,
+        wchar: None,
+        read_bytes: None,
+        write_bytes: None,
+        cancelled_write_bytes: None,
+        exit_signal: 0,
+        scope: 0,
+    }
+}
+
+fn frame_activity_relation_gap_fixture() -> (tempfile::TempDir, i64) {
+    let previous_ts = 1_000;
+    let current_ts = previous_ts + 16 * 60 * 1_000_000;
+    let directory = tempfile::tempdir().expect("tempdir");
+    for (file, timestamp, include_process) in [
+        ("frame-activity-prev.pgm", previous_ts, true),
+        ("frame-activity-current.pgm", current_ts, false),
+    ] {
+        let activity = PgStatActivityV3::encode(&[activity_gap_row(timestamp)])
+            .expect("encode activity gap fixture");
+        let process =
+            OsProcess::encode(&[process_gap_row(timestamp)]).expect("encode process gap fixture");
+        let mut sections = vec![SectionInput {
+            type_id: 1_001_003,
+            rows: 1,
+            body: &activity,
+        }];
+        if include_process {
+            sections.push(SectionInput {
+                type_id: 1_100_001,
+                rows: 1,
+                body: &process,
+            });
+        }
+        let pgm = build_part(
+            &sections,
+            PartMeta {
+                min_ts: timestamp,
+                max_ts: timestamp,
+            },
+        );
+        crate::test_layout::write_named_pgm(directory.path(), file, &pgm);
+    }
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let store = FactStore::new(directory.path());
+    for descriptor in snapshot.sealed_descriptors() {
+        snapshot
+            .load_sealed_facts_by_descriptor(&descriptor, &store, &LIMIT)
+            .expect("publish web index");
+    }
+    (directory, current_ts)
+}
+
 #[test]
 fn frame_uses_last_known_track_planning_from_the_same_exact_pgm() {
     let directory = frame_statement_planning_fixture();
@@ -2310,6 +2448,30 @@ fn frame_does_not_open_or_use_a_predecessor_beyond_the_rate_gap() {
             ..
         })
     ));
+}
+
+#[test]
+fn frame_loads_previous_process_for_pid_link_beyond_the_rate_gap() {
+    let (directory, current_ts) = frame_activity_relation_gap_fixture();
+    let snapshot = LocalDirSnapshot::open(directory.path()).expect("snapshot");
+    let raw = format!("at={current_ts}&columns=pid,process_link,cpu");
+    let request = FrameRequest::parse("activity", Some(&raw), &catalog()).expect("request");
+    kronika_reader::qualification_reset_open_unit_calls();
+
+    let frame = project_frame(&snapshot, &request, &catalog(), FrameLimits::default())
+        .expect("frame projection");
+
+    assert_eq!(kronika_reader::qualification_open_unit_calls(), 2);
+    assert_eq!(frame.predecessor_ts_us, None);
+    assert_eq!(frame.neighbors.previous, Some(1_000));
+    assert_eq!(
+        frame.rows.first().expect("activity row").cells,
+        vec![
+            DtoFrameValue::Number(7.0),
+            DtoFrameValue::String("pid".to_owned()),
+            DtoFrameValue::Null,
+        ]
+    );
 }
 
 #[test]

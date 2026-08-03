@@ -489,3 +489,41 @@ test("row dock drills down via server related provenance and clears", async () =
   fireEvent.click(screen.getByRole("button", { name: "dock.row.clear" }));
   expect(onPatch).toHaveBeenCalledWith({ entity: null, dock: null });
 });
+
+test("activity-process relationship is presented as a direct PID link", async () => {
+  stubFetch(
+    makeEntityPointResponse({
+      view: "activity",
+      entity: "activity:44",
+      related: [
+        {
+          view: "processes",
+          entity: "process:44",
+          relation: "activity_process",
+          provenance: {
+            kind: "best_effort",
+            method: "pid",
+            fields: ["pid"],
+          },
+        },
+      ],
+    }),
+  );
+  renderDock({
+    state: {
+      ...baseState,
+      view: "activity",
+      dock: "row",
+      entity: "activity:44",
+    },
+    view: makeViewSpec({ code: "activity" }),
+  });
+
+  fireEvent.click(
+    await screen.findByRole("tab", { name: "dock.detail.relationships" }),
+  );
+  const link = screen.getByRole("button", { name: /activity_process/ });
+  expect(link.textContent).toContain("relation.activityProcess.pid");
+  expect(link.textContent).not.toContain("best_effort");
+  expect(link.textContent).not.toContain("proof");
+});

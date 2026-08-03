@@ -75,8 +75,8 @@ export function formatCellValue(
   if (column.code === "phase" && typeof value === "string") {
     return t(`pg.vacuumPhase.${value}`, { defaultValue: value });
   }
-  // process_link carries the closed RelationKind vocabulary: localized label,
-  // the machine kind stays for the tooltip.
+  // process_link exposes how Activity reaches the OS-process history. The
+  // machine token stays in the tooltip while the cell states the direct link.
   if (column.code === "process_link" && typeof value === "string") {
     return relationKindLabel(t, value);
   }

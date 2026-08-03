@@ -231,7 +231,7 @@ SQL и другие чувствительные свободные строки
 - Evidence lanes: CPU saturation, memory pressure, storage pressure и error/event lane.
 - Heatmap: строки — CPU, memory, devices, cgroups или процессы; метрика переключается без изменения оси времени.
 - Ranked matrix: resource, utilization, saturation, errors, Δ baseline, coverage, top contributor.
-- При выборе процесса Detail совмещает `/proc`, cgroup и `pg_stat_activity`, если collector сохранил relation token или доказан однозначный lifetime. Совпадение одного PID всегда остаётся связью `best_effort`.
+- При выборе процесса Detail совмещает `/proc`, cgroup и `pg_stat_activity` по PID. Если в сохранённой истории найден одинаковый PID, интерфейс связывает все найденные строки и показывает переходы между ними; `starttime` используется только внутри расчёта дельт CPU/I/O.
 
 `rchar`/`wchar` показываются как логические байты, которые могут обслуживаться page cache. `read_bytes`/`write_bytes` показываются как storage-accounted bytes. Разность может называться только приблизительной оценкой cache-served I/O, но не «page-cache hits».
 

@@ -36,7 +36,7 @@ beforeEach(() => {
   queryClient.clear();
   history.replaceState(null, "", location.pathname);
   // Tests assert localized view labels, so run with the sidebar expanded.
-  localStorage.setItem("pgk-sidebar", "open");
+  window.localStorage.setItem("pgk-sidebar", "open");
 });
 
 function jsonResponse(body: unknown): Response {
@@ -571,7 +571,7 @@ test("a Locks hash renders its contextual deep-link surface without selecting OS
   ).toBe(true);
 });
 
-test("a Processes hash explicitly selects OS while retaining deep-link context", async () => {
+test("a Processes hash explicitly selects OS without wasting a context row", async () => {
   history.replaceState(null, "", `${location.pathname}#view=processes`);
   renderApp();
 
@@ -579,9 +579,54 @@ test("a Processes hash explicitly selects OS while retaining deep-link context",
     name: /navigation\.destination\.os/i,
   });
   expect(os.getAttribute("aria-selected")).toBe("true");
-  expect(screen.getByTestId("contextual-deep-link").textContent).toContain(
-    "navigation.deepLink.processes",
+  expect(screen.queryByTestId("contextual-deep-link")).toBeNull();
+  expect(await screen.findByTestId("os-workspace")).toBeDefined();
+  expect(screen.getByTestId("processes-time-matrix")).toBeDefined();
+  expect(
+    document.querySelector('[data-shell-region="analytical-center"]'),
+  ).toBeNull();
+});
+
+test("mobile OS keeps host context and its row-coupled process matrix", async () => {
+  history.replaceState(null, "", `${location.pathname}#view=processes`);
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn().mockReturnValue({
+      matches: true,
+      media: "(max-width: 760px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }),
   );
+  renderApp();
+
+  const workspace = await screen.findByTestId("mobile-os-workspace");
+  expect(within(workspace).getByTestId("host-pressure-evidence")).toBeDefined();
+  expect(within(workspace).getByTestId("processes-time-matrix")).toBeDefined();
+  await waitFor(() => {
+    const heatmap = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      )
+      .find(
+        (url) =>
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("view") === "processes",
+      );
+    expect(heatmap?.searchParams.get("buckets")).toBe("48");
+  });
 });
 
 test("arrow keys step the cursor; shift+arrow jumps an hour", async () => {
@@ -1469,6 +1514,13 @@ test("Events owns bounded Signals, a dense heatmap and machine-filtered family l
         event_kind: "pg.log.error_group_observed",
         occurred_at_us: 1_722_400_000_000_456,
         sort_ts_us: 1_722_400_000_000_456,
+        payload: {
+          kind: "error",
+          category: "internal",
+          severity: "fatal",
+          sqlstate: null,
+          dropped_field_count: 0,
+        },
       }),
     ],
   });
@@ -1492,6 +1544,8 @@ test("Events owns bounded Signals, a dense heatmap and machine-filtered family l
   renderApp(fetchImpl);
 
   expect(await screen.findByTestId("events-signal-panel")).toBeDefined();
+  expect(screen.getByTestId("events-workspace")).toBeDefined();
+  expect(await screen.findAllByTestId("event-range-row")).toHaveLength(2);
   expect(
     screen
       .getByRole("button", { name: /^eventTimeline$/i })
@@ -1526,41 +1580,37 @@ test("Events owns bounded Signals, a dense heatmap and machine-filtered family l
           url.searchParams.get("buckets") === "96",
       ),
     ).toBe(true);
-    expect(
-      calls.some(
-        (url) =>
-          url.pathname === "/v1/frame/events" &&
-          url.searchParams.get("preset") === "checkpoints" &&
-          url.searchParams.get("q") === "category_code=pg.checkpoint.*",
-      ),
-    ).toBe(true);
   });
   expect(screen.getAllByTestId("event-signal-lane")).toHaveLength(1);
   expect(
     screen.getByTestId("event-signal-lane").getAttribute("data-event-instance"),
   ).toBe("checkpoint-1");
+  await waitFor(() => {
+    const rows = screen.getAllByTestId("event-range-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.getAttribute("data-event-instance")).toBe("checkpoint-1");
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: /^eventErrors$/i }));
+  await waitFor(() => {
+    const rows = screen.getAllByTestId("event-range-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.getAttribute("data-event-instance")).toBe("error-1");
+  });
 
   const filter = screen.getByRole("searchbox", { name: "toolbar.filter" });
   fireEvent.change(filter, {
     target: { value: "severity_code=fatal" },
   });
-  fireEvent.keyDown(filter, { key: "Enter" });
+  expect((filter as HTMLInputElement).value).toBe("severity_code=fatal");
+  fireEvent.keyDown(filter, {
+    key: "Enter",
+    target: { value: "severity_code=fatal" },
+  });
   await waitFor(() => {
-    const frameCalls = fetchImpl.mock.calls
-      .map(
-        ([input]) =>
-          new URL(
-            typeof input === "string"
-              ? input
-              : input instanceof Request
-                ? input.url
-                : input.href,
-          ),
-      )
-      .filter((url) => url.pathname === "/v1/frame/events");
-    expect(frameCalls.at(-1)?.searchParams.get("q")).toBe(
-      "severity_code=fatal",
-    );
+    const rows = screen.getAllByTestId("event-range-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.getAttribute("data-event-instance")).toBe("error-1");
   });
 });
 

@@ -56,9 +56,9 @@ const activityView = makeViewSpec({
       left: "activity",
       right: "process",
       kind: "best_effort",
-      fields: ["pid", "ts"],
-      cardinality: "zero_or_one",
-      provenance: "same_snapshot_pid_only",
+      fields: ["pid"],
+      cardinality: "zero_or_many",
+      provenance: "pid",
     },
   ],
   metrics: [
@@ -153,7 +153,7 @@ const activityFrame = makeFrameResponse({
     makeFrameRow({
       entity: "pid:18422",
       label: "api / erp_prod",
-      cells: [18422, "erp_prod", "api", "web", "active", "best_effort", 0.82],
+      cells: [18422, "erp_prod", "api", "web", "active", "pid", 0.82],
     }),
     makeFrameRow({
       entity: "pid:19041",
@@ -289,7 +289,10 @@ test("builds one dense Activity point-sample matrix with explicit process proven
   expect(screen.getByTestId("activity-point-evidence")).toBeDefined();
   expect(
     screen.getByTestId("activity-process-provenance").textContent,
-  ).toContain("same_snapshot_pid_only");
+  ).toContain("relation.activityProcess.pid");
+  expect(
+    screen.getByTestId("activity-process-provenance").textContent,
+  ).not.toContain("best_effort");
   expect(screen.queryByTestId("activity-detached-heatmap")).toBeNull();
   await waitFor(() =>
     expect(screen.getAllByTestId("activity-sample-row")).toHaveLength(2),

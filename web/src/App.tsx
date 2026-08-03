@@ -16,12 +16,13 @@ import type { ViewSpec } from "./api/types";
 import { ActivityWorkspace } from "./components/ActivityWorkspace";
 import { AlertBar } from "./components/AlertBar";
 import { DockOverlay } from "./components/DockOverlay";
-import { EventsSignalPanel } from "./components/EventsSignalPanel";
+import { EventsWorkspace } from "./components/EventsWorkspace";
 import { FocusBar } from "./components/FocusBar";
 import { ForensicSearch } from "./components/ForensicSearch";
 import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
 import { InfrastructureEvidencePanel } from "./components/InfrastructureEvidencePanel";
+import { OsWorkspace, osMetricForPreset } from "./components/OsWorkspace";
 import { PrimaryNavigation } from "./components/PrimaryNavigation";
 import { ShellLayout } from "./components/ShellLayout";
 import { HealthLine } from "./components/HealthLine";
@@ -129,23 +130,6 @@ const EVENT_LENSES = [
   ["eventSlowQueries", "slow"],
   ["eventCollectorHealth", "collector_health"],
 ] as const;
-
-function eventFrameFilter(preset: string | null): string | null {
-  switch (preset) {
-    case "errors":
-      return "category_code=*error*";
-    case "checkpoints":
-      return "category_code=pg.checkpoint.*";
-    case "vacuum":
-      return "category_code=pg.maintenance.*";
-    case "slow":
-      return "category_code=pg.query.slow_*";
-    case "collector_health":
-      return "category_code=collector.*";
-    default:
-      return null;
-  }
-}
 
 function catalogPreparedLens(
   view: ViewSpec | undefined,
@@ -351,10 +335,9 @@ function Shell() {
   const vacuumScreen = activeView?.code === "vacuum";
   const eventsScreen = activeView?.code === "events";
   const infrastructureEvidenceScreen =
-    processesScreen || tablesScreen || indexesScreen || vacuumScreen;
-  const evidencePanelScreen = infrastructureEvidenceScreen || eventsScreen;
-  const denseHeatmapScreen =
-    activityScreen || infrastructureEvidenceScreen || eventsScreen;
+    tablesScreen || indexesScreen || vacuumScreen;
+  const evidencePanelScreen = infrastructureEvidenceScreen;
+  const denseHeatmapScreen = activityScreen || infrastructureEvidenceScreen;
   const effectivePreset = statementsScreen
     ? (state.preset ?? "time")
     : activityScreen
@@ -382,13 +365,24 @@ function Shell() {
           metric.availability === "available",
       ))
       ? activityPresetMetric
-      : activeView?.canonical_metric;
+      : undefined;
+  const osPresetMetric = osMetricForPreset(effectivePreset);
+  const osDefaultMetric =
+    processesScreen &&
+    (activeView?.metrics.length === 0 ||
+      activeView?.metrics.some(
+        (metric) =>
+          metric.code === osPresetMetric && metric.availability === "available",
+      ))
+      ? osPresetMetric
+      : undefined;
   const metricContext = activeView
     ? `${activeView.code}:${effectivePreset ?? ""}`
     : "";
   const selectedMetric = activeView
     ? (metricByContext[metricContext] ??
       activityDefaultMetric ??
+      osDefaultMetric ??
       activeView.canonical_metric)
     : "";
   const selectMetric = (metric: string) => {
@@ -583,10 +577,7 @@ function Shell() {
                 : eventsScreen
                   ? t("events.filterHint")
                   : undefined;
-  const frameQuery =
-    eventsScreen && state.q === null
-      ? eventFrameFilter(effectivePreset)
-      : state.q;
+  const frameQuery = state.q;
   // A preset owns its default ranking. Carrying an explicit sort from the
   // previous lens can leave the matrix invisibly ranked by a hidden column.
   const selectPreset = (preset: string | null) => {
@@ -965,6 +956,69 @@ function Shell() {
               </div>
             </section>
           )}
+          {processesScreen && heatmapReady && (
+            <section
+              data-testid="mobile-os-workspace"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "var(--space-2)",
+                minWidth: 0,
+              }}
+            >
+              <HealthLine />
+              <PageHeader
+                view={activeView}
+                summary={summary.data?.views.find(
+                  (view) => view.view === state.view,
+                )}
+                matched={matched}
+                live={state.at === null}
+                onOpenIncidents={() => patch({ dock: "incidents" })}
+              />
+              <Toolbar
+                view={activeView}
+                preset={effectivePreset}
+                q={state.q}
+                matched={matched}
+                onSelectPreset={selectPreset}
+                onFilter={(q) => patch({ q })}
+                lenses={preparedLenses}
+                contextNote={evidenceNote}
+                filterHint={filterHint}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  height: "70dvh",
+                  minHeight: "520px",
+                  minWidth: 0,
+                }}
+              >
+                <OsWorkspace
+                  view={activeView}
+                  at={at}
+                  span={state.span}
+                  from={heatmapRange.from}
+                  to={heatmapRange.to}
+                  metric={selectedMetric}
+                  preset={effectivePreset}
+                  q={state.q}
+                  sort={state.sort}
+                  order={state.order}
+                  entity={state.entity}
+                  matched={matched}
+                  mobile
+                  context={context.data}
+                  onMetricChange={selectMetric}
+                  onSort={onTableSort}
+                  onSelectRow={onSelectRow}
+                  onMatched={setMatched}
+                />
+              </div>
+            </section>
+          )}
         </div>
       ) : (
         <div
@@ -981,7 +1035,7 @@ function Shell() {
           }}
         >
           <HealthLine />
-          {(state.view === "locks" || state.view === "processes") && (
+          {state.view === "locks" && (
             <aside
               data-testid="contextual-deep-link"
               role="status"
@@ -1069,7 +1123,9 @@ function Shell() {
           {heatmapReady &&
             !statementsScreen &&
             !activityScreen &&
-            !plansScreen && (
+            !plansScreen &&
+            !processesScreen &&
+            !eventsScreen && (
               <div
                 data-shell-region="analytical-center"
                 data-testid={
@@ -1129,25 +1185,6 @@ function Shell() {
                               sort: null,
                               order: null,
                             }),
-                      })
-                    }
-                  />
-                )}
-                {eventsScreen && (
-                  <EventsSignalPanel
-                    from={range.fromUs}
-                    to={range.toUs}
-                    preset={effectivePreset}
-                    onInvestigate={(view, atUs) =>
-                      patch({
-                        view,
-                        at: atUs,
-                        preset: null,
-                        sort: null,
-                        order: null,
-                        q: null,
-                        entity: null,
-                        dock: null,
                       })
                     }
                   />
@@ -1247,6 +1284,55 @@ function Shell() {
                   })
                 }
                 onMatched={setMatched}
+              />
+            ) : processesScreen ? (
+              <OsWorkspace
+                view={activeView}
+                at={at}
+                span={state.span}
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                metric={selectedMetric}
+                preset={effectivePreset}
+                q={frameQuery}
+                sort={state.sort}
+                order={state.order}
+                entity={state.entity}
+                matched={matched}
+                mobile={false}
+                context={context.data}
+                onMetricChange={selectMetric}
+                onSort={onTableSort}
+                onSelectRow={onSelectRow}
+                onMatched={setMatched}
+              />
+            ) : eventsScreen ? (
+              <EventsWorkspace
+                view={activeView}
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                metric={selectedMetric}
+                preset={effectivePreset}
+                q={frameQuery}
+                selectedRange={range}
+                cursorUs={at}
+                hoverUs={hoverUs}
+                brushDraft={brushDraft}
+                baselineUs={state.baseline}
+                onMetricChange={selectMetric}
+                onSelectEntity={(entity) => patch({ entity, dock: "row" })}
+                onInvestigate={(view, atUs) =>
+                  patch({
+                    view,
+                    at: atUs,
+                    preset: null,
+                    sort: null,
+                    order: null,
+                    q: null,
+                    entity: null,
+                    dock: null,
+                  })
+                }
               />
             ) : (
               <TableView

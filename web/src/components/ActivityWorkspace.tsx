@@ -293,9 +293,9 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
           data-testid="activity-process-provenance"
           title={t("activity.processEvidence")}
         >
-          {t("activity.matrix.processLink")} ·{" "}
-          {processJoin?.kind ?? "unavailable"}
-          {processJoin === undefined ? "" : ` · ${processJoin.provenance}`}
+          {processJoin === undefined
+            ? t("relation.kind.unavailable.label")
+            : t("relation.activityProcess.pid")}
         </span>
         <span
           className="activity-workspace__coverage"

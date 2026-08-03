@@ -44,9 +44,9 @@
           "left": "activity",
           "right": "process",
           "kind": "best_effort",
-          "fields": ["pid", "ts"],
-          "cardinality": "zero_or_one",
-          "provenance": "same_snapshot_pid_only"
+          "fields": ["pid"],
+          "cardinality": "zero_or_many",
+          "provenance": "pid"
         },
         {
           "left": "activity",
@@ -197,7 +197,7 @@
         {
           "code": "process_link",
           "type": "text",
-          "formula": "best_effort same-snapshot PID association",
+          "formula": "Activity and OS-process histories linked by PID",
           "lazy": false,
           "requires": ["activity", "process"],
           "availability": "gated",

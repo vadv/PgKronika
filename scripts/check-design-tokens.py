@@ -48,7 +48,12 @@ def violations(path: Path) -> list[str]:
                 out.append(
                     f"{path.relative_to(ROOT)}:{lineno}: off-grid {match.group(0)}"
                 )
-        for word in re.findall(r"\b[A-Za-z]+\b", line):
+        # In CSS, inspect the declaration value rather than the property name:
+        # `white-space` is layout syntax, not the named color `white`.
+        named_color_source = line
+        if path.suffix == ".css" and ":" in line:
+            named_color_source = line.split(":", 1)[1]
+        for word in re.findall(r"\b[A-Za-z]+\b", named_color_source):
             if word in NAMED_COLORS and word not in SAFE_KEYWORDS:
                 out.append(f"{path.relative_to(ROOT)}:{lineno}: named color {word}")
     return out

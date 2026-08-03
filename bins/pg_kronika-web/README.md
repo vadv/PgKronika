@@ -372,15 +372,16 @@ retained data, and always uploads the stand diagnostics. It has no automatic
   timestamps did not advance or the scalar kinds were inconsistent.
 - The catalog and related-entity provenance use the closed relation-kind
   vocabulary `exact`, `lifetime`, `temporal`, `best_effort`, and `unavailable`.
-  `exact` proves every declared identity field; `lifetime` is valid only within
-  a proven process lifetime; `temporal` applies only at the declared snapshot;
-  `best_effort` is an attribution rather than identity proof; and `unavailable`
-  means the required evidence is absent. These are locale-neutral API values.
-- Activity OS metrics use `best_effort` enrichment from one unique OS-process
-  row with the same snapshot and PID. They do not compare PostgreSQL
-  `backend_start` with OS `starttime`; a missing or ambiguous PID candidate
-  leaves the enrichment empty. CPU and I/O deltas stay within the selected
-  OS-process `(pid, starttime)` lifetime, so PID reuse cannot bridge counters.
+  `exact` means every declared identity field is equal; `lifetime` is scoped to
+  one process lifetime; `temporal` applies only at the declared snapshot;
+  `best_effort` uses the available attribution fields; and `unavailable` means
+  the required fields are absent. These are locale-neutral API values.
+- Activity and OS-process histories link whenever their PID is the same. All
+  retained same-PID process rows are returned as related entities, including
+  rows across collection gaps. Scalar OS enrichment still needs one current
+  candidate; ambiguous candidates leave only those scalar cells empty. CPU and
+  I/O deltas use `(pid, starttime)` internally so PID reuse cannot bridge
+  counters, but `starttime` never suppresses the visible PID link.
 - Statement-to-plan links are fork-specific `best_effort` attribution, not
   cross-extension identity. OSSC uses `queryid`, `dbid`, and `userid`; the vadv
   fork uses `queryid_stat_statements`, `dbid`, and `userid`. The emitted

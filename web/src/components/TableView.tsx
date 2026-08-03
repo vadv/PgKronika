@@ -29,8 +29,12 @@ import type {
 import { TemporalBucketRow } from "./TemporalBucketRow";
 
 export interface TimeMatrixColumn {
-  kind?: "statements" | "activity" | "plans";
-  evidenceMode?: "point_samples" | "interval_estimates" | "plan_intervals";
+  kind?: "statements" | "activity" | "plans" | "processes";
+  evidenceMode?:
+    | "point_samples"
+    | "interval_estimates"
+    | "plan_intervals"
+    | "process_intervals";
   data: HeatmapResponse | undefined;
   pending: boolean;
   error: boolean;
@@ -80,6 +84,7 @@ const ROW_OVERSCAN = 5;
 const FALLBACK_VIEWPORT_HEIGHT = 650;
 const STATEMENT_IDENTITY_COLUMNS = new Set(["queryid", "database", "user"]);
 const PLAN_IDENTITY_COLUMNS = new Set(["planid", "queryid"]);
+const PROCESS_IDENTITY_COLUMNS = new Set(["pid", "type"]);
 const ACTIVITY_IDENTITY_COLUMNS = new Set([
   "pid",
   "database",
@@ -388,9 +393,11 @@ function TableViewImpl(props: TableViewProps) {
   const matrixKind = timeMatrix?.kind ?? "statements";
   const activityMatrixMode = timeMatrixMode && matrixKind === "activity";
   const plansMatrixMode = timeMatrixMode && matrixKind === "plans";
+  const processesMatrixMode = timeMatrixMode && matrixKind === "processes";
   const matrixClass = `${matrixKind}-time-matrix`;
+  const matrixNamespace = processesMatrixMode ? "host" : matrixKind;
   const matrixLoadError = timeMatrix?.error
-    ? t(`${matrixKind}.matrix.loadError`)
+    ? t(`${matrixNamespace}.matrix.loadError`)
     : null;
   const matrixIdentityClass = `${matrixClass}__identity`;
   const matrixTimelineClass = `${matrixClass}__timeline`;
@@ -399,7 +406,9 @@ function TableViewImpl(props: TableViewProps) {
     ? ACTIVITY_IDENTITY_COLUMNS
     : plansMatrixMode
       ? PLAN_IDENTITY_COLUMNS
-      : STATEMENT_IDENTITY_COLUMNS;
+      : processesMatrixMode
+        ? PROCESS_IDENTITY_COLUMNS
+        : STATEMENT_IDENTITY_COLUMNS;
   const rowHeight = activityMatrixMode
     ? ACTIVITY_MATRIX_ROW_HEIGHT
     : timeMatrixMode
@@ -585,7 +594,9 @@ function TableViewImpl(props: TableViewProps) {
                           ? "pid"
                           : plansMatrixMode
                             ? "planid"
-                            : "queryid",
+                            : processesMatrixMode
+                              ? "pid"
+                              : "queryid",
                       )
                     }
                     style={{
@@ -600,13 +611,17 @@ function TableViewImpl(props: TableViewProps) {
                       ? t("activity.matrix.identity")
                       : plansMatrixMode
                         ? t("plans.matrix.identity")
-                        : t("statements.matrix.identity")}
+                        : processesMatrixMode
+                          ? t("host.matrix.identity")
+                          : t("statements.matrix.identity")}
                     {sortArrow(
                       activityMatrixMode
                         ? "pid"
                         : plansMatrixMode
                           ? "planid"
-                          : "queryid",
+                          : processesMatrixMode
+                            ? "pid"
+                            : "queryid",
                     )}
                   </button>
                 </th>
@@ -727,9 +742,11 @@ function TableViewImpl(props: TableViewProps) {
                         )
                       : plansMatrixMode
                         ? t("plans.matrix.heatmap", { count: bucketCount })
-                        : t("statements.matrix.heatmap", {
-                            count: bucketCount,
-                          })}
+                        : processesMatrixMode
+                          ? t("host.matrix.heatmap", { count: bucketCount })
+                          : t("statements.matrix.heatmap", {
+                              count: bucketCount,
+                            })}
                   </span>
                   <span className={`${matrixClass}__metric`}>
                     {timeMatrix.metricLabel}
@@ -838,7 +855,9 @@ function TableViewImpl(props: TableViewProps) {
                               ? "pid"
                               : plansMatrixMode
                                 ? "planid"
-                                : "queryid"),
+                                : processesMatrixMode
+                                  ? "pid"
+                                  : "queryid"),
                         ) ?? identityColumns[0];
                       if (primary === undefined) return null;
                       const primaryValue: FrameValue =
@@ -852,7 +871,9 @@ function TableViewImpl(props: TableViewProps) {
                             row.cells[cellIndex] ?? null;
                           return {
                             display: formatCellValue(value, column, t),
-                            full: fullCellValue(value, column),
+                            full:
+                              fullCellValue(value, column) ??
+                              formatCellValue(value, column, t),
                           };
                         })
                         .filter(({ display }) => display !== "—");
@@ -861,7 +882,12 @@ function TableViewImpl(props: TableViewProps) {
                           className={matrixIdentityClass}
                           title={
                             [
-                              fullCellValue(primaryValue, primary.column),
+                              fullCellValue(primaryValue, primary.column) ??
+                                formatCellValue(
+                                  primaryValue,
+                                  primary.column,
+                                  t,
+                                ),
                               ...secondary.map(({ full }) => full),
                             ]
                               .filter(Boolean)
@@ -963,7 +989,9 @@ function TableViewImpl(props: TableViewProps) {
                             ? (timeMatrix?.evidenceMode ?? "point_samples")
                             : plansMatrixMode
                               ? "plan_intervals"
-                              : "range"
+                              : processesMatrixMode
+                                ? "process_intervals"
+                                : "range"
                         }
                       />
                     </td>

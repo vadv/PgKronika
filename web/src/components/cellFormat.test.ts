@@ -52,21 +52,19 @@ test("severity and category codes route through the dictionary", () => {
   expect(fullCellValue("plain", { code: "query", type: "text" })).toBeNull();
 });
 
-test("process_link renders the localized relation kind, machine form in tooltip", () => {
+test("process_link renders the direct PID link, machine form in tooltip", () => {
   const column = { code: "process_link", type: "text" };
   const dict: Record<string, string> = {
-    "relation.kind.best_effort.label": "приблизительная",
+    "relation.kind.pid.label": "Связано по PID",
   };
   const localized = ((key: string, opts?: Record<string, unknown>) =>
     dict[key] ??
     (opts?.defaultValue as string | undefined) ??
     key) as TFunction<"translation", undefined>;
-  expect(formatCellValue("best_effort", column, localized)).toBe(
-    "приблизительная",
-  );
+  expect(formatCellValue("pid", column, localized)).toBe("Связано по PID");
   // Missing dictionary falls back to the honest machine code, never blank.
-  expect(formatCellValue("best_effort", column, t)).toBe("best_effort");
-  expect(fullCellValue("best_effort", column)).toBe("best_effort");
+  expect(formatCellValue("pid", column, t)).toBe("pid");
+  expect(fullCellValue("pid", column)).toBe("pid");
 });
 
 test("numeric cells honor the catalog unit", () => {

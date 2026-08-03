@@ -128,7 +128,7 @@ export function Toolbar(props: ToolbarProps) {
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
-            props.onFilter(draft.trim() || null);
+            props.onFilter(e.currentTarget.value.trim() || null);
           }
         }}
         style={{ ...input, minWidth: "220px", marginInlineStart: "4px" }}

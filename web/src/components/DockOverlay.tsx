@@ -1012,6 +1012,9 @@ function RowDock(props: {
                   </div>
                 )}
                 {data.related.map((relation) => {
+                  const activityProcess =
+                    relation.relation === "activity_process" &&
+                    relation.provenance.method === "pid";
                   const kind = relationKindLabel(t, relation.provenance.kind);
                   const kindDesc = relationKindDesc(
                     t,
@@ -1050,21 +1053,34 @@ function RowDock(props: {
                       }}
                     >
                       <strong>{relation.relation}</strong>
-                      <span
-                        style={{
-                          display: "block",
-                          color: "var(--fg-dim)",
-                          fontFamily: "var(--mono-font)",
-                          fontSize: "var(--text-xs)",
-                        }}
-                      >
-                        {kind} · {relation.provenance.method} ·{" "}
-                        {relation.provenance.fields.join(", ")}
-                      </span>
-                      {kindDesc !== null && (
-                        <span style={{ color: "var(--fg-dim)" }}>
-                          {kindDesc}
+                      {activityProcess ? (
+                        <span
+                          style={{
+                            display: "block",
+                            color: "var(--accent-strong)",
+                          }}
+                        >
+                          {t("relation.activityProcess.pid")}
                         </span>
+                      ) : (
+                        <>
+                          <span
+                            style={{
+                              display: "block",
+                              color: "var(--fg-dim)",
+                              fontFamily: "var(--mono-font)",
+                              fontSize: "var(--text-xs)",
+                            }}
+                          >
+                            {kind} · {relation.provenance.method} ·{" "}
+                            {relation.provenance.fields.join(", ")}
+                          </span>
+                          {kindDesc !== null && (
+                            <span style={{ color: "var(--fg-dim)" }}>
+                              {kindDesc}
+                            </span>
+                          )}
+                        </>
                       )}
                     </button>
                   );

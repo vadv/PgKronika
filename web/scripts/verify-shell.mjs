@@ -990,12 +990,15 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     activityFailures.push(`row sample buckets ${activity.sampleBuckets}`);
   if (!activity.pointEvidence.includes("Short queries"))
     activityFailures.push("point-snapshot sampling caveat is missing");
-  if (!activity.processProvenance.includes("same_snapshot_pid_only"))
+  if (
+    !/linked by PID/i.test(activity.processProvenance) ||
+    /best[_ ]effort/i.test(activity.processProvenance)
+  )
     activityFailures.push(
       `process provenance is incomplete: ${activity.processProvenance}`,
     );
-  if (!/best[- ]effort/i.test(activity.processCaveat))
-    activityFailures.push("process attribution caveat is missing");
+  if (!/linked by PID/i.test(activity.processCaveat))
+    activityFailures.push("PID link explanation is missing");
   if (
     !activity.gated.includes("Memory") ||
     !activity.gated.includes("XID / Horizon")
@@ -1132,8 +1135,8 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     (element) => element.textContent ?? "",
   );
   if (
-    !processRelation.includes("same_snapshot_unique_pid") ||
-    !/best[_ ]effort/.test(processRelation)
+    !processRelation.includes("Linked by PID") ||
+    /best[_ ]effort/.test(processRelation)
   ) {
     throw new Error(`Activity process provenance: ${processRelation}`);
   }
@@ -1404,23 +1407,94 @@ function assertInfrastructureGeometry(name, geometry) {
   }
 }
 
+async function osWorkspaceGeometry(page) {
+  const geometry = await page.evaluate(() => {
+    const workspace = document.querySelector('[data-testid="os-workspace"]');
+    const host = document.querySelector(
+      '[data-testid="host-pressure-evidence"][data-view="processes"]',
+    );
+    const global = document.querySelector(
+      '[data-shell-region="global-context"]',
+    );
+    const health = document.querySelector('[data-shell-region="health-line"]');
+    if (
+      !(workspace instanceof HTMLElement) ||
+      !(host instanceof HTMLElement) ||
+      !(global instanceof HTMLElement) ||
+      !(health instanceof HTMLElement)
+    ) {
+      throw new Error("OS process workspace is incomplete");
+    }
+    const workspaceRect = workspace.getBoundingClientRect();
+    const hostRect = host.getBoundingClientRect();
+    const matrixRows = document.querySelectorAll(
+      ".processes-time-matrix__timeline-cell",
+    ).length;
+    const signalLanes = [...document.querySelectorAll(".os-host-signal")];
+    return {
+      rootHeight: document.documentElement.scrollHeight,
+      scrollY: window.scrollY,
+      globalHeight: global.getBoundingClientRect().height,
+      healthHeight: health.getBoundingClientRect().height,
+      hostInside:
+        hostRect.top >= workspaceRect.top &&
+        hostRect.bottom <= workspaceRect.bottom,
+      signalLanes: signalLanes.length,
+      signalBuckets: signalLanes.map(
+        (lane) => lane.querySelectorAll("meter").length,
+      ),
+      matrixRows,
+      hostText: host.textContent ?? "",
+      selectedMetric:
+        document
+          .querySelector('.os-workspace__metric[aria-pressed="true"]')
+          ?.textContent?.trim() ?? "",
+    };
+  });
+  geometry.heatmapBuckets = await heatmapBucketsFor(page, "processes");
+  return geometry;
+}
+
+function assertOsWorkspaceGeometry(geometry) {
+  const failures = [];
+  if (geometry.rootHeight > 1080)
+    failures.push(`root height ${geometry.rootHeight}`);
+  if (geometry.scrollY !== 0)
+    failures.push(`shell scroll offset ${geometry.scrollY}`);
+  if (geometry.globalHeight !== 44)
+    failures.push(`global region ${geometry.globalHeight}px`);
+  if (geometry.healthHeight !== 60)
+    failures.push(`Health line ${geometry.healthHeight}px`);
+  if (!geometry.hostInside) failures.push("host evidence escapes workspace");
+  if (geometry.signalLanes !== 2)
+    failures.push(`host signal lanes ${geometry.signalLanes}`);
+  if (geometry.signalBuckets.some((count) => count !== 24))
+    failures.push(`host signal buckets ${geometry.signalBuckets.join(",")}`);
+  if (geometry.matrixRows < 10)
+    failures.push(`process matrix rows ${geometry.matrixRows}`);
+  if (geometry.heatmapBuckets !== 96)
+    failures.push(`process heatmap buckets ${geometry.heatmapBuckets}`);
+  if (!/CPU/i.test(geometry.selectedMetric))
+    failures.push(`selected process metric ${geometry.selectedMetric}`);
+  if (failures.length > 0) {
+    throw new Error(`OS workspace: ${failures.join("; ")}`);
+  }
+}
+
 async function verifyInfrastructureWorkspaces(page, base, at) {
   await page.goto(
     `${base}/#source=local&view=processes&at=${at}&span=3600&preset=pressure`,
     { waitUntil: "networkidle0" },
   );
-  await page.waitForSelector(
-    '[data-testid="infrastructure-evidence-panel"][data-view="processes"]',
-    { timeout: 15_000 },
-  );
+  await page.waitForSelector('[data-testid="os-workspace"]', {
+    timeout: 15_000,
+  });
   await page.evaluate(() => window.scrollTo(0, 0));
-  const os = await infrastructureGeometry(page, "processes");
-  assertInfrastructureGeometry("OS", os);
+  const os = await osWorkspaceGeometry(page);
+  assertOsWorkspaceGeometry(os);
   if (
-    !os.panelText.includes("Load per CPU is runnable demand") ||
-    !os.panelText.includes("host values are not summed") ||
-    !os.gated.includes("Network") ||
-    !os.gated.includes("Filesystems")
+    !os.hostText.includes("Load per CPU is runnable demand") ||
+    !os.hostText.includes("host values are not summed")
   ) {
     throw new Error(`OS scope/gating contract: ${JSON.stringify(os)}`);
   }
@@ -1532,19 +1606,24 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
 
 async function eventGeometry(page) {
   const geometry = await page.evaluate(() => {
-    const center = document.querySelector(
-      '[data-testid="events-analytical-center"]',
+    const workspace = document.querySelector(
+      '[data-testid="events-workspace"]',
     );
+    const overview = document.querySelector(".events-workspace__overview");
+    const body = document.querySelector(".events-workspace__body");
     const panel = document.querySelector('[data-testid="events-signal-panel"]');
     const health = document.querySelector('[data-shell-region="health-line"]');
     if (
-      !(center instanceof HTMLElement) ||
+      !(workspace instanceof HTMLElement) ||
+      !(overview instanceof HTMLElement) ||
+      !(body instanceof HTMLElement) ||
       !(panel instanceof HTMLElement) ||
       !(health instanceof HTMLElement)
     ) {
-      throw new Error("Events analytical shell is incomplete");
+      throw new Error("Events range workspace is incomplete");
     }
-    const centerRect = center.getBoundingClientRect();
+    const overviewRect = overview.getBoundingClientRect();
+    const bodyRect = body.getBoundingClientRect();
     const panelRect = panel.getBoundingClientRect();
     const lanes = [
       ...panel.querySelectorAll('[data-testid="event-signal-lane"]'),
@@ -1558,13 +1637,22 @@ async function eventGeometry(page) {
       rootHeight: document.documentElement.scrollHeight,
       scrollY: window.scrollY,
       healthHeight: health.getBoundingClientRect().height,
-      centerHeight: centerRect.height,
+      overviewHeight: overviewRect.height,
       panelInside:
-        panelRect.top >= centerRect.top &&
-        panelRect.bottom <= centerRect.bottom,
+        panelRect.top >= overviewRect.top &&
+        panelRect.bottom <= overviewRect.bottom,
+      bodyInside:
+        bodyRect.top >= workspace.getBoundingClientRect().top &&
+        bodyRect.bottom <= workspace.getBoundingClientRect().bottom,
       lastLaneInside:
         lastLane === undefined || lastLane.bottom <= panelRect.bottom,
       lanes: lanes.length,
+      rangeRows: document.querySelectorAll('[data-testid="event-range-row"]')
+        .length,
+      families: document.querySelectorAll(".event-family").length,
+      eventDensityBuckets: document.querySelectorAll(
+        '[data-testid="spine-event-density"]',
+      ).length,
       quality:
         document.querySelector('[data-testid="event-signals-quality"]')
           ?.textContent ?? "",
@@ -1584,14 +1672,23 @@ function assertEventsGeometry(name, geometry) {
   if (geometry.scrollY !== 0) failures.push(`scrollY ${geometry.scrollY}`);
   if (geometry.healthHeight !== 60)
     failures.push(`Health line ${geometry.healthHeight}px`);
-  if (geometry.centerHeight !== 156)
-    failures.push(`analytical center ${geometry.centerHeight}px`);
-  if (!geometry.panelInside) failures.push("Signals escapes analytical center");
+  if (geometry.overviewHeight !== 156)
+    failures.push(`events overview ${geometry.overviewHeight}px`);
+  if (!geometry.panelInside) failures.push("Signals escapes events overview");
+  if (!geometry.bodyInside) failures.push("Events body escapes workspace");
   if (!geometry.lastLaneInside) failures.push("last Signal lane is clipped");
   if (geometry.lanes < 1 || geometry.lanes > 6)
     failures.push(`Signal lanes ${geometry.lanes}, expected 1..6`);
   if (geometry.heatmapBuckets !== 96)
     failures.push(`heatmap buckets ${geometry.heatmapBuckets}`);
+  if (geometry.rangeRows < 1)
+    failures.push(`selected-range rows ${geometry.rangeRows}`);
+  if (geometry.families < 1)
+    failures.push(`event families ${geometry.families}`);
+  if (geometry.eventDensityBuckets < 1 || geometry.eventDensityBuckets > 48)
+    failures.push(
+      `Health event density buckets ${geometry.eventDensityBuckets}, expected 1..48`,
+    );
   if (
     !geometry.quality.includes("partial") ||
     !geometry.quality.includes("lower_bound")
@@ -1645,17 +1742,19 @@ async function verifyEventsWorkspace(page, base, at) {
 
   const desktop = await eventGeometry(page);
   assertEventsGeometry("Events 1920x1080", desktop);
-  const eventRequest = await page.evaluate(() =>
+  const eventRequests = await page.evaluate(() =>
     performance
       .getEntriesByType("resource")
       .map((entry) => entry.name)
-      .find((name) => name.includes("/v1/timeline/events")),
+      .filter((name) => name.includes("/v1/timeline/events")),
   );
-  if (
-    eventRequest === undefined ||
-    new URL(eventRequest).searchParams.get("limit") !== "50"
-  ) {
-    throw new Error(`Events request is not bounded: ${String(eventRequest)}`);
+  const eventLimits = eventRequests.map((request) =>
+    new URL(request).searchParams.get("limit"),
+  );
+  if (!eventLimits.includes("50") || !eventLimits.includes("200")) {
+    throw new Error(
+      `Events range and Signals requests are not bounded: ${eventLimits.join(",")}`,
+    );
   }
   await page.screenshot({ path: EVENTS_SHOT });
 
@@ -1664,24 +1763,18 @@ async function verifyEventsWorkspace(page, base, at) {
     () => location.hash.includes("preset=checkpoints"),
     { timeout: 5_000 },
   );
-  await page.waitForFunction(
-    () =>
-      performance
-        .getEntriesByType("resource")
-        .some(
-          (entry) =>
-            entry.name.includes("/v1/frame/events") &&
-            new URL(entry.name).searchParams.get("q") ===
-              "category_code=pg.checkpoint.*",
-        ),
-    { timeout: 5_000 },
-  );
   const checkpointLanes = await page.$$eval(
     '[data-testid="event-signal-lane"]',
     (lanes) => lanes.length,
   );
   if (checkpointLanes !== 2)
     throw new Error(`checkpoint Signal lanes ${checkpointLanes}, expected 2`);
+  const checkpointRows = await page.$$eval(
+    '[data-testid="event-range-row"]',
+    (rows) => rows.length,
+  );
+  if (checkpointRows !== 2)
+    throw new Error(`checkpoint range rows ${checkpointRows}, expected 2`);
 
   await page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1 });
   await page.goto(
@@ -1716,8 +1809,10 @@ async function verifyEventsWorkspace(page, base, at) {
   return {
     desktop,
     compact,
-    eventRequest,
+    eventRequests,
+    eventLimits,
     checkpointLanes,
+    checkpointRows,
     skipFocused,
     mainFocused,
     investigationHash,

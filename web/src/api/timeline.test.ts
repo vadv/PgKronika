@@ -2,7 +2,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
-import { makeEventsResponse, makeHealthResponse } from "../testkit/apiFixtures";
+import {
+  makeEventFact,
+  makeEventsResponse,
+  makeHealthResponse,
+} from "../testkit/apiFixtures";
 import { useTimelineEvents, useTimelineHealth } from "./timeline";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -70,5 +74,58 @@ test("useTimelineEvents builds query with limit", async () => {
   expect(url.pathname + url.search).toBe(
     "/v1/timeline/events?from=0&to=86400000000&limit=100",
   );
-  expect(result.current.data).toEqual(body);
+  expect(result.current.data).toEqual({
+    ...body,
+    fetched_pages: 1,
+    truncated: false,
+  });
+});
+
+test("useTimelineEvents follows a bounded event cursor when maxPages is requested", async () => {
+  const first = makeEventsResponse({
+    events: [makeEventFact({ event_instance_id: "event-1" })],
+    next_cursor: "cursor-2",
+  });
+  const second = makeEventsResponse({
+    events: [makeEventFact({ event_instance_id: "event-2" })],
+    next_cursor: null,
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(first), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(second), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+  );
+  const { result } = renderHook(
+    () =>
+      useTimelineEvents({
+        from: "0",
+        to: "86400000000",
+        limit: 50,
+        maxPages: 4,
+      }),
+    { wrapper },
+  );
+
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  expect(
+    result.current.data?.events.map((event) => event.event_instance_id),
+  ).toEqual(["event-1", "event-2"]);
+  expect(result.current.data?.next_cursor).toBeNull();
+  const calls = vi
+    .mocked(fetch)
+    .mock.calls.map(([input]) => new URL((input as Request).url));
+  expect(calls).toHaveLength(2);
+  expect(calls[1]?.searchParams.get("cursor")).toBe("cursor-2");
 });

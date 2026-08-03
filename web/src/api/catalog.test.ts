@@ -22,8 +22,9 @@ test("demo catalog preserves the current relation provenance contract", () => {
   expect(fixture.revision).toBe(4);
   expect(processJoin).toMatchObject({
     kind: "best_effort",
-    fields: ["pid", "ts"],
-    provenance: "same_snapshot_pid_only",
+    fields: ["pid"],
+    cardinality: "zero_or_many",
+    provenance: "pid",
   });
   expect(activity?.columns.map((column) => column.code)).toEqual(
     expect.arrayContaining([

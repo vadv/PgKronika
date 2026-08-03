@@ -151,8 +151,9 @@ fn catalog_serializes_relation_quality_without_promoting_pid_only_evidence() {
         .expect("process to cgroup join");
 
     assert_eq!(activity_join["kind"], "best_effort");
-    assert_eq!(activity_join["fields"], json!(["pid", "ts"]));
-    assert_eq!(activity_join["provenance"], "same_snapshot_pid_only");
+    assert_eq!(activity_join["fields"], json!(["pid"]));
+    assert_eq!(activity_join["cardinality"], "zero_or_many");
+    assert_eq!(activity_join["provenance"], "pid");
     assert_eq!(replication_join["kind"], "temporal");
     assert_eq!(vacuum_join["kind"], "temporal");
     assert_eq!(process_cgroup_join["kind"], "exact");
