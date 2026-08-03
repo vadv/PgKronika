@@ -280,7 +280,7 @@ npm --prefix web run verify:shell
 make web-frontend-check
 make web-bundle-budget
 npm --prefix web run build
-make web-dist
+make web-frontend
 tar -tzf bins/pg_kronika-web/static.tar.gz
 git status --short
 ```

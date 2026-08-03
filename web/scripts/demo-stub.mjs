@@ -690,9 +690,14 @@ const STMT_DATABASES = ["orders", "orders", "billing", "analytics"];
 const STMT_USERS = ["app_rw", "app_rw", "billing_job", "report"];
 
 function rowsStatements() {
-  return QUERIES.map(([qid], i) => {
-    const calls = 12_400_000 - i * 912_000;
-    const total = r2(8_420_000 - i * 588_000);
+  // A production pg_stat_statements population is commonly O(1000). Keep
+  // that density in the deterministic demo so the viewport contract proves
+  // an independently scrolling ranked matrix instead of a twelve-row toy.
+  return Array.from({ length: 1000 }, (_, i) => {
+    const [baseQueryId] = QUERIES[i % QUERIES.length];
+    const qid = baseQueryId + i * 10_007;
+    const calls = Math.max(100, Math.round(12_400_000 * Math.exp(-i / 160)));
+    const total = r2(Math.max(1, 8_420_000 * Math.exp(-i / 130)));
     const mean = r2(total / Math.max(calls / 1000, 1));
     const cls = [];
     if (i < 2) {
@@ -722,13 +727,13 @@ function rowsStatements() {
         total,
         ms_per_row: r2(0.42 + i * 0.18),
         mean,
-        time_pct: r2(31.5 - i * 2.6),
+        time_pct: r2(31.5 * Math.exp(-i / 45)),
         plan_time_pct: i === 7 ? null : r2(1.2 + (i % 4) * 0.8),
         rows: Math.round(calls * (0.8 + (i % 3) * 2.2)),
         hit_pct: r2(99.4 - i * 0.7),
         blks_read: Math.round(420_000 + i * 88_000),
         temp_written: i % 4 === 3 ? Math.round(12_000 + i * 900) : 0,
-        wal_bytes: Math.round(8_800_000 - i * 420_000),
+        wal_bytes: Math.max(0, Math.round(8_800_000 * Math.exp(-i / 120))),
       },
       cls,
     };

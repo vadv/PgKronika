@@ -97,6 +97,19 @@ test("renders frame rows once loaded and reports the matched count", async () =>
   await waitFor(() => expect(onMatched).toHaveBeenCalledWith(1));
 });
 
+test("exposes a bounded ranked matrix with an independent scroll body", async () => {
+  stubFrame(frameBody());
+  renderTable();
+  await waitFor(() => expect(screen.getByText("select 1")).toBeDefined());
+
+  const matrix = document.querySelector('[data-shell-region="ranked-matrix"]');
+  const body = screen.getByTestId("ranked-matrix-body");
+  expect(matrix).not.toBeNull();
+  expect(body.style.minHeight).toBe("0");
+  expect(body.style.overflow).toBe("auto");
+  expect(body.querySelector("table")).not.toBeNull();
+});
+
 test("sort header click cycles desc, asc, cleared", async () => {
   const onSort = vi.fn();
   stubFrame(frameBody());

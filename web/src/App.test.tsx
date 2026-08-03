@@ -275,6 +275,24 @@ test("renders the shell regions from fixtures", async () => {
   expect(screen.getByRole("contentinfo").dataset.shellRegion).toBe("status");
 });
 
+test("marks every desktop analytical boundary for bounded viewport layout", async () => {
+  renderApp();
+  await waitFor(() =>
+    expect(screen.getByRole("table", { name: "activity" })).toBeDefined(),
+  );
+
+  const content = screen.getByTestId("desktop-forensic-content");
+  expect(content.dataset.layoutBoundary).toBe("analytical-content");
+  expect(content.style.minHeight).toBe("0");
+  expect(content.style.overflow).toBe("hidden");
+  expect(
+    document.querySelector('[data-shell-region="analytical-center"]'),
+  ).not.toBeNull();
+  expect(
+    document.querySelector('[data-shell-region="ranked-matrix"]'),
+  ).not.toBeNull();
+});
+
 test("mobile keeps incident triage in normal flow without permanent navigation", async () => {
   vi.stubGlobal(
     "matchMedia",

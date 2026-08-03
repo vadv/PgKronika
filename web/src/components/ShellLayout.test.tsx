@@ -33,6 +33,9 @@ test("provides semantic desktop header, navigation, main, and footer regions", (
   expect(header.style.height).toBe("44px");
   expect(navigation.style.height).toBe("32px");
   expect(footer.style.height).toBe("24px");
+  expect(main.style.overflow).toBe("hidden");
+  expect(main.style.display).toBe("flex");
+  expect(footer.tabIndex).toBe(0);
 });
 
 test("keeps mobile incident triage in normal document flow", () => {

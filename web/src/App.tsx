@@ -318,9 +318,13 @@ function Shell() {
       ) : (
         <div
           data-testid="desktop-forensic-content"
+          data-layout-boundary="analytical-content"
           style={{
             display: "flex",
             flexDirection: "column",
+            flex: "1 1 auto",
+            minHeight: 0,
+            overflow: "hidden",
             gap: "var(--space-2)",
             padding: "var(--space-2) var(--space-3)",
           }}
@@ -359,18 +363,26 @@ function Shell() {
             />
           )}
           {heatmapReady && (
-            <HeatmapStrip
-              view={activeView}
-              metric={
-                metricByView[activeView.code] ?? activeView.canonical_metric
-              }
-              from={heatmapRange.from}
-              to={heatmapRange.to}
-              onMetricChange={(m) =>
-                setMetricByView((prev) => ({ ...prev, [activeView.code]: m }))
-              }
-              onSelectEntity={(entity) => patch({ entity, dock: "row" })}
-            />
+            <div
+              data-shell-region="analytical-center"
+              style={{ flex: "0 0 auto", minHeight: 0 }}
+            >
+              <HeatmapStrip
+                view={activeView}
+                metric={
+                  metricByView[activeView.code] ?? activeView.canonical_metric
+                }
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                onMetricChange={(m) =>
+                  setMetricByView((prev) => ({
+                    ...prev,
+                    [activeView.code]: m,
+                  }))
+                }
+                onSelectEntity={(entity) => patch({ entity, dock: "row" })}
+              />
+            </div>
           )}
           {/* A gated view renders its availability reason, never an empty
               table — the tab may still be active from a shared link. */}
