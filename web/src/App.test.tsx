@@ -12,6 +12,7 @@ import {
   makeContextResponse,
   makeDataQualityResponse,
   makeEntityHistoryResponse,
+  makeEventFact,
   makeEventsResponse,
   makeFrameResponse,
   makeHealthResponse,
@@ -1268,4 +1269,199 @@ test("Vacuum defaults to point progress and discloses unsafe lifetime joins", as
       screen.getByRole("button", { name }).getAttribute("aria-disabled"),
     ).toBe("true");
   }
+});
+
+test("Events owns bounded Signals, a dense heatmap and machine-filtered family lenses", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=events&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const eventsView = availableCatalog.views.find(
+    (view) => view.code === "events",
+  );
+  if (eventsView !== undefined) {
+    eventsView.presets = [
+      "timeline",
+      "errors",
+      "checkpoints",
+      "vacuum",
+      "slow",
+      "collector_health",
+    ].map((code) => ({
+      code,
+      columns: [],
+      sort: { column: "time", order: "desc" as const },
+    }));
+  }
+  const timelineEvents = makeEventsResponse({
+    events: [
+      makeEventFact({
+        event_instance_id: "checkpoint-1",
+        event_kind: "pg.checkpoint.completed",
+        occurred_at_us: 1_722_400_000_000_123,
+        sort_ts_us: 1_722_400_000_000_123,
+      }),
+      makeEventFact({
+        event_instance_id: "error-1",
+        event_kind: "pg.log.error_group_observed",
+        occurred_at_us: 1_722_400_000_000_456,
+        sort_ts_us: 1_722_400_000_000_456,
+      }),
+    ],
+  });
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    const path = new URL(url).pathname;
+    if (path === "/v1/ui/catalog") {
+      return Promise.resolve(jsonResponse(availableCatalog));
+    }
+    if (path === "/v1/timeline/events") {
+      return Promise.resolve(jsonResponse(timelineEvents));
+    }
+    return baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("events-signal-panel")).toBeDefined();
+  expect(
+    screen
+      .getByRole("button", { name: /^eventTimeline$/i })
+      .getAttribute("aria-pressed"),
+  ).toBe("true");
+  expect(
+    screen
+      .getByRole("button", { name: /^eventConfigChanges /i })
+      .getAttribute("aria-disabled"),
+  ).toBe("true");
+  fireEvent.click(screen.getByRole("button", { name: /^eventCheckpoints$/i }));
+  expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBe(
+    "checkpoints",
+  );
+
+  await waitFor(() => {
+    const calls = fetchImpl.mock.calls.map(
+      ([input]) =>
+        new URL(
+          typeof input === "string"
+            ? input
+            : input instanceof Request
+              ? input.url
+              : input.href,
+        ),
+    );
+    expect(
+      calls.some(
+        (url) =>
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("view") === "events" &&
+          url.searchParams.get("buckets") === "96",
+      ),
+    ).toBe(true);
+    expect(
+      calls.some(
+        (url) =>
+          url.pathname === "/v1/frame/events" &&
+          url.searchParams.get("preset") === "checkpoints" &&
+          url.searchParams.get("q") === "category_code=pg.checkpoint.*",
+      ),
+    ).toBe(true);
+  });
+  expect(screen.getAllByTestId("event-signal-lane")).toHaveLength(1);
+  expect(
+    screen.getByTestId("event-signal-lane").getAttribute("data-event-instance"),
+  ).toBe("checkpoint-1");
+
+  const filter = screen.getByRole("searchbox", { name: "toolbar.filter" });
+  fireEvent.change(filter, {
+    target: { value: "severity_code=fatal" },
+  });
+  fireEvent.keyDown(filter, { key: "Enter" });
+  await waitFor(() => {
+    const frameCalls = fetchImpl.mock.calls
+      .map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      )
+      .filter((url) => url.pathname === "/v1/frame/events");
+    expect(frameCalls.at(-1)?.searchParams.get("q")).toBe(
+      "severity_code=fatal",
+    );
+  });
+});
+
+test("Event investigation routes by entity kind without reusing opaque timeline identity", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=events&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const eventsView = availableCatalog.views.find(
+    (view) => view.code === "events",
+  );
+  if (eventsView !== undefined) {
+    eventsView.presets = [
+      {
+        code: "timeline",
+        columns: [],
+        sort: { column: "time", order: "desc" as const },
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    const path = new URL(url).pathname;
+    if (path === "/v1/ui/catalog") {
+      return Promise.resolve(jsonResponse(availableCatalog));
+    }
+    if (path === "/v1/timeline/events") {
+      return Promise.resolve(
+        jsonResponse(
+          makeEventsResponse({
+            events: [
+              makeEventFact({
+                event_instance_id: "database-event",
+                event_kind: "pg.database.deadlock_delta",
+                occurred_at_us: 1_722_400_000_000_123,
+                sort_ts_us: 1_722_400_000_000_123,
+                entity: { kind: "database", id: "opaque-content-id" },
+              }),
+            ],
+          }),
+        ),
+      );
+    }
+    return baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  fireEvent.click(await screen.findByTestId("event-signal-lane"));
+  await waitFor(() => {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    expect(hash.get("view")).toBe("tables");
+    expect(hash.get("at")).toBe("1722400000000123");
+    expect(hash.get("entity")).toBeNull();
+    expect(hash.get("dock")).toBeNull();
+    expect(location.hash).not.toContain("opaque-content-id");
+  });
 });

@@ -40,6 +40,9 @@ test("enter applies the trimmed filter, blank clears it", () => {
   const onFilter = vi.fn();
   renderToolbar({ onFilter });
   const input = screen.getByRole("searchbox");
+  expect(input.getAttribute("name")).toBe("view-filter");
+  expect(input.getAttribute("autocomplete")).toBe("off");
+  expect(input.getAttribute("spellcheck")).toBe("false");
   fireEvent.change(input, { target: { value: "  active  " } });
   fireEvent.keyDown(input, { key: "Enter" });
   expect(onFilter).toHaveBeenCalledWith("active");

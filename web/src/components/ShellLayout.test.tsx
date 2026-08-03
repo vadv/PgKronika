@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { expect, test } from "vitest";
 import { ShellLayout } from "./ShellLayout";
 
@@ -9,6 +9,7 @@ function renderLayout(mobile = false) {
       globalContext={<span>global context</span>}
       primaryNavigation={mobile ? null : <span>primary navigation</span>}
       primaryNavigationLabel="Primary navigation"
+      skipToMainLabel="Skip to forensic content"
       status={<span>status context</span>}
     >
       <section>evidence</section>
@@ -36,6 +37,19 @@ test("provides semantic desktop header, navigation, main, and footer regions", (
   expect(main.style.overflow).toBe("hidden");
   expect(main.style.display).toBe("flex");
   expect(footer.tabIndex).toBe(0);
+  expect(
+    screen
+      .getByRole("link", { name: "Skip to forensic content" })
+      .getAttribute("href"),
+  ).toBe("#main-content");
+  expect(main.id).toBe("main-content");
+  expect(main.tabIndex).toBe(-1);
+  history.replaceState(null, "", "#view=events&at=1722400000000000");
+  fireEvent.click(
+    screen.getByRole("link", { name: "Skip to forensic content" }),
+  );
+  expect(document.activeElement).toBe(main);
+  expect(location.hash).toBe("#view=events&at=1722400000000000");
 });
 
 test("keeps mobile incident triage in normal document flow", () => {
