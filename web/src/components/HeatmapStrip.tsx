@@ -13,12 +13,18 @@ import { TipFormula, TipRow, Tooltip } from "./Tooltip";
  * same cut the color scale makes between heat-1 and heat-2. */
 const NORMAL_FRACTION = 0.4;
 
-function timePercent(value: string, from: string, to: string): number | null {
+function timePercent(
+  value: string,
+  from: string,
+  to: string,
+  clip: boolean,
+): number | null {
   try {
     const start = BigInt(from);
     const end = BigInt(to);
     if (end <= start) return null;
     const point = BigInt(value);
+    if (!clip && (point < start || point > end)) return null;
     const scaled = Number(((point - start) * 100_000n) / (end - start)) / 1000;
     return Math.min(100, Math.max(0, scaled));
   } catch {
@@ -214,26 +220,26 @@ export function HeatmapStrip(props: {
   const cursorPercent =
     props.cursorUs == null
       ? null
-      : timePercent(props.cursorUs, overlayFrom, overlayTo);
+      : timePercent(props.cursorUs, overlayFrom, overlayTo, false);
   const hoverPercent =
     props.hoverUs == null
       ? null
-      : timePercent(props.hoverUs, overlayFrom, overlayTo);
+      : timePercent(props.hoverUs, overlayFrom, overlayTo, false);
   const baselinePercent =
     props.baselineUs == null
       ? null
-      : timePercent(props.baselineUs, overlayFrom, overlayTo);
+      : timePercent(props.baselineUs, overlayFrom, overlayTo, false);
   const selectedStart = props.selectedRange
-    ? timePercent(props.selectedRange.fromUs, overlayFrom, overlayTo)
+    ? timePercent(props.selectedRange.fromUs, overlayFrom, overlayTo, true)
     : null;
   const selectedEnd = props.selectedRange
-    ? timePercent(props.selectedRange.toUs, overlayFrom, overlayTo)
+    ? timePercent(props.selectedRange.toUs, overlayFrom, overlayTo, true)
     : null;
   const brushStart = props.brushDraft
-    ? timePercent(props.brushDraft.fromUs, overlayFrom, overlayTo)
+    ? timePercent(props.brushDraft.fromUs, overlayFrom, overlayTo, true)
     : null;
   const brushEnd = props.brushDraft
-    ? timePercent(props.brushDraft.toUs, overlayFrom, overlayTo)
+    ? timePercent(props.brushDraft.toUs, overlayFrom, overlayTo, true)
     : null;
 
   // Density: quiet rows collapse into one-line summaries; loud rows keep

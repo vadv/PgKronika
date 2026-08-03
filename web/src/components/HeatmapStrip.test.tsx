@@ -169,10 +169,17 @@ test("shared time geometry aligns cursor, hover, brush, baseline and selected ra
   expect(screen.getByTestId("heatmap-brush-draft").style.width).toBe("50%");
 });
 
-test("invalid or out-of-window shared timestamps are clamped or omitted without changing query geometry", async () => {
-  renderStrip({ cursorUs: "9", hoverUs: "invalid", baselineUs: "-2" });
+test("out-of-window point markers are omitted while range overlays clip to the API grid", async () => {
+  renderStrip({
+    cursorUs: "9",
+    hoverUs: "invalid",
+    baselineUs: "-2",
+    brushDraft: { fromUs: "-2", toUs: "2" },
+  });
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
-  expect(screen.getByTestId("heatmap-cursor").style.left).toBe("100%");
-  expect(screen.getByTestId("heatmap-baseline").style.left).toBe("0%");
+  expect(screen.queryByTestId("heatmap-cursor")).toBeNull();
+  expect(screen.queryByTestId("heatmap-baseline")).toBeNull();
   expect(screen.queryByTestId("heatmap-hover-cursor")).toBeNull();
+  expect(screen.getByTestId("heatmap-brush-draft").style.left).toBe("0%");
+  expect(screen.getByTestId("heatmap-brush-draft").style.width).toBe("50%");
 });
