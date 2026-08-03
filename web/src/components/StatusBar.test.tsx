@@ -63,7 +63,7 @@ test("no notable counter when nothing is notable", () => {
   expect(screen.queryByTestId("notable-count")).toBeNull();
 });
 
-test("fixed strip reports mode, cursor range, baseline, quality and selection count", () => {
+test("fixed strip reports operator context without backend quality codes", () => {
   render(
     <StatusBar
       embedded
@@ -93,18 +93,19 @@ test("fixed strip reports mode, cursor range, baseline, quality and selection co
   expect(screen.getByTitle("1722400000000123")).toBeDefined();
   expect(strip.textContent).toContain("15 m");
   expect(strip.textContent).toContain("statusbar.baseline.present");
-  expect(strip.textContent).toContain("partial");
+  expect(screen.queryByTestId("statusbar-quality")).toBeNull();
+  expect(strip.textContent).not.toMatch(/partial|gaps|gated|quality/i);
   expect(strip.textContent).toContain("statusbar.selection: 1");
   expect(strip.style.height).toBe("100%");
   expect(strip.style.whiteSpace).toBe("nowrap");
 });
 
-test("live strip is honest when quality and selection are absent", () => {
+test("live strip keeps the operator context calm when summary is absent", () => {
   render(<StatusBar embedded state={state} summary={undefined} />);
   const strip = screen.getByTestId("statusbar-content");
   expect(strip.textContent).toContain("statusbar.mode.live");
   expect(strip.textContent).toContain("statusbar.cursor.latest");
   expect(strip.textContent).toContain("statusbar.baseline.none");
-  expect(strip.textContent).toContain("statusbar.quality.unknown");
+  expect(screen.queryByTestId("statusbar-quality")).toBeNull();
   expect(strip.textContent).toContain("statusbar.selection: 0");
 });

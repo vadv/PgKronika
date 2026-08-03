@@ -180,7 +180,7 @@ test("data chip shows unknown state without context, ok when complete", () => {
   );
 });
 
-test("data chip shows partial when gaps or gated present, click toggles", () => {
+test("data chip stays neutral when optional snapshots or sources are missing", () => {
   const onToggleDataHealth = vi.fn();
   renderHeader({
     onToggleDataHealth,
@@ -194,7 +194,9 @@ test("data chip shows partial when gaps or gated present, click toggles", () => 
     }),
   });
   const chip = screen.getByTestId("data-health-chip");
-  expect(chip.textContent).toContain("header.dataPartial");
+  expect(chip.textContent).toContain("header.dataOk");
+  expect(chip.dataset.tone).toBe("neutral");
+  expect(chip.textContent).not.toMatch(/partial|gaps|gated/i);
   fireEvent.click(chip);
   expect(onToggleDataHealth).toHaveBeenCalledTimes(1);
 });

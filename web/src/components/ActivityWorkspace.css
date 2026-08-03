@@ -9,12 +9,12 @@
 
 .activity-workspace__evidence {
   display: flex;
-  flex: 0 0 38px;
+  flex: 0 0 32px;
   align-items: center;
   gap: var(--space-3);
   min-width: 0;
-  height: 38px;
-  padding: var(--space-1) var(--space-2);
+  height: 32px;
+  padding: 3px var(--space-2);
   color: var(--fg-dim);
   font-family: var(--ui-font);
   font-size: var(--text-xs);
@@ -28,8 +28,7 @@
   display: flex;
   align-items: baseline;
   gap: var(--space-2);
-  min-width: 300px;
-  max-width: 540px;
+  flex: 0 0 auto;
   overflow: hidden;
   text-wrap: nowrap;
 }
@@ -39,11 +38,6 @@
   color: var(--fg-strong);
   text-transform: uppercase;
   letter-spacing: var(--tracking-caps);
-}
-
-.activity-workspace__snapshot span {
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .activity-workspace__metrics {
@@ -79,33 +73,28 @@
   color: var(--fg-strong);
 }
 
-.activity-workspace__provenance {
+.activity-workspace__process-link {
   min-width: 0;
   overflow: hidden;
   color: var(--accent-strong);
-  font-family: var(--mono-font);
   text-overflow: ellipsis;
   text-wrap: nowrap;
 }
 
-.activity-workspace__coverage {
+.activity-workspace__population {
   margin-inline-start: auto;
-  color: var(--sev-ok-fg);
+  color: var(--fg-dim);
   font-family: var(--mono-font);
   text-wrap: nowrap;
 }
 
-.activity-workspace__coverage:not([data-quality="complete"]) {
-  color: var(--sev-warn-fg);
-}
-
 .activity-lock-evidence {
   display: grid;
-  grid-template-columns: minmax(190px, 0.35fr) minmax(0, 1fr) auto;
-  flex: 0 0 72px;
+  grid-template-columns: minmax(150px, 0.22fr) minmax(0, 1fr);
+  flex: 0 0 54px;
   align-items: stretch;
   min-width: 0;
-  height: 72px;
+  height: 54px;
   color: var(--fg);
   background: var(--bg);
   border: 1px solid var(--border);
@@ -116,7 +105,6 @@
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 2px;
   padding: var(--space-2) var(--space-3);
   border-inline-end: 1px solid var(--border);
 }
@@ -126,7 +114,6 @@
   font-size: var(--text-sm);
 }
 
-.activity-lock-evidence__context span,
 .activity-lock-evidence__state {
   color: var(--fg-dim);
   font-family: var(--ui-font);
@@ -177,17 +164,6 @@
 
 .activity-lock-evidence__age {
   color: var(--sev-warn-fg);
-}
-
-.activity-lock-evidence__badge {
-  align-self: center;
-  margin-inline: var(--space-3);
-  color: var(--sev-warn-fg);
-  font-family: var(--mono-font);
-  font-size: var(--text-xs);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-caps);
-  text-wrap: nowrap;
 }
 
 .activity-lock-evidence__state {
