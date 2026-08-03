@@ -1035,3 +1035,236 @@ test("Plans owns change lanes, fork provenance and keeps Compare explicitly gate
     ).toBe(true);
   });
 });
+
+test("OS keeps host pressure separate from process rows and uses a dense range heatmap", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=processes&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const processes = availableCatalog.views.find(
+    (view) => view.code === "processes",
+  );
+  if (processes !== undefined) {
+    processes.presets = [
+      "pressure",
+      "cpu",
+      "memory",
+      "disk_io",
+      "cgroup",
+      "processes",
+      "data_quality",
+    ].map((code) => ({
+      code,
+      columns: [],
+      sort: { column: "metric", order: "desc" as const },
+    }));
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  const evidence = await screen.findByTestId("host-pressure-evidence");
+  expect(evidence.closest("aside")?.dataset.view).toBe("processes");
+  expect(
+    screen
+      .getByRole("button", { name: /^osPressure$/i })
+      .getAttribute("aria-pressed"),
+  ).toBe("true");
+  for (const name of [/^osNetwork /i, /^osFilesystems /i]) {
+    expect(
+      screen.getByRole("button", { name }).getAttribute("aria-disabled"),
+    ).toBe("true");
+  }
+
+  await waitFor(() => {
+    const calls = fetchImpl.mock.calls.map(
+      ([input]) =>
+        new URL(
+          typeof input === "string"
+            ? input
+            : input instanceof Request
+              ? input.url
+              : input.href,
+        ),
+    );
+    expect(
+      calls.some(
+        (url) =>
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("view") === "processes" &&
+          url.searchParams.get("buckets") === "96",
+      ),
+    ).toBe(true);
+    expect(
+      calls.some(
+        (url) =>
+          url.pathname === "/v1/timeline/spine" &&
+          url.searchParams.get("buckets") === "24",
+      ),
+    ).toBe(true);
+  });
+});
+
+test("Tables and Indexes expose same-snapshot context while unsupported analysis stays gated", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=tables&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const tables = availableCatalog.views.find((view) => view.code === "tables");
+  const indexes = availableCatalog.views.find(
+    (view) => view.code === "indexes",
+  );
+  if (tables !== undefined) {
+    tables.presets = [
+      "health",
+      "vacuum_risk",
+      "io",
+      "scan_pattern",
+      "size_growth",
+      "xid_mxid",
+    ].map((code) => ({
+      code,
+      columns: [],
+      sort: { column: "metric", order: "desc" as const },
+    }));
+    tables.joins = [
+      {
+        left: "tables",
+        right: "vacuum",
+        kind: "temporal",
+        fields: ["datid", "relid", "ts"],
+        cardinality: "zero_or_many",
+        provenance: "same_snapshot_database_relation_oid",
+      },
+    ];
+  }
+  if (indexes !== undefined) {
+    indexes.presets = [
+      "usage",
+      "io",
+      "size_growth",
+      "unused",
+      "table_context",
+    ].map((code) => ({
+      code,
+      columns: [],
+      sort: { column: "metric", order: "desc" as const },
+    }));
+    indexes.joins = [
+      {
+        left: "indexes",
+        right: "tables",
+        kind: "temporal",
+        fields: ["datid", "relid", "ts"],
+        cardinality: "zero_or_one",
+        provenance: "same_snapshot_database_relation_oid",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(
+    (await screen.findByTestId("infrastructure-evidence-panel")).dataset.view,
+  ).toBe("tables");
+  expect(
+    screen
+      .getByRole("button", { name: /^tableDependencies /i })
+      .getAttribute("aria-disabled"),
+  ).toBe("true");
+  fireEvent.click(screen.getByRole("tab", { name: /tabs\.indexes/i }));
+  expect(
+    (await screen.findByTestId("index-table-provenance")).textContent,
+  ).toContain("same_snapshot_database_relation_oid");
+  for (const name of [/^indexDuplication /i, /^indexInvalidBuild /i]) {
+    expect(
+      screen.getByRole("button", { name }).getAttribute("aria-disabled"),
+    ).toBe("true");
+  }
+});
+
+test("Vacuum defaults to point progress and discloses unsafe lifetime joins", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=vacuum&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const vacuum = availableCatalog.views.find((view) => view.code === "vacuum");
+  if (vacuum !== undefined) {
+    vacuum.presets = [
+      "progress",
+      "phase",
+      "dead_items",
+      "wraparound_context",
+    ].map((code) => ({
+      code,
+      columns: [],
+      sort: { column: "metric", order: "desc" as const },
+    }));
+    vacuum.joins = [
+      {
+        left: "vacuum",
+        right: "tables",
+        kind: "temporal",
+        fields: ["datid", "relid", "ts"],
+        cardinality: "zero_or_one",
+        provenance: "same_snapshot_database_relation_oid",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("vacuum-lifetime-warning")).toBeDefined();
+  expect(
+    screen
+      .getByRole("button", { name: /^vacuumProgress$/i })
+      .getAttribute("aria-pressed"),
+  ).toBe("true");
+  for (const name of [
+    /^vacuumThroughput /i,
+    /^vacuumBlockers /i,
+    /^vacuumHistory /i,
+  ]) {
+    expect(
+      screen.getByRole("button", { name }).getAttribute("aria-disabled"),
+    ).toBe("true");
+  }
+});

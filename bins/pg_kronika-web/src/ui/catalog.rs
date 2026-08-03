@@ -1785,6 +1785,19 @@ fn processes_view() -> ViewSpec {
         columns,
         vec![
             preset(
+                "pressure",
+                &[
+                    "pid",
+                    "type",
+                    "cpu",
+                    "rss",
+                    "read_bytes_per_second",
+                    "write_bytes_per_second",
+                ],
+                "cpu",
+                "desc",
+            ),
+            preset(
                 "cpu",
                 &[
                     "pid",
@@ -1830,6 +1843,12 @@ fn processes_view() -> ViewSpec {
                 &["pid", "type", "cpu", "rss", "threads", "cgroup", "command"],
                 "cpu",
                 "desc",
+            ),
+            preset(
+                "data_quality",
+                &["pid", "type", "cpu", "rss", "cgroup"],
+                "pid",
+                "asc",
             ),
         ],
     )
