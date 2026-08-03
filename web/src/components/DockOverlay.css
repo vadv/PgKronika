@@ -80,7 +80,7 @@
 }
 
 .entity-detail__tab {
-  min-height: 33px;
+  min-height: 34px;
   padding: 0 var(--space-2);
   color: var(--fg-dim);
   background: transparent;
@@ -112,7 +112,7 @@
   gap: var(--space-3);
   align-items: baseline;
   min-height: 30px;
-  padding: 5px var(--space-1);
+  padding: var(--space-1);
   border-block-end: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
 }
 
@@ -174,7 +174,7 @@
 .entity-detail__history-table th,
 .entity-detail__history-table td {
   min-height: 28px;
-  padding: 5px var(--space-2);
+  padding: var(--space-1) var(--space-2);
   border-block-end: 1px solid var(--border);
   text-align: start;
 }
