@@ -11,6 +11,8 @@ const OUT_DIR = fileURLToPath(new URL("../demo/shots/", import.meta.url));
 const REQUESTED_PORT = Number(process.env.PGK_SHELL_PORT ?? 0);
 const VIEWPORT = { width: 1920, height: 1080, deviceScaleFactor: 1 };
 const SUCCESS_SHOT = `${OUT_DIR}forensic-shell-1920x1080.png`;
+const ACTIVITY_SHOT = `${OUT_DIR}forensic-activity-1920x1080.png`;
+const PLANS_SHOT = `${OUT_DIR}forensic-plans-1920x1080.png`;
 const FAILURE_SHOT = `${OUT_DIR}forensic-shell-1920x1080-failure.png`;
 
 const chromeCandidates = [
@@ -802,6 +804,229 @@ async function verifyGlobalSearchDetail(page) {
   };
 }
 
+async function heatmapBucketsFor(page, view) {
+  return page.evaluate((viewCode) => {
+    const request = performance
+      .getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .find((name) => {
+        if (!name.includes("/v1/timeline/heatmap")) return false;
+        return new URL(name).searchParams.get("view") === viewCode;
+      });
+    return request === undefined
+      ? null
+      : Number(new URL(request).searchParams.get("buckets"));
+  }, view);
+}
+
+async function verifyActivityPlansWorkspaces(page, base, at) {
+  await page.goto(
+    `${base}/#source=local&view=activity&at=${at}&span=3600&preset=waits_locks`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector(
+    '[data-testid="workload-evidence-panel"][data-view="activity"]',
+    { timeout: 15_000 },
+  );
+  await page.waitForSelector('[data-testid="activity-lock-lanes"] button', {
+    timeout: 10_000,
+  });
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const activity = await page.evaluate(() => {
+    const center = document.querySelector(
+      '[data-testid="workload-analytical-center"]',
+    );
+    const panel = document.querySelector(
+      '[data-testid="workload-evidence-panel"][data-view="activity"]',
+    );
+    if (!(center instanceof HTMLElement) || !(panel instanceof HTMLElement)) {
+      throw new Error("Activity analytical center is incomplete");
+    }
+    const centerRect = center.getBoundingClientRect();
+    const panelRect = panel.getBoundingClientRect();
+    const lockLanes = [
+      ...panel.querySelectorAll('[data-testid="activity-lock-lanes"] button'),
+    ];
+    const lastLaneRect = lockLanes.at(-1)?.getBoundingClientRect();
+    const gated = [...document.querySelectorAll('button[aria-disabled="true"]')]
+      .map((button) => button.textContent?.trim() ?? "")
+      .filter(Boolean);
+    return {
+      rootHeight: document.documentElement.scrollHeight,
+      scrollY: window.scrollY,
+      centerHeight: centerRect.height,
+      panelInside:
+        panelRect.top >= centerRect.top &&
+        panelRect.bottom <= centerRect.bottom,
+      pointEvidence:
+        document.querySelector('[data-testid="activity-point-evidence"]')
+          ?.textContent ?? "",
+      lockLanes: lockLanes.length,
+      lastLaneInside:
+        lastLaneRect !== undefined && lastLaneRect.bottom <= panelRect.bottom,
+      gated,
+    };
+  });
+  activity.heatmapBuckets = await heatmapBucketsFor(page, "activity");
+  const activityFailures = [];
+  if (activity.rootHeight > 1080)
+    activityFailures.push(`root height ${activity.rootHeight}`);
+  if (activity.scrollY !== 0)
+    activityFailures.push(`shell scroll offset ${activity.scrollY}`);
+  if (activity.centerHeight !== 156)
+    activityFailures.push(`analytical center ${activity.centerHeight}`);
+  if (!activity.panelInside) activityFailures.push("panel escapes center");
+  if (activity.lockLanes < 1) activityFailures.push("no lock lanes");
+  if (!activity.lastLaneInside)
+    activityFailures.push("last lock lane is clipped");
+  if (!activity.pointEvidence.includes("Short queries"))
+    activityFailures.push("point-snapshot sampling caveat is missing");
+  if (
+    !activity.gated.includes("Memory") ||
+    !activity.gated.includes("XID / Horizon")
+  )
+    activityFailures.push(`gated lenses missing: ${activity.gated.join(", ")}`);
+  if (activity.heatmapBuckets !== 96)
+    activityFailures.push(`heatmap buckets ${activity.heatmapBuckets}`);
+  if (activityFailures.length > 0) {
+    throw new Error(`Activity workspace: ${activityFailures.join("; ")}`);
+  }
+  await page.screenshot({ path: ACTIVITY_SHOT });
+
+  await page.evaluate(() => {
+    const search = document.querySelector('input[type="search"]');
+    if (!(search instanceof HTMLInputElement)) {
+      throw new Error("Activity filter is missing");
+    }
+    const setValue = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    if (setValue === undefined) throw new Error("input setter missing");
+    setValue.call(search, "pid=12041");
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    search.focus();
+  });
+  await page.keyboard.press("Enter");
+  await page.waitForSelector('table[aria-label="activity"] tr[data-entity]', {
+    timeout: 10_000,
+  });
+  await page.click('table[aria-label="activity"] tr[data-entity]');
+  await page.waitForSelector('[data-dock="row"]', { timeout: 10_000 });
+  await page.click('[data-detail-tab-trigger="relationships"]');
+  await page.waitForFunction(
+    () =>
+      document
+        .querySelector('[data-dock="row"] [role="tabpanel"]')
+        ?.textContent?.includes("activity_process") === true,
+    { timeout: 5_000 },
+  );
+  const processRelation = await page.$eval(
+    '[data-dock="row"] [role="tabpanel"]',
+    (element) => element.textContent ?? "",
+  );
+  if (
+    !processRelation.includes("same_snapshot_unique_pid") ||
+    !/best[_ ]effort/.test(processRelation)
+  ) {
+    throw new Error(`Activity process provenance: ${processRelation}`);
+  }
+
+  await page.goto(
+    `${base}/#source=local&view=plans&at=${at}&span=3600&preset=change_timeline`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector(
+    '[data-testid="workload-evidence-panel"][data-view="plans"]',
+    { timeout: 15_000 },
+  );
+  await page.waitForSelector('[data-testid="plan-version-lanes"] button', {
+    timeout: 10_000,
+  });
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const plans = await page.evaluate(() => {
+    const panel = document.querySelector(
+      '[data-testid="workload-evidence-panel"][data-view="plans"]',
+    );
+    const center = document.querySelector(
+      '[data-testid="workload-analytical-center"]',
+    );
+    const global = document.querySelector(
+      '[data-shell-region="global-context"]',
+    );
+    const health = document.querySelector('[data-shell-region="health-line"]');
+    if (
+      !(panel instanceof HTMLElement) ||
+      !(center instanceof HTMLElement) ||
+      !(global instanceof HTMLElement) ||
+      !(health instanceof HTMLElement)
+    ) {
+      throw new Error("Plans shell regions are incomplete");
+    }
+    const panelRect = panel.getBoundingClientRect();
+    const centerRect = center.getBoundingClientRect();
+    const globalRect = global.getBoundingClientRect();
+    const healthRect = health.getBoundingClientRect();
+    const lanes = [
+      ...panel.querySelectorAll('[data-testid="plan-version-lanes"] button'),
+    ];
+    const lastLaneRect = lanes.at(-1)?.getBoundingClientRect();
+    const panelText = panel?.textContent ?? "";
+    const compare = [...document.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "Compare",
+    );
+    return {
+      rootHeight: document.documentElement.scrollHeight,
+      scrollY: window.scrollY,
+      globalHeight: globalRect.height,
+      globalTop: globalRect.top,
+      healthHeight: healthRect.height,
+      healthInsideViewport:
+        healthRect.top >= 0 && healthRect.bottom <= window.innerHeight,
+      centerHeight: centerRect.height,
+      panelInside:
+        panelRect.top >= centerRect.top &&
+        panelRect.bottom <= centerRect.bottom,
+      lanes: lanes.length,
+      lastLaneInside:
+        lastLaneRect !== undefined && lastLaneRect.bottom <= panelRect.bottom,
+      ossc: panelText.includes("ossc_queryid_dbid_userid_attribution"),
+      vadv: panelText.includes(
+        "vadv_queryid_stat_statements_dbid_userid_attribution",
+      ),
+      compareGated: compare?.getAttribute("aria-disabled") === "true",
+    };
+  });
+  plans.heatmapBuckets = await heatmapBucketsFor(page, "plans");
+  const plansFailures = [];
+  if (plans.rootHeight > 1080)
+    plansFailures.push(`root height ${plans.rootHeight}`);
+  if (plans.scrollY !== 0)
+    plansFailures.push(`shell scroll offset ${plans.scrollY}`);
+  if (plans.globalHeight !== 44 || plans.globalTop !== 0)
+    plansFailures.push(
+      `global region ${plans.globalHeight}px at ${plans.globalTop}px`,
+    );
+  if (plans.healthHeight !== 60 || !plans.healthInsideViewport)
+    plansFailures.push(`Health line ${plans.healthHeight}px outside viewport`);
+  if (plans.centerHeight !== 156 || !plans.panelInside)
+    plansFailures.push(`analytical center/panel geometry is invalid`);
+  if (plans.lanes < 1) plansFailures.push("no version lanes");
+  if (!plans.lastLaneInside) plansFailures.push("last plan lane is clipped");
+  if (!plans.ossc || !plans.vadv) plansFailures.push("fork provenance missing");
+  if (!plans.compareGated) plansFailures.push("Compare is not gated");
+  if (plans.heatmapBuckets !== 96)
+    plansFailures.push(`heatmap buckets ${plans.heatmapBuckets}`);
+  if (plansFailures.length > 0) {
+    throw new Error(`Plans workspace: ${plansFailures.join("; ")}`);
+  }
+  await page.screenshot({ path: PLANS_SHOT });
+  return {
+    activity: { ...activity, processRelationVerified: true },
+    plans,
+  };
+}
+
 function assertContract(metrics, keyboard) {
   const failures = [];
   const exactHeight = (name, expected) => {
@@ -952,14 +1177,17 @@ try {
       document.activeElement.blur();
   });
   await page.screenshot({ path: SUCCESS_SHOT });
+  const activityPlans = await verifyActivityPlansWorkspaces(page, base, at);
   console.log(
     `forensic shell PASS\n${JSON.stringify(
-      { ...metrics, keyboard, statements, globalSearchDetail },
+      { ...metrics, keyboard, statements, globalSearchDetail, activityPlans },
       null,
       2,
     )}`,
   );
   console.log(`approved screenshot: ${SUCCESS_SHOT}`);
+  console.log(`approved screenshot: ${ACTIVITY_SHOT}`);
+  console.log(`approved screenshot: ${PLANS_SHOT}`);
 } catch (error) {
   if (page !== undefined) {
     console.error(

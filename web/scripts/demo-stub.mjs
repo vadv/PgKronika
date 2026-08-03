@@ -73,6 +73,110 @@ for (const view of catalog.views) {
   }
 }
 
+const activityCatalog = catalog.views.find((view) => view.code === "activity");
+if (activityCatalog !== undefined) {
+  activityCatalog.capabilities.related = true;
+  activityCatalog.presets.push(
+    {
+      code: "overview",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "application",
+        "state",
+        "wait_event",
+        "query",
+        "query_duration_us",
+      ],
+      sort: { column: "query_duration_us", order: "desc" },
+    },
+    {
+      code: "waits_locks",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "state",
+        "wait_event",
+        "query",
+        "query_duration_us",
+      ],
+      sort: { column: "query_duration_us", order: "desc" },
+    },
+    {
+      code: "duration",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "query_duration_us",
+        "transaction_duration_us",
+        "query",
+      ],
+      sort: { column: "query_duration_us", order: "desc" },
+    },
+    {
+      code: "cpu",
+      columns: ["pid", "user", "database", "process_link", "cpu", "query"],
+      sort: { column: "cpu", order: "desc" },
+    },
+    {
+      code: "disk_io",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "process_link",
+        "read_bytes_per_second",
+        "write_bytes_per_second",
+        "query",
+      ],
+      sort: { column: "read_bytes_per_second", order: "desc" },
+    },
+    {
+      code: "sampling",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "state",
+        "wait_event",
+        "query_duration_us",
+        "query",
+      ],
+      sort: { column: "query_duration_us", order: "desc" },
+    },
+  );
+}
+
+const plansCatalog = catalog.views.find((view) => view.code === "plans");
+if (plansCatalog !== undefined) {
+  plansCatalog.joins.push(
+    {
+      left: "plans",
+      right: "statements",
+      kind: "best_effort",
+      fields: ["queryid", "dbid", "userid"],
+      cardinality: "many_to_one",
+      provenance: "ossc_queryid_dbid_userid_attribution",
+    },
+    {
+      left: "plans",
+      right: "statements",
+      kind: "best_effort",
+      fields: ["queryid_stat_statements", "dbid", "userid"],
+      cardinality: "many_to_one",
+      provenance: "vadv_queryid_stat_statements_dbid_userid_attribution",
+    },
+  );
+  plansCatalog.presets.push({
+    code: "change_timeline",
+    columns: ["planid", "queryid", "first_call", "last_call", "calls", "mean"],
+    sort: { column: "last_call", order: "desc" },
+  });
+}
+
 // --- summary ---------------------------------------------------------------
 
 // Populations per plan: activity..events in stable view_code order.
@@ -749,6 +853,7 @@ function rowsStatements() {
 }
 
 function rowsPlans() {
+  const now = nowUs();
   const shapes = [
     "Index Scan using orders_pkey on orders",
     "Bitmap Heap Scan on sessions",
@@ -777,6 +882,8 @@ function rowsPlans() {
         calls: 2_400_000 - i * 188_000,
         mean: r2(48_200 / (i + 1)),
         rows: Math.round(120_000 + i * 44_000),
+        first_call: String(now - (i + 4) * 900 * US),
+        last_call: String(now - i * 180 * US),
       },
       cls,
     };
@@ -910,18 +1017,81 @@ function rowsProcesses() {
 
 function rowsLocks() {
   const defs = [
-    [12055, "app / api-worker", "Lock:relation", "public.orders", 412_880_000],
-    [12107, "app / api-worker", "Lock:relation", "public.orders", 388_220_000],
-    [12120, "app / api-worker", "Lock:tuple", "public.orders", 204_440_000],
-    [12133, "etl / loader", "Lock:relation", "public.orders", 188_884_000],
-    [12146, "app / api-worker", "Lock:relation", "public.orders", 142_220_000],
-    [12159, "app / reports", "Lock:relation", "public.orders", 98_440_000],
-    [12172, "app / api-worker", "Lock:transactionid", null, 64_884_000],
-    [12185, "etl / reconciler", "Lock:relation", "public.sessions", 42_220_000],
-    [12198, "app / api-worker", "Lock:tuple", "public.orders", 18_884_000],
-    [12211, "app / api-worker", "Lock:relation", "public.job_queue", 4_220_000],
+    [
+      12055,
+      11991,
+      "app / api-worker",
+      "Lock:relation",
+      "public.orders",
+      412_880_000,
+    ],
+    [
+      12107,
+      12055,
+      "app / api-worker",
+      "Lock:relation",
+      "public.orders",
+      388_220_000,
+    ],
+    [
+      12120,
+      12055,
+      "app / api-worker",
+      "Lock:tuple",
+      "public.orders",
+      204_440_000,
+    ],
+    [
+      12133,
+      12107,
+      "etl / loader",
+      "Lock:relation",
+      "public.orders",
+      188_884_000,
+    ],
+    [
+      12146,
+      12107,
+      "app / api-worker",
+      "Lock:relation",
+      "public.orders",
+      142_220_000,
+    ],
+    [
+      12159,
+      12120,
+      "app / reports",
+      "Lock:relation",
+      "public.orders",
+      98_440_000,
+    ],
+    [12172, 12120, "app / api-worker", "Lock:transactionid", null, 64_884_000],
+    [
+      12185,
+      12133,
+      "etl / reconciler",
+      "Lock:relation",
+      "public.sessions",
+      42_220_000,
+    ],
+    [
+      12198,
+      12133,
+      "app / api-worker",
+      "Lock:tuple",
+      "public.orders",
+      18_884_000,
+    ],
+    [
+      12211,
+      12146,
+      "app / api-worker",
+      "Lock:relation",
+      "public.job_queue",
+      4_220_000,
+    ],
   ];
-  return defs.map(([pid, ua, lock, target, waitUs], i) => {
+  return defs.map(([pid, blocker, ua, lock, target, waitUs], i) => {
     const cls =
       waitUs > 120_000_000
         ? [
@@ -939,8 +1109,14 @@ function rowsLocks() {
       label: `${ua} on ${target ?? "xid"}`,
       data: {
         pid,
+        depth: i === 0 ? 1 : 2,
+        root_pid: 11991,
+        blocked_by: String(blocker),
         user_application: ua,
         lock,
+        granted: false,
+        lock_mode: "ShareLock",
+        lock_type: target === null ? "transactionid" : "relation",
         target,
         wait_age_us: waitUs,
         query: "UPDATE orders SET status=$1 WHERE id=$2",
@@ -1290,6 +1466,23 @@ function entityResponse(viewCode, entity, params) {
             kind: "best_effort",
             method: "ossc_queryid_dbid_userid_attribution",
             fields: ["queryid", "dbid", "userid"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "activity") {
+      const process = rowsProcesses().find(
+        (candidate) => candidate.data.pid === row.data.pid,
+      );
+      if (process !== undefined) {
+        related.push({
+          view: "processes",
+          entity: process.entity,
+          relation: "activity_process",
+          provenance: {
+            kind: "best_effort",
+            method: "same_snapshot_unique_pid",
+            fields: ["pid", "ts"],
           },
         });
       }

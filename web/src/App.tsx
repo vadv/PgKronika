@@ -12,6 +12,7 @@ import { apiRetryDelay, isWarmingUp, retryApiRequest } from "./api/client";
 import { useUiContext } from "./api/context";
 import { useIncidents } from "./api/incidents";
 import { useSummary } from "./api/summary";
+import type { ViewSpec } from "./api/types";
 import { AlertBar } from "./components/AlertBar";
 import { DockOverlay } from "./components/DockOverlay";
 import { FocusBar } from "./components/FocusBar";
@@ -25,6 +26,7 @@ import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
 import { TableView } from "./components/TableView";
 import { Toolbar, type PreparedLens } from "./components/Toolbar";
+import { WorkloadEvidencePanel } from "./components/WorkloadEvidencePanel";
 import {
   availableDestinations,
   buildNavigationGroups,
@@ -57,6 +59,61 @@ const STATEMENT_LENSES = [
   ["temp", "temp"],
   ["planning", "planning"],
 ] as const;
+const ACTIVITY_LENSES = [
+  ["overview", "overview"],
+  ["waitsLocks", "waits_locks"],
+  ["duration", "duration"],
+  ["cpu", "cpu"],
+  ["diskIo", "disk_io"],
+  ["replication", "replication"],
+  ["sampling", "sampling"],
+] as const;
+const PLAN_LENSES = [
+  ["planExecution", "time"],
+  ["planBuffers", "io"],
+  ["planRows", "rows"],
+  ["planChanges", "change_timeline"],
+] as const;
+
+function catalogPreparedLens(
+  view: ViewSpec | undefined,
+  code: string,
+  preset: string,
+): PreparedLens {
+  if (view === undefined) {
+    return { code, preset, availability: "gated", reason: "view_missing" };
+  }
+  const presetSpec = view.presets.find(
+    (candidate) => candidate.code === preset,
+  );
+  if (presetSpec === undefined) {
+    return {
+      code,
+      preset,
+      availability: "gated",
+      reason: "preset_not_published",
+    };
+  }
+  const requiredColumns = presetSpec.columns
+    .map((columnCode) =>
+      view.columns.find((column) => column.code === columnCode),
+    )
+    .filter((column) => column !== undefined);
+  const unavailable =
+    requiredColumns.find((column) => column.availability === "not_collected") ??
+    requiredColumns.find((column) => column.availability !== "available");
+  if (unavailable === undefined) {
+    return { code, preset, availability: "available" };
+  }
+  return {
+    code,
+    preset,
+    availability:
+      unavailable.availability === "not_collected" ? "not_collected" : "gated",
+    reason: unavailable.unavailable_reason ?? unavailable.availability,
+  };
+}
+
 function useMobile(): boolean {
   return useSyncExternalStore(
     (onChange) => {
@@ -211,16 +268,22 @@ function Shell() {
   const tableReady = activeView !== undefined;
   const heatmapReady = tableReady && activeView.availability === "available";
   const statementsScreen = activeView?.code === "statements";
+  const activityScreen = activeView?.code === "activity";
+  const plansScreen = activeView?.code === "plans";
+  const evidencePanelScreen = activityScreen || plansScreen;
+  const denseHeatmapScreen = activityScreen || statementsScreen || plansScreen;
   const effectivePreset = statementsScreen
     ? (state.preset ?? "time")
-    : state.preset;
-  const statementLenses: PreparedLens[] | undefined = statementsScreen
+    : activityScreen
+      ? (state.preset ?? "overview")
+      : plansScreen
+        ? (state.preset ?? "time")
+        : state.preset;
+  const preparedLenses: PreparedLens[] | undefined = statementsScreen
     ? [
-        ...STATEMENT_LENSES.map(([code, preset]) => ({
-          code,
-          preset,
-          availability: "available" as const,
-        })),
+        ...STATEMENT_LENSES.map(([code, preset]) =>
+          catalogPreparedLens(activeView, code, preset),
+        ),
         {
           code: "regression",
           preset: null,
@@ -234,7 +297,51 @@ function Shell() {
           reason: t("statements.lens.observedSamples.reason"),
         },
       ]
-    : undefined;
+    : activityScreen
+      ? [
+          ...ACTIVITY_LENSES.map(([code, preset]) =>
+            catalogPreparedLens(activeView, code, preset),
+          ),
+          {
+            code: "memory",
+            preset: null,
+            availability: "not_collected" as const,
+            reason: t("activity.lens.memory.reason"),
+          },
+          {
+            code: "xidHorizon",
+            preset: null,
+            availability: "gated" as const,
+            reason: t("activity.lens.xidHorizon.reason"),
+          },
+        ]
+      : plansScreen
+        ? [
+            ...PLAN_LENSES.map(([code, preset]) =>
+              catalogPreparedLens(activeView, code, preset),
+            ),
+            {
+              code: "planCompare",
+              preset: null,
+              availability: "gated" as const,
+              reason: t("plans.lens.compare.reason"),
+            },
+          ]
+        : undefined;
+  const evidenceNote = statementsScreen
+    ? t("statements.evidenceNote")
+    : activityScreen
+      ? t("activity.evidenceNote")
+      : plansScreen
+        ? t("plans.evidenceNote")
+        : undefined;
+  const filterHint = statementsScreen
+    ? t("statements.filterHint")
+    : activityScreen
+      ? t("activity.filterHint")
+      : plansScreen
+        ? t("plans.filterHint")
+        : undefined;
   // A preset owns its default ranking. Carrying an explicit sort from the
   // previous lens can leave the matrix invisibly ranked by a hidden column.
   const selectPreset = (preset: string | null) =>
@@ -427,9 +534,9 @@ function Shell() {
                 matched={matched}
                 onSelectPreset={selectPreset}
                 onFilter={(q) => patch({ q })}
-                lenses={statementLenses}
-                contextNote={t("statements.evidenceNote")}
-                filterHint={t("statements.filterHint")}
+                lenses={preparedLenses}
+                contextNote={evidenceNote}
+                filterHint={filterHint}
               />
               <div style={{ minWidth: 0, overflowX: "auto" }}>
                 <div style={{ minWidth: "1040px" }}>
@@ -552,13 +659,9 @@ function Shell() {
                   matched={matched}
                   onSelectPreset={selectPreset}
                   onFilter={(q) => patch({ q })}
-                  lenses={statementLenses}
-                  contextNote={
-                    statementsScreen ? t("statements.evidenceNote") : undefined
-                  }
-                  filterHint={
-                    statementsScreen ? t("statements.filterHint") : undefined
-                  }
+                  lenses={preparedLenses}
+                  contextNote={evidenceNote}
+                  filterHint={filterHint}
                 />
               ) : (
                 <div
@@ -590,29 +693,62 @@ function Shell() {
           {heatmapReady && (
             <div
               data-shell-region="analytical-center"
-              style={{ flex: "0 0 auto", minHeight: 0 }}
+              data-testid={
+                evidencePanelScreen ? "workload-analytical-center" : undefined
+              }
+              style={{
+                display: "grid",
+                gridTemplateColumns: evidencePanelScreen
+                  ? "minmax(0, 1fr) minmax(320px, 0.32fr)"
+                  : "minmax(0, 1fr)",
+                gap: "var(--space-2)",
+                flex: "0 0 156px",
+                height: "156px",
+                minHeight: 0,
+                overflow: "hidden",
+              }}
             >
-              <HeatmapStrip
-                view={activeView}
-                metric={
-                  metricByView[activeView.code] ?? activeView.canonical_metric
-                }
-                from={heatmapRange.from}
-                to={heatmapRange.to}
-                selectedRange={range}
-                cursorUs={at}
-                hoverUs={hoverUs}
-                brushDraft={brushDraft}
-                baselineUs={state.baseline}
-                buckets={statementsScreen ? 96 : undefined}
-                onMetricChange={(m) =>
-                  setMetricByView((prev) => ({
-                    ...prev,
-                    [activeView.code]: m,
-                  }))
-                }
-                onSelectEntity={(entity) => patch({ entity, dock: "row" })}
-              />
+              <div style={{ minWidth: 0, overflow: "hidden" }}>
+                <HeatmapStrip
+                  view={activeView}
+                  metric={
+                    metricByView[activeView.code] ?? activeView.canonical_metric
+                  }
+                  from={heatmapRange.from}
+                  to={heatmapRange.to}
+                  selectedRange={range}
+                  cursorUs={at}
+                  hoverUs={hoverUs}
+                  brushDraft={brushDraft}
+                  baselineUs={state.baseline}
+                  buckets={denseHeatmapScreen ? 96 : undefined}
+                  onMetricChange={(m) =>
+                    setMetricByView((prev) => ({
+                      ...prev,
+                      [activeView.code]: m,
+                    }))
+                  }
+                  onSelectEntity={(entity) => patch({ entity, dock: "row" })}
+                />
+              </div>
+              {evidencePanelScreen && (
+                <WorkloadEvidencePanel
+                  view={activeView}
+                  preset={effectivePreset}
+                  at={at}
+                  span={state.span}
+                  onOpenEntity={(view, entity) =>
+                    patch({
+                      view,
+                      entity,
+                      dock: "row",
+                      ...(view === state.view
+                        ? {}
+                        : { preset: null, sort: null, order: null }),
+                    })
+                  }
+                />
+              )}
             </div>
           )}
           {heatmapReady && (

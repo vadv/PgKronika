@@ -524,7 +524,7 @@ fn view(
                 projection.name.as_bytes(),
                 b"activity" | b"statements" | b"plans" | b"tables" | b"indexes" | b"processes"
             ),
-            related: projection.name.as_bytes() == b"statements",
+            related: matches!(projection.name.as_bytes(), b"activity" | b"statements"),
         },
         inputs: projection_inputs(projection),
         joins,
@@ -750,6 +750,82 @@ fn activity_view() -> ViewSpec {
             "replay_lag_us",
             "desc",
         ),
+        preset(
+            "overview",
+            &[
+                "pid",
+                "user",
+                "database",
+                "application",
+                "state",
+                "wait_event",
+                "query",
+                "query_duration_us",
+            ],
+            "query_duration_us",
+            "desc",
+        ),
+        preset(
+            "waits_locks",
+            &[
+                "pid",
+                "user",
+                "database",
+                "state",
+                "wait_event",
+                "query",
+                "query_duration_us",
+            ],
+            "query_duration_us",
+            "desc",
+        ),
+        preset(
+            "duration",
+            &[
+                "pid",
+                "user",
+                "database",
+                "query_duration_us",
+                "transaction_duration_us",
+                "query",
+            ],
+            "query_duration_us",
+            "desc",
+        ),
+        preset(
+            "cpu",
+            &["pid", "user", "database", "process_link", "cpu", "query"],
+            "cpu",
+            "desc",
+        ),
+        preset(
+            "disk_io",
+            &[
+                "pid",
+                "user",
+                "database",
+                "process_link",
+                "read_bytes_per_second",
+                "write_bytes_per_second",
+                "query",
+            ],
+            "read_bytes_per_second",
+            "desc",
+        ),
+        preset(
+            "sampling",
+            &[
+                "pid",
+                "user",
+                "database",
+                "state",
+                "wait_event",
+                "query_duration_us",
+                "query",
+            ],
+            "query_duration_us",
+            "desc",
+        ),
     ];
     view(projection, Scope::Database, joins, columns, presets)
 }
@@ -964,7 +1040,24 @@ fn plans_view() -> ViewSpec {
     view(
         projection("plans"),
         Scope::Database,
-        Vec::new(),
+        vec![
+            JoinSpec {
+                left: "plans",
+                right: "statements",
+                kind: RelationKind::BestEffort,
+                fields: vec!["queryid", "dbid", "userid"],
+                cardinality: "many_to_one",
+                provenance: "ossc_queryid_dbid_userid_attribution",
+            },
+            JoinSpec {
+                left: "plans",
+                right: "statements",
+                kind: RelationKind::BestEffort,
+                fields: vec!["queryid_stat_statements", "dbid", "userid"],
+                cardinality: "many_to_one",
+                provenance: "vadv_queryid_stat_statements_dbid_userid_attribution",
+            },
+        ],
         vec![
             raw_column(
                 "planid",
@@ -1071,6 +1164,19 @@ fn plans_view() -> ViewSpec {
                 "regression",
                 &["planid", "plan", "queryid", "mean"],
                 "mean",
+                "desc",
+            ),
+            preset(
+                "change_timeline",
+                &[
+                    "planid",
+                    "queryid",
+                    "first_call",
+                    "last_call",
+                    "calls",
+                    "mean",
+                ],
+                "last_call",
                 "desc",
             ),
         ],

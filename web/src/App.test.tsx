@@ -795,3 +795,243 @@ test("switching a statement lens drops the prior explicit sort", async () => {
   expect(params.get("sort")).toBeNull();
   expect(params.get("order")).toBeNull();
 });
+
+test("Activity owns prepared forensic lenses, point evidence and a 96-bucket heatmap", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const activity = availableCatalog.views.find(
+    (view) => view.code === "activity",
+  );
+  if (activity !== undefined) {
+    activity.presets = [
+      "overview",
+      "waits_locks",
+      "duration",
+      "cpu",
+      "disk_io",
+      "replication",
+      "sampling",
+    ].map((code) => ({
+      code,
+      columns: [],
+      sort: { column: "metric", order: "desc" as const },
+    }));
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("activity-point-evidence")).toBeDefined();
+  const overview = screen.getByRole("button", { name: /^overview$/i });
+  expect(overview.getAttribute("aria-pressed")).toBe("true");
+  expect(
+    screen
+      .getByRole("button", { name: /^memory /i })
+      .getAttribute("aria-disabled"),
+  ).toBe("true");
+  expect(
+    screen
+      .getByRole("button", { name: /^xidHorizon /i })
+      .getAttribute("aria-disabled"),
+  ).toBe("true");
+  fireEvent.click(screen.getByRole("button", { name: /^cpu$/i }));
+  expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBe("cpu");
+  expect(screen.getByTestId("activity-process-evidence")).toBeDefined();
+
+  await waitFor(() => {
+    const heatmap = fetchImpl.mock.calls
+      .map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      )
+      .find(
+        (url) =>
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("view") === "activity",
+      );
+    expect(heatmap?.searchParams.get("buckets")).toBe("96");
+  });
+});
+
+test("Activity resource lenses inherit partial-source availability from the catalog", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const activity = availableCatalog.views.find(
+    (view) => view.code === "activity",
+  );
+  if (activity !== undefined) {
+    activity.columns = [
+      {
+        availability: "gated",
+        unavailable_reason: "not_collected",
+        code: "cpu",
+        lazy: false,
+        requires: ["process", "instance"],
+        type: "f64",
+      },
+      {
+        availability: "not_collected",
+        unavailable_reason: "not_collected",
+        code: "read_bytes_per_second",
+        lazy: false,
+        requires: ["process"],
+        type: "f64",
+      },
+      {
+        availability: "gated",
+        unavailable_reason: "missing_privilege_or_version",
+        code: "replication_state",
+        lazy: false,
+        requires: ["replication_replicas"],
+        type: "text",
+      },
+    ];
+    activity.presets = [
+      {
+        code: "overview",
+        columns: [],
+        sort: { column: "cpu", order: "desc" as const },
+      },
+      {
+        code: "cpu",
+        columns: ["cpu"],
+        sort: { column: "cpu", order: "desc" as const },
+      },
+      {
+        code: "disk_io",
+        columns: ["read_bytes_per_second"],
+        sort: { column: "read_bytes_per_second", order: "desc" as const },
+      },
+      {
+        code: "replication",
+        columns: ["replication_state"],
+        sort: { column: "replication_state", order: "desc" as const },
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  await screen.findByTestId("activity-point-evidence");
+  for (const name of [/^cpu /i, /^diskIo /i, /^replication /i]) {
+    expect(
+      screen.getByRole("button", { name }).getAttribute("aria-disabled"),
+    ).toBe("true");
+  }
+  fireEvent.click(screen.getByRole("button", { name: /^cpu /i }));
+  expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBeNull();
+});
+
+test("Plans owns change lanes, fork provenance and keeps Compare explicitly gated", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=plans&at=1722400000000000`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const plans = availableCatalog.views.find((view) => view.code === "plans");
+  if (plans !== undefined) {
+    plans.presets = ["time", "io", "rows", "change_timeline"].map((code) => ({
+      code,
+      columns: [],
+      sort: { column: "metric", order: "desc" as const },
+    }));
+    plans.joins = [
+      {
+        left: "plans",
+        right: "statements",
+        kind: "best_effort",
+        fields: ["queryid", "dbid", "userid"],
+        cardinality: "many_to_one",
+        provenance: "ossc_queryid_dbid_userid_attribution",
+      },
+      {
+        left: "plans",
+        right: "statements",
+        kind: "best_effort",
+        fields: ["queryid_stat_statements", "dbid", "userid"],
+        cardinality: "many_to_one",
+        provenance: "vadv_queryid_stat_statements_dbid_userid_attribution",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(
+    await screen.findByText("ossc_queryid_dbid_userid_attribution"),
+  ).toBeDefined();
+  expect(
+    screen
+      .getByRole("button", { name: /^planCompare /i })
+      .getAttribute("aria-disabled"),
+  ).toBe("true");
+  fireEvent.click(screen.getByRole("button", { name: /^planChanges$/i }));
+  expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBe(
+    "change_timeline",
+  );
+  await waitFor(() => {
+    expect(
+      fetchImpl.mock.calls.some(([input]) => {
+        const url = new URL(
+          typeof input === "string"
+            ? input
+            : input instanceof Request
+              ? input.url
+              : input.href,
+        );
+        return (
+          url.pathname === "/v1/frame/plans" &&
+          url.searchParams.get("preset") === "change_timeline" &&
+          url.searchParams.get("limit") === "3"
+        );
+      }),
+    ).toBe(true);
+  });
+});
