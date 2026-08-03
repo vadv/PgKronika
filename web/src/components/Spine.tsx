@@ -235,7 +235,10 @@ export function Spine(props: SpineProps) {
     { from, to, buckets: SPINE_BUCKETS },
     liveOpts,
   );
-  const events = useTimelineEvents({ from, to, limit: 50 }, liveOpts);
+  const events = useTimelineEvents(
+    { from, to, limit: 50, maxPages: 4 },
+    liveOpts,
+  );
   const incidents = useIncidents({ from: prevFrom, to }, liveOpts);
 
   const timestampX = (timestampUs: string | number): number => {
@@ -1109,7 +1112,12 @@ export function Spine(props: SpineProps) {
             </span>{" "}
             ·{" "}
             <span style={{ color: "var(--fg)" }}>
-              {t("healthLine.events", { count: visibleEventCount })}
+              {t(
+                events.data?.truncated
+                  ? "healthLine.eventsLowerBound"
+                  : "healthLine.events",
+                { count: visibleEventCount },
+              )}
             </span>{" "}
             ·{" "}
             {primary !== null && currentValue !== null && (

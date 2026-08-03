@@ -288,6 +288,48 @@ test("renders verdict ribbon, score chip, event density, sparkline and summary",
   expect(screen.getByTestId("spine-cursor")).toBeDefined();
 });
 
+test("discloses a lower-bound event total when the bounded cursor budget is exhausted", async () => {
+  let eventPage = 0;
+  await renderLocalizedSpine({}, (input) => {
+    const url = new URL(
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href,
+    );
+    if (url.pathname === "/v1/timeline/events") {
+      eventPage += 1;
+      return Promise.resolve(
+        jsonResponse(
+          makeEventsResponse({
+            events: [
+              makeEventFact({
+                event_instance_id: `page-${eventPage}`,
+                occurred_at_us: FROM_US + eventPage,
+                sort_ts_us: FROM_US + eventPage,
+              }),
+            ],
+            next_cursor: `cursor-${eventPage + 1}`,
+          }),
+        ),
+      );
+    }
+    const body =
+      url.pathname === "/v1/timeline/health"
+        ? healthFixture
+        : url.pathname === "/v1/incidents"
+          ? incidentsFixture
+          : spineFixture;
+    return Promise.resolve(jsonResponse(body));
+  });
+
+  await waitFor(() => expect(eventPage).toBe(4));
+  expect(screen.getByTestId("spine-summary").textContent).toContain(
+    "events ≥4",
+  );
+});
+
 test("a health-less window renders honest gap markers, not silence", async () => {
   vi.stubGlobal(
     "fetch",
@@ -786,7 +828,7 @@ test("a 503 during revalidation keeps the ribbon — warming is cold-start only"
     incidentsFixture,
   );
   client.setQueryData(
-    ["timeline-events", String(FROM_US), String(AT_US), 50],
+    ["timeline-events", String(FROM_US), String(AT_US), 50, 4],
     eventsFixture,
   );
   // Every refetch fails as a warm-up 503; cached answers must stay on screen.

@@ -226,6 +226,13 @@ impl ProjectionInput {
 struct ActivityProcessIndex<'a> {
     current: BTreeMap<u64, Vec<&'a OutRow>>,
     previous: BTreeMap<(u64, i64), Vec<&'a OutRow>>,
+    rate_previous_available: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectionInputNeeds {
+    rate_predecessor: bool,
+    activity_relation_previous: bool,
 }
 
 impl<'a> ActivityProcessIndex<'a> {
@@ -240,9 +247,10 @@ impl<'a> ActivityProcessIndex<'a> {
             };
             index.current.entry(pid).or_default().push(process);
         }
-        let Some(previous_ts_us) = input.predecessor_ts_us else {
+        let Some(previous_ts_us) = input.neighbors.previous else {
             return index;
         };
+        index.rate_previous_available = input.predecessor_ts_us == Some(previous_ts_us);
         for process in input.previous.get("os_process").into_iter().flatten() {
             if timestamp(process, "ts").ok().flatten() != Some(previous_ts_us) {
                 continue;
@@ -271,6 +279,9 @@ impl<'a> ActivityProcessIndex<'a> {
     }
 
     fn predecessor(&self, current: &OutRow) -> Option<&'a OutRow> {
+        if !self.rate_previous_available {
+            return None;
+        }
         let key = (
             process_pid_key(current)?,
             timestamp(current, "starttime").ok().flatten()?,
@@ -460,6 +471,29 @@ mod activity_process_index_tests {
         assert_eq!(finite_number(unique, "pid").expect("pid"), Some(7.0));
         assert!(index.current_candidate(&ambiguous_activity).is_none());
     }
+
+    #[test]
+    fn pid_link_uses_the_neighbor_snapshot_even_when_rate_continuity_is_rejected() {
+        let activity = row(&[("pid", Value::I64(7))]);
+        let current_process = row(&[
+            ("ts", Value::Ts(20)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2)),
+        ]);
+        let previous_process = row(&[
+            ("ts", Value::Ts(10)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2)),
+        ]);
+        let mut input = ProjectionInput::empty(20);
+        input.push("os_process", current_process.clone());
+        input.push_previous(10, "os_process", previous_process);
+        input.predecessor_ts_us = None;
+
+        let index = ActivityProcessIndex::from_input(&input);
+        assert_eq!(index.pid_candidates(&activity).len(), 2);
+        assert!(index.predecessor(&current_process).is_none());
+    }
 }
 
 #[derive(Debug)]
@@ -567,10 +601,15 @@ pub(crate) fn project_frame(
     }
 
     let needs_predecessor = preset_requires_predecessor(request, catalog)?;
+    let needs_activity_relation_previous =
+        preset_requires_activity_relation_previous(request, catalog)?;
     let input = read_projection_input(
         snapshot,
         request.view,
-        needs_predecessor,
+        ProjectionInputNeeds {
+            rate_predecessor: needs_predecessor,
+            activity_relation_previous: needs_activity_relation_previous,
+        },
         false,
         limits,
         &resolved,
@@ -628,7 +667,11 @@ pub(crate) fn project_entity_at(
     let input = read_projection_input(
         snapshot,
         view,
-        columns_require_predecessor(view, columns),
+        ProjectionInputNeeds {
+            rate_predecessor: columns_require_predecessor(view, columns),
+            activity_relation_previous: view.name == "activity"
+                && (include_related || columns.iter().any(|column| column.code == "process_link")),
+        },
         false,
         limits,
         &resolved,
@@ -860,7 +903,7 @@ fn statement_plan_relations(
 fn read_projection_input(
     snapshot: &LocalDirSnapshot,
     view: &'static WebView,
-    needs_predecessor: bool,
+    needs: ProjectionInputNeeds,
     same_descriptor_only: bool,
     limits: FrameLimits,
     resolved: &ResolvedViewSnapshot,
@@ -886,7 +929,7 @@ fn read_projection_input(
         .current_descriptor
         .ok_or(ProjectionError::MissingCatalogView)?;
     let rate_previous = neighbors.previous.filter(|previous| {
-        needs_predecessor
+        needs.rate_predecessor
             && neighbors
                 .current
                 .checked_sub(*previous)
@@ -903,7 +946,8 @@ fn read_projection_input(
                             .is_some_and(|current| current.locator == previous.locator)
                     }))
     });
-    let rate_gap = needs_predecessor
+    let rate_gap = needs
+        .rate_predecessor
         .then_some(neighbors.previous)
         .flatten()
         .filter(|previous| Some(*previous) != rate_previous)
@@ -935,7 +979,12 @@ fn read_projection_input(
         reject_internal_continuation(&pages, limits.rows)?;
         current.extend(pages);
     }
-    let previous = match (rate_previous, resolved.previous_descriptor.as_ref()) {
+    let previous_to_load = rate_previous.or_else(|| {
+        neighbors
+            .previous
+            .filter(|_| needs.activity_relation_previous)
+    });
+    let previous = match (previous_to_load, resolved.previous_descriptor.as_ref()) {
         (Some(previous), Some(previous_descriptor)) => {
             let pages = query.sections(
                 previous_descriptor,
@@ -979,6 +1028,16 @@ fn preset_requires_predecessor(
     Ok(selected_columns(request, catalog)?
         .iter()
         .any(|column| column_requires_predecessor(request.view.name, column.code)))
+}
+
+fn preset_requires_activity_relation_previous(
+    request: &FrameRequest,
+    catalog: &ProjectionCatalog,
+) -> Result<bool, ProjectionError> {
+    Ok(request.view.name == "activity"
+        && selected_columns(request, catalog)?
+            .iter()
+            .any(|column| column.code == "process_link"))
 }
 
 fn columns_require_predecessor(view: &WebView, columns: &[&ColumnSpec]) -> bool {
