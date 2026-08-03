@@ -9,7 +9,9 @@
 - `Workload`, `Latency`, `Buffers`, `WAL`, `Temp`, and `Planning` use existing reset-aware statement deltas.
 - `Regression` remains prepared but unavailable until comparable baseline deltas exist in the frame contract.
 - `Observed samples` remains prepared but unavailable until activity/process samples have a proven per-statement relation.
-- Query text is deliberately not collected; the screen and row detail must say so explicitly.
+- Query text is collected with a server-side character cap, stays lazy/detail-only, and may be null when PostgreSQL masks another role.
+- Ranked table deltas cover the latest valid predecessor interval at the cursor; only heatmap and spark cover the selected range.
+- The retained candidate set is top-N by total execution time union top-N by calls; WAL and Temp ranking is exact only inside that retained set.
 - PostgreSQL buffer reads are not labelled as physical storage I/O, and no statement CPU value is invented.
 
 ## Tasks
@@ -24,7 +26,7 @@
 
 - Extend the shared toolbar with optional prepared lens descriptors.
 - Render eight statement lenses: six executable and two disabled with accessible explanations.
-- Expose cumulative/reset-aware semantics and query-text availability in a compact evidence note.
+- Expose latest-interval/reset-aware semantics, candidate-set coverage, and bounded query-text provenance in a compact evidence note.
 - Preserve URL-backed preset and search state.
 
 ### 3. Virtualize the ranked matrix
@@ -45,4 +47,3 @@
 - Add unit tests that fail before virtualization and prove the DOM window moves on scroll.
 - Add browser verification at 1920×1080 for 1,000 demo statements: bounded DOM rows, at least 16 fully visible evidence rows, pagination visibility, responsive fallback, and bounded search interaction latency.
 - Run Rust catalog tests, frontend gates, shell verification, and the new statements verification before review.
-

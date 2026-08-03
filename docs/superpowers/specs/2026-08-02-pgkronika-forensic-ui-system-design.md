@@ -181,7 +181,7 @@ cgroup:/kubepods.slice/...
 device:8:0
 ```
 
-Свободный текст ищет только в материализованных полях: сообщении события, `cmdline` и человекочитаемом имени сущности. SQL участвует в поиске лишь тогда, когда конкретный источник действительно собрал query text; текущий production collector для `pg_stat_statements` намеренно пишет `query = null`. Plan text остаётся lazy-полем и не входит в bounded frame search. Текущий серверный контракт поддерживает до 16 AND-термов, равенство полей, case-insensitive glob `*`/`?` и типизированное равенство; операторы `cpu>80`, `duration>1s`, OR/NOT, диапазоны и `has:null` считаются отдельным будущим требованием, а не существующей возможностью.
+Свободный текст ищет только в материализованных полях: сообщении события, `cmdline` и человекочитаемом имени сущности. Production collector для `pg_stat_statements` сохраняет server-truncated query text с лимитом `KRONIKA_PG_MAX_QUERY_TEXT`, но поле остаётся lazy/detail-only и не входит в bounded frame search; PostgreSQL может вернуть `null` для чужой роли. Plan text также остаётся lazy-полем. Текущий серверный контракт поддерживает до 16 AND-термов, равенство полей, case-insensitive glob `*`/`?` и типизированное равенство; операторы `cpu>80`, `duration>1s`, OR/NOT, диапазоны и `has:null` считаются отдельным будущим требованием, а не существующей возможностью.
 
 ### 6.3. Область поиска
 
@@ -297,7 +297,7 @@ OS evidence inspector всегда разделяет: «Наблюдалось�
 - Group by database/user/application доступен как агрегация, но не меняет исходную сущность `queryid`.
 - Строка раскрывается в Detail без потери фильтра, диапазона и baseline.
 
-`pg_stat_statements` рассматривается как накопительный top-N snapshot. Дельты должны быть reset-aware. Если текст query не собирается, интерфейс показывает `queryid` и честное состояние `query text unavailable`, а не выдуманный SQL.
+`pg_stat_statements` рассматривается как накопительный top-N snapshot. Дельты должны быть reset-aware. Текст query показывается только в detail с явным server-side cap; если PostgreSQL маскирует текст, интерфейс показывает `queryid` и `null`, а не выдуманный SQL.
 
 Identity statement: `(queryid, userid, dbid, toplevel)` для `pg_stat_statements` 1.9+; для старых раскладок `toplevel` отсутствует. Ratio и per-call значения считаются из сумм валидных парных дельт, а не усреднением готовых interval ratios.
 
@@ -547,7 +547,7 @@ Same timestamp не доказывает общий producer snapshot. PostgreSQ
 | --- | --- | --- |
 | OS / Pressure | `a444eb94-d25b-4cb2-9b9b-c978592e71da` | Общие OS/PG lanes, heatmap, evidence inspector и ranked resources помещаются над сгибом. |
 | Activity / Waits & Locks | `57e405e9-7007-4536-83b0-7e7823991361` | Sampled waits, waiter-age Gantt, edge-only lock graph и 12 строк history видны одновременно. |
-| Statements / Buffers | `745c03fe-93a3-47c9-87cd-799027c8e6c4` | 23 строки и статическая temporal heatmap видны без прокрутки; query text явно недоступен. |
+| Statements / Buffers | `745c03fe-93a3-47c9-87cd-799027c8e6c4` | 23 строки и статическая temporal heatmap видны без прокрутки; query text остаётся bounded detail-only полем. |
 | Plans / Regression | `6b04f496-f1f3-47ba-81ec-ba3af3f8952a` | Plan mix, synchronized metrics, fork provenance и A/B diff помещаются над сгибом. |
 | Tables / Maintenance & Freeze | `4167d669-3c15-4d23-b68b-b375008cc1fe` | Scatter, XID/MXID context, 15 relations и раздельные source timestamps видны одновременно. |
 | Indexes / Usage & Risk | `a82ee76a-f697-462c-b8c8-02a59a62e9dc` | Review candidate, parent-table context и relation provenance заменяют автоматический вывод об удалении. |

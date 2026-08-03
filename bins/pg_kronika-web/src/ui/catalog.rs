@@ -760,11 +760,10 @@ fn activity_view() -> ViewSpec {
 )]
 fn statements_view() -> ViewSpec {
     let projection = projection("statements");
-    // The production collector writes `query` as NULL on purpose (unbounded
-    // text vs. a bounded segment budget), so the column is intrinsically
-    // not-collected rather than gated by the store: the UI must say
-    // "not collected", never show an empty value.
-    let mut query_text = raw_column(
+    // Query text is server-truncated by the collector and remains lazy: it is
+    // useful in entity detail but must not inflate bounded frame responses.
+    // PostgreSQL may still mask both queryid and query for another role.
+    let query_text = raw_column(
         "query",
         ValueType::Text,
         "statements.query",
@@ -772,8 +771,6 @@ fn statements_view() -> ViewSpec {
         &["statements"],
         None,
     );
-    query_text.availability = Availability::NotCollected;
-    query_text.unavailable_reason = Some("query_text_not_collected");
     let columns = vec![
         raw_column(
             "queryid",
@@ -901,6 +898,22 @@ fn statements_view() -> ViewSpec {
             "desc",
         ),
         preset(
+            "latency",
+            &[
+                "queryid",
+                "database",
+                "user",
+                "calls",
+                "mean",
+                "ms_per_row",
+                "total",
+                "time_pct",
+                "rows",
+            ],
+            "mean",
+            "desc",
+        ),
+        preset(
             "io",
             &[
                 "queryid",
@@ -914,15 +927,29 @@ fn statements_view() -> ViewSpec {
             "desc",
         ),
         preset(
+            "wal",
+            &["queryid", "database", "user", "calls", "wal_bytes", "total"],
+            "wal_bytes",
+            "desc",
+        ),
+        preset(
             "temp",
             &["queryid", "database", "user", "calls", "temp_written"],
             "temp_written",
             "desc",
         ),
         preset(
-            "wal",
-            &["queryid", "database", "user", "calls", "wal_bytes", "total"],
-            "wal_bytes",
+            "planning",
+            &[
+                "queryid",
+                "database",
+                "user",
+                "calls",
+                "plan_time_pct",
+                "total",
+                "mean",
+            ],
+            "plan_time_pct",
             "desc",
         ),
     ];
