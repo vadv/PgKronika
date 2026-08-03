@@ -73,20 +73,38 @@ export function ProvenancePopover(props: ProvenancePopoverProps) {
   const [position, setPosition] = useState({ left: 0, top: 0 });
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
+  const restoreTimerRef = useRef<number | null>(null);
   const id = useId();
 
   const close = useCallback((afterPointerDefault = false) => {
     setOpen(false);
+    if (restoreTimerRef.current !== null) {
+      window.clearTimeout(restoreTimerRef.current);
+      restoreTimerRef.current = null;
+    }
     const restore = () => triggerRef.current?.focus();
     if (afterPointerDefault) {
-      // A real browser focuses the outside pointer target after pointerdown
-      // listeners return. Restore in the microtask checkpoint after that
-      // default action, not in the intermediate pointerdown state.
-      queueMicrotask(restore);
+      // Chrome may apply the outside pointer focus default after the
+      // microtask checkpoint. Restore in the next task, after the complete
+      // activation sequence, not in the intermediate pointerdown state.
+      restoreTimerRef.current = window.setTimeout(() => {
+        restoreTimerRef.current = null;
+        restore();
+      }, 0);
     } else {
       restore();
     }
   }, []);
+
+  useEffect(
+    () => () => {
+      if (restoreTimerRef.current !== null) {
+        window.clearTimeout(restoreTimerRef.current);
+        restoreTimerRef.current = null;
+      }
+    },
+    [],
+  );
 
   const place = useCallback(() => {
     const trigger = triggerRef.current;

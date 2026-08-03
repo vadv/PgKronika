@@ -33,7 +33,10 @@ const completeRecord = {
   reason: "2 snapshots unavailable",
 };
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 test("click opens persistent ordered provenance facts and omits absent fields", () => {
   renderEnglish(
@@ -78,6 +81,7 @@ test.each(["Enter", " "])(
 );
 
 test("outside activation restores trigger focus after the browser default focuses its target", async () => {
+  vi.useFakeTimers();
   renderEnglish(
     <div>
       <ProvenancePopover
@@ -91,13 +95,39 @@ test("outside activation restores trigger focus after the browser default focuse
   const outside = screen.getByRole("button", { name: "Outside" });
   fireEvent.click(trigger);
   fireEvent.pointerDown(outside);
-  // Chromium focuses the pointer target as the pointerdown default action,
-  // after the document listener has run. Reproduce that ordering explicitly.
+  // Chrome can apply the pointer focus default after the microtask checkpoint.
+  // A microtask restore is therefore still too early.
+  await Promise.resolve();
   outside.focus();
   fireEvent.click(outside);
   expect(screen.queryByRole("dialog")).toBeNull();
   expect(document.activeElement).toBe(outside);
-  await waitFor(() => expect(document.activeElement).toBe(trigger));
+  vi.runOnlyPendingTimers();
+  expect(document.activeElement).toBe(trigger);
+  vi.useRealTimers();
+});
+
+test("pending pointer focus restoration is cancelled on unmount", () => {
+  vi.useFakeTimers();
+  const rendered = renderEnglish(
+    <div>
+      <ProvenancePopover
+        triggerLabel="Show provenance"
+        record={{ definition: "Persistent fact" }}
+      />
+      <button type="button">Outside</button>
+    </div>,
+  );
+  const trigger = screen.getByRole("button", { name: "Show provenance" });
+  const outside = screen.getByRole("button", { name: "Outside" });
+  const focus = vi.spyOn(trigger, "focus");
+  fireEvent.click(trigger);
+  fireEvent.pointerDown(outside);
+  rendered.unmount();
+  vi.runOnlyPendingTimers();
+  expect(focus).not.toHaveBeenCalled();
+  expect(vi.getTimerCount()).toBe(0);
+  vi.useRealTimers();
 });
 
 test("all supplied fields render in contract order and formula wraps", () => {
