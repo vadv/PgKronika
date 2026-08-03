@@ -1,4 +1,11 @@
-import { memo, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
 import { colDesc, colLabel } from "../api/codes";
@@ -43,12 +50,34 @@ interface Pages {
   key: string;
   rows: FrameRowDto[];
   next: string | null;
+  columns: FrameColumnDto[];
+  matched: number;
 }
 
 /** Column types the backend accepts as frame sort keys. */
 const SORTABLE_TYPES = new Set(["i64", "u64", "f64", "timestamp"]);
 /** Column types whose wire value may arrive as a decimal string. */
 const NUMERIC_TYPES = new Set(["i64", "u64", "f64"]);
+const ROW_HEIGHT = 28;
+const ROW_OVERSCAN = 6;
+const FALLBACK_VIEWPORT_HEIGHT = 650;
+
+function boundedUniqueRows(
+  existing: FrameRowDto[],
+  incoming: FrameRowDto[],
+  matched: number,
+): FrameRowDto[] {
+  const limit = Math.max(0, matched);
+  const rows = existing.slice(0, limit);
+  const entities = new Set(rows.map((row) => row.entity));
+  for (const row of incoming) {
+    if (rows.length >= limit) break;
+    if (entities.has(row.entity)) continue;
+    entities.add(row.entity);
+    rows.push(row);
+  }
+  return rows;
+}
 
 /** Verdict tint (background wash + foreground) from a classification result. */
 function verdictTintOf(
@@ -113,7 +142,18 @@ function TableViewImpl(props: TableViewProps) {
   const [pages, setPages] = useState<Pages | null>(null);
   const [cursorExpired, setCursorExpired] = useState(false);
   const [hovered, setHovered] = useState<string | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(
+    FALLBACK_VIEWPORT_HEIGHT,
+  );
+  const [pendingFocusEntity, setPendingFocusEntity] = useState<string | null>(
+    null,
+  );
+  const scrollBody = useRef<HTMLDivElement | null>(null);
   const lastMatched = useRef<number | null>(null);
+  // Which selection this frame has already brought into view. Appended
+  // cursor pages must not re-scroll to it and yank the reader off the tail.
+  const scrolledEntity = useRef<string | null>(null);
 
   const frameKey = [
     props.view.code,
@@ -149,8 +189,23 @@ function TableViewImpl(props: TableViewProps) {
     setPages((p) => (p === null || p.key === frameKey ? p : null));
     setCursorState(null);
     setCursorExpired(false);
+    setScrollTop(0);
+    if (scrollBody.current !== null) scrollBody.current.scrollTop = 0;
     lastMatched.current = null;
+    scrolledEntity.current = null;
   }, [frameKey]);
+
+  useLayoutEffect(() => {
+    const body = scrollBody.current;
+    if (body === null) return;
+    const measure = () =>
+      setViewportHeight(body.clientHeight || FALLBACK_VIEWPORT_HEIGHT);
+    measure();
+    if (typeof ResizeObserver !== "function") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, []);
 
   // Cursor page arrived: append its rows and fall back to the first page.
   useEffect(() => {
@@ -158,8 +213,14 @@ function TableViewImpl(props: TableViewProps) {
     if (data === undefined || cursor === null) return;
     setPages((p) => ({
       key: frameKey,
-      rows: [...(p !== null && p.key === frameKey ? p.rows : []), ...data.rows],
+      rows: boundedUniqueRows(
+        p !== null && p.key === frameKey ? p.rows : [],
+        data.rows,
+        data.page.matched,
+      ),
       next: data.page.next ?? null,
+      columns: p !== null && p.key === frameKey ? p.columns : data.columns,
+      matched: data.page.matched,
     }));
     setCursorState(null);
   }, [frame.data, cursor, frameKey]);
@@ -173,7 +234,13 @@ function TableViewImpl(props: TableViewProps) {
     setPages((p) =>
       p !== null && p.key === frameKey
         ? p
-        : { key: frameKey, rows: data.rows, next: data.page.next ?? null },
+        : {
+            key: frameKey,
+            rows: boundedUniqueRows([], data.rows, data.page.matched),
+            next: data.page.next ?? null,
+            columns: data.columns,
+            matched: data.page.matched,
+          },
     );
     // The fresh first page after a cursor expiry replaces the dead one.
     setCursorExpired(false);
@@ -210,9 +277,12 @@ function TableViewImpl(props: TableViewProps) {
   );
   const columnSpec = new Map(props.view.columns.map((c) => [c.code, c]));
 
+  const accumulated = pages !== null && pages.key === frameKey ? pages : null;
+  const responseColumns = frame.data?.columns ?? accumulated?.columns ?? [];
+  const matched = frame.data?.page.matched ?? accumulated?.matched ?? 0;
   const columns: DisplayColumn[] = [];
-  if (frame.data !== undefined) {
-    frame.data.columns.forEach((column, cellIndex) => {
+  if (responseColumns.length > 0) {
+    responseColumns.forEach((column, cellIndex) => {
       // `hidden` columns are materialized only for sort/filter — never shown.
       // Unavailable (gated/not_collected) columns stay visible as honest
       // nulls with their availability reason instead of being dropped.
@@ -236,10 +306,56 @@ function TableViewImpl(props: TableViewProps) {
     }
   }
 
-  const rows = pages !== null && pages.key === frameKey ? pages.rows : [];
+  const rows = useMemo(
+    () => (pages !== null && pages.key === frameKey ? pages.rows : []),
+    [frameKey, pages],
+  );
   const nextCursor =
     pages !== null && pages.key === frameKey ? pages.next : null;
   const loadingMore = cursor !== null && frame.isLoading;
+  const startIndex = Math.max(
+    0,
+    Math.floor(scrollTop / ROW_HEIGHT) - ROW_OVERSCAN,
+  );
+  const windowSize = Math.ceil(viewportHeight / ROW_HEIGHT) + ROW_OVERSCAN * 2;
+  const endIndex = Math.min(rows.length, startIndex + windowSize);
+  const visibleRows = rows.slice(startIndex, endIndex);
+  const topSpacerHeight = startIndex * ROW_HEIGHT;
+  const bottomSpacerHeight = (rows.length - endIndex) * ROW_HEIGHT;
+
+  useEffect(() => {
+    if (pendingFocusEntity === null || scrollBody.current === null) return;
+    const target = [
+      ...scrollBody.current.querySelectorAll("tr[data-entity]"),
+    ].find((row) => row.getAttribute("data-entity") === pendingFocusEntity);
+    if (!(target instanceof HTMLElement)) return;
+    target.focus();
+    setPendingFocusEntity(null);
+  }, [pendingFocusEntity, startIndex, endIndex]);
+
+  useEffect(() => {
+    const body = scrollBody.current;
+    if (body === null || props.entity === null) {
+      scrolledEntity.current = null;
+      return;
+    }
+    // Bring a selection into view once; later cursor pages grow `rows` but
+    // must not re-run the scroll on an already-handled selection.
+    if (scrolledEntity.current === props.entity) return;
+    const index = rows.findIndex((row) => row.entity === props.entity);
+    if (index < 0) return;
+    scrolledEntity.current = props.entity;
+    const rowTop = index * ROW_HEIGHT;
+    const rowBottom = rowTop + ROW_HEIGHT;
+    if (
+      rowTop >= body.scrollTop &&
+      rowBottom <= body.scrollTop + body.clientHeight
+    )
+      return;
+    const nextTop = Math.max(0, rowTop - ROW_HEIGHT * 2);
+    body.scrollTop = nextTop;
+    setScrollTop(nextTop);
+  }, [props.entity, rows]);
 
   const headerCellStyle = (code: string): React.CSSProperties => ({
     position: "sticky",
@@ -287,11 +403,16 @@ function TableViewImpl(props: TableViewProps) {
       }}
     >
       <div
+        ref={scrollBody}
         data-testid="ranked-matrix-body"
+        data-loaded-rows={rows.length}
+        data-rendered-rows={visibleRows.length}
+        onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
         style={{ minHeight: 0, overflow: "auto" }}
       >
         <table
           aria-label={props.view.code}
+          aria-rowcount={(matched || rows.length) + 1}
           style={{ borderCollapse: "collapse", width: "100%" }}
         >
           <thead>
@@ -387,7 +508,15 @@ function TableViewImpl(props: TableViewProps) {
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => {
+            {topSpacerHeight > 0 && (
+              <tr aria-hidden="true" data-virtual-spacer="top">
+                <td
+                  colSpan={columns.length + 1}
+                  style={{ height: `${topSpacerHeight}px`, padding: 0 }}
+                />
+              </tr>
+            )}
+            {visibleRows.map((row, visibleIndex) => {
               const selected = props.entity === row.entity;
               return (
                 // The whole row is one selectable control; keyboard activation
@@ -395,11 +524,34 @@ function TableViewImpl(props: TableViewProps) {
                 <tr
                   key={row.entity}
                   tabIndex={0}
+                  aria-rowindex={startIndex + visibleIndex + 2}
                   aria-selected={selected}
                   data-entity={row.entity}
                   onClick={() => props.onSelectRow(row.entity)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") props.onSelectRow(row.entity);
+                    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                      e.preventDefault();
+                      const direction = e.key === "ArrowDown" ? 1 : -1;
+                      const targetIndex = Math.min(
+                        rows.length - 1,
+                        Math.max(0, startIndex + visibleIndex + direction),
+                      );
+                      const target = rows[targetIndex];
+                      const body = scrollBody.current;
+                      if (target === undefined || body === null) return;
+                      const targetTop = targetIndex * ROW_HEIGHT;
+                      if (
+                        targetTop < body.scrollTop ||
+                        targetTop + ROW_HEIGHT >
+                          body.scrollTop + body.clientHeight
+                      ) {
+                        const nextTop = Math.max(0, targetTop - ROW_HEIGHT * 2);
+                        body.scrollTop = nextTop;
+                        setScrollTop(nextTop);
+                      }
+                      setPendingFocusEntity(target.entity);
+                    }
                   }}
                   onMouseEnter={() => setHovered(row.entity)}
                   onMouseLeave={() =>
@@ -493,6 +645,14 @@ function TableViewImpl(props: TableViewProps) {
                 </tr>
               );
             })}
+            {bottomSpacerHeight > 0 && (
+              <tr aria-hidden="true" data-virtual-spacer="bottom">
+                <td
+                  colSpan={columns.length + 1}
+                  style={{ height: `${bottomSpacerHeight}px`, padding: 0 }}
+                />
+              </tr>
+            )}
           </tbody>
         </table>
         {frame.isLoading && cursor === null && (
@@ -584,6 +744,7 @@ function TableViewImpl(props: TableViewProps) {
         {!cursorExpired && nextCursor !== null && (
           <button
             type="button"
+            data-testid="table-load-more"
             disabled={loadingMore}
             onClick={() => setCursorState({ key: frameKey, value: nextCursor })}
             style={{

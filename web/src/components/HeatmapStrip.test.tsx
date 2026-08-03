@@ -55,6 +55,7 @@ function renderStrip(
     hoverUs: string | null;
     brushDraft: { fromUs: string; toUs: string } | null;
     baselineUs: string | null;
+    buckets: number;
   }> = {},
 ) {
   vi.stubGlobal(
@@ -80,6 +81,7 @@ function renderStrip(
       hoverUs={overrides.hoverUs}
       brushDraft={overrides.brushDraft}
       baselineUs={overrides.baselineUs}
+      buckets={overrides.buckets}
       onMetricChange={overrides.onMetricChange ?? (() => {})}
       onSelectEntity={overrides.onSelectEntity ?? (() => {})}
     />,
@@ -107,6 +109,25 @@ test("partial quality renders a warning badge", async () => {
   renderStrip();
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
   expect(screen.getByText(/partial/)).toBeDefined();
+});
+
+test("partial ranking exposes the unseen candidate bound", async () => {
+  const original = fixture.ranking;
+  fixture.ranking = { exact: false, unseen_upper: 17 };
+  renderStrip();
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  const ranking = screen.getByText("heatmap.ranking.partial");
+  expect(ranking.getAttribute("title")).toContain("17");
+  fixture.ranking = original;
+});
+
+test("forwards the requested dense bucket count", async () => {
+  renderStrip({ buckets: 96 });
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  const fetchMock = vi.mocked(fetch);
+  const request = fetchMock.mock.calls[0]?.[0];
+  const url = request instanceof Request ? request.url : String(request);
+  expect(url).toContain("buckets=96");
 });
 
 test("metric switcher lists only available metrics and reports changes", async () => {

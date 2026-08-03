@@ -23,7 +23,7 @@ import { HealthLine } from "./components/HealthLine";
 import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
 import { TableView } from "./components/TableView";
-import { Toolbar } from "./components/Toolbar";
+import { Toolbar, type PreparedLens } from "./components/Toolbar";
 import {
   availableDestinations,
   buildNavigationGroups,
@@ -31,7 +31,7 @@ import {
 import { TimeGeometryProvider, useTimeGeometry } from "./state/timeGeometry";
 import { toHash } from "./state/url";
 
-const queryClient = new QueryClient({
+export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: retryApiRequest,
@@ -47,6 +47,15 @@ const HOUR_US = 3_600_000_000n;
 /** Arrow keys step through 1/48 of the active span. */
 const STEP_DIVISOR = 48n;
 const MOBILE_QUERY = "(max-width: 760px)";
+
+const STATEMENT_LENSES = [
+  ["workload", "time"],
+  ["latency", "latency"],
+  ["buffers", "io"],
+  ["wal", "wal"],
+  ["temp", "temp"],
+  ["planning", "planning"],
+] as const;
 function useMobile(): boolean {
   return useSyncExternalStore(
     (onChange) => {
@@ -193,6 +202,35 @@ function Shell() {
 
   const tableReady = activeView !== undefined;
   const heatmapReady = tableReady && activeView.availability === "available";
+  const statementsScreen = activeView?.code === "statements";
+  const effectivePreset = statementsScreen
+    ? (state.preset ?? "time")
+    : state.preset;
+  const statementLenses: PreparedLens[] | undefined = statementsScreen
+    ? [
+        ...STATEMENT_LENSES.map(([code, preset]) => ({
+          code,
+          preset,
+          availability: "available" as const,
+        })),
+        {
+          code: "regression",
+          preset: null,
+          availability: "gated",
+          reason: t("statements.lens.regression.reason"),
+        },
+        {
+          code: "observedSamples",
+          preset: null,
+          availability: "gated",
+          reason: t("statements.lens.observedSamples.reason"),
+        },
+      ]
+    : undefined;
+  // A preset owns its default ranking. Carrying an explicit sort from the
+  // previous lens can leave the matrix invisibly ranked by a hidden column.
+  const selectPreset = (preset: string | null) =>
+    patch({ preset, sort: null, order: null });
 
   const globalContext = (
     <Header
@@ -332,6 +370,88 @@ function Shell() {
               </span>
             </button>
           ))}
+          {statementsScreen && heatmapReady && (
+            <section
+              data-testid="mobile-statements-workspace"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "var(--space-2)",
+                minWidth: 0,
+              }}
+            >
+              <HealthLine />
+              <PageHeader
+                view={activeView}
+                summary={summary.data?.views.find(
+                  (view) => view.view === state.view,
+                )}
+                matched={matched}
+                live={state.at === null}
+                onOpenIncidents={() => patch({ dock: "incidents" })}
+              />
+              <Toolbar
+                view={activeView}
+                preset={effectivePreset}
+                q={state.q}
+                matched={matched}
+                onSelectPreset={selectPreset}
+                onFilter={(q) => patch({ q })}
+                lenses={statementLenses}
+                contextNote={t("statements.evidenceNote")}
+                filterHint={t("statements.filterHint")}
+              />
+              <div style={{ minWidth: 0, overflowX: "auto" }}>
+                <div style={{ minWidth: "1040px" }}>
+                  <HeatmapStrip
+                    view={activeView}
+                    metric={
+                      metricByView[activeView.code] ??
+                      activeView.canonical_metric
+                    }
+                    from={heatmapRange.from}
+                    to={heatmapRange.to}
+                    selectedRange={range}
+                    cursorUs={at}
+                    hoverUs={hoverUs}
+                    brushDraft={brushDraft}
+                    baselineUs={state.baseline}
+                    buckets={48}
+                    onMetricChange={(metric) =>
+                      setMetricByView((previous) => ({
+                        ...previous,
+                        [activeView.code]: metric,
+                      }))
+                    }
+                    onSelectEntity={(entity) => patch({ entity, dock: "row" })}
+                  />
+                </div>
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  height: "70dvh",
+                  minHeight: "520px",
+                  minWidth: 0,
+                }}
+              >
+                <TableView
+                  view={activeView}
+                  at={at}
+                  span={state.span}
+                  preset={effectivePreset}
+                  q={state.q}
+                  sort={state.sort}
+                  order={state.order}
+                  entity={state.entity}
+                  onSort={onTableSort}
+                  onSelectRow={onSelectRow}
+                  onMatched={setMatched}
+                />
+              </div>
+            </section>
+          )}
         </div>
       ) : (
         <div
@@ -397,11 +517,18 @@ function Shell() {
               {heatmapReady ? (
                 <Toolbar
                   view={activeView}
-                  preset={state.preset}
+                  preset={effectivePreset}
                   q={state.q}
                   matched={matched}
-                  onSelectPreset={(preset) => patch({ preset })}
+                  onSelectPreset={selectPreset}
                   onFilter={(q) => patch({ q })}
+                  lenses={statementLenses}
+                  contextNote={
+                    statementsScreen ? t("statements.evidenceNote") : undefined
+                  }
+                  filterHint={
+                    statementsScreen ? t("statements.filterHint") : undefined
+                  }
                 />
               ) : (
                 <div
@@ -447,6 +574,7 @@ function Shell() {
                 hoverUs={hoverUs}
                 brushDraft={brushDraft}
                 baselineUs={state.baseline}
+                buckets={statementsScreen ? 96 : undefined}
                 onMetricChange={(m) =>
                   setMetricByView((prev) => ({
                     ...prev,
@@ -462,7 +590,7 @@ function Shell() {
               view={activeView}
               at={at}
               span={state.span}
-              preset={state.preset}
+              preset={effectivePreset}
               q={state.q}
               sort={state.sort}
               order={state.order}

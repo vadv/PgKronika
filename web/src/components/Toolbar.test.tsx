@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { expect, test, vi } from "vitest";
 import { makeViewSpec } from "../testkit/apiFixtures";
 import { Toolbar, type ToolbarProps } from "./Toolbar";
@@ -81,4 +81,50 @@ test("shows the matched row count when provided", () => {
   unmount();
   renderToolbar({ matched: 42 });
   expect(screen.getByText(/toolbar\.rows/)).toBeDefined();
+});
+
+test("prepared lenses map display names to presets and expose gated reasons", () => {
+  const onSelectPreset = vi.fn();
+  renderToolbar({
+    preset: "time",
+    onSelectPreset,
+    lenses: [
+      { code: "workload", preset: "time", availability: "available" },
+      {
+        code: "regression",
+        preset: null,
+        availability: "gated",
+        reason: "baseline deltas are not projected",
+      },
+    ],
+    contextNote: "reset-aware · query text not collected",
+    filterHint: "field=value · full decimal queryid",
+  });
+
+  const workload = screen.getByRole("button", { name: "workload" });
+  expect(workload.getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(workload);
+  expect(onSelectPreset).not.toHaveBeenCalled();
+
+  const regression = screen.getByRole("button", {
+    name: /regression/,
+  });
+  expect((regression as HTMLButtonElement).disabled).toBe(false);
+  expect(regression.getAttribute("aria-disabled")).toBe("true");
+  expect(regression.getAttribute("title")).toContain(
+    "baseline deltas are not projected",
+  );
+  act(() => regression.focus());
+  expect(document.activeElement).toBe(regression);
+  expect(screen.getByRole("status").textContent).toContain(
+    "baseline deltas are not projected",
+  );
+  onSelectPreset.mockClear();
+  fireEvent.click(regression);
+  expect(onSelectPreset).not.toHaveBeenCalled();
+  act(() => regression.blur());
+  expect(screen.getByText(/reset-aware/)).toBeDefined();
+  expect(screen.getByRole("searchbox").getAttribute("title")).toContain(
+    "full decimal queryid",
+  );
 });

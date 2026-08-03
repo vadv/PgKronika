@@ -266,6 +266,297 @@ async function verifyKeyboardReach(page) {
   return reached;
 }
 
+async function verifyStatementsWorkspace(page) {
+  const bodySelector = '[data-testid="ranked-matrix-body"]';
+  const loadMoreSelector = '[data-testid="table-load-more"]';
+  const read = () =>
+    page.evaluate((selector) => {
+      const body = document.querySelector(selector);
+      if (!(body instanceof HTMLElement)) {
+        throw new Error("ranked matrix body is missing");
+      }
+      const table = body.querySelector('table[aria-label="statements"]');
+      const heatmap = document.querySelector(
+        '[data-testid="heatmap-time-grid"]',
+      );
+      const heatmapRequest = performance
+        .getEntriesByType("resource")
+        .map((entry) => entry.name)
+        .find((url) => url.includes("/v1/timeline/heatmap"));
+      return {
+        loaded: Number(body.dataset.loadedRows ?? "0"),
+        rendered: Number(body.dataset.renderedRows ?? "0"),
+        domRows: body.querySelectorAll("tr[data-entity]").length,
+        spacerRows: body.querySelectorAll("tr[data-virtual-spacer]").length,
+        ariaRowCount: Number(table?.getAttribute("aria-rowcount") ?? "0"),
+        heatmapCells: heatmap?.querySelectorAll("[data-cell]").length ?? 0,
+        heatmapBuckets:
+          heatmapRequest === undefined
+            ? null
+            : Number(new URL(heatmapRequest).searchParams.get("buckets")),
+      };
+    }, bodySelector);
+
+  const initial = await read();
+  const commitFilter = async (value, expectedLoaded, expectedAriaRowCount) => {
+    await page.evaluate(async (nextValue) => {
+      const search = document.querySelector('input[type="search"]');
+      if (!(search instanceof HTMLInputElement)) {
+        throw new Error("statement filter is missing");
+      }
+      const setValue = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      if (setValue === undefined) {
+        throw new Error("input value setter is missing");
+      }
+      setValue.call(search, nextValue);
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      search.focus();
+      await new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      );
+    }, value);
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(
+      (selector, loaded, rowCount) => {
+        const body = document.querySelector(selector);
+        const table = body?.querySelector('table[aria-label="statements"]');
+        return (
+          body instanceof HTMLElement &&
+          Number(body.dataset.loadedRows ?? "-1") === loaded &&
+          Number(table?.getAttribute("aria-rowcount") ?? "-1") === rowCount
+        );
+      },
+      { timeout: 10_000 },
+      bodySelector,
+      expectedLoaded,
+      expectedAriaRowCount,
+    );
+    return read();
+  };
+  const lazySqlFilter = await commitFilter("*cart_items*", 0, 1);
+  const databaseFilter = await commitFilter("database=orders", 200, 501);
+  const restoredFilter = await commitFilter("", 200, 1001);
+  const filterSemantics = {
+    lazySqlMatched: lazySqlFilter.ariaRowCount - 1,
+    databaseMatched: databaseFilter.ariaRowCount - 1,
+    restoredMatched: restoredFilter.ariaRowCount - 1,
+  };
+  const bufferHitRange = await page.evaluate(async () => {
+    const state = new URLSearchParams(location.hash.slice(1));
+    const params = new URLSearchParams({
+      at: state.get("at") ?? String(Date.now() * 1000),
+      span: `${state.get("span") ?? "3600"}s`,
+      preset: "io",
+      limit: "200",
+    });
+    const response = await fetch(`/v1/frame/statements?${params}`);
+    if (!response.ok)
+      throw new Error(`buffer lens returned ${response.status}`);
+    const frame = await response.json();
+    const index = frame.columns.findIndex(
+      (column) => column.code === "hit_pct",
+    );
+    if (index < 0) throw new Error("buffer lens omitted hit_pct");
+    const values = frame.rows
+      .map((row) => row.cells[index])
+      .filter((value) => typeof value === "number");
+    return {
+      count: values.length,
+      min: Math.min(...values),
+      max: Math.max(...values),
+    };
+  });
+  const pages = [initial.loaded];
+  while (await page.$(loadMoreSelector)) {
+    const before = pages.at(-1) ?? 0;
+    await page.evaluate((selector) => {
+      const body = document.querySelector(selector);
+      if (!(body instanceof HTMLElement)) {
+        throw new Error("ranked matrix body is missing");
+      }
+      body.scrollTop = body.scrollHeight;
+    }, bodySelector);
+    await page.waitForFunction(
+      (selector) => {
+        const button = document.querySelector(selector);
+        return button instanceof HTMLButtonElement && !button.disabled;
+      },
+      { timeout: 5_000 },
+      loadMoreSelector,
+    );
+    await page.$eval(loadMoreSelector, (button) => button.click());
+    await page.waitForFunction(
+      (selector, prior) => {
+        const body = document.querySelector(selector);
+        return (
+          body instanceof HTMLElement &&
+          Number(body.dataset.loadedRows ?? "0") > prior
+        );
+      },
+      { timeout: 10_000 },
+      bodySelector,
+      before,
+    );
+    const current = await read();
+    pages.push(current.loaded);
+  }
+
+  await page.evaluate((selector) => {
+    const body = document.querySelector(selector);
+    if (body instanceof HTMLElement) body.scrollTop = 0;
+  }, bodySelector);
+  await page.waitForFunction(
+    (selector) => {
+      const body = document.querySelector(selector);
+      const first = body?.querySelector("tr[data-entity]");
+      return (
+        body instanceof HTMLElement && body.scrollTop === 0 && first !== null
+      );
+    },
+    { timeout: 5_000 },
+    bodySelector,
+  );
+
+  const inputLatencyMs = await page.evaluate(async () => {
+    const search = document.querySelector('input[type="search"]');
+    if (!(search instanceof HTMLInputElement)) {
+      throw new Error("statement filter is missing");
+    }
+    const setValue = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    if (setValue === undefined)
+      throw new Error("input value setter is missing");
+    const update = async (value) => {
+      const started = performance.now();
+      setValue.call(search, value);
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      await new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      );
+      return performance.now() - started;
+    };
+    search.focus();
+    const latency = await update("analytics");
+    await update("");
+    return latency;
+  });
+
+  const firstEntity = await page.$eval(
+    `${bodySelector} tr[data-entity]`,
+    (row) => {
+      row.focus();
+      return row.getAttribute("data-entity");
+    },
+  );
+  await page.keyboard.press("ArrowDown");
+  await page.waitForFunction(
+    (entity) =>
+      document.activeElement?.getAttribute("data-entity") !== entity &&
+      document.activeElement?.hasAttribute("data-entity") === true,
+    { timeout: 5_000 },
+    firstEntity,
+  );
+  const arrowEntity = await page.evaluate(() =>
+    document.activeElement?.getAttribute("data-entity"),
+  );
+  await page.keyboard.press("Enter");
+  await page.waitForSelector('[data-dock="row"] [data-field="query"]', {
+    timeout: 10_000,
+  });
+  const detail = await page.$eval(
+    '[data-dock="row"] [data-field="query"]',
+    (field) => ({
+      text: field.textContent?.trim() ?? "",
+      visible:
+        field.getBoundingClientRect().height > 0 ||
+        [...field.children].some(
+          (child) => child.getBoundingClientRect().height > 0,
+        ),
+    }),
+  );
+  await page.keyboard.press("Escape");
+  await page.waitForSelector('[data-dock="row"]', {
+    hidden: true,
+    timeout: 5_000,
+  });
+
+  const final = await read();
+  const failures = [];
+  if (initial.loaded !== 200) {
+    failures.push(`initial page loaded ${initial.loaded}, expected 200`);
+  }
+  if (final.loaded !== 1000) {
+    failures.push(`accumulated rows ${final.loaded}, expected 1000`);
+  }
+  if (final.ariaRowCount !== 1001) {
+    failures.push(`aria-rowcount ${final.ariaRowCount}, expected 1001`);
+  }
+  if (final.rendered > 48 || final.domRows > 48) {
+    failures.push(
+      `virtual DOM is unbounded: rendered=${final.rendered}, domRows=${final.domRows}`,
+    );
+  }
+  if (final.spacerRows > 2) {
+    failures.push(`virtual spacer rows ${final.spacerRows}, expected <= 2`);
+  }
+  if (initial.heatmapBuckets !== 96 || initial.heatmapCells < 96) {
+    failures.push(
+      `heatmap contract buckets=${initial.heatmapBuckets}, cells=${initial.heatmapCells}`,
+    );
+  }
+  if (inputLatencyMs > 100) {
+    failures.push(
+      `filter input latency ${inputLatencyMs.toFixed(1)}ms, expected <= 100ms`,
+    );
+  }
+  if (
+    filterSemantics.lazySqlMatched !== 0 ||
+    filterSemantics.databaseMatched !== 500 ||
+    filterSemantics.restoredMatched !== 1000
+  ) {
+    failures.push(`filter semantics ${JSON.stringify(filterSemantics)}`);
+  }
+  if (
+    bufferHitRange.count === 0 ||
+    bufferHitRange.min < 0 ||
+    bufferHitRange.max > 100
+  ) {
+    failures.push(`invalid buffer hit range ${JSON.stringify(bufferHitRange)}`);
+  }
+  if (
+    firstEntity === null ||
+    arrowEntity === null ||
+    firstEntity === arrowEntity
+  ) {
+    failures.push(
+      `row keyboard navigation did not advance: ${firstEntity} -> ${arrowEntity}`,
+    );
+  }
+  if (
+    !detail.visible ||
+    !/(SELECT|UPDATE|INSERT|DELETE)\b/i.test(detail.text)
+  ) {
+    failures.push(
+      `statement detail did not expose bounded SQL: ${detail.text}`,
+    );
+  }
+  if (failures.length > 0) throw new Error(failures.join("\n"));
+  return {
+    pages,
+    final,
+    inputLatencyMs,
+    filterSemantics,
+    bufferHitRange,
+    keyboard: { firstEntity, arrowEntity },
+    detail,
+  };
+}
+
 function assertContract(metrics, keyboard) {
   const failures = [];
   const exactHeight = (name, expected) => {
@@ -405,6 +696,7 @@ try {
   const metrics = await measure(page);
   const keyboard = await verifyKeyboardReach(page);
   assertContract(metrics, keyboard);
+  const statements = await verifyStatementsWorkspace(page);
   await page.evaluate(() => {
     const matrixBody = document.querySelector(
       '[data-testid="ranked-matrix-body"]',
@@ -415,7 +707,7 @@ try {
   });
   await page.screenshot({ path: SUCCESS_SHOT });
   console.log(
-    `forensic shell PASS\n${JSON.stringify({ ...metrics, keyboard }, null, 2)}`,
+    `forensic shell PASS\n${JSON.stringify({ ...metrics, keyboard, statements }, null, 2)}`,
   );
   console.log(`approved screenshot: ${SUCCESS_SHOT}`);
 } catch (error) {

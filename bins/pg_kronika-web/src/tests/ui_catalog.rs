@@ -629,10 +629,9 @@ fn statements_hit_percentage_uses_window_deltas() {
 }
 
 #[test]
-fn statements_query_text_is_intrinsically_not_collected() {
-    // The production collector writes `query` as NULL by design; the column
-    // must stay `not_collected` even when every input is available, in the
-    // store-derived catalog and in the materialization one alike.
+fn statements_query_text_is_available_but_detail_only() {
+    // The collector server-truncates and stores query text. The frame keeps it
+    // lazy for response bounds, while entity detail can project it.
     for catalog in [
         ProjectionCatalog::for_type_ids(&all_type_ids()),
         ProjectionCatalog::for_materialization(),
@@ -643,10 +642,20 @@ fn statements_query_text_is_intrinsically_not_collected() {
             .find(|view| view.code == "statements")
             .and_then(|view| view.columns.iter().find(|column| column.code == "query"))
             .expect("statements.query");
-        assert_eq!(query.availability, Availability::NotCollected);
-        assert_eq!(query.unavailable_reason, Some("query_text_not_collected"));
+        assert_eq!(query.availability, Availability::Available);
+        assert_eq!(query.unavailable_reason, None);
         assert!(query.lazy, "query text stays a detail-only column");
     }
+
+    let missing = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let query = missing
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .and_then(|view| view.columns.iter().find(|column| column.code == "query"))
+        .expect("statements.query");
+    assert_eq!(query.availability, Availability::Gated);
+    assert_eq!(query.unavailable_reason, Some("missing_extension"));
 }
 
 #[test]
@@ -679,6 +688,40 @@ fn statements_presets_identify_rows_by_database_and_user() {
             );
         }
     }
+}
+
+#[test]
+fn statements_publish_only_executable_forensic_lenses() {
+    let catalog = ProjectionCatalog::for_type_ids(&all_type_ids());
+    let statements = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .expect("statements view");
+
+    let actual = statements
+        .presets
+        .iter()
+        .map(|preset| (preset.code, preset.sort.column, preset.sort.order))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("time", "total", "desc"),
+            ("latency", "mean", "desc"),
+            ("io", "blks_read", "desc"),
+            ("wal", "wal_bytes", "desc"),
+            ("temp", "temp_written", "desc"),
+            ("planning", "plan_time_pct", "desc"),
+        ]
+    );
+    assert!(
+        statements
+            .presets
+            .iter()
+            .all(|preset| !matches!(preset.code, "regression" | "observed_samples")),
+        "unproven baseline and sample relations stay out of executable presets"
+    );
 }
 
 #[test]

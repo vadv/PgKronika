@@ -467,6 +467,7 @@ function EntityPointView(props: {
         return isSql && !notCollected ? (
           <div
             key={field.code}
+            data-field={field.code}
             style={{ gridColumn: "1 / -1", marginBlock: "4px" }}
           >
             <div
@@ -495,7 +496,11 @@ function EntityPointView(props: {
             </pre>
           </div>
         ) : (
-          <div key={field.code} style={{ display: "contents" }}>
+          <div
+            key={field.code}
+            data-field={field.code}
+            style={{ display: "contents" }}
+          >
             <span
               title={desc ?? undefined}
               style={{
@@ -689,9 +694,9 @@ function RowDock(props: {
   // The API label is the human row name (index/relation/pid); the typed
   // entity token is routing material — short form, full value in the title.
   const label = data !== undefined && data.label !== "" ? data.label : null;
-  // statements/plans have no collected text to grow a name from: their label
-  // is the bare numeric identity. The heading is the tab name plus a short
-  // id; the full id stays in the field list below, uncut.
+  // Statement/plan labels deliberately remain stable numeric identities even
+  // when bounded SQL text is available in the detail fields. The heading is
+  // the tab name plus a short id; the full id stays in the field list below.
   const heading =
     label !== null &&
     (viewCode === "statements" || viewCode === "plans") &&

@@ -76,7 +76,7 @@ for (const view of catalog.views) {
 // --- summary ---------------------------------------------------------------
 
 // Populations per plan: activity..events in stable view_code order.
-const POPULATIONS = [142, 500, 83, 64, 121, 2, 218, 3, 5];
+const POPULATIONS = [142, 1000, 83, 64, 121, 2, 218, 3, 5];
 // Views that carry a live anomaly in the demo storyline.
 const NOTABLE = { locks: ["critical", 4], statements: ["warning", 2] };
 
@@ -93,7 +93,15 @@ function summaryResponse(at) {
         notable: notable !== undefined,
         notable_count: notable?.[1] ?? 0,
         notable_level: notable?.[0] ?? "none",
-        collection: null,
+        collection:
+          view.code === "statements"
+            ? {
+                collected: 1000,
+                source_total: 1453,
+                read_state: "source_limit",
+                visibility: "full",
+              }
+            : null,
       };
     }),
     quality: {
@@ -711,16 +719,16 @@ function rowsStatements() {
         ),
       );
     }
-    // Mirror the live store: the collector writes the query text as NULL by
-    // design, so the label is the bare queryid and identification rides on
-    // database/user — the demo must not promise text the stand cannot show.
+    // Query text is a server-capped, lazy detail field. The ranked frame uses
+    // the bare queryid plus database/user and never inflates its response with
+    // SQL; selecting a row exposes the bounded text in entity detail.
     const queryid = String(9_180_220_441_120_000n + BigInt(qid));
     return {
       entity: `stmt:${qid}`,
       label: queryid,
       data: {
         queryid,
-        query: null,
+        query: QUERIES[i % QUERIES.length][1],
         database: STMT_DATABASES[i % STMT_DATABASES.length],
         user: STMT_USERS[i % STMT_USERS.length],
         calls,
@@ -730,7 +738,7 @@ function rowsStatements() {
         time_pct: r2(31.5 * Math.exp(-i / 45)),
         plan_time_pct: i === 7 ? null : r2(1.2 + (i % 4) * 0.8),
         rows: Math.round(calls * (0.8 + (i % 3) * 2.2)),
-        hit_pct: r2(99.4 - i * 0.7),
+        hit_pct: r2(99.4 - i * 0.039),
         blks_read: Math.round(420_000 + i * 88_000),
         temp_written: i % 4 === 3 ? Math.round(12_000 + i * 900) : 0,
         wal_bytes: Math.max(0, Math.round(8_800_000 * Math.exp(-i / 120))),
@@ -1098,6 +1106,84 @@ function compareCells(a, b, order) {
   return order === "asc" ? cmp : -cmp;
 }
 
+function splitFilterTerms(raw) {
+  const terms = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  for (const character of raw.trim()) {
+    if (character === " " && !quoted) {
+      if (current !== "") terms.push(current);
+      current = "";
+      continue;
+    }
+    current += character;
+    if (escaped) escaped = false;
+    else if (quoted && character === "\\") escaped = true;
+    else if (character === '"') quoted = !quoted;
+  }
+  if (current !== "") terms.push(current);
+  return terms;
+}
+
+function splitFilterField(raw) {
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
+    if (escaped) escaped = false;
+    else if (quoted && character === "\\") escaped = true;
+    else if (character === '"') quoted = !quoted;
+    else if (character === "=" && !quoted) {
+      return [raw.slice(0, index), raw.slice(index + 1)];
+    }
+  }
+  return [null, raw];
+}
+
+function globPattern(raw) {
+  const quoted = raw.startsWith('"') && raw.endsWith('"');
+  const source = quoted ? raw.slice(1, -1) : raw;
+  let pattern = "";
+  let escaped = false;
+  for (const character of source) {
+    if (escaped) {
+      pattern += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      escaped = false;
+    } else if (quoted && character === "\\") escaped = true;
+    else if (character === "*") pattern += ".*";
+    else if (character === "?") pattern += ".";
+    else pattern += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${pattern}$`, "iu");
+}
+
+function filterRows(rows, view, raw) {
+  const visibleColumns = view.columns.filter((column) => !column.lazy);
+  const terms = splitFilterTerms(raw).map((term) => {
+    const [field, value] = splitFilterField(term);
+    return { field, pattern: globPattern(value) };
+  });
+  return rows.filter((row) =>
+    terms.every(({ field, pattern }) => {
+      if (field !== null) {
+        const column = visibleColumns.find(
+          (candidate) => candidate.code === field,
+        );
+        return (
+          column !== undefined && pattern.test(String(row.data[field] ?? ""))
+        );
+      }
+      return [
+        row.label,
+        ...visibleColumns.map((column) => row.data[column.code]),
+      ]
+        .filter((value) => value !== null && value !== undefined)
+        .some((value) => pattern.test(String(value)));
+    }),
+  );
+}
+
 function frameResponse(viewCode, params) {
   const view = catalog.views.find((v) => v.code === viewCode);
   if (view === undefined) return null;
@@ -1105,19 +1191,27 @@ function frameResponse(viewCode, params) {
   const generate = ROW_GENERATORS[viewCode] ?? (() => []);
   let rows = generate();
 
-  // `q`: minimal substring filter over the row payload.
+  // Mirror the production frame filter: ANDed full-value globs over the row
+  // label and non-lazy columns. Lazy SQL is intentionally absent.
   const q = params.get("q");
   if (q !== null && q !== "") {
-    const needle = q.toLowerCase();
-    rows = rows.filter((r) =>
-      JSON.stringify(r.data).toLowerCase().includes(needle),
-    );
+    rows = filterRows(rows, view, q);
   }
   const matched = rows.length;
 
-  // Stable order: requested sort column first, entity as the tie-break.
-  const sort = params.get("sort");
-  const order = params.get("order") === "asc" ? "asc" : "desc";
+  const presetParam = params.get("preset");
+  const preset = presetParam
+    ? view.presets.find((candidate) => candidate.code === presetParam)
+    : view.presets[0];
+  // Explicit sort wins; otherwise the selected preset owns the ranking.
+  const explicitSort = params.get("sort");
+  const sort = explicitSort ?? preset?.sort?.column ?? null;
+  const order =
+    explicitSort === null
+      ? (preset?.sort?.order ?? "desc")
+      : params.get("order") === "asc"
+        ? "asc"
+        : "desc";
   rows = [...rows].sort((ra, rb) => {
     const cmp = sort ? compareCells(ra.data[sort], rb.data[sort], order) : 0;
     return cmp !== 0 ? cmp : ra.entity.localeCompare(rb.entity);
@@ -1134,10 +1228,6 @@ function frameResponse(viewCode, params) {
 
   // Mirror the backend admission: a preset (default = first) selects the
   // frame columns, lazy columns never ride the frame.
-  const presetParam = params.get("preset");
-  const preset = presetParam
-    ? view.presets.find((p) => p.code === presetParam)
-    : view.presets[0];
   const frameColumns = (preset?.columns ?? view.columns.map((c) => c.code))
     .map((code) => view.columns.find((c) => c.code === code && !c.lazy))
     .filter((c) => c !== undefined);
