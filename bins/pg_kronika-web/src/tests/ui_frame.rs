@@ -702,7 +702,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
 }
 
 #[test]
-fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
+fn activity_links_a_unique_same_snapshot_process_by_pid() {
     let request = FrameRequest::parse(
         "activity",
         Some("at=20000000&columns=queryid,process_link,cpu,rss,threads,read_bytes_per_second,write_bytes_per_second,command"),
@@ -760,7 +760,7 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
         frame.rows[0].cells,
         vec![
             DtoFrameValue::Number(424_242.0),
-            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Number(0.09),
             DtoFrameValue::Number(262_144.0),
             DtoFrameValue::Number(8.0),
@@ -772,7 +772,7 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
 }
 
 #[test]
-fn activity_leaves_every_process_scalar_null_for_an_ambiguous_pid() {
+fn activity_keeps_the_pid_link_visible_but_leaves_ambiguous_process_scalars_null() {
     let request = FrameRequest::parse(
         "activity",
         Some("at=20000000&columns=process_link,rss,threads,command"),
@@ -806,7 +806,7 @@ fn activity_leaves_every_process_scalar_null_for_an_ambiguous_pid() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
-            DtoFrameValue::Null,
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Null,
             DtoFrameValue::Null,
             DtoFrameValue::Null,
@@ -839,8 +839,8 @@ fn activity_process_relation_keeps_unique_pid_evidence_best_effort() {
         relations[0].kind,
         crate::ui::catalog::RelationKind::BestEffort
     );
-    assert_eq!(relations[0].method, "same_snapshot_unique_pid");
-    assert_eq!(relations[0].fields, vec!["pid", "ts"]);
+    assert_eq!(relations[0].method, "pid");
+    assert_eq!(relations[0].fields, vec!["pid"]);
     assert!(!relations[0].entity.is_empty());
 
     let absent = ProjectionInput::single(20_000_000, "pg_stat_activity", activity.clone());
@@ -859,12 +859,38 @@ fn activity_process_relation_keeps_unique_pid_evidence_best_effort() {
             ("starttime", Value::Ts(3_000_000)),
         ]),
     );
-    assert!(
-        activity_process_relations(&activity, &input)
-            .expect("ambiguous relation")
-            .is_empty(),
-        "a same-snapshot PID collision must not choose a process lifetime"
+    let candidates = activity_process_relations(&activity, &input).expect("PID links");
+    assert_eq!(candidates.len(), 2, "all same-PID processes stay linked");
+    assert!(candidates.iter().all(|relation| relation.method == "pid"));
+    assert_ne!(candidates[0].entity, candidates[1].entity);
+}
+
+#[test]
+fn activity_keeps_the_pid_link_across_a_collection_gap() {
+    let activity = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("pid", Value::I64(7)),
+        ("backend_start", Value::Ts(1_000_000)),
+    ]);
+    let mut input = ProjectionInput::single(20_000_000, "pg_stat_activity", activity.clone());
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+        ]),
     );
+
+    let relations = activity_process_relations(&activity, &input).expect("PID link");
+    assert_eq!(relations.len(), 1);
+    assert_eq!(
+        relations[0].kind,
+        crate::ui::catalog::RelationKind::BestEffort
+    );
+    assert_eq!(relations[0].method, "pid");
+    assert_eq!(relations[0].fields, vec!["pid"]);
 }
 
 #[test]
@@ -1128,7 +1154,7 @@ fn activity_cpu_uses_the_same_instance_clock() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
-            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Number(0.09),
         ]
     );
@@ -1193,7 +1219,7 @@ fn tick_rates_are_null_without_a_positive_clock() {
 }
 
 #[test]
-fn activity_rejects_ambiguous_same_snapshot_pid_process_evidence() {
+fn activity_keeps_ambiguous_pid_links_but_rejects_ambiguous_counter_deltas() {
     let request = FrameRequest::parse(
         "activity",
         Some("at=20000000&columns=process_link,cpu,read_bytes_per_second,write_bytes_per_second"),
@@ -1244,7 +1270,7 @@ fn activity_rejects_ambiguous_same_snapshot_pid_process_evidence() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
-            DtoFrameValue::Null,
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Null,
             DtoFrameValue::Null,
             DtoFrameValue::Null,
@@ -1329,7 +1355,7 @@ fn activity_does_not_bridge_process_counters_across_starttime() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
-            DtoFrameValue::String("best_effort".to_owned()),
+            DtoFrameValue::String("pid".to_owned()),
             DtoFrameValue::Null,
             DtoFrameValue::Null,
             DtoFrameValue::Null,

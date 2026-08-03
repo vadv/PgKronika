@@ -15,6 +15,7 @@ import type { TimeRange } from "../state/timeGeometry";
 import { Tooltip } from "./Tooltip";
 import { ProvenancePopover } from "./ProvenancePopover";
 import {
+  aggregateEventBuckets,
   bucketReason,
   bucketVerdicts,
   chipTone,
@@ -60,8 +61,9 @@ const SVG_WIDTH = 1000;
 /** Verdict ribbon band (top of the strip). */
 const RIBBON_Y = 2;
 const RIBBON_H = 8;
-/** Event glyph row baseline. */
-const GLYPH_Y = 20;
+/** Event density row baseline. */
+const EVENT_LANE_BOTTOM = 23;
+const EVENT_BUCKETS = 48;
 /** Load sparkline band (bottom of the strip). */
 const SPARK_Y = 26;
 const SPARK_H = 12;
@@ -262,6 +264,20 @@ export function Spine(props: SpineProps) {
     const ts = e.occurred_at_us ?? e.sort_ts_us;
     return ts >= fromUs && ts <= toUs;
   });
+  const eventBuckets = aggregateEventBuckets(
+    visibleEvents,
+    fromUs,
+    toUs,
+    EVENT_BUCKETS,
+  );
+  const maxEventCount = Math.max(
+    1,
+    ...eventBuckets.map((bucket) => bucket?.count ?? 0),
+  );
+  const visibleEventCount = visibleEvents.reduce(
+    (total, event) => total + Math.max(1, event.occurrence_count),
+    0,
+  );
 
   // Health points split into the current window and the previous one by
   // interval midpoint; buckets without a point stay honest gaps.
@@ -1019,22 +1035,42 @@ export function Spine(props: SpineProps) {
               vectorEffect="non-scaling-stroke"
             />
           )}
-          {visibleEvents.map((e) => {
-            const ts = e.occurred_at_us ?? e.sort_ts_us;
-            const g = glyphOf(e);
+          {eventBuckets.map((bucket, index) => {
+            if (bucket === null) return null;
+            const width = SVG_WIDTH / EVENT_BUCKETS;
+            const x = index * width;
+            const height = 3 + (bucket.count / maxEventCount) * 8;
+            const kinds = new Map<string, number>();
+            for (const event of bucket.events) {
+              kinds.set(
+                event.event_kind,
+                (kinds.get(event.event_kind) ?? 0) +
+                  Math.max(1, event.occurrence_count),
+              );
+            }
+            const detail = [...kinds.entries()]
+              .sort((left, right) => right[1] - left[1])
+              .slice(0, 3)
+              .map(
+                ([kind, count]) =>
+                  `${eventKindLabel(t, kind)}${count > 1 ? ` ×${count}` : ""}`,
+              )
+              .join(" · ");
             return (
-              <text
-                key={e.event_instance_id}
-                data-event-kind={e.event_kind}
-                x={timestampX(ts)}
-                y={GLYPH_Y}
-                fontSize="10"
-                textAnchor="middle"
-                fill={GLYPH_FILL[g.tone]}
+              <rect
+                key={index}
+                data-testid="spine-event-density"
+                data-event-count={bucket.count}
+                x={x + 1}
+                y={EVENT_LANE_BOTTOM - height}
+                width={Math.max(2, width - 2)}
+                height={height}
+                rx={1.5}
+                fill={GLYPH_FILL[bucket.tone]}
+                opacity={0.82}
               >
-                <title>{`${eventKindLabel(t, e.event_kind)} · ${new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "medium" }).format(new Date(ts / 1000))}`}</title>
-                {g.glyph}
-              </text>
+                <title>{`${t("healthLine.eventBucket", { count: bucket.count })} · ${detail}`}</title>
+              </rect>
             );
           })}
         </svg>
@@ -1070,6 +1106,10 @@ export function Spine(props: SpineProps) {
               })}
             >
               {`Q ${observedBuckets}/${scored.length}`}
+            </span>{" "}
+            ·{" "}
+            <span style={{ color: "var(--fg)" }}>
+              {t("healthLine.events", { count: visibleEventCount })}
             </span>{" "}
             ·{" "}
             {primary !== null && currentValue !== null && (

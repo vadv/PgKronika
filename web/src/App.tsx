@@ -16,7 +16,7 @@ import type { ViewSpec } from "./api/types";
 import { ActivityWorkspace } from "./components/ActivityWorkspace";
 import { AlertBar } from "./components/AlertBar";
 import { DockOverlay } from "./components/DockOverlay";
-import { EventsSignalPanel } from "./components/EventsSignalPanel";
+import { EventsWorkspace } from "./components/EventsWorkspace";
 import { FocusBar } from "./components/FocusBar";
 import { ForensicSearch } from "./components/ForensicSearch";
 import { Header } from "./components/Header";
@@ -130,23 +130,6 @@ const EVENT_LENSES = [
   ["eventSlowQueries", "slow"],
   ["eventCollectorHealth", "collector_health"],
 ] as const;
-
-function eventFrameFilter(preset: string | null): string | null {
-  switch (preset) {
-    case "errors":
-      return "category_code=*error*";
-    case "checkpoints":
-      return "category_code=pg.checkpoint.*";
-    case "vacuum":
-      return "category_code=pg.maintenance.*";
-    case "slow":
-      return "category_code=pg.query.slow_*";
-    case "collector_health":
-      return "category_code=collector.*";
-    default:
-      return null;
-  }
-}
 
 function catalogPreparedLens(
   view: ViewSpec | undefined,
@@ -353,9 +336,8 @@ function Shell() {
   const eventsScreen = activeView?.code === "events";
   const infrastructureEvidenceScreen =
     tablesScreen || indexesScreen || vacuumScreen;
-  const evidencePanelScreen = infrastructureEvidenceScreen || eventsScreen;
-  const denseHeatmapScreen =
-    activityScreen || infrastructureEvidenceScreen || eventsScreen;
+  const evidencePanelScreen = infrastructureEvidenceScreen;
+  const denseHeatmapScreen = activityScreen || infrastructureEvidenceScreen;
   const effectivePreset = statementsScreen
     ? (state.preset ?? "time")
     : activityScreen
@@ -595,10 +577,7 @@ function Shell() {
                 : eventsScreen
                   ? t("events.filterHint")
                   : undefined;
-  const frameQuery =
-    eventsScreen && state.q === null
-      ? eventFrameFilter(effectivePreset)
-      : state.q;
+  const frameQuery = state.q;
   // A preset owns its default ranking. Carrying an explicit sort from the
   // previous lens can leave the matrix invisibly ranked by a hidden column.
   const selectPreset = (preset: string | null) => {
@@ -1056,7 +1035,7 @@ function Shell() {
           }}
         >
           <HealthLine />
-          {(state.view === "locks" || state.view === "processes") && (
+          {state.view === "locks" && (
             <aside
               data-testid="contextual-deep-link"
               role="status"
@@ -1145,7 +1124,8 @@ function Shell() {
             !statementsScreen &&
             !activityScreen &&
             !plansScreen &&
-            !processesScreen && (
+            !processesScreen &&
+            !eventsScreen && (
               <div
                 data-shell-region="analytical-center"
                 data-testid={
@@ -1205,25 +1185,6 @@ function Shell() {
                               sort: null,
                               order: null,
                             }),
-                      })
-                    }
-                  />
-                )}
-                {eventsScreen && (
-                  <EventsSignalPanel
-                    from={range.fromUs}
-                    to={range.toUs}
-                    preset={effectivePreset}
-                    onInvestigate={(view, atUs) =>
-                      patch({
-                        view,
-                        at: atUs,
-                        preset: null,
-                        sort: null,
-                        order: null,
-                        q: null,
-                        entity: null,
-                        dock: null,
                       })
                     }
                   />
@@ -1344,6 +1305,34 @@ function Shell() {
                 onSort={onTableSort}
                 onSelectRow={onSelectRow}
                 onMatched={setMatched}
+              />
+            ) : eventsScreen ? (
+              <EventsWorkspace
+                view={activeView}
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                metric={selectedMetric}
+                preset={effectivePreset}
+                q={frameQuery}
+                selectedRange={range}
+                cursorUs={at}
+                hoverUs={hoverUs}
+                brushDraft={brushDraft}
+                baselineUs={state.baseline}
+                onMetricChange={selectMetric}
+                onSelectEntity={(entity) => patch({ entity, dock: "row" })}
+                onInvestigate={(view, atUs) =>
+                  patch({
+                    view,
+                    at: atUs,
+                    preset: null,
+                    sort: null,
+                    order: null,
+                    q: null,
+                    entity: null,
+                    dock: null,
+                  })
+                }
               />
             ) : (
               <TableView

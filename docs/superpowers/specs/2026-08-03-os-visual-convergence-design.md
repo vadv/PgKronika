@@ -88,8 +88,9 @@ zero-pressure host.
 
 ## Process matrix grammar
 
-- Sticky identity combines PID and process type. PID alone is not a lifetime;
-  starttime remains part of the server entity identity and Entity Detail.
+- Sticky identity combines PID and process type. Process Entity Detail may keep
+  `starttime` for rate-delta continuity and history, while Activity navigation
+  links every retained entity with the same PID.
 - Aggregate columns follow the selected catalog preset and remain sortable.
 - Every rendered row contains exactly 96 temporal buckets on desktop and 48 on
   mobile.
@@ -108,13 +109,34 @@ zero-pressure host.
 ## Detail and relation boundaries
 
 Selecting a process opens the existing reusable Entity Detail with point,
-history, relations and raw projection views. Activity attribution is shown only
-when the server publishes the existing unique same-snapshot PID candidate.
-Cross-time PID coincidence is never upgraded to an exact process↔query link.
+history, relations and raw projection views. Activity and OS-process histories
+are linked by PID, including across retained collection gaps. `starttime` is
+used only for process-rate delta continuity and never hides the navigation
+relationship.
 
 The matrix does not add a separate evidence inspector filled with inferred
 mechanisms. Findings, events and relationships remain independently sourced and
 retain their own provenance in Detail and Signals.
+
+## Shared Health and Events convergence
+
+The persistent 60 px Health line aggregates event facts into 48 bounded
+density buckets. One interval renders one bar whose height is occurrence count
+and whose colour is the strongest event family in that interval. It never
+stacks one glyph per fact. The right summary exposes the total occurrence count
+for the selected window.
+
+The Events screen owns range evidence instead of stretching a point-in-time
+frame row over the remaining viewport. Its investigation body contains:
+
+- the existing 96-bucket family heatmap and six newest Signals;
+- a scrollable timeline of up to 200 typed event facts from the selected range;
+- occurrence and retained-fact totals;
+- ranked event-family density and collection-quality fields;
+- client-side prepared-lens and typed-filter application, with typed input
+  taking priority.
+
+At 1920×1080 the screen has no empty table canvas while range facts exist.
 
 ## States and accessibility
 

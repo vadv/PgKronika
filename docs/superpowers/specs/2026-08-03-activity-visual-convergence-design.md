@@ -4,8 +4,8 @@
 
 Replace the detached Activity heatmap plus generic table with one dense forensic
 workspace that answers, at a glance, which PostgreSQL backends were observed,
-what they were doing or waiting for, which OS process evidence can be joined,
-and how trustworthy that join is.
+what they were doing or waiting for, and which OS process history is linked by
+the same PID.
 
 The baseline viewport is 1920×1080. Health Line remains the only upper chart.
 The Activity workspace owns the remaining height and must not make the document
@@ -62,10 +62,13 @@ without the UI claiming statistical or causal correlation.
 - Sticky backend identity combines PID with `database / user · application`.
 - PostgreSQL context, relation quality, OS metrics and observed samples are
   visually grouped in the header.
-- `process_link` is rendered as `best_effort` only for one unique same-snapshot
-  PID candidate. Missing and ambiguous candidates stay unavailable.
-- Overview publishes `process_link`, CPU, RSS, read/s and write/s only from that
-  candidate. CPU and I/O rates preserve the existing reset/continuity rules.
+- `process_link` is visible whenever retained Activity and OS-process evidence
+  has the same PID. All matching process entities remain reachable, including
+  candidates across collection gaps.
+- Overview publishes scalar CPU, RSS, read/s and write/s only when one current
+  process sample is unambiguous. CPU and I/O deltas preserve the existing
+  reset/continuity rules and use `starttime` only to protect that calculation;
+  this never hides the PID navigation link.
 - Activity rows remain virtualized and independently scrollable.
 - The temporal lane uses 96 buckets on desktop and 48 on mobile. A coloured
   bucket means an observed sample contributed evidence; a blank bucket is not
@@ -90,12 +93,12 @@ renamed to lock wait age.
 Selecting an Activity row continues to open universal Entity Detail. Its
 Activity→Process relation must show:
 
-- relation kind `best_effort`;
-- method `same_snapshot_unique_pid`;
-- fields `pid, ts`;
-- the related process identity, whose own lifetime remains `(pid,starttime)`.
+- the human label “Linked by PID” / “Связано по PID”;
+- method `pid` and field `pid` on the wire;
+- every retained related process entity with that PID.
 
-The UI must not equate PostgreSQL `backend_start` with Linux `starttime`.
+Linux `starttime` remains internal to rate-delta continuity and process entity
+history. It does not decide whether Activity and process history are linked.
 
 ## Data contract additions
 
@@ -108,8 +111,8 @@ row:
 - richer Overview, CPU and Disk I/O presets containing the explicit
   `process_link` quality column.
 
-These additions do not broaden the join. Ambiguous or absent process candidates
-produce null for every OS-derived Activity value.
+Ambiguous current process candidates produce null for OS-derived scalar values,
+while every same-PID relationship remains available for navigation.
 
 ## States and accessibility
 
@@ -127,6 +130,7 @@ produce null for every OS-derived Activity value.
 - Overview, CPU and Waits & Locks are materially distinct and URL-addressable.
 - Every rendered temporal row contains exactly 96 buckets on desktop.
 - Point-snapshot and missed-short-query caveats are visible.
-- Process relation provenance remains `best_effort / same_snapshot_unique_pid`.
+- Process relationships render as “Linked by PID” and retain every same-PID
+  candidate.
 - Frontend and Rust tests, formatting, lint, clippy, visual verifier and bundle
   budget pass.

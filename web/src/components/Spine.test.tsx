@@ -253,7 +253,7 @@ function stubPartialFetch(failedSources: ReadonlySet<string>) {
   };
 }
 
-test("renders verdict ribbon, score chip, glyphs, sparkline and summary", async () => {
+test("renders verdict ribbon, score chip, event density, sparkline and summary", async () => {
   renderSpine();
   await waitFor(() =>
     expect(screen.getAllByTestId("spine-ribbon-ok").length).toBeGreaterThan(0),
@@ -274,16 +274,15 @@ test("renders verdict ribbon, score chip, glyphs, sparkline and summary", async 
   // 100 − 15×3 − 15×0.5 − 1×5 = 42.5 → 43; prev window is fully calm.
   expect(screen.getByTestId("spine-score").textContent).toContain("43");
   expect(screen.getByTestId("spine-score-delta").textContent).toContain("▼57");
-  // Event glyphs per the approved mapping.
-  expect(screen.getByText("●")).toBeDefined();
-  expect(screen.getByText("◆")).toBeDefined();
-  expect(screen.getByText("○")).toBeDefined();
+  // Event facts are aggregated into bounded density cells, never piled up.
+  expect(screen.getAllByTestId("spine-event-density")).toHaveLength(3);
   // Load sparkline skips the null bucket (one 2-point segment).
   const spark = screen.getByTestId("spine-load-line");
   expect(spark.getAttribute("points")?.split(" ")).toHaveLength(2);
   // Right summary: cursor time + current load + crit/warn counts.
   const summary = screen.getByTestId("spine-summary");
   expect(summary.textContent).toContain("host.load1");
+  expect(summary.textContent).toContain("healthLine.events");
   expect(summary.textContent).toContain("▲24");
   expect(summary.textContent).toContain("●24");
   expect(screen.getByTestId("spine-cursor")).toBeDefined();
@@ -507,7 +506,7 @@ test("event evidence remains visible when health and spine responses are empty",
   });
 
   expect(await screen.findByRole("slider")).toBeDefined();
-  expect(screen.getByText("◆")).toBeDefined();
+  expect(screen.getAllByTestId("spine-event-density")).toHaveLength(3);
   expect(screen.queryByTestId("spine-state")).toBeNull();
 });
 

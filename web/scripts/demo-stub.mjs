@@ -1055,7 +1055,7 @@ function rowsActivity() {
         query_duration_us: state === "idle" ? null : dur,
         transaction_duration_us:
           state === "idle in transaction" ? r2(dur * 3.2) : null,
-        process_link: i % 9 === 4 ? null : "best_effort",
+        process_link: i % 9 === 4 ? null : "pid",
         cpu:
           i % 9 === 4
             ? null
@@ -1801,7 +1801,7 @@ function entityResponse(viewCode, entity, params) {
     if (
       params.get("include") === "related" &&
       viewCode === "activity" &&
-      row.data.process_link === "best_effort"
+      row.data.process_link === "pid"
     ) {
       const process = rowsProcesses().find(
         (candidate) => candidate.data.pid === row.data.pid,
@@ -1813,8 +1813,8 @@ function entityResponse(viewCode, entity, params) {
           relation: "activity_process",
           provenance: {
             kind: "best_effort",
-            method: "same_snapshot_unique_pid",
-            fields: ["pid", "ts"],
+            method: "pid",
+            fields: ["pid"],
           },
         });
       }

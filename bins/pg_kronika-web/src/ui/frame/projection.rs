@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -222,25 +222,10 @@ impl ProjectionInput {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ActivityProcessEvidence<'a> {
-    Unique(&'a OutRow),
-    Ambiguous,
-}
-
-impl<'a> ActivityProcessEvidence<'a> {
-    const fn unique(self) -> Option<&'a OutRow> {
-        match self {
-            Self::Unique(row) => Some(row),
-            Self::Ambiguous => None,
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct ActivityProcessIndex<'a> {
-    current: BTreeMap<u64, ActivityProcessEvidence<'a>>,
-    previous: BTreeMap<(u64, i64), ActivityProcessEvidence<'a>>,
+    current: BTreeMap<u64, Vec<&'a OutRow>>,
+    previous: BTreeMap<(u64, i64), Vec<&'a OutRow>>,
 }
 
 impl<'a> ActivityProcessIndex<'a> {
@@ -253,14 +238,7 @@ impl<'a> ActivityProcessIndex<'a> {
             let Some(pid) = process_pid_key(process) else {
                 continue;
             };
-            match index.current.entry(pid) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(ActivityProcessEvidence::Unique(process));
-                }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    slot.insert(ActivityProcessEvidence::Ambiguous);
-                }
-            }
+            index.current.entry(pid).or_default().push(process);
         }
         let Some(previous_ts_us) = input.predecessor_ts_us else {
             return index;
@@ -275,23 +253,21 @@ impl<'a> ActivityProcessIndex<'a> {
             ) else {
                 continue;
             };
-            match index.previous.entry((pid, starttime)) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(ActivityProcessEvidence::Unique(process));
-                }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    slot.insert(ActivityProcessEvidence::Ambiguous);
-                }
-            }
+            index
+                .previous
+                .entry((pid, starttime))
+                .or_default()
+                .push(process);
         }
         index
     }
 
     fn current_candidate(&self, activity: &OutRow) -> Option<&'a OutRow> {
-        self.current
-            .get(&process_pid_key(activity)?)
-            .copied()
-            .and_then(ActivityProcessEvidence::unique)
+        let candidates = self.current.get(&process_pid_key(activity)?)?;
+        match candidates.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        }
     }
 
     fn predecessor(&self, current: &OutRow) -> Option<&'a OutRow> {
@@ -299,10 +275,33 @@ impl<'a> ActivityProcessIndex<'a> {
             process_pid_key(current)?,
             timestamp(current, "starttime").ok().flatten()?,
         );
-        self.previous
-            .get(&key)
+        let candidates = self.previous.get(&key)?;
+        match candidates.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        }
+    }
+
+    fn pid_candidates(&self, activity: &OutRow) -> Vec<&'a OutRow> {
+        let Some(pid) = process_pid_key(activity) else {
+            return Vec::new();
+        };
+        self.current
+            .get(&pid)
+            .into_iter()
+            .flatten()
             .copied()
-            .and_then(ActivityProcessEvidence::unique)
+            .chain(
+                self.previous
+                    .iter()
+                    .filter(move |((candidate_pid, _starttime), _rows)| *candidate_pid == pid)
+                    .flat_map(|(_key, rows)| rows.iter().copied()),
+            )
+            .collect()
+    }
+
+    fn has_pid_link(&self, activity: &OutRow) -> bool {
+        !self.pid_candidates(activity).is_empty()
     }
 }
 
@@ -1298,6 +1297,7 @@ fn project_activity(
     } else {
         None
     };
+    let process_linked = needs_process && process_index.has_pid_link(row);
     let previous_process = if columns.iter().any(|column| {
         matches!(
             column.code,
@@ -1309,9 +1309,14 @@ fn project_activity(
         None
     };
     for column in columns {
-        let value = if let Some(value) =
-            activity_process_value(column, current_process, previous_process, input, continuity)
-        {
+        let value = if let Some(value) = activity_process_value(
+            column,
+            process_linked,
+            current_process,
+            previous_process,
+            input,
+            continuity,
+        ) {
             value
         } else {
             match column.code {
@@ -1348,15 +1353,20 @@ fn project_activity(
 
 fn activity_process_value(
     column: &ColumnSpec,
+    linked: bool,
     current: Option<&OutRow>,
     previous: Option<&OutRow>,
     input: &ProjectionInput,
     continuity: ContinuityVerdict,
 ) -> Option<FrameValue> {
     let value = match column.code {
-        "process_link" => current.map_or(FrameValue::Null, |_process| {
-            FrameValue::String("best_effort".to_owned())
-        }),
+        "process_link" => {
+            if linked {
+                FrameValue::String("pid".to_owned())
+            } else {
+                FrameValue::Null
+            }
+        }
         "cpu" => current.map_or(FrameValue::Null, |row| {
             tick_rate_sum(row, previous, &["utime", "stime"], input, continuity)
         }),
@@ -1397,18 +1407,24 @@ pub(crate) fn activity_process_relations(
     input: &ProjectionInput,
 ) -> Result<Vec<ProjectedRelation>, ProjectionError> {
     let process_index = ActivityProcessIndex::from_input(input);
-    let Some(process) = process_index.current_candidate(activity) else {
-        return Ok(Vec::new());
-    };
     let process_view = web_view_by_name("processes").ok_or(ProjectionError::MissingCatalogView)?;
-    Ok(vec![ProjectedRelation {
-        relation: "activity_process",
-        view: "processes",
-        entity: entity_for(process_view, "os_process", process, input.snapshot_ts_us)?,
-        kind: RelationKind::BestEffort,
-        method: "same_snapshot_unique_pid",
-        fields: vec!["pid", "ts"],
-    }])
+    let mut seen = BTreeSet::new();
+    let mut relations = Vec::new();
+    for process in process_index.pid_candidates(activity) {
+        let entity = entity_for(process_view, "os_process", process, input.snapshot_ts_us)?;
+        if !seen.insert(entity.clone()) {
+            continue;
+        }
+        relations.push(ProjectedRelation {
+            relation: "activity_process",
+            view: "processes",
+            entity,
+            kind: RelationKind::BestEffort,
+            method: "pid",
+            fields: vec!["pid"],
+        });
+    }
+    Ok(relations)
 }
 
 fn same_snapshot_object(source: &OutRow, candidate: &OutRow, snapshot_ts_us: i64) -> bool {

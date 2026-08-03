@@ -549,9 +549,9 @@ fn activity_view() -> ViewSpec {
             left: "activity",
             right: "process",
             kind: RelationKind::BestEffort,
-            fields: vec!["pid", "ts"],
-            cardinality: "zero_or_one",
-            provenance: "same_snapshot_pid_only",
+            fields: vec!["pid"],
+            cardinality: "zero_or_many",
+            provenance: "pid",
         },
         JoinSpec {
             left: "activity",
@@ -651,7 +651,7 @@ fn activity_view() -> ViewSpec {
         derived_column(
             "process_link",
             ValueType::Text,
-            "best_effort same-snapshot PID association",
+            "Activity and OS-process histories linked by PID",
             &["activity", "process"],
             None,
         ),

@@ -10,6 +10,7 @@ interface EventsSignalPanelProps {
   from: string;
   to: string;
   preset: string | null;
+  q?: string | null;
   onInvestigate: (view: string, atUs: string, eventInstance: string) => void;
 }
 
@@ -29,7 +30,10 @@ const panel: CSSProperties = {
   fontSize: "var(--text-xs)",
 };
 
-function eventMatchesPreset(event: EventFact, preset: string | null): boolean {
+export function eventMatchesPreset(
+  event: EventFact,
+  preset: string | null,
+): boolean {
   const code = event.event_kind;
   switch (preset) {
     case "errors":
@@ -47,7 +51,49 @@ function eventMatchesPreset(event: EventFact, preset: string | null): boolean {
   }
 }
 
-function investigationView(event: EventFact): string {
+function eventField(event: EventFact, field: string): string {
+  switch (field) {
+    case "category_code":
+    case "event_kind":
+      return event.event_kind;
+    case "severity_code":
+      return "severity" in event.payload
+        ? String(event.payload.severity)
+        : event.notable_class;
+    case "entity_kind":
+      return event.entity?.kind ?? "";
+    case "identity_quality":
+      return event.identity_quality;
+    case "evidence_quality":
+      return event.evidence_quality;
+    default:
+      return "";
+  }
+}
+
+export function eventMatchesQuery(
+  event: EventFact,
+  query: string | null,
+): boolean {
+  const typed = query?.trim();
+  if (!typed) return true;
+  return typed.split(/\s+&&\s+/).every((term) => {
+    const match = term.match(/^([a-z_]+)\s*=\s*(.+)$/i);
+    if (match === null) {
+      const haystack =
+        `${event.event_kind} ${event.entity?.kind ?? ""}`.toLowerCase();
+      return haystack.includes(term.toLowerCase());
+    }
+    const [, field = "", raw = ""] = match;
+    const expected = raw.trim().toLowerCase();
+    const actual = eventField(event, field.toLowerCase()).toLowerCase();
+    return expected.endsWith("*")
+      ? actual.startsWith(expected.slice(0, -1))
+      : actual === expected;
+  });
+}
+
+export function investigationView(event: EventFact): string {
   switch (event.entity?.kind) {
     case "host":
     case "filesystem":
@@ -64,7 +110,7 @@ function investigationView(event: EventFact): string {
   }
 }
 
-function eventAt(event: EventFact): string {
+export function eventAt(event: EventFact): string {
   return String(event.occurred_at_us ?? event.sort_ts_us);
 }
 
@@ -88,7 +134,11 @@ export function EventsSignalPanel(props: EventsSignalPanelProps) {
     limit: EVENT_REQUEST_LIMIT,
   });
   const matching = [...(events.data?.events ?? [])]
-    .filter((event) => eventMatchesPreset(event, props.preset))
+    .filter((event) =>
+      props.q?.trim()
+        ? eventMatchesQuery(event, props.q)
+        : eventMatchesPreset(event, props.preset),
+    )
     .sort((left, right) => right.sort_ts_us - left.sort_ts_us);
   const visible = matching.slice(0, MAX_SIGNAL_LANES);
   const quality = events.data;
