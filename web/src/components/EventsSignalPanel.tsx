@@ -1,4 +1,3 @@
-import type { CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
 import { eventKindLabel } from "../api/codes";
 import type { EventFact } from "../api/types";
@@ -16,19 +15,6 @@ interface EventsSignalPanelProps {
 
 const MAX_SIGNAL_LANES = 6;
 const EVENT_REQUEST_LIMIT = 50;
-
-const panel: CSSProperties = {
-  minWidth: 0,
-  height: "100%",
-  overflow: "hidden",
-  padding: "var(--space-1)",
-  color: "var(--fg)",
-  background: "var(--bg-raised)",
-  border: "1px solid var(--border)",
-  borderRadius: "var(--radius-md)",
-  fontFamily: "var(--ui-font)",
-  fontSize: "var(--text-xs)",
-};
 
 export function eventMatchesPreset(
   event: EventFact,
@@ -238,16 +224,14 @@ export function eventAt(event: EventFact): string {
   return String(event.occurred_at_us ?? event.sort_ts_us);
 }
 
-function lossText(event: EventFact): string | null {
-  if (event.loss === null) return null;
-  const lowerBound = event.loss.lost_count_lower_bound;
-  const reasons = event.loss.reasons.join(", ");
-  return [
-    lowerBound === null ? null : `lost≥${formatNumber(lowerBound)}`,
-    reasons === "" ? null : reasons,
-  ]
-    .filter((part): part is string => part !== null)
-    .join(" · ");
+function signalPosition(event: EventFact, from: string, to: string): number {
+  const start = BigInt(from);
+  const end = BigInt(to);
+  const span = end - start;
+  if (span <= 0n) return 100;
+  const at = BigInt(eventAt(event));
+  const basisPoints = Number(((at - start) * 10_000n) / span);
+  return Math.min(100, Math.max(0, basisPoints / 100));
 }
 
 export function EventsSignalPanel(props: EventsSignalPanelProps) {
@@ -265,40 +249,25 @@ export function EventsSignalPanel(props: EventsSignalPanelProps) {
     )
     .sort((left, right) => right.sort_ts_us - left.sort_ts_us);
   const visible = matching.slice(0, MAX_SIGNAL_LANES);
-  const quality = events.data;
 
   return (
-    <aside data-testid="events-signal-panel" data-view="events" style={panel}>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "baseline",
-          gap: "var(--space-2)",
-          marginBlockEnd: "var(--space-1)",
-        }}
-      >
-        <strong style={{ fontSize: "var(--text-sm)" }}>
-          {t("eventsSignals.title")}
-        </strong>
+    <aside
+      data-testid="events-signal-panel"
+      data-view="events"
+      className="event-signals"
+    >
+      <header className="event-signals__header">
+        <strong>{t("eventsSignals.title")}</strong>
         <span
-          data-testid="event-signals-quality"
+          data-testid="event-signals-summary"
           role="status"
           aria-live="polite"
-          style={{
-            minWidth: 0,
-            marginInlineStart: "auto",
-            overflow: "hidden",
-            color: "var(--fg-dim)",
-            fontFamily: "var(--mono-font)",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
         >
-          {quality === undefined
+          {events.data === undefined
             ? t("table.loading")
-            : `${quality.completeness} · ${quality.retained_exactness} · ${visible.length}/${matching.length}`}
+            : t("eventsSignals.summary", { count: matching.length })}
         </span>
-      </div>
+      </header>
       {events.isPending ? (
         <div style={{ color: "var(--fg-dim)" }}>{t("table.loading")}</div>
       ) : events.isError ? (
@@ -324,15 +293,17 @@ export function EventsSignalPanel(props: EventsSignalPanelProps) {
       ) : visible.length === 0 ? (
         <div style={{ color: "var(--fg-dim)" }}>{t("eventsSignals.empty")}</div>
       ) : (
-        <div
-          data-testid="event-signal-lanes"
-          style={{ display: "grid", gap: "calc(var(--space-1) / 2)" }}
-        >
+        <div data-testid="event-signal-lanes" className="event-signals__lanes">
           {visible.map((event) => {
             const target = investigationView(event);
-            const lost = lossText(event);
-            const qualityText = `${event.identity_quality}/${event.evidence_quality}`;
             const label = eventKindLabel(t, event.event_kind);
+            const object = event.entity?.kind ?? t("eventsWorkspace.cluster");
+            const targetLabel = t(
+              target === "processes"
+                ? "navigation.destination.os"
+                : `tabs.${target}`,
+              { defaultValue: target === "processes" ? "OS" : target },
+            );
             return (
               <button
                 key={event.event_instance_id}
@@ -341,16 +312,11 @@ export function EventsSignalPanel(props: EventsSignalPanelProps) {
                 data-event-instance={event.event_instance_id}
                 aria-label={t("eventsSignals.investigate", {
                   event: label,
-                  target: t(
-                    target === "processes"
-                      ? "navigation.destination.os"
-                      : `tabs.${target}`,
-                  ),
-                  quality: qualityText,
+                  target: targetLabel,
                 })}
                 title={t("eventsSignals.tooltip", {
-                  eventKind: event.event_kind,
-                  quality: qualityText,
+                  event: label,
+                  object,
                   count: event.supporting_evidence.length,
                 })}
                 onClick={() =>
@@ -360,22 +326,7 @@ export function EventsSignalPanel(props: EventsSignalPanelProps) {
                     event.event_instance_id,
                   )
                 }
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "auto minmax(0, 1fr) auto",
-                  alignItems: "center",
-                  gap: "var(--space-2)",
-                  minWidth: 0,
-                  padding: "0 var(--space-2)",
-                  color: "var(--fg)",
-                  background: "var(--bg)",
-                  border: "1px solid var(--border)",
-                  borderRadius: "var(--radius-sm)",
-                  cursor: "pointer",
-                  fontFamily: "var(--mono-font)",
-                  fontSize: "var(--text-xs)",
-                  textAlign: "start",
-                }}
+                className="event-signal-lane"
               >
                 <time
                   dateTime={new Date(
@@ -384,25 +335,25 @@ export function EventsSignalPanel(props: EventsSignalPanelProps) {
                 >
                   {formatTimestampUs(eventAt(event)).split(", ").at(-1)}
                 </time>
-                <span
-                  style={{
-                    minWidth: 0,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {label} · {qualityText}
-                  {event.occurrence_count > 1
-                    ? ` · ×${formatNumber(event.occurrence_count)}`
-                    : ""}
-                  {lost === null ? "" : ` · ${lost}`}
-                  {` · ${t("eventsSignals.supportingEvidence", {
-                    count: event.supporting_evidence.length,
-                  })}`}
+                <span className="event-signal-lane__identity">
+                  <strong>{label}</strong>
+                  <small>{object}</small>
                 </span>
-                <span style={{ color: "var(--accent-strong)" }}>
-                  → {target === "processes" ? "OS" : target}
+                <span
+                  className="event-signal-lane__timeline"
+                  aria-hidden="true"
+                >
+                  <i
+                    style={{
+                      left: `${signalPosition(event, props.from, props.to)}%`,
+                    }}
+                  />
+                </span>
+                <strong className="event-signal-lane__count">
+                  ×{formatNumber(Math.max(1, event.occurrence_count))}
+                </strong>
+                <span className="event-signal-lane__target">
+                  → {targetLabel}
                 </span>
               </button>
             );
