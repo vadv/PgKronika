@@ -1353,11 +1353,21 @@ function entityResponse(viewCode, entity, params) {
     columns,
     snapshots,
     page: { next: pageIndex < 2 ? `page-${pageIndex + 2}` : null },
-    quality: {
-      status: "partial",
-      gaps: [{ from_us: String(from + step), to_us: String(from + 2 * step) }],
-      gated: [],
-    },
+    quality:
+      pageIndex === 0
+        ? { status: "complete", gaps: [], gated: [] }
+        : pageIndex === 1
+          ? {
+              status: "partial",
+              gaps: [
+                {
+                  from_us: String(from + step),
+                  to_us: String(from + 2 * step),
+                },
+              ],
+              gated: [],
+            }
+          : { status: "partial", gaps: [], gated: ["os_process"] },
   };
 }
 

@@ -268,11 +268,20 @@ test("history preserves quality and follows every opaque continuation", async ()
             },
           ],
           page: { next: page < 3 ? `page-${page + 1}` : null },
-          quality: {
-            status: "partial",
-            gaps: [{ from_us: "1", to_us: "2" }],
-            gated: ["os_process"],
-          },
+          quality:
+            page === 1
+              ? { status: "complete", gaps: [], gated: [] }
+              : page === 2
+                ? {
+                    status: "partial",
+                    gaps: [{ from_us: "1", to_us: "2" }],
+                    gated: [],
+                  }
+                : {
+                    status: "partial",
+                    gaps: [],
+                    gated: ["os_process"],
+                  },
         });
       }
       return Promise.resolve(
@@ -302,11 +311,20 @@ test("history preserves quality and follows every opaque continuation", async ()
 
   await waitFor(() => expect(screen.getByText("12")).toBeDefined());
   fireEvent.click(screen.getByRole("tab", { name: "dock.detail.history" }));
-  expect(await screen.findByText("dock.detail.historyQuality")).toBeDefined();
-  fireEvent.click(screen.getByRole("button", { name: "dock.row.loadMore" }));
+  const firstLoadMore = await screen.findByRole("button", {
+    name: "dock.row.loadMore",
+  });
+  expect(screen.queryByText("dock.detail.historyQuality")).toBeNull();
+  fireEvent.click(firstLoadMore);
   await waitFor(() => expect(screen.getByText("2")).toBeDefined());
+  const pageTwoQuality = screen.getByText("dock.detail.historyQuality");
+  expect(pageTwoQuality.dataset.gaps).toBe("1");
+  expect(pageTwoQuality.dataset.gated).toBe("0");
   fireEvent.click(screen.getByRole("button", { name: "dock.row.loadMore" }));
   await waitFor(() => expect(screen.getByText("3")).toBeDefined());
+  const pageThreeQuality = screen.getByText("dock.detail.historyQuality");
+  expect(pageThreeQuality.dataset.gaps).toBe("1");
+  expect(pageThreeQuality.dataset.gated).toBe("1");
   expect(
     screen.queryByRole("button", { name: "dock.row.loadMore" }),
   ).toBeNull();

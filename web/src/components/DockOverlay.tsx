@@ -673,6 +673,27 @@ function uniqueSnapshots(
   });
 }
 
+function mergeHistoryQuality(
+  existing: EntityHistoryResponse["quality"] | null,
+  incoming: EntityHistoryResponse["quality"],
+): EntityHistoryResponse["quality"] {
+  if (existing === null) return incoming;
+  const gaps = new Map(
+    existing.gaps.map((gap) => [`${gap.from_us}:${gap.to_us}`, gap]),
+  );
+  for (const gap of incoming.gaps) {
+    gaps.set(`${gap.from_us}:${gap.to_us}`, gap);
+  }
+  return {
+    status:
+      existing.status === "complete" && incoming.status === "complete"
+        ? "complete"
+        : "partial",
+    gaps: [...gaps.values()],
+    gated: [...new Set([...existing.gated, ...incoming.gated])].sort(),
+  };
+}
+
 function RowDock(props: {
   state: UiState;
   view: ViewSpec | undefined;
@@ -688,6 +709,9 @@ function RowDock(props: {
   const [historyBase, setHistoryBase] = useState<EntityHistoryResponse | null>(
     null,
   );
+  const [historyQuality, setHistoryQuality] = useState<
+    EntityHistoryResponse["quality"] | null
+  >(null);
   const [extraSnapshots, setExtraSnapshots] = useState<EntitySnapshotDto[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const entityKey = `${props.state.view}:${props.state.entity ?? ""}`;
@@ -721,12 +745,16 @@ function RowDock(props: {
   useEffect(() => {
     setHistoryCursor(null);
     setHistoryBase(null);
+    setHistoryQuality(null);
     setExtraSnapshots([]);
     setNextCursor(null);
   }, [historyKey]);
   useEffect(() => {
     const data = history.data;
     if (data === undefined) return;
+    setHistoryQuality((previous) =>
+      mergeHistoryQuality(previous, data.quality),
+    );
     if (historyCursor !== null) {
       setExtraSnapshots((previous) =>
         uniqueSnapshots(previous, data.snapshots),
@@ -774,6 +802,7 @@ function RowDock(props: {
           ...visibleHistory,
           snapshots: uniqueSnapshots(visibleHistory.snapshots, extraSnapshots),
           page: { next: nextCursor },
+          quality: historyQuality ?? visibleHistory.quality,
         };
 
   const [tokenCopied, setTokenCopied] = useState(false);
@@ -940,6 +969,8 @@ function RowDock(props: {
                     {combinedHistory.quality.status !== "complete" && (
                       <div
                         data-history-quality
+                        data-gaps={combinedHistory.quality.gaps.length}
+                        data-gated={combinedHistory.quality.gated.length}
                         role="note"
                         style={{
                           color: "var(--sev-warn-fg)",

@@ -655,9 +655,10 @@ async function verifyGlobalSearchDetail(page) {
       timeout: 10_000,
     },
   );
-  await page.waitForSelector('[data-dock="row"] [data-history-quality]', {
-    timeout: 5_000,
-  });
+  const initialHistoryQuality = await page.$(
+    '[data-dock="row"] [data-history-quality]',
+  );
+  const initialHistoryQualityVisible = initialHistoryQuality !== null;
   for (const expectedRows of [8, 12]) {
     await page.click('[data-dock="row"] [data-testid="history-load-more"]');
     await page.waitForFunction(
@@ -668,8 +669,13 @@ async function verifyGlobalSearchDetail(page) {
       { timeout: 10_000 },
       expectedRows,
     );
+    if (expectedRows === 8) {
+      await page.waitForSelector('[data-dock="row"] [data-history-quality]', {
+        timeout: 5_000,
+      });
+    }
   }
-  const historyState = await page.evaluate(() => {
+  const historyState = await page.evaluate((initialQualityVisible) => {
     const requests = performance
       .getEntriesByType("resource")
       .map((entry) => entry.name)
@@ -690,13 +696,20 @@ async function verifyGlobalSearchDetail(page) {
       quality:
         document.querySelector('[data-dock="row"] [data-history-quality]')
           ?.textContent ?? "",
+      qualityGaps: document
+        .querySelector('[data-dock="row"] [data-history-quality]')
+        ?.getAttribute("data-gaps"),
+      qualityGated: document
+        .querySelector('[data-dock="row"] [data-history-quality]')
+        ?.getAttribute("data-gated"),
+      initialQualityVisible,
       hasPointAt: url?.searchParams.has("at") ?? null,
       hasRange:
         url?.searchParams.has("from") === true &&
         url.searchParams.has("to") &&
         url.searchParams.has("columns"),
     };
-  });
+  }, initialHistoryQualityVisible);
 
   await page.click('[data-detail-tab-trigger="relationships"]');
   await page.waitForFunction(
@@ -754,7 +767,10 @@ async function verifyGlobalSearchDetail(page) {
     historyState.rows !== 12 ||
     historyState.hasRange !== true ||
     historyState.cursors.join(",") !== ",page-2,page-3" ||
-    !historyState.quality.includes("partial")
+    !historyState.quality.includes("partial") ||
+    historyState.qualityGaps !== "1" ||
+    historyState.qualityGated !== "1" ||
+    historyState.initialQualityVisible !== false
   ) {
     failures.push(`history contract failed: ${JSON.stringify(historyState)}`);
   }
