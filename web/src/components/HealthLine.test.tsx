@@ -130,14 +130,10 @@ test("public Health line is exactly 60 px and leaves mode and zoom to navigation
   await waitFor(() => expect(screen.getByRole("slider")).toBeDefined());
 
   const region = screen.getByTestId("health-line");
-  expect(region.style.height).toBe("60px");
-  expect(region.style.boxSizing).toBe("border-box");
+  expect(getComputedStyle(region).height).toBe("60px");
+  expect(getComputedStyle(region).boxSizing).toBe("border-box");
   expect(screen.getAllByRole("slider")).toHaveLength(1);
-  expect(
-    screen.getByRole("button", {
-      name: "healthLine.provenance.trigger",
-    }),
-  ).toBeDefined();
+  expect(screen.queryByRole("button")).toBeNull();
   expect(screen.queryByRole("group", { name: /spine\.zoom/i })).toBeNull();
   expect(region.getAttribute("aria-describedby")).toBeTruthy();
   expect(screen.getByTestId("health-line-meaning").textContent).toContain(
@@ -145,66 +141,39 @@ test("public Health line is exactly 60 px and leaves mode and zoom to navigation
   );
 });
 
-test("Health score provenance uses the exact selected server window and documents a local non-causal formula", async () => {
-  renderHealthLine();
-  const trigger = await screen.findByRole("button", {
-    name: "healthLine.provenance.trigger",
-  });
-  fireEvent.click(trigger);
-  const dialog = screen.getByRole("dialog");
-  expect(dialog.textContent).toContain(`${FROM_US}–${AT_US}`);
-  expect(dialog.textContent).toContain("spine.score.formula");
-  expect(dialog.textContent).toContain("healthLine.provenance.localAggregate");
-  expect(dialog.textContent).toContain("healthLine.coincidence");
-  expect(dialog.textContent).toContain("96/96");
-  expect(dialog.textContent).not.toMatch(/root cause/i);
-});
-
 test.each(["spine", "events"] as const)(
-  "%s failure stays visible on the Health line but does not make score provenance partial",
+  "%s failure stays out of normal Health chrome while retained observations remain",
   async (source) => {
     renderHealthLine([source]);
-    const trigger = await screen.findByRole("button", {
-      name: "healthLine.provenance.trigger",
-    });
     await waitFor(() =>
-      expect(screen.getByTestId("health-line-source-state")).toBeDefined(),
+      expect(screen.getByTestId("spine-score").textContent).not.toContain("—"),
     );
-    fireEvent.click(trigger);
-    const dialog = screen.getByRole("dialog");
-    expect(dialog.querySelector('[data-field="state"]')).toBeNull();
-    expect(dialog.querySelector('[data-field="reason"]')).toBeNull();
+    expect(screen.queryByTestId("health-line-source-state")).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
   },
 );
 
-test.each([
-  ["health", "healthLine.provenance.healthUnavailable"],
-  ["incidents", "spine.score.incidentsUnavailable"],
-] as const)(
-  "%s failure marks score provenance partial with its exact relevant reason",
-  async (source, reason) => {
-    renderHealthLine([source]);
-    const trigger = await screen.findByRole("button", {
-      name: "healthLine.provenance.trigger",
-    });
-    await waitFor(() =>
-      expect(screen.getByTestId("health-score-state").textContent).toContain(
-        "semantic.state.partial.label",
-      ),
-    );
-    fireEvent.click(trigger);
-    const dialog = screen.getByRole("dialog");
-    const state = dialog.querySelector('[data-field="state"]');
-    expect(state?.querySelector('[data-state="partial"]')).not.toBeNull();
-    expect(
-      dialog.querySelector('[data-field="reason"]')?.textContent,
-    ).toContain(reason);
-    expect(screen.getByTestId("spine-score").textContent).toContain("—");
+test("a missing Health source is shown locally without technical status", async () => {
+  renderHealthLine(["health"]);
+  await waitFor(() =>
     expect(screen.getByTestId("health-score-state").textContent).toContain(
-      "semantic.state.partial.label",
-    );
-  },
-);
+      "data.noSnapshotCurrent",
+    ),
+  );
+  expect(screen.getByTestId("spine-score").textContent).toContain("—");
+  expect(screen.getByTestId("health-line").textContent).not.toMatch(
+    /partial|source|coverage|gap/i,
+  );
+});
+
+test("incident transport does not suppress observed Health", async () => {
+  renderHealthLine(["incidents"]);
+  await waitFor(() =>
+    expect(screen.getByTestId("spine-score").textContent).not.toContain("—"),
+  );
+  expect(screen.queryByTestId("health-score-state")).toBeNull();
+  expect(screen.queryByRole("button")).toBeNull();
+});
 
 test("pointer hover writes the shared time bucket for an external consumer", async () => {
   renderHealthLine();
