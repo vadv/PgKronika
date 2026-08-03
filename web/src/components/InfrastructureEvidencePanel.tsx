@@ -9,7 +9,12 @@ import type {
   FrameValue,
   ViewSpec,
 } from "../api/types";
-import { formatByUnit, formatNumber } from "../design/format";
+import {
+  formatByUnit,
+  formatDurationUs,
+  formatNumber,
+  formatTimestampUs,
+} from "../design/format";
 
 interface InfrastructureEvidencePanelProps {
   view: ViewSpec;
@@ -183,19 +188,35 @@ function TablesEvidence(props: InfrastructureEvidencePanelProps) {
     preset: "progress",
     limit: 3,
   });
-  const provenance =
-    props.view.joins.find(
-      (join) => join.left === "tables" && join.right === "vacuum",
-    )?.provenance ?? "unavailable";
+  const snapshot = frame.data?.snapshot_ts_us;
+  const snapshotMatchesCursor = snapshot === props.at;
+  const snapshotDeltaUs =
+    snapshot === undefined
+      ? null
+      : Math.abs(Number(props.at) - Number(snapshot));
   return (
     <aside
       data-testid="infrastructure-evidence-panel"
       data-view="tables"
+      data-snapshot-ts={snapshot}
+      data-snapshot-match={
+        snapshot === undefined ? undefined : snapshotMatchesCursor
+      }
+      data-snapshot-delta-us={snapshotDeltaUs ?? undefined}
+      data-snapshot-provenance="independent_nearest_vacuum_snapshot"
       style={panel}
     >
-      {heading(t("tableEvidence.activeVacuum"), provenance)}
+      {heading(
+        t("tableEvidence.activeVacuum"),
+        t("tableEvidence.independentSnapshot"),
+      )}
       <div style={{ ...dim, marginBlockEnd: "var(--space-1)" }}>
-        {t("tableEvidence.sameSnapshotOnly")}
+        {snapshot === undefined
+          ? t("tableEvidence.snapshotPending")
+          : t("tableEvidence.snapshotDisclosure", {
+              snapshot: formatTimestampUs(snapshot),
+              delta: formatDurationUs(snapshotDeltaUs ?? 0),
+            })}
       </div>
       {frame.isPending ? (
         <span style={dim}>{t("table.loading")}</span>
@@ -295,6 +316,16 @@ function VacuumEvidence(props: InfrastructureEvidencePanelProps) {
   const pg17 = props.view.columns.find(
     (column) => column.code === "dead_item_ids",
   );
+  const pgVersionNum = props.context?.instance.pg_version_num;
+  const pgMajor =
+    pgVersionNum == null ? null : Math.floor(pgVersionNum / 10_000);
+  const status = (column: typeof pre17, applicable: boolean): string => {
+    if (pgMajor === null) return "unknown";
+    if (!applicable) return "not_applicable";
+    return column?.availability ?? "gated";
+  };
+  const pre17Status = status(pre17, pgMajor !== null && pgMajor <= 16);
+  const pg17Status = status(pg17, pgMajor !== null && pgMajor >= 17);
   return (
     <aside
       data-testid="infrastructure-evidence-panel"
@@ -315,11 +346,19 @@ function VacuumEvidence(props: InfrastructureEvidencePanelProps) {
           marginBlockStart: "var(--space-2)",
         }}
       >
-        <span style={{ padding: "var(--space-1)", background: "var(--bg)" }}>
-          PG10–16 · {pre17?.availability ?? "gated"}
+        <span
+          data-testid="vacuum-pre17-generation"
+          data-status={pre17Status}
+          style={{ padding: "var(--space-1)", background: "var(--bg)" }}
+        >
+          PG10–16 · {t(`status.${pre17Status}`, { defaultValue: pre17Status })}
         </span>
-        <span style={{ padding: "var(--space-1)", background: "var(--bg)" }}>
-          PG17+ · {pg17?.availability ?? "gated"}
+        <span
+          data-testid="vacuum-pg17-generation"
+          data-status={pg17Status}
+          style={{ padding: "var(--space-1)", background: "var(--bg)" }}
+        >
+          PG17+ · {t(`status.${pg17Status}`, { defaultValue: pg17Status })}
         </span>
       </div>
       <div style={{ marginBlockStart: "var(--space-2)" }}>

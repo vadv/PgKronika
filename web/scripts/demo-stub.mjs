@@ -261,12 +261,6 @@ if (tablesCatalog !== undefined) {
   );
   replacePreset(
     tablesCatalog,
-    "size_growth",
-    ["relation", "size", "dead_pct", "xid_age", "mxid_age"],
-    "size",
-  );
-  replacePreset(
-    tablesCatalog,
     "xid_mxid",
     ["relation", "xid_age", "mxid_age", "dead_pct", "size"],
     "xid_age",
@@ -286,12 +280,6 @@ if (indexesCatalog !== undefined) {
       provenance: "same_snapshot_database_relation_oid",
     },
   ];
-  replacePreset(
-    indexesCatalog,
-    "size_growth",
-    ["index", "table", "size", "scans", "last_idx_scan"],
-    "size",
-  );
   replacePreset(
     indexesCatalog,
     "table_context",
@@ -317,13 +305,6 @@ if (vacuumCatalog !== undefined) {
       "elapsed",
     ],
     "dead_tuples",
-  );
-  replacePreset(
-    vacuumCatalog,
-    "wraparound_context",
-    ["pid", "relation", "phase", "progress", "elapsed"],
-    "relation",
-    "asc",
   );
 }
 

@@ -89,13 +89,13 @@ const TABLE_LENSES = [
   ["tableVacuumRisk", "vacuum_risk"],
   ["tableIo", "io"],
   ["tableScanPattern", "scan_pattern"],
-  ["tableSizeGrowth", "size_growth"],
+  ["tableSize", "size"],
   ["tableXidMxid", "xid_mxid"],
 ] as const;
 const INDEX_LENSES = [
   ["indexUsage", "usage"],
   ["indexIo", "io"],
-  ["indexSizeGrowth", "size_growth"],
+  ["indexSize", "size"],
   ["indexUnused", "unused"],
   ["indexTableContext", "table_context"],
 ] as const;
@@ -103,7 +103,6 @@ const VACUUM_LENSES = [
   ["vacuumProgress", "progress"],
   ["vacuumPhase", "phase"],
   ["vacuumDeadItems", "dead_items"],
-  ["vacuumWraparound", "wraparound_context"],
 ] as const;
 
 function catalogPreparedLens(
@@ -402,6 +401,12 @@ function Shell() {
                   catalogPreparedLens(activeView, code, preset),
                 ),
                 {
+                  code: "tableSizeGrowth",
+                  preset: null,
+                  availability: "gated" as const,
+                  reason: t("tables.lens.sizeGrowth.reason"),
+                },
+                {
                   code: "tableDependencies",
                   preset: null,
                   availability: "gated" as const,
@@ -413,6 +418,12 @@ function Shell() {
                   ...INDEX_LENSES.map(([code, preset]) =>
                     catalogPreparedLens(activeView, code, preset),
                   ),
+                  {
+                    code: "indexSizeGrowth",
+                    preset: null,
+                    availability: "gated" as const,
+                    reason: t("indexes.lens.sizeGrowth.reason"),
+                  },
                   {
                     code: "indexDuplication",
                     preset: null,
@@ -431,6 +442,12 @@ function Shell() {
                     ...VACUUM_LENSES.map(([code, preset]) =>
                       catalogPreparedLens(activeView, code, preset),
                     ),
+                    {
+                      code: "vacuumWraparound",
+                      preset: null,
+                      availability: "gated" as const,
+                      reason: t("vacuum.lens.wraparound.reason"),
+                    },
                     {
                       code: "vacuumThroughput",
                       preset: null,

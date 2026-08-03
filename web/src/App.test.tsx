@@ -1134,7 +1134,7 @@ test("Tables and Indexes expose same-snapshot context while unsupported analysis
       "vacuum_risk",
       "io",
       "scan_pattern",
-      "size_growth",
+      "size",
       "xid_mxid",
     ].map((code) => ({
       code,
@@ -1153,17 +1153,13 @@ test("Tables and Indexes expose same-snapshot context while unsupported analysis
     ];
   }
   if (indexes !== undefined) {
-    indexes.presets = [
-      "usage",
-      "io",
-      "size_growth",
-      "unused",
-      "table_context",
-    ].map((code) => ({
-      code,
-      columns: [],
-      sort: { column: "metric", order: "desc" as const },
-    }));
+    indexes.presets = ["usage", "io", "size", "unused", "table_context"].map(
+      (code) => ({
+        code,
+        columns: [],
+        sort: { column: "metric", order: "desc" as const },
+      }),
+    );
     indexes.joins = [
       {
         left: "indexes",
@@ -1197,11 +1193,20 @@ test("Tables and Indexes expose same-snapshot context while unsupported analysis
       .getByRole("button", { name: /^tableDependencies /i })
       .getAttribute("aria-disabled"),
   ).toBe("true");
+  expect(
+    screen
+      .getByRole("button", { name: /^tableSizeGrowth /i })
+      .getAttribute("aria-disabled"),
+  ).toBe("true");
   fireEvent.click(screen.getByRole("tab", { name: /tabs\.indexes/i }));
   expect(
     (await screen.findByTestId("index-table-provenance")).textContent,
   ).toContain("same_snapshot_database_relation_oid");
-  for (const name of [/^indexDuplication /i, /^indexInvalidBuild /i]) {
+  for (const name of [
+    /^indexSizeGrowth /i,
+    /^indexDuplication /i,
+    /^indexInvalidBuild /i,
+  ]) {
     expect(
       screen.getByRole("button", { name }).getAttribute("aria-disabled"),
     ).toBe("true");
@@ -1217,12 +1222,7 @@ test("Vacuum defaults to point progress and discloses unsafe lifetime joins", as
   const availableCatalog = structuredClone(catalogBody);
   const vacuum = availableCatalog.views.find((view) => view.code === "vacuum");
   if (vacuum !== undefined) {
-    vacuum.presets = [
-      "progress",
-      "phase",
-      "dead_items",
-      "wraparound_context",
-    ].map((code) => ({
+    vacuum.presets = ["progress", "phase", "dead_items"].map((code) => ({
       code,
       columns: [],
       sort: { column: "metric", order: "desc" as const },
@@ -1259,6 +1259,7 @@ test("Vacuum defaults to point progress and discloses unsafe lifetime joins", as
       .getAttribute("aria-pressed"),
   ).toBe("true");
   for (const name of [
+    /^vacuumWraparound /i,
     /^vacuumThroughput /i,
     /^vacuumBlockers /i,
     /^vacuumHistory /i,

@@ -104,6 +104,7 @@ test("Tables panel fetches only a bounded active-vacuum lane set", async () => {
     response(
       makeFrameResponse({
         view: "vacuum",
+        snapshot_ts_us: "1722399999000000",
         columns: [
           makeFrameColumn({ code: "relation", type: "text" }),
           makeFrameColumn({ code: "phase", type: "text" }),
@@ -154,6 +155,13 @@ test("Tables panel fetches only a bounded active-vacuum lane set", async () => {
   expect(url.pathname).toBe("/v1/frame/vacuum");
   expect(url.searchParams.get("limit")).toBe("3");
   expect(url.searchParams.get("preset")).toBe("progress");
+  const panel = screen.getByTestId("infrastructure-evidence-panel");
+  expect(panel.getAttribute("data-snapshot-ts")).toBe("1722399999000000");
+  expect(panel.getAttribute("data-snapshot-match")).toBe("false");
+  expect(panel.getAttribute("data-snapshot-delta-us")).toBe("1000000");
+  expect(panel.getAttribute("data-snapshot-provenance")).toBe(
+    "independent_nearest_vacuum_snapshot",
+  );
 });
 
 test("Index and Vacuum panels disclose temporal context and lifetime limits", () => {
@@ -192,6 +200,22 @@ test("Index and Vacuum panels disclose temporal context and lifetime limits", ()
     <InfrastructureEvidencePanel
       view={makeViewSpec({
         code: "vacuum",
+        columns: [
+          {
+            availability: "available",
+            code: "dead_tuples",
+            lazy: false,
+            requires: [],
+            type: "i64",
+          },
+          {
+            availability: "available",
+            code: "dead_item_ids",
+            lazy: false,
+            requires: [],
+            type: "i64",
+          },
+        ],
         capabilities: {
           detail: true,
           history: false,
@@ -203,10 +227,16 @@ test("Index and Vacuum panels disclose temporal context and lifetime limits", ()
       span={3600}
       from="1722396400000000"
       to="1722400000000000"
-      context={undefined}
+      context={makeContextResponse({ instance: { pg_version_num: 160004 } })}
       onOpenEntity={() => {}}
     />,
   );
   expect(screen.getByTestId("vacuum-lifetime-warning")).toBeDefined();
+  expect(
+    screen.getByTestId("vacuum-pre17-generation").getAttribute("data-status"),
+  ).toBe("available");
+  expect(
+    screen.getByTestId("vacuum-pg17-generation").getAttribute("data-status"),
+  ).toBe("not_applicable");
   expect(fetchMock).not.toHaveBeenCalled();
 });
