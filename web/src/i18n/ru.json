@@ -150,6 +150,8 @@
   "lens.eventConfigChanges": "Изменения конфигурации",
   "statements.evidenceNote": "таблица: последний интервал у курсора · heatmap/spark: выбранный диапазон · кандидаты: top time ∪ calls · SQL: detail с лимитом",
   "statements.filterHint": "Поиск только по собранному набору кандидатов. Синтаксис field=value и *glob*; queryid — полный знаковый decimal; lazy SQL-текст не участвует.",
+  "statements.matrix.seriesUnavailable": "временной ряд для запроса не сохранён",
+  "statements.matrix.bucketValue": "{{time}} · {{metric}}: {{value}}",
   "statements.lens.regression.reason": "сопоставимые baseline-дельты ещё не проецируются",
   "statements.lens.observedSamples.reason": "нет доказанной связи activity/process-сэмплов с statement",
   "activity.evidenceNote": "таблица и боковая панель: point snapshot у курсора · heatmap: выбранный диапазон · быстрые запросы могут быть пропущены",
