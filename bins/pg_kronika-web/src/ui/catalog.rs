@@ -1149,7 +1149,7 @@ fn plans_view() -> ViewSpec {
                 ValueType::F64,
                 "positive_delta(total_time) / max(positive_delta(calls), 1)",
                 &["plans"],
-                None,
+                Some("ms"),
             ),
             derived_column(
                 "rows",

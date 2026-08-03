@@ -1159,46 +1159,59 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     );
   }
 
-  await page.goto(
-    `${base}/#source=local&view=plans&at=${at}&span=3600&preset=change_timeline`,
-    { waitUntil: "networkidle0" },
-  );
-  await page.waitForSelector(
-    '[data-testid="workload-evidence-panel"][data-view="plans"]',
-    { timeout: 15_000 },
-  );
-  await page.waitForSelector('[data-testid="plan-version-lanes"] button', {
+  await page.goto(`${base}/#source=local&view=plans&at=${at}&span=3600`, {
+    waitUntil: "networkidle0",
+  });
+  await page.waitForSelector('[data-testid="plans-workspace"]', {
+    timeout: 15_000,
+  });
+  await page.waitForSelector('[data-testid="plans-time-matrix"]', {
+    timeout: 15_000,
+  });
+  await page.waitForSelector('[data-testid="plan-observation-envelope"]', {
     timeout: 10_000,
   });
   await page.evaluate(() => window.scrollTo(0, 0));
   const plans = await page.evaluate(() => {
-    const panel = document.querySelector(
-      '[data-testid="workload-evidence-panel"][data-view="plans"]',
+    const workspace = document.querySelector('[data-testid="plans-workspace"]');
+    const matrix = document.querySelector('[data-testid="plans-time-matrix"]');
+    const matrixBody = document.querySelector(
+      '[data-testid="plans-workspace"] [data-testid="ranked-matrix-body"]',
     );
-    const center = document.querySelector(
-      '[data-testid="workload-analytical-center"]',
+    const changeEvidence = document.querySelector(
+      '[data-testid="plan-change-evidence"]',
+    );
+    const temporalRow = document.querySelector(
+      '[data-testid="plans-time-matrix"] [data-testid="plans-interval-row"]',
     );
     const global = document.querySelector(
       '[data-shell-region="global-context"]',
     );
     const health = document.querySelector('[data-shell-region="health-line"]');
     if (
-      !(panel instanceof HTMLElement) ||
-      !(center instanceof HTMLElement) ||
+      !(workspace instanceof HTMLElement) ||
+      !(matrix instanceof HTMLElement) ||
+      !(matrixBody instanceof HTMLElement) ||
+      !(changeEvidence instanceof HTMLElement) ||
+      !(temporalRow instanceof HTMLElement) ||
       !(global instanceof HTMLElement) ||
       !(health instanceof HTMLElement)
     ) {
-      throw new Error("Plans shell regions are incomplete");
+      throw new Error("Plans row-coupled workspace is incomplete");
     }
-    const panelRect = panel.getBoundingClientRect();
-    const centerRect = center.getBoundingClientRect();
+    const workspaceRect = workspace.getBoundingClientRect();
+    const matrixRect = matrix.getBoundingClientRect();
     const globalRect = global.getBoundingClientRect();
     const healthRect = health.getBoundingClientRect();
-    const lanes = [
-      ...panel.querySelectorAll('[data-testid="plan-version-lanes"] button'),
+    const records = [
+      ...changeEvidence.querySelectorAll(
+        '[data-testid="plan-observation-envelope"]',
+      ),
     ];
-    const lastLaneRect = lanes.at(-1)?.getBoundingClientRect();
-    const panelText = panel?.textContent ?? "";
+    const lastRecordRect = records.at(-1)?.getBoundingClientRect();
+    const provenanceText =
+      document.querySelector('[data-testid="plans-attribution-provenance"]')
+        ?.textContent ?? "";
     const compare = [...document.querySelectorAll("button")].find(
       (button) => button.textContent?.trim() === "Compare",
     );
@@ -1210,17 +1223,38 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       healthHeight: healthRect.height,
       healthInsideViewport:
         healthRect.top >= 0 && healthRect.bottom <= window.innerHeight,
-      centerHeight: centerRect.height,
-      panelInside:
-        panelRect.top >= centerRect.top &&
-        panelRect.bottom <= centerRect.bottom,
-      lanes: lanes.length,
-      lastLaneInside:
-        lastLaneRect !== undefined && lastLaneRect.bottom <= panelRect.bottom,
-      ossc: panelText.includes("ossc_queryid_dbid_userid_attribution"),
-      vadv: panelText.includes(
+      detachedCenter:
+        document.querySelector('[data-shell-region="analytical-center"]') !==
+        null,
+      workspaceInsideViewport:
+        workspaceRect.top >= 0 && workspaceRect.bottom <= window.innerHeight,
+      matrixInsideWorkspace:
+        matrixRect.top >= workspaceRect.top &&
+        matrixRect.bottom >= workspaceRect.top,
+      visibleRows: matrix.querySelectorAll("tbody tr[data-entity]").length,
+      loadedRows: Number(matrixBody.dataset.loadedRows ?? "0"),
+      temporalRows: matrix.querySelectorAll(
+        '[data-testid="plans-interval-row"]',
+      ).length,
+      sampleBuckets: temporalRow.querySelectorAll(
+        '[data-testid="time-matrix-bucket"]',
+      ).length,
+      matrixScrollable: matrixBody.scrollHeight > matrixBody.clientHeight,
+      records: records.length,
+      lastRecordInside:
+        lastRecordRect !== undefined &&
+        lastRecordRect.bottom <= changeEvidence.getBoundingClientRect().bottom,
+      recordProvenance: changeEvidence.dataset.provenance ?? "",
+      ossc: provenanceText.includes("ossc_queryid_dbid_userid_attribution"),
+      vadv: provenanceText.includes(
         "vadv_queryid_stat_statements_dbid_userid_attribution",
       ),
+      activeLens: workspace.dataset.lens ?? "",
+      regressionBoundary:
+        document.querySelector('[data-testid="plans-regression-boundary"]')
+          ?.textContent ?? "",
+      coverage:
+        document.querySelector(".plans-workspace__coverage")?.textContent ?? "",
       compareGated: compare?.getAttribute("aria-disabled") === "true",
     };
   });
@@ -1236,11 +1270,35 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     );
   if (plans.healthHeight !== 60 || !plans.healthInsideViewport)
     plansFailures.push(`Health line ${plans.healthHeight}px outside viewport`);
-  if (plans.centerHeight !== 156 || !plans.panelInside)
-    plansFailures.push(`analytical center/panel geometry is invalid`);
-  if (plans.lanes < 1) plansFailures.push("no version lanes");
-  if (!plans.lastLaneInside) plansFailures.push("last plan lane is clipped");
+  if (plans.detachedCenter)
+    plansFailures.push("legacy detached analytical center is present");
+  if (!plans.workspaceInsideViewport)
+    plansFailures.push("workspace escapes the 1920x1080 viewport");
+  if (!plans.matrixInsideWorkspace)
+    plansFailures.push("plan matrix is detached from the workspace");
+  if (plans.visibleRows < 18)
+    plansFailures.push(`only ${plans.visibleRows} plan rows are visible`);
+  if (plans.loadedRows < 200)
+    plansFailures.push(`only ${plans.loadedRows} plan rows are loaded`);
+  if (plans.temporalRows < 18)
+    plansFailures.push(`only ${plans.temporalRows} temporal rows are rendered`);
+  if (plans.sampleBuckets !== 96)
+    plansFailures.push(`row temporal buckets ${plans.sampleBuckets}`);
+  if (!plans.matrixScrollable)
+    plansFailures.push("plan matrix is not independently scrollable");
+  if (plans.records < 1 || plans.records > 3)
+    plansFailures.push(`bounded change records ${plans.records}`);
+  if (!plans.lastRecordInside)
+    plansFailures.push("last observed plan record is clipped");
+  if (plans.recordProvenance !== "first_last_observed_only")
+    plansFailures.push(`change provenance ${plans.recordProvenance}`);
   if (!plans.ossc || !plans.vadv) plansFailures.push("fork provenance missing");
+  if (plans.activeLens !== "regression")
+    plansFailures.push(`default lens ${plans.activeLens}`);
+  if (!plans.regressionBoundary.includes("no before/after baseline"))
+    plansFailures.push("regression evidence boundary is missing");
+  if (!/1[,. ]?000/.test(plans.coverage))
+    plansFailures.push(`dense population coverage missing: ${plans.coverage}`);
   if (!plans.compareGated) plansFailures.push("Compare is not gated");
   if (plans.heatmapBuckets !== 96)
     plansFailures.push(`heatmap buckets ${plans.heatmapBuckets}`);
@@ -1248,6 +1306,22 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     throw new Error(`Plans workspace: ${plansFailures.join("; ")}`);
   }
   await page.screenshot({ path: PLANS_SHOT });
+  await page.evaluate(() => {
+    const changesButton = [...document.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "Changes",
+    );
+    if (!(changesButton instanceof HTMLButtonElement)) {
+      throw new Error("Plans Changes lens is missing");
+    }
+    changesButton.click();
+  });
+  await page.waitForFunction(
+    () =>
+      new URLSearchParams(location.hash.slice(1)).get("preset") ===
+      "change_timeline",
+    { timeout: 10_000 },
+  );
+  plans.changesLensVerified = true;
   return {
     activity: {
       ...activity,

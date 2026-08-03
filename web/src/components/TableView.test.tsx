@@ -267,6 +267,109 @@ test("couples each virtualized statement row to its exact temporal evidence", as
   ).toContain("height: 27px");
 });
 
+test("couples plan identity to its exact 96-bucket interval evidence", async () => {
+  const planColumns: ColumnSpec[] = [
+    {
+      availability: "available",
+      code: "planid",
+      lazy: false,
+      requires: ["plans"],
+      type: "i64",
+    },
+    {
+      availability: "available",
+      code: "queryid",
+      lazy: false,
+      requires: ["plans"],
+      type: "i64",
+    },
+    {
+      availability: "available",
+      code: "mean",
+      lazy: false,
+      requires: ["plans"],
+      type: "f64",
+      unit: "ms",
+    },
+  ];
+  stubFrame(
+    makeFrameResponse({
+      view: "plans",
+      columns: [
+        makeFrameColumn({ code: "planid", type: "i64" }),
+        makeFrameColumn({ code: "queryid", type: "i64" }),
+        makeFrameColumn({ code: "mean", type: "f64", unit: "ms" }),
+      ],
+      rows: [
+        makeFrameRow({
+          entity: "plan:77",
+          label: "plan 77",
+          cells: ["77", "42", 42],
+        }),
+        makeFrameRow({
+          entity: "plan:78",
+          label: "plan 78",
+          cells: ["78", "43", 21],
+        }),
+      ],
+      page: { matched: 1_000, returned: 2 },
+    }),
+  );
+  const heatmap: HeatmapResponse = {
+    grid: { from_us: "100", to_us: "200", bucket_count: 96 },
+    ranking: { exact: true, unseen_upper: 0 },
+    quality: makeHeatmapQuality({ snapshots: 96 }),
+    rows: [
+      {
+        entity: "plan:77",
+        label: "plan 77",
+        unit: "us",
+        score: { lower: 0, upper: 95 },
+        values: Array.from({ length: 96 }, (_, index) => index),
+      },
+    ],
+  };
+
+  renderTable({
+    view: makeViewSpec({ code: "plans", columns: planColumns }),
+    timeMatrix: {
+      kind: "plans",
+      evidenceMode: "plan_intervals",
+      data: heatmap,
+      pending: false,
+      error: false,
+      metricLabel: "time",
+      cursorUs: "150",
+      baselineUs: null,
+      onRetry: () => {},
+    },
+  });
+
+  const matrix = await screen.findByTestId("plans-time-matrix");
+  await waitFor(() =>
+    expect(matrix.querySelectorAll("tr[data-entity]")).toHaveLength(2),
+  );
+  expect(screen.getByText("plans.matrix.identity")).toBeDefined();
+  expect(screen.getByText("plans.matrix.heatmap")).toBeDefined();
+  expect(screen.getAllByTestId("plans-interval-row")).toHaveLength(2);
+  expect(
+    matrix
+      .querySelector('[data-entity="plan:77"]')
+      ?.querySelector('[data-evidence="available"]'),
+  ).not.toBeNull();
+  expect(
+    matrix
+      .querySelector('[data-entity="plan:78"]')
+      ?.querySelector('[data-evidence="unavailable"]'),
+  ).not.toBeNull();
+  expect(screen.getAllByTestId("time-matrix-bucket")).toHaveLength(2 * 96);
+  expect(
+    matrix
+      .querySelector('[data-entity="plan:77"] .plans-time-matrix__identity')
+      ?.getAttribute("title"),
+  ).toBe("77 · 42");
+});
+
 test("five server pages stay deduplicated and DOM-bounded", async () => {
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(280);
   const allRows = Array.from({ length: 1_000 }, (_, index) =>

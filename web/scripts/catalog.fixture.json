@@ -619,7 +619,7 @@
     {
       "view_code": 3,
       "code": "plans",
-      "view_revision": 2,
+      "view_revision": 3,
       "scope": "database",
       "identity_revision": 1,
       "availability": "gated",
@@ -704,6 +704,7 @@
           "code": "mean",
           "type": "f64",
           "formula": "positive_delta(total_time) / max(positive_delta(calls), 1)",
+          "unit": "ms",
           "lazy": false,
           "requires": ["plans"],
           "availability": "gated",

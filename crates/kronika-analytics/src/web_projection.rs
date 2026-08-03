@@ -618,7 +618,7 @@ const WEB_VIEWS: &[WebView] = &[
     WebView {
         code: 3,
         name: "plans",
-        revision: 2,
+        revision: 3,
         identity_revision: 1,
         max_rate_gap_us: Some(DELTA_MAX_RATE_GAP_US),
         inputs: PLANS_INPUTS,

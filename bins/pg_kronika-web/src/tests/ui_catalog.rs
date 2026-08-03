@@ -113,7 +113,7 @@ fn metric_semantics_publish_revision_four_with_stable_numeric_ids() {
         vec![
             (1, 2, vec![(1, 1), (2, 2), (3, 1), (4, 1)]),
             (2, 3, vec![(1, 3), (2, 2), (3, 2), (4, 2)]),
-            (3, 2, vec![(1, 2), (2, 2)]),
+            (3, 3, vec![(1, 2), (2, 2)]),
             (4, 2, vec![(1, 1), (2, 1), (3, 1)]),
             (5, 2, vec![(1, 1), (2, 1)]),
             (6, 2, vec![(1, 2)]),
@@ -419,7 +419,15 @@ fn plan_call_timestamps_keep_their_source_names() {
             .all(|column| !matches!(column["code"].as_str(), Some("first_seen" | "last_seen"))),
         "the catalog must not rename the collected call timestamps as observations"
     );
-    assert_eq!(plans["view_revision"], json!(2));
+    let mean = columns
+        .iter()
+        .find(|column| column["code"] == "mean")
+        .expect("plans.mean");
+    assert_eq!(
+        mean["unit"], "ms",
+        "pg_store_plans.total_time is milliseconds; the frame mean preserves that unit"
+    );
+    assert_eq!(plans["view_revision"], json!(3));
 
     let locks = serialized_view(&catalog, "locks");
     assert_eq!(locks["view_revision"], json!(2));

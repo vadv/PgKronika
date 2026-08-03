@@ -29,8 +29,8 @@ import type {
 import { TemporalBucketRow } from "./TemporalBucketRow";
 
 export interface TimeMatrixColumn {
-  kind?: "statements" | "activity";
-  evidenceMode?: "point_samples" | "interval_estimates";
+  kind?: "statements" | "activity" | "plans";
+  evidenceMode?: "point_samples" | "interval_estimates" | "plan_intervals";
   data: HeatmapResponse | undefined;
   pending: boolean;
   error: boolean;
@@ -79,6 +79,7 @@ const ACTIVITY_MATRIX_ROW_HEIGHT = 34;
 const ROW_OVERSCAN = 5;
 const FALLBACK_VIEWPORT_HEIGHT = 650;
 const STATEMENT_IDENTITY_COLUMNS = new Set(["queryid", "database", "user"]);
+const PLAN_IDENTITY_COLUMNS = new Set(["planid", "queryid"]);
 const ACTIVITY_IDENTITY_COLUMNS = new Set([
   "pid",
   "database",
@@ -386,13 +387,19 @@ function TableViewImpl(props: TableViewProps) {
   const timeMatrixMode = timeMatrix !== null;
   const matrixKind = timeMatrix?.kind ?? "statements";
   const activityMatrixMode = timeMatrixMode && matrixKind === "activity";
+  const plansMatrixMode = timeMatrixMode && matrixKind === "plans";
   const matrixClass = `${matrixKind}-time-matrix`;
+  const matrixLoadError = timeMatrix?.error
+    ? t(`${matrixKind}.matrix.loadError`)
+    : null;
   const matrixIdentityClass = `${matrixClass}__identity`;
   const matrixTimelineClass = `${matrixClass}__timeline`;
   const matrixTimelineCellClass = `${matrixClass}__timeline-cell`;
   const identityCodes = activityMatrixMode
     ? ACTIVITY_IDENTITY_COLUMNS
-    : STATEMENT_IDENTITY_COLUMNS;
+    : plansMatrixMode
+      ? PLAN_IDENTITY_COLUMNS
+      : STATEMENT_IDENTITY_COLUMNS;
   const rowHeight = activityMatrixMode
     ? ACTIVITY_MATRIX_ROW_HEIGHT
     : timeMatrixMode
@@ -573,7 +580,13 @@ function TableViewImpl(props: TableViewProps) {
                   <button
                     type="button"
                     onClick={() =>
-                      cycleSort(activityMatrixMode ? "pid" : "queryid")
+                      cycleSort(
+                        activityMatrixMode
+                          ? "pid"
+                          : plansMatrixMode
+                            ? "planid"
+                            : "queryid",
+                      )
                     }
                     style={{
                       color: "inherit",
@@ -585,8 +598,16 @@ function TableViewImpl(props: TableViewProps) {
                   >
                     {activityMatrixMode
                       ? t("activity.matrix.identity")
-                      : t("statements.matrix.identity")}
-                    {sortArrow(activityMatrixMode ? "pid" : "queryid")}
+                      : plansMatrixMode
+                        ? t("plans.matrix.identity")
+                        : t("statements.matrix.identity")}
+                    {sortArrow(
+                      activityMatrixMode
+                        ? "pid"
+                        : plansMatrixMode
+                          ? "planid"
+                          : "queryid",
+                    )}
                   </button>
                 </th>
               )}
@@ -704,7 +725,11 @@ function TableViewImpl(props: TableViewProps) {
                             : "activity.matrix.samples",
                           { count: bucketCount },
                         )
-                      : t("statements.matrix.heatmap", { count: bucketCount })}
+                      : plansMatrixMode
+                        ? t("plans.matrix.heatmap", { count: bucketCount })
+                        : t("statements.matrix.heatmap", {
+                            count: bucketCount,
+                          })}
                   </span>
                   <span className={`${matrixClass}__metric`}>
                     {timeMatrix.metricLabel}
@@ -714,10 +739,16 @@ function TableViewImpl(props: TableViewProps) {
                       {t("statements.matrix.loading")}
                     </span>
                   )}
+                  {matrixLoadError !== null && (
+                    <span role="alert" className={`${matrixClass}__status`}>
+                      {matrixLoadError}
+                    </span>
+                  )}
                   {timeMatrix.error && (
                     <button
                       type="button"
                       className={`${matrixClass}__retry`}
+                      aria-label={`${matrixLoadError}. ${t("table.retry")}`}
                       onClick={timeMatrix.onRetry}
                     >
                       {t("table.retry")}
@@ -803,7 +834,11 @@ function TableViewImpl(props: TableViewProps) {
                         identityColumns.find(
                           ({ column }) =>
                             column.code ===
-                            (activityMatrixMode ? "pid" : "queryid"),
+                            (activityMatrixMode
+                              ? "pid"
+                              : plansMatrixMode
+                                ? "planid"
+                                : "queryid"),
                         ) ?? identityColumns[0];
                       if (primary === undefined) return null;
                       const primaryValue: FrameValue =
@@ -812,21 +847,22 @@ function TableViewImpl(props: TableViewProps) {
                         .filter(
                           ({ column }) => column.code !== primary.column.code,
                         )
-                        .map(({ column, cellIndex }) =>
-                          formatCellValue(
-                            row.cells[cellIndex] ?? null,
-                            column,
-                            t,
-                          ),
-                        )
-                        .filter((value) => value !== "—");
+                        .map(({ column, cellIndex }) => {
+                          const value: FrameValue =
+                            row.cells[cellIndex] ?? null;
+                          return {
+                            display: formatCellValue(value, column, t),
+                            full: fullCellValue(value, column),
+                          };
+                        })
+                        .filter(({ display }) => display !== "—");
                       return (
                         <td
                           className={matrixIdentityClass}
                           title={
                             [
                               fullCellValue(primaryValue, primary.column),
-                              ...secondary,
+                              ...secondary.map(({ full }) => full),
                             ]
                               .filter(Boolean)
                               .join(" · ") || undefined
@@ -837,7 +873,9 @@ function TableViewImpl(props: TableViewProps) {
                           </span>
                           {secondary.length > 0 && (
                             <span className={`${matrixClass}__identity-meta`}>
-                              {secondary.join(" · ")}
+                              {secondary
+                                .map(({ display }) => display)
+                                .join(" · ")}
                             </span>
                           )}
                         </td>
@@ -918,11 +956,14 @@ function TableViewImpl(props: TableViewProps) {
                         cursorUs={timeMatrix.cursorUs}
                         baselineUs={timeMatrix.baselineUs}
                         metricLabel={timeMatrix.metricLabel}
+                        unavailableLabel={matrixLoadError ?? undefined}
                         max={heatmapMax}
                         mode={
                           activityMatrixMode
                             ? (timeMatrix?.evidenceMode ?? "point_samples")
-                            : "range"
+                            : plansMatrixMode
+                              ? "plan_intervals"
+                              : "range"
                         }
                       />
                     </td>

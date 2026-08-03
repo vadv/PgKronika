@@ -1146,12 +1146,22 @@ function rowsPlans() {
     "Merge Join -> Index Scan on users",
     "GroupAggregate -> Index Scan on inventory",
   ];
-  return shapes.map((plan, i) => {
+  // Real pg_store_plans populations can be as dense as statements. Keep a
+  // thousand deterministic rows so the Plans workspace proves paging and
+  // virtualization instead of looking correct only for a ten-row toy.
+  return Array.from({ length: 1_000 }, (_, i) => {
+    const plan = `${shapes[i % shapes.length]} · v${Math.floor(i / shapes.length) + 1}`;
     const planid = 84_102_200 + i * 17_311;
     const cls =
       i === 2
         ? [verdict("mean", "pg.plans.mean_time_us", 48_200, "critical", 10_000)]
         : [];
+    const calls = Math.max(1, Math.round(2_400_000 * Math.exp(-i / 180)));
+    const mean = r2(Math.max(0.12, 48.2 * Math.exp(-i / 150)));
+    const sharedRead = Math.max(
+      0,
+      Math.round(184_000 * Math.exp(-i / 120) + (i % 13) * 720),
+    );
     return {
       entity: `plan:${planid}`,
       label: plan,
@@ -1159,11 +1169,13 @@ function rowsPlans() {
         planid: String(planid),
         plan,
         queryid: String(9_180_220_441_120_000n + BigInt(7101 + i)),
-        calls: 2_400_000 - i * 188_000,
-        mean: r2(48_200 / (i + 1)),
-        rows: Math.round(120_000 + i * 44_000),
-        first_call: String(now - (i + 4) * 900 * US),
-        last_call: String(now - i * 180 * US),
+        calls,
+        mean,
+        rows: Math.max(1, Math.round(calls * (0.8 + (i % 7) * 0.6))),
+        shared_hit: Math.round(sharedRead * (18 + (i % 5) * 6)),
+        shared_read: i % 19 === 0 ? null : sharedRead,
+        first_call: String(now - (48 + (i % 240)) * 60 * US),
+        last_call: String(now - (i % 360) * 10 * US),
       },
       cls,
     };
@@ -2072,7 +2084,10 @@ function heatmapResponse(params) {
   const top = Number(params.get("top") ?? "8");
 
   const rand = mulberry32(42);
-  const style = METRIC_STYLE[metric] ?? { unit: "count", scale: 1000 };
+  const style =
+    view === "plans" && metric === "time"
+      ? { unit: "us", scale: 120_000 }
+      : (METRIC_STYLE[metric] ?? { unit: "count", scale: 1000 });
   const entities = (ENTITIES[view] ?? []).slice(0, top);
 
   const rows = entities.map(([entity, label]) => {
