@@ -8,6 +8,7 @@ export interface HeatmapArgs {
   to: string;
   buckets?: number;
   top?: number;
+  enabled?: boolean;
 }
 
 export function useHeatmap(args: HeatmapArgs) {
@@ -36,5 +37,6 @@ export function useHeatmap(args: HeatmapArgs) {
           },
         },
       }),
+    enabled: args.enabled ?? true,
   });
 }

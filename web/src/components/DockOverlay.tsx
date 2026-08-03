@@ -100,7 +100,7 @@ function stateWindow(at: string, span: number): { from: string; to: string } {
   };
 }
 
-const dockStyle = (mobile: boolean) =>
+const dockStyle = (mobile: boolean, kind: DockKind) =>
   ({
     position: "fixed",
     // min() keeps the dock inside narrow viewports: on mobile triage
@@ -114,21 +114,30 @@ const dockStyle = (mobile: boolean) =>
           maxHeight: "60vh",
           borderBlockStart: "1px solid var(--border)",
         }
-      : {
-          insetBlock: 0,
-          insetInlineEnd: 0,
-          width: "560px",
-          maxWidth: "calc(100vw - 24px)",
-          borderInlineStart: "1px solid var(--border)",
-        }),
+      : kind === "row"
+        ? {
+            // The published forensic detail is a workspace, not a cramped
+            // drawer. Keep global header, navigation, Health Line and footer.
+            insetBlockStart: "136px",
+            insetBlockEnd: "24px",
+            insetInline: 0,
+            borderBlockStart: "1px solid var(--border-strong)",
+          }
+        : {
+            insetBlock: 0,
+            insetInlineEnd: 0,
+            width: "560px",
+            maxWidth: "calc(100vw - 24px)",
+            borderInlineStart: "1px solid var(--border)",
+          }),
     background: "var(--bg-overlay)",
-    boxShadow: "var(--shadow-pop)",
+    boxShadow: !mobile && kind === "row" ? "none" : "var(--shadow-pop)",
     color: "var(--fg)",
     fontFamily: "var(--ui-font)",
     overflowY: "auto",
     overflowX: "hidden",
     zIndex: 10,
-    padding: "12px",
+    padding: !mobile && kind === "row" ? "0" : "12px",
   }) as const;
 
 const tabButtonStyle = (active: boolean) =>
@@ -253,6 +262,7 @@ function IncidentDetail(props: {
         {t("dock.incidents.back")}
       </button>
       <div
+        className="entity-detail__actions"
         style={{
           fontFamily: "var(--ui-font)",
           fontWeight: 600,
@@ -425,69 +435,133 @@ function EntityPointView(props: {
   viewCode: string;
 }) {
   const { t } = useTranslation();
+  const meaningful = props.data.fields.filter((field) => field.value !== null);
+  const identityCodes = new Set(
+    props.viewCode === "activity"
+      ? ["pid", "database", "user", "application", "process_link"]
+      : props.viewCode === "processes"
+        ? ["pid", "type", "cgroup"]
+        : props.viewCode === "statements"
+          ? ["queryid", "database", "user"]
+          : props.viewCode === "plans"
+            ? ["planid", "queryid"]
+            : ["schema", "table", "index", "pid", "database"],
+  );
+  const stateCodes = new Set(
+    props.viewCode === "activity"
+      ? ["state", "wait_event", "query_duration_us", "transaction_duration_us"]
+      : [],
+  );
+  const identity = meaningful.filter((field) => identityCodes.has(field.code));
+  const state = meaningful
+    .filter((field) => stateCodes.has(field.code))
+    .slice(0, 4);
+  const body = meaningful.filter(
+    (field) => !identityCodes.has(field.code) && !stateCodes.has(field.code),
+  );
+  const groups = [
+    {
+      code: "compute",
+      fields: body.filter((field) =>
+        /(cpu|rss|mem|thread|sched|delay|load|context)/i.test(field.code),
+      ),
+    },
+    {
+      code: "ioCache",
+      fields: body.filter((field) =>
+        /(read|write|(^|_)io|cache|hit|miss|block|wal|buffer|temp|disk)/i.test(
+          field.code,
+        ),
+      ),
+    },
+  ];
+  const groupedCodes = new Set(
+    groups.flatMap((group) => group.fields.map((field) => field.code)),
+  );
+  groups.push({
+    code: "context",
+    fields: body.filter((field) => !groupedCodes.has(field.code)),
+  });
+
+  const renderField = (
+    field: EntityPointResponse["fields"][number],
+    compact = false,
+  ) => {
+    const spec = props.columns.get(field.code);
+    const cellColumn = {
+      code: field.code,
+      type: spec?.type ?? "text",
+      unit: spec?.unit ?? null,
+    };
+    const label = colLabel(t, props.viewCode, field.code);
+    const desc = colDesc(t, props.viewCode, field.code);
+    const isSql =
+      typeof field.value === "string" &&
+      (field.value.length > 60 || field.value.includes("\n"));
+    const fullIdentity = isIdentityColumn(field.code);
+    const display = fullIdentity
+      ? String(field.value)
+      : formatCellValue(field.value, cellColumn, t);
+    return isSql && !compact ? (
+      <div
+        key={field.code}
+        data-field={field.code}
+        className="entity-detail__measurement entity-detail__measurement--block"
+      >
+        <div title={desc ?? undefined} className="entity-detail__label">
+          {label}
+        </div>
+        <pre data-sql className="entity-detail__code">
+          {field.value}
+        </pre>
+      </div>
+    ) : (
+      <div
+        key={field.code}
+        data-field={field.code}
+        className={`entity-detail__measurement${compact ? " entity-detail__measurement--compact" : ""}`}
+      >
+        <span title={desc ?? undefined} className="entity-detail__label">
+          {label}
+        </span>
+        <span
+          className="entity-detail__value"
+          style={fullIdentity ? { userSelect: "all" } : undefined}
+        >
+          {display}
+        </span>
+      </div>
+    );
+  };
+
   return (
-    <div data-kv className="entity-detail__measurements">
-      {props.data.fields.map((field) => {
-        const spec = props.columns.get(field.code);
-        const cellColumn = {
-          code: field.code,
-          type: spec?.type ?? "text",
-          unit: spec?.unit ?? null,
-        };
-        const label = colLabel(t, props.viewCode, field.code);
-        const desc = colDesc(t, props.viewCode, field.code);
-        const availability = spec?.availability ?? "available";
-        const isSql =
-          typeof field.value === "string" &&
-          (field.value.length > 60 || field.value.includes("\n"));
-        // Honest absence: a column the source never fills (or the store
-        // gates) renders its availability status, not a blank em-dash.
-        const notCollected =
-          field.value === null && availability !== "available";
-        // Identifier values are never cut in the dock: full mono text,
-        // wrap anywhere, one click selects the whole value for copying.
-        const fullIdentity =
-          isIdentityColumn(field.code) && field.value !== null;
-        const display = notCollected
-          ? t(`availability.${availability}`, { defaultValue: availability })
-          : fullIdentity
-            ? String(field.value)
-            : formatCellValue(field.value, cellColumn, t);
-        return isSql && !notCollected ? (
-          <div
-            key={field.code}
-            data-field={field.code}
-            className="entity-detail__measurement entity-detail__measurement--block"
-          >
-            <div title={desc ?? undefined} className="entity-detail__label">
-              {label}
-            </div>
-            <pre data-sql className="entity-detail__code">
-              {field.value}
-            </pre>
-          </div>
-        ) : (
-          <div
-            key={field.code}
-            data-field={field.code}
-            className="entity-detail__measurement"
-          >
-            <span title={desc ?? undefined} className="entity-detail__label">
-              {label}
-            </span>
-            <span
-              className={`entity-detail__value${
-                field.value === null || notCollected
-                  ? " entity-detail__value--missing"
-                  : ""
-              }`}
-              style={fullIdentity ? { userSelect: "all" } : undefined}
+    <div data-kv data-forensic-summary className="entity-detail__forensic">
+      {identity.length > 0 && (
+        <div className="entity-detail__identity-strip">
+          {identity.map((field) => renderField(field, true))}
+        </div>
+      )}
+      {state.length > 0 && (
+        <div className="entity-detail__state-strip">
+          {state.map((field) => renderField(field, true))}
+        </div>
+      )}
+      <div className="entity-detail__summary-grid">
+        {groups
+          .filter((group) => group.fields.length > 0)
+          .map((group) => (
+            <section
+              key={group.code}
+              data-forensic-group={group.code}
+              className="entity-detail__group"
             >
-              {display}
-            </span>
-          </div>
-        );
-      })}
+              <h3>{t(`dock.detail.group.${group.code}`)}</h3>
+              <div className="entity-detail__measurements">
+                {group.fields.map((field) => renderField(field))}
+              </div>
+            </section>
+          ))}
+      </div>
     </div>
   );
 }
@@ -783,18 +857,6 @@ function RowDock(props: {
             <span className="entity-detail__title">{heading}</span>
           </>
         )}
-        {props.state.entity !== null && (
-          <button
-            type="button"
-            data-testid="dock-copy-token"
-            aria-label={t("dock.row.copyTechnicalId")}
-            title={t("dock.row.copyTechnicalId")}
-            onClick={copyToken}
-            className="entity-detail__copy-id"
-          >
-            {tokenCopied ? t("dock.row.tokenCopied") : "⧉"}
-          </button>
-        )}
       </div>
       {missing && (
         <div style={{ color: "var(--fg-dim)" }}>{t("dock.row.missing")}</div>
@@ -995,53 +1057,66 @@ export function DockOverlay(props: DockOverlayProps) {
   const { t } = useTranslation();
   if (props.state.dock === null) return null;
   const active = props.state.dock;
+  const rowWorkspace = active === "row" && !props.mobile;
   return (
     <aside
       data-dock={active}
-      style={dockStyle(props.mobile)}
-      className={`dock-overlay${props.mobile ? " dock-overlay--mobile" : ""}`}
+      style={dockStyle(props.mobile, active)}
+      className={`dock-overlay${props.mobile ? " dock-overlay--mobile" : ""}${rowWorkspace ? " dock-overlay--row-workspace" : ""}`}
       aria-label={t("dock.title")}
     >
-      <div
-        role="tablist"
-        className="dock-overlay__rail"
-        style={{
-          display: "flex",
-          gap: "8px",
-          alignItems: "baseline",
-          marginBlockEnd: "8px",
-        }}
-      >
-        {DOCK_KINDS.map((kind) => (
+      {!rowWorkspace && (
+        <div
+          role="tablist"
+          className="dock-overlay__rail"
+          style={{
+            display: "flex",
+            gap: "8px",
+            alignItems: "baseline",
+            marginBlockEnd: "8px",
+          }}
+        >
+          {DOCK_KINDS.map((kind) => (
+            <button
+              key={kind}
+              type="button"
+              role="tab"
+              aria-selected={active === kind}
+              onClick={() => props.onPatch({ dock: kind })}
+              style={tabButtonStyle(active === kind)}
+              className="dock-overlay__rail-tab"
+            >
+              {t(`dock.tabs.${kind}`)}
+            </button>
+          ))}
           <button
-            key={kind}
             type="button"
-            role="tab"
-            aria-selected={active === kind}
-            onClick={() => props.onPatch({ dock: kind })}
-            style={tabButtonStyle(active === kind)}
-            className="dock-overlay__rail-tab"
+            aria-label={t("dock.close")}
+            onClick={props.onClose}
+            className="dock-overlay__close"
+            style={{
+              marginInlineStart: "auto",
+              color: "var(--fg-dim)",
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              fontFamily: "var(--mono-font)",
+            }}
           >
-            {t(`dock.tabs.${kind}`)}
+            ×
           </button>
-        ))}
+        </div>
+      )}
+      {rowWorkspace && (
         <button
           type="button"
           aria-label={t("dock.close")}
           onClick={props.onClose}
-          className="dock-overlay__close"
-          style={{
-            marginInlineStart: "auto",
-            color: "var(--fg-dim)",
-            background: "none",
-            border: "none",
-            cursor: "pointer",
-            fontFamily: "var(--mono-font)",
-          }}
+          className="dock-overlay__close dock-overlay__workspace-close"
         >
           ×
         </button>
-      </div>
+      )}
       {active === "incidents" ? (
         <IncidentsDock
           state={props.state}

@@ -108,6 +108,7 @@ export function EventsWorkspace(props: EventsWorkspaceProps) {
             brushDraft={props.brushDraft}
             baselineUs={props.baselineUs}
             buckets={96}
+            presentation="events"
             onMetricChange={props.onMetricChange}
             onSelectEntity={props.onSelectEntity}
           />

@@ -66,6 +66,7 @@ function HeatmapRowView(props: {
   gridFromUs: number | null;
   bucketWidthUs: number;
   max: number;
+  presentation: "heatmap" | "events";
   onSelectEntity: (entity: string) => void;
 }) {
   const { t } = useTranslation();
@@ -95,6 +96,16 @@ function HeatmapRowView(props: {
         </button>
       </Tooltip>
       {r.values.map((v, i) => {
+        const ratio = v === null || props.max <= 0 ? 0 : v / props.max;
+        const eventValue =
+          v === null
+            ? "empty"
+            : v === 0
+              ? "zero"
+              : ratio < NORMAL_FRACTION
+                ? "quiet"
+                : "peak";
+        const eventLane = props.presentation === "events";
         const when =
           props.gridFromUs !== null
             ? bucketTime(props.gridFromUs, props.bucketWidthUs, i)
@@ -131,14 +142,30 @@ function HeatmapRowView(props: {
             <div
               data-cell
               data-empty={v === null ? "true" : undefined}
+              data-value={eventLane ? eventValue : undefined}
               style={{
                 width: "10px",
-                height: "10px",
-                margin: "2px 0.5px",
-                borderRadius: "2px",
-                background: heatColor(
-                  v === null ? null : props.max > 0 ? v / props.max : 0,
-                ),
+                height: eventLane
+                  ? eventValue === "peak"
+                    ? "8px"
+                    : "2px"
+                  : "10px",
+                margin: eventLane
+                  ? eventValue === "peak"
+                    ? "2px 0.5px 4px"
+                    : "6px 0.5px"
+                  : "2px 0.5px",
+                borderRadius: eventLane ? "1px" : "2px",
+                background:
+                  eventLane && eventValue === "quiet"
+                    ? "var(--fg-dim)"
+                    : heatColor(v === null ? null : props.max > 0 ? ratio : 0),
+                opacity:
+                  eventLane && (eventValue === "zero" || eventValue === "empty")
+                    ? 0
+                    : eventLane && eventValue === "quiet"
+                      ? 0.35
+                      : 1,
               }}
             />
           </Tooltip>
@@ -159,6 +186,7 @@ export function HeatmapStrip(props: {
   brushDraft?: TimeRange | null;
   baselineUs?: string | null;
   buckets?: number;
+  presentation?: "heatmap" | "events";
   onMetricChange: (metric: string) => void;
   onSelectEntity: (entity: string) => void;
 }) {
@@ -235,6 +263,7 @@ export function HeatmapStrip(props: {
 
   return (
     <section
+      data-heatmap-presentation={props.presentation ?? "heatmap"}
       style={{
         fontFamily: "var(--mono-font)",
         background: "var(--bg-raised)",
@@ -389,6 +418,7 @@ export function HeatmapStrip(props: {
               gridFromUs={gridFromUs}
               bucketWidthUs={bucketWidthUs}
               max={max}
+              presentation={props.presentation ?? "heatmap"}
               onSelectEntity={props.onSelectEntity}
             />
           ))}

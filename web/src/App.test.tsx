@@ -287,6 +287,11 @@ test("marks the integrated Activity matrix boundary for bounded viewport layout"
   expect(content.dataset.layoutBoundary).toBe("analytical-content");
   expect(content.style.minHeight).toBe("0");
   expect(content.style.overflow).toBe("hidden");
+  // The published 1920×1080 cockpit is one ruled surface. Reintroducing the
+  // old card-stack inset would shrink the Health axis and waste a full row of
+  // evidence at the bottom of the viewport.
+  expect(content.style.gap).toBe("0px");
+  expect(content.style.padding).toBe("0px");
   expect(
     document.querySelector('[data-shell-region="analytical-center"]'),
   ).toBeNull();
@@ -704,7 +709,7 @@ test("an arbitrary replay span reaches heatmap consumers exactly", async () => {
   history.replaceState(
     null,
     "",
-    `${location.pathname}#view=activity&at=1722400000000000&span=37`,
+    `${location.pathname}#view=activity&preset=cpu&at=1722400000000000&span=37`,
   );
   renderApp();
 
@@ -744,6 +749,11 @@ test("an arbitrary replay span reaches heatmap consumers exactly", async () => {
 test("real timeline and data-health endpoints share the pinned LIVE geometry", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-08-03T12:00:00.123Z"));
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&preset=cpu`,
+  );
   renderApp();
   await act(async () => {
     await vi.advanceTimersByTimeAsync(50);

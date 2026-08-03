@@ -155,7 +155,7 @@ test("tab switches the dock kind and close calls onClose", () => {
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
-test("row dock keeps the technical id out of the human heading", async () => {
+test("desktop row detail is a full forensic workspace and keeps the token in Raw", async () => {
   stubFetch(
     makeEntityPointResponse({ view: "activity", entity: "AQAEBQAAx9" }),
   );
@@ -165,16 +165,22 @@ test("row dock keeps the technical id out of the human heading", async () => {
     configurable: true,
   });
   renderDock({ state: { ...baseState, dock: "row", entity: "AQAEBQAAx9" } });
-  await waitFor(() =>
-    expect(screen.getByTestId("dock-copy-token")).toBeDefined(),
-  );
-  // The raw token never renders as its own line or native tooltip.
+  await waitFor(() => expect(screen.getByRole("tabpanel")).toBeDefined());
+  const aside = screen.getByLabelText("dock.title");
+  expect(aside.classList.contains("dock-overlay--row-workspace")).toBe(true);
+  expect(aside.style.insetBlockStart).toBe("136px");
+  expect(aside.style.insetBlockEnd).toBe("24px");
+  expect(aside.style.insetInline).toBe("0");
+  // The raw token never renders in the normal summary or native tooltip.
   expect(screen.queryByText("AQAEBQAA…")).toBeNull();
   expect(
     screen.getByTestId("dock-entity-heading").getAttribute("title"),
   ).toBeNull();
-  const copy = screen.getByTestId("dock-copy-token");
-  expect(copy.getAttribute("aria-label")).toBe("dock.row.copyTechnicalId");
+  expect(screen.queryByTestId("dock-copy-token")).toBeNull();
+  fireEvent.click(screen.getByRole("tab", { name: "dock.detail.raw" }));
+  const copy = screen.getByRole("button", {
+    name: "dock.row.copyTechnicalId",
+  });
   fireEvent.click(copy);
   expect(writeText).toHaveBeenCalledWith("AQAEBQAAx9");
 });
@@ -196,14 +202,14 @@ test("row dock renders point fields from the entity endpoint", async () => {
   });
   await waitFor(() => expect(screen.getByText("42")).toBeDefined());
   expect(screen.getByText("tup")).toBeDefined();
+  expect(screen.queryByText("locks")).toBeNull();
+  expect(document.querySelector("[data-forensic-summary]")).not.toBeNull();
   const summary = screen.getByRole("tabpanel");
   expect(summary.textContent).not.toMatch(
     /partial|complete|gaps|gated|point projection|\/v1\/entity/i,
   );
   expect(document.querySelector("[data-detail-provenance]")).toBeNull();
-  const missing = screen.getByText("—");
-  expect(missing.dataset.status).toBeUndefined();
-  expect(missing.title).toBe("");
+  expect(summary.textContent).not.toContain("—");
 });
 
 test("row dock fetches bounded history only after selecting the History tab", async () => {

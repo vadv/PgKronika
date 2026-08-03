@@ -1030,8 +1030,8 @@ function Shell() {
             flex: "1 1 auto",
             minHeight: 0,
             overflow: "hidden",
-            gap: "var(--space-2)",
-            padding: "var(--space-2) var(--space-3)",
+            gap: "0px",
+            padding: "0px",
           }}
         >
           <HealthLine />
@@ -1071,7 +1071,8 @@ function Shell() {
                 minHeight: "72px",
                 minWidth: 0,
                 overflow: "hidden",
-                padding: "var(--space-1) 2px",
+                padding: "0 var(--space-4)",
+                borderBlockEnd: "1px solid var(--border)",
               }}
             >
               <PageHeader

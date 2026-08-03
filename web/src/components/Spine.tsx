@@ -162,10 +162,18 @@ function sparkSegments(
   return { lines, dots };
 }
 
-const VERDICT_FILL: Record<Exclude<BucketVerdict, "gap">, string> = {
-  ok: "var(--sev-ok-quiet)",
+const VERDICT_STROKE: Record<BucketVerdict, string> = {
+  ok: "var(--border-strong)",
   warn: "var(--sev-warn)",
   crit: "var(--sev-crit)",
+  gap: "var(--border)",
+};
+
+const VERDICT_Y: Record<BucketVerdict, number> = {
+  ok: RIBBON_Y + RIBBON_H - 1,
+  warn: RIBBON_Y + RIBBON_H / 2,
+  crit: RIBBON_Y + 1,
+  gap: RIBBON_Y + RIBBON_H - 1,
 };
 
 const GLYPH_FILL = {
@@ -638,6 +646,7 @@ export function Spine(props: SpineProps) {
             "aria-valuenow": to,
           } as unknown as React.AriaAttributes)}
           aria-valuetext={cursorLabel}
+          data-health-render="signal-line"
           viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
           preserveAspectRatio="none"
           onPointerDown={onStripPointerDown}
@@ -700,13 +709,14 @@ export function Spine(props: SpineProps) {
               pointerEvents="none"
             />
           )}
-          {/* Verdict ribbon: one cell per bucket, calm cells quiet, warn/crit
-              full-saturation; a bucket with no server verdict is an explicit
-              gap substrate (raised band + hairline), never a silent hole. */}
+          {/* One continuous Health signal. Severity lifts the line toward the
+              top of the lane; color is reserved for warn/critical intervals.
+              The 96 buckets remain independently titled and interactive. */}
           {verdicts.map((v, i) => {
             const w = SVG_WIDTH / SPINE_BUCKETS;
             const x = i * w;
-            const cellW = Math.max(w - 1, 0.5);
+            const next = verdicts[i + 1] ?? v;
+            const nextY = next === "gap" ? VERDICT_Y[v] : VERDICT_Y[next];
             const bucketStart = Math.round(
               fromUs + (i / SPINE_BUCKETS) * windowNum,
             );
@@ -744,40 +754,26 @@ export function Spine(props: SpineProps) {
               ),
             ].join("\n");
             return (
-              <g key={i}>
-                {v === "gap" ? (
-                  <rect
-                    data-testid="spine-ribbon-gap"
-                    x={x}
-                    y={RIBBON_Y}
-                    width={cellW}
-                    height={RIBBON_H}
-                    fill="var(--bg-raised)"
-                    stroke="var(--border)"
-                    strokeWidth="0.5"
-                  >
-                    <title>{tip}</title>
-                  </rect>
-                ) : (
-                  <rect
-                    data-testid={`spine-ribbon-${v}`}
-                    x={x}
-                    y={RIBBON_Y}
-                    width={cellW}
-                    height={RIBBON_H}
-                    rx={1}
-                    fill={VERDICT_FILL[v]}
-                    opacity={forming ? 0.5 : 1}
-                  >
-                    <title>{tip}</title>
-                  </rect>
-                )}
+              <g
+                key={i}
+                data-testid={`spine-ribbon-${v}`}
+                opacity={forming ? 0.55 : 1}
+              >
+                <title>{tip}</title>
+                <path
+                  d={`M ${x.toFixed(2)} ${VERDICT_Y[v]} L ${(x + w).toFixed(2)} ${nextY}`}
+                  fill="none"
+                  stroke={VERDICT_STROKE[v]}
+                  strokeWidth={v === "crit" ? 1.8 : v === "warn" ? 1.4 : 1}
+                  strokeDasharray={v === "gap" ? "2 3" : undefined}
+                  vectorEffect="non-scaling-stroke"
+                />
                 {forming && (
                   <rect
                     data-testid="spine-ribbon-forming"
                     x={x}
                     y={RIBBON_Y}
-                    width={cellW}
+                    width={Math.max(w - 1, 0.5)}
                     height={RIBBON_H}
                     fill="url(#spine-forming-hatch)"
                     pointerEvents="none"
@@ -883,7 +879,7 @@ export function Spine(props: SpineProps) {
             if (bucket === null) return null;
             const width = SVG_WIDTH / EVENT_BUCKETS;
             const x = index * width;
-            const height = 3 + (bucket.count / maxEventCount) * 8;
+            const height = 3 + (bucket.count / maxEventCount) * 5;
             const kinds = new Map<string, number>();
             for (const event of bucket.events) {
               kinds.set(
@@ -905,11 +901,11 @@ export function Spine(props: SpineProps) {
                 key={index}
                 data-testid="spine-event-density"
                 data-event-count={bucket.count}
-                x={x + 1}
+                x={x + width / 2 - 1.5}
                 y={EVENT_LANE_BOTTOM - height}
-                width={Math.max(2, width - 2)}
+                width={3}
                 height={height}
-                rx={1.5}
+                rx={1}
                 fill={GLYPH_FILL[bucket.tone]}
                 opacity={0.82}
               >
