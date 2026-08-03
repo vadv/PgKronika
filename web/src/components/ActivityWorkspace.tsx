@@ -3,6 +3,7 @@ import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { apiGet } from "../api/client";
 import { metricDesc, metricLabel } from "../api/codes";
+import { fetchEntityPoint } from "../api/entity";
 import { useHeatmap } from "../api/heatmap";
 import type {
   FrameColumnDto,
@@ -244,6 +245,26 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
     (metric) => metric.availability === "available",
   );
   const metricText = metricLabel(t, props.view.code, props.metric);
+  const openLinkedProcess = async (activityEntity: string) => {
+    try {
+      const point = await fetchEntityPoint({
+        view: "activity",
+        entity: activityEntity,
+        at: props.at,
+        includeRelated: true,
+      });
+      const process = point.related.find(
+        (related) => related.view === "processes",
+      );
+      if (process !== undefined) {
+        props.onOpenEntity("processes", process.entity);
+        return;
+      }
+    } catch {
+      // The Activity detail remains useful when the related lookup is absent.
+    }
+    props.onSelectRow(activityEntity);
+  };
 
   return (
     <section
@@ -314,6 +335,9 @@ export function ActivityWorkspace(props: ActivityWorkspaceProps) {
         entity={props.entity}
         onSort={props.onSort}
         onSelectRow={props.onSelectRow}
+        onOpenActivityProcess={(activityEntity) =>
+          void openLinkedProcess(activityEntity)
+        }
         onMatched={props.onMatched}
         activitySnapshot={!temporalLens}
         timeMatrix={

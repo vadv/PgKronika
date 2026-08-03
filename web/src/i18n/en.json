@@ -182,6 +182,7 @@
   "activity.filterHint": "Searches retained rows in the selected activity snapshot; lazy query text is excluded.",
   "activity.snapshotBadge": "Activity at cursor",
   "activity.pointEvidence": "One pg_stat_activity observation at the cursor. Short queries between samples may not appear.",
+  "activity.openLinkedProcess": "Open linked OS process for {{backend}}",
   "activity.processEvidence": "Activity and OS-process history are linked by PID. CPU and disk deltas still use one unambiguous process sample pair.",
   "activity.samplingEvidence": "Observed snapshot coverage only — not ASH and not an exact attribution of query cost.",
   "activity.locks.empty": "No waiter/blocker relations at the cursor",

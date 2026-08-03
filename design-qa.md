@@ -40,12 +40,12 @@ The deterministic shell verifier also captured Statements, Activity CPU, Activit
 - P2 — The last Signals row clipped in the 176 px overview. Limited the bounded rail to five dense 24 px rows and verified both desktop sizes.
 - P2 — Shell QA still required internal provenance and collection-quality jargon. Updated the contract to verify human links and keep internals out of ordinary UI.
 - P1 review — Detail grouping suppressed unavailable catalog fields together with ordinary nulls. Ordinary nulls remain quiet; unavailable fields now stay visible with a calm `not collected / нет данных` value.
-- P2 review — `Linked by PID` repeated across every Activity row. The dense relation cell now says only `Linked / Связано`; the shared PID remains an explanatory tooltip and Relationships keeps a human `Linked process` target.
+- P2 review — `Linked by PID` repeated across every Activity row. The dense relation cell now says only `Linked / Связано`, remains a real keyboard-accessible action, and opens the related OS process resolved by the bounded entity endpoint. The shared PID remains an explanatory tooltip and Relationships keeps a human `Linked process` target.
 
 ## Automated verification
 
-- Frontend: 53 files / 329 tests passed with 93.31% statement coverage.
+- Frontend: 53 files / 329 tests passed with 93.33% statement coverage.
 - Typecheck, ESLint, Prettier, production build, and deterministic shell verification passed.
-- Shell verifier exercised 1,000 Statements, 96-bucket analytical matrices, full-width detail, all infrastructure screens, Events, keyboard paths, and 1920×1080 root geometry.
+- Shell verifier exercised 1,000 Statements, 96-bucket analytical matrices, the direct Activity → process action, full-width detail, all infrastructure screens, Events, keyboard paths, and 1920×1080 root geometry.
 
 final result: passed

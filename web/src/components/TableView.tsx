@@ -55,6 +55,7 @@ export interface TableViewProps {
   entity: string | null;
   onSort: (sort: string | null, order: "asc" | "desc" | null) => void;
   onSelectRow: (entity: string) => void;
+  onOpenActivityProcess?: (entity: string) => void;
   onMatched?: (matched: number) => void;
   timeMatrix?: TimeMatrixColumn | null;
   /** Dense joined PG/backend + Linux process snapshot used by Activity overview. */
@@ -1017,7 +1018,41 @@ function TableViewImpl(props: TableViewProps) {
                           maxWidth: "320px",
                         }}
                       >
-                        {formatCellValue(value, column, t)}
+                        {activityGroupedMode &&
+                        column.code === "process_link" &&
+                        value !== null &&
+                        props.onOpenActivityProcess !== undefined ? (
+                          <button
+                            type="button"
+                            data-testid="activity-process-link-cell"
+                            aria-label={t("activity.openLinkedProcess", {
+                              backend: row.label,
+                            })}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              props.onOpenActivityProcess?.(row.entity);
+                            }}
+                            onKeyDown={(event) => event.stopPropagation()}
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              width: "100%",
+                              minHeight: "24px",
+                              padding: 0,
+                              border: 0,
+                              color: "inherit",
+                              background: "transparent",
+                              cursor: "pointer",
+                              font: "inherit",
+                              fontWeight: "inherit",
+                              textAlign: "start",
+                            }}
+                          >
+                            {formatCellValue(value, column, t)}
+                          </button>
+                        ) : (
+                          formatCellValue(value, column, t)
+                        )}
                       </td>
                     );
                   })}

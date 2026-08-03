@@ -4,6 +4,7 @@ import { type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { HeatmapResponse } from "../api/types";
 import {
+  makeEntityPointResponse,
   makeFrameColumn,
   makeFrameResponse,
   makeFrameRow,
@@ -246,6 +247,28 @@ function stubRequests() {
           ),
         );
       }
+      if (url.pathname.startsWith("/v1/entity/activity/")) {
+        return Promise.resolve(
+          json(
+            makeEntityPointResponse({
+              view: "activity",
+              entity: "pid:18422",
+              related: [
+                {
+                  view: "processes",
+                  entity: "proc:18422",
+                  relation: "activity_process",
+                  provenance: {
+                    kind: "best_effort",
+                    method: "pid",
+                    fields: ["pid"],
+                  },
+                },
+              ],
+            }),
+          ),
+        );
+      }
       return Promise.resolve(json(activityFrame));
     }),
   );
@@ -283,7 +306,8 @@ function renderWorkspace(
 
 test("builds the joined Activity snapshot by default and keeps PID links calm", async () => {
   stubRequests();
-  renderWorkspace("overview");
+  const onOpenEntity = vi.fn();
+  renderWorkspace("overview", onOpenEntity);
 
   expect(await screen.findByTestId("activity-snapshot-table")).toBeDefined();
   expect(screen.getByTestId("activity-point-evidence")).toBeDefined();
@@ -308,6 +332,16 @@ test("builds the joined Activity snapshot by default and keeps PID links calm", 
     table.querySelector('[data-evidence-group="relation"]'),
   ).not.toBeNull();
   expect(table.querySelector('[data-evidence-group="os"]')).not.toBeNull();
+
+  screen.getByTestId("activity-process-link-cell").click();
+  await waitFor(() =>
+    expect(onOpenEntity).toHaveBeenCalledWith("processes", "proc:18422"),
+  );
+  const relationCall = vi
+    .mocked(fetch)
+    .mock.calls.map(([input]) => requestUrl(input))
+    .find((url) => url.pathname.startsWith("/v1/entity/activity/"));
+  expect(relationCall?.searchParams.get("include")).toBe("related");
 
   const heatmapCall = vi
     .mocked(fetch)

@@ -1108,6 +1108,14 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   }
   await page.screenshot({ path: ACTIVITY_WAITS_SHOT });
 
+  await page.goto(
+    `${base}/#source=local&view=activity&at=${at}&span=3600&preset=overview`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector(
+    'table[aria-label="activity"] [data-testid="activity-process-link-cell"]',
+    { timeout: 10_000 },
+  );
   await page.evaluate(() => {
     const search = document.querySelector('input[name="view-filter"]');
     if (!(search instanceof HTMLInputElement)) {
@@ -1126,24 +1134,9 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   await page.waitForSelector('table[aria-label="activity"] tr[data-entity]', {
     timeout: 10_000,
   });
-  await page.click('table[aria-label="activity"] tr[data-entity]');
-  await page.waitForSelector('[data-dock="row"]', { timeout: 10_000 });
-  await page.click('[data-detail-tab-trigger="relationships"]');
-  await page.waitForSelector(
-    '[data-dock="row"] [data-detail-tab="relationships"] .entity-detail__relation',
-    { timeout: 5_000 },
+  await page.click(
+    'table[aria-label="activity"] [data-testid="activity-process-link-cell"]',
   );
-  const processRelation = await page.$eval(
-    '[data-dock="row"] [role="tabpanel"]',
-    (element) => element.textContent ?? "",
-  );
-  if (
-    !processRelation.includes("Linked process") ||
-    /best[_ ]effort|activity_process|proof|exact/i.test(processRelation)
-  ) {
-    throw new Error(`Activity process link: ${processRelation}`);
-  }
-  await page.click('[data-dock="row"] [role="tabpanel"] button');
   await page.waitForFunction(
     () => {
       const params = new URLSearchParams(location.hash.slice(1));

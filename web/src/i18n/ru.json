@@ -182,6 +182,7 @@
   "activity.filterHint": "Поиск по retained-строкам выбранного activity snapshot; lazy-текст запроса исключён.",
   "activity.snapshotBadge": "Активность у курсора",
   "activity.pointEvidence": "Одно наблюдение pg_stat_activity у курсора. Короткие запросы между сэмплами могут не попасть в снимок.",
+  "activity.openLinkedProcess": "Открыть связанный процесс ОС для {{backend}}",
   "activity.processEvidence": "Истории Activity и процессов ОС связаны по PID. Для CPU и disk delta по-прежнему используется одна однозначная пара сэмплов процесса.",
   "activity.samplingEvidence": "Только наблюдаемое покрытие snapshot — не ASH и не точная атрибуция стоимости запроса.",
   "activity.locks.empty": "У курсора нет связей waiter/blocker",
