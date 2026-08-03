@@ -1061,38 +1061,36 @@ fn process_cpu_and_block_delay_are_divided_by_clock_ticks() {
     );
 }
 
-#[test]
-fn process_detail_projects_gauges_rates_and_cache_path() {
-    let columns = [
-        "state",
-        "parent_pid",
-        "uid",
-        "effective_uid",
-        "started_at",
-        "current_cpu",
-        "nice",
-        "priority",
-        "realtime_priority",
-        "scheduler_policy",
-        "cpu_user",
-        "cpu_system",
-        "run_delay",
-        "virtual_memory",
-        "swap",
-        "voluntary_context_switches_per_second",
-        "involuntary_context_switches_per_second",
-        "minor_faults_per_second",
-        "major_faults_per_second",
-        "read_syscalls_per_second",
-        "write_syscalls_per_second",
-        "logical_read_bytes_per_second",
-        "logical_write_bytes_per_second",
-        "read_bytes_per_second",
-        "write_bytes_per_second",
-        "cache_served_read_bytes_per_second",
-    ];
-    let query = format!("at=20000000&columns={}", columns.join(","));
-    let request = FrameRequest::parse("processes", Some(&query), &catalog()).expect("request");
+const PROCESS_DETAIL_COLUMNS: &[&str] = &[
+    "state",
+    "parent_pid",
+    "uid",
+    "effective_uid",
+    "started_at",
+    "current_cpu",
+    "nice",
+    "priority",
+    "realtime_priority",
+    "scheduler_policy",
+    "cpu_user",
+    "cpu_system",
+    "run_delay",
+    "virtual_memory",
+    "swap",
+    "voluntary_context_switches_per_second",
+    "involuntary_context_switches_per_second",
+    "minor_faults_per_second",
+    "major_faults_per_second",
+    "read_syscalls_per_second",
+    "write_syscalls_per_second",
+    "logical_read_bytes_per_second",
+    "logical_write_bytes_per_second",
+    "read_bytes_per_second",
+    "write_bytes_per_second",
+    "cache_served_read_bytes_per_second",
+];
+
+fn process_detail_input() -> ProjectionInput {
     let mut input = ProjectionInput::single(
         20_000_000,
         "os_process",
@@ -1155,10 +1153,19 @@ fn process_detail_projects_gauges_rates_and_cache_path() {
             ("write_bytes", Value::U64(10_000_000)),
         ]),
     );
+    input
+}
+
+#[test]
+fn process_detail_projects_gauges_rates_and_cache_path() {
+    let query = format!("at=20000000&columns={}", PROCESS_DETAIL_COLUMNS.join(","));
+    let request = FrameRequest::parse("processes", Some(&query), &catalog()).expect("request");
+    let input = process_detail_input();
 
     let frame = project_input(&request, &catalog(), input).expect("projection");
-    let values = columns
-        .into_iter()
+    let values = PROCESS_DETAIL_COLUMNS
+        .iter()
+        .copied()
         .zip(frame.rows[0].cells.iter().cloned())
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(values["state"], DtoFrameValue::String("R".to_owned()));
