@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
 import { colDesc, colLabel } from "../api/codes";
@@ -14,7 +14,11 @@ import type {
   ViewSpec,
 } from "../api/types";
 import type { DockKind, UiState } from "../state/url";
-import { isIdentityColumn, shortIdToken } from "../design/format";
+import {
+  formatDurationUs,
+  isIdentityColumn,
+  shortIdToken,
+} from "../design/format";
 import { formatCellValue } from "./cellFormat";
 import { formatIntervalTime } from "./FocusBar";
 import { SemanticBadge } from "./SemanticBadge";
@@ -434,6 +438,8 @@ function EntityPointView(props: {
   data: EntityPointResponse;
   columns: Map<string, ColumnSpec>;
   viewCode: string;
+  relatedActivity?: EntityPointResponse;
+  onPatch: (patch: Partial<UiState>) => void;
 }) {
   const { t } = useTranslation();
   const meaningful = props.data.fields.filter((field) => {
@@ -536,24 +542,23 @@ function EntityPointView(props: {
               "started_at",
               "command",
             ]),
-            ...body.filter((field) => !groupedCodes.has(field.code)).filter(
-              (field) =>
-                ![
-                  "parent_pid",
-                  "uid",
-                  "effective_uid",
-                  "started_at",
-                  "command",
-                ].includes(field.code),
-            ),
+            ...body
+              .filter((field) => !groupedCodes.has(field.code))
+              .filter(
+                (field) =>
+                  ![
+                    "parent_pid",
+                    "uid",
+                    "effective_uid",
+                    "started_at",
+                    "command",
+                  ].includes(field.code),
+              ),
           ]
         : body.filter((field) => !groupedCodes.has(field.code)),
   });
 
-  const processSemantics: Record<
-    string,
-    "S" | "G" | "R" | "EST"
-  > = {
+  const processSemantics: Record<string, "S" | "G" | "R" | "EST"> = {
     pid: "S",
     type: "S",
     state: "S",
@@ -589,6 +594,32 @@ function EntityPointView(props: {
     write_syscalls_per_second: "R",
     cache_served_read_bytes_per_second: "EST",
   };
+  const processSubgroupBefore: Record<string, string> = {
+    rss: "memory",
+    logical_read_bytes_per_second: "readPath",
+    logical_write_bytes_per_second: "ioRates",
+    parent_pid: "execution",
+  };
+  const relatedActivityRelation = props.data.related.find(
+    (relation) =>
+      props.viewCode === "processes" &&
+      relation.view === "activity" &&
+      relation.relation === "activity_process",
+  );
+  const relatedActivityField = (code: string) =>
+    props.relatedActivity?.fields.find((field) => field.code === code)?.value ??
+    null;
+  const relatedQuery = relatedActivityField("query");
+  const relatedDuration = relatedActivityField("query_duration_us");
+  const relatedMeta = [
+    relatedActivityField("database"),
+    relatedActivityField("user"),
+    relatedActivityField("application"),
+  ].filter(
+    (value): value is string => typeof value === "string" && value !== "",
+  );
+  const relatedState = relatedActivityField("state");
+  const relatedWait = relatedActivityField("wait_event");
 
   const renderField = (
     field: EntityPointResponse["fields"][number],
@@ -604,9 +635,7 @@ function EntityPointView(props: {
     const desc = colDesc(t, props.viewCode, field.code);
     const availability = spec?.availability ?? "available";
     const semantic =
-      props.viewCode === "processes"
-        ? processSemantics[field.code]
-        : undefined;
+      props.viewCode === "processes" ? processSemantics[field.code] : undefined;
     const notCollected = field.value === null && availability !== "available";
     const isSql =
       typeof field.value === "string" &&
@@ -658,7 +687,12 @@ function EntityPointView(props: {
   };
 
   return (
-    <div data-kv data-forensic-summary className="entity-detail__forensic">
+    <div
+      data-kv
+      data-forensic-summary
+      data-view={props.viewCode}
+      className="entity-detail__forensic"
+    >
       {identity.length > 0 && (
         <div className="entity-detail__identity-strip">
           {identity.map((field) => renderField(field, true))}
@@ -679,12 +713,73 @@ function EntityPointView(props: {
               className="entity-detail__group"
             >
               <h3>
-                {t(`dock.detail.group.${group.code}.${props.viewCode}`, {
-                  defaultValue: t(`dock.detail.group.${group.code}`),
-                })}
+                <span>
+                  {t(`dock.detail.group.${group.code}.${props.viewCode}`, {
+                    defaultValue: t(`dock.detail.group.${group.code}`),
+                  })}
+                </span>
+                {props.viewCode === "processes" && (
+                  <code>{t(`dock.detail.source.process.${group.code}`)}</code>
+                )}
               </h3>
+              {group.code === "context" &&
+                relatedActivityRelation !== undefined &&
+                props.relatedActivity !== undefined && (
+                  <button
+                    type="button"
+                    className="entity-detail__inline-activity"
+                    aria-label={t("dock.detail.relatedActivity.open")}
+                    onClick={() =>
+                      props.onPatch({
+                        view: relatedActivityRelation.view,
+                        entity: relatedActivityRelation.entity,
+                        dock: "row",
+                        preset: null,
+                        q: null,
+                        sort: null,
+                        order: null,
+                      })
+                    }
+                  >
+                    <span className="entity-detail__inline-activity-heading">
+                      <strong>{t("dock.detail.relatedActivity.title")}</strong>
+                      <span>{t("dock.detail.relatedActivity.open")}</span>
+                    </span>
+                    {relatedMeta.length > 0 && (
+                      <code>{relatedMeta.join(" / ")}</code>
+                    )}
+                    {typeof relatedQuery === "string" &&
+                      relatedQuery !== "" && <pre>{relatedQuery}</pre>}
+                    <span className="entity-detail__inline-activity-state">
+                      {typeof relatedState === "string" && (
+                        <span>{relatedState}</span>
+                      )}
+                      {typeof relatedWait === "string" && (
+                        <span>{relatedWait}</span>
+                      )}
+                      {typeof relatedDuration === "number" && (
+                        <span>{formatDurationUs(relatedDuration)}</span>
+                      )}
+                    </span>
+                  </button>
+                )}
               <div className="entity-detail__measurements">
-                {group.fields.map((field) => renderField(field))}
+                {group.fields.map((field) => {
+                  const subgroup =
+                    props.viewCode === "processes"
+                      ? processSubgroupBefore[field.code]
+                      : undefined;
+                  return (
+                    <Fragment key={field.code}>
+                      {subgroup && (
+                        <h4 className="entity-detail__subgroup">
+                          {t(`dock.detail.subgroup.${subgroup}`)}
+                        </h4>
+                      )}
+                      {renderField(field)}
+                    </Fragment>
+                  );
+                })}
               </div>
             </section>
           ))}
@@ -872,6 +967,17 @@ function RowDock(props: {
     at: props.at,
     includeRelated: true,
   });
+  const activityRelation = entity.data?.related.find(
+    (relation) =>
+      props.state.view === "processes" &&
+      relation.view === "activity" &&
+      relation.relation === "activity_process",
+  );
+  const relatedActivity = useEntityPoint({
+    view: "activity",
+    entity: activityRelation?.entity ?? "",
+    at: props.at,
+  });
   const historyColumns = detailHistoryColumns(props.view);
   const historySpan = Math.min(props.state.span, MAX_DETAIL_HISTORY_SECONDS);
   const historyFrom = (
@@ -1032,6 +1138,8 @@ function RowDock(props: {
                   data={data}
                   columns={columnSpecs}
                   viewCode={viewCode}
+                  relatedActivity={relatedActivity.data}
+                  onPatch={props.onPatch}
                 />
               </div>
             )}

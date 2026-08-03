@@ -1158,23 +1158,25 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       "Activity process drill-down kept an invalid Activity lens",
     );
   }
-  const richProcessDetail = await page.$eval(
-    '[data-dock="row"]',
-    (dock) => ({
-      groups: [...dock.querySelectorAll("[data-forensic-group]")].map(
-        (group) => group.getAttribute("data-forensic-group"),
-      ),
-      fields: [...dock.querySelectorAll("[data-field]")].map((field) =>
-        field.getAttribute("data-field"),
-      ),
-      semantics: [...dock.querySelectorAll("[data-semantic]")].map((field) =>
-        field.getAttribute("data-semantic"),
-      ),
-      text: dock.textContent ?? "",
-      rootHeight: document.documentElement.scrollHeight,
-      scrollY: window.scrollY,
-    }),
-  );
+  await page.waitForSelector(".entity-detail__inline-activity", {
+    timeout: 10_000,
+  });
+  const richProcessDetail = await page.$eval('[data-dock="row"]', (dock) => ({
+    groups: [...dock.querySelectorAll("[data-forensic-group]")].map((group) =>
+      group.getAttribute("data-forensic-group"),
+    ),
+    fields: [...dock.querySelectorAll("[data-field]")].map((field) =>
+      field.getAttribute("data-field"),
+    ),
+    semantics: [...dock.querySelectorAll("[data-semantic]")].map((field) =>
+      field.getAttribute("data-semantic"),
+    ),
+    text: dock.textContent ?? "",
+    inlineActivity:
+      dock.querySelector(".entity-detail__inline-activity") !== null,
+    rootHeight: document.documentElement.scrollHeight,
+    scrollY: window.scrollY,
+  }));
   const requiredProcessFields = [
     "cpu_user",
     "cpu_system",
@@ -1195,6 +1197,7 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     ) ||
     !richProcessDetail.semantics.includes("estimate") ||
     !richProcessDetail.semantics.includes("R") ||
+    !richProcessDetail.inlineActivity ||
     /page-cache hits|proof|confidence|exact match|gaps|gated/i.test(
       richProcessDetail.text,
     ) ||

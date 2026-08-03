@@ -1292,8 +1292,7 @@ function rowsProcesses() {
   return Array.from({ length: 36 }, (_, i) => i)
     .filter((i) => i % 9 !== 4)
     .map((i) => {
-      const [user, application, activityState] =
-        BACKENDS[i % BACKENDS.length];
+      const [user, application, activityState] = BACKENDS[i % BACKENDS.length];
       const pid = 12041 + i * 13;
       const active = activityState === "active";
       const type =

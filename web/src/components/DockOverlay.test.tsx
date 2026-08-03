@@ -247,6 +247,7 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
     { code: "read_bytes_per_second", value: 2_000_000 },
     { code: "cache_served_read_bytes_per_second", value: 8_000_000 },
     { code: "logical_read_bytes_per_second", value: 10_000_000 },
+    { code: "logical_write_bytes_per_second", value: 1_400_000 },
     { code: "cpu_system", value: 0.2 },
     { code: "cpu_user", value: 0.3 },
     { code: "cpu", value: 0.5 },
@@ -274,17 +275,58 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
     voluntary_context_switches_per_second: "per_second",
     minor_faults_per_second: "per_second",
     logical_read_bytes_per_second: "bytes_per_second",
+    logical_write_bytes_per_second: "bytes_per_second",
     cache_served_read_bytes_per_second: "bytes_per_second",
     read_bytes_per_second: "bytes_per_second",
   };
-  stubFetch(
-    makeEntityPointResponse({
-      view: "processes",
-      entity: "process:12496",
-      label: "postgres: backend api-worker",
-      fields,
+  const processPoint = makeEntityPointResponse({
+    view: "processes",
+    entity: "process:12496",
+    label: "postgres: backend api-worker",
+    fields,
+    related: [
+      {
+        view: "activity",
+        entity: "pid:12496",
+        relation: "activity_process",
+        provenance: {
+          kind: "best_effort",
+          method: "pid",
+          fields: ["pid"],
+        },
+      },
+    ],
+  });
+  const activityPoint = makeEntityPointResponse({
+    view: "activity",
+    entity: "pid:12496",
+    label: "app/api-worker (active)",
+    fields: [
+      { code: "database", value: "erp_prod" },
+      { code: "user", value: "app" },
+      { code: "application", value: "api-worker" },
+      { code: "state", value: "active" },
+      { code: "wait_event", value: "IO:DataFileRead" },
+      { code: "query_duration_us", value: 1_240_000 },
+      { code: "query", value: "select * from orders where id = $1" },
+    ],
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input instanceof Request ? input.url : input);
+      const body = url.includes("/entity/activity/")
+        ? activityPoint
+        : processPoint;
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
     }),
   );
+  const onPatch = vi.fn();
   renderDock({
     state: {
       ...baseState,
@@ -308,6 +350,7 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
         availability: "available",
       })),
     }),
+    onPatch,
   });
 
   await waitFor(() => expect(screen.getByText("12496")).toBeDefined());
@@ -315,6 +358,32 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
     document.querySelectorAll<HTMLElement>("[data-forensic-group]"),
   ).map((group) => group.dataset.forensicGroup);
   expect(groupCodes).toEqual(["compute", "ioCache", "context"]);
+  expect(screen.getByText("dock.detail.source.process.compute")).toBeDefined();
+  expect(screen.getByText("dock.detail.source.process.ioCache")).toBeDefined();
+  expect(screen.getByText("dock.detail.source.process.context")).toBeDefined();
+  expect(screen.getByText("dock.detail.subgroup.memory")).toBeDefined();
+  expect(screen.getByText("dock.detail.subgroup.readPath")).toBeDefined();
+  expect(screen.getByText("dock.detail.subgroup.ioRates")).toBeDefined();
+  expect(screen.getByText("dock.detail.subgroup.execution")).toBeDefined();
+  expect(
+    await screen.findByText("dock.detail.relatedActivity.title"),
+  ).toBeDefined();
+  expect(screen.getByText("select * from orders where id = $1")).toBeDefined();
+  expect(screen.getByText("1.24 s")).toBeDefined();
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: /dock\.detail\.relatedActivity\.open/,
+    }),
+  );
+  expect(onPatch).toHaveBeenCalledWith({
+    view: "activity",
+    entity: "pid:12496",
+    dock: "row",
+    preset: null,
+    q: null,
+    sort: null,
+    order: null,
+  });
   const fieldCodes = (group: string) =>
     Array.from(
       document.querySelectorAll<HTMLElement>(
