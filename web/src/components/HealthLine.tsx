@@ -32,6 +32,7 @@ export function HealthLine() {
       onBrushDraft={setBrushDraft}
       onCommitRange={commitRange}
       meaning={t("healthLine.coincidence")}
+      showProvenance
     />
   );
 }

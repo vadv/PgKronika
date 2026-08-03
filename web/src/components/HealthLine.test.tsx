@@ -122,12 +122,31 @@ test("public Health line is exactly 60 px and leaves mode and zoom to navigation
   expect(region.style.height).toBe("60px");
   expect(region.style.boxSizing).toBe("border-box");
   expect(screen.getAllByRole("slider")).toHaveLength(1);
-  expect(screen.queryByRole("button")).toBeNull();
+  expect(
+    screen.getByRole("button", {
+      name: "healthLine.provenance.trigger",
+    }),
+  ).toBeDefined();
   expect(screen.queryByRole("group", { name: /spine\.zoom/i })).toBeNull();
   expect(region.getAttribute("aria-describedby")).toBeTruthy();
   expect(screen.getByTestId("health-line-meaning").textContent).toContain(
     "healthLine.coincidence",
   );
+});
+
+test("Health score provenance uses the exact selected server window and documents a local non-causal formula", async () => {
+  renderHealthLine();
+  const trigger = await screen.findByRole("button", {
+    name: "healthLine.provenance.trigger",
+  });
+  fireEvent.click(trigger);
+  const dialog = screen.getByRole("dialog");
+  expect(dialog.textContent).toContain(`${FROM_US}–${AT_US}`);
+  expect(dialog.textContent).toContain("spine.score.formula");
+  expect(dialog.textContent).toContain("healthLine.provenance.localAggregate");
+  expect(dialog.textContent).toContain("healthLine.coincidence");
+  expect(dialog.textContent).toContain("96/96");
+  expect(dialog.textContent).not.toMatch(/root cause/i);
 });
 
 test("pointer hover writes the shared time bucket for an external consumer", async () => {

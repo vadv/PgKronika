@@ -1,5 +1,6 @@
 import { useTranslation } from "react-i18next";
 import type { ViewSummaryResponse } from "../api/types";
+import { formatDurationUs, formatTimestampUs } from "../design/format";
 import type { UiState } from "../state/url";
 
 export interface StatusBarProps {
@@ -12,6 +13,10 @@ export interface StatusBarProps {
 export function StatusBar(props: StatusBarProps) {
   const { t } = useTranslation();
   const notable = props.summary?.views.filter((v) => v.notable).length ?? 0;
+  const replay = props.state.at !== null;
+  const cursor = props.state.at ?? props.summary?.at_us ?? null;
+  const quality = props.summary?.quality.status ?? null;
+  const selected = props.state.entity === null ? 0 : 1;
   const Root = props.embedded === true ? "div" : "footer";
   return (
     <Root
@@ -31,6 +36,42 @@ export function StatusBar(props: StatusBarProps) {
         whiteSpace: "nowrap",
       }}
     >
+      <span data-status-field="mode">
+        {t(replay ? "statusbar.mode.replay" : "statusbar.mode.live")}
+      </span>
+      <span aria-hidden="true">·</span>
+      <span
+        data-status-field="cursor"
+        title={cursor ?? undefined}
+        style={{ fontFamily: cursor === null ? undefined : "var(--mono-font)" }}
+      >
+        {cursor === null
+          ? t("statusbar.cursor.latest")
+          : formatTimestampUs(cursor)}
+      </span>
+      <span aria-hidden="true">·</span>
+      <span data-status-field="range">
+        {t("statusbar.range")}: {formatDurationUs(props.state.span * 1_000_000)}
+      </span>
+      <span aria-hidden="true">·</span>
+      <span data-status-field="baseline">
+        {t(
+          props.state.baseline === null
+            ? "statusbar.baseline.none"
+            : "statusbar.baseline.present",
+        )}
+      </span>
+      <span aria-hidden="true">·</span>
+      <span data-status-field="quality">
+        {quality === null
+          ? t("statusbar.quality.unknown")
+          : `${t("statusbar.quality")}: ${quality}`}
+      </span>
+      <span aria-hidden="true">·</span>
+      <span data-status-field="selection">
+        {t("statusbar.selection")}: {selected}
+      </span>
+      <span style={{ flex: 1 }} />
       <span
         style={{
           overflow: "hidden",
@@ -40,7 +81,6 @@ export function StatusBar(props: StatusBarProps) {
       >
         {t("statusbar.hints")}
       </span>
-      <span style={{ flex: 1 }} />
       {notable > 0 && (
         <span
           data-testid="notable-count"

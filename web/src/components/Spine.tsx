@@ -13,6 +13,7 @@ import {
 } from "../design/format";
 import type { TimeRange } from "../state/timeGeometry";
 import { Tooltip } from "./Tooltip";
+import { ProvenancePopover } from "./ProvenancePopover";
 import {
   bucketReason,
   bucketVerdicts,
@@ -43,6 +44,9 @@ export interface SpineProps {
   onCommitRange?: (range: TimeRange) => void;
   /** Accessible explanation: coincidence and collection quality, not cause. */
   meaning?: string;
+  /** The public HealthLine opts into persistent score provenance; direct
+   * Spine consumers remain a query/render backend without extra chrome. */
+  showProvenance?: boolean;
   /** @deprecated Navigation owns mode and prepared spans. */
   controls?: "embedded" | "external";
   /** @deprecated Navigation owns prepared spans. */
@@ -637,6 +641,40 @@ export function Spine(props: SpineProps) {
             </span>
           </span>
         </Tooltip>
+      )}
+      {!warming && !failed && !empty && props.showProvenance === true && (
+        <ProvenancePopover
+          triggerLabel={t("healthLine.provenance.trigger")}
+          renderTrigger={() => t("healthLine.provenance.short")}
+          record={{
+            definition: `${t("healthLine.provenance.definition")} ${props.meaning ?? t("healthLine.coincidence")}`,
+            value: hasCurrent ? score.score : "—",
+            unit: t("healthLine.provenance.unit"),
+            window: `${from}–${to}`,
+            aggregation: t("healthLine.provenance.localAggregate"),
+            formula: t("spine.score.formula"),
+            // This comparison belongs to the score itself: the preceding
+            // same-width window. It is not the operator's heatmap baseline.
+            baseline: `${prevFrom}–${from}`,
+            source: t("healthLine.provenance.source"),
+            coverage: `${observedBuckets}/${scored.length} · ${t("healthLine.provenance.completedBuckets")}`,
+            sampling: `${bucketSpanUs} µs · ${t("healthLine.provenance.formingTailExcluded")}`,
+            verdictRule: t("healthLine.provenance.verdictRule"),
+            revision: health.data?.health_policy_version,
+            state: !hasCurrent
+              ? "gap"
+              : sourceFailures.length > 0 || incidents.error !== null
+                ? "partial"
+                : undefined,
+            reason: !hasCurrent
+              ? t("healthLine.provenance.noVerdicts")
+              : incidents.error !== null
+                ? t("spine.score.incidentsUnavailable")
+                : sourceFailures.length > 0
+                  ? t("healthLine.partial", { sources: sourceList })
+                  : undefined,
+          }}
+        />
       )}
       {warming || failed || empty ? (
         <span
