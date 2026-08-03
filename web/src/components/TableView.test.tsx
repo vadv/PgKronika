@@ -370,6 +370,101 @@ test("couples plan identity to its exact 96-bucket interval evidence", async () 
   ).toBe("77 · 42");
 });
 
+test("couples process PID and type to exact interval evidence", async () => {
+  const processColumns: ColumnSpec[] = [
+    {
+      availability: "available",
+      code: "pid",
+      lazy: false,
+      requires: ["process"],
+      type: "i64",
+    },
+    {
+      availability: "available",
+      code: "type",
+      lazy: false,
+      requires: ["process"],
+      type: "text",
+    },
+    {
+      availability: "available",
+      code: "cpu",
+      lazy: false,
+      requires: ["process"],
+      type: "f64",
+      unit: "ratio",
+    },
+  ];
+  stubFrame(
+    makeFrameResponse({
+      view: "processes",
+      columns: [
+        makeFrameColumn({ code: "pid", type: "i64" }),
+        makeFrameColumn({ code: "type", type: "text" }),
+        makeFrameColumn({ code: "cpu", type: "f64", unit: "ratio" }),
+      ],
+      rows: [
+        makeFrameRow({
+          entity: "process:18422:1722390000",
+          label: "postgres 18422",
+          cells: [18422, "postgres", 0.82],
+        }),
+        makeFrameRow({
+          entity: "process:18423:1722390001",
+          label: "postgres 18423",
+          cells: [18423, "postgres", 0.44],
+        }),
+      ],
+      page: { matched: 218, returned: 2 },
+    }),
+  );
+  const heatmap: HeatmapResponse = {
+    grid: { from_us: "100", to_us: "200", bucket_count: 96 },
+    ranking: { exact: true, unseen_upper: 0 },
+    quality: makeHeatmapQuality({ snapshots: 96 }),
+    rows: [
+      {
+        entity: "process:18422:1722390000",
+        label: "postgres 18422",
+        unit: "ratio",
+        score: { lower: 0, upper: 1 },
+        values: Array.from({ length: 96 }, (_, index) => index / 100),
+      },
+    ],
+  };
+
+  renderTable({
+    view: makeViewSpec({ code: "processes", columns: processColumns }),
+    timeMatrix: {
+      kind: "processes",
+      evidenceMode: "process_intervals",
+      data: heatmap,
+      pending: false,
+      error: false,
+      metricLabel: "CPU",
+      cursorUs: "150",
+      baselineUs: null,
+      onRetry: () => {},
+    },
+  });
+
+  const matrix = await screen.findByTestId("processes-time-matrix");
+  await waitFor(() =>
+    expect(matrix.querySelectorAll("tr[data-entity]")).toHaveLength(2),
+  );
+  expect(screen.getByText("host.matrix.identity")).toBeDefined();
+  expect(screen.getByText("host.matrix.heatmap")).toBeDefined();
+  expect(screen.getAllByTestId("process-interval-row")).toHaveLength(2);
+  expect(screen.getAllByTestId("time-matrix-bucket")).toHaveLength(2 * 96);
+  expect(
+    matrix
+      .querySelector(
+        '[data-entity="process:18422:1722390000"] .processes-time-matrix__identity',
+      )
+      ?.getAttribute("title"),
+  ).toBe("18422 · postgres");
+});
+
 test("five server pages stay deduplicated and DOM-bounded", async () => {
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(280);
   const allRows = Array.from({ length: 1_000 }, (_, index) =>

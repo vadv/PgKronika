@@ -582,6 +582,53 @@ test("a Processes hash explicitly selects OS while retaining deep-link context",
   expect(screen.getByTestId("contextual-deep-link").textContent).toContain(
     "navigation.deepLink.processes",
   );
+  expect(screen.getByTestId("os-workspace")).toBeDefined();
+  expect(screen.getByTestId("processes-time-matrix")).toBeDefined();
+  expect(
+    document.querySelector('[data-shell-region="analytical-center"]'),
+  ).toBeNull();
+});
+
+test("mobile OS keeps host context and its row-coupled process matrix", async () => {
+  history.replaceState(null, "", `${location.pathname}#view=processes`);
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn().mockReturnValue({
+      matches: true,
+      media: "(max-width: 760px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }),
+  );
+  renderApp();
+
+  const workspace = await screen.findByTestId("mobile-os-workspace");
+  expect(within(workspace).getByTestId("host-pressure-evidence")).toBeDefined();
+  expect(within(workspace).getByTestId("processes-time-matrix")).toBeDefined();
+  await waitFor(() => {
+    const heatmap = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map(
+        ([input]) =>
+          new URL(
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : input.href,
+          ),
+      )
+      .find(
+        (url) =>
+          url.pathname === "/v1/timeline/heatmap" &&
+          url.searchParams.get("view") === "processes",
+      );
+    expect(heatmap?.searchParams.get("buckets")).toBe("48");
+  });
 });
 
 test("arrow keys step the cursor; shift+arrow jumps an hour", async () => {

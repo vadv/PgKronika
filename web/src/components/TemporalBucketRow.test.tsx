@@ -116,4 +116,35 @@ describe("TemporalBucketRow", () => {
       "plans.matrix.bucketValue",
     );
   });
+
+  test("labels process buckets as interval evidence without inventing continuity", () => {
+    render(
+      <TemporalBucketRow
+        row={{
+          entity: "process:18422:1722390000",
+          label: "postgres 18422",
+          unit: "ratio",
+          score: { lower: 0, upper: 1 },
+          values: [0.8, null, 0.3, 0],
+        }}
+        bucketCount={4}
+        gridFromUs="100"
+        gridToUs="200"
+        cursorUs="150"
+        baselineUs={null}
+        metricLabel="CPU"
+        mode="process_intervals"
+      />,
+    );
+
+    const row = screen.getByTestId("process-interval-row");
+    expect(row.dataset.mode).toBe("process_intervals");
+    expect(row.getAttribute("aria-label")).toContain(
+      "host.matrix.intervalRowLabel",
+    );
+    expect(row.querySelector("svg, polyline, path")).toBeNull();
+    expect(screen.getAllByTestId("time-matrix-bucket")[0]?.title).toContain(
+      "host.matrix.bucketValue",
+    );
+  });
 });
