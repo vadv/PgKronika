@@ -262,11 +262,18 @@
 }
 
 .entity-detail__label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
   min-width: 0;
   color: var(--fg-dim);
   font-family: var(--ui-font);
   font-size: var(--text-xs);
   letter-spacing: 0.02em;
+}
+
+.entity-detail__measurement[data-semantic="estimate"] {
+  background: color-mix(in srgb, var(--sev-warn) 5%, transparent);
 }
 
 .entity-detail__value {

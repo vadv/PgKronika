@@ -241,6 +241,120 @@ test("row dock renders point fields from the entity endpoint", async () => {
   expect(summary.textContent).not.toContain("—");
 });
 
+test("process detail orders real Linux evidence into a dense forensic workspace", async () => {
+  const fields = [
+    { code: "command", value: "postgres: api-worker erp_prod" },
+    { code: "read_bytes_per_second", value: 2_000_000 },
+    { code: "cache_served_read_bytes_per_second", value: 8_000_000 },
+    { code: "logical_read_bytes_per_second", value: 10_000_000 },
+    { code: "cpu_system", value: 0.2 },
+    { code: "cpu_user", value: 0.3 },
+    { code: "cpu", value: 0.5 },
+    { code: "run_delay", value: 0.4 },
+    { code: "rss", value: 412_884 },
+    { code: "virtual_memory", value: 1_048_576 },
+    { code: "voluntary_context_switches_per_second", value: 10 },
+    { code: "minor_faults_per_second", value: 100 },
+    { code: "parent_pid", value: 1 },
+    { code: "uid", value: 999 },
+    { code: "effective_uid", value: 998 },
+    { code: "started_at", value: "1722400000000000" },
+    { code: "pid", value: 12496 },
+    { code: "type", value: "postgres: backend" },
+    { code: "state", value: "R" },
+    { code: "cgroup", value: "/system.slice/postgresql.service" },
+  ];
+  const unitByCode: Record<string, string | null> = {
+    cpu: "ratio",
+    cpu_user: "ratio",
+    cpu_system: "ratio",
+    run_delay: "ratio",
+    rss: "kib",
+    virtual_memory: "kib",
+    voluntary_context_switches_per_second: "per_second",
+    minor_faults_per_second: "per_second",
+    logical_read_bytes_per_second: "bytes_per_second",
+    cache_served_read_bytes_per_second: "bytes_per_second",
+    read_bytes_per_second: "bytes_per_second",
+  };
+  stubFetch(
+    makeEntityPointResponse({
+      view: "processes",
+      entity: "process:12496",
+      label: "postgres: backend api-worker",
+      fields,
+    }),
+  );
+  renderDock({
+    state: {
+      ...baseState,
+      view: "processes",
+      dock: "row",
+      entity: "process:12496",
+    },
+    view: makeViewSpec({
+      code: "processes",
+      columns: fields.map((field) => ({
+        code: field.code,
+        type:
+          field.code === "started_at"
+            ? "timestamp"
+            : typeof field.value === "number"
+              ? "f64"
+              : "text",
+        unit: unitByCode[field.code] ?? null,
+        lazy: false,
+        requires: ["process"],
+        availability: "available",
+      })),
+    }),
+  });
+
+  await waitFor(() => expect(screen.getByText("12496")).toBeDefined());
+  const groupCodes = Array.from(
+    document.querySelectorAll<HTMLElement>("[data-forensic-group]"),
+  ).map((group) => group.dataset.forensicGroup);
+  expect(groupCodes).toEqual(["compute", "ioCache", "context"]);
+  const fieldCodes = (group: string) =>
+    Array.from(
+      document.querySelectorAll<HTMLElement>(
+        `[data-forensic-group="${group}"] [data-field]`,
+      ),
+    ).map((field) => field.dataset.field);
+  expect(fieldCodes("compute").slice(0, 4)).toEqual([
+    "cpu",
+    "cpu_user",
+    "cpu_system",
+    "run_delay",
+  ]);
+  expect(fieldCodes("ioCache").slice(0, 3)).toEqual([
+    "logical_read_bytes_per_second",
+    "cache_served_read_bytes_per_second",
+    "read_bytes_per_second",
+  ]);
+  expect(fieldCodes("context").slice(0, 4)).toEqual([
+    "parent_pid",
+    "uid",
+    "effective_uid",
+    "started_at",
+  ]);
+  expect(
+    document.querySelector(
+      '[data-field="cache_served_read_bytes_per_second"][data-semantic="estimate"]',
+    ),
+  ).not.toBeNull();
+  expect(screen.getByText("EST").getAttribute("title")).toBe(
+    "semantic.kind.EST.label: semantic.kind.EST.explanation",
+  );
+  expect(screen.getAllByText("R").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("G").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("S").length).toBeGreaterThan(0);
+  expect(screen.getByText("10/s")).toBeDefined();
+  expect(screen.getByRole("tabpanel").textContent).not.toMatch(
+    /page-cache hits|proof|confidence|exact match|gaps|gated/i,
+  );
+});
+
 test("row dock fetches bounded history only after selecting the History tab", async () => {
   const point = makeEntityPointResponse({
     fields: [{ code: "tup", value: 12 }],

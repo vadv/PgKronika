@@ -17,6 +17,7 @@ import type { DockKind, UiState } from "../state/url";
 import { isIdentityColumn, shortIdToken } from "../design/format";
 import { formatCellValue } from "./cellFormat";
 import { formatIntervalTime } from "./FocusBar";
+import { SemanticBadge } from "./SemanticBadge";
 import "./DockOverlay.css";
 
 export interface DockOverlayProps {
@@ -444,7 +445,7 @@ function EntityPointView(props: {
     props.viewCode === "activity"
       ? ["pid", "database", "user", "application", "process_link"]
       : props.viewCode === "processes"
-        ? ["pid", "type", "cgroup"]
+        ? ["pid", "type", "state", "cgroup"]
         : props.viewCode === "statements"
           ? ["queryid", "database", "user"]
           : props.viewCode === "plans"
@@ -463,29 +464,131 @@ function EntityPointView(props: {
   const body = meaningful.filter(
     (field) => !identityCodes.has(field.code) && !stateCodes.has(field.code),
   );
-  const groups = [
-    {
-      code: "compute",
-      fields: body.filter((field) =>
-        /(cpu|rss|mem|thread|sched|delay|load|context)/i.test(field.code),
-      ),
-    },
-    {
-      code: "ioCache",
-      fields: body.filter((field) =>
-        /(read|write|(^|_)io|cache|hit|miss|block|wal|buffer|temp|disk)/i.test(
-          field.code,
-        ),
-      ),
-    },
-  ];
+  const ordered = (codes: readonly string[]) =>
+    codes.flatMap((code) => body.filter((field) => field.code === code));
+  const groups =
+    props.viewCode === "processes"
+      ? [
+          {
+            code: "compute",
+            fields: ordered([
+              "cpu",
+              "cpu_user",
+              "cpu_system",
+              "run_delay",
+              "block_delay",
+              "current_cpu",
+              "rss",
+              "virtual_memory",
+              "swap",
+              "threads",
+              "minor_faults_per_second",
+              "major_faults_per_second",
+              "voluntary_context_switches_per_second",
+              "involuntary_context_switches_per_second",
+              "scheduler_policy",
+              "nice",
+              "priority",
+              "realtime_priority",
+            ]),
+          },
+          {
+            code: "ioCache",
+            fields: ordered([
+              "logical_read_bytes_per_second",
+              "cache_served_read_bytes_per_second",
+              "read_bytes_per_second",
+              "logical_write_bytes_per_second",
+              "write_bytes_per_second",
+              "read_syscalls_per_second",
+              "write_syscalls_per_second",
+            ]),
+          },
+        ]
+      : [
+          {
+            code: "compute",
+            fields: body.filter((field) =>
+              /(cpu|rss|mem|thread|sched|delay|load|context)/i.test(field.code),
+            ),
+          },
+          {
+            code: "ioCache",
+            fields: body.filter((field) =>
+              /(read|write|(^|_)io|cache|hit|miss|block|wal|buffer|temp|disk)/i.test(
+                field.code,
+              ),
+            ),
+          },
+        ];
   const groupedCodes = new Set(
     groups.flatMap((group) => group.fields.map((field) => field.code)),
   );
   groups.push({
     code: "context",
-    fields: body.filter((field) => !groupedCodes.has(field.code)),
+    fields:
+      props.viewCode === "processes"
+        ? [
+            ...ordered([
+              "parent_pid",
+              "uid",
+              "effective_uid",
+              "started_at",
+              "command",
+            ]),
+            ...body.filter((field) => !groupedCodes.has(field.code)).filter(
+              (field) =>
+                ![
+                  "parent_pid",
+                  "uid",
+                  "effective_uid",
+                  "started_at",
+                  "command",
+                ].includes(field.code),
+            ),
+          ]
+        : body.filter((field) => !groupedCodes.has(field.code)),
   });
+
+  const processSemantics: Record<
+    string,
+    "S" | "G" | "R" | "EST"
+  > = {
+    pid: "S",
+    type: "S",
+    state: "S",
+    cgroup: "S",
+    parent_pid: "S",
+    uid: "S",
+    effective_uid: "S",
+    started_at: "S",
+    command: "S",
+    current_cpu: "G",
+    rss: "G",
+    virtual_memory: "G",
+    swap: "G",
+    threads: "G",
+    scheduler_policy: "G",
+    nice: "G",
+    priority: "G",
+    realtime_priority: "G",
+    cpu: "R",
+    cpu_user: "R",
+    cpu_system: "R",
+    run_delay: "R",
+    block_delay: "R",
+    minor_faults_per_second: "R",
+    major_faults_per_second: "R",
+    voluntary_context_switches_per_second: "R",
+    involuntary_context_switches_per_second: "R",
+    logical_read_bytes_per_second: "R",
+    logical_write_bytes_per_second: "R",
+    read_bytes_per_second: "R",
+    write_bytes_per_second: "R",
+    read_syscalls_per_second: "R",
+    write_syscalls_per_second: "R",
+    cache_served_read_bytes_per_second: "EST",
+  };
 
   const renderField = (
     field: EntityPointResponse["fields"][number],
@@ -500,6 +603,10 @@ function EntityPointView(props: {
     const label = colLabel(t, props.viewCode, field.code);
     const desc = colDesc(t, props.viewCode, field.code);
     const availability = spec?.availability ?? "available";
+    const semantic =
+      props.viewCode === "processes"
+        ? processSemantics[field.code]
+        : undefined;
     const notCollected = field.value === null && availability !== "available";
     const isSql =
       typeof field.value === "string" &&
@@ -518,10 +625,12 @@ function EntityPointView(props: {
       <div
         key={field.code}
         data-field={field.code}
+        data-semantic={semantic === "EST" ? "estimate" : semantic}
         className="entity-detail__measurement entity-detail__measurement--block"
       >
         <div title={desc ?? undefined} className="entity-detail__label">
-          {label}
+          <span>{label}</span>
+          {semantic && <SemanticBadge kind={semantic} />}
         </div>
         <pre data-sql className="entity-detail__code">
           {field.value}
@@ -531,10 +640,12 @@ function EntityPointView(props: {
       <div
         key={field.code}
         data-field={field.code}
+        data-semantic={semantic === "EST" ? "estimate" : semantic}
         className={`entity-detail__measurement${compact ? " entity-detail__measurement--compact" : ""}`}
       >
         <span title={desc ?? undefined} className="entity-detail__label">
-          {label}
+          <span>{label}</span>
+          {semantic && <SemanticBadge kind={semantic} />}
         </span>
         <span
           className={`entity-detail__value${notCollected ? " entity-detail__value--missing" : ""}`}
@@ -567,7 +678,11 @@ function EntityPointView(props: {
               data-forensic-group={group.code}
               className="entity-detail__group"
             >
-              <h3>{t(`dock.detail.group.${group.code}`)}</h3>
+              <h3>
+                {t(`dock.detail.group.${group.code}.${props.viewCode}`, {
+                  defaultValue: t(`dock.detail.group.${group.code}`),
+                })}
+              </h3>
               <div className="entity-detail__measurements">
                 {group.fields.map((field) => renderField(field))}
               </div>
