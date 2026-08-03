@@ -1350,16 +1350,15 @@ function rowsProcesses() {
           involuntary_context_switches_per_second: r2(0.4 + (i % 6) * 0.7),
           minor_faults_per_second: r2(4 + (i % 9) * 3.2),
           major_faults_per_second: i % 11 === 3 ? 0.2 : 0,
-          read_syscalls_per_second: r2(logicalReadBps / 8_192),
-          write_syscalls_per_second: r2(logicalWriteBps / 6_144),
-          logical_read_bytes_per_second: logicalReadBps,
-          logical_write_bytes_per_second: logicalWriteBps,
-          read_bytes_per_second: readBps,
-          write_bytes_per_second: writeBps,
-          cache_served_read_bytes_per_second: Math.max(
-            logicalReadBps - readBps,
-            0,
-          ),
+          read_syscalls_per_second: i === 7 ? null : r2(logicalReadBps / 8_192),
+          write_syscalls_per_second:
+            i === 7 ? null : r2(logicalWriteBps / 6_144),
+          logical_read_bytes_per_second: i === 7 ? null : logicalReadBps,
+          logical_write_bytes_per_second: i === 7 ? null : logicalWriteBps,
+          read_bytes_per_second: i === 7 ? null : readBps,
+          write_bytes_per_second: i === 7 ? null : writeBps,
+          cache_served_read_bytes_per_second:
+            i === 7 ? null : Math.max(logicalReadBps - readBps, 0),
           block_delay: r2(i % 4 === 0 ? 0.8 : 0.05),
           command,
           cgroup: i < 12 ? "/system.slice/postgresql.service" : "/system.slice",
@@ -1825,6 +1824,7 @@ function entityResponse(viewCode, entity, params) {
           view: "plans",
           entity: plan.entity,
           relation: "statement_plan",
+          snapshot_ts_us: at,
           provenance: {
             kind: "best_effort",
             method: "ossc_queryid_dbid_userid_attribution",
@@ -1846,6 +1846,7 @@ function entityResponse(viewCode, entity, params) {
           view: "processes",
           entity: process.entity,
           relation: "activity_process",
+          snapshot_ts_us: at,
           provenance: {
             kind: "best_effort",
             method: "pid",
@@ -1862,6 +1863,7 @@ function entityResponse(viewCode, entity, params) {
           view: "activity",
           entity: activity.entity,
           relation: "activity_process",
+          snapshot_ts_us: at,
           provenance: {
             kind: "best_effort",
             method: "pid",
@@ -1878,6 +1880,7 @@ function entityResponse(viewCode, entity, params) {
           view: "vacuum",
           entity: vacuum.entity,
           relation: "table_active_vacuum",
+          snapshot_ts_us: at,
           provenance: {
             kind: "temporal",
             method: "same_snapshot_database_relation_oid",
@@ -1895,6 +1898,7 @@ function entityResponse(viewCode, entity, params) {
           view: "tables",
           entity: table.entity,
           relation: "index_table",
+          snapshot_ts_us: at,
           provenance: {
             kind: "temporal",
             method: "same_snapshot_database_relation_oid",
@@ -1912,6 +1916,7 @@ function entityResponse(viewCode, entity, params) {
           view: "tables",
           entity: table.entity,
           relation: "vacuum_table",
+          snapshot_ts_us: at,
           provenance: {
             kind: "temporal",
             method: "same_snapshot_database_relation_oid",

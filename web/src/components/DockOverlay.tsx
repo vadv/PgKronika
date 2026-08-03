@@ -445,7 +445,11 @@ function EntityPointView(props: {
   const meaningful = props.data.fields.filter((field) => {
     const availability =
       props.columns.get(field.code)?.availability ?? "available";
-    return field.value !== null || availability !== "available";
+    return (
+      props.viewCode === "processes" ||
+      field.value !== null ||
+      availability !== "available"
+    );
   });
   const identityCodes = new Set(
     props.viewCode === "activity"
@@ -636,15 +640,21 @@ function EntityPointView(props: {
     const availability = spec?.availability ?? "available";
     const semantic =
       props.viewCode === "processes" ? processSemantics[field.code] : undefined;
-    const notCollected = field.value === null && availability !== "available";
+    const notCollected =
+      field.value === null &&
+      (props.viewCode === "processes" || availability !== "available");
     const isSql =
       typeof field.value === "string" &&
       (field.value.length > 60 || field.value.includes("\n"));
     const fullIdentity = field.value !== null && isIdentityColumn(field.code);
+    const unavailableKind =
+      props.viewCode === "processes" && availability === "available"
+        ? "not_collected"
+        : availability;
     const unavailableFallback =
-      availability === "available" ? "—" : "not collected";
+      unavailableKind === "available" ? "—" : "not collected";
     const display = notCollected
-      ? t(`availability.${availability}`, {
+      ? t(`availability.${unavailableKind}`, {
           defaultValue: unavailableFallback,
         })
       : fullIdentity
@@ -738,6 +748,7 @@ function EntityPointView(props: {
                         q: null,
                         sort: null,
                         order: null,
+                        at: relatedActivityRelation.snapshot_ts_us,
                       })
                     }
                   >
@@ -976,7 +987,7 @@ function RowDock(props: {
   const relatedActivity = useEntityPoint({
     view: "activity",
     entity: activityRelation?.entity ?? "",
-    at: props.at,
+    at: activityRelation?.snapshot_ts_us ?? props.at,
   });
   const historyColumns = detailHistoryColumns(props.view);
   const historySpan = Math.min(props.state.span, MAX_DETAIL_HISTORY_SECONDS);
@@ -1206,6 +1217,7 @@ function RowDock(props: {
                           view: relation.view,
                           entity: relation.entity,
                           dock: "row",
+                          at: relation.snapshot_ts_us,
                           ...(relation.view === props.state.view
                             ? {}
                             : {

@@ -248,6 +248,7 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
     { code: "cache_served_read_bytes_per_second", value: 8_000_000 },
     { code: "logical_read_bytes_per_second", value: 10_000_000 },
     { code: "logical_write_bytes_per_second", value: 1_400_000 },
+    { code: "write_bytes_per_second", value: null },
     { code: "cpu_system", value: 0.2 },
     { code: "cpu_user", value: 0.3 },
     { code: "cpu", value: 0.5 },
@@ -278,7 +279,9 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
     logical_write_bytes_per_second: "bytes_per_second",
     cache_served_read_bytes_per_second: "bytes_per_second",
     read_bytes_per_second: "bytes_per_second",
+    write_bytes_per_second: "bytes_per_second",
   };
+  const relatedAt = "1722399990000000";
   const processPoint = makeEntityPointResponse({
     view: "processes",
     entity: "process:12496",
@@ -289,6 +292,7 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
         view: "activity",
         entity: "pid:12496",
         relation: "activity_process",
+        snapshot_ts_us: relatedAt,
         provenance: {
           kind: "best_effort",
           method: "pid",
@@ -311,10 +315,12 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
       { code: "query", value: "select * from orders where id = $1" },
     ],
   });
+  const requestUrls: string[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn().mockImplementation((input: RequestInfo | URL) => {
       const url = String(input instanceof Request ? input.url : input);
+      requestUrls.push(url);
       const body = url.includes("/entity/activity/")
         ? activityPoint
         : processPoint;
@@ -370,6 +376,20 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
   ).toBeDefined();
   expect(screen.getByText("select * from orders where id = $1")).toBeDefined();
   expect(screen.getByText("1.24 s")).toBeDefined();
+  expect(
+    document.querySelector(
+      '[data-field="write_bytes_per_second"] .entity-detail__value',
+    )?.textContent,
+  ).toBe("not collected");
+  expect(
+    requestUrls.some((url) => {
+      const request = new URL(url);
+      return (
+        request.pathname.includes("/entity/activity/") &&
+        request.searchParams.get("at") === relatedAt
+      );
+    }),
+  ).toBe(true);
   fireEvent.click(
     screen.getByRole("button", {
       name: /dock\.detail\.relatedActivity\.open/,
@@ -383,6 +403,7 @@ test("process detail orders real Linux evidence into a dense forensic workspace"
     q: null,
     sort: null,
     order: null,
+    at: relatedAt,
   });
   const fieldCodes = (group: string) =>
     Array.from(
@@ -672,6 +693,7 @@ test("row dock drills down via server related provenance and clears", async () =
           view: "plans",
           entity: "plan:9",
           relation: "statement_plan",
+          snapshot_ts_us: "1722400000000000",
           provenance: {
             kind: "best_effort",
             method: "ossc_queryid_dbid_userid_attribution",
@@ -714,6 +736,7 @@ test("row dock drills down via server related provenance and clears", async () =
     q: null,
     sort: null,
     order: null,
+    at: "1722400000000000",
   });
   fireEvent.click(screen.getByRole("button", { name: "dock.row.clear" }));
   expect(onPatch).toHaveBeenCalledWith({ entity: null, dock: null });
@@ -734,6 +757,7 @@ test("activity-process relationship stays positive across partial collection", a
           view: "processes",
           entity: "process:44",
           relation: "activity_process",
+          snapshot_ts_us: "1722400000000000",
           provenance: {
             kind: "best_effort",
             method: "pid",

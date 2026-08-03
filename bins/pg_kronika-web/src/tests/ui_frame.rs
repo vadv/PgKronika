@@ -886,15 +886,31 @@ fn process_activity_relation_keeps_every_same_pid_activity_record() {
             ]),
         );
     }
+    input.push_previous(
+        10_000_000,
+        "pg_stat_activity",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("backend_start", Value::Ts(500_000)),
+        ]),
+    );
 
     let relations = process_activity_relations(&process, &input).expect("PID links");
-    assert_eq!(relations.len(), 2, "all same-PID activity stays linked");
+    assert_eq!(relations.len(), 3, "all same-PID activity stays linked");
     assert!(relations.iter().all(|relation| {
         relation.relation == "activity_process"
             && relation.view == "activity"
             && relation.method == "pid"
             && relation.fields == vec!["pid"]
     }));
+    assert_eq!(
+        relations
+            .iter()
+            .map(|relation| relation.snapshot_ts_us)
+            .collect::<Vec<_>>(),
+        vec![20_000_000, 20_000_000, 10_000_000]
+    );
     assert_ne!(relations[0].entity, relations[1].entity);
 }
 
@@ -1233,6 +1249,42 @@ fn process_detail_projects_gauges_rates_and_cache_path() {
         values["cache_served_read_bytes_per_second"],
         DtoFrameValue::Number(8_000_000.0)
     );
+}
+
+#[test]
+fn process_detail_keeps_unavailable_io_and_cache_estimate_null() {
+    let request = FrameRequest::parse(
+        "processes",
+        Some(
+            "at=20000000&columns=logical_read_bytes_per_second,read_bytes_per_second,write_bytes_per_second,cache_served_read_bytes_per_second",
+        ),
+        &catalog(),
+    )
+    .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+        ]),
+    );
+    input.push_previous(
+        10_000_000,
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(10_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+            ("rchar", Value::U64(4_857_600)),
+            ("read_bytes", Value::U64(4_857_600)),
+            ("write_bytes", Value::U64(1_000_000)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Null; 4]);
 }
 
 #[test]

@@ -1248,12 +1248,15 @@ RelatedEntityDto:
       $ref: '#/RelationProvenanceDto'
     relation:
       type: string
+    snapshot_ts_us:
+      type: string
     view:
       type: string
   required:
   - relation
   - view
   - entity
+  - snapshot_ts_us
   - provenance
   type: object
 RelationKind:
