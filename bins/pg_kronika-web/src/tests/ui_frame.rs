@@ -1566,6 +1566,26 @@ fn plan_call_timestamps_keep_their_source_names() {
 }
 
 #[test]
+fn plan_queryid_uses_the_fork_specific_vadv_statement_identity() {
+    let request =
+        FrameRequest::parse("plans", Some("at=20&columns=queryid"), &catalog()).expect("request");
+    let input = ProjectionInput::single(
+        20,
+        "pg_store_plans_vadv",
+        out_row(&[
+            ("ts", Value::Ts(20)),
+            ("dbid", Value::U64(3)),
+            ("userid", Value::U64(2)),
+            ("planid", Value::I64(9)),
+            ("queryid_stat_statements", Value::I64(8)),
+        ]),
+    );
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(frame.rows[0].cells, vec![DtoFrameValue::Number(8.0)]);
+}
+
+#[test]
 fn reset_before_the_predecessor_does_not_break_the_interval() {
     let request =
         FrameRequest::parse("statements", Some("at=20&columns=mean"), &catalog()).expect("request");

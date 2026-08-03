@@ -92,7 +92,7 @@ function LockLanes(props: {
     at: props.at,
     span: props.span,
     preset: "tree",
-    limit: 6,
+    limit: 3,
   });
   if (frame.isPending) {
     return <span style={{ color: "var(--fg-dim)" }}>{t("table.loading")}</span>;
@@ -228,7 +228,7 @@ function PlanTimeline(props: {
     at: props.at,
     span: props.span,
     preset: "change_timeline",
-    limit: 5,
+    limit: 3,
   });
   if (frame.isPending) {
     return <span style={{ color: "var(--fg-dim)" }}>{t("table.loading")}</span>;

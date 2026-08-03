@@ -12,6 +12,7 @@ import { apiRetryDelay, isWarmingUp, retryApiRequest } from "./api/client";
 import { useUiContext } from "./api/context";
 import { useIncidents } from "./api/incidents";
 import { useSummary } from "./api/summary";
+import type { ViewSpec } from "./api/types";
 import { AlertBar } from "./components/AlertBar";
 import { DockOverlay } from "./components/DockOverlay";
 import { FocusBar } from "./components/FocusBar";
@@ -73,6 +74,46 @@ const PLAN_LENSES = [
   ["planRows", "rows"],
   ["planChanges", "change_timeline"],
 ] as const;
+
+function catalogPreparedLens(
+  view: ViewSpec | undefined,
+  code: string,
+  preset: string,
+): PreparedLens {
+  if (view === undefined) {
+    return { code, preset, availability: "gated", reason: "view_missing" };
+  }
+  const presetSpec = view.presets.find(
+    (candidate) => candidate.code === preset,
+  );
+  if (presetSpec === undefined) {
+    return {
+      code,
+      preset,
+      availability: "gated",
+      reason: "preset_not_published",
+    };
+  }
+  const requiredColumns = presetSpec.columns
+    .map((columnCode) =>
+      view.columns.find((column) => column.code === columnCode),
+    )
+    .filter((column) => column !== undefined);
+  const unavailable =
+    requiredColumns.find((column) => column.availability === "not_collected") ??
+    requiredColumns.find((column) => column.availability !== "available");
+  if (unavailable === undefined) {
+    return { code, preset, availability: "available" };
+  }
+  return {
+    code,
+    preset,
+    availability:
+      unavailable.availability === "not_collected" ? "not_collected" : "gated",
+    reason: unavailable.unavailable_reason ?? unavailable.availability,
+  };
+}
+
 function useMobile(): boolean {
   return useSyncExternalStore(
     (onChange) => {
@@ -240,11 +281,9 @@ function Shell() {
         : state.preset;
   const preparedLenses: PreparedLens[] | undefined = statementsScreen
     ? [
-        ...STATEMENT_LENSES.map(([code, preset]) => ({
-          code,
-          preset,
-          availability: "available" as const,
-        })),
+        ...STATEMENT_LENSES.map(([code, preset]) =>
+          catalogPreparedLens(activeView, code, preset),
+        ),
         {
           code: "regression",
           preset: null,
@@ -260,11 +299,9 @@ function Shell() {
       ]
     : activityScreen
       ? [
-          ...ACTIVITY_LENSES.map(([code, preset]) => ({
-            code,
-            preset,
-            availability: "available" as const,
-          })),
+          ...ACTIVITY_LENSES.map(([code, preset]) =>
+            catalogPreparedLens(activeView, code, preset),
+          ),
           {
             code: "memory",
             preset: null,
@@ -280,11 +317,9 @@ function Shell() {
         ]
       : plansScreen
         ? [
-            ...PLAN_LENSES.map(([code, preset]) => ({
-              code,
-              preset,
-              availability: "available" as const,
-            })),
+            ...PLAN_LENSES.map(([code, preset]) =>
+              catalogPreparedLens(activeView, code, preset),
+            ),
             {
               code: "planCompare",
               preset: null,

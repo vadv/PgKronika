@@ -1366,7 +1366,13 @@ fn project_plans(
         let value = match column.code {
             "planid" => raw_frame(row, "planid", column.value_type),
             "plan" => raw_frame(row, "plan", column.value_type),
-            "queryid" => raw_frame(row, "queryid", column.value_type),
+            "queryid" => {
+                if value(row, "queryid").is_some_and(|value| *value != Value::Null) {
+                    raw_frame(row, "queryid", column.value_type)
+                } else {
+                    raw_frame(row, "queryid_stat_statements", column.value_type)
+                }
+            }
             "calls" => delta_frame(calls),
             "mean" => divide_delta(total, calls),
             "rows" => delta_frame(rows),

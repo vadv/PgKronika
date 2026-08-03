@@ -74,7 +74,7 @@ test("Activity always identifies point evidence and fetches bounded lock lanes o
   const url = new URL((fetchMock.mock.calls[0]?.[0] as Request).url);
   expect(url.pathname).toBe("/v1/frame/locks");
   expect(url.searchParams.get("preset")).toBe("tree");
-  expect(url.searchParams.get("limit")).toBe("6");
+  expect(url.searchParams.get("limit")).toBe("3");
   expect(url.searchParams.get("span")).toBe("3600s");
 });
 
@@ -159,5 +159,5 @@ test("Plans change timeline is bounded and publishes both fork attribution metho
   const url = new URL((fetchMock.mock.calls[0]?.[0] as Request).url);
   expect(url.pathname).toBe("/v1/frame/plans");
   expect(url.searchParams.get("preset")).toBe("change_timeline");
-  expect(url.searchParams.get("limit")).toBe("5");
+  expect(url.searchParams.get("limit")).toBe("3");
 });

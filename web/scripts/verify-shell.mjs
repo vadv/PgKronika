@@ -831,6 +831,7 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   await page.waitForSelector('[data-testid="activity-lock-lanes"] button', {
     timeout: 10_000,
   });
+  await page.evaluate(() => window.scrollTo(0, 0));
   const activity = await page.evaluate(() => {
     const center = document.querySelector(
       '[data-testid="workload-analytical-center"]',
@@ -843,11 +844,16 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     }
     const centerRect = center.getBoundingClientRect();
     const panelRect = panel.getBoundingClientRect();
+    const lockLanes = [
+      ...panel.querySelectorAll('[data-testid="activity-lock-lanes"] button'),
+    ];
+    const lastLaneRect = lockLanes.at(-1)?.getBoundingClientRect();
     const gated = [...document.querySelectorAll('button[aria-disabled="true"]')]
       .map((button) => button.textContent?.trim() ?? "")
       .filter(Boolean);
     return {
       rootHeight: document.documentElement.scrollHeight,
+      scrollY: window.scrollY,
       centerHeight: centerRect.height,
       panelInside:
         panelRect.top >= centerRect.top &&
@@ -855,9 +861,9 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       pointEvidence:
         document.querySelector('[data-testid="activity-point-evidence"]')
           ?.textContent ?? "",
-      lockLanes: document.querySelectorAll(
-        '[data-testid="activity-lock-lanes"] button',
-      ).length,
+      lockLanes: lockLanes.length,
+      lastLaneInside:
+        lastLaneRect !== undefined && lastLaneRect.bottom <= panelRect.bottom,
       gated,
     };
   });
@@ -865,10 +871,14 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   const activityFailures = [];
   if (activity.rootHeight > 1080)
     activityFailures.push(`root height ${activity.rootHeight}`);
+  if (activity.scrollY !== 0)
+    activityFailures.push(`shell scroll offset ${activity.scrollY}`);
   if (activity.centerHeight !== 156)
     activityFailures.push(`analytical center ${activity.centerHeight}`);
   if (!activity.panelInside) activityFailures.push("panel escapes center");
   if (activity.lockLanes < 1) activityFailures.push("no lock lanes");
+  if (!activity.lastLaneInside)
+    activityFailures.push("last lock lane is clipped");
   if (!activity.pointEvidence.includes("Short queries"))
     activityFailures.push("point-snapshot sampling caveat is missing");
   if (
@@ -933,19 +943,53 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   await page.waitForSelector('[data-testid="plan-version-lanes"] button', {
     timeout: 10_000,
   });
+  await page.evaluate(() => window.scrollTo(0, 0));
   const plans = await page.evaluate(() => {
     const panel = document.querySelector(
       '[data-testid="workload-evidence-panel"][data-view="plans"]',
     );
+    const center = document.querySelector(
+      '[data-testid="workload-analytical-center"]',
+    );
+    const global = document.querySelector(
+      '[data-shell-region="global-context"]',
+    );
+    const health = document.querySelector('[data-shell-region="health-line"]');
+    if (
+      !(panel instanceof HTMLElement) ||
+      !(center instanceof HTMLElement) ||
+      !(global instanceof HTMLElement) ||
+      !(health instanceof HTMLElement)
+    ) {
+      throw new Error("Plans shell regions are incomplete");
+    }
+    const panelRect = panel.getBoundingClientRect();
+    const centerRect = center.getBoundingClientRect();
+    const globalRect = global.getBoundingClientRect();
+    const healthRect = health.getBoundingClientRect();
+    const lanes = [
+      ...panel.querySelectorAll('[data-testid="plan-version-lanes"] button'),
+    ];
+    const lastLaneRect = lanes.at(-1)?.getBoundingClientRect();
     const panelText = panel?.textContent ?? "";
     const compare = [...document.querySelectorAll("button")].find(
       (button) => button.textContent?.trim() === "Compare",
     );
     return {
       rootHeight: document.documentElement.scrollHeight,
-      lanes: document.querySelectorAll(
-        '[data-testid="plan-version-lanes"] button',
-      ).length,
+      scrollY: window.scrollY,
+      globalHeight: globalRect.height,
+      globalTop: globalRect.top,
+      healthHeight: healthRect.height,
+      healthInsideViewport:
+        healthRect.top >= 0 && healthRect.bottom <= window.innerHeight,
+      centerHeight: centerRect.height,
+      panelInside:
+        panelRect.top >= centerRect.top &&
+        panelRect.bottom <= centerRect.bottom,
+      lanes: lanes.length,
+      lastLaneInside:
+        lastLaneRect !== undefined && lastLaneRect.bottom <= panelRect.bottom,
       ossc: panelText.includes("ossc_queryid_dbid_userid_attribution"),
       vadv: panelText.includes(
         "vadv_queryid_stat_statements_dbid_userid_attribution",
@@ -957,7 +1001,18 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   const plansFailures = [];
   if (plans.rootHeight > 1080)
     plansFailures.push(`root height ${plans.rootHeight}`);
+  if (plans.scrollY !== 0)
+    plansFailures.push(`shell scroll offset ${plans.scrollY}`);
+  if (plans.globalHeight !== 44 || plans.globalTop !== 0)
+    plansFailures.push(
+      `global region ${plans.globalHeight}px at ${plans.globalTop}px`,
+    );
+  if (plans.healthHeight !== 60 || !plans.healthInsideViewport)
+    plansFailures.push(`Health line ${plans.healthHeight}px outside viewport`);
+  if (plans.centerHeight !== 156 || !plans.panelInside)
+    plansFailures.push(`analytical center/panel geometry is invalid`);
   if (plans.lanes < 1) plansFailures.push("no version lanes");
+  if (!plans.lastLaneInside) plansFailures.push("last plan lane is clipped");
   if (!plans.ossc || !plans.vadv) plansFailures.push("fork provenance missing");
   if (!plans.compareGated) plansFailures.push("Compare is not gated");
   if (plans.heatmapBuckets !== 96)
