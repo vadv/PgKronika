@@ -132,6 +132,7 @@ The focused comparison confirms that the two-level column grouping is readable o
    - The fresh Waits capture shows a regular blocker, a prepared-transaction blocker, and a third independent edge without overflow.
    - Preset-scoped metric state now follows URL history, cross-view relations clear incompatible filters, and the Activity grouped table reports both header rows to assistive technology.
    - Active-fraction lanes remain labeled as observed samples; CPU, I/O, and wait lanes now say `derived intervals` and disclose consecutive-observation provenance in each cell tooltip.
+   - Failed lock continuations stop automatic pagination and expose an explicit retry instead of entering a request loop; Activity toolbar and metric descriptions use the same point-versus-interval vocabulary as the matrix.
    - The three fresh source/implementation pairs were reopened together at original 1920 × 1080 resolution. No actionable P0, P1, or P2 mismatch was introduced.
 
 ## Findings

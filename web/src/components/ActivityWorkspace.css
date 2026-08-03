@@ -199,6 +199,18 @@
   color: var(--sev-crit-fg);
 }
 
+.activity-lock-evidence__retry {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: start;
+}
+
+.activity-lock-evidence__retry:hover,
+.activity-lock-evidence__retry:focus-visible {
+  background: var(--hover-bg);
+}
+
 .activity-workspace > [data-shell-region="ranked-matrix"] {
   border-start-start-radius: 0 !important;
   border-start-end-radius: 0 !important;

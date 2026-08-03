@@ -344,3 +344,40 @@ test("adds bounded edge-only lock evidence only to Waits & Locks", async () => {
     ).toBe(true);
   });
 });
+
+test("stops lock continuation pagination on error and exposes an explicit retry", async () => {
+  let continuationAttempts = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.pathname === "/v1/timeline/heatmap")
+        return Promise.resolve(json(heatmap));
+      if (url.pathname === "/v1/frame/locks") {
+        if (url.searchParams.get("cursor") === "locks-page-2") {
+          continuationAttempts += 1;
+          return Promise.resolve(
+            new Response(JSON.stringify({ code: "continuation_failed" }), {
+              status: 500,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }
+        return Promise.resolve(json(locksRootFrame));
+      }
+      return Promise.resolve(json(activityFrame));
+    }),
+  );
+  renderWorkspace("waits_locks");
+
+  const retry = await screen.findByRole("button", {
+    name: /table\.error.*table\.retry/i,
+  });
+  expect(continuationAttempts).toBe(1);
+
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  expect(continuationAttempts).toBe(1);
+
+  retry.click();
+  await waitFor(() => expect(continuationAttempts).toBe(2));
+});

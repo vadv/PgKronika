@@ -145,16 +145,18 @@ function ActivityLockEvidence(props: {
     [frame.data?.pages],
   );
   const { fetchNextPage, hasNextPage, isFetchingNextPage } = frame;
+  const lockError = frame.isError || frame.isFetchNextPageError;
 
   useEffect(() => {
-    if (edges.length >= 3 || !hasNextPage || isFetchingNextPage) {
+    if (edges.length >= 3 || !hasNextPage || isFetchingNextPage || lockError) {
       return;
     }
     void fetchNextPage();
-  }, [edges.length, fetchNextPage, hasNextPage, isFetchingNextPage]);
+  }, [edges.length, fetchNextPage, hasNextPage, isFetchingNextPage, lockError]);
 
   const isSearchingForEdges =
     edges.length === 0 &&
+    !lockError &&
     (frame.isPending || hasNextPage || isFetchingNextPage);
 
   return (
@@ -174,16 +176,20 @@ function ActivityLockEvidence(props: {
             {t("table.loading")}
           </span>
         )}
-        {frame.isError && (
-          <span className="activity-lock-evidence__state activity-lock-evidence__state--error">
-            {t("table.error")}
-          </span>
+        {lockError && (
+          <button
+            type="button"
+            className="activity-lock-evidence__state activity-lock-evidence__state--error activity-lock-evidence__retry"
+            onClick={() => void fetchNextPage()}
+          >
+            {t("table.error")} · {t("table.retry")}
+          </button>
         )}
         {frame.data !== undefined &&
           edges.length === 0 &&
           !hasNextPage &&
           !isFetchingNextPage &&
-          !frame.isError && (
+          !lockError && (
             <span className="activity-lock-evidence__state">
               {t("activity.locks.empty")}
             </span>
