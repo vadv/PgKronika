@@ -1,7 +1,7 @@
 # PgKronika Superdesign fidelity pass
 
-**Status:** approved for autonomous implementation  
-**Visual source of truth:** <https://pgkronika-forensic-u.superdesign.cloud/>  
+**Status:** approved for autonomous implementation
+**Visual source of truth:** <https://pgkronika-forensic-u.superdesign.cloud/>
 **Baseline viewport:** 1920×1080, DPR 1, 100% zoom
 
 ## 1. Goal
