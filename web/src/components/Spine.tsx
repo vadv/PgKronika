@@ -287,7 +287,7 @@ export function Spine(props: SpineProps) {
   const observedBuckets = scored.filter((verdict) => verdict !== "gap").length;
   const hasCurrent = observedBuckets > 0;
   const hasPrevious = previousVerdicts.some((v) => v !== "gap");
-  const delta =
+  const rawDelta =
     hasCurrent && hasPrevious ? score.score - previousScore.score : null;
   const tone = chipTone(score.score);
 
@@ -449,18 +449,29 @@ export function Spine(props: SpineProps) {
   );
   const warming = cold && retrying;
   const sourceFailures = [
-    { code: "health", query: health },
-    { code: "spine", query: spine },
-    { code: "events", query: events },
-  ].filter(({ query }) => query.error !== null && !isWarmingUp(query.error));
+    health.error !== null && !isWarmingUp(health.error) ? "health" : null,
+    spine.error !== null && !isWarmingUp(spine.error) ? "spine" : null,
+    events.error !== null && !isWarmingUp(events.error) ? "events" : null,
+    incidents.error !== null && !isWarmingUp(incidents.error)
+      ? "incidents"
+      : null,
+  ].filter((code): code is string => code !== null);
   // Score provenance is narrower than the persistent Health-line evidence:
   // the local formula consumes only server health verdicts and incidents.
   // Spine series and event glyph availability cannot change this score.
   const scoreHealthUnavailable =
     health.error !== null && !isWarmingUp(health.error);
   const scoreIncidentsUnavailable = incidents.error !== null;
+  const scoreHealthPending =
+    health.data === undefined && !scoreHealthUnavailable;
+  const scoreIncidentsPending =
+    incidents.data === undefined && !scoreIncidentsUnavailable;
   const failed =
-    cold && !warming && sourceFailures.length === evidenceQueries.length;
+    cold &&
+    !warming &&
+    [health, spine, events].every(
+      (query) => query.error !== null && !isWarmingUp(query.error),
+    );
   const empty =
     !cold &&
     !failed &&
@@ -471,13 +482,44 @@ export function Spine(props: SpineProps) {
     allSeries.every((s) => s.values.every((v) => v === null)) &&
     visibleEvents.length === 0;
 
-  const sourceNames = sourceFailures.map(({ code }) =>
+  const sourceNames = sourceFailures.map((code) =>
     t(`healthLine.source.${code}`),
   );
   const sourceList = sourceNames.join(", ");
-  const sourcesLoading = evidenceQueries.some(
+  const sourcesLoading = [...evidenceQueries, incidents].some(
     (query) => query.isPending && query.data === undefined,
   );
+  const scoreCoverageComplete =
+    scored.length > 0 && observedBuckets === scored.length;
+  const scoreDisplayable =
+    hasCurrent &&
+    scoreCoverageComplete &&
+    !scoreHealthUnavailable &&
+    !scoreIncidentsUnavailable &&
+    !scoreHealthPending &&
+    !scoreIncidentsPending;
+  const scoreState = scoreDisplayable
+    ? null
+    : scoreHealthUnavailable ||
+        scoreIncidentsUnavailable ||
+        scoreHealthPending ||
+        scoreIncidentsPending ||
+        hasCurrent
+      ? "partial"
+      : "gap";
+  const scoreStateReason = scoreHealthUnavailable
+    ? t("healthLine.provenance.healthUnavailable")
+    : scoreIncidentsUnavailable
+      ? t("spine.score.incidentsUnavailable")
+      : scoreHealthPending || scoreIncidentsPending
+        ? t("healthLine.provenance.inputsLoading")
+        : hasCurrent && !scoreCoverageComplete
+          ? t("healthLine.provenance.incompleteCoverage", {
+              observed: observedBuckets,
+              total: scored.length,
+            })
+          : t("healthLine.provenance.noVerdicts");
+  const delta = scoreDisplayable ? rawDelta : null;
   const sourceStatus = failed
     ? t("healthLine.sources.unavailable")
     : sourceFailures.length > 0
@@ -602,10 +644,10 @@ export function Spine(props: SpineProps) {
                   fontFamily: "var(--mono-font)",
                   fontSize: 20,
                   fontWeight: 600,
-                  color: CHIP_FG[tone],
+                  color: scoreDisplayable ? CHIP_FG[tone] : "var(--fg-dim)",
                 }}
               >
-                {hasCurrent ? score.score : "—"}
+                {scoreDisplayable ? score.score : "—"}
               </span>
               <span
                 style={{
@@ -616,6 +658,22 @@ export function Spine(props: SpineProps) {
               >
                 {t("spine.score.caption")}
               </span>
+              {scoreState !== null && (
+                <span
+                  data-testid="health-score-state"
+                  title={scoreStateReason}
+                  style={{
+                    display: "block",
+                    color:
+                      scoreState === "partial"
+                        ? "var(--sev-warn-fg)"
+                        : "var(--fg-dim)",
+                    fontSize: "var(--text-xs)",
+                  }}
+                >
+                  {t(`semantic.state.${scoreState}.label`)}
+                </span>
+              )}
             </span>
             <span
               style={{
@@ -654,7 +712,7 @@ export function Spine(props: SpineProps) {
           renderTrigger={() => t("healthLine.provenance.short")}
           record={{
             definition: `${t("healthLine.provenance.definition")} ${props.meaning ?? t("healthLine.coincidence")}`,
-            value: hasCurrent ? score.score : "—",
+            value: scoreDisplayable ? score.score : "—",
             unit: t("healthLine.provenance.unit"),
             window: `${from}–${to}`,
             aggregation: t("healthLine.provenance.localAggregate"),
@@ -667,19 +725,8 @@ export function Spine(props: SpineProps) {
             sampling: `${bucketSpanUs} µs · ${t("healthLine.provenance.formingTailExcluded")}`,
             verdictRule: t("healthLine.provenance.verdictRule"),
             revision: health.data?.health_policy_version,
-            state:
-              scoreHealthUnavailable || scoreIncidentsUnavailable
-                ? "partial"
-                : !hasCurrent
-                  ? "gap"
-                  : undefined,
-            reason: scoreHealthUnavailable
-              ? t("healthLine.provenance.healthUnavailable")
-              : scoreIncidentsUnavailable
-                ? t("spine.score.incidentsUnavailable")
-                : !hasCurrent
-                  ? t("healthLine.provenance.noVerdicts")
-                  : undefined,
+            state: scoreState ?? undefined,
+            reason: scoreState === null ? undefined : scoreStateReason,
           }}
         />
       )}

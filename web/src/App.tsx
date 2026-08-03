@@ -72,6 +72,8 @@ function Shell() {
     state,
     range,
     cursorUs: at,
+    hoverUs,
+    brushDraft,
     patchUiState: patch,
     setCursor,
     setSpan,
@@ -424,6 +426,11 @@ function Shell() {
                 }
                 from={heatmapRange.from}
                 to={heatmapRange.to}
+                selectedRange={range}
+                cursorUs={at}
+                hoverUs={hoverUs}
+                brushDraft={brushDraft}
+                baselineUs={state.baseline}
                 onMetricChange={(m) =>
                   setMetricByView((prev) => ({
                     ...prev,

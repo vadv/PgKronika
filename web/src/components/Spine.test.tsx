@@ -335,9 +335,43 @@ test("a health-less window renders honest gap markers, not silence", async () =>
       ?.textContent,
   ).toContain("spine.missing");
   expect(screen.getByTestId("spine-score").textContent).toContain("—");
+  expect(screen.getByTestId("health-score-state").textContent).toContain(
+    "semantic.state.gap.label",
+  );
   expect(screen.getByTestId("health-line-quality").textContent).toContain(
     "0/96",
   );
+});
+
+test("a partial health window cannot render a healthy numeric score", async () => {
+  await renderLocalizedSpine({}, (input) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    if (url.includes("/v1/timeline/health")) {
+      return Promise.resolve(
+        jsonResponse(
+          makeHealthResponse({ points: healthFixture.points.slice(0, -1) }),
+        ),
+      );
+    }
+    const body = url.includes("/v1/timeline/events")
+      ? eventsFixture
+      : url.includes("/v1/incidents")
+        ? incidentsFixture
+        : spineFixture;
+    return Promise.resolve(jsonResponse(body));
+  });
+  await waitFor(() =>
+    expect(screen.getByTestId("health-score-state").textContent).toContain(
+      "Partial",
+    ),
+  );
+  expect(screen.getByTestId("spine-score").textContent).toContain("—");
+  expect(screen.getByTestId("spine-score").textContent).not.toContain("100");
 });
 
 test("selection overlays share one SVG grid while gap hatch remains on top", async () => {

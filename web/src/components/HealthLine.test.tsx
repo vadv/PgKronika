@@ -187,6 +187,11 @@ test.each([
     const trigger = await screen.findByRole("button", {
       name: "healthLine.provenance.trigger",
     });
+    await waitFor(() =>
+      expect(screen.getByTestId("health-score-state").textContent).toContain(
+        "semantic.state.partial.label",
+      ),
+    );
     fireEvent.click(trigger);
     const dialog = screen.getByRole("dialog");
     const state = dialog.querySelector('[data-field="state"]');
@@ -194,6 +199,10 @@ test.each([
     expect(
       dialog.querySelector('[data-field="reason"]')?.textContent,
     ).toContain(reason);
+    expect(screen.getByTestId("spine-score").textContent).toContain("—");
+    expect(screen.getByTestId("health-score-state").textContent).toContain(
+      "semantic.state.partial.label",
+    );
   },
 );
 
