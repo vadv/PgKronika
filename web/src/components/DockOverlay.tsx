@@ -1,12 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
-import {
-  colDesc,
-  colLabel,
-  relationKindDesc,
-  relationKindLabel,
-} from "../api/codes";
+import { colDesc, colLabel } from "../api/codes";
 import { useEntityHistory, useEntityPoint } from "../api/entity";
 import { useIncidents } from "../api/incidents";
 import type {
@@ -22,6 +17,7 @@ import type { DockKind, UiState } from "../state/url";
 import { isIdentityColumn, shortIdToken } from "../design/format";
 import { formatCellValue } from "./cellFormat";
 import { formatIntervalTime } from "./FocusBar";
+import "./DockOverlay.css";
 
 export interface DockOverlayProps {
   state: UiState;
@@ -121,7 +117,7 @@ const dockStyle = (mobile: boolean) =>
       : {
           insetBlock: 0,
           insetInlineEnd: 0,
-          width: "520px",
+          width: "560px",
           maxWidth: "calc(100vw - 24px)",
           borderInlineStart: "1px solid var(--border)",
         }),
@@ -430,15 +426,7 @@ function EntityPointView(props: {
 }) {
   const { t } = useTranslation();
   return (
-    <div
-      data-kv
-      style={{
-        display: "grid",
-        gridTemplateColumns: "130px 1fr",
-        gap: "2px 8px",
-        alignItems: "baseline",
-      }}
-    >
+    <div data-kv className="entity-detail__measurements">
       {props.data.fields.map((field) => {
         const spec = props.columns.get(field.code);
         const cellColumn = {
@@ -469,30 +457,12 @@ function EntityPointView(props: {
           <div
             key={field.code}
             data-field={field.code}
-            style={{ gridColumn: "1 / -1", marginBlock: "4px" }}
+            className="entity-detail__measurement entity-detail__measurement--block"
           >
-            <div
-              title={desc ?? undefined}
-              style={{
-                color: "var(--fg-dim)",
-                fontFamily: "var(--ui-font)",
-              }}
-            >
+            <div title={desc ?? undefined} className="entity-detail__label">
               {label}
             </div>
-            <pre
-              data-sql
-              style={{
-                margin: 0,
-                fontFamily: "var(--mono-font)",
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
-                color: "var(--fg)",
-                border: "1px solid var(--border)",
-                borderRadius: "4px",
-                padding: "4px 6px",
-              }}
-            >
+            <pre data-sql className="entity-detail__code">
               {field.value}
             </pre>
           </div>
@@ -500,27 +470,18 @@ function EntityPointView(props: {
           <div
             key={field.code}
             data-field={field.code}
-            style={{ display: "contents" }}
+            className="entity-detail__measurement"
           >
-            <span
-              title={desc ?? undefined}
-              style={{
-                color: "var(--fg-dim)",
-                fontFamily: "var(--ui-font)",
-              }}
-            >
+            <span title={desc ?? undefined} className="entity-detail__label">
               {label}
             </span>
             <span
-              style={{
-                fontFamily: "var(--mono-font)",
-                color:
-                  field.value !== null && !notCollected
-                    ? "var(--fg)"
-                    : "var(--fg-dim)",
-                overflowWrap: "break-word",
-                ...(fullIdentity ? { userSelect: "all" } : {}),
-              }}
+              className={`entity-detail__value${
+                field.value === null || notCollected
+                  ? " entity-detail__value--missing"
+                  : ""
+              }`}
+              style={fullIdentity ? { userSelect: "all" } : undefined}
             >
               {display}
             </span>
@@ -530,20 +491,6 @@ function EntityPointView(props: {
     </div>
   );
 }
-
-const historyHeadCellStyle = {
-  textAlign: "start",
-  color: "var(--fg-dim)",
-  fontWeight: "normal",
-  borderBottom: "1px solid var(--border)",
-  padding: "2px 6px 2px 0",
-} as const;
-
-const historyCellStyle = {
-  borderBottom: "1px solid var(--border)",
-  padding: "2px 6px 2px 0",
-  overflowWrap: "break-word",
-} as const;
 
 function EntityHistoryView(props: {
   data: EntityHistoryResponse;
@@ -555,23 +502,15 @@ function EntityHistoryView(props: {
   const { t } = useTranslation();
   const { data } = props;
   return (
-    <div>
-      <table
-        data-detail-history
-        style={{
-          borderCollapse: "collapse",
-          fontFamily: "var(--mono-font)",
-          width: "100%",
-        }}
-      >
+    <div className="entity-detail__history-scroll">
+      <table data-detail-history className="entity-detail__history-table">
         <thead>
           <tr>
-            <th style={historyHeadCellStyle}>ts</th>
+            <th>{t("dock.detail.observedAt")}</th>
             {data.columns.map((column) => (
               <th
                 key={column}
                 title={colDesc(t, props.viewCode, column) ?? undefined}
-                style={historyHeadCellStyle}
               >
                 {colLabel(t, props.viewCode, column)}
               </th>
@@ -580,8 +519,8 @@ function EntityHistoryView(props: {
         </thead>
         <tbody>
           {data.snapshots.map((snapshot) => (
-            <tr key={snapshot.ts_us}>
-              <td style={{ ...historyCellStyle, color: "var(--fg-dim)" }}>
+            <tr key={snapshot.ts_us} data-testid="history-snapshot">
+              <td className="entity-detail__history-time">
                 {formatIntervalTime(Number(snapshot.ts_us))}
               </td>
               {data.columns.map((column, i) => {
@@ -590,10 +529,11 @@ function EntityHistoryView(props: {
                 return (
                   <td
                     key={column}
-                    style={{
-                      ...historyCellStyle,
-                      color: value !== null ? "var(--fg)" : "var(--fg-dim)",
-                    }}
+                    className={
+                      value === null
+                        ? "entity-detail__history-missing"
+                        : undefined
+                    }
                   >
                     {formatCellValue(
                       value,
@@ -617,15 +557,7 @@ function EntityHistoryView(props: {
           data-testid="history-load-more"
           disabled={props.loadingMore === true}
           onClick={props.onLoadMore}
-          style={{
-            color: "var(--accent)",
-            fontFamily: "var(--mono-font)",
-            background: "none",
-            border: "none",
-            padding: "4px 0",
-            cursor: "pointer",
-            marginBlockStart: "4px",
-          }}
+          className="entity-detail__load-more"
         >
           {props.loadingMore === true
             ? t("table.loading")
@@ -645,6 +577,24 @@ const ENTITY_DETAIL_TABS: EntityDetailTab[] = [
   "raw",
 ];
 const MAX_DETAIL_HISTORY_SECONDS = 21_600;
+
+function relationLabelKey(relation: string): string {
+  switch (relation) {
+    case "activity_process":
+      return "dock.relation.pid";
+    case "statement_plan":
+      return "dock.relation.query";
+    case "table_index":
+    case "table_vacuum":
+      return "dock.relation.table";
+    case "index_table":
+      return "dock.relation.index";
+    default:
+      return relation.includes("time") || relation.includes("temporal")
+        ? "dock.relation.nearTime"
+        : "dock.relation.object";
+  }
+}
 
 function detailHistoryColumns(view: ViewSpec | undefined): string[] {
   if (view === undefined || !view.capabilities.history) return [];
@@ -812,43 +762,35 @@ function RowDock(props: {
     setTokenCopied(true);
     setTimeout(() => setTokenCopied(false), 1700);
   };
+  const rawEvidence =
+    data === undefined
+      ? null
+      : {
+          endpoint: `/v1/entity/${viewCode}/${encodeURIComponent(data.entity)}`,
+          technical_entity_id: data.entity,
+          snapshot_ts_us: data.snapshot_ts_us,
+          quality: data.quality,
+          response: data,
+        };
 
   return (
-    <div>
-      {/* The heading is always human text (tab + server label); the entity
-          token is routing material — it lives in the heading tooltip and
-          rides the clipboard, never a visible line of its own. */}
-      <div
-        title={props.state.entity ?? undefined}
-        style={{
-          fontFamily: "var(--ui-font)",
-          marginBlockEnd: "6px",
-          overflowWrap: "anywhere",
-        }}
-      >
-        <span style={{ color: "var(--fg-dim)" }}>{t(`tabs.${viewCode}`)}</span>
+    <div className="entity-detail">
+      <div data-testid="dock-entity-heading" className="entity-detail__heading">
+        <span className="entity-detail__view">{t(`tabs.${viewCode}`)}</span>
         {heading !== null && (
           <>
             {" · "}
-            <span style={{ fontWeight: 600 }}>{heading}</span>
+            <span className="entity-detail__title">{heading}</span>
           </>
         )}
         {props.state.entity !== null && (
           <button
             type="button"
             data-testid="dock-copy-token"
-            title={t("dock.row.copyToken")}
+            aria-label={t("dock.row.copyTechnicalId")}
+            title={t("dock.row.copyTechnicalId")}
             onClick={copyToken}
-            style={{
-              marginInlineStart: "6px",
-              fontFamily: "var(--mono-font)",
-              fontSize: "var(--text-xs)",
-              color: "var(--fg-dim)",
-              background: "none",
-              border: "none",
-              padding: 0,
-              cursor: "pointer",
-            }}
+            className="entity-detail__copy-id"
           >
             {tokenCopied ? t("dock.row.tokenCopied") : "⧉"}
           </button>
@@ -869,28 +811,12 @@ function RowDock(props: {
             : t("table.loading")}
         </div>
       )}
-      {data && data.quality.status !== "complete" && (
-        <div
-          style={{
-            color: "var(--fg-dim)",
-            fontFamily: "var(--mono-font)",
-            marginBlockEnd: "6px",
-          }}
-        >
-          {t("dock.row.partial")}
-        </div>
-      )}
       {data !== undefined && (
         <>
           <div
             role="tablist"
             aria-label={t("dock.detail.tabs")}
-            style={{
-              display: "flex",
-              gap: "var(--space-1)",
-              borderBlockEnd: "1px solid var(--border)",
-              marginBlockEnd: "var(--space-2)",
-            }}
+            className="entity-detail__tabs"
           >
             {ENTITY_DETAIL_TABS.map((tab) => (
               <button
@@ -900,39 +826,19 @@ function RowDock(props: {
                 data-detail-tab-trigger={tab}
                 aria-selected={detailTab === tab}
                 onClick={() => setDetailTab(tab)}
-                style={tabButtonStyle(detailTab === tab)}
+                className="entity-detail__tab"
               >
                 {t(`dock.detail.${tab}`)}
               </button>
             ))}
           </div>
-          <div role="tabpanel" data-detail-tab={detailTab}>
+          <div
+            role="tabpanel"
+            data-detail-tab={detailTab}
+            className="entity-detail__panel"
+          >
             {detailTab === "summary" && (
-              <div>
-                <div
-                  data-detail-provenance
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-                    gap: "var(--space-1)",
-                    marginBlockEnd: "var(--space-2)",
-                    padding: "var(--space-2)",
-                    color: "var(--fg-dim)",
-                    background: "var(--bg-raised)",
-                    border: "1px solid var(--border)",
-                    borderRadius: "var(--radius-sm)",
-                    fontFamily: "var(--mono-font)",
-                    fontSize: "var(--text-xs)",
-                  }}
-                >
-                  <span>{formatIntervalTime(Number(data.snapshot_ts_us))}</span>
-                  <span>{data.quality.status}</span>
-                  <span>gaps {data.quality.gaps.length}</span>
-                  <span>gated {data.quality.gated.length}</span>
-                  <span style={{ gridColumn: "1 / -1" }}>
-                    /v1/entity/{viewCode}/… · point projection
-                  </span>
-                </div>
+              <div className="entity-detail__summary">
                 <EntityPointView
                   data={data}
                   columns={columnSpecs}
@@ -966,25 +872,6 @@ function RowDock(props: {
                   </div>
                 ) : combinedHistory !== undefined ? (
                   <>
-                    {combinedHistory.quality.status !== "complete" && (
-                      <div
-                        data-history-quality
-                        data-gaps={combinedHistory.quality.gaps.length}
-                        data-gated={combinedHistory.quality.gated.length}
-                        role="note"
-                        style={{
-                          color: "var(--sev-warn-fg)",
-                          fontFamily: "var(--mono-font)",
-                          marginBlockEnd: "var(--space-2)",
-                        }}
-                      >
-                        {t("dock.detail.historyQuality", {
-                          status: combinedHistory.quality.status,
-                          gaps: combinedHistory.quality.gaps.length,
-                          gated: combinedHistory.quality.gated.length,
-                        })}
-                      </div>
-                    )}
                     <EntityHistoryView
                       data={combinedHistory}
                       columns={columnSpecs}
@@ -1012,14 +899,7 @@ function RowDock(props: {
                   </div>
                 )}
                 {data.related.map((relation) => {
-                  const activityProcess =
-                    relation.relation === "activity_process" &&
-                    relation.provenance.method === "pid";
-                  const kind = relationKindLabel(t, relation.provenance.kind);
-                  const kindDesc = relationKindDesc(
-                    t,
-                    relation.provenance.kind,
-                  );
+                  const labelKey = relationLabelKey(relation.relation);
                   return (
                     <button
                       key={`${relation.view}:${relation.entity}`}
@@ -1039,81 +919,40 @@ function RowDock(props: {
                               }),
                         })
                       }
-                      style={{
-                        display: "block",
-                        width: "100%",
-                        marginBlockEnd: "var(--space-2)",
-                        padding: "var(--space-2)",
-                        color: "var(--fg)",
-                        background: "var(--bg-raised)",
-                        border: "1px solid var(--border)",
-                        borderRadius: "var(--radius-sm)",
-                        textAlign: "start",
-                        cursor: "pointer",
-                      }}
+                      className="entity-detail__relation"
                     >
-                      <strong>{relation.relation}</strong>
-                      {activityProcess ? (
-                        <span
-                          style={{
-                            display: "block",
-                            color: "var(--accent-strong)",
-                          }}
-                        >
-                          {t("relation.activityProcess.pid")}
-                        </span>
-                      ) : (
-                        <>
-                          <span
-                            style={{
-                              display: "block",
-                              color: "var(--fg-dim)",
-                              fontFamily: "var(--mono-font)",
-                              fontSize: "var(--text-xs)",
-                            }}
-                          >
-                            {kind} · {relation.provenance.method} ·{" "}
-                            {relation.provenance.fields.join(", ")}
-                          </span>
-                          {kindDesc !== null && (
-                            <span style={{ color: "var(--fg-dim)" }}>
-                              {kindDesc}
-                            </span>
-                          )}
-                        </>
-                      )}
+                      <span className="entity-detail__relation-target">
+                        {t(`tabs.${relation.view}`, {
+                          defaultValue: relation.view,
+                        })}
+                        <span aria-hidden="true"> →</span>
+                      </span>
+                      <strong className="entity-detail__relation-basis">
+                        {t(labelKey)}
+                      </strong>
                     </button>
                   );
                 })}
               </div>
             )}
             {detailTab === "raw" && (
-              <div>
-                <div
-                  role="note"
-                  style={{
-                    color: "var(--fg-dim)",
-                    marginBlockEnd: "var(--space-2)",
-                  }}
-                >
+              <div className="entity-detail__raw">
+                <div role="note" className="entity-detail__raw-note">
                   {t("dock.detail.rawProjectedOnly")}
                 </div>
-                <pre
-                  data-raw-evidence
-                  style={{
-                    margin: 0,
-                    padding: "var(--space-2)",
-                    color: "var(--fg)",
-                    background: "var(--bg)",
-                    border: "1px solid var(--border)",
-                    borderRadius: "var(--radius-sm)",
-                    fontFamily: "var(--mono-font)",
-                    fontSize: "var(--text-xs)",
-                    whiteSpace: "pre-wrap",
-                    overflowWrap: "anywhere",
-                  }}
-                >
-                  {JSON.stringify(data, null, 2)}
+                <div className="entity-detail__raw-actions">
+                  <button
+                    type="button"
+                    onClick={copyToken}
+                    className="entity-detail__raw-copy"
+                  >
+                    {tokenCopied
+                      ? t("dock.row.tokenCopied")
+                      : t("dock.row.copyTechnicalId")}
+                  </button>
+                </div>
+                <pre data-raw-evidence className="entity-detail__raw-data">
+                  {JSON.stringify(rawEvidence, null, 2)}
                 </pre>
               </div>
             )}
@@ -1160,10 +999,12 @@ export function DockOverlay(props: DockOverlayProps) {
     <aside
       data-dock={active}
       style={dockStyle(props.mobile)}
+      className={`dock-overlay${props.mobile ? " dock-overlay--mobile" : ""}`}
       aria-label={t("dock.title")}
     >
       <div
         role="tablist"
+        className="dock-overlay__rail"
         style={{
           display: "flex",
           gap: "8px",
@@ -1179,6 +1020,7 @@ export function DockOverlay(props: DockOverlayProps) {
             aria-selected={active === kind}
             onClick={() => props.onPatch({ dock: kind })}
             style={tabButtonStyle(active === kind)}
+            className="dock-overlay__rail-tab"
           >
             {t(`dock.tabs.${kind}`)}
           </button>
@@ -1187,6 +1029,7 @@ export function DockOverlay(props: DockOverlayProps) {
           type="button"
           aria-label={t("dock.close")}
           onClick={props.onClose}
+          className="dock-overlay__close"
           style={{
             marginInlineStart: "auto",
             color: "var(--fg-dim)",
