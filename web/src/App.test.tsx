@@ -23,7 +23,7 @@ import {
   makeViewSummaryItem,
   makeViewSummaryResponse,
 } from "./testkit/apiFixtures";
-import { App } from "./App";
+import { App, queryClient } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -32,6 +32,7 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+  queryClient.clear();
   history.replaceState(null, "", location.pathname);
   // Tests assert localized view labels, so run with the sidebar expanded.
   localStorage.setItem("pgk-sidebar", "open");
@@ -344,10 +345,65 @@ test("mobile keeps incident triage in normal flow without permanent navigation",
   expect(screen.queryByRole("navigation")).toBeNull();
 });
 
+test("mobile statements keeps the heatmap and ranked table available", async () => {
+  history.replaceState(null, "", `${location.pathname}#view=statements`);
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn().mockReturnValue({
+      matches: true,
+      media: "(max-width: 760px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }),
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const statements = availableCatalog.views.find(
+    (view) => view.code === "statements",
+  );
+  if (statements !== undefined) {
+    statements.availability = "available";
+    statements.presets = [
+      {
+        code: "time",
+        columns: ["total"],
+        sort: { column: "total", order: "desc" },
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  const workspace = await screen.findByTestId("mobile-statements-workspace");
+  expect(
+    within(workspace).getByRole("table", { name: "statements" }),
+  ).toBeDefined();
+  expect(within(workspace).getByText("heatmap.metric")).toBeDefined();
+  expect(screen.getByTestId("app-shell").dataset.shellLayout).toBe("mobile");
+});
+
 test("digit key follows visible available destination order, not catalog order", async () => {
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.plans").length).toBeGreaterThan(0),
+    expect(
+      screen
+        .getByRole("tab", { name: /tabs\.plans/i })
+        .getAttribute("aria-disabled"),
+    ).toBe("false"),
   );
   fireEvent.keyDown(window, { key: "2" });
   expect(location.hash).toContain("view=plans");
@@ -609,7 +665,11 @@ test("switching view drops preset and sort the next view does not have", async (
   );
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.plans").length).toBeGreaterThan(0),
+    expect(
+      screen
+        .getByRole("tab", { name: /tabs\.plans/i })
+        .getAttribute("aria-disabled"),
+    ).toBe("false"),
   );
   expect(location.hash).toContain("preset=stmt_only");
   fireEvent.keyDown(window, { key: "2" });
@@ -628,7 +688,11 @@ test("switching view keeps a preset both views share", async () => {
   );
   renderApp();
   await waitFor(() =>
-    expect(screen.getAllByText("tabs.tables").length).toBeGreaterThan(0),
+    expect(
+      screen
+        .getByRole("tab", { name: /tabs\.tables/i })
+        .getAttribute("aria-disabled"),
+    ).toBe("false"),
   );
   fireEvent.keyDown(window, { key: "3" });
   expect(new URLSearchParams(location.hash.slice(1)).get("view")).toBe(

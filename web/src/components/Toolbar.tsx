@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ViewSpec } from "../api/types";
 import {
@@ -15,10 +15,21 @@ export interface ToolbarProps {
   matched: number | null;
   onSelectPreset: (preset: string | null) => void;
   onFilter: (q: string | null) => void;
+  lenses?: PreparedLens[];
+  contextNote?: string;
+  filterHint?: string;
+}
+
+export interface PreparedLens {
+  code: string;
+  preset: string | null;
+  availability: "available" | "gated" | "not_collected";
+  reason?: string;
 }
 
 export function Toolbar(props: ToolbarProps) {
   const { t } = useTranslation();
+  const filterHintId = useId();
   const [draft, setDraft] = useState(props.q ?? "");
   // The filter can also change from outside (URL state); adopt it then.
   const [prevQ, setPrevQ] = useState(props.q);
@@ -26,6 +37,16 @@ export function Toolbar(props: ToolbarProps) {
     setPrevQ(props.q);
     setDraft(props.q ?? "");
   }
+  const lenses: PreparedLens[] =
+    props.lenses ??
+    props.view.presets.map((preset) => ({
+      code: preset.code,
+      preset: preset.code,
+      availability: "available",
+    }));
+  const groupLabel = t(
+    props.lenses === undefined ? "toolbar.presets" : "toolbar.lenses",
+  );
 
   return (
     <div
@@ -38,24 +59,50 @@ export function Toolbar(props: ToolbarProps) {
         fontFamily: "var(--ui-font)",
       }}
     >
-      <span style={sectionTitle}>{t("toolbar.presets")}</span>
-      <div
-        role="group"
-        aria-label={t("toolbar.presets")}
-        style={segmentedGroup}
-      >
-        {props.view.presets.map((p) => {
-          const active = props.preset === p.code;
+      <span style={sectionTitle}>{groupLabel}</span>
+      <div role="group" aria-label={groupLabel} style={segmentedGroup}>
+        {lenses.map((lens) => {
+          const active = props.preset === lens.preset;
+          const available = lens.availability === "available";
+          const title = available
+            ? lens.code
+            : `${t(`availability.${lens.availability}`, {
+                defaultValue: lens.availability,
+              })}: ${lens.reason ?? "—"}`;
           return (
             <button
-              key={p.code}
+              key={lens.code}
               type="button"
               aria-pressed={active}
-              title={p.code}
-              onClick={() => props.onSelectPreset(active ? null : p.code)}
-              style={segmentedItem(active)}
+              aria-label={`${t(`lens.${lens.code}`, {
+                defaultValue: t(`preset.${lens.code}`, {
+                  defaultValue: lens.code,
+                }),
+              })}${available ? "" : ` · ${title}`}`}
+              title={title}
+              disabled={!available}
+              onClick={() => {
+                if (!active) props.onSelectPreset(lens.preset);
+                else if (props.lenses === undefined) props.onSelectPreset(null);
+              }}
+              style={{
+                ...segmentedItem(active),
+                ...(available
+                  ? undefined
+                  : {
+                      color: "var(--fg-dim)",
+                      cursor: "not-allowed",
+                      opacity: 0.58,
+                      textDecoration: "underline dotted",
+                      textUnderlineOffset: "4px",
+                    }),
+              }}
             >
-              {t(`preset.${p.code}`, { defaultValue: p.code })}
+              {t(`lens.${lens.code}`, {
+                defaultValue: t(`preset.${lens.code}`, {
+                  defaultValue: lens.code,
+                }),
+              })}
             </button>
           );
         })}
@@ -63,7 +110,9 @@ export function Toolbar(props: ToolbarProps) {
       <input
         type="search"
         aria-label={t("toolbar.filter")}
+        aria-describedby={props.filterHint ? filterHintId : undefined}
         placeholder={t("toolbar.filter")}
+        title={props.filterHint}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {
@@ -73,6 +122,41 @@ export function Toolbar(props: ToolbarProps) {
         }}
         style={{ ...input, minWidth: "220px", marginInlineStart: "4px" }}
       />
+      {props.filterHint !== undefined && (
+        <span
+          id={filterHintId}
+          style={{
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            padding: 0,
+            margin: "-1px",
+            overflow: "hidden",
+            clip: "rect(0, 0, 0, 0)",
+            whiteSpace: "nowrap",
+            border: 0,
+          }}
+        >
+          {props.filterHint}
+        </span>
+      )}
+      {props.contextNote !== undefined && (
+        <span
+          role="note"
+          title={props.contextNote}
+          style={{
+            minWidth: 0,
+            maxWidth: "320px",
+            overflow: "hidden",
+            color: "var(--fg-dim)",
+            fontSize: "var(--text-xs)",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {props.contextNote}
+        </span>
+      )}
       {props.matched !== null && (
         <span
           style={{

@@ -76,7 +76,7 @@ for (const view of catalog.views) {
 // --- summary ---------------------------------------------------------------
 
 // Populations per plan: activity..events in stable view_code order.
-const POPULATIONS = [142, 500, 83, 64, 121, 2, 218, 3, 5];
+const POPULATIONS = [142, 1000, 83, 64, 121, 2, 218, 3, 5];
 // Views that carry a live anomaly in the demo storyline.
 const NOTABLE = { locks: ["critical", 4], statements: ["warning", 2] };
 
@@ -93,7 +93,15 @@ function summaryResponse(at) {
         notable: notable !== undefined,
         notable_count: notable?.[1] ?? 0,
         notable_level: notable?.[0] ?? "none",
-        collection: null,
+        collection:
+          view.code === "statements"
+            ? {
+                collected: 1000,
+                source_total: 1453,
+                read_state: "source_limit",
+                visibility: "full",
+              }
+            : null,
       };
     }),
     quality: {
@@ -711,16 +719,16 @@ function rowsStatements() {
         ),
       );
     }
-    // Mirror the live store: the collector writes the query text as NULL by
-    // design, so the label is the bare queryid and identification rides on
-    // database/user — the demo must not promise text the stand cannot show.
+    // Query text is a server-capped, lazy detail field. The ranked frame uses
+    // the bare queryid plus database/user and never inflates its response with
+    // SQL; selecting a row exposes the bounded text in entity detail.
     const queryid = String(9_180_220_441_120_000n + BigInt(qid));
     return {
       entity: `stmt:${qid}`,
       label: queryid,
       data: {
         queryid,
-        query: null,
+        query: QUERIES[i % QUERIES.length][1],
         database: STMT_DATABASES[i % STMT_DATABASES.length],
         user: STMT_USERS[i % STMT_USERS.length],
         calls,

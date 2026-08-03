@@ -188,6 +188,7 @@ export function HeatmapStrip(props: {
   hoverUs?: string | null;
   brushDraft?: TimeRange | null;
   baselineUs?: string | null;
+  buckets?: number;
   onMetricChange: (metric: string) => void;
   onSelectEntity: (entity: string) => void;
 }) {
@@ -198,6 +199,7 @@ export function HeatmapStrip(props: {
     metric: props.metric,
     from: props.from,
     to: props.to,
+    buckets: props.buckets,
   });
 
   const metrics = props.view.metrics.filter(
@@ -379,6 +381,25 @@ export function HeatmapStrip(props: {
               </span>
             </Tooltip>
           )}
+        {heatmap.data?.ranking.exact === false && (
+          <span
+            role="status"
+            title={`${t("heatmap.ranking.partialHint", {
+              count: heatmap.data.ranking.unseen_upper,
+            })} · unseen_upper=${heatmap.data.ranking.unseen_upper}`}
+            style={{
+              fontFamily: "var(--ui-font)",
+              fontSize: "var(--text-xs)",
+              fontWeight: 600,
+              color: "var(--sev-warn-fg)",
+              background: "var(--sev-warn-bg)",
+              borderRadius: "var(--radius-sm)",
+              padding: "1px 8px",
+            }}
+          >
+            {t("heatmap.ranking.partial")}
+          </span>
+        )}
         {/* Verdict legend: the colors mean thresholds, not decoration. */}
         <span
           style={{

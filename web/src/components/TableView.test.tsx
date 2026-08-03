@@ -11,7 +11,10 @@ import {
 } from "../testkit/apiFixtures";
 import { TableView, type TableViewProps } from "./TableView";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 function wrapper({ children }: { children: ReactNode }) {
   return createElement(
@@ -111,6 +114,97 @@ test("exposes a bounded ranked matrix with an independent scroll body", async ()
   expect(body.querySelector("tbody tr")?.getAttribute("style")).toContain(
     "height: 28px",
   );
+});
+
+test("virtualizes a thousand loaded rows and moves the DOM window on scroll", async () => {
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(280);
+  stubFrame(
+    makeFrameResponse({
+      view: "statements",
+      columns: [makeFrameColumn({ code: "xact", type: "i64" })],
+      rows: Array.from({ length: 1_000 }, (_, index) =>
+        makeFrameRow({ entity: `stmt:${index}`, cells: [index] }),
+      ),
+      page: { matched: 1_000, returned: 1_000 },
+    }),
+  );
+  renderTable({
+    view: makeViewSpec({ code: "statements", columns }),
+  });
+
+  const body = await screen.findByTestId("ranked-matrix-body");
+  await waitFor(() =>
+    expect(body.querySelectorAll("tr[data-entity]").length).toBeGreaterThan(0),
+  );
+  expect(body.dataset.loadedRows).toBe("1000");
+  expect(body.querySelectorAll("tr[data-entity]").length).toBeLessThanOrEqual(
+    24,
+  );
+  expect(body.querySelector('[data-entity="stmt:0"]')).not.toBeNull();
+  const first = body.querySelector('[data-entity="stmt:0"]') as HTMLElement;
+  first.focus();
+  fireEvent.keyDown(first, { key: "ArrowDown" });
+  await waitFor(() =>
+    expect(document.activeElement?.getAttribute("data-entity")).toBe("stmt:1"),
+  );
+
+  fireEvent.scroll(body, { target: { scrollTop: 1_400 } });
+  await waitFor(() =>
+    expect(body.querySelector('[data-entity="stmt:0"]')).toBeNull(),
+  );
+  expect(body.querySelector('[data-entity="stmt:50"]')).not.toBeNull();
+});
+
+test("five server pages stay deduplicated and DOM-bounded", async () => {
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(280);
+  const allRows = Array.from({ length: 1_000 }, (_, index) =>
+    makeFrameRow({ entity: `stmt:${index}`, cells: [index] }),
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? new URL(input, "http://localhost")
+          : new URL(input instanceof Request ? input.url : input.href);
+      const cursor = url.searchParams.get("cursor");
+      const offset = cursor === null ? 0 : Number(cursor.slice(2));
+      // Repeat the page boundary once: the client must not let an unstable
+      // continuation duplicate an entity or grow beyond `matched`.
+      const start = offset === 200 ? 199 : offset;
+      const pageRows = allRows.slice(start, start + 200);
+      const next = offset + 200 < allRows.length ? `o:${offset + 200}` : null;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify(
+            makeFrameResponse({
+              view: "statements",
+              columns: [makeFrameColumn({ code: "xact", type: "i64" })],
+              rows: pageRows,
+              page: {
+                matched: 1_000,
+                returned: pageRows.length,
+                ...(next === null ? {} : { next }),
+              },
+            }),
+          ),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }),
+  );
+  renderTable({ view: makeViewSpec({ code: "statements", columns }) });
+  const body = await screen.findByTestId("ranked-matrix-body");
+  await waitFor(() => expect(body.dataset.loadedRows).toBe("200"));
+
+  for (const expected of [399, 599, 799, 999]) {
+    fireEvent.click(screen.getByRole("button", { name: /table.more/ }));
+    await waitFor(() => expect(body.dataset.loadedRows).toBe(String(expected)));
+    expect(body.querySelectorAll("tr[data-entity]").length).toBeLessThanOrEqual(
+      24,
+    );
+  }
+  expect(screen.queryByRole("button", { name: /table.more/ })).toBeNull();
 });
 
 test("sort header click cycles desc, asc, cleared", async () => {

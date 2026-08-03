@@ -82,3 +82,39 @@ test("shows the matched row count when provided", () => {
   renderToolbar({ matched: 42 });
   expect(screen.getByText(/toolbar\.rows/)).toBeDefined();
 });
+
+test("prepared lenses map display names to presets and expose gated reasons", () => {
+  const onSelectPreset = vi.fn();
+  renderToolbar({
+    preset: "time",
+    onSelectPreset,
+    lenses: [
+      { code: "workload", preset: "time", availability: "available" },
+      {
+        code: "regression",
+        preset: null,
+        availability: "gated",
+        reason: "baseline deltas are not projected",
+      },
+    ],
+    contextNote: "reset-aware · query text not collected",
+    filterHint: "field=value · full decimal queryid",
+  });
+
+  const workload = screen.getByRole("button", { name: "workload" });
+  expect(workload.getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(workload);
+  expect(onSelectPreset).not.toHaveBeenCalled();
+
+  const regression = screen.getByRole("button", {
+    name: /regression/,
+  });
+  expect((regression as HTMLButtonElement).disabled).toBe(true);
+  expect(regression.getAttribute("title")).toContain(
+    "baseline deltas are not projected",
+  );
+  expect(screen.getByText(/reset-aware/)).toBeDefined();
+  expect(screen.getByRole("searchbox").getAttribute("title")).toContain(
+    "full decimal queryid",
+  );
+});

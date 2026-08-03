@@ -252,7 +252,7 @@ test("row dock in LIVE mode sends the resolved at (point shape), not a bare toke
   expect(screen.getByTitle("db:1")).toBeDefined();
 });
 
-test("statements row dock: query heading fallback, uncut id, honest uncollected field", async () => {
+test("statements row dock: query heading fallback, uncut id, bounded query detail", async () => {
   const full = "-1999008735841373854";
   stubFetch(
     makeEntityPointResponse({
@@ -261,7 +261,7 @@ test("statements row dock: query heading fallback, uncut id, honest uncollected 
       label: full,
       fields: [
         { code: "queryid", value: full },
-        { code: "query", value: null },
+        { code: "query", value: "select * from orders where id = $1" },
       ],
     }),
   );
@@ -282,8 +282,7 @@ test("statements row dock: query heading fallback, uncut id, honest uncollected 
           type: "text",
           lazy: true,
           requires: [],
-          availability: "not_collected",
-          unavailable_reason: "query_text_not_collected",
+          availability: "available",
         },
       ],
     }),
@@ -292,8 +291,9 @@ test("statements row dock: query heading fallback, uncut id, honest uncollected 
   await waitFor(() => expect(screen.getByText(full)).toBeDefined());
   // The bare numeric label heads as a localized "Query · <short id>" fallback.
   expect(screen.getByText(/dock\.row\.heading\.statements/)).toBeDefined();
-  // A column the collector never fills states its availability, not a blank.
-  expect(screen.getByText("not_collected")).toBeDefined();
+  // Query text is detail-only and server-bounded, but available when the
+  // connected PostgreSQL role may see it.
+  expect(screen.getByText("select * from orders where id = $1")).toBeDefined();
 });
 
 test("row dock drills down via server related provenance and clears", async () => {
