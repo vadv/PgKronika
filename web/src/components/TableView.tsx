@@ -1,4 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, isWarmingUp } from "../api/client";
 import { colDesc, colLabel } from "../api/codes";
@@ -43,12 +50,34 @@ interface Pages {
   key: string;
   rows: FrameRowDto[];
   next: string | null;
+  columns: FrameColumnDto[];
+  matched: number;
 }
 
 /** Column types the backend accepts as frame sort keys. */
 const SORTABLE_TYPES = new Set(["i64", "u64", "f64", "timestamp"]);
 /** Column types whose wire value may arrive as a decimal string. */
 const NUMERIC_TYPES = new Set(["i64", "u64", "f64"]);
+const ROW_HEIGHT = 28;
+const ROW_OVERSCAN = 6;
+const FALLBACK_VIEWPORT_HEIGHT = 650;
+
+function boundedUniqueRows(
+  existing: FrameRowDto[],
+  incoming: FrameRowDto[],
+  matched: number,
+): FrameRowDto[] {
+  const limit = Math.max(0, matched);
+  const rows = existing.slice(0, limit);
+  const entities = new Set(rows.map((row) => row.entity));
+  for (const row of incoming) {
+    if (rows.length >= limit) break;
+    if (entities.has(row.entity)) continue;
+    entities.add(row.entity);
+    rows.push(row);
+  }
+  return rows;
+}
 
 /** Verdict tint (background wash + foreground) from a classification result. */
 function verdictTintOf(
@@ -102,7 +131,7 @@ function Sparkline(props: { spark: SparkDto }) {
   );
 }
 
-export function TableView(props: TableViewProps) {
+function TableViewImpl(props: TableViewProps) {
   const { t } = useTranslation();
   // The continuation cursor belongs to the intent (frameKey) it was taken
   // from; a stale cursor must never ride along with new key arguments.
@@ -113,7 +142,18 @@ export function TableView(props: TableViewProps) {
   const [pages, setPages] = useState<Pages | null>(null);
   const [cursorExpired, setCursorExpired] = useState(false);
   const [hovered, setHovered] = useState<string | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(
+    FALLBACK_VIEWPORT_HEIGHT,
+  );
+  const [pendingFocusEntity, setPendingFocusEntity] = useState<string | null>(
+    null,
+  );
+  const scrollBody = useRef<HTMLDivElement | null>(null);
   const lastMatched = useRef<number | null>(null);
+  // Which selection this frame has already brought into view. Appended
+  // cursor pages must not re-scroll to it and yank the reader off the tail.
+  const scrolledEntity = useRef<string | null>(null);
 
   const frameKey = [
     props.view.code,
@@ -149,8 +189,23 @@ export function TableView(props: TableViewProps) {
     setPages((p) => (p === null || p.key === frameKey ? p : null));
     setCursorState(null);
     setCursorExpired(false);
+    setScrollTop(0);
+    if (scrollBody.current !== null) scrollBody.current.scrollTop = 0;
     lastMatched.current = null;
+    scrolledEntity.current = null;
   }, [frameKey]);
+
+  useLayoutEffect(() => {
+    const body = scrollBody.current;
+    if (body === null) return;
+    const measure = () =>
+      setViewportHeight(body.clientHeight || FALLBACK_VIEWPORT_HEIGHT);
+    measure();
+    if (typeof ResizeObserver !== "function") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, []);
 
   // Cursor page arrived: append its rows and fall back to the first page.
   useEffect(() => {
@@ -158,8 +213,14 @@ export function TableView(props: TableViewProps) {
     if (data === undefined || cursor === null) return;
     setPages((p) => ({
       key: frameKey,
-      rows: [...(p !== null && p.key === frameKey ? p.rows : []), ...data.rows],
+      rows: boundedUniqueRows(
+        p !== null && p.key === frameKey ? p.rows : [],
+        data.rows,
+        data.page.matched,
+      ),
       next: data.page.next ?? null,
+      columns: p !== null && p.key === frameKey ? p.columns : data.columns,
+      matched: data.page.matched,
     }));
     setCursorState(null);
   }, [frame.data, cursor, frameKey]);
@@ -173,7 +234,13 @@ export function TableView(props: TableViewProps) {
     setPages((p) =>
       p !== null && p.key === frameKey
         ? p
-        : { key: frameKey, rows: data.rows, next: data.page.next ?? null },
+        : {
+            key: frameKey,
+            rows: boundedUniqueRows([], data.rows, data.page.matched),
+            next: data.page.next ?? null,
+            columns: data.columns,
+            matched: data.page.matched,
+          },
     );
     // The fresh first page after a cursor expiry replaces the dead one.
     setCursorExpired(false);
@@ -210,9 +277,12 @@ export function TableView(props: TableViewProps) {
   );
   const columnSpec = new Map(props.view.columns.map((c) => [c.code, c]));
 
+  const accumulated = pages !== null && pages.key === frameKey ? pages : null;
+  const responseColumns = frame.data?.columns ?? accumulated?.columns ?? [];
+  const matched = frame.data?.page.matched ?? accumulated?.matched ?? 0;
   const columns: DisplayColumn[] = [];
-  if (frame.data !== undefined) {
-    frame.data.columns.forEach((column, cellIndex) => {
+  if (responseColumns.length > 0) {
+    responseColumns.forEach((column, cellIndex) => {
       // `hidden` columns are materialized only for sort/filter — never shown.
       // Unavailable (gated/not_collected) columns stay visible as honest
       // nulls with their availability reason instead of being dropped.
@@ -236,10 +306,56 @@ export function TableView(props: TableViewProps) {
     }
   }
 
-  const rows = pages !== null && pages.key === frameKey ? pages.rows : [];
+  const rows = useMemo(
+    () => (pages !== null && pages.key === frameKey ? pages.rows : []),
+    [frameKey, pages],
+  );
   const nextCursor =
     pages !== null && pages.key === frameKey ? pages.next : null;
   const loadingMore = cursor !== null && frame.isLoading;
+  const startIndex = Math.max(
+    0,
+    Math.floor(scrollTop / ROW_HEIGHT) - ROW_OVERSCAN,
+  );
+  const windowSize = Math.ceil(viewportHeight / ROW_HEIGHT) + ROW_OVERSCAN * 2;
+  const endIndex = Math.min(rows.length, startIndex + windowSize);
+  const visibleRows = rows.slice(startIndex, endIndex);
+  const topSpacerHeight = startIndex * ROW_HEIGHT;
+  const bottomSpacerHeight = (rows.length - endIndex) * ROW_HEIGHT;
+
+  useEffect(() => {
+    if (pendingFocusEntity === null || scrollBody.current === null) return;
+    const target = [
+      ...scrollBody.current.querySelectorAll("tr[data-entity]"),
+    ].find((row) => row.getAttribute("data-entity") === pendingFocusEntity);
+    if (!(target instanceof HTMLElement)) return;
+    target.focus();
+    setPendingFocusEntity(null);
+  }, [pendingFocusEntity, startIndex, endIndex]);
+
+  useEffect(() => {
+    const body = scrollBody.current;
+    if (body === null || props.entity === null) {
+      scrolledEntity.current = null;
+      return;
+    }
+    // Bring a selection into view once; later cursor pages grow `rows` but
+    // must not re-run the scroll on an already-handled selection.
+    if (scrolledEntity.current === props.entity) return;
+    const index = rows.findIndex((row) => row.entity === props.entity);
+    if (index < 0) return;
+    scrolledEntity.current = props.entity;
+    const rowTop = index * ROW_HEIGHT;
+    const rowBottom = rowTop + ROW_HEIGHT;
+    if (
+      rowTop >= body.scrollTop &&
+      rowBottom <= body.scrollTop + body.clientHeight
+    )
+      return;
+    const nextTop = Math.max(0, rowTop - ROW_HEIGHT * 2);
+    body.scrollTop = nextTop;
+    setScrollTop(nextTop);
+  }, [props.entity, rows]);
 
   const headerCellStyle = (code: string): React.CSSProperties => ({
     position: "sticky",
@@ -273,302 +389,380 @@ export function TableView(props: TableViewProps) {
 
   return (
     <section
+      data-shell-region="ranked-matrix"
       style={{
+        display: "flex",
+        flex: "1 1 auto",
+        flexDirection: "column",
+        minHeight: 0,
         fontFamily: "var(--mono-font)",
-        overflow: "auto",
+        overflow: "hidden",
         background: "var(--bg-raised)",
         border: "1px solid var(--border)",
         borderRadius: "var(--radius-md)",
       }}
     >
-      <table
-        aria-label={props.view.code}
-        style={{ borderCollapse: "collapse", width: "100%" }}
+      <div
+        ref={scrollBody}
+        data-testid="ranked-matrix-body"
+        data-loaded-rows={rows.length}
+        data-rendered-rows={visibleRows.length}
+        onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+        style={{ minHeight: 0, overflow: "auto" }}
       >
-        <thead>
-          <tr>
-            {columns.map(({ column }) => {
-              const meta = columnMeta.get(column.code);
-              const unavailable =
-                meta !== undefined && meta.availability !== "available";
-              const spec = columnSpec.get(column.code);
-              const label = colLabel(t, props.view.code, column.code);
-              const desc = colDesc(t, props.view.code, column.code);
-              const tip = (
-                <span style={{ display: "grid", gap: "2px" }}>
-                  {desc !== null && <span>{desc}</span>}
-                  <TipRow
-                    label={t("tooltip.code")}
-                    value={`${column.code} · ${column.type}${column.unit != null ? ` · ${column.unit}` : ""}`}
-                    mono
-                  />
-                  {spec?.formula != null && (
-                    <TipFormula
-                      label={t("tooltip.formula")}
-                      value={spec.formula}
-                    />
-                  )}
-                  {spec?.source != null && (
+        <table
+          aria-label={props.view.code}
+          aria-rowcount={(matched || rows.length) + 1}
+          style={{ borderCollapse: "collapse", width: "100%" }}
+        >
+          <thead>
+            <tr>
+              {columns.map(({ column }, columnIndex) => {
+                const meta = columnMeta.get(column.code);
+                const unavailable =
+                  meta !== undefined && meta.availability !== "available";
+                const spec = columnSpec.get(column.code);
+                const label = colLabel(t, props.view.code, column.code);
+                const desc = colDesc(t, props.view.code, column.code);
+                const tip = (
+                  <span style={{ display: "grid", gap: "2px" }}>
+                    {desc !== null && <span>{desc}</span>}
                     <TipRow
-                      label={t("tooltip.source")}
-                      value={spec.source}
+                      label={t("tooltip.code")}
+                      value={`${column.code} · ${column.type}${column.unit != null ? ` · ${column.unit}` : ""}`}
                       mono
                     />
-                  )}
-                  {spec?.threshold_metric != null && (
-                    <TipRow
-                      label={t("tooltip.threshold")}
-                      value={spec.threshold_metric}
-                      mono
-                    />
-                  )}
-                  {spec?.lazy === true && (
-                    <TipRow
-                      label={t("tooltip.lazy")}
-                      value={t("tooltip.lazyValue")}
-                    />
-                  )}
-                  {unavailable && (
-                    <TipRow
-                      label={t(`availability.${meta.availability}`, {
-                        defaultValue: meta.availability,
-                      })}
-                      value={meta.reason ?? "—"}
-                    />
-                  )}
-                </span>
-              );
+                    {spec?.formula != null && (
+                      <TipFormula
+                        label={t("tooltip.formula")}
+                        value={spec.formula}
+                      />
+                    )}
+                    {spec?.source != null && (
+                      <TipRow
+                        label={t("tooltip.source")}
+                        value={spec.source}
+                        mono
+                      />
+                    )}
+                    {spec?.threshold_metric != null && (
+                      <TipRow
+                        label={t("tooltip.threshold")}
+                        value={spec.threshold_metric}
+                        mono
+                      />
+                    )}
+                    {spec?.lazy === true && (
+                      <TipRow
+                        label={t("tooltip.lazy")}
+                        value={t("tooltip.lazyValue")}
+                      />
+                    )}
+                    {unavailable && (
+                      <TipRow
+                        label={t(`availability.${meta.availability}`, {
+                          defaultValue: meta.availability,
+                        })}
+                        value={meta.reason ?? "—"}
+                      />
+                    )}
+                  </span>
+                );
+                return (
+                  <th
+                    key={column.code}
+                    style={{
+                      ...headerCellStyle(column.code),
+                      ...(columnIndex === 0
+                        ? { left: 0, zIndex: 3 }
+                        : undefined),
+                      color: unavailable
+                        ? "var(--fg-dim)"
+                        : headerCellStyle(column.code).color,
+                    }}
+                  >
+                    <Tooltip content={tip}>
+                      {SORTABLE_TYPES.has(column.type) ? (
+                        <button
+                          type="button"
+                          onClick={() => cycleSort(column.code)}
+                          style={{
+                            color: "inherit",
+                            background: "none",
+                            border: "none",
+                            padding: 0,
+                            cursor: "pointer",
+                          }}
+                        >
+                          {label}
+                          {sortArrow(column.code)}
+                        </button>
+                      ) : (
+                        <span>{label}</span>
+                      )}
+                    </Tooltip>
+                  </th>
+                );
+              })}
+              <th style={headerCellStyle("")}>{t("table.spark")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {topSpacerHeight > 0 && (
+              <tr aria-hidden="true" data-virtual-spacer="top">
+                <td
+                  colSpan={columns.length + 1}
+                  style={{ height: `${topSpacerHeight}px`, padding: 0 }}
+                />
+              </tr>
+            )}
+            {visibleRows.map((row, visibleIndex) => {
+              const selected = props.entity === row.entity;
               return (
-                <th
-                  key={column.code}
+                // The whole row is one selectable control; keyboard activation
+                // mirrors click through onKeyDown below.
+                <tr
+                  key={row.entity}
+                  tabIndex={0}
+                  aria-rowindex={startIndex + visibleIndex + 2}
+                  aria-selected={selected}
+                  data-entity={row.entity}
+                  onClick={() => props.onSelectRow(row.entity)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") props.onSelectRow(row.entity);
+                    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                      e.preventDefault();
+                      const direction = e.key === "ArrowDown" ? 1 : -1;
+                      const targetIndex = Math.min(
+                        rows.length - 1,
+                        Math.max(0, startIndex + visibleIndex + direction),
+                      );
+                      const target = rows[targetIndex];
+                      const body = scrollBody.current;
+                      if (target === undefined || body === null) return;
+                      const targetTop = targetIndex * ROW_HEIGHT;
+                      if (
+                        targetTop < body.scrollTop ||
+                        targetTop + ROW_HEIGHT >
+                          body.scrollTop + body.clientHeight
+                      ) {
+                        const nextTop = Math.max(0, targetTop - ROW_HEIGHT * 2);
+                        body.scrollTop = nextTop;
+                        setScrollTop(nextTop);
+                      }
+                      setPendingFocusEntity(target.entity);
+                    }
+                  }}
+                  onMouseEnter={() => setHovered(row.entity)}
+                  onMouseLeave={() =>
+                    setHovered((h) => (h === row.entity ? null : h))
+                  }
                   style={{
-                    ...headerCellStyle(column.code),
-                    color: unavailable
-                      ? "var(--fg-dim)"
-                      : headerCellStyle(column.code).color,
+                    cursor: "pointer",
+                    height: "28px",
+                    background:
+                      selected === true
+                        ? "var(--active-bg)"
+                        : hovered === row.entity
+                          ? "var(--hover-bg)"
+                          : "transparent",
+                    boxShadow: selected
+                      ? "inset 2px 0 0 var(--accent)"
+                      : "none",
+                    transition: "background var(--transition-fast)",
                   }}
                 >
-                  <Tooltip content={tip}>
-                    {SORTABLE_TYPES.has(column.type) ? (
-                      <button
-                        type="button"
-                        onClick={() => cycleSort(column.code)}
+                  {columns.map(({ column, cellIndex }, columnIndex) => {
+                    const value: FrameValue = row.cells[cellIndex] ?? null;
+                    const classification = row.classifications.find(
+                      (c) => c.column === column.code,
+                    );
+                    const tint =
+                      classification !== undefined
+                        ? verdictTintOf(classification.result)
+                        : undefined;
+                    const numeric = NUMERIC_TYPES.has(column.type);
+                    const full = fullCellValue(value, column);
+                    const classificationResult = classification?.result;
+                    const notClassified =
+                      classificationResult !== undefined &&
+                      !("level" in classificationResult)
+                        ? classificationResult
+                        : undefined;
+                    return (
+                      <td
+                        key={column.code}
+                        title={
+                          value === null && notClassified !== undefined
+                            ? nullReasonTitle(
+                                notClassified.status,
+                                notClassified.reason,
+                                t,
+                              )
+                            : (full ?? whyTitle(classification?.result, t))
+                        }
                         style={{
-                          color: "inherit",
-                          background: "none",
-                          border: "none",
-                          padding: 0,
-                          cursor: "pointer",
+                          padding: "2px 10px",
+                          borderBottom: "1px solid var(--border)",
+                          fontSize: "var(--text-md)",
+                          textAlign: numeric ? "end" : "start",
+                          ...(tint ?? {
+                            color:
+                              value === null ? "var(--fg-dim)" : "var(--fg)",
+                          }),
+                          ...(columnIndex === 0
+                            ? {
+                                position: "sticky",
+                                left: 0,
+                                zIndex: 1,
+                                background:
+                                  tint?.background ??
+                                  (selected
+                                    ? "var(--active-bg)"
+                                    : hovered === row.entity
+                                      ? "var(--hover-bg)"
+                                      : "var(--bg-raised)"),
+                              }
+                            : undefined),
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          maxWidth: "320px",
                         }}
                       >
-                        {label}
-                        {sortArrow(column.code)}
-                      </button>
-                    ) : (
-                      <span>{label}</span>
-                    )}
-                  </Tooltip>
-                </th>
+                        {formatCellValue(value, column, t)}
+                      </td>
+                    );
+                  })}
+                  <td
+                    style={{
+                      padding: "2px 8px",
+                      borderBottom: "1px solid var(--border)",
+                    }}
+                  >
+                    <Sparkline spark={row.spark} />
+                  </td>
+                </tr>
               );
             })}
-            <th style={headerCellStyle("")}>{t("table.spark")}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => {
-            const selected = props.entity === row.entity;
-            return (
-              // The whole row is one selectable control; keyboard activation
-              // mirrors click through onKeyDown below.
-              <tr
-                key={row.entity}
-                tabIndex={0}
-                aria-selected={selected}
-                data-entity={row.entity}
-                onClick={() => props.onSelectRow(row.entity)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") props.onSelectRow(row.entity);
-                }}
-                onMouseEnter={() => setHovered(row.entity)}
-                onMouseLeave={() =>
-                  setHovered((h) => (h === row.entity ? null : h))
-                }
+            {bottomSpacerHeight > 0 && (
+              <tr aria-hidden="true" data-virtual-spacer="bottom">
+                <td
+                  colSpan={columns.length + 1}
+                  style={{ height: `${bottomSpacerHeight}px`, padding: 0 }}
+                />
+              </tr>
+            )}
+          </tbody>
+        </table>
+        {frame.isLoading && cursor === null && (
+          <div style={{ padding: "8px" }} aria-busy="true">
+            {frame.failureCount > 0 && isWarmingUp(frame.failureReason) && (
+              <div
+                role="status"
                 style={{
-                  cursor: "pointer",
-                  background:
-                    selected === true
-                      ? "var(--active-bg)"
-                      : hovered === row.entity
-                        ? "var(--hover-bg)"
-                        : "transparent",
-                  boxShadow: selected ? "inset 2px 0 0 var(--accent)" : "none",
-                  transition: "background var(--transition-fast)",
+                  color: "var(--fg-dim)",
+                  fontFamily: "var(--ui-font)",
+                  fontSize: "var(--text-sm)",
+                  marginBlockEnd: "8px",
                 }}
               >
-                {columns.map(({ column, cellIndex }) => {
-                  const value: FrameValue = row.cells[cellIndex] ?? null;
-                  const classification = row.classifications.find(
-                    (c) => c.column === column.code,
-                  );
-                  const tint =
-                    classification !== undefined
-                      ? verdictTintOf(classification.result)
-                      : undefined;
-                  const numeric = NUMERIC_TYPES.has(column.type);
-                  const full = fullCellValue(value, column);
-                  const classificationResult = classification?.result;
-                  const notClassified =
-                    classificationResult !== undefined &&
-                    !("level" in classificationResult)
-                      ? classificationResult
-                      : undefined;
-                  return (
-                    <td
-                      key={column.code}
-                      title={
-                        value === null && notClassified !== undefined
-                          ? nullReasonTitle(
-                              notClassified.status,
-                              notClassified.reason,
-                              t,
-                            )
-                          : (full ?? whyTitle(classification?.result, t))
-                      }
-                      style={{
-                        padding: "2px 10px",
-                        borderBottom: "1px solid var(--border)",
-                        fontSize: "var(--text-md)",
-                        textAlign: numeric ? "end" : "start",
-                        ...(tint ?? {
-                          color: value === null ? "var(--fg-dim)" : "var(--fg)",
-                        }),
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        maxWidth: "320px",
-                      }}
-                    >
-                      {formatCellValue(value, column, t)}
-                    </td>
-                  );
-                })}
-                <td
-                  style={{
-                    padding: "2px 8px",
-                    borderBottom: "1px solid var(--border)",
-                  }}
-                >
-                  <Sparkline spark={row.spark} />
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-      {frame.isLoading && cursor === null && (
-        <div style={{ padding: "8px" }} aria-busy="true">
-          {frame.failureCount > 0 && isWarmingUp(frame.failureReason) && (
-            <div
-              role="status"
+                {t("loading.warming")}
+              </div>
+            )}
+            {[0, 1, 2, 3].map((i) => (
+              <div
+                key={i}
+                style={{
+                  height: "18px",
+                  marginBlockEnd: "8px",
+                  background: "var(--skeleton)",
+                  borderRadius: "var(--radius-sm)",
+                  animation: "pgk-pulse 1.4s ease-in-out infinite",
+                  width: `${88 - i * 12}%`,
+                }}
+              />
+            ))}
+          </div>
+        )}
+        {frame.isError && !cursorExpired && (
+          <div
+            role="alert"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              padding: "12px",
+              color: "var(--sev-crit-fg)",
+            }}
+          >
+            {isWarmingUp(frame.error) ? t("error.warming") : t("table.error")}
+            <button
+              type="button"
+              onClick={() => void frame.refetch()}
               style={{
-                color: "var(--fg-dim)",
                 fontFamily: "var(--ui-font)",
                 fontSize: "var(--text-sm)",
-                marginBlockEnd: "8px",
+                color: "var(--fg)",
+                background: "var(--bg-raised)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-sm)",
+                padding: "2px 8px",
+                cursor: "pointer",
               }}
             >
-              {t("loading.warming")}
-            </div>
-          )}
-          {[0, 1, 2, 3].map((i) => (
-            <div
-              key={i}
-              style={{
-                height: "18px",
-                marginBlockEnd: "8px",
-                background: "var(--skeleton)",
-                borderRadius: "var(--radius-sm)",
-                animation: "pgk-pulse 1.4s ease-in-out infinite",
-                width: `${88 - i * 12}%`,
-              }}
-            />
-          ))}
-        </div>
-      )}
-      {frame.isError && !cursorExpired && (
-        <div
-          role="alert"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "8px",
-            padding: "12px",
-            color: "var(--sev-crit-fg)",
-          }}
-        >
-          {isWarmingUp(frame.error) ? t("error.warming") : t("table.error")}
+              {t("table.retry")}
+            </button>
+          </div>
+        )}
+        {frame.isSuccess && rows.length === 0 && (
+          <div
+            style={{
+              padding: "24px 12px",
+              textAlign: "center",
+              color: "var(--fg-dim)",
+              fontFamily: "var(--ui-font)",
+            }}
+          >
+            {t("table.empty")}
+          </div>
+        )}
+        {cursorExpired && (
+          <div
+            role="status"
+            style={{
+              padding: "8px 12px",
+              color: "var(--sev-warn-fg)",
+              background: "var(--sev-warn-bg)",
+              borderRadius: "var(--radius-sm)",
+              margin: "8px",
+            }}
+          >
+            {t("table.cursor_expired")}
+          </div>
+        )}
+        {!cursorExpired && nextCursor !== null && (
           <button
             type="button"
-            onClick={() => void frame.refetch()}
+            data-testid="table-load-more"
+            disabled={loadingMore}
+            onClick={() => setCursorState({ key: frameKey, value: nextCursor })}
             style={{
               fontFamily: "var(--ui-font)",
               fontSize: "var(--text-sm)",
-              color: "var(--fg)",
-              background: "var(--bg-raised)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius-sm)",
-              padding: "2px 8px",
+              color: "var(--accent-strong)",
+              background: "none",
+              border: "none",
+              padding: "8px 12px",
               cursor: "pointer",
             }}
           >
-            {t("table.retry")}
+            {t("table.more")} →
           </button>
-        </div>
-      )}
-      {frame.isSuccess && rows.length === 0 && (
-        <div
-          style={{
-            padding: "24px 12px",
-            textAlign: "center",
-            color: "var(--fg-dim)",
-            fontFamily: "var(--ui-font)",
-          }}
-        >
-          {t("table.empty")}
-        </div>
-      )}
-      {cursorExpired && (
-        <div
-          role="status"
-          style={{
-            padding: "8px 12px",
-            color: "var(--sev-warn-fg)",
-            background: "var(--sev-warn-bg)",
-            borderRadius: "var(--radius-sm)",
-            margin: "8px",
-          }}
-        >
-          {t("table.cursor_expired")}
-        </div>
-      )}
-      {!cursorExpired && nextCursor !== null && (
-        <button
-          type="button"
-          disabled={loadingMore}
-          onClick={() => setCursorState({ key: frameKey, value: nextCursor })}
-          style={{
-            fontFamily: "var(--ui-font)",
-            fontSize: "var(--text-sm)",
-            color: "var(--accent-strong)",
-            background: "none",
-            border: "none",
-            padding: "8px 12px",
-            cursor: "pointer",
-          }}
-        >
-          {t("table.more")} →
-        </button>
-      )}
+        )}
+      </div>
     </section>
   );
 }
+
+export const TableView = memo(TableViewImpl);

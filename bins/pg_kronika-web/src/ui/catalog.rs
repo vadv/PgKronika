@@ -524,7 +524,10 @@ fn view(
                 projection.name.as_bytes(),
                 b"activity" | b"statements" | b"plans" | b"tables" | b"indexes" | b"processes"
             ),
-            related: projection.name.as_bytes() == b"statements",
+            related: matches!(
+                projection.name.as_bytes(),
+                b"activity" | b"statements" | b"tables" | b"indexes" | b"vacuum"
+            ),
         },
         inputs: projection_inputs(projection),
         joins,
@@ -750,6 +753,82 @@ fn activity_view() -> ViewSpec {
             "replay_lag_us",
             "desc",
         ),
+        preset(
+            "overview",
+            &[
+                "pid",
+                "user",
+                "database",
+                "application",
+                "state",
+                "wait_event",
+                "query",
+                "query_duration_us",
+            ],
+            "query_duration_us",
+            "desc",
+        ),
+        preset(
+            "waits_locks",
+            &[
+                "pid",
+                "user",
+                "database",
+                "state",
+                "wait_event",
+                "query",
+                "query_duration_us",
+            ],
+            "query_duration_us",
+            "desc",
+        ),
+        preset(
+            "duration",
+            &[
+                "pid",
+                "user",
+                "database",
+                "query_duration_us",
+                "transaction_duration_us",
+                "query",
+            ],
+            "query_duration_us",
+            "desc",
+        ),
+        preset(
+            "cpu",
+            &["pid", "user", "database", "process_link", "cpu", "query"],
+            "cpu",
+            "desc",
+        ),
+        preset(
+            "disk_io",
+            &[
+                "pid",
+                "user",
+                "database",
+                "process_link",
+                "read_bytes_per_second",
+                "write_bytes_per_second",
+                "query",
+            ],
+            "read_bytes_per_second",
+            "desc",
+        ),
+        preset(
+            "sampling",
+            &[
+                "pid",
+                "user",
+                "database",
+                "state",
+                "wait_event",
+                "query_duration_us",
+                "query",
+            ],
+            "query_duration_us",
+            "desc",
+        ),
     ];
     view(projection, Scope::Database, joins, columns, presets)
 }
@@ -760,11 +839,10 @@ fn activity_view() -> ViewSpec {
 )]
 fn statements_view() -> ViewSpec {
     let projection = projection("statements");
-    // The production collector writes `query` as NULL on purpose (unbounded
-    // text vs. a bounded segment budget), so the column is intrinsically
-    // not-collected rather than gated by the store: the UI must say
-    // "not collected", never show an empty value.
-    let mut query_text = raw_column(
+    // Query text is server-truncated by the collector and remains lazy: it is
+    // useful in entity detail but must not inflate bounded frame responses.
+    // PostgreSQL may still mask both queryid and query for another role.
+    let query_text = raw_column(
         "query",
         ValueType::Text,
         "statements.query",
@@ -772,8 +850,6 @@ fn statements_view() -> ViewSpec {
         &["statements"],
         None,
     );
-    query_text.availability = Availability::NotCollected;
-    query_text.unavailable_reason = Some("query_text_not_collected");
     let columns = vec![
         raw_column(
             "queryid",
@@ -901,6 +977,22 @@ fn statements_view() -> ViewSpec {
             "desc",
         ),
         preset(
+            "latency",
+            &[
+                "queryid",
+                "database",
+                "user",
+                "calls",
+                "mean",
+                "ms_per_row",
+                "total",
+                "time_pct",
+                "rows",
+            ],
+            "mean",
+            "desc",
+        ),
+        preset(
             "io",
             &[
                 "queryid",
@@ -914,15 +1006,29 @@ fn statements_view() -> ViewSpec {
             "desc",
         ),
         preset(
+            "wal",
+            &["queryid", "database", "user", "calls", "wal_bytes", "total"],
+            "wal_bytes",
+            "desc",
+        ),
+        preset(
             "temp",
             &["queryid", "database", "user", "calls", "temp_written"],
             "temp_written",
             "desc",
         ),
         preset(
-            "wal",
-            &["queryid", "database", "user", "calls", "wal_bytes", "total"],
-            "wal_bytes",
+            "planning",
+            &[
+                "queryid",
+                "database",
+                "user",
+                "calls",
+                "plan_time_pct",
+                "total",
+                "mean",
+            ],
+            "plan_time_pct",
             "desc",
         ),
     ];
@@ -937,7 +1043,24 @@ fn plans_view() -> ViewSpec {
     view(
         projection("plans"),
         Scope::Database,
-        Vec::new(),
+        vec![
+            JoinSpec {
+                left: "plans",
+                right: "statements",
+                kind: RelationKind::BestEffort,
+                fields: vec!["queryid", "dbid", "userid"],
+                cardinality: "many_to_one",
+                provenance: "ossc_queryid_dbid_userid_attribution",
+            },
+            JoinSpec {
+                left: "plans",
+                right: "statements",
+                kind: RelationKind::BestEffort,
+                fields: vec!["queryid_stat_statements", "dbid", "userid"],
+                cardinality: "many_to_one",
+                provenance: "vadv_queryid_stat_statements_dbid_userid_attribution",
+            },
+        ],
         vec![
             raw_column(
                 "planid",
@@ -1046,6 +1169,19 @@ fn plans_view() -> ViewSpec {
                 "mean",
                 "desc",
             ),
+            preset(
+                "change_timeline",
+                &[
+                    "planid",
+                    "queryid",
+                    "first_call",
+                    "last_call",
+                    "calls",
+                    "mean",
+                ],
+                "last_call",
+                "desc",
+            ),
         ],
     )
 }
@@ -1058,7 +1194,14 @@ fn tables_view() -> ViewSpec {
     view(
         projection("tables"),
         Scope::Database,
-        Vec::new(),
+        vec![JoinSpec {
+            left: "tables",
+            right: "vacuum",
+            kind: RelationKind::Temporal,
+            fields: vec!["datid", "relid", "ts"],
+            cardinality: "zero_or_many",
+            provenance: "same_snapshot_database_relation_oid",
+        }],
         vec![
             derived_column(
                 "relation",
@@ -1177,6 +1320,32 @@ fn tables_view() -> ViewSpec {
         ],
         vec![
             preset(
+                "health",
+                &[
+                    "relation",
+                    "dead_pct",
+                    "dead_tuples",
+                    "seq_scan_pct",
+                    "autovacuum_age_seconds",
+                ],
+                "dead_pct",
+                "desc",
+            ),
+            preset(
+                "vacuum_risk",
+                &[
+                    "relation",
+                    "dead_pct",
+                    "dead_tuples",
+                    "modified_since_analyze",
+                    "inserted_since_vacuum",
+                    "last_autovacuum",
+                    "autovacuum_age_seconds",
+                ],
+                "autovacuum_age_seconds",
+                "desc",
+            ),
+            preset(
                 "activity",
                 &[
                     "relation",
@@ -1228,9 +1397,27 @@ fn tables_view() -> ViewSpec {
                 "desc",
             ),
             preset(
+                "scan_pattern",
+                &[
+                    "relation",
+                    "seq_scan",
+                    "idx_scan",
+                    "seq_scan_pct",
+                    "dead_pct",
+                ],
+                "seq_scan_pct",
+                "desc",
+            ),
+            preset(
                 "size",
                 &["relation", "size", "dead_pct", "xid_age", "mxid_age"],
                 "size",
+                "desc",
+            ),
+            preset(
+                "xid_mxid",
+                &["relation", "xid_age", "mxid_age", "dead_pct", "size"],
+                "xid_age",
                 "desc",
             ),
         ],
@@ -1241,7 +1428,14 @@ fn indexes_view() -> ViewSpec {
     view(
         projection("indexes"),
         Scope::Database,
-        Vec::new(),
+        vec![JoinSpec {
+            left: "indexes",
+            right: "tables",
+            kind: RelationKind::Temporal,
+            fields: vec!["datid", "relid", "ts"],
+            cardinality: "zero_or_one",
+            provenance: "same_snapshot_database_relation_oid",
+        }],
         vec![
             raw_column(
                 "index",
@@ -1316,6 +1510,12 @@ fn indexes_view() -> ViewSpec {
                 &["index", "table", "scans", "io_hit_pct"],
                 "io_hit_pct",
                 "desc",
+            ),
+            preset(
+                "table_context",
+                &["index", "table", "scans", "rows_per_scan", "size"],
+                "table",
+                "asc",
             ),
         ],
     )
@@ -1452,6 +1652,20 @@ fn vacuum_presets() -> Vec<PresetSpec> {
             "dead_tuples",
             "desc",
         ),
+        preset(
+            "dead_items",
+            &[
+                "pid",
+                "relation",
+                "dead_tuples",
+                "dead_item_ids",
+                "dead_tuple_bytes",
+                "progress",
+                "elapsed",
+            ],
+            "dead_tuples",
+            "desc",
+        ),
     ]
 }
 
@@ -1553,6 +1767,19 @@ fn processes_view() -> ViewSpec {
         columns,
         vec![
             preset(
+                "pressure",
+                &[
+                    "pid",
+                    "type",
+                    "cpu",
+                    "rss",
+                    "read_bytes_per_second",
+                    "write_bytes_per_second",
+                ],
+                "cpu",
+                "desc",
+            ),
+            preset(
                 "cpu",
                 &[
                     "pid",
@@ -1592,6 +1819,18 @@ fn processes_view() -> ViewSpec {
                 &["pid", "type", "threads", "cpu", "rss", "command"],
                 "threads",
                 "desc",
+            ),
+            preset(
+                "processes",
+                &["pid", "type", "cpu", "rss", "threads", "cgroup", "command"],
+                "cpu",
+                "desc",
+            ),
+            preset(
+                "data_quality",
+                &["pid", "type", "cpu", "rss", "cgroup"],
+                "pid",
+                "asc",
             ),
         ],
     )

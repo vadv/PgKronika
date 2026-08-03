@@ -64,6 +64,8 @@
   --active-bg: rgb(88 166 255 / 0.12);
   --focus-ring: 0 0 0 2px rgb(88 166 255 / 0.55);
   --skeleton: rgb(177 186 196 / 0.1);
+  --state-muted-bg: rgb(139 148 158 / 0.1);
+  --state-caution-bg: rgb(210 153 34 / 0.12);
   --shadow-pop: 0 8px 24px rgb(0 0 0 / 0.45), 0 0 0 1px rgb(240 246 252 / 0.06);
 }
 
@@ -101,6 +103,8 @@
   --active-bg: rgb(9 105 218 / 0.1);
   --focus-ring: 0 0 0 2px rgb(9 105 218 / 0.45);
   --skeleton: rgb(31 35 40 / 0.08);
+  --state-muted-bg: rgb(89 99 110 / 0.08);
+  --state-caution-bg: rgb(154 103 0 / 0.1);
   --shadow-pop:
     0 8px 24px rgb(140 149 159 / 0.3), 0 0 0 1px rgb(27 31 36 / 0.06);
 }
@@ -113,9 +117,21 @@
 }
 
 body {
+  margin: 0;
   font-family: var(--ui-font);
   font-size: var(--text-md);
   line-height: 1.45;
+}
+
+@media (min-width: 761px) {
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
 }
 
 :focus-visible {
@@ -150,5 +166,16 @@ button:hover:not(:disabled) {
 @media (max-width: 760px) {
   .statusbar-hints {
     display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }

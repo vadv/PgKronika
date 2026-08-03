@@ -114,8 +114,8 @@ fn metric_semantics_publish_revision_four_with_stable_numeric_ids() {
             (1, 2, vec![(1, 1), (2, 2), (3, 1), (4, 1)]),
             (2, 3, vec![(1, 3), (2, 2), (3, 2), (4, 2)]),
             (3, 2, vec![(1, 2), (2, 2)]),
-            (4, 1, vec![(1, 1), (2, 1), (3, 1)]),
-            (5, 1, vec![(1, 1), (2, 1)]),
+            (4, 2, vec![(1, 1), (2, 1), (3, 1)]),
+            (5, 2, vec![(1, 1), (2, 1)]),
             (6, 2, vec![(1, 2)]),
             (7, 2, vec![(1, 2), (2, 1)]),
             (8, 2, vec![(1, 2)]),
@@ -156,6 +156,120 @@ fn catalog_serializes_relation_quality_without_promoting_pid_only_evidence() {
     assert_eq!(replication_join["kind"], "temporal");
     assert_eq!(vacuum_join["kind"], "temporal");
     assert_eq!(process_cgroup_join["kind"], "exact");
+}
+
+#[test]
+fn workload_views_publish_distinct_prepared_lenses_and_fork_provenance() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let activity = serialized_view(&catalog, "activity");
+    let plans = serialized_view(&catalog, "plans");
+
+    assert_eq!(activity["capabilities"]["related"], true);
+    for preset in [
+        "overview",
+        "waits_locks",
+        "duration",
+        "cpu",
+        "disk_io",
+        "replication",
+        "sampling",
+    ] {
+        assert_serialized_preset(&catalog, "activity", preset);
+    }
+    assert_serialized_preset(&catalog, "plans", "change_timeline");
+
+    let plan_joins = plans["joins"].as_array().expect("plan joins");
+    assert!(plan_joins.iter().any(|join| {
+        join["kind"] == "best_effort"
+            && join["provenance"] == "ossc_queryid_dbid_userid_attribution"
+            && join["fields"] == json!(["queryid", "dbid", "userid"])
+    }));
+    assert!(plan_joins.iter().any(|join| {
+        join["kind"] == "best_effort"
+            && join["provenance"] == "vadv_queryid_stat_statements_dbid_userid_attribution"
+            && join["fields"] == json!(["queryid_stat_statements", "dbid", "userid"])
+    }));
+}
+
+#[test]
+fn host_and_object_views_publish_prepared_lenses_and_temporal_relations() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+
+    for (view, presets) in [
+        (
+            "processes",
+            &[
+                "pressure",
+                "cpu",
+                "memory",
+                "disk_io",
+                "cgroup",
+                "processes",
+                "data_quality",
+            ][..],
+        ),
+        (
+            "tables",
+            &[
+                "health",
+                "vacuum_risk",
+                "io",
+                "scan_pattern",
+                "size",
+                "xid_mxid",
+            ][..],
+        ),
+        (
+            "indexes",
+            &["usage", "io", "size", "unused", "table_context"][..],
+        ),
+        ("vacuum", &["progress", "phase", "dead_items"][..]),
+    ] {
+        for preset in presets {
+            assert_serialized_preset(&catalog, view, preset);
+        }
+    }
+
+    for view in ["tables", "indexes", "vacuum"] {
+        assert_eq!(
+            serialized_view(&catalog, view)["capabilities"]["related"],
+            true,
+            "{view} exposes bounded same-snapshot relations"
+        );
+    }
+
+    for (view, left, right, provenance) in [
+        (
+            "tables",
+            "tables",
+            "vacuum",
+            "same_snapshot_database_relation_oid",
+        ),
+        (
+            "indexes",
+            "indexes",
+            "tables",
+            "same_snapshot_database_relation_oid",
+        ),
+        (
+            "vacuum",
+            "vacuum",
+            "tables",
+            "same_snapshot_database_relation_oid",
+        ),
+    ] {
+        let join = serialized_view(&catalog, view)["joins"]
+            .as_array()
+            .expect("joins")
+            .iter()
+            .find(|join| join["left"] == left && join["right"] == right)
+            .unwrap_or_else(|| panic!("missing {view}: {left} -> {right}"));
+        assert_eq!(join["kind"], "temporal");
+        assert_eq!(join["fields"], json!(["datid", "relid", "ts"]));
+        assert_eq!(join["provenance"], provenance);
+    }
 }
 
 #[test]
@@ -629,10 +743,9 @@ fn statements_hit_percentage_uses_window_deltas() {
 }
 
 #[test]
-fn statements_query_text_is_intrinsically_not_collected() {
-    // The production collector writes `query` as NULL by design; the column
-    // must stay `not_collected` even when every input is available, in the
-    // store-derived catalog and in the materialization one alike.
+fn statements_query_text_is_available_but_detail_only() {
+    // The collector server-truncates and stores query text. The frame keeps it
+    // lazy for response bounds, while entity detail can project it.
     for catalog in [
         ProjectionCatalog::for_type_ids(&all_type_ids()),
         ProjectionCatalog::for_materialization(),
@@ -643,10 +756,20 @@ fn statements_query_text_is_intrinsically_not_collected() {
             .find(|view| view.code == "statements")
             .and_then(|view| view.columns.iter().find(|column| column.code == "query"))
             .expect("statements.query");
-        assert_eq!(query.availability, Availability::NotCollected);
-        assert_eq!(query.unavailable_reason, Some("query_text_not_collected"));
+        assert_eq!(query.availability, Availability::Available);
+        assert_eq!(query.unavailable_reason, None);
         assert!(query.lazy, "query text stays a detail-only column");
     }
+
+    let missing = ProjectionCatalog::for_type_ids(&BTreeSet::new());
+    let query = missing
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .and_then(|view| view.columns.iter().find(|column| column.code == "query"))
+        .expect("statements.query");
+    assert_eq!(query.availability, Availability::Gated);
+    assert_eq!(query.unavailable_reason, Some("missing_extension"));
 }
 
 #[test]
@@ -679,6 +802,40 @@ fn statements_presets_identify_rows_by_database_and_user() {
             );
         }
     }
+}
+
+#[test]
+fn statements_publish_only_executable_forensic_lenses() {
+    let catalog = ProjectionCatalog::for_type_ids(&all_type_ids());
+    let statements = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .expect("statements view");
+
+    let actual = statements
+        .presets
+        .iter()
+        .map(|preset| (preset.code, preset.sort.column, preset.sort.order))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("time", "total", "desc"),
+            ("latency", "mean", "desc"),
+            ("io", "blks_read", "desc"),
+            ("wal", "wal_bytes", "desc"),
+            ("temp", "temp_written", "desc"),
+            ("planning", "plan_time_pct", "desc"),
+        ]
+    );
+    assert!(
+        statements
+            .presets
+            .iter()
+            .all(|preset| !matches!(preset.code, "regression" | "observed_samples")),
+        "unproven baseline and sample relations stay out of executable presets"
+    );
 }
 
 #[test]

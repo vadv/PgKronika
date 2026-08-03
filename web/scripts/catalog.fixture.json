@@ -409,8 +409,8 @@
           "source": "statements.query",
           "lazy": true,
           "requires": ["statements"],
-          "availability": "not_collected",
-          "unavailable_reason": "query_text_not_collected"
+          "availability": "gated",
+          "unavailable_reason": "missing_extension"
         },
         {
           "code": "database",
@@ -557,6 +557,21 @@
           "sort": { "column": "total", "order": "desc" }
         },
         {
+          "code": "latency",
+          "columns": [
+            "queryid",
+            "database",
+            "user",
+            "calls",
+            "mean",
+            "ms_per_row",
+            "total",
+            "time_pct",
+            "rows"
+          ],
+          "sort": { "column": "mean", "order": "desc" }
+        },
+        {
           "code": "io",
           "columns": [
             "queryid",
@@ -569,11 +584,6 @@
           "sort": { "column": "blks_read", "order": "desc" }
         },
         {
-          "code": "temp",
-          "columns": ["queryid", "database", "user", "calls", "temp_written"],
-          "sort": { "column": "temp_written", "order": "desc" }
-        },
-        {
           "code": "wal",
           "columns": [
             "queryid",
@@ -584,6 +594,24 @@
             "total"
           ],
           "sort": { "column": "wal_bytes", "order": "desc" }
+        },
+        {
+          "code": "temp",
+          "columns": ["queryid", "database", "user", "calls", "temp_written"],
+          "sort": { "column": "temp_written", "order": "desc" }
+        },
+        {
+          "code": "planning",
+          "columns": [
+            "queryid",
+            "database",
+            "user",
+            "calls",
+            "plan_time_pct",
+            "total",
+            "mean"
+          ],
+          "sort": { "column": "plan_time_pct", "order": "desc" }
         }
       ],
       "canonical_metric": "time"

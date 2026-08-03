@@ -6,11 +6,31 @@ import type { HeatmapQuality, HeatmapRow, ViewSpec } from "../api/types";
 import { breakableCode, formatByUnit, shortIdToken } from "../design/format";
 import { heatColor } from "./heatmapColor";
 import { HEATMAP_LABEL_COL_PX } from "../design/ui";
+import type { TimeRange } from "../state/timeGeometry";
 import { TipFormula, TipRow, Tooltip } from "./Tooltip";
 
 /** Fraction of the global max below which a cell reads as "normal" — the
  * same cut the color scale makes between heat-1 and heat-2. */
 const NORMAL_FRACTION = 0.4;
+
+function timePercent(
+  value: string,
+  from: string,
+  to: string,
+  clip: boolean,
+): number | null {
+  try {
+    const start = BigInt(from);
+    const end = BigInt(to);
+    if (end <= start) return null;
+    const point = BigInt(value);
+    if (!clip && (point < start || point > end)) return null;
+    const scaled = Number(((point - start) * 100_000n) / (end - start)) / 1000;
+    return Math.min(100, Math.max(0, scaled));
+  } catch {
+    return null;
+  }
+}
 
 /** Localized breakdown of heatmap quality reasons for the partial chip:
  * a bare "partial data" gives the operator nothing to act on. */
@@ -163,6 +183,12 @@ export function HeatmapStrip(props: {
   metric: string;
   from: string;
   to: string;
+  selectedRange?: TimeRange;
+  cursorUs?: string | null;
+  hoverUs?: string | null;
+  brushDraft?: TimeRange | null;
+  baselineUs?: string | null;
+  buckets?: number;
   onMetricChange: (metric: string) => void;
   onSelectEntity: (entity: string) => void;
 }) {
@@ -173,6 +199,7 @@ export function HeatmapStrip(props: {
     metric: props.metric,
     from: props.from,
     to: props.to,
+    buckets: props.buckets,
   });
 
   const metrics = props.view.metrics.filter(
@@ -190,6 +217,32 @@ export function HeatmapStrip(props: {
       ? (Number(heatmap.data.grid.to_us) - Number(heatmap.data.grid.from_us)) /
         heatmap.data.grid.bucket_count
       : 0;
+  const overlayFrom = heatmap.data?.grid.from_us ?? props.from;
+  const overlayTo = heatmap.data?.grid.to_us ?? props.to;
+  const cursorPercent =
+    props.cursorUs == null
+      ? null
+      : timePercent(props.cursorUs, overlayFrom, overlayTo, false);
+  const hoverPercent =
+    props.hoverUs == null
+      ? null
+      : timePercent(props.hoverUs, overlayFrom, overlayTo, false);
+  const baselinePercent =
+    props.baselineUs == null
+      ? null
+      : timePercent(props.baselineUs, overlayFrom, overlayTo, false);
+  const selectedStart = props.selectedRange
+    ? timePercent(props.selectedRange.fromUs, overlayFrom, overlayTo, true)
+    : null;
+  const selectedEnd = props.selectedRange
+    ? timePercent(props.selectedRange.toUs, overlayFrom, overlayTo, true)
+    : null;
+  const brushStart = props.brushDraft
+    ? timePercent(props.brushDraft.fromUs, overlayFrom, overlayTo, true)
+    : null;
+  const brushEnd = props.brushDraft
+    ? timePercent(props.brushDraft.toUs, overlayFrom, overlayTo, true)
+    : null;
 
   // Density: quiet rows collapse into one-line summaries; loud rows keep
   // their full grid. Empty (all-null) rows collapse separately — absence of
@@ -328,6 +381,25 @@ export function HeatmapStrip(props: {
               </span>
             </Tooltip>
           )}
+        {heatmap.data?.ranking.exact === false && (
+          <span
+            role="status"
+            title={`${t("heatmap.ranking.partialHint", {
+              count: heatmap.data.ranking.unseen_upper,
+            })} · unseen_upper=${heatmap.data.ranking.unseen_upper}`}
+            style={{
+              fontFamily: "var(--ui-font)",
+              fontSize: "var(--text-xs)",
+              fontWeight: 600,
+              color: "var(--sev-warn-fg)",
+              background: "var(--sev-warn-bg)",
+              borderRadius: "var(--radius-sm)",
+              padding: "1px 8px",
+            }}
+          >
+            {t("heatmap.ranking.partial")}
+          </span>
+        )}
         {/* Verdict legend: the colors mean thresholds, not decoration. */}
         <span
           style={{
@@ -376,7 +448,9 @@ export function HeatmapStrip(props: {
       )}
       {rows.length > 0 && (
         <div
+          data-testid="heatmap-time-grid"
           style={{
+            position: "relative",
             display: "grid",
             gridTemplateColumns: `${HEATMAP_LABEL_COL_PX}px repeat(${bucketCount}, 1fr)`,
             marginTop: "4px",
@@ -448,6 +522,78 @@ export function HeatmapStrip(props: {
               {t("heatmap.collapse")}
             </button>
           )}
+          <div
+            data-testid="heatmap-time-overlay"
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              insetBlock: 0,
+              insetInlineStart: `${HEATMAP_LABEL_COL_PX}px`,
+              insetInlineEnd: 0,
+              pointerEvents: "none",
+              overflow: "hidden",
+            }}
+          >
+            {selectedStart !== null && selectedEnd !== null && (
+              <span
+                data-testid="heatmap-selected-range"
+                style={{
+                  position: "absolute",
+                  insetBlock: 0,
+                  left: `${Math.min(selectedStart, selectedEnd)}%`,
+                  width: `${Math.abs(selectedEnd - selectedStart)}%`,
+                  background: "var(--active-bg)",
+                  opacity: 0.12,
+                }}
+              />
+            )}
+            {brushStart !== null && brushEnd !== null && (
+              <span
+                data-testid="heatmap-brush-draft"
+                style={{
+                  position: "absolute",
+                  insetBlock: 0,
+                  left: `${Math.min(brushStart, brushEnd)}%`,
+                  width: `${Math.abs(brushEnd - brushStart)}%`,
+                  background: "var(--accent)",
+                  opacity: 0.18,
+                }}
+              />
+            )}
+            {baselinePercent !== null && (
+              <span
+                data-testid="heatmap-baseline"
+                style={{
+                  position: "absolute",
+                  insetBlock: 0,
+                  left: `${baselinePercent}%`,
+                  borderInlineStart: "1px dashed var(--accent)",
+                }}
+              />
+            )}
+            {cursorPercent !== null && (
+              <span
+                data-testid="heatmap-cursor"
+                style={{
+                  position: "absolute",
+                  insetBlock: 0,
+                  left: `${cursorPercent}%`,
+                  borderInlineStart: "1px solid var(--fg)",
+                }}
+              />
+            )}
+            {hoverPercent !== null && (
+              <span
+                data-testid="heatmap-hover-cursor"
+                style={{
+                  position: "absolute",
+                  insetBlock: 0,
+                  left: `${hoverPercent}%`,
+                  borderInlineStart: "1px dashed var(--fg-dim)",
+                }}
+              />
+            )}
+          </div>
         </div>
       )}
     </section>

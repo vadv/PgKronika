@@ -82,3 +82,42 @@ test("collection coverage joins the context line when present", () => {
   const context = screen.getByTitle("pageheader.matchedHint");
   expect(context.textContent).toContain("pageheader.collection: 42/45");
 });
+
+test("collection coverage opens exact source and snapshot provenance", () => {
+  render(
+    <PageHeader
+      view={makeViewSpec({
+        code: "statements",
+        inputs: [
+          {
+            code: "pg.stat_statements",
+            availability: "available",
+            logical_sections: ["pg_stat_statements"],
+            type_ids: [11],
+          },
+        ],
+      })}
+      summary={summary({
+        snapshot_ts_us: "1722400000000123",
+        status: "partial",
+        collection: {
+          collected: 42,
+          source_total: 45,
+          read_state: "partial",
+          visibility: "bounded",
+        },
+      })}
+      matched={null}
+      live={false}
+    />,
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "pageheader.provenance.trigger" }),
+  );
+  const dialog = screen.getByRole("dialog");
+  expect(dialog.textContent).toContain("42/45");
+  expect(dialog.textContent).toContain("1722400000000123");
+  expect(dialog.textContent).toContain("pg.stat_statements");
+  expect(dialog.textContent).toContain("partial");
+  expect(dialog.textContent).toContain("bounded");
+});

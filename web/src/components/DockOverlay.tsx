@@ -7,7 +7,7 @@ import {
   relationKindDesc,
   relationKindLabel,
 } from "../api/codes";
-import { useEntity } from "../api/entity";
+import { useEntityHistory, useEntityPoint } from "../api/entity";
 import { useIncidents } from "../api/incidents";
 import type {
   ColumnSpec,
@@ -121,7 +121,8 @@ const dockStyle = (mobile: boolean) =>
       : {
           insetBlock: 0,
           insetInlineEnd: 0,
-          width: "min(100vw, clamp(400px, 32vw, 560px))",
+          width: "520px",
+          maxWidth: "calc(100vw - 24px)",
           borderInlineStart: "1px solid var(--border)",
         }),
     background: "var(--bg-overlay)",
@@ -467,6 +468,7 @@ function EntityPointView(props: {
         return isSql && !notCollected ? (
           <div
             key={field.code}
+            data-field={field.code}
             style={{ gridColumn: "1 / -1", marginBlock: "4px" }}
           >
             <div
@@ -495,7 +497,11 @@ function EntityPointView(props: {
             </pre>
           </div>
         ) : (
-          <div key={field.code} style={{ display: "contents" }}>
+          <div
+            key={field.code}
+            data-field={field.code}
+            style={{ display: "contents" }}
+          >
             <span
               title={desc ?? undefined}
               style={{
@@ -551,6 +557,7 @@ function EntityHistoryView(props: {
   return (
     <div>
       <table
+        data-detail-history
         style={{
           borderCollapse: "collapse",
           fontFamily: "var(--mono-font)",
@@ -607,6 +614,7 @@ function EntityHistoryView(props: {
       {data.page.next !== null && (
         <button
           type="button"
+          data-testid="history-load-more"
           disabled={props.loadingMore === true}
           onClick={props.onLoadMore}
           style={{
@@ -628,6 +636,64 @@ function EntityHistoryView(props: {
   );
 }
 
+type EntityDetailTab = "summary" | "history" | "relationships" | "raw";
+
+const ENTITY_DETAIL_TABS: EntityDetailTab[] = [
+  "summary",
+  "history",
+  "relationships",
+  "raw",
+];
+const MAX_DETAIL_HISTORY_SECONDS = 21_600;
+
+function detailHistoryColumns(view: ViewSpec | undefined): string[] {
+  if (view === undefined || !view.capabilities.history) return [];
+  const useful = view.columns.filter(
+    (column) =>
+      !column.lazy &&
+      column.availability === "available" &&
+      !isIdentityColumn(column.code),
+  );
+  const metricLike = useful.filter((column) => column.type !== "text");
+  return (metricLike.length > 0 ? metricLike : useful)
+    .slice(0, 6)
+    .map((column) => column.code);
+}
+
+function uniqueSnapshots(
+  existing: EntitySnapshotDto[],
+  incoming: EntitySnapshotDto[],
+): EntitySnapshotDto[] {
+  const snapshots = new Map(existing.map((item) => [item.ts_us, item]));
+  for (const item of incoming) snapshots.set(item.ts_us, item);
+  return [...snapshots.values()].sort((left, right) => {
+    const leftTs = BigInt(left.ts_us);
+    const rightTs = BigInt(right.ts_us);
+    return leftTs < rightTs ? -1 : leftTs > rightTs ? 1 : 0;
+  });
+}
+
+function mergeHistoryQuality(
+  existing: EntityHistoryResponse["quality"] | null,
+  incoming: EntityHistoryResponse["quality"],
+): EntityHistoryResponse["quality"] {
+  if (existing === null) return incoming;
+  const gaps = new Map(
+    existing.gaps.map((gap) => [`${gap.from_us}:${gap.to_us}`, gap]),
+  );
+  for (const gap of incoming.gaps) {
+    gaps.set(`${gap.from_us}:${gap.to_us}`, gap);
+  }
+  return {
+    status:
+      existing.status === "complete" && incoming.status === "complete"
+        ? "complete"
+        : "partial",
+    gaps: [...gaps.values()],
+    gated: [...new Set([...existing.gated, ...incoming.gated])].sort(),
+  };
+}
+
 function RowDock(props: {
   state: UiState;
   view: ViewSpec | undefined;
@@ -638,38 +704,67 @@ function RowDock(props: {
   onPatch: (patch: Partial<UiState>) => void;
 }) {
   const { t } = useTranslation();
+  const [detailTab, setDetailTab] = useState<EntityDetailTab>("summary");
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
-  const [historyBase, setHistoryBase] = useState<string | null>(null);
+  const [historyBase, setHistoryBase] = useState<EntityHistoryResponse | null>(
+    null,
+  );
+  const [historyQuality, setHistoryQuality] = useState<
+    EntityHistoryResponse["quality"] | null
+  >(null);
   const [extraSnapshots, setExtraSnapshots] = useState<EntitySnapshotDto[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const entityKey = `${props.state.view}:${props.state.entity ?? ""}`;
-  const entity = useEntity({
+  const entity = useEntityPoint({
     view: props.state.view,
     entity: props.state.entity ?? "",
     at: props.at,
     includeRelated: true,
-    cursor: historyCursor,
   });
-  // History continuation: adopt the arrived page and fall back to the base
-  // query; accumulated snapshots reset when the entity changes.
+  const historyColumns = detailHistoryColumns(props.view);
+  const historySpan = Math.min(props.state.span, MAX_DETAIL_HISTORY_SECONDS);
+  const historyFrom = (
+    BigInt(props.at) -
+    BigInt(historySpan) * 1_000_000n
+  ).toString();
+  const historyKey = `${entityKey}:${historyFrom}:${props.at}:${historyColumns.join(",")}`;
+  const history = useEntityHistory({
+    view: props.state.view,
+    entity: props.state.entity ?? "",
+    from: historyFrom,
+    to: props.at,
+    columns: historyColumns,
+    limit: 200,
+    cursor: historyCursor,
+    enabled: detailTab === "history" && historyColumns.length > 0,
+  });
+
   useEffect(() => {
-    setHistoryCursor(null);
-    setExtraSnapshots([]);
-    setNextCursor(null);
-    setHistoryBase(entityKey);
+    setDetailTab("summary");
   }, [entityKey]);
   useEffect(() => {
-    const data = entity.data;
-    if (data === undefined || !("snapshots" in data)) return;
+    setHistoryCursor(null);
+    setHistoryBase(null);
+    setHistoryQuality(null);
+    setExtraSnapshots([]);
+    setNextCursor(null);
+  }, [historyKey]);
+  useEffect(() => {
+    const data = history.data;
+    if (data === undefined) return;
+    setHistoryQuality((previous) =>
+      mergeHistoryQuality(previous, data.quality),
+    );
     if (historyCursor !== null) {
-      setExtraSnapshots((prev) => [...prev, ...data.snapshots]);
+      setExtraSnapshots((previous) =>
+        uniqueSnapshots(previous, data.snapshots),
+      );
       setNextCursor(data.page.next ?? null);
-      setHistoryCursor(null);
-    } else if (historyBase === entityKey && extraSnapshots.length === 0) {
+    } else {
+      setHistoryBase((previous) => previous ?? data);
       setNextCursor(data.page.next ?? null);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entity.data, historyCursor, entityKey, historyBase]);
+  }, [history.data, historyCursor]);
   const viewCode = props.view?.code ?? props.state.view;
   const data = props.state.entity === null ? undefined : entity.data;
   const apiError = entity.error instanceof ApiError ? entity.error : null;
@@ -689,15 +784,26 @@ function RowDock(props: {
   // The API label is the human row name (index/relation/pid); the typed
   // entity token is routing material — short form, full value in the title.
   const label = data !== undefined && data.label !== "" ? data.label : null;
-  // statements/plans have no collected text to grow a name from: their label
-  // is the bare numeric identity. The heading is the tab name plus a short
-  // id; the full id stays in the field list below, uncut.
+  // Statement/plan labels deliberately remain stable numeric identities even
+  // when bounded SQL text is available in the detail fields. The heading is
+  // the tab name plus a short id; the full id stays in the field list below.
   const heading =
     label !== null &&
     (viewCode === "statements" || viewCode === "plans") &&
     /^-?\d+$/.test(label)
       ? t(`dock.row.heading.${viewCode}`, { id: shortIdToken(label) })
       : label;
+  const visibleHistory =
+    historyBase ?? (historyCursor === null ? history.data : undefined);
+  const combinedHistory =
+    visibleHistory === undefined
+      ? undefined
+      : {
+          ...visibleHistory,
+          snapshots: uniqueSnapshots(visibleHistory.snapshots, extraSnapshots),
+          page: { next: nextCursor },
+          quality: historyQuality ?? visibleHistory.quality,
+        };
 
   const [tokenCopied, setTokenCopied] = useState(false);
   const copyToken = () => {
@@ -756,13 +862,13 @@ function RowDock(props: {
           {isWarmingUp(entity.error) ? t("error.warming") : t("dock.row.error")}
         </div>
       )}
-      {entity.isPending &&
-        entity.failureCount > 0 &&
-        isWarmingUp(entity.failureReason) && (
-          <div role="status" style={{ color: "var(--fg-dim)" }}>
-            {t("loading.warming")}
-          </div>
-        )}
+      {entity.isPending && (
+        <div role="status" style={{ color: "var(--fg-dim)" }}>
+          {entity.failureCount > 0 && isWarmingUp(entity.failureReason)
+            ? t("loading.warming")
+            : t("table.loading")}
+        </div>
+      )}
       {data && data.quality.status !== "complete" && (
         <div
           style={{
@@ -774,27 +880,221 @@ function RowDock(props: {
           {t("dock.row.partial")}
         </div>
       )}
-      {data && "fields" in data && (
-        <EntityPointView
-          data={data}
-          columns={columnSpecs}
-          viewCode={viewCode}
-        />
-      )}
-      {data && "snapshots" in data && (
-        <EntityHistoryView
-          data={{
-            ...data,
-            snapshots: [...data.snapshots, ...extraSnapshots],
-            page: { next: nextCursor },
-          }}
-          columns={columnSpecs}
-          viewCode={viewCode}
-          loadingMore={historyCursor !== null && entity.isLoading}
-          onLoadMore={
-            nextCursor !== null ? () => setHistoryCursor(nextCursor) : undefined
-          }
-        />
+      {data !== undefined && (
+        <>
+          <div
+            role="tablist"
+            aria-label={t("dock.detail.tabs")}
+            style={{
+              display: "flex",
+              gap: "var(--space-1)",
+              borderBlockEnd: "1px solid var(--border)",
+              marginBlockEnd: "var(--space-2)",
+            }}
+          >
+            {ENTITY_DETAIL_TABS.map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                role="tab"
+                data-detail-tab-trigger={tab}
+                aria-selected={detailTab === tab}
+                onClick={() => setDetailTab(tab)}
+                style={tabButtonStyle(detailTab === tab)}
+              >
+                {t(`dock.detail.${tab}`)}
+              </button>
+            ))}
+          </div>
+          <div role="tabpanel" data-detail-tab={detailTab}>
+            {detailTab === "summary" && (
+              <div>
+                <div
+                  data-detail-provenance
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                    gap: "var(--space-1)",
+                    marginBlockEnd: "var(--space-2)",
+                    padding: "var(--space-2)",
+                    color: "var(--fg-dim)",
+                    background: "var(--bg-raised)",
+                    border: "1px solid var(--border)",
+                    borderRadius: "var(--radius-sm)",
+                    fontFamily: "var(--mono-font)",
+                    fontSize: "var(--text-xs)",
+                  }}
+                >
+                  <span>{formatIntervalTime(Number(data.snapshot_ts_us))}</span>
+                  <span>{data.quality.status}</span>
+                  <span>gaps {data.quality.gaps.length}</span>
+                  <span>gated {data.quality.gated.length}</span>
+                  <span style={{ gridColumn: "1 / -1" }}>
+                    /v1/entity/{viewCode}/… · point projection
+                  </span>
+                </div>
+                <EntityPointView
+                  data={data}
+                  columns={columnSpecs}
+                  viewCode={viewCode}
+                />
+              </div>
+            )}
+            {detailTab === "history" && (
+              <div>
+                {props.state.span > MAX_DETAIL_HISTORY_SECONDS && (
+                  <div
+                    role="note"
+                    style={{
+                      color: "var(--fg-dim)",
+                      fontFamily: "var(--mono-font)",
+                      marginBlockEnd: "var(--space-2)",
+                    }}
+                  >
+                    {t("dock.detail.historyCapped", {
+                      hours: MAX_DETAIL_HISTORY_SECONDS / 3600,
+                    })}
+                  </div>
+                )}
+                {historyColumns.length === 0 ? (
+                  <div style={{ color: "var(--fg-dim)" }}>
+                    {t("dock.detail.historyUnavailable")}
+                  </div>
+                ) : history.isError ? (
+                  <div role="alert" style={{ color: "var(--sev-warn-fg)" }}>
+                    {t("dock.detail.historyError")}
+                  </div>
+                ) : combinedHistory !== undefined ? (
+                  <>
+                    {combinedHistory.quality.status !== "complete" && (
+                      <div
+                        data-history-quality
+                        data-gaps={combinedHistory.quality.gaps.length}
+                        data-gated={combinedHistory.quality.gated.length}
+                        role="note"
+                        style={{
+                          color: "var(--sev-warn-fg)",
+                          fontFamily: "var(--mono-font)",
+                          marginBlockEnd: "var(--space-2)",
+                        }}
+                      >
+                        {t("dock.detail.historyQuality", {
+                          status: combinedHistory.quality.status,
+                          gaps: combinedHistory.quality.gaps.length,
+                          gated: combinedHistory.quality.gated.length,
+                        })}
+                      </div>
+                    )}
+                    <EntityHistoryView
+                      data={combinedHistory}
+                      columns={columnSpecs}
+                      viewCode={viewCode}
+                      loadingMore={historyCursor !== null && history.isLoading}
+                      onLoadMore={
+                        nextCursor !== null
+                          ? () => setHistoryCursor(nextCursor)
+                          : undefined
+                      }
+                    />
+                  </>
+                ) : (
+                  <div role="status" style={{ color: "var(--fg-dim)" }}>
+                    {t("table.loading")}
+                  </div>
+                )}
+              </div>
+            )}
+            {detailTab === "relationships" && (
+              <div>
+                {data.related.length === 0 && (
+                  <div style={{ color: "var(--fg-dim)" }}>
+                    {t("dock.detail.noRelationships")}
+                  </div>
+                )}
+                {data.related.map((relation) => {
+                  const kind = relationKindLabel(t, relation.provenance.kind);
+                  const kindDesc = relationKindDesc(
+                    t,
+                    relation.provenance.kind,
+                  );
+                  return (
+                    <button
+                      key={`${relation.view}:${relation.entity}`}
+                      type="button"
+                      onClick={() =>
+                        props.onPatch({
+                          view: relation.view,
+                          entity: relation.entity,
+                          dock: "row",
+                        })
+                      }
+                      style={{
+                        display: "block",
+                        width: "100%",
+                        marginBlockEnd: "var(--space-2)",
+                        padding: "var(--space-2)",
+                        color: "var(--fg)",
+                        background: "var(--bg-raised)",
+                        border: "1px solid var(--border)",
+                        borderRadius: "var(--radius-sm)",
+                        textAlign: "start",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <strong>{relation.relation}</strong>
+                      <span
+                        style={{
+                          display: "block",
+                          color: "var(--fg-dim)",
+                          fontFamily: "var(--mono-font)",
+                          fontSize: "var(--text-xs)",
+                        }}
+                      >
+                        {kind} · {relation.provenance.method} ·{" "}
+                        {relation.provenance.fields.join(", ")}
+                      </span>
+                      {kindDesc !== null && (
+                        <span style={{ color: "var(--fg-dim)" }}>
+                          {kindDesc}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {detailTab === "raw" && (
+              <div>
+                <div
+                  role="note"
+                  style={{
+                    color: "var(--fg-dim)",
+                    marginBlockEnd: "var(--space-2)",
+                  }}
+                >
+                  {t("dock.detail.rawProjectedOnly")}
+                </div>
+                <pre
+                  data-raw-evidence
+                  style={{
+                    margin: 0,
+                    padding: "var(--space-2)",
+                    color: "var(--fg)",
+                    background: "var(--bg)",
+                    border: "1px solid var(--border)",
+                    borderRadius: "var(--radius-sm)",
+                    fontFamily: "var(--mono-font)",
+                    fontSize: "var(--text-xs)",
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {JSON.stringify(data, null, 2)}
+                </pre>
+              </div>
+            )}
+          </div>
+        </>
       )}
       <div
         style={{
@@ -804,35 +1104,6 @@ function RowDock(props: {
           flexWrap: "wrap",
         }}
       >
-        {/* Drill-down follows only the server's provenance-backed `related`
-            list — never a client-side join by name/queryid via free text. */}
-        {data &&
-          "fields" in data &&
-          data.related.map((rel) => {
-            // Localized kind label + explanation; the machine method/fields
-            // stay in the tooltip as the full provenance value.
-            const kindDesc = relationKindDesc(t, rel.provenance.kind);
-            const title = `${rel.relation}: ${relationKindLabel(t, rel.provenance.kind)}${
-              kindDesc !== null ? ` — ${kindDesc}` : ""
-            } [${rel.provenance.method} · ${rel.provenance.fields.join(", ")}]`;
-            return (
-              <button
-                key={`${rel.view}:${rel.entity}`}
-                type="button"
-                title={title}
-                onClick={() =>
-                  props.onPatch({
-                    view: rel.view,
-                    entity: rel.entity,
-                    dock: "row",
-                  })
-                }
-                style={drillButtonStyle}
-              >
-                {t("dock.row.drill", { view: rel.view })}
-              </button>
-            );
-          })}
         <button
           type="button"
           onClick={() => props.onPatch({ entity: null, dock: null })}

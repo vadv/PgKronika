@@ -73,10 +73,245 @@ for (const view of catalog.views) {
   }
 }
 
+const activityCatalog = catalog.views.find((view) => view.code === "activity");
+if (activityCatalog !== undefined) {
+  activityCatalog.capabilities.related = true;
+  activityCatalog.presets.push(
+    {
+      code: "overview",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "application",
+        "state",
+        "wait_event",
+        "query",
+        "query_duration_us",
+      ],
+      sort: { column: "query_duration_us", order: "desc" },
+    },
+    {
+      code: "waits_locks",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "state",
+        "wait_event",
+        "query",
+        "query_duration_us",
+      ],
+      sort: { column: "query_duration_us", order: "desc" },
+    },
+    {
+      code: "duration",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "query_duration_us",
+        "transaction_duration_us",
+        "query",
+      ],
+      sort: { column: "query_duration_us", order: "desc" },
+    },
+    {
+      code: "cpu",
+      columns: ["pid", "user", "database", "process_link", "cpu", "query"],
+      sort: { column: "cpu", order: "desc" },
+    },
+    {
+      code: "disk_io",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "process_link",
+        "read_bytes_per_second",
+        "write_bytes_per_second",
+        "query",
+      ],
+      sort: { column: "read_bytes_per_second", order: "desc" },
+    },
+    {
+      code: "sampling",
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "state",
+        "wait_event",
+        "query_duration_us",
+        "query",
+      ],
+      sort: { column: "query_duration_us", order: "desc" },
+    },
+  );
+}
+
+const plansCatalog = catalog.views.find((view) => view.code === "plans");
+if (plansCatalog !== undefined) {
+  plansCatalog.joins.push(
+    {
+      left: "plans",
+      right: "statements",
+      kind: "best_effort",
+      fields: ["queryid", "dbid", "userid"],
+      cardinality: "many_to_one",
+      provenance: "ossc_queryid_dbid_userid_attribution",
+    },
+    {
+      left: "plans",
+      right: "statements",
+      kind: "best_effort",
+      fields: ["queryid_stat_statements", "dbid", "userid"],
+      cardinality: "many_to_one",
+      provenance: "vadv_queryid_stat_statements_dbid_userid_attribution",
+    },
+  );
+  plansCatalog.presets.push({
+    code: "change_timeline",
+    columns: ["planid", "queryid", "first_call", "last_call", "calls", "mean"],
+    sort: { column: "last_call", order: "desc" },
+  });
+}
+
+function replacePreset(view, code, columns, sort, order = "desc") {
+  view.presets = view.presets.filter((preset) => preset.code !== code);
+  view.presets.push({ code, columns, sort: { column: sort, order } });
+}
+
+const processesCatalog = catalog.views.find(
+  (view) => view.code === "processes",
+);
+if (processesCatalog !== undefined) {
+  replacePreset(
+    processesCatalog,
+    "pressure",
+    [
+      "pid",
+      "type",
+      "cpu",
+      "rss",
+      "read_bytes_per_second",
+      "write_bytes_per_second",
+    ],
+    "cpu",
+  );
+  replacePreset(
+    processesCatalog,
+    "processes",
+    ["pid", "type", "cpu", "rss", "threads", "cgroup", "command"],
+    "cpu",
+  );
+  replacePreset(
+    processesCatalog,
+    "data_quality",
+    ["pid", "type", "cpu", "rss", "cgroup"],
+    "pid",
+    "asc",
+  );
+}
+
+const tablesCatalog = catalog.views.find((view) => view.code === "tables");
+if (tablesCatalog !== undefined) {
+  tablesCatalog.capabilities.related = true;
+  tablesCatalog.joins = [
+    {
+      left: "tables",
+      right: "vacuum",
+      kind: "temporal",
+      fields: ["datid", "relid", "ts"],
+      cardinality: "zero_or_many",
+      provenance: "same_snapshot_database_relation_oid",
+    },
+  ];
+  replacePreset(
+    tablesCatalog,
+    "health",
+    [
+      "relation",
+      "dead_pct",
+      "dead_tuples",
+      "seq_scan_pct",
+      "autovacuum_age_seconds",
+    ],
+    "dead_pct",
+  );
+  replacePreset(
+    tablesCatalog,
+    "vacuum_risk",
+    [
+      "relation",
+      "dead_pct",
+      "dead_tuples",
+      "modified_since_analyze",
+      "inserted_since_vacuum",
+      "last_autovacuum",
+      "autovacuum_age_seconds",
+    ],
+    "autovacuum_age_seconds",
+  );
+  replacePreset(
+    tablesCatalog,
+    "scan_pattern",
+    ["relation", "seq_scan", "idx_scan", "seq_scan_pct", "dead_pct"],
+    "seq_scan_pct",
+  );
+  replacePreset(
+    tablesCatalog,
+    "xid_mxid",
+    ["relation", "xid_age", "mxid_age", "dead_pct", "size"],
+    "xid_age",
+  );
+}
+
+const indexesCatalog = catalog.views.find((view) => view.code === "indexes");
+if (indexesCatalog !== undefined) {
+  indexesCatalog.capabilities.related = true;
+  indexesCatalog.joins = [
+    {
+      left: "indexes",
+      right: "tables",
+      kind: "temporal",
+      fields: ["datid", "relid", "ts"],
+      cardinality: "zero_or_one",
+      provenance: "same_snapshot_database_relation_oid",
+    },
+  ];
+  replacePreset(
+    indexesCatalog,
+    "table_context",
+    ["index", "table", "scans", "rows_per_scan", "size"],
+    "table",
+    "asc",
+  );
+}
+
+const vacuumCatalog = catalog.views.find((view) => view.code === "vacuum");
+if (vacuumCatalog !== undefined) {
+  vacuumCatalog.capabilities.related = true;
+  replacePreset(
+    vacuumCatalog,
+    "dead_items",
+    [
+      "pid",
+      "relation",
+      "dead_tuples",
+      "dead_item_ids",
+      "dead_tuple_bytes",
+      "progress",
+      "elapsed",
+    ],
+    "dead_tuples",
+  );
+}
+
 // --- summary ---------------------------------------------------------------
 
 // Populations per plan: activity..events in stable view_code order.
-const POPULATIONS = [142, 500, 83, 64, 121, 2, 218, 3, 5];
+const POPULATIONS = [142, 1000, 83, 64, 121, 2, 218, 3, 5];
 // Views that carry a live anomaly in the demo storyline.
 const NOTABLE = { locks: ["critical", 4], statements: ["warning", 2] };
 
@@ -93,7 +328,15 @@ function summaryResponse(at) {
         notable: notable !== undefined,
         notable_count: notable?.[1] ?? 0,
         notable_level: notable?.[0] ?? "none",
-        collection: null,
+        collection:
+          view.code === "statements"
+            ? {
+                collected: 1000,
+                source_total: 1453,
+                read_state: "source_limit",
+                visibility: "full",
+              }
+            : null,
       };
     }),
     quality: {
@@ -690,9 +933,14 @@ const STMT_DATABASES = ["orders", "orders", "billing", "analytics"];
 const STMT_USERS = ["app_rw", "app_rw", "billing_job", "report"];
 
 function rowsStatements() {
-  return QUERIES.map(([qid], i) => {
-    const calls = 12_400_000 - i * 912_000;
-    const total = r2(8_420_000 - i * 588_000);
+  // A production pg_stat_statements population is commonly O(1000). Keep
+  // that density in the deterministic demo so the viewport contract proves
+  // an independently scrolling ranked matrix instead of a twelve-row toy.
+  return Array.from({ length: 1000 }, (_, i) => {
+    const [baseQueryId] = QUERIES[i % QUERIES.length];
+    const qid = baseQueryId + i * 10_007;
+    const calls = Math.max(100, Math.round(12_400_000 * Math.exp(-i / 160)));
+    const total = r2(Math.max(1, 8_420_000 * Math.exp(-i / 130)));
     const mean = r2(total / Math.max(calls / 1000, 1));
     const cls = [];
     if (i < 2) {
@@ -706,29 +954,29 @@ function rowsStatements() {
         ),
       );
     }
-    // Mirror the live store: the collector writes the query text as NULL by
-    // design, so the label is the bare queryid and identification rides on
-    // database/user — the demo must not promise text the stand cannot show.
+    // Query text is a server-capped, lazy detail field. The ranked frame uses
+    // the bare queryid plus database/user and never inflates its response with
+    // SQL; selecting a row exposes the bounded text in entity detail.
     const queryid = String(9_180_220_441_120_000n + BigInt(qid));
     return {
       entity: `stmt:${qid}`,
       label: queryid,
       data: {
         queryid,
-        query: null,
+        query: QUERIES[i % QUERIES.length][1],
         database: STMT_DATABASES[i % STMT_DATABASES.length],
         user: STMT_USERS[i % STMT_USERS.length],
         calls,
         total,
         ms_per_row: r2(0.42 + i * 0.18),
         mean,
-        time_pct: r2(31.5 - i * 2.6),
+        time_pct: r2(31.5 * Math.exp(-i / 45)),
         plan_time_pct: i === 7 ? null : r2(1.2 + (i % 4) * 0.8),
         rows: Math.round(calls * (0.8 + (i % 3) * 2.2)),
-        hit_pct: r2(99.4 - i * 0.7),
+        hit_pct: r2(99.4 - i * 0.039),
         blks_read: Math.round(420_000 + i * 88_000),
         temp_written: i % 4 === 3 ? Math.round(12_000 + i * 900) : 0,
-        wal_bytes: Math.round(8_800_000 - i * 420_000),
+        wal_bytes: Math.max(0, Math.round(8_800_000 * Math.exp(-i / 120))),
       },
       cls,
     };
@@ -736,6 +984,7 @@ function rowsStatements() {
 }
 
 function rowsPlans() {
+  const now = nowUs();
   const shapes = [
     "Index Scan using orders_pkey on orders",
     "Bitmap Heap Scan on sessions",
@@ -764,6 +1013,8 @@ function rowsPlans() {
         calls: 2_400_000 - i * 188_000,
         mean: r2(48_200 / (i + 1)),
         rows: Math.round(120_000 + i * 44_000),
+        first_call: String(now - (i + 4) * 900 * US),
+        last_call: String(now - i * 180 * US),
       },
       cls,
     };
@@ -791,10 +1042,14 @@ function rowsTables() {
         label: `public.${name}`,
         data: {
           relation: `public.${name}`,
+          size: 48_000_000 + i * 384_000_000 + idx * 24,
           seq_scan: seq,
           idx_scan: idx,
           dead_pct: deadPct,
           dead_tuples: dead,
+          io_hit_pct: r2(Math.max(72, 99.7 - i * 1.4)),
+          xid_age: 18_400_000 + i * 7_220_000,
+          mxid_age: 1_220_000 + i * 884_000,
           seq_scan_pct: r2((100 * seq) / Math.max(seq + idx, 1)),
           modified_since_analyze: modSince,
           inserted_since_vacuum: insSince,
@@ -826,10 +1081,19 @@ function rowsIndexes() {
     ["events_ts_idx", "events", 44_102, 88.4],
     ["audit_log_actor_idx", "audit_log", 0, 0.0],
   ];
-  return defs.map(([index, table, scans, rps]) => ({
+  const now = nowUs();
+  return defs.map(([index, table, scans, rps], i) => ({
     entity: `index:${index}`,
     label: index,
-    data: { index, table, scans, rows_per_scan: rps },
+    data: {
+      index,
+      table,
+      size: 24_000_000 + i * 118_000_000,
+      scans,
+      rows_per_scan: rps,
+      io_hit_pct: r2(Math.max(68, 99.8 - i * 2.1)),
+      last_idx_scan: scans === 0 ? null : String(now - (i + 1) * 1_800 * US),
+    },
     cls: [],
   }));
 }
@@ -851,6 +1115,9 @@ function rowsVacuum() {
       is_autovacuum: isAuto,
       progress,
       dead_tuples: dead,
+      dead_item_ids: i < 2 ? null : dead,
+      dead_tuple_bytes: i < 2 ? dead * 72 : null,
+      elapsed: null,
     },
     cls: [],
   }));
@@ -885,10 +1152,12 @@ function rowsProcesses() {
         type,
         cpu,
         rss,
+        threads: 1 + (i % 7),
         read_bytes_per_second: readBps,
         write_bytes_per_second: writeBps,
         block_delay: r2(i % 4 === 0 ? 0.8 : 0.05),
         command: type,
+        cgroup: i < 12 ? "/system.slice/postgresql.service" : "/system.slice",
       },
       cls,
     };
@@ -897,18 +1166,81 @@ function rowsProcesses() {
 
 function rowsLocks() {
   const defs = [
-    [12055, "app / api-worker", "Lock:relation", "public.orders", 412_880_000],
-    [12107, "app / api-worker", "Lock:relation", "public.orders", 388_220_000],
-    [12120, "app / api-worker", "Lock:tuple", "public.orders", 204_440_000],
-    [12133, "etl / loader", "Lock:relation", "public.orders", 188_884_000],
-    [12146, "app / api-worker", "Lock:relation", "public.orders", 142_220_000],
-    [12159, "app / reports", "Lock:relation", "public.orders", 98_440_000],
-    [12172, "app / api-worker", "Lock:transactionid", null, 64_884_000],
-    [12185, "etl / reconciler", "Lock:relation", "public.sessions", 42_220_000],
-    [12198, "app / api-worker", "Lock:tuple", "public.orders", 18_884_000],
-    [12211, "app / api-worker", "Lock:relation", "public.job_queue", 4_220_000],
+    [
+      12055,
+      11991,
+      "app / api-worker",
+      "Lock:relation",
+      "public.orders",
+      412_880_000,
+    ],
+    [
+      12107,
+      12055,
+      "app / api-worker",
+      "Lock:relation",
+      "public.orders",
+      388_220_000,
+    ],
+    [
+      12120,
+      12055,
+      "app / api-worker",
+      "Lock:tuple",
+      "public.orders",
+      204_440_000,
+    ],
+    [
+      12133,
+      12107,
+      "etl / loader",
+      "Lock:relation",
+      "public.orders",
+      188_884_000,
+    ],
+    [
+      12146,
+      12107,
+      "app / api-worker",
+      "Lock:relation",
+      "public.orders",
+      142_220_000,
+    ],
+    [
+      12159,
+      12120,
+      "app / reports",
+      "Lock:relation",
+      "public.orders",
+      98_440_000,
+    ],
+    [12172, 12120, "app / api-worker", "Lock:transactionid", null, 64_884_000],
+    [
+      12185,
+      12133,
+      "etl / reconciler",
+      "Lock:relation",
+      "public.sessions",
+      42_220_000,
+    ],
+    [
+      12198,
+      12133,
+      "app / api-worker",
+      "Lock:tuple",
+      "public.orders",
+      18_884_000,
+    ],
+    [
+      12211,
+      12146,
+      "app / api-worker",
+      "Lock:relation",
+      "public.job_queue",
+      4_220_000,
+    ],
   ];
-  return defs.map(([pid, ua, lock, target, waitUs], i) => {
+  return defs.map(([pid, blocker, ua, lock, target, waitUs], i) => {
     const cls =
       waitUs > 120_000_000
         ? [
@@ -926,8 +1258,14 @@ function rowsLocks() {
       label: `${ua} on ${target ?? "xid"}`,
       data: {
         pid,
+        depth: i === 0 ? 1 : 2,
+        root_pid: 11991,
+        blocked_by: String(blocker),
         user_application: ua,
         lock,
+        granted: false,
+        lock_mode: "ShareLock",
+        lock_type: target === null ? "transactionid" : "relation",
         target,
         wait_age_us: waitUs,
         query: "UPDATE orders SET status=$1 WHERE id=$2",
@@ -1093,6 +1431,84 @@ function compareCells(a, b, order) {
   return order === "asc" ? cmp : -cmp;
 }
 
+function splitFilterTerms(raw) {
+  const terms = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  for (const character of raw.trim()) {
+    if (character === " " && !quoted) {
+      if (current !== "") terms.push(current);
+      current = "";
+      continue;
+    }
+    current += character;
+    if (escaped) escaped = false;
+    else if (quoted && character === "\\") escaped = true;
+    else if (character === '"') quoted = !quoted;
+  }
+  if (current !== "") terms.push(current);
+  return terms;
+}
+
+function splitFilterField(raw) {
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
+    if (escaped) escaped = false;
+    else if (quoted && character === "\\") escaped = true;
+    else if (character === '"') quoted = !quoted;
+    else if (character === "=" && !quoted) {
+      return [raw.slice(0, index), raw.slice(index + 1)];
+    }
+  }
+  return [null, raw];
+}
+
+function globPattern(raw) {
+  const quoted = raw.startsWith('"') && raw.endsWith('"');
+  const source = quoted ? raw.slice(1, -1) : raw;
+  let pattern = "";
+  let escaped = false;
+  for (const character of source) {
+    if (escaped) {
+      pattern += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      escaped = false;
+    } else if (quoted && character === "\\") escaped = true;
+    else if (character === "*") pattern += ".*";
+    else if (character === "?") pattern += ".";
+    else pattern += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${pattern}$`, "iu");
+}
+
+function filterRows(rows, view, raw) {
+  const visibleColumns = view.columns.filter((column) => !column.lazy);
+  const terms = splitFilterTerms(raw).map((term) => {
+    const [field, value] = splitFilterField(term);
+    return { field, pattern: globPattern(value) };
+  });
+  return rows.filter((row) =>
+    terms.every(({ field, pattern }) => {
+      if (field !== null) {
+        const column = visibleColumns.find(
+          (candidate) => candidate.code === field,
+        );
+        return (
+          column !== undefined && pattern.test(String(row.data[field] ?? ""))
+        );
+      }
+      return [
+        row.label,
+        ...visibleColumns.map((column) => row.data[column.code]),
+      ]
+        .filter((value) => value !== null && value !== undefined)
+        .some((value) => pattern.test(String(value)));
+    }),
+  );
+}
+
 function frameResponse(viewCode, params) {
   const view = catalog.views.find((v) => v.code === viewCode);
   if (view === undefined) return null;
@@ -1100,19 +1516,27 @@ function frameResponse(viewCode, params) {
   const generate = ROW_GENERATORS[viewCode] ?? (() => []);
   let rows = generate();
 
-  // `q`: minimal substring filter over the row payload.
+  // Mirror the production frame filter: ANDed full-value globs over the row
+  // label and non-lazy columns. Lazy SQL is intentionally absent.
   const q = params.get("q");
   if (q !== null && q !== "") {
-    const needle = q.toLowerCase();
-    rows = rows.filter((r) =>
-      JSON.stringify(r.data).toLowerCase().includes(needle),
-    );
+    rows = filterRows(rows, view, q);
   }
   const matched = rows.length;
 
-  // Stable order: requested sort column first, entity as the tie-break.
-  const sort = params.get("sort");
-  const order = params.get("order") === "asc" ? "asc" : "desc";
+  const presetParam = params.get("preset");
+  const preset = presetParam
+    ? view.presets.find((candidate) => candidate.code === presetParam)
+    : view.presets[0];
+  // Explicit sort wins; otherwise the selected preset owns the ranking.
+  const explicitSort = params.get("sort");
+  const sort = explicitSort ?? preset?.sort?.column ?? null;
+  const order =
+    explicitSort === null
+      ? (preset?.sort?.order ?? "desc")
+      : params.get("order") === "asc"
+        ? "asc"
+        : "desc";
   rows = [...rows].sort((ra, rb) => {
     const cmp = sort ? compareCells(ra.data[sort], rb.data[sort], order) : 0;
     return cmp !== 0 ? cmp : ra.entity.localeCompare(rb.entity);
@@ -1129,10 +1553,6 @@ function frameResponse(viewCode, params) {
 
   // Mirror the backend admission: a preset (default = first) selects the
   // frame columns, lazy columns never ride the frame.
-  const presetParam = params.get("preset");
-  const preset = presetParam
-    ? view.presets.find((p) => p.code === presetParam)
-    : view.presets[0];
   const frameColumns = (preset?.columns ?? view.columns.map((c) => c.code))
     .map((code) => view.columns.find((c) => c.code === code && !c.lazy))
     .filter((c) => c !== undefined);
@@ -1158,12 +1578,13 @@ function frameResponse(viewCode, params) {
     page: { matched, returned: pageRows.length, next },
     neighbors: {},
     quality: {
-      status: "complete",
+      status: viewCode === "statements" ? "partial" : "complete",
       snapshots: 42,
       gaps: [],
       gated: [],
       unavailable_revision: [],
-      resource_limited: [],
+      resource_limited:
+        viewCode === "statements" ? ["source_limit:1000/1453"] : [],
       active_tail: true,
     },
   };
@@ -1180,6 +1601,91 @@ function entityResponse(viewCode, entity, params) {
 
   const at = params.get("at");
   if (at !== null) {
+    const related = [];
+    if (params.get("include") === "related" && viewCode === "statements") {
+      const plan = rowsPlans().find(
+        (candidate) => candidate.data.queryid === row.data.queryid,
+      );
+      if (plan !== undefined) {
+        related.push({
+          view: "plans",
+          entity: plan.entity,
+          relation: "statement_plan",
+          provenance: {
+            kind: "best_effort",
+            method: "ossc_queryid_dbid_userid_attribution",
+            fields: ["queryid", "dbid", "userid"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "activity") {
+      const process = rowsProcesses().find(
+        (candidate) => candidate.data.pid === row.data.pid,
+      );
+      if (process !== undefined) {
+        related.push({
+          view: "processes",
+          entity: process.entity,
+          relation: "activity_process",
+          provenance: {
+            kind: "best_effort",
+            method: "same_snapshot_unique_pid",
+            fields: ["pid", "ts"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "tables") {
+      for (const vacuum of rowsVacuum().filter(
+        (candidate) => candidate.data.relation === row.data.relation,
+      )) {
+        related.push({
+          view: "vacuum",
+          entity: vacuum.entity,
+          relation: "table_active_vacuum",
+          provenance: {
+            kind: "temporal",
+            method: "same_snapshot_database_relation_oid",
+            fields: ["datid", "relid", "ts"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "indexes") {
+      const table = rowsTables().find(
+        (candidate) => candidate.data.relation === `public.${row.data.table}`,
+      );
+      if (table !== undefined) {
+        related.push({
+          view: "tables",
+          entity: table.entity,
+          relation: "index_table",
+          provenance: {
+            kind: "temporal",
+            method: "same_snapshot_database_relation_oid",
+            fields: ["datid", "relid", "ts"],
+          },
+        });
+      }
+    }
+    if (params.get("include") === "related" && viewCode === "vacuum") {
+      const table = rowsTables().find(
+        (candidate) => candidate.data.relation === row.data.relation,
+      );
+      if (table !== undefined) {
+        related.push({
+          view: "tables",
+          entity: table.entity,
+          relation: "vacuum_table",
+          provenance: {
+            kind: "temporal",
+            method: "same_snapshot_database_relation_oid",
+            fields: ["datid", "relid", "ts"],
+          },
+        });
+      }
+    }
     return {
       view: viewCode,
       entity,
@@ -1195,22 +1701,35 @@ function entityResponse(viewCode, entity, params) {
           reason: value === null ? "not_collected" : null,
         };
       }),
-      related: [],
+      related,
       quality: { status: "complete", gaps: [], gated: [] },
     };
   }
 
-  // History mode: follow the entity over the trailing hour in 5-minute steps.
-  const now = nowUs();
-  const columns = view.columns
-    .filter((c) => !c.lazy)
-    .slice(0, 5)
-    .map((c) => c.code);
+  // History mode follows the exact requested range and public non-lazy
+  // columns, mirroring the backend admission contract used by Entity Detail.
+  const from = Number(params.get("from"));
+  const to = Number(params.get("to"));
+  const requestedColumns = (params.get("columns") ?? "")
+    .split(",")
+    .filter(Boolean);
+  const availableColumns = new Set(
+    view.columns.filter((column) => !column.lazy).map((column) => column.code),
+  );
+  const columns = requestedColumns.filter((code) => availableColumns.has(code));
   const rand = mulberry32(hashCode(entity));
   const snapshots = [];
-  for (let i = 11; i >= 0; i--) {
+  const totalSamples = 12;
+  const pageSize = 4;
+  const pageIndex = Math.max(
+    0,
+    Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
+  );
+  const step = Math.max(1, Math.floor((to - from) / totalSamples));
+  for (let i = 0; i < pageSize; i++) {
+    const sampleIndex = pageIndex * pageSize + i;
     snapshots.push({
-      ts_us: String(now - i * 300 * US),
+      ts_us: String(from + sampleIndex * step),
       values: columns.map((code) => {
         const value = row.data[code] ?? null;
         if (typeof value === "number") return r2(value * (0.8 + rand() * 0.4));
@@ -1225,8 +1744,22 @@ function entityResponse(viewCode, entity, params) {
     mode: "history",
     columns,
     snapshots,
-    page: { next: null },
-    quality: { status: "complete", gaps: [], gated: [] },
+    page: { next: pageIndex < 2 ? `page-${pageIndex + 2}` : null },
+    quality:
+      pageIndex === 0
+        ? { status: "complete", gaps: [], gated: [] }
+        : pageIndex === 1
+          ? {
+              status: "partial",
+              gaps: [
+                {
+                  from_us: String(from + step),
+                  to_us: String(from + 2 * step),
+                },
+              ],
+              gated: [],
+            }
+          : { status: "partial", gaps: [], gated: ["os_process"] },
   };
 }
 
@@ -1523,5 +2056,11 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`demo stub: http://127.0.0.1:${PORT} (static: ${STATIC_DIR})`);
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("demo stub did not expose a TCP address");
+  }
+  console.log(
+    `demo stub: http://127.0.0.1:${address.port} (static: ${STATIC_DIR})`,
+  );
 });

@@ -50,6 +50,12 @@ function renderStrip(
     metric: string;
     onMetricChange: (m: string) => void;
     onSelectEntity: (e: string) => void;
+    selectedRange: { fromUs: string; toUs: string };
+    cursorUs: string | null;
+    hoverUs: string | null;
+    brushDraft: { fromUs: string; toUs: string } | null;
+    baselineUs: string | null;
+    buckets: number;
   }> = {},
 ) {
   vi.stubGlobal(
@@ -70,6 +76,12 @@ function renderStrip(
       metric={overrides.metric ?? "time"}
       from="0"
       to="4"
+      selectedRange={overrides.selectedRange}
+      cursorUs={overrides.cursorUs}
+      hoverUs={overrides.hoverUs}
+      brushDraft={overrides.brushDraft}
+      baselineUs={overrides.baselineUs}
+      buckets={overrides.buckets}
       onMetricChange={overrides.onMetricChange ?? (() => {})}
       onSelectEntity={overrides.onSelectEntity ?? (() => {})}
     />,
@@ -97,6 +109,25 @@ test("partial quality renders a warning badge", async () => {
   renderStrip();
   await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
   expect(screen.getByText(/partial/)).toBeDefined();
+});
+
+test("partial ranking exposes the unseen candidate bound", async () => {
+  const original = fixture.ranking;
+  fixture.ranking = { exact: false, unseen_upper: 17 };
+  renderStrip();
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  const ranking = screen.getByText("heatmap.ranking.partial");
+  expect(ranking.getAttribute("title")).toContain("17");
+  fixture.ranking = original;
+});
+
+test("forwards the requested dense bucket count", async () => {
+  renderStrip({ buckets: 96 });
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  const fetchMock = vi.mocked(fetch);
+  const request = fetchMock.mock.calls[0]?.[0];
+  const url = request instanceof Request ? request.url : String(request);
+  expect(url).toContain("buckets=96");
 });
 
 test("metric switcher lists only available metrics and reports changes", async () => {
@@ -136,4 +167,40 @@ test("partial chip tooltip lists localized quality reasons", async () => {
   expect(tip).toContain("heatmap.quality.gated");
   expect(tip).toContain("heatmap.quality.active_tail");
   fixture.quality = original;
+});
+
+test("shared time geometry aligns cursor, hover, brush, baseline and selected range on the bucket grid", async () => {
+  renderStrip({
+    selectedRange: { fromUs: "0", toUs: "4" },
+    cursorUs: "4",
+    hoverUs: "1",
+    brushDraft: { fromUs: "1", toUs: "3" },
+    baselineUs: "2",
+  });
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  expect(
+    screen.getByTestId("heatmap-time-overlay").style.insetInlineStart,
+  ).toBe("220px");
+  expect(screen.getByTestId("heatmap-selected-range").style.left).toBe("0%");
+  expect(screen.getByTestId("heatmap-selected-range").style.width).toBe("100%");
+  expect(screen.getByTestId("heatmap-cursor").style.left).toBe("100%");
+  expect(screen.getByTestId("heatmap-hover-cursor").style.left).toBe("25%");
+  expect(screen.getByTestId("heatmap-baseline").style.left).toBe("50%");
+  expect(screen.getByTestId("heatmap-brush-draft").style.left).toBe("25%");
+  expect(screen.getByTestId("heatmap-brush-draft").style.width).toBe("50%");
+});
+
+test("out-of-window point markers are omitted while range overlays clip to the API grid", async () => {
+  renderStrip({
+    cursorUs: "9",
+    hoverUs: "invalid",
+    baselineUs: "-2",
+    brushDraft: { fromUs: "-2", toUs: "2" },
+  });
+  await waitFor(() => expect(screen.getByText("alpha")).toBeDefined());
+  expect(screen.queryByTestId("heatmap-cursor")).toBeNull();
+  expect(screen.queryByTestId("heatmap-baseline")).toBeNull();
+  expect(screen.queryByTestId("heatmap-hover-cursor")).toBeNull();
+  expect(screen.getByTestId("heatmap-brush-draft").style.left).toBe("0%");
+  expect(screen.getByTestId("heatmap-brush-draft").style.width).toBe("50%");
 });

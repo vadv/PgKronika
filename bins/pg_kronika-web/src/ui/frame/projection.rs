@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 
-use kronika_analytics::web_projection::WebView;
+use kronika_analytics::web_projection::{WebView, web_view_by_name};
 use kronika_reader::{
     Gap, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SealedQuerySession, SectionPage,
     SnapshotNeighbors, Value, WebIndexReadError, logical_section,
@@ -596,6 +596,10 @@ pub(crate) fn project_entity_at(
         source,
         resolved.current_descriptor.as_ref(),
     ) {
+        (true, "activity", Some((_section, row)), _) => activity_process_relations(row, &input)?,
+        (true, "tables" | "indexes" | "vacuum", Some((_section, row)), _) => {
+            object_relations(view.name, row, &input)?
+        }
         (true, "statements", Some((_section, row)), Some(descriptor)) => {
             statement_plan_relations(snapshot, descriptor, input.snapshot_ts_us, row, limits)?
         }
@@ -667,8 +671,7 @@ fn statement_plan_relations(
     else {
         return Ok(Vec::new());
     };
-    let plan_view = kronika_analytics::web_projection::web_view_by_name("plans")
-        .ok_or(ProjectionError::MissingCatalogView)?;
+    let plan_view = web_view_by_name("plans").ok_or(ProjectionError::MissingCatalogView)?;
     let mut query = SealedQuerySession::new(
         snapshot,
         QueryLimits::with_bytes(limits.rows, limits.cells, limits.bytes),
@@ -1245,6 +1248,109 @@ fn activity_process_candidate<'a>(
     candidates.next().is_none().then_some(candidate)
 }
 
+pub(crate) fn activity_process_relations(
+    activity: &OutRow,
+    input: &ProjectionInput,
+) -> Result<Vec<ProjectedRelation>, ProjectionError> {
+    let Some(process) = activity_process_candidate(activity, &input.current, input.snapshot_ts_us)
+    else {
+        return Ok(Vec::new());
+    };
+    let process_view = web_view_by_name("processes").ok_or(ProjectionError::MissingCatalogView)?;
+    Ok(vec![ProjectedRelation {
+        relation: "activity_process",
+        view: "processes",
+        entity: entity_for(process_view, "os_process", process, input.snapshot_ts_us)?,
+        kind: RelationKind::BestEffort,
+        method: "same_snapshot_unique_pid",
+        fields: vec!["pid", "ts"],
+    }])
+}
+
+fn same_snapshot_object(source: &OutRow, candidate: &OutRow, snapshot_ts_us: i64) -> bool {
+    timestamp(candidate, "ts").ok().flatten() == Some(snapshot_ts_us)
+        && value(candidate, "datid") == value(source, "datid")
+        && value(candidate, "relid") == value(source, "relid")
+        && value(source, "datid").is_some_and(|value| *value != Value::Null)
+        && value(source, "relid").is_some_and(|value| *value != Value::Null)
+}
+
+fn unique_same_snapshot_object<'a>(
+    source: &OutRow,
+    candidates: impl Iterator<Item = &'a OutRow>,
+    snapshot_ts_us: i64,
+) -> Option<&'a OutRow> {
+    let mut matches =
+        candidates.filter(|candidate| same_snapshot_object(source, candidate, snapshot_ts_us));
+    let candidate = matches.next()?;
+    matches.next().is_none().then_some(candidate)
+}
+
+/// Resolve only object relations proven inside one database at one snapshot.
+///
+/// `PostgreSQL` relation OIDs are database-local and may be reused over time, so
+/// this helper deliberately refuses name-only and cross-snapshot association.
+pub(crate) fn object_relations(
+    source_view: &str,
+    source: &OutRow,
+    input: &ProjectionInput,
+) -> Result<Vec<ProjectedRelation>, ProjectionError> {
+    let (relation, target_view, target_section, candidates, cardinality_many) = match source_view {
+        "tables" => (
+            "table_active_vacuum",
+            "vacuum",
+            "pg_stat_progress_vacuum",
+            input.current.get("pg_stat_progress_vacuum"),
+            true,
+        ),
+        "indexes" => (
+            "index_table",
+            "tables",
+            "pg_stat_user_tables",
+            input.current.get("pg_stat_user_tables"),
+            false,
+        ),
+        "vacuum" => (
+            "vacuum_table",
+            "tables",
+            "pg_stat_user_tables",
+            input.current.get("pg_stat_user_tables"),
+            false,
+        ),
+        _ => return Ok(Vec::new()),
+    };
+    let Some(candidates) = candidates else {
+        return Ok(Vec::new());
+    };
+    let target = web_view_by_name(target_view).ok_or(ProjectionError::MissingCatalogView)?;
+    let selected = if cardinality_many {
+        candidates
+            .iter()
+            .filter(|candidate| same_snapshot_object(source, candidate, input.snapshot_ts_us))
+            .collect::<Vec<_>>()
+    } else {
+        unique_same_snapshot_object(source, candidates.iter(), input.snapshot_ts_us)
+            .into_iter()
+            .collect()
+    };
+    let mut relations = selected
+        .into_iter()
+        .map(|candidate| {
+            Ok(ProjectedRelation {
+                relation,
+                view: target_view,
+                entity: entity_for(target, target_section, candidate, input.snapshot_ts_us)?,
+                kind: RelationKind::Temporal,
+                method: "same_snapshot_database_relation_oid",
+                fields: vec!["datid", "relid", "ts"],
+            })
+        })
+        .collect::<Result<Vec<_>, ProjectionError>>()?;
+    relations.sort_by(|left, right| left.entity.cmp(&right.entity));
+    relations.dedup_by(|left, right| left.entity == right.entity);
+    Ok(relations)
+}
+
 fn activity_process_predecessor<'a>(
     current: &OutRow,
     sections: &'a BTreeMap<String, Vec<OutRow>>,
@@ -1347,7 +1453,13 @@ fn project_plans(
         let value = match column.code {
             "planid" => raw_frame(row, "planid", column.value_type),
             "plan" => raw_frame(row, "plan", column.value_type),
-            "queryid" => raw_frame(row, "queryid", column.value_type),
+            "queryid" => {
+                if value(row, "queryid").is_some_and(|value| *value != Value::Null) {
+                    raw_frame(row, "queryid", column.value_type)
+                } else {
+                    raw_frame(row, "queryid_stat_statements", column.value_type)
+                }
+            }
             "calls" => delta_frame(calls),
             "mean" => divide_delta(total, calls),
             "rows" => delta_frame(rows),

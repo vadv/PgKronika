@@ -1,43 +1,96 @@
 import { useQuery } from "@tanstack/react-query";
 import { apiGet } from "./client";
 
-export interface EntityArgs {
+export interface EntityPointArgs {
   view: string;
-  /** Typed entity token from a frame row. */
+  /** Typed entity token from a frame/search row. */
   entity: string;
-  /** Cursor timestamp (int64 µs, decimal string); omit for history mode. */
-  at?: string | null;
-  /** Ask the server for provenance-backed related entities (point mode). */
+  /** Cursor timestamp (int64 µs, decimal string). */
+  at: string;
+  /** Ask the server for provenance-backed related entities. */
   includeRelated?: boolean;
-  /** Opaque history continuation token from `page.next` (transient). */
-  cursor?: string | null;
 }
 
-export function useEntity(args: EntityArgs) {
+export interface EntityHistoryArgs {
+  view: string;
+  entity: string;
+  /** Bounded half-open history window, microseconds as decimal strings. */
+  from: string;
+  to: string;
+  columns: string[];
+  limit?: number;
+  /** Opaque history continuation token (transient). */
+  cursor?: string | null;
+  enabled?: boolean;
+}
+
+export function useEntityPoint(args: EntityPointArgs) {
   return useQuery({
     queryKey: [
-      "entity",
+      "entity-point",
       args.view,
       args.entity,
-      args.at ?? null,
+      args.at,
       args.includeRelated ?? false,
-      args.cursor ?? null,
     ],
-    // `at` travels through URL state as a decimal string; the wire
-    // parameter is int64 µs.
-    queryFn: () =>
-      apiGet("/v1/entity/{view}/{entity}", {
+    queryFn: async () => {
+      const response = await apiGet("/v1/entity/{view}/{entity}", {
         params: {
           path: { view: args.view, entity: args.entity },
           query: {
-            ...(args.at != null ? { at: Number(args.at) } : {}),
+            at: Number(args.at),
             ...(args.includeRelated ? { include: "related" } : {}),
-            ...(args.cursor != null ? { cursor: args.cursor } : {}),
           },
         },
-      }),
-    // A dock without a selected entity must not fire a request with an
-    // empty path parameter.
+      });
+      if (!("fields" in response)) {
+        throw new Error("entity point endpoint returned history mode");
+      }
+      return response;
+    },
     enabled: args.entity !== "",
   });
 }
+
+export function useEntityHistory(args: EntityHistoryArgs) {
+  return useQuery({
+    queryKey: [
+      "entity-history",
+      args.view,
+      args.entity,
+      args.from,
+      args.to,
+      args.columns.join(","),
+      args.limit ?? null,
+      args.cursor ?? null,
+    ],
+    queryFn: async () => {
+      const response = await apiGet("/v1/entity/{view}/{entity}", {
+        params: {
+          path: { view: args.view, entity: args.entity },
+          query: {
+            from: Number(args.from),
+            to: Number(args.to),
+            columns: args.columns.join(","),
+            ...(args.limit !== undefined ? { limit: args.limit } : {}),
+            ...(args.cursor != null ? { cursor: args.cursor } : {}),
+          },
+        },
+      });
+      if (!("snapshots" in response)) {
+        throw new Error("entity history endpoint returned point mode");
+      }
+      return response;
+    },
+    enabled:
+      args.enabled !== false &&
+      args.entity !== "" &&
+      args.columns.length > 0 &&
+      args.from !== "" &&
+      args.to !== "",
+  });
+}
+
+/** Compatibility name for point-only callers while the universal detail is
+ * rolled through every screen. Its type no longer permits a history shape. */
+export const useEntity = useEntityPoint;
