@@ -19,6 +19,7 @@ export interface HeaderProps {
   dataHealthOpen: boolean;
   onToggleDataHealth: () => void;
   onOpenIncidents: () => void;
+  onOpenSearch?: () => void;
 }
 
 type ContextQuality = ContextResponse["quality"];
@@ -289,6 +290,16 @@ export function Header(props: HeaderProps) {
       )}
 
       <span style={{ flex: 1 }} />
+      {props.onOpenSearch !== undefined && (
+        <button
+          type="button"
+          aria-label={t("search.open")}
+          onClick={props.onOpenSearch}
+          style={{ ...button, fontFamily: "var(--mono-font)" }}
+        >
+          ⌕ <kbd>/</kbd>
+        </button>
+      )}
       <Clock />
       <CopyLinkButton url={props.shareUrl} />
     </Root>
