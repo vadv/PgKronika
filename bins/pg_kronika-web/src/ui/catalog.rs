@@ -2063,35 +2063,51 @@ fn events_view() -> ViewSpec {
                 None,
             ),
         ],
-        vec![
-            // Human columns in presets: the raw severity/category integers
-            // stay available through `columns=` but never headline a table.
-            preset(
-                "errors",
-                &["time", "severity_code", "category_code", "message"],
-                "time",
-                "desc",
-            ),
-            preset(
-                "checkpoints",
-                &["time", "category_code", "duration", "message"],
-                "time",
-                "desc",
-            ),
-            preset(
-                "vacuum",
-                &["time", "category_code", "duration", "message"],
-                "time",
-                "desc",
-            ),
-            preset(
-                "slow",
-                &["time", "category_code", "duration", "message"],
-                "duration",
-                "desc",
-            ),
-        ],
+        events_presets(),
     )
+}
+
+fn events_presets() -> Vec<PresetSpec> {
+    // Human columns in presets: the raw severity/category integers stay
+    // available through `columns=` but never headline a table.
+    vec![
+        preset(
+            "timeline",
+            &["time", "severity_code", "category_code", "duration"],
+            "time",
+            "desc",
+        ),
+        preset(
+            "errors",
+            &["time", "severity_code", "category_code", "message"],
+            "time",
+            "desc",
+        ),
+        preset(
+            "checkpoints",
+            &["time", "category_code", "duration", "message"],
+            "time",
+            "desc",
+        ),
+        preset(
+            "vacuum",
+            &["time", "category_code", "duration", "message"],
+            "time",
+            "desc",
+        ),
+        preset(
+            "slow",
+            &["time", "category_code", "duration", "message"],
+            "duration",
+            "desc",
+        ),
+        preset(
+            "collector_health",
+            &["time", "severity_code", "category_code", "message"],
+            "time",
+            "desc",
+        ),
+    ]
 }
 
 #[cfg(test)]
