@@ -381,3 +381,45 @@ test("stops lock continuation pagination on error and exposes an explicit retry"
   retry.click();
   await waitFor(() => expect(continuationAttempts).toBe(2));
 });
+
+test("retries the initial lock page instead of requesting a continuation", async () => {
+  let initialAttempts = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.pathname === "/v1/timeline/heatmap")
+        return Promise.resolve(json(heatmap));
+      if (url.pathname === "/v1/frame/locks") {
+        initialAttempts += 1;
+        if (initialAttempts === 1) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ code: "initial_failed" }), {
+              status: 500,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }
+        return Promise.resolve(json(locksEdgeFrame));
+      }
+      return Promise.resolve(json(activityFrame));
+    }),
+  );
+  renderWorkspace("waits_locks");
+
+  const retry = await screen.findByRole("button", {
+    name: /table\.error.*table\.retry/i,
+  });
+  expect(initialAttempts).toBe(1);
+  retry.click();
+
+  expect(
+    await screen.findByRole("button", { name: /18422.*19041/ }),
+  ).toBeDefined();
+  expect(initialAttempts).toBe(2);
+  const lockCalls = vi
+    .mocked(fetch)
+    .mock.calls.map(([input]) => requestUrl(input))
+    .filter((url) => url.pathname === "/v1/frame/locks");
+  expect(lockCalls.every((url) => !url.searchParams.has("cursor"))).toBe(true);
+});

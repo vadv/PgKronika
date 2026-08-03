@@ -158,6 +158,13 @@ function ActivityLockEvidence(props: {
     edges.length === 0 &&
     !lockError &&
     (frame.isPending || hasNextPage || isFetchingNextPage);
+  const retryLockEvidence = () => {
+    if (frame.isFetchNextPageError) {
+      void fetchNextPage();
+      return;
+    }
+    void frame.refetch();
+  };
 
   return (
     <section
@@ -180,7 +187,7 @@ function ActivityLockEvidence(props: {
           <button
             type="button"
             className="activity-lock-evidence__state activity-lock-evidence__state--error activity-lock-evidence__retry"
-            onClick={() => void fetchNextPage()}
+            onClick={retryLockEvidence}
           >
             {t("table.error")} · {t("table.retry")}
           </button>
