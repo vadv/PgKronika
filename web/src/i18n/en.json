@@ -33,6 +33,7 @@
   "search.placeholder": "pid:18422 · queryid:… · rel:public.orders",
   "search.serverScope": "server snapshot; lazy SQL excluded",
   "search.emptyPrompt": "Search every materialized evidence projection",
+  "search.noMatches": "No server-side matches in this time window",
   "search.searching": "searching…",
   "search.count": "{{shown}} / {{matched}}",
   "search.loadMore": "load next server page",

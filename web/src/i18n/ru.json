@@ -33,6 +33,7 @@
   "search.placeholder": "pid:18422 · queryid:… · rel:public.orders",
   "search.serverScope": "снимок на сервере; lazy SQL исключён",
   "search.emptyPrompt": "Поиск по всем материализованным проекциям свидетельств",
+  "search.noMatches": "В этом временном окне серверных совпадений нет",
   "search.searching": "поиск…",
   "search.count": "{{shown}} / {{matched}}",
   "search.loadMore": "загрузить следующую страницу с сервера",

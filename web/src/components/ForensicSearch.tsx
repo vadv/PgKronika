@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ViewSpec } from "../api/types";
 import {
@@ -44,11 +44,16 @@ function errorText(
 }
 
 function SearchResultGroup(props: {
+  groupKey: string;
   plan: SearchGroupPlan;
   at: string;
   span: number;
   onSelect: (view: string, entity: string) => void;
   onResultKeyDown: React.KeyboardEventHandler<HTMLButtonElement>;
+  onStatus: (
+    key: string,
+    status: { state: "pending" | "success" | "error"; matched: number },
+  ) => void;
 }) {
   const { t } = useTranslation();
   const search = useForensicSearchGroup({
@@ -58,6 +63,16 @@ function SearchResultGroup(props: {
     q: props.plan.q,
     enabled: true,
   });
+  const status = search.isPending
+    ? "pending"
+    : search.isError
+      ? "error"
+      : "success";
+  const reportStatus = props.onStatus;
+  const statusKey = props.groupKey;
+  useEffect(() => {
+    reportStatus(statusKey, { state: status, matched: search.matched });
+  }, [reportStatus, search.matched, status, statusKey]);
   if (!search.isPending && !search.isError && search.matched === 0) return null;
   return (
     <section
@@ -211,6 +226,9 @@ export function ForensicSearch(props: ForensicSearchProps) {
   const { t } = useTranslation();
   const [draft, setDraft] = useState("");
   const [committed, setCommitted] = useState("");
+  const [groupStatus, setGroupStatus] = useState<
+    Record<string, { state: "pending" | "success" | "error"; matched: number }>
+  >({});
   const inputRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLFormElement>(null);
   const restoreFocus = useRef<HTMLElement | null>(null);
@@ -230,11 +248,36 @@ export function ForensicSearch(props: ForensicSearchProps) {
     return () => window.clearTimeout(timeout);
   }, [draft]);
 
+  const onGroupStatus = useCallback(
+    (
+      key: string,
+      status: { state: "pending" | "success" | "error"; matched: number },
+    ) => {
+      setGroupStatus((previous) => {
+        const current = previous[key];
+        if (
+          current?.state === status.state &&
+          current.matched === status.matched
+        ) {
+          return previous;
+        }
+        return { ...previous, [key]: status };
+      });
+    },
+    [],
+  );
+
   if (!props.open) return null;
   const visiblePlan = compileForensicSearch(draft.trim(), props.views);
   const serverPlan = compileForensicSearch(committed, props.views);
   const groups = committed === draft.trim() ? serverPlan.groups : [];
-
+  const groupKeys = groups.map((plan) => `${plan.view.code}:${plan.q}`);
+  const statuses = groupKeys.map((key) => groupStatus[key]);
+  const noMatches =
+    statuses.length > 0 &&
+    statuses.every(
+      (status) => status?.state === "success" && status.matched === 0,
+    );
   const resultButtons = () =>
     Array.from(
       dialogRef.current?.querySelectorAll<HTMLButtonElement>(
@@ -391,13 +434,30 @@ export function ForensicSearch(props: ForensicSearchProps) {
           {groups.map((plan) => (
             <SearchResultGroup
               key={`${plan.view.code}:${plan.q}`}
+              groupKey={`${plan.view.code}:${plan.q}`}
               plan={plan}
               at={props.at}
               span={props.span}
               onSelect={props.onSelect}
               onResultKeyDown={onKeyDown}
+              onStatus={onGroupStatus}
             />
           ))}
+          {noMatches && (
+            <div
+              role="status"
+              style={{
+                padding: "var(--space-5)",
+                color: "var(--fg-dim)",
+                fontFamily: "var(--ui-font)",
+                textAlign: "center",
+              }}
+            >
+              {t("search.noMatches", {
+                defaultValue: "No server-side matches in this time window",
+              })}
+            </div>
+          )}
         </div>
       </form>
     </div>

@@ -63,6 +63,26 @@ function stubResult() {
   );
 }
 
+function stubNoResults() {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify(
+          makeFrameResponse({
+            view: "activity",
+            snapshot_ts_us: "1722400000000000",
+            columns: [makeFrameColumn({ code: "pid", type: "i64" })],
+            rows: [],
+            page: { matched: 0, returned: 0, next: null },
+          }),
+        ),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ),
+  );
+}
+
 test("closed search renders no dialog", () => {
   const { container } = render(
     <ForensicSearch
@@ -124,4 +144,25 @@ test("shows unsupported evidence keys and Escape closes", () => {
   expect(screen.getByRole("alert").textContent).toContain("device");
   fireEvent.keyDown(input, { key: "Escape" });
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("shows an honest aggregate empty state after every group settles", async () => {
+  stubNoResults();
+  render(
+    <ForensicSearch
+      open
+      views={views}
+      at="1722400000000000"
+      span={3600}
+      onClose={() => {}}
+      onSelect={() => {}}
+    />,
+    { wrapper },
+  );
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "pid:99999" },
+  });
+  expect(
+    await screen.findByText("No server-side matches in this time window"),
+  ).toBeDefined();
 });
