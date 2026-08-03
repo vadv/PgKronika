@@ -222,6 +222,94 @@ impl ProjectionInput {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ActivityProcessEvidence<'a> {
+    Unique(&'a OutRow),
+    Ambiguous,
+}
+
+impl<'a> ActivityProcessEvidence<'a> {
+    const fn unique(self) -> Option<&'a OutRow> {
+        match self {
+            Self::Unique(row) => Some(row),
+            Self::Ambiguous => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActivityProcessIndex<'a> {
+    current: BTreeMap<u64, ActivityProcessEvidence<'a>>,
+    previous: BTreeMap<(u64, i64), ActivityProcessEvidence<'a>>,
+}
+
+impl<'a> ActivityProcessIndex<'a> {
+    fn from_input(input: &'a ProjectionInput) -> Self {
+        let mut index = Self::default();
+        for process in input.current.get("os_process").into_iter().flatten() {
+            if timestamp(process, "ts").ok().flatten() != Some(input.snapshot_ts_us) {
+                continue;
+            }
+            let Some(pid) = process_pid_key(process) else {
+                continue;
+            };
+            match index.current.entry(pid) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(ActivityProcessEvidence::Unique(process));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    slot.insert(ActivityProcessEvidence::Ambiguous);
+                }
+            }
+        }
+        let Some(previous_ts_us) = input.predecessor_ts_us else {
+            return index;
+        };
+        for process in input.previous.get("os_process").into_iter().flatten() {
+            if timestamp(process, "ts").ok().flatten() != Some(previous_ts_us) {
+                continue;
+            }
+            let (Some(pid), Some(starttime)) = (
+                process_pid_key(process),
+                timestamp(process, "starttime").ok().flatten(),
+            ) else {
+                continue;
+            };
+            match index.previous.entry((pid, starttime)) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(ActivityProcessEvidence::Unique(process));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    slot.insert(ActivityProcessEvidence::Ambiguous);
+                }
+            }
+        }
+        index
+    }
+
+    fn current_candidate(&self, activity: &OutRow) -> Option<&'a OutRow> {
+        self.current
+            .get(&process_pid_key(activity)?)
+            .copied()
+            .and_then(ActivityProcessEvidence::unique)
+    }
+
+    fn predecessor(&self, current: &OutRow) -> Option<&'a OutRow> {
+        let key = (
+            process_pid_key(current)?,
+            timestamp(current, "starttime").ok().flatten()?,
+        );
+        self.previous
+            .get(&key)
+            .copied()
+            .and_then(ActivityProcessEvidence::unique)
+    }
+}
+
+fn process_pid_key(row: &OutRow) -> Option<u64> {
+    finite_number(row, "pid").ok().flatten().map(f64::to_bits)
+}
+
 fn continuity_for(view: &WebView, input: &ProjectionInput) -> ContinuityVerdict {
     if !input.gaps.is_empty() {
         return ContinuityVerdict::Gap;
@@ -330,6 +418,48 @@ mod continuity_tests {
             continuity_for(statements, &reset_input(None, Some(15), None, vec![gap])),
             ContinuityVerdict::Gap
         );
+    }
+}
+
+#[cfg(test)]
+mod activity_process_index_tests {
+    use kronika_reader::{OutRow, Value};
+
+    use super::{ActivityProcessIndex, ProjectionInput, finite_number};
+
+    fn row(values: &[(&str, Value)]) -> OutRow {
+        values
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_index_preserves_unique_and_ambiguous_pid_evidence() {
+        let unique_activity = row(&[("pid", Value::I64(7))]);
+        let ambiguous_activity = row(&[("pid", Value::I64(8))]);
+        let mut input = ProjectionInput::empty(20);
+        input.push(
+            "os_process",
+            row(&[("ts", Value::Ts(20)), ("pid", Value::I64(7))]),
+        );
+        for starttime in [1, 2] {
+            input.push(
+                "os_process",
+                row(&[
+                    ("ts", Value::Ts(20)),
+                    ("pid", Value::I64(8)),
+                    ("starttime", Value::Ts(starttime)),
+                ]),
+            );
+        }
+
+        let index = ActivityProcessIndex::from_input(&input);
+        let unique = index
+            .current_candidate(&unique_activity)
+            .expect("unique PID candidate");
+        assert_eq!(finite_number(unique, "pid").expect("pid"), Some(7.0));
+        assert!(index.current_candidate(&ambiguous_activity).is_none());
     }
 }
 
@@ -539,6 +669,8 @@ pub(crate) fn project_entity_at(
         .max_by_key(|(at, _row)| *at)
         .is_some_and(|(_at, row)| text(row, "setting") == Some("on"));
     let continuity = continuity_for(view, &input);
+    let activity_process_index =
+        (view.name == "activity").then(|| ActivityProcessIndex::from_input(&input));
     let mut source = None;
     let mut projected = None;
     for section in primary_sections {
@@ -559,6 +691,7 @@ pub(crate) fn project_entity_at(
                 row,
                 predecessor,
                 &input,
+                activity_process_index.as_ref(),
                 track_planning,
                 continuity,
             )?);
@@ -963,6 +1096,8 @@ pub(crate) fn project_input(
     }
     let track_planning = track_planning_value.is_some_and(|(_timestamp, setting)| setting == "on");
     let continuity = continuity_for(request.view, &input);
+    let activity_process_index =
+        (request.view.name == "activity").then(|| ActivityProcessIndex::from_input(&input));
     let mut rows = Vec::new();
     for section in primary_sections {
         for row in input.current.get(*section).into_iter().flatten() {
@@ -979,6 +1114,7 @@ pub(crate) fn project_input(
                 row,
                 predecessor,
                 &input,
+                activity_process_index.as_ref(),
                 track_planning,
                 continuity,
             )?;
@@ -1049,11 +1185,20 @@ fn project_view(
     row: &OutRow,
     previous: Option<&OutRow>,
     input: &ProjectionInput,
+    activity_process_index: Option<&ActivityProcessIndex<'_>>,
     track_planning: bool,
     continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     match view.name {
-        "activity" => project_activity(view, columns, section, row, previous, input, continuity),
+        "activity" => project_activity(
+            view,
+            columns,
+            section,
+            row,
+            input,
+            activity_process_index.ok_or(ProjectionError::MissingCatalogView)?,
+            continuity,
+        ),
         "statements" => project_statements(
             view,
             columns,
@@ -1128,8 +1273,8 @@ fn project_activity(
     columns: &[&ColumnSpec],
     section: &str,
     row: &OutRow,
-    _previous: Option<&OutRow>,
     input: &ProjectionInput,
+    process_index: &ActivityProcessIndex<'_>,
     continuity: ContinuityVerdict,
 ) -> Result<ProjectedRow, ProjectionError> {
     let mut out = row_shell(view, section, row, input.snapshot_ts_us)?;
@@ -1139,11 +1284,17 @@ fn project_activity(
     let needs_process = columns.iter().any(|column| {
         matches!(
             column.code,
-            "process_link" | "cpu" | "read_bytes_per_second" | "write_bytes_per_second"
+            "process_link"
+                | "cpu"
+                | "rss"
+                | "threads"
+                | "read_bytes_per_second"
+                | "write_bytes_per_second"
+                | "command"
         )
     });
     let current_process = if needs_process {
-        activity_process_candidate(row, &input.current, input.snapshot_ts_us)
+        process_index.current_candidate(row)
     } else {
         None
     };
@@ -1153,73 +1304,80 @@ fn project_activity(
             "cpu" | "read_bytes_per_second" | "write_bytes_per_second"
         )
     }) {
-        current_process.and_then(|current| {
-            input.predecessor_ts_us.and_then(|timestamp| {
-                activity_process_predecessor(current, &input.previous, timestamp)
-            })
-        })
+        current_process.and_then(|current| process_index.predecessor(current))
     } else {
         None
     };
     for column in columns {
-        let value = match column.code {
-            "pid" => raw_frame(row, "pid", column.value_type),
-            "user" => raw_frame(row, "usename", column.value_type),
-            "database" => raw_frame(row, "datname", column.value_type),
-            "application" => raw_frame(row, "application_name", column.value_type),
-            "backend_type" => raw_frame(row, "backend_type", column.value_type),
-            "state" => raw_frame(row, "state", column.value_type),
-            "wait_event" => joined(row, "wait_event_type", ":", "wait_event"),
-            "query" => raw_frame(row, "query", column.value_type),
-            "query_duration_us" => duration_us(input.snapshot_ts_us, row, "query_start")?,
-            "transaction_duration_us" => duration_us(input.snapshot_ts_us, row, "xact_start")?,
-            "process_link" => current_process.map_or(FrameValue::Null, |_process| {
-                FrameValue::String("best_effort".to_owned())
-            }),
-            "cpu" => current_process.map_or(FrameValue::Null, |current| {
-                tick_rate_sum(
-                    current,
-                    previous_process,
-                    &["utime", "stime"],
-                    input,
-                    continuity,
-                )
-            }),
-            "read_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
-                rate_sum(
-                    current,
-                    previous_process,
-                    &["read_bytes"],
-                    input,
-                    continuity,
-                )
-            }),
-            "write_bytes_per_second" => current_process.map_or(FrameValue::Null, |current| {
-                rate_sum(
-                    current,
-                    previous_process,
-                    &["write_bytes"],
-                    input,
-                    continuity,
-                )
-            }),
-            "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
-                .map_or(FrameValue::Null, |replica| {
-                    raw_frame(replica, "state", column.value_type)
-                }),
-            "sync_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
-                .map_or(FrameValue::Null, |replica| {
-                    raw_frame(replica, "sync_state", column.value_type)
-                }),
-            "replay_lag_us" => activity_replica(row, &input.current, input.snapshot_ts_us)
-                .map_or(FrameValue::Null, |replica| {
-                    raw_frame(replica, "replay_lag_us", column.value_type)
-                }),
-            _ => FrameValue::Null,
+        let value = if let Some(value) =
+            activity_process_value(column, current_process, previous_process, input, continuity)
+        {
+            value
+        } else {
+            match column.code {
+                "pid" => raw_frame(row, "pid", column.value_type),
+                "user" => raw_frame(row, "usename", column.value_type),
+                "database" => raw_frame(row, "datname", column.value_type),
+                "application" => raw_frame(row, "application_name", column.value_type),
+                "backend_type" => raw_frame(row, "backend_type", column.value_type),
+                "state" => raw_frame(row, "state", column.value_type),
+                "wait_event" => joined(row, "wait_event_type", ":", "wait_event"),
+                "query" => raw_frame(row, "query", column.value_type),
+                "queryid" => raw_frame(row, "query_id", column.value_type),
+                "query_duration_us" => duration_us(input.snapshot_ts_us, row, "query_start")?,
+                "transaction_duration_us" => duration_us(input.snapshot_ts_us, row, "xact_start")?,
+                "replication_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                    .map_or(FrameValue::Null, |replica| {
+                        raw_frame(replica, "state", column.value_type)
+                    }),
+                "sync_state" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                    .map_or(FrameValue::Null, |replica| {
+                        raw_frame(replica, "sync_state", column.value_type)
+                    }),
+                "replay_lag_us" => activity_replica(row, &input.current, input.snapshot_ts_us)
+                    .map_or(FrameValue::Null, |replica| {
+                        raw_frame(replica, "replay_lag_us", column.value_type)
+                    }),
+                _ => FrameValue::Null,
+            }
         };
         out.values.push((column.code, value));
     }
     Ok(out)
+}
+
+fn activity_process_value(
+    column: &ColumnSpec,
+    current: Option<&OutRow>,
+    previous: Option<&OutRow>,
+    input: &ProjectionInput,
+    continuity: ContinuityVerdict,
+) -> Option<FrameValue> {
+    let value = match column.code {
+        "process_link" => current.map_or(FrameValue::Null, |_process| {
+            FrameValue::String("best_effort".to_owned())
+        }),
+        "cpu" => current.map_or(FrameValue::Null, |row| {
+            tick_rate_sum(row, previous, &["utime", "stime"], input, continuity)
+        }),
+        "rss" => current.map_or(FrameValue::Null, |row| {
+            raw_frame(row, "rmem_kb", column.value_type)
+        }),
+        "threads" => current.map_or(FrameValue::Null, |row| {
+            raw_frame(row, "num_threads", column.value_type)
+        }),
+        "read_bytes_per_second" => current.map_or(FrameValue::Null, |row| {
+            rate_sum(row, previous, &["read_bytes"], input, continuity)
+        }),
+        "write_bytes_per_second" => current.map_or(FrameValue::Null, |row| {
+            rate_sum(row, previous, &["write_bytes"], input, continuity)
+        }),
+        "command" => current.map_or(FrameValue::Null, |row| {
+            raw_frame(row, "cmdline", column.value_type)
+        }),
+        _ => return None,
+    };
+    Some(value)
 }
 
 fn activity_replica<'a>(
@@ -1234,26 +1392,12 @@ fn activity_replica<'a>(
     })
 }
 
-fn activity_process_candidate<'a>(
-    activity: &OutRow,
-    sections: &'a BTreeMap<String, Vec<OutRow>>,
-    timestamp_us: i64,
-) -> Option<&'a OutRow> {
-    let pid = finite_number(activity, "pid").ok().flatten()?;
-    let mut candidates = sections.get("os_process")?.iter().filter(|process| {
-        timestamp(process, "ts").ok().flatten() == Some(timestamp_us)
-            && finite_number(process, "pid").ok().flatten() == Some(pid)
-    });
-    let candidate = candidates.next()?;
-    candidates.next().is_none().then_some(candidate)
-}
-
 pub(crate) fn activity_process_relations(
     activity: &OutRow,
     input: &ProjectionInput,
 ) -> Result<Vec<ProjectedRelation>, ProjectionError> {
-    let Some(process) = activity_process_candidate(activity, &input.current, input.snapshot_ts_us)
-    else {
+    let process_index = ActivityProcessIndex::from_input(input);
+    let Some(process) = process_index.current_candidate(activity) else {
         return Ok(Vec::new());
     };
     let process_view = web_view_by_name("processes").ok_or(ProjectionError::MissingCatalogView)?;
@@ -1349,20 +1493,6 @@ pub(crate) fn object_relations(
     relations.sort_by(|left, right| left.entity.cmp(&right.entity));
     relations.dedup_by(|left, right| left.entity == right.entity);
     Ok(relations)
-}
-
-fn activity_process_predecessor<'a>(
-    current: &OutRow,
-    sections: &'a BTreeMap<String, Vec<OutRow>>,
-    timestamp_us: i64,
-) -> Option<&'a OutRow> {
-    let pid = finite_number(current, "pid").ok().flatten()?;
-    let starttime = timestamp(current, "starttime").ok().flatten()?;
-    sections.get("os_process")?.iter().find(|process| {
-        timestamp(process, "ts").ok().flatten() == Some(timestamp_us)
-            && finite_number(process, "pid").ok().flatten() == Some(pid)
-            && timestamp(process, "starttime").ok().flatten() == Some(starttime)
-    })
 }
 
 #[allow(

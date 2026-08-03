@@ -69,8 +69,10 @@ export function TemporalBucketRow(props: {
   baselineUs: string | null;
   metricLabel: string;
   max?: number;
+  mode?: "range" | "point_samples" | "interval_estimates";
 }) {
   const { t } = useTranslation();
+  const mode = props.mode ?? "range";
   const values = Array.from(
     { length: props.bucketCount },
     (_, index) => props.row?.values[index] ?? null,
@@ -90,16 +92,41 @@ export function TemporalBucketRow(props: {
     props.gridFromUs,
     props.gridToUs,
   );
+  const availableLabel =
+    mode === "point_samples"
+      ? t("activity.matrix.pointRowLabel", {
+          entity: props.row?.label,
+          metric: props.metricLabel,
+        })
+      : mode === "interval_estimates"
+        ? t("activity.matrix.intervalRowLabel", {
+            entity: props.row?.label,
+            metric: props.metricLabel,
+          })
+        : `${props.row?.label} · ${props.metricLabel}`;
 
   return (
     <div
-      className="temporal-bucket-row"
-      data-testid="temporal-row"
+      className={`temporal-bucket-row temporal-bucket-row--${mode}`}
+      data-testid={
+        mode === "point_samples"
+          ? "activity-sample-row"
+          : mode === "interval_estimates"
+            ? "activity-interval-row"
+            : "temporal-row"
+      }
+      data-mode={mode}
       data-evidence={props.row === null ? "unavailable" : "available"}
       aria-label={
         props.row === null
-          ? t("statements.matrix.seriesUnavailable")
-          : `${props.row.label} · ${props.metricLabel}`
+          ? t(
+              mode === "point_samples" || mode === "interval_estimates"
+                ? mode === "interval_estimates"
+                  ? "activity.matrix.intervalUnavailable"
+                  : "activity.matrix.seriesUnavailable"
+                : "statements.matrix.seriesUnavailable",
+            )
+          : availableLabel
       }
       style={
         {
@@ -120,14 +147,29 @@ export function TemporalBucketRow(props: {
             className="temporal-bucket-row__bucket"
             data-testid="time-matrix-bucket"
             data-empty={value === null ? "true" : undefined}
-            title={t("statements.matrix.bucketValue", {
-              time,
-              metric: props.metricLabel,
-              value:
-                value === null
-                  ? t("spine.missing")
-                  : formatByUnit(value, props.row?.unit),
-            })}
+            data-observed={
+              mode === "point_samples" && value !== null ? "true" : undefined
+            }
+            data-derived={
+              mode === "interval_estimates" && value !== null
+                ? "true"
+                : undefined
+            }
+            title={t(
+              mode === "point_samples"
+                ? "activity.matrix.bucketValue"
+                : mode === "interval_estimates"
+                  ? "activity.matrix.intervalValue"
+                  : "statements.matrix.bucketValue",
+              {
+                time,
+                metric: props.metricLabel,
+                value:
+                  value === null
+                    ? t("spine.missing")
+                    : formatByUnit(value, props.row?.unit),
+              },
+            )}
             style={{
               background: heatColor(
                 value === null ? null : max > 0 ? value / max : 0,

@@ -705,7 +705,7 @@ fn frame_projection_covers_all_nine_views_and_omits_lazy_cells() {
 fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
     let request = FrameRequest::parse(
         "activity",
-        Some("at=20000000&columns=process_link,cpu,read_bytes_per_second,write_bytes_per_second"),
+        Some("at=20000000&columns=queryid,process_link,cpu,rss,threads,read_bytes_per_second,write_bytes_per_second,command"),
         &catalog(),
     )
     .expect("request");
@@ -716,6 +716,7 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
             ("ts", Value::Ts(20_000_000)),
             ("pid", Value::I64(7)),
             ("backend_start", Value::Ts(1_000_000)),
+            ("query_id", Value::I64(424_242)),
         ]),
     );
     input.push(
@@ -728,6 +729,9 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
             ("stime", Value::U64(50)),
             ("read_bytes", Value::U64(900)),
             ("write_bytes", Value::U64(500)),
+            ("rmem_kb", Value::I64(262_144)),
+            ("num_threads", Value::U64(8)),
+            ("cmdline", Value::Str("postgres: app erp_prod".to_owned())),
         ]),
     );
     input.push(
@@ -755,10 +759,57 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
     assert_eq!(
         frame.rows[0].cells,
         vec![
+            DtoFrameValue::Number(424_242.0),
             DtoFrameValue::String("best_effort".to_owned()),
             DtoFrameValue::Number(0.09),
+            DtoFrameValue::Number(262_144.0),
+            DtoFrameValue::Number(8.0),
             DtoFrameValue::Number(60.0),
             DtoFrameValue::Number(40.0),
+            DtoFrameValue::String("postgres: app erp_prod".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn activity_leaves_every_process_scalar_null_for_an_ambiguous_pid() {
+    let request = FrameRequest::parse(
+        "activity",
+        Some("at=20000000&columns=process_link,rss,threads,command"),
+        &catalog(),
+    )
+    .expect("request");
+    let mut input = ProjectionInput::single(
+        20_000_000,
+        "pg_stat_activity",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("backend_start", Value::Ts(1_000_000)),
+        ]),
+    );
+    for starttime in [2_000_000, 3_000_000] {
+        input.push(
+            "os_process",
+            out_row(&[
+                ("ts", Value::Ts(20_000_000)),
+                ("pid", Value::I64(7)),
+                ("starttime", Value::Ts(starttime)),
+                ("rmem_kb", Value::I64(262_144)),
+                ("num_threads", Value::U64(8)),
+                ("cmdline", Value::Str("postgres".to_owned())),
+            ]),
+        );
+    }
+
+    let frame = project_input(&request, &catalog(), input).expect("projection");
+    assert_eq!(
+        frame.rows[0].cells,
+        vec![
+            DtoFrameValue::Null,
+            DtoFrameValue::Null,
+            DtoFrameValue::Null,
+            DtoFrameValue::Null,
         ]
     );
 }

@@ -76,6 +76,61 @@ for (const view of catalog.views) {
 const activityCatalog = catalog.views.find((view) => view.code === "activity");
 if (activityCatalog !== undefined) {
   activityCatalog.capabilities.related = true;
+  for (const column of [
+    {
+      code: "queryid",
+      type: "i64",
+      source: "activity.query_id",
+      lazy: false,
+      requires: ["activity"],
+      availability: "available",
+    },
+    {
+      code: "rss",
+      type: "i64",
+      formula: "process.rmem_kb through unique same-snapshot PID candidate",
+      unit: "kib",
+      lazy: false,
+      requires: ["activity", "process"],
+      availability: "available",
+    },
+    {
+      code: "threads",
+      type: "u64",
+      formula: "process.num_threads through unique same-snapshot PID candidate",
+      unit: "count",
+      lazy: false,
+      requires: ["activity", "process"],
+      availability: "available",
+    },
+    {
+      code: "command",
+      type: "text",
+      formula: "process.cmdline through unique same-snapshot PID candidate",
+      lazy: false,
+      requires: ["activity", "process"],
+      availability: "available",
+    },
+  ]) {
+    if (
+      !activityCatalog.columns.some(
+        (candidate) => candidate.code === column.code,
+      )
+    ) {
+      activityCatalog.columns.push(column);
+    }
+  }
+  activityCatalog.presets = activityCatalog.presets.filter(
+    (preset) =>
+      ![
+        "overview",
+        "waits_locks",
+        "duration",
+        "cpu",
+        "disk_io",
+        "sampling",
+      ].includes(preset.code),
+  );
   activityCatalog.presets.push(
     {
       code: "overview",
@@ -86,8 +141,14 @@ if (activityCatalog !== undefined) {
         "application",
         "state",
         "wait_event",
-        "query",
+        "queryid",
         "query_duration_us",
+        "process_link",
+        "cpu",
+        "rss",
+        "read_bytes_per_second",
+        "write_bytes_per_second",
+        "command",
       ],
       sort: { column: "query_duration_us", order: "desc" },
     },
@@ -99,8 +160,9 @@ if (activityCatalog !== undefined) {
         "database",
         "state",
         "wait_event",
-        "query",
+        "queryid",
         "query_duration_us",
+        "process_link",
       ],
       sort: { column: "query_duration_us", order: "desc" },
     },
@@ -110,6 +172,7 @@ if (activityCatalog !== undefined) {
         "pid",
         "user",
         "database",
+        "queryid",
         "query_duration_us",
         "transaction_duration_us",
         "query",
@@ -118,7 +181,18 @@ if (activityCatalog !== undefined) {
     },
     {
       code: "cpu",
-      columns: ["pid", "user", "database", "process_link", "cpu", "query"],
+      columns: [
+        "pid",
+        "user",
+        "database",
+        "state",
+        "queryid",
+        "process_link",
+        "cpu",
+        "rss",
+        "threads",
+        "command",
+      ],
       sort: { column: "cpu", order: "desc" },
     },
     {
@@ -127,10 +201,14 @@ if (activityCatalog !== undefined) {
         "pid",
         "user",
         "database",
+        "state",
+        "wait_event",
+        "queryid",
         "process_link",
         "read_bytes_per_second",
         "write_bytes_per_second",
-        "query",
+        "rss",
+        "command",
       ],
       sort: { column: "read_bytes_per_second", order: "desc" },
     },
@@ -945,7 +1023,8 @@ function rowsActivity() {
     null,
     "IO:WALWrite",
   ];
-  return BACKENDS.map(([user, app, state], i) => {
+  return Array.from({ length: 36 }, (_, i) => {
+    const [user, app, state] = BACKENDS[i % BACKENDS.length];
     const pid = 12041 + i * 13;
     const dur = r2((i + 1) * 2_400_000 + (i % 3) * 880_000);
     const cls = [];
@@ -970,12 +1049,29 @@ function rowsActivity() {
           user === "postgres" ? "orders" : i % 5 === 4 ? "billing" : "orders",
         application: app,
         state,
-        wait_event: waitEvents[i],
+        wait_event: waitEvents[i % waitEvents.length],
         query: QUERIES[i % QUERIES.length][1],
+        queryid: i % 11 === 8 ? null : String(81_270 + (i % 12) * 3_881),
         query_duration_us: state === "idle" ? null : dur,
         transaction_duration_us:
           state === "idle in transaction" ? r2(dur * 3.2) : null,
-        cpu: state === "active" ? r2(0.12 + (i % 5) * 0.14) : r2(0.01),
+        process_link: i % 9 === 4 ? null : "best_effort",
+        cpu:
+          i % 9 === 4
+            ? null
+            : state === "active"
+              ? r2(0.12 + (i % 7) * 0.14)
+              : r2(0.01),
+        rss: i % 9 === 4 ? null : 8_192 + (i % 10) * 24_576,
+        threads: i % 9 === 4 ? null : 1 + (i % 12),
+        read_bytes_per_second:
+          i % 9 === 4 ? null : state === "active" ? 82_000 + i * 11_400 : 0,
+        write_bytes_per_second:
+          i % 9 === 4 ? null : state === "active" ? 16_000 + i * 4_200 : 0,
+        command:
+          i % 9 === 4
+            ? null
+            : `postgres: ${user} ${app} ${state === "idle" ? "idle" : "worker"}`,
       },
       cls,
     };
@@ -1193,28 +1289,37 @@ function rowsProcesses() {
     ["pgbouncer", 0.09, 88_441, 4_440_000, 1_220_000],
     ["node_exporter", 0.02, 22_118, 88_884_000, 12_220_000],
   ];
-  return defs.map(([type, cpu, rss, readBps, writeBps], i) => {
-    const pid = 12041 + i * 31;
-    const cls =
-      cpu > 0.4 ? [verdict("cpu", "os.process.cpu", cpu, "warning", 0.4)] : [];
-    return {
-      entity: `proc:${pid}`,
-      label: type,
-      data: {
-        pid,
-        type,
-        cpu,
-        rss,
-        threads: 1 + (i % 7),
-        read_bytes_per_second: readBps,
-        write_bytes_per_second: writeBps,
-        block_delay: r2(i % 4 === 0 ? 0.8 : 0.05),
-        command: type,
-        cgroup: i < 12 ? "/system.slice/postgresql.service" : "/system.slice",
-      },
-      cls,
-    };
-  });
+  // Mirror the activity demo's backend PIDs so a claimed best-effort
+  // same-snapshot association always resolves to an inspectable process.
+  // The ninth row in each group remains deliberately unmatched in
+  // rowsActivity() to demonstrate an honest null join.
+  return Array.from({ length: 36 }, (_, i) => i)
+    .filter((i) => i % 9 !== 4)
+    .map((i) => {
+      const [type, cpu, rss, readBps, writeBps] = defs[i % defs.length];
+      const pid = 12041 + i * 13;
+      const cls =
+        cpu > 0.4
+          ? [verdict("cpu", "os.process.cpu", cpu, "warning", 0.4)]
+          : [];
+      return {
+        entity: `proc:${pid}`,
+        label: type,
+        data: {
+          pid,
+          type,
+          cpu,
+          rss,
+          threads: 1 + (i % 7),
+          read_bytes_per_second: readBps,
+          write_bytes_per_second: writeBps,
+          block_delay: r2(i % 4 === 0 ? 0.8 : 0.05),
+          command: type,
+          cgroup: i < 12 ? "/system.slice/postgresql.service" : "/system.slice",
+        },
+        cls,
+      };
+    });
 }
 
 function rowsLocks() {
@@ -1313,7 +1418,7 @@ function rowsLocks() {
         pid,
         depth: i === 0 ? 1 : 2,
         root_pid: 11991,
-        blocked_by: String(blocker),
+        blocked_by: i === 0 ? `${blocker}, 0` : String(blocker),
         user_application: ua,
         lock,
         granted: false,
@@ -1681,7 +1786,11 @@ function entityResponse(viewCode, entity, params) {
         });
       }
     }
-    if (params.get("include") === "related" && viewCode === "activity") {
+    if (
+      params.get("include") === "related" &&
+      viewCode === "activity" &&
+      row.data.process_link === "best_effort"
+    ) {
       const process = rowsProcesses().find(
         (candidate) => candidate.data.pid === row.data.pid,
       );
