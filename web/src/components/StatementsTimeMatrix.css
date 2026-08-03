@@ -1,3 +1,98 @@
+.statements-workspace {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.statements-workspace__controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  min-height: var(--space-6);
+  padding: var(--space-1) var(--space-2);
+  color: var(--fg-dim);
+  font-family: var(--ui-font);
+  font-size: var(--text-xs);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-block-end: 0;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+}
+
+.statements-workspace__title {
+  color: var(--fg-strong);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+}
+
+.statements-workspace__lens,
+.statements-workspace__count,
+.statements-workspace__missing,
+.statements-workspace__quality {
+  text-wrap: nowrap;
+}
+
+.statements-workspace__metrics {
+  display: inline-flex;
+  overflow: hidden;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.statements-workspace__metric {
+  padding: 2px var(--space-2);
+  color: var(--fg-dim);
+  font: inherit;
+  background: transparent;
+  border: 0;
+  border-inline-end: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.statements-workspace__metric:last-child {
+  border-inline-end: 0;
+}
+
+.statements-workspace__metric[aria-pressed="true"] {
+  color: var(--accent-strong);
+  background: var(--active-bg);
+}
+
+.statements-workspace__count {
+  margin-inline-start: auto;
+  color: var(--fg);
+}
+
+.statements-workspace__missing {
+  color: var(--fg-dim);
+}
+
+.statements-workspace__quality {
+  color: var(--sev-ok-fg);
+}
+
+.statements-workspace__quality:not([data-quality="complete"]) {
+  color: var(--sev-warn-fg);
+}
+
+.statements-workspace__metric-tip,
+.statements-workspace__quality-tip {
+  display: grid;
+  gap: 2px;
+}
+
+.statements-workspace > [data-shell-region="ranked-matrix"] {
+  border-start-start-radius: 0 !important;
+  border-start-end-radius: 0 !important;
+}
+
 .statements-time-matrix {
   min-width: var(--statement-matrix-min-width);
   table-layout: fixed;
