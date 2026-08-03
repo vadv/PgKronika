@@ -1,0 +1,617 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { ViewSpec } from "../api/types";
+import {
+  compileForensicSearch,
+  type ForensicSearchError,
+  type ForensicSearchGroup as SearchGroupPlan,
+} from "../search/compile";
+import { useForensicSearchGroup } from "../search/group";
+import { formatIntervalTime } from "./FocusBar";
+
+export interface ForensicSearchProps {
+  open: boolean;
+  views: ViewSpec[];
+  at: string;
+  span: number;
+  onClose: () => void;
+  onSelect: (view: string, entity: string) => void;
+}
+
+interface SearchGroupStatus {
+  state: "pending" | "success" | "error";
+  matched: number;
+  qualityStatus: string | null;
+  gaps: number;
+  gated: number;
+  unavailable: number;
+  limited: number;
+  activeTail: boolean;
+}
+
+function errorText(
+  error: ForensicSearchError,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  if (error.code === "unsupported_key") {
+    return t("search.error.unsupportedKey", {
+      key: error.key,
+      defaultValue: `${error.key}: no public searchable evidence field`,
+    });
+  }
+  if (error.code === "query_too_long") {
+    return t("search.error.queryTooLong", {
+      limit: error.limit,
+      defaultValue: `Search is limited to ${error.limit} UTF-8 bytes`,
+    });
+  }
+  if (error.code === "too_many_terms") {
+    return t("search.error.tooManyTerms", {
+      limit: error.limit,
+      defaultValue: `Search is limited to ${error.limit} AND terms`,
+    });
+  }
+  return t("search.error.invalid", { defaultValue: "Invalid search syntax" });
+}
+
+function SearchResultGroup(props: {
+  groupKey: string;
+  plan: SearchGroupPlan;
+  at: string;
+  span: number;
+  onSelect: (view: string, entity: string) => void;
+  onStatus: (key: string, status: SearchGroupStatus) => void;
+}) {
+  const { t } = useTranslation();
+  const search = useForensicSearchGroup({
+    view: props.plan.view.code,
+    at: props.at,
+    span: props.span,
+    q: props.plan.q,
+    enabled: true,
+  });
+  const status = search.isPending
+    ? "pending"
+    : search.isError
+      ? "error"
+      : "success";
+  const reportStatus = props.onStatus;
+  const statusKey = props.groupKey;
+  const qualityStatus = search.quality?.status ?? null;
+  const gaps = search.quality?.gaps.length ?? 0;
+  const gated = search.quality?.gated.length ?? 0;
+  const unavailable = search.quality?.unavailable_revision.length ?? 0;
+  const limited = search.quality?.resource_limited.length ?? 0;
+  const activeTail = search.quality?.active_tail ?? false;
+  useEffect(() => {
+    reportStatus(statusKey, {
+      state: status,
+      matched: search.matched,
+      qualityStatus,
+      gaps,
+      gated,
+      unavailable,
+      limited,
+      activeTail,
+    });
+  }, [
+    gaps,
+    gated,
+    unavailable,
+    limited,
+    activeTail,
+    qualityStatus,
+    reportStatus,
+    search.matched,
+    status,
+    statusKey,
+  ]);
+  if (!search.isPending && !search.isError && search.matched === 0) return null;
+  return (
+    <section
+      data-search-group={props.plan.view.code}
+      style={{
+        borderBlockStart: "1px solid var(--border)",
+        paddingBlock: "var(--space-2)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: "var(--space-2)",
+          paddingInline: "var(--space-2)",
+          marginBlockEnd: "var(--space-1)",
+        }}
+      >
+        <strong style={{ fontFamily: "var(--ui-font)" }}>
+          {t(`tabs.${props.plan.view.code}`, {
+            defaultValue: props.plan.view.code,
+          })}
+        </strong>
+        <span
+          style={{
+            fontFamily: "var(--mono-font)",
+            color: "var(--fg-dim)",
+            fontSize: "var(--text-xs)",
+          }}
+        >
+          {search.isPending
+            ? t("search.searching", { defaultValue: "searching…" })
+            : t("search.count", {
+                shown: search.rows.length,
+                matched: search.matched,
+                defaultValue: `${search.rows.length} / ${search.matched}`,
+              })}
+        </span>
+        <span
+          style={{
+            marginInlineStart: "auto",
+            color: "var(--fg-dim)",
+            fontFamily: "var(--mono-font)",
+            fontSize: "var(--text-xs)",
+          }}
+        >
+          {props.plan.reason}
+          {search.quality !== undefined && (
+            <span>
+              {" · "}
+              {t("search.quality", {
+                status: search.quality.status,
+                gaps: search.quality.gaps.length,
+                gated: search.quality.gated.length,
+                unavailable: search.quality.unavailable_revision.length,
+                limited: search.quality.resource_limited.length,
+                tail: search.quality.active_tail ? t("search.activeTail") : "",
+                defaultValue: `${search.quality.status} · gaps ${search.quality.gaps.length} · gated ${search.quality.gated.length} · unavailable ${search.quality.unavailable_revision.length} · limited ${search.quality.resource_limited.length}${search.quality.active_tail ? " · active tail" : ""}`,
+              })}
+            </span>
+          )}
+        </span>
+      </div>
+      {search.isError && (
+        <div role="alert" style={{ color: "var(--sev-warn-fg)" }}>
+          {t("search.error.group", { defaultValue: "Search group failed" })}
+        </div>
+      )}
+      {search.rows.map((row) => (
+        <button
+          key={row.entity}
+          type="button"
+          data-search-result
+          onClick={() => props.onSelect(props.plan.view.code, row.entity)}
+          style={{
+            display: "grid",
+            gridTemplateColumns: "minmax(220px, 1fr) minmax(160px, 0.7fr)",
+            gap: "var(--space-3)",
+            width: "100%",
+            minHeight: "44px",
+            padding: "var(--space-2)",
+            color: "var(--fg)",
+            background: "transparent",
+            border: "none",
+            borderRadius: "var(--radius-sm)",
+            textAlign: "start",
+            cursor: "pointer",
+          }}
+        >
+          <span style={{ minWidth: 0 }}>
+            <span
+              style={{
+                display: "block",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                fontFamily: "var(--ui-font)",
+                fontWeight: 600,
+              }}
+            >
+              {row.label}
+            </span>
+            <span
+              style={{
+                display: "block",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                color: "var(--fg-dim)",
+                fontFamily: "var(--mono-font)",
+                fontSize: "var(--text-xs)",
+              }}
+            >
+              {row.cells
+                .filter((value) => value !== null)
+                .slice(0, 3)
+                .map(String)
+                .join(" · ")}
+            </span>
+          </span>
+          <span
+            style={{
+              minWidth: 0,
+              color: "var(--fg-dim)",
+              fontFamily: "var(--mono-font)",
+              fontSize: "var(--text-xs)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            frame:{props.plan.view.code}
+            {search.snapshotTsUs !== null
+              ? ` · ${formatIntervalTime(Number(search.snapshotTsUs))}`
+              : ""}
+            {search.quality !== undefined ? ` · ${search.quality.status}` : ""}
+          </span>
+        </button>
+      ))}
+      {search.hasNextPage && (
+        <button
+          type="button"
+          disabled={search.isFetchingNextPage}
+          onClick={() => void search.fetchNextPage()}
+          style={{
+            marginInlineStart: "var(--space-2)",
+            color: "var(--accent)",
+            background: "none",
+            border: "none",
+            fontFamily: "var(--mono-font)",
+            cursor: "pointer",
+          }}
+        >
+          {search.isFetchingNextPage
+            ? t("table.loading")
+            : t("search.loadMore", { defaultValue: "load next server page" })}
+        </button>
+      )}
+    </section>
+  );
+}
+
+export function ForensicSearch(props: ForensicSearchProps) {
+  const { t } = useTranslation();
+  const [draft, setDraft] = useState("");
+  const [committed, setCommitted] = useState("");
+  const [groupStatus, setGroupStatus] = useState<
+    Record<string, SearchGroupStatus>
+  >({});
+  const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLFormElement>(null);
+  const restoreFocus = useRef<HTMLElement | null>(null);
+  const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => {});
+
+  useEffect(() => {
+    if (!props.open) return;
+    restoreFocus.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    inputRef.current?.focus();
+    return () => restoreFocus.current?.focus();
+  }, [props.open]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setCommitted(draft.trim()), 200);
+    return () => window.clearTimeout(timeout);
+  }, [draft]);
+
+  useEffect(() => {
+    if (!props.open) return;
+    const listener = (event: KeyboardEvent) => {
+      if (
+        event.target instanceof Node &&
+        dialogRef.current?.contains(event.target)
+      ) {
+        keyHandlerRef.current(event);
+      }
+    };
+    document.addEventListener("keydown", listener);
+    return () => document.removeEventListener("keydown", listener);
+  }, [props.open]);
+
+  const onGroupStatus = useCallback(
+    (key: string, status: SearchGroupStatus) => {
+      setGroupStatus((previous) => {
+        const current = previous[key];
+        if (
+          current?.state === status.state &&
+          current.matched === status.matched &&
+          current.qualityStatus === status.qualityStatus &&
+          current.gaps === status.gaps &&
+          current.gated === status.gated &&
+          current.unavailable === status.unavailable &&
+          current.limited === status.limited &&
+          current.activeTail === status.activeTail
+        ) {
+          return previous;
+        }
+        return { ...previous, [key]: status };
+      });
+    },
+    [],
+  );
+
+  if (!props.open) return null;
+  const visiblePlan = compileForensicSearch(draft.trim(), props.views);
+  const serverPlan = compileForensicSearch(committed, props.views);
+  const groups = committed === draft.trim() ? serverPlan.groups : [];
+  const groupKeys = groups.map((plan) => `${plan.view.code}:${plan.q}`);
+  const statuses = groupKeys.map((key) => groupStatus[key]);
+  const noMatches =
+    statuses.length > 0 &&
+    statuses.every(
+      (status) => status?.state === "success" && status.matched === 0,
+    );
+  const noMatchCoverage = statuses.reduce(
+    (total, status) => ({
+      gaps: total.gaps + (status?.gaps ?? 0),
+      gated: total.gated + (status?.gated ?? 0),
+      unavailable: total.unavailable + (status?.unavailable ?? 0),
+      limited: total.limited + (status?.limited ?? 0),
+      activeTail: total.activeTail || (status?.activeTail ?? false),
+    }),
+    { gaps: 0, gated: 0, unavailable: 0, limited: 0, activeTail: false },
+  );
+  const resultButtons = () =>
+    Array.from(
+      dialogRef.current?.querySelectorAll<HTMLButtonElement>(
+        "button[data-search-result]",
+      ) ?? [],
+    );
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      props.onClose();
+      return;
+    }
+    if (event.key === "Tab") {
+      const focusable = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLElement>(
+          'input:not([disabled]), button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (first === undefined || last === undefined) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+      return;
+    }
+    const buttons = resultButtons();
+    if (event.key === "Enter") {
+      const active = document.activeElement;
+      if (active instanceof HTMLButtonElement && active.dataset.searchResult) {
+        event.preventDefault();
+        active.click();
+      } else if (event.target === inputRef.current && draft.trim() !== "") {
+        setCommitted(draft.trim());
+      }
+      return;
+    }
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    if (buttons.length === 0) return;
+    event.preventDefault();
+    const current = buttons.indexOf(
+      document.activeElement as HTMLButtonElement,
+    );
+    const direction = event.key === "ArrowDown" ? 1 : -1;
+    const next =
+      current < 0
+        ? direction > 0
+          ? 0
+          : buttons.length - 1
+        : (current + direction + buttons.length) % buttons.length;
+    buttons[next]?.focus();
+  };
+  keyHandlerRef.current = onKeyDown;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 30,
+        display: "grid",
+        placeItems: "start center",
+        paddingBlockStart: "8vh",
+      }}
+    >
+      <button
+        type="button"
+        tabIndex={-1}
+        data-testid="forensic-search-backdrop"
+        aria-label={t("search.dismiss", {
+          defaultValue: "Dismiss forensic search backdrop",
+        })}
+        onClick={props.onClose}
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          padding: 0,
+          background: "color-mix(in srgb, var(--bg) 58%, transparent)",
+          border: "none",
+          cursor: "default",
+        }}
+      />
+      <form
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+        aria-modal="true"
+        aria-label={t("search.title", { defaultValue: "Forensic search" })}
+        onSubmit={(event) => event.preventDefault()}
+        style={{
+          position: "relative",
+          zIndex: 1,
+          width: "min(920px, calc(100vw - 32px))",
+          maxHeight: "min(760px, 84vh)",
+          display: "flex",
+          flexDirection: "column",
+          color: "var(--fg)",
+          background: "var(--bg-overlay)",
+          border: "1px solid var(--border-strong)",
+          borderRadius: "var(--radius-md)",
+          boxShadow: "var(--shadow-pop)",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "var(--space-2)",
+            padding: "var(--space-3)",
+            borderBlockEnd: "1px solid var(--border)",
+          }}
+        >
+          <span aria-hidden="true" style={{ color: "var(--accent)" }}>
+            ⌕
+          </span>
+          <input
+            ref={inputRef}
+            type="search"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder={t("search.placeholder", {
+              defaultValue: "pid:18422 · queryid:… · rel:public.orders",
+            })}
+            aria-describedby="forensic-search-help"
+            style={{
+              flex: "1 1 auto",
+              minWidth: 0,
+              color: "var(--fg)",
+              background: "transparent",
+              border: "none",
+              outline: "none",
+              fontFamily: "var(--mono-font)",
+              fontSize: "var(--text-lg)",
+            }}
+          />
+          <kbd style={{ color: "var(--fg-dim)" }}>esc</kbd>
+          <button
+            type="button"
+            aria-label={t("search.close", {
+              defaultValue: "Close forensic search",
+            })}
+            onClick={props.onClose}
+            style={{
+              color: "var(--fg-dim)",
+              background: "none",
+              border: "none",
+              fontFamily: "var(--mono-font)",
+              fontSize: "var(--text-lg)",
+              cursor: "pointer",
+            }}
+          >
+            ×
+          </button>
+        </div>
+        <div
+          id="forensic-search-help"
+          style={{
+            padding: "var(--space-2) var(--space-3)",
+            color: "var(--fg-dim)",
+            fontFamily: "var(--mono-font)",
+            fontSize: "var(--text-xs)",
+          }}
+        >
+          pid · queryid · planid · rel · index · wait · event · db · user · app
+          · cgroup
+          {" · "}
+          {t("search.serverScope", {
+            defaultValue: "server snapshot; lazy SQL excluded",
+          })}
+        </div>
+        <div style={{ overflowY: "auto", minHeight: "120px" }}>
+          {visiblePlan.error !== null && (
+            <div
+              role="alert"
+              style={{
+                margin: "var(--space-3)",
+                padding: "var(--space-2)",
+                color: "var(--sev-warn-fg)",
+                background: "var(--sev-warn-bg)",
+                border: "1px solid var(--sev-warn)",
+                borderRadius: "var(--radius-sm)",
+                fontFamily: "var(--ui-font)",
+              }}
+            >
+              {errorText(visiblePlan.error, t)}
+            </div>
+          )}
+          {visiblePlan.error === null && draft.trim() === "" && (
+            <div
+              style={{
+                padding: "var(--space-5)",
+                color: "var(--fg-dim)",
+                fontFamily: "var(--ui-font)",
+                textAlign: "center",
+              }}
+            >
+              {t("search.emptyPrompt", {
+                defaultValue: "Search every materialized evidence projection",
+              })}
+            </div>
+          )}
+          {groups.map((plan) => (
+            <SearchResultGroup
+              key={`${plan.view.code}:${plan.q}`}
+              groupKey={`${plan.view.code}:${plan.q}`}
+              plan={plan}
+              at={props.at}
+              span={props.span}
+              onSelect={props.onSelect}
+              onStatus={onGroupStatus}
+            />
+          ))}
+          {noMatches && (
+            <div
+              role="status"
+              style={{
+                padding: "var(--space-5)",
+                color: "var(--fg-dim)",
+                fontFamily: "var(--ui-font)",
+                textAlign: "center",
+              }}
+            >
+              <span style={{ display: "block" }}>
+                {t("search.noMatches", {
+                  defaultValue:
+                    "No matches in retained snapshot candidates; absence is not proof",
+                })}
+              </span>
+              <span
+                style={{
+                  display: "block",
+                  marginBlockStart: "var(--space-1)",
+                  fontFamily: "var(--mono-font)",
+                  fontSize: "var(--text-xs)",
+                }}
+              >
+                {t("search.quality", {
+                  status: "retained",
+                  gaps: noMatchCoverage.gaps,
+                  gated: noMatchCoverage.gated,
+                  unavailable: noMatchCoverage.unavailable,
+                  limited: noMatchCoverage.limited,
+                  tail: noMatchCoverage.activeTail
+                    ? t("search.activeTail")
+                    : "",
+                  defaultValue: `retained · gaps ${noMatchCoverage.gaps} · gated ${noMatchCoverage.gated} · unavailable ${noMatchCoverage.unavailable} · limited ${noMatchCoverage.limited}${noMatchCoverage.activeTail ? " · active tail" : ""}`,
+                })}
+              </span>
+            </div>
+          )}
+        </div>
+      </form>
+    </div>
+  );
+}

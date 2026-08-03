@@ -15,6 +15,7 @@ import { useSummary } from "./api/summary";
 import { AlertBar } from "./components/AlertBar";
 import { DockOverlay } from "./components/DockOverlay";
 import { FocusBar } from "./components/FocusBar";
+import { ForensicSearch } from "./components/ForensicSearch";
 import { Header } from "./components/Header";
 import { HeatmapStrip } from "./components/HeatmapStrip";
 import { PrimaryNavigation } from "./components/PrimaryNavigation";
@@ -95,6 +96,7 @@ function Shell() {
     toggleLive,
   } = useTimeGeometry();
   const [dataHealthOpen, setDataHealthOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [matched, setMatched] = useState<number | null>(null);
   const [metricByView, setMetricByView] = useState<Record<string, string>>({});
   const mobile = useMobile();
@@ -160,6 +162,11 @@ function Shell() {
     // global shortcuts.
     const onButton =
       e.target instanceof HTMLElement && e.target.tagName === "BUTTON";
+    if (e.key === "/") {
+      e.preventDefault();
+      setSearchOpen(true);
+      return;
+    }
     if (e.key >= "1" && e.key <= "9") {
       if (mobile) return;
       const destination = shortcutDestinations[Number(e.key) - 1];
@@ -188,7 +195,8 @@ function Shell() {
       return;
     }
     if (e.key === "Escape") {
-      if (dataHealthOpen) setDataHealthOpen(false);
+      if (searchOpen) setSearchOpen(false);
+      else if (dataHealthOpen) setDataHealthOpen(false);
       else if (state.dock !== null) patch({ dock: null });
       else if (state.focus !== null) patch({ focus: null });
     }
@@ -245,6 +253,7 @@ function Shell() {
       dataHealthOpen={dataHealthOpen}
       onToggleDataHealth={() => setDataHealthOpen((open) => !open)}
       onOpenIncidents={() => patch({ dock: "incidents" })}
+      onOpenSearch={() => setSearchOpen(true)}
     />
   );
   const primaryNavigation = !mobile ? (
@@ -267,15 +276,36 @@ function Shell() {
       primaryNavigationLabel={t("navigation.primary")}
       status={<StatusBar embedded state={state} summary={summary.data} />}
       overlay={
-        <DockOverlay
-          state={state}
-          view={activeView}
-          at={at}
-          mobile={mobile}
-          onClose={() => patch({ dock: null })}
-          onSelectIncident={(focus) => patch({ focus })}
-          onPatch={patch}
-        />
+        <>
+          <DockOverlay
+            state={state}
+            view={activeView}
+            at={at}
+            mobile={mobile}
+            onClose={() => patch({ dock: null })}
+            onSelectIncident={(focus) => patch({ focus })}
+            onPatch={patch}
+          />
+          <ForensicSearch
+            open={searchOpen}
+            views={views}
+            at={at}
+            span={state.span}
+            onClose={() => setSearchOpen(false)}
+            onSelect={(view, entity) => {
+              patch({
+                view,
+                entity,
+                dock: "row",
+                q: null,
+                preset: null,
+                sort: null,
+                order: null,
+              });
+              setSearchOpen(false);
+            }}
+          />
+        </>
       }
     >
       <AlertBar live={state.at === null} summary={summary.data} />

@@ -557,6 +557,251 @@ async function verifyStatementsWorkspace(page) {
   };
 }
 
+async function verifyGlobalSearchDetail(page) {
+  const matrixSelector = '[data-testid="ranked-matrix-body"]';
+  const matrixBefore = await page.$eval(matrixSelector, (element) => {
+    const rect = element.getBoundingClientRect();
+    return {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+    };
+  });
+
+  await page.keyboard.press("/");
+  await page.waitForSelector('[role="dialog"] input[type="search"]', {
+    timeout: 5_000,
+  });
+  const forensicInput = await page.$('[role="dialog"] input[type="search"]');
+  if (forensicInput === null)
+    throw new Error("forensic search input is missing");
+  await page.keyboard.down("Shift");
+  await page.keyboard.press("Tab");
+  await page.keyboard.up("Shift");
+  const trappedBackward = await page.evaluate(
+    () =>
+      document.activeElement?.getAttribute("aria-label") ===
+      "Close forensic search",
+  );
+  await page.keyboard.press("Tab");
+  const trappedForward = await page.evaluate(
+    () =>
+      document.activeElement?.matches(
+        '[role="dialog"] input[type="search"]',
+      ) === true,
+  );
+  await forensicInput.type("queryid:9180220441127101");
+  await page.waitForSelector('[role="dialog"] [data-search-result]', {
+    timeout: 10_000,
+  });
+  const searchResultState = await page.evaluate(() => {
+    const dialog = document.querySelector('[role="dialog"]');
+    const results = dialog?.querySelectorAll("[data-search-result]") ?? [];
+    const resources = performance
+      .getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .filter(
+        (name) => name.includes("/v1/frame/") && name.includes("queryid"),
+      );
+    return {
+      resultCount: results.length,
+      hashHasQuery: new URLSearchParams(location.hash.slice(1)).has("q"),
+      resources,
+    };
+  });
+  const searchState = {
+    ...searchResultState,
+    trappedBackward,
+    trappedForward,
+  };
+
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+  await page.waitForSelector('[data-dock="row"] [data-detail-provenance]', {
+    timeout: 10_000,
+  });
+  const pointState = await page.evaluate((selector) => {
+    const dock = document.querySelector('[data-dock="row"]');
+    const matrix = document.querySelector(selector);
+    if (!(dock instanceof HTMLElement) || !(matrix instanceof HTMLElement)) {
+      throw new Error("detail dock or ranked matrix is missing");
+    }
+    const dockRect = dock.getBoundingClientRect();
+    const matrixRect = matrix.getBoundingClientRect();
+    const params = new URLSearchParams(location.hash.slice(1));
+    return {
+      dock: {
+        left: dockRect.left,
+        right: dockRect.right,
+        width: dockRect.width,
+      },
+      matrix: {
+        left: matrixRect.left,
+        top: matrixRect.top,
+        width: matrixRect.width,
+        height: matrixRect.height,
+      },
+      hashView: params.get("view"),
+      hashHasQuery: params.has("q"),
+      provenance: dock.querySelector("[data-detail-provenance]")?.textContent,
+    };
+  }, matrixSelector);
+
+  await page.click('[data-detail-tab-trigger="history"]');
+  await page.waitForSelector(
+    '[data-dock="row"] [data-detail-history] tbody tr',
+    {
+      timeout: 10_000,
+    },
+  );
+  const initialHistoryQuality = await page.$(
+    '[data-dock="row"] [data-history-quality]',
+  );
+  const initialHistoryQualityVisible = initialHistoryQuality !== null;
+  for (const expectedRows of [8, 12]) {
+    await page.click('[data-dock="row"] [data-testid="history-load-more"]');
+    await page.waitForFunction(
+      (rows) =>
+        document.querySelectorAll(
+          '[data-dock="row"] [data-detail-history] tbody tr',
+        ).length === rows,
+      { timeout: 10_000 },
+      expectedRows,
+    );
+    if (expectedRows === 8) {
+      await page.waitForSelector('[data-dock="row"] [data-history-quality]', {
+        timeout: 5_000,
+      });
+    }
+  }
+  const historyState = await page.evaluate((initialQualityVisible) => {
+    const requests = performance
+      .getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .filter(
+        (name) =>
+          name.includes("/v1/entity/statements/") &&
+          name.includes("from=") &&
+          name.includes("columns="),
+      );
+    const request = requests[0];
+    const url = request === undefined ? null : new URL(request);
+    return {
+      rows: document.querySelectorAll(
+        '[data-dock="row"] [data-detail-history] tbody tr',
+      ).length,
+      request,
+      cursors: requests.map((name) => new URL(name).searchParams.get("cursor")),
+      quality:
+        document.querySelector('[data-dock="row"] [data-history-quality]')
+          ?.textContent ?? "",
+      qualityGaps: document
+        .querySelector('[data-dock="row"] [data-history-quality]')
+        ?.getAttribute("data-gaps"),
+      qualityGated: document
+        .querySelector('[data-dock="row"] [data-history-quality]')
+        ?.getAttribute("data-gated"),
+      initialQualityVisible,
+      hasPointAt: url?.searchParams.has("at") ?? null,
+      hasRange:
+        url?.searchParams.has("from") === true &&
+        url.searchParams.has("to") &&
+        url.searchParams.has("columns"),
+    };
+  }, initialHistoryQualityVisible);
+
+  await page.click('[data-detail-tab-trigger="relationships"]');
+  await page.waitForFunction(
+    () =>
+      document
+        .querySelector('[data-dock="row"] [role="tabpanel"]')
+        ?.textContent?.includes("statement_plan") === true,
+    { timeout: 5_000 },
+  );
+  const relationship = await page.$eval(
+    '[data-dock="row"] [role="tabpanel"]',
+    (element) => element.textContent ?? "",
+  );
+
+  await page.click('[data-detail-tab-trigger="raw"]');
+  await page.waitForSelector('[data-dock="row"] [data-raw-evidence]', {
+    timeout: 5_000,
+  });
+  const rawProjection = await page.$eval(
+    '[data-dock="row"] [data-raw-evidence]',
+    (element) => element.textContent ?? "",
+  );
+
+  const failures = [];
+  if (searchState.resultCount < 1)
+    failures.push("global search returned no result");
+  if (!searchState.trappedBackward || !searchState.trappedForward) {
+    failures.push("forensic search did not trap keyboard focus");
+  }
+  if (searchState.resources.length < 2) {
+    failures.push("global search did not fan out through server frame queries");
+  }
+  if (searchState.hashHasQuery || pointState.hashHasQuery) {
+    failures.push("transient forensic search leaked into shareable q state");
+  }
+  if (pointState.hashView !== "statements") {
+    failures.push(`search opened ${pointState.hashView}, expected statements`);
+  }
+  if (Math.abs(pointState.dock.width - 520) > 0.5) {
+    failures.push(
+      `desktop detail width ${pointState.dock.width}, expected 520`,
+    );
+  }
+  for (const key of ["left", "top", "width", "height"]) {
+    if (Math.abs(pointState.matrix[key] - matrixBefore[key]) > 0.5) {
+      failures.push(
+        `detail reflowed matrix ${key}: ${matrixBefore[key]} -> ${pointState.matrix[key]}`,
+      );
+    }
+  }
+  if (!pointState.provenance?.includes("point projection")) {
+    failures.push("summary omitted point projection provenance");
+  }
+  if (
+    historyState.rows !== 12 ||
+    historyState.hasRange !== true ||
+    historyState.cursors.join(",") !== ",page-2,page-3" ||
+    !historyState.quality.includes("partial") ||
+    historyState.qualityGaps !== "1" ||
+    historyState.qualityGated !== "1" ||
+    historyState.initialQualityVisible !== false
+  ) {
+    failures.push(`history contract failed: ${JSON.stringify(historyState)}`);
+  }
+  if (historyState.hasPointAt !== false) {
+    failures.push("history request incorrectly mixed point at with range mode");
+  }
+  if (
+    !/(best[_ ]effort)/.test(relationship) ||
+    !relationship.includes("ossc_queryid_dbid_userid_attribution")
+  ) {
+    failures.push(`relationship provenance is incomplete: ${relationship}`);
+  }
+  if (!rawProjection.includes('"mode": "point"')) {
+    failures.push("raw tab did not expose the bounded point projection");
+  }
+  if (failures.length > 0) throw new Error(failures.join("\n"));
+
+  await page.keyboard.press("Escape");
+  await page.waitForSelector('[data-dock="row"]', {
+    hidden: true,
+    timeout: 5_000,
+  });
+  return {
+    searchState,
+    pointState,
+    historyState,
+    relationshipVerified: true,
+    rawProjectionVerified: true,
+  };
+}
+
 function assertContract(metrics, keyboard) {
   const failures = [];
   const exactHeight = (name, expected) => {
@@ -697,6 +942,7 @@ try {
   const keyboard = await verifyKeyboardReach(page);
   assertContract(metrics, keyboard);
   const statements = await verifyStatementsWorkspace(page);
+  const globalSearchDetail = await verifyGlobalSearchDetail(page);
   await page.evaluate(() => {
     const matrixBody = document.querySelector(
       '[data-testid="ranked-matrix-body"]',
@@ -707,7 +953,11 @@ try {
   });
   await page.screenshot({ path: SUCCESS_SHOT });
   console.log(
-    `forensic shell PASS\n${JSON.stringify({ ...metrics, keyboard, statements }, null, 2)}`,
+    `forensic shell PASS\n${JSON.stringify(
+      { ...metrics, keyboard, statements, globalSearchDetail },
+      null,
+      2,
+    )}`,
   );
   console.log(`approved screenshot: ${SUCCESS_SHOT}`);
 } catch (error) {

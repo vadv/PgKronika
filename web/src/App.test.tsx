@@ -449,6 +449,30 @@ test("Escape closes an open dock", async () => {
   expect(location.hash).not.toContain("dock=");
 });
 
+test("slash opens global forensic search and keeps its text out of share state", async () => {
+  renderApp();
+  await waitFor(() =>
+    expect(screen.getAllByText("tabs.activity").length).toBeGreaterThan(0),
+  );
+  fireEvent.keyDown(document.body, { key: "/" });
+  const dialog = await screen.findByRole("dialog", {
+    name: /Forensic search|search\.title/i,
+  });
+  const search = within(dialog).getByRole("searchbox");
+  expect(document.activeElement).toBe(search);
+  fireEvent.change(search, { target: { value: "pid:18422" } });
+  expect(location.hash).not.toContain("pid");
+  expect(location.hash).not.toContain("q=");
+  fireEvent.keyDown(search, { key: "Escape" });
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("dialog", {
+        name: /Forensic search|search\.title/i,
+      }),
+    ).toBeNull(),
+  );
+});
+
 test("a Locks hash renders its contextual deep-link surface without selecting OS", async () => {
   renderApp();
   await waitFor(() =>

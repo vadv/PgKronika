@@ -1253,12 +1253,13 @@ function frameResponse(viewCode, params) {
     page: { matched, returned: pageRows.length, next },
     neighbors: {},
     quality: {
-      status: "complete",
+      status: viewCode === "statements" ? "partial" : "complete",
       snapshots: 42,
       gaps: [],
       gated: [],
       unavailable_revision: [],
-      resource_limited: [],
+      resource_limited:
+        viewCode === "statements" ? ["source_limit:1000/1453"] : [],
       active_tail: true,
     },
   };
@@ -1275,6 +1276,24 @@ function entityResponse(viewCode, entity, params) {
 
   const at = params.get("at");
   if (at !== null) {
+    const related = [];
+    if (params.get("include") === "related" && viewCode === "statements") {
+      const plan = rowsPlans().find(
+        (candidate) => candidate.data.queryid === row.data.queryid,
+      );
+      if (plan !== undefined) {
+        related.push({
+          view: "plans",
+          entity: plan.entity,
+          relation: "statement_plan",
+          provenance: {
+            kind: "best_effort",
+            method: "ossc_queryid_dbid_userid_attribution",
+            fields: ["queryid", "dbid", "userid"],
+          },
+        });
+      }
+    }
     return {
       view: viewCode,
       entity,
@@ -1290,22 +1309,35 @@ function entityResponse(viewCode, entity, params) {
           reason: value === null ? "not_collected" : null,
         };
       }),
-      related: [],
+      related,
       quality: { status: "complete", gaps: [], gated: [] },
     };
   }
 
-  // History mode: follow the entity over the trailing hour in 5-minute steps.
-  const now = nowUs();
-  const columns = view.columns
-    .filter((c) => !c.lazy)
-    .slice(0, 5)
-    .map((c) => c.code);
+  // History mode follows the exact requested range and public non-lazy
+  // columns, mirroring the backend admission contract used by Entity Detail.
+  const from = Number(params.get("from"));
+  const to = Number(params.get("to"));
+  const requestedColumns = (params.get("columns") ?? "")
+    .split(",")
+    .filter(Boolean);
+  const availableColumns = new Set(
+    view.columns.filter((column) => !column.lazy).map((column) => column.code),
+  );
+  const columns = requestedColumns.filter((code) => availableColumns.has(code));
   const rand = mulberry32(hashCode(entity));
   const snapshots = [];
-  for (let i = 11; i >= 0; i--) {
+  const totalSamples = 12;
+  const pageSize = 4;
+  const pageIndex = Math.max(
+    0,
+    Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
+  );
+  const step = Math.max(1, Math.floor((to - from) / totalSamples));
+  for (let i = 0; i < pageSize; i++) {
+    const sampleIndex = pageIndex * pageSize + i;
     snapshots.push({
-      ts_us: String(now - i * 300 * US),
+      ts_us: String(from + sampleIndex * step),
       values: columns.map((code) => {
         const value = row.data[code] ?? null;
         if (typeof value === "number") return r2(value * (0.8 + rand() * 0.4));
@@ -1320,8 +1352,22 @@ function entityResponse(viewCode, entity, params) {
     mode: "history",
     columns,
     snapshots,
-    page: { next: null },
-    quality: { status: "complete", gaps: [], gated: [] },
+    page: { next: pageIndex < 2 ? `page-${pageIndex + 2}` : null },
+    quality:
+      pageIndex === 0
+        ? { status: "complete", gaps: [], gated: [] }
+        : pageIndex === 1
+          ? {
+              status: "partial",
+              gaps: [
+                {
+                  from_us: String(from + step),
+                  to_us: String(from + 2 * step),
+                },
+              ],
+              gated: [],
+            }
+          : { status: "partial", gaps: [], gated: ["os_process"] },
   };
 }
 

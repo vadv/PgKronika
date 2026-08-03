@@ -87,6 +87,13 @@ test("fits the fixed desktop Global context region when embedded", () => {
   expect(content.style.flexWrap).toBe("nowrap");
 });
 
+test("global context exposes the forensic search trigger", () => {
+  const onOpenSearch = vi.fn();
+  renderHeader({ onOpenSearch });
+  fireEvent.click(screen.getByRole("button", { name: "search.open" }));
+  expect(onOpenSearch).toHaveBeenCalledTimes(1);
+});
+
 test("embedded mobile Header wraps incident chips at natural height", () => {
   renderHeader({
     embedded: true,
