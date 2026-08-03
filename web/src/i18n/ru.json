@@ -542,6 +542,7 @@
   "healthLine.provenance.completedBuckets": "завершённых бакетов с вердиктом",
   "healthLine.provenance.formingTailExcluded": "health-бакет; формирующийся Live-хвост исключён",
   "healthLine.provenance.noVerdicts": "В выбранном окне нет серверных health-вердиктов",
+  "healthLine.provenance.healthUnavailable": "Health-вердикты недоступны — у оценки нет текущего входного вердикта",
   "semantic.kind.G.label": "Gauge",
   "semantic.kind.G.explanation": "Значение, наблюдавшееся в один момент времени",
   "semantic.kind.ΔC.label": "Дельта счётчика",

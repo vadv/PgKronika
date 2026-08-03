@@ -542,6 +542,7 @@
   "healthLine.provenance.completedBuckets": "completed verdict buckets",
   "healthLine.provenance.formingTailExcluded": "health bucket; a forming Live tail is excluded",
   "healthLine.provenance.noVerdicts": "No server health verdicts in the selected window",
+  "healthLine.provenance.healthUnavailable": "Health verdicts unavailable — score has no current verdict input",
   "semantic.kind.G.label": "Gauge",
   "semantic.kind.G.explanation": "Value observed at a point in time",
   "semantic.kind.ΔC.label": "Counter delta",

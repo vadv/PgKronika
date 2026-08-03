@@ -453,6 +453,12 @@ export function Spine(props: SpineProps) {
     { code: "spine", query: spine },
     { code: "events", query: events },
   ].filter(({ query }) => query.error !== null && !isWarmingUp(query.error));
+  // Score provenance is narrower than the persistent Health-line evidence:
+  // the local formula consumes only server health verdicts and incidents.
+  // Spine series and event glyph availability cannot change this score.
+  const scoreHealthUnavailable =
+    health.error !== null && !isWarmingUp(health.error);
+  const scoreIncidentsUnavailable = incidents.error !== null;
   const failed =
     cold && !warming && sourceFailures.length === evidenceQueries.length;
   const empty =
@@ -661,17 +667,18 @@ export function Spine(props: SpineProps) {
             sampling: `${bucketSpanUs} µs · ${t("healthLine.provenance.formingTailExcluded")}`,
             verdictRule: t("healthLine.provenance.verdictRule"),
             revision: health.data?.health_policy_version,
-            state: !hasCurrent
-              ? "gap"
-              : sourceFailures.length > 0 || incidents.error !== null
+            state:
+              scoreHealthUnavailable || scoreIncidentsUnavailable
                 ? "partial"
-                : undefined,
-            reason: !hasCurrent
-              ? t("healthLine.provenance.noVerdicts")
-              : incidents.error !== null
+                : !hasCurrent
+                  ? "gap"
+                  : undefined,
+            reason: scoreHealthUnavailable
+              ? t("healthLine.provenance.healthUnavailable")
+              : scoreIncidentsUnavailable
                 ? t("spine.score.incidentsUnavailable")
-                : sourceFailures.length > 0
-                  ? t("healthLine.partial", { sources: sourceList })
+                : !hasCurrent
+                  ? t("healthLine.provenance.noVerdicts")
                   : undefined,
           }}
         />

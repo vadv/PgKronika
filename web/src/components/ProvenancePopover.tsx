@@ -75,9 +75,17 @@ export function ProvenancePopover(props: ProvenancePopoverProps) {
   const popoverRef = useRef<HTMLDivElement>(null);
   const id = useId();
 
-  const close = useCallback(() => {
+  const close = useCallback((afterPointerDefault = false) => {
     setOpen(false);
-    triggerRef.current?.focus();
+    const restore = () => triggerRef.current?.focus();
+    if (afterPointerDefault) {
+      // A real browser focuses the outside pointer target after pointerdown
+      // listeners return. Restore in the microtask checkpoint after that
+      // default action, not in the intermediate pointerdown state.
+      queueMicrotask(restore);
+    } else {
+      restore();
+    }
   }, []);
 
   const place = useCallback(() => {
@@ -119,7 +127,7 @@ export function ProvenancePopover(props: ProvenancePopoverProps) {
       ) {
         return;
       }
-      close();
+      close(true);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;

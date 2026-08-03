@@ -77,7 +77,7 @@ test.each(["Enter", " "])(
   },
 );
 
-test("outside pointer closes and restores trigger focus", () => {
+test("outside activation restores trigger focus after the browser default focuses its target", async () => {
   renderEnglish(
     <div>
       <ProvenancePopover
@@ -88,10 +88,16 @@ test("outside pointer closes and restores trigger focus", () => {
     </div>,
   );
   const trigger = screen.getByRole("button", { name: "Show provenance" });
+  const outside = screen.getByRole("button", { name: "Outside" });
   fireEvent.click(trigger);
-  fireEvent.pointerDown(screen.getByRole("button", { name: "Outside" }));
+  fireEvent.pointerDown(outside);
+  // Chromium focuses the pointer target as the pointerdown default action,
+  // after the document listener has run. Reproduce that ordering explicitly.
+  outside.focus();
+  fireEvent.click(outside);
   expect(screen.queryByRole("dialog")).toBeNull();
-  expect(document.activeElement).toBe(trigger);
+  expect(document.activeElement).toBe(outside);
+  await waitFor(() => expect(document.activeElement).toBe(trigger));
 });
 
 test("all supplied fields render in contract order and formula wraps", () => {

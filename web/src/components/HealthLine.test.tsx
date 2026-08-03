@@ -32,7 +32,9 @@ function response(body: unknown): Response {
   });
 }
 
-function stubHealthFetch() {
+type FailingSource = "health" | "spine" | "events" | "incidents";
+
+function stubHealthFetch(failing: readonly FailingSource[] = []) {
   const points = Array.from({ length: 96 }, (_, index) =>
     makeHealthPoint({
       interval: {
@@ -49,15 +51,24 @@ function stubHealthFetch() {
         : input instanceof Request
           ? input.url
           : input.href;
+    const fails = (source: FailingSource) => failing.includes(source);
     if (url.includes("/v1/timeline/health")) {
+      if (fails("health"))
+        return Promise.resolve(new Response("health down", { status: 500 }));
       return Promise.resolve(response(makeHealthResponse({ points })));
     }
     if (url.includes("/v1/timeline/events")) {
+      if (fails("events"))
+        return Promise.resolve(new Response("events down", { status: 500 }));
       return Promise.resolve(response(makeEventsResponse({ events: [] })));
     }
     if (url.includes("/v1/incidents")) {
+      if (fails("incidents"))
+        return Promise.resolve(new Response("incidents down", { status: 500 }));
       return Promise.resolve(response(makeIncidentsResponse()));
     }
+    if (fails("spine"))
+      return Promise.resolve(new Response("spine down", { status: 500 }));
     return Promise.resolve(
       response(
         makeSpineResponse({
@@ -85,8 +96,8 @@ function HoverProbe() {
   return <output aria-label="external hover">{hoverUs ?? "none"}</output>;
 }
 
-function renderHealthLine() {
-  vi.stubGlobal("fetch", stubHealthFetch());
+function renderHealthLine(failing: readonly FailingSource[] = []) {
+  vi.stubGlobal("fetch", stubHealthFetch(failing));
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -148,6 +159,43 @@ test("Health score provenance uses the exact selected server window and document
   expect(dialog.textContent).toContain("96/96");
   expect(dialog.textContent).not.toMatch(/root cause/i);
 });
+
+test.each(["spine", "events"] as const)(
+  "%s failure stays visible on the Health line but does not make score provenance partial",
+  async (source) => {
+    renderHealthLine([source]);
+    const trigger = await screen.findByRole("button", {
+      name: "healthLine.provenance.trigger",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("health-line-source-state")).toBeDefined(),
+    );
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.querySelector('[data-field="state"]')).toBeNull();
+    expect(dialog.querySelector('[data-field="reason"]')).toBeNull();
+  },
+);
+
+test.each([
+  ["health", "healthLine.provenance.healthUnavailable"],
+  ["incidents", "spine.score.incidentsUnavailable"],
+] as const)(
+  "%s failure marks score provenance partial with its exact relevant reason",
+  async (source, reason) => {
+    renderHealthLine([source]);
+    const trigger = await screen.findByRole("button", {
+      name: "healthLine.provenance.trigger",
+    });
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole("dialog");
+    const state = dialog.querySelector('[data-field="state"]');
+    expect(state?.querySelector('[data-state="partial"]')).not.toBeNull();
+    expect(
+      dialog.querySelector('[data-field="reason"]')?.textContent,
+    ).toContain(reason);
+  },
+);
 
 test("pointer hover writes the shared time bucket for an external consumer", async () => {
   renderHealthLine();
