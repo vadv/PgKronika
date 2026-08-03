@@ -18,6 +18,7 @@ const TABLES_SHOT = `${OUT_DIR}forensic-tables-1920x1080.png`;
 const INDEXES_SHOT = `${OUT_DIR}forensic-indexes-1920x1080.png`;
 const VACUUM_SHOT = `${OUT_DIR}forensic-vacuum-1920x1080.png`;
 const EVENTS_SHOT = `${OUT_DIR}forensic-events-1920x1080.png`;
+const STATEMENTS_COMPACT_SHOT = `${OUT_DIR}forensic-statements-1440x900.png`;
 const EVENTS_COMPACT_SHOT = `${OUT_DIR}forensic-events-1440x900.png`;
 const FAILURE_SHOT = `${OUT_DIR}forensic-shell-1920x1080-failure.png`;
 
@@ -117,6 +118,20 @@ async function measure(page) {
         height: box.height,
       };
     };
+    const optionalRect = (selector) => {
+      const element = document.querySelector(selector);
+      if (!(element instanceof HTMLElement || element instanceof SVGElement))
+        return null;
+      const box = element.getBoundingClientRect();
+      return {
+        top: box.top,
+        bottom: box.bottom,
+        left: box.left,
+        right: box.right,
+        width: box.width,
+        height: box.height,
+      };
+    };
 
     const matrixBody = required('[data-testid="ranked-matrix-body"]');
     const matrixRect = matrixBody.getBoundingClientRect();
@@ -158,13 +173,18 @@ async function measure(page) {
       root: {
         scrollHeight: root.scrollHeight,
         clientHeight: root.clientHeight,
+        scrollWidth: root.scrollWidth,
+        clientWidth: root.clientWidth,
+        scrollY,
       },
       regions: {
         global: rect('[data-shell-region="global-context"]'),
         navigation: rect('[data-shell-region="primary-navigation"]'),
         health: rect('[data-shell-region="health-line"]'),
         screenContext: rect('[data-shell-region="screen-context"]'),
-        analyticalCenter: rect('[data-shell-region="analytical-center"]'),
+        analyticalCenter: optionalRect(
+          '[data-shell-region="analytical-center"]',
+        ),
         matrix: rect('[data-shell-region="ranked-matrix"]'),
         matrixBody: rect('[data-testid="ranked-matrix-body"]'),
         status: rect('[data-shell-region="status"]'),
@@ -176,6 +196,20 @@ async function measure(page) {
         evidenceTop,
         visibleRows: visibleRowHeights.length,
         visibleRowHeights,
+      },
+      statements: {
+        workspace: rect('[data-testid="statements-workspace"]'),
+        controls: rect(".statements-workspace__controls"),
+        timeMatrix: rect('[data-testid="statements-time-matrix"]'),
+        timeline: rect(".statements-time-matrix__timeline"),
+        detachedHeatmap:
+          document.querySelector('[data-testid="heatmap-time-grid"]') !== null,
+        temporalRows: document.querySelectorAll(
+          '[data-testid="statements-time-matrix"] [data-testid="temporal-row"]',
+        ).length,
+        bucketCells: document.querySelectorAll(
+          '[data-testid="statements-time-matrix"] [data-testid="time-matrix-bucket"]',
+        ).length,
       },
       motion,
       rowCount: matrixBody.querySelectorAll("tbody tr").length,
@@ -284,24 +318,44 @@ async function verifyStatementsWorkspace(page) {
         throw new Error("ranked matrix body is missing");
       }
       const table = body.querySelector('table[aria-label="statements"]');
-      const heatmap = document.querySelector(
-        '[data-testid="heatmap-time-grid"]',
-      );
       const heatmapRequest = performance
         .getEntriesByType("resource")
         .map((entry) => entry.name)
-        .find((url) => url.includes("/v1/timeline/heatmap"));
+        .find(
+          (url) =>
+            url.includes("/v1/timeline/heatmap") &&
+            new URL(url).searchParams.get("view") === "statements",
+        );
+      const temporalRows = body.querySelectorAll(
+        '[data-testid="temporal-row"]',
+      );
+      const bucketCells = body.querySelectorAll(
+        '[data-testid="time-matrix-bucket"]',
+      );
       return {
         loaded: Number(body.dataset.loadedRows ?? "0"),
         rendered: Number(body.dataset.renderedRows ?? "0"),
         domRows: body.querySelectorAll("tr[data-entity]").length,
         spacerRows: body.querySelectorAll("tr[data-virtual-spacer]").length,
         ariaRowCount: Number(table?.getAttribute("aria-rowcount") ?? "0"),
-        heatmapCells: heatmap?.querySelectorAll("[data-cell]").length ?? 0,
+        detachedHeatmap:
+          document.querySelector('[data-testid="heatmap-time-grid"]') !== null,
+        temporalRows: temporalRows.length,
+        bucketCells: bucketCells.length,
+        timeMatrixBuckets:
+          temporalRows.length === 0
+            ? 0
+            : temporalRows[0].querySelectorAll(
+                '[data-testid="time-matrix-bucket"]',
+              ).length,
         heatmapBuckets:
           heatmapRequest === undefined
             ? null
             : Number(new URL(heatmapRequest).searchParams.get("buckets")),
+        heatmapTop:
+          heatmapRequest === undefined
+            ? null
+            : Number(new URL(heatmapRequest).searchParams.get("top")),
       };
     }, bodySelector);
 
@@ -512,9 +566,23 @@ async function verifyStatementsWorkspace(page) {
   if (final.spacerRows > 2) {
     failures.push(`virtual spacer rows ${final.spacerRows}, expected <= 2`);
   }
-  if (initial.heatmapBuckets !== 96 || initial.heatmapCells < 96) {
+  if (
+    initial.detachedHeatmap ||
+    initial.heatmapBuckets !== 96 ||
+    initial.heatmapTop !== 64 ||
+    initial.timeMatrixBuckets !== 96 ||
+    initial.temporalRows < 1 ||
+    initial.bucketCells !== initial.temporalRows * 96
+  ) {
     failures.push(
-      `heatmap contract buckets=${initial.heatmapBuckets}, cells=${initial.heatmapCells}`,
+      `integrated heatmap contract ${JSON.stringify({
+        detached: initial.detachedHeatmap,
+        buckets: initial.heatmapBuckets,
+        top: initial.heatmapTop,
+        rowBuckets: initial.timeMatrixBuckets,
+        temporalRows: initial.temporalRows,
+        cells: initial.bucketCells,
+      })}`,
     );
   }
   if (inputLatencyMs > 100) {
@@ -1454,17 +1522,20 @@ function assertContract(metrics, keyboard) {
       `root scrollHeight ${metrics.root.scrollHeight}, expected <= 1080`,
     );
   }
-  for (const name of [
-    "health",
-    "screenContext",
-    "analyticalCenter",
-    "matrix",
-    "status",
-  ]) {
+  if (
+    metrics.root.scrollWidth > metrics.root.clientWidth ||
+    metrics.root.scrollY !== 0
+  ) {
+    failures.push(`document owns overflow: ${JSON.stringify(metrics.root)}`);
+  }
+  for (const name of ["health", "screenContext", "matrix", "status"]) {
     const region = metrics.regions[name];
     if (region.top < 0 || region.bottom > 1080 || region.height <= 0) {
       failures.push(`${name} is not fully visible: ${JSON.stringify(region)}`);
     }
+  }
+  if (metrics.regions.analyticalCenter !== null) {
+    failures.push("Statements still renders a detached analytical center");
   }
   if (!["auto", "scroll"].includes(metrics.matrix.overflowY)) {
     failures.push(
@@ -1476,14 +1547,44 @@ function assertContract(metrics, keyboard) {
       `matrix is not independently scrollable: ${metrics.matrix.scrollHeight} <= ${metrics.matrix.clientHeight}`,
     );
   }
-  if (metrics.matrix.visibleRows < 16) {
+  if (metrics.matrix.visibleRows < 18 || metrics.matrix.visibleRows > 40) {
     failures.push(
-      `visible matrix rows ${metrics.matrix.visibleRows}, expected >= 16`,
+      `visible matrix rows ${metrics.matrix.visibleRows}, expected 18..40`,
     );
   }
   if (metrics.matrix.visibleRowHeights.some((height) => height < 28)) {
     failures.push(
       `visible matrix row below 28px: ${Math.min(...metrics.matrix.visibleRowHeights)}`,
+    );
+  }
+  if (metrics.statements.detachedHeatmap) {
+    failures.push("Statements has a detached heatmap grid");
+  }
+  if (
+    metrics.statements.temporalRows < 18 ||
+    metrics.statements.temporalRows > 40 ||
+    metrics.statements.bucketCells !== metrics.statements.temporalRows * 96 ||
+    metrics.statements.bucketCells > 40 * 96
+  ) {
+    failures.push(
+      `bounded temporal DOM failed: ${JSON.stringify(metrics.statements)}`,
+    );
+  }
+  if (
+    metrics.statements.timeline.width / metrics.statements.timeMatrix.width <
+    0.45
+  ) {
+    failures.push(
+      `timeline ratio ${metrics.statements.timeline.width / metrics.statements.timeMatrix.width}, expected >= 0.45`,
+    );
+  }
+  if (
+    metrics.statements.controls.top < 0 ||
+    metrics.statements.controls.bottom > 1080 ||
+    metrics.statements.controls.height <= 0
+  ) {
+    failures.push(
+      `matrix controls are not visible: ${JSON.stringify(metrics.statements.controls)}`,
     );
   }
   const durationMs = (value) =>
@@ -1515,6 +1616,101 @@ function assertContract(metrics, keyboard) {
       `${failures.join("\n")}\nmeasurements: ${JSON.stringify(metrics, null, 2)}`,
     );
   }
+}
+
+async function verifyStatementsCompact(page, base, at) {
+  await page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1 });
+  await page.goto(`${base}/#source=local&view=statements&at=${at}&span=3600`, {
+    waitUntil: "networkidle0",
+  });
+  await page.waitForSelector(
+    '[data-testid="statements-time-matrix"] tr[data-entity]',
+    { timeout: 15_000 },
+  );
+  const compact = await page.evaluate(() => {
+    const required = (selector) => {
+      const element = document.querySelector(selector);
+      if (!(element instanceof HTMLElement))
+        throw new Error(`missing compact selector ${selector}`);
+      return element;
+    };
+    const box = (selector) => {
+      const rect = required(selector).getBoundingClientRect();
+      return {
+        top: rect.top,
+        bottom: rect.bottom,
+        left: rect.left,
+        right: rect.right,
+        width: rect.width,
+        height: rect.height,
+      };
+    };
+    const root = document.documentElement;
+    const body = required('[data-testid="ranked-matrix-body"]');
+    return {
+      viewport: { width: innerWidth, height: innerHeight },
+      root: {
+        clientWidth: root.clientWidth,
+        scrollWidth: root.scrollWidth,
+        clientHeight: root.clientHeight,
+        scrollHeight: root.scrollHeight,
+        scrollY,
+      },
+      health: box('[data-shell-region="health-line"]'),
+      controls: box(".statements-workspace__controls"),
+      matrix: box('[data-testid="statements-time-matrix"]'),
+      matrixBody: {
+        clientWidth: body.clientWidth,
+        scrollWidth: body.scrollWidth,
+        overflowX: getComputedStyle(body).overflowX,
+      },
+      detachedHeatmap:
+        document.querySelector('[data-testid="heatmap-time-grid"]') !== null,
+      buckets:
+        document
+          .querySelector('[data-testid="temporal-row"]')
+          ?.querySelectorAll('[data-testid="time-matrix-bucket"]').length ?? 0,
+    };
+  });
+  const failures = [];
+  if (compact.viewport.width !== 1440 || compact.viewport.height !== 900)
+    failures.push(`viewport ${JSON.stringify(compact.viewport)}`);
+  if (
+    compact.root.scrollHeight > compact.root.clientHeight ||
+    compact.root.scrollWidth > compact.root.clientWidth ||
+    compact.root.scrollY !== 0
+  ) {
+    failures.push(`root owns overflow ${JSON.stringify(compact.root)}`);
+  }
+  if (
+    compact.matrixBody.scrollWidth <= compact.matrixBody.clientWidth ||
+    !["auto", "scroll"].includes(compact.matrixBody.overflowX)
+  ) {
+    failures.push(
+      `matrix does not own horizontal overflow ${JSON.stringify(compact.matrixBody)}`,
+    );
+  }
+  if (
+    compact.health.top < 0 ||
+    compact.health.bottom > 900 ||
+    compact.controls.top < 0 ||
+    compact.controls.bottom > 900 ||
+    compact.matrix.top < 0 ||
+    compact.matrix.bottom <= compact.matrix.top
+  ) {
+    failures.push("Health line, controls, or matrix is outside the viewport");
+  }
+  if (compact.detachedHeatmap || compact.buckets !== 96)
+    failures.push(
+      `compact heatmap detached=${compact.detachedHeatmap}, buckets=${compact.buckets}`,
+    );
+  if (failures.length > 0)
+    throw new Error(
+      `Statements 1440x900: ${failures.join("; ")}\n${JSON.stringify(compact, null, 2)}`,
+    );
+  await page.screenshot({ path: STATEMENTS_COMPACT_SHOT });
+  await page.setViewport(VIEWPORT);
+  return compact;
 }
 
 await mkdir(OUT_DIR, { recursive: true });
@@ -1581,6 +1777,7 @@ try {
       document.activeElement.blur();
   });
   await page.screenshot({ path: SUCCESS_SHOT });
+  const statementsCompact = await verifyStatementsCompact(page, base, at);
   const activityPlans = await verifyActivityPlansWorkspaces(page, base, at);
   const infrastructure = await verifyInfrastructureWorkspaces(page, base, at);
   const events = await verifyEventsWorkspace(page, base, at);
@@ -1590,6 +1787,7 @@ try {
         ...metrics,
         keyboard,
         statements,
+        statementsCompact,
         globalSearchDetail,
         activityPlans,
         infrastructure,
@@ -1600,6 +1798,7 @@ try {
     )}`,
   );
   console.log(`approved screenshot: ${SUCCESS_SHOT}`);
+  console.log(`approved screenshot: ${STATEMENTS_COMPACT_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_SHOT}`);
   console.log(`approved screenshot: ${PLANS_SHOT}`);
   console.log(`approved screenshot: ${OS_SHOT}`);
