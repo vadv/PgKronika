@@ -31,6 +31,9 @@ export function Toolbar(props: ToolbarProps) {
   const { t } = useTranslation();
   const filterHintId = useId();
   const [draft, setDraft] = useState(props.q ?? "");
+  const [focusedLensReason, setFocusedLensReason] = useState<string | null>(
+    null,
+  );
   // The filter can also change from outside (URL state); adopt it then.
   const [prevQ, setPrevQ] = useState(props.q);
   if (prevQ !== props.q) {
@@ -74,14 +77,19 @@ export function Toolbar(props: ToolbarProps) {
               key={lens.code}
               type="button"
               aria-pressed={active}
+              aria-disabled={!available}
               aria-label={`${t(`lens.${lens.code}`, {
                 defaultValue: t(`preset.${lens.code}`, {
                   defaultValue: lens.code,
                 }),
               })}${available ? "" : ` · ${title}`}`}
               title={title}
-              disabled={!available}
+              onFocus={() => {
+                if (!available) setFocusedLensReason(title);
+              }}
+              onBlur={() => setFocusedLensReason(null)}
               onClick={() => {
+                if (!available) return;
                 if (!active) props.onSelectPreset(lens.preset);
                 else if (props.lenses === undefined) props.onSelectPreset(null);
               }}
@@ -140,10 +148,11 @@ export function Toolbar(props: ToolbarProps) {
           {props.filterHint}
         </span>
       )}
-      {props.contextNote !== undefined && (
+      {(focusedLensReason ?? props.contextNote) !== undefined && (
         <span
-          role="note"
-          title={props.contextNote}
+          role={focusedLensReason === null ? "note" : "status"}
+          aria-live={focusedLensReason === null ? undefined : "polite"}
+          title={focusedLensReason ?? props.contextNote}
           style={{
             minWidth: 0,
             maxWidth: "320px",
@@ -154,7 +163,7 @@ export function Toolbar(props: ToolbarProps) {
             whiteSpace: "nowrap",
           }}
         >
-          {props.contextNote}
+          {focusedLensReason ?? props.contextNote}
         </span>
       )}
       {props.matched !== null && (

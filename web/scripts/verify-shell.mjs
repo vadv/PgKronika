@@ -298,6 +298,77 @@ async function verifyStatementsWorkspace(page) {
     }, bodySelector);
 
   const initial = await read();
+  const commitFilter = async (value, expectedLoaded, expectedAriaRowCount) => {
+    await page.evaluate(async (nextValue) => {
+      const search = document.querySelector('input[type="search"]');
+      if (!(search instanceof HTMLInputElement)) {
+        throw new Error("statement filter is missing");
+      }
+      const setValue = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      if (setValue === undefined) {
+        throw new Error("input value setter is missing");
+      }
+      setValue.call(search, nextValue);
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      search.focus();
+      await new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      );
+    }, value);
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(
+      (selector, loaded, rowCount) => {
+        const body = document.querySelector(selector);
+        const table = body?.querySelector('table[aria-label="statements"]');
+        return (
+          body instanceof HTMLElement &&
+          Number(body.dataset.loadedRows ?? "-1") === loaded &&
+          Number(table?.getAttribute("aria-rowcount") ?? "-1") === rowCount
+        );
+      },
+      { timeout: 10_000 },
+      bodySelector,
+      expectedLoaded,
+      expectedAriaRowCount,
+    );
+    return read();
+  };
+  const lazySqlFilter = await commitFilter("*cart_items*", 0, 1);
+  const databaseFilter = await commitFilter("database=orders", 200, 501);
+  const restoredFilter = await commitFilter("", 200, 1001);
+  const filterSemantics = {
+    lazySqlMatched: lazySqlFilter.ariaRowCount - 1,
+    databaseMatched: databaseFilter.ariaRowCount - 1,
+    restoredMatched: restoredFilter.ariaRowCount - 1,
+  };
+  const bufferHitRange = await page.evaluate(async () => {
+    const state = new URLSearchParams(location.hash.slice(1));
+    const params = new URLSearchParams({
+      at: state.get("at") ?? String(Date.now() * 1000),
+      span: `${state.get("span") ?? "3600"}s`,
+      preset: "io",
+      limit: "200",
+    });
+    const response = await fetch(`/v1/frame/statements?${params}`);
+    if (!response.ok)
+      throw new Error(`buffer lens returned ${response.status}`);
+    const frame = await response.json();
+    const index = frame.columns.findIndex(
+      (column) => column.code === "hit_pct",
+    );
+    if (index < 0) throw new Error("buffer lens omitted hit_pct");
+    const values = frame.rows
+      .map((row) => row.cells[index])
+      .filter((value) => typeof value === "number");
+    return {
+      count: values.length,
+      min: Math.min(...values),
+      max: Math.max(...values),
+    };
+  });
   const pages = [initial.loaded];
   while (await page.$(loadMoreSelector)) {
     const before = pages.at(-1) ?? 0;
@@ -444,6 +515,20 @@ async function verifyStatementsWorkspace(page) {
     );
   }
   if (
+    filterSemantics.lazySqlMatched !== 0 ||
+    filterSemantics.databaseMatched !== 500 ||
+    filterSemantics.restoredMatched !== 1000
+  ) {
+    failures.push(`filter semantics ${JSON.stringify(filterSemantics)}`);
+  }
+  if (
+    bufferHitRange.count === 0 ||
+    bufferHitRange.min < 0 ||
+    bufferHitRange.max > 100
+  ) {
+    failures.push(`invalid buffer hit range ${JSON.stringify(bufferHitRange)}`);
+  }
+  if (
     firstEntity === null ||
     arrowEntity === null ||
     firstEntity === arrowEntity
@@ -465,6 +550,8 @@ async function verifyStatementsWorkspace(page) {
     pages,
     final,
     inputLatencyMs,
+    filterSemantics,
+    bufferHitRange,
     keyboard: { firstEntity, arrowEntity },
     detail,
   };

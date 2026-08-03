@@ -207,6 +207,71 @@ test("five server pages stay deduplicated and DOM-bounded", async () => {
   expect(screen.queryByRole("button", { name: /table.more/ })).toBeNull();
 });
 
+test("keeps first-page columns and total while a continuation is pending", async () => {
+  let resolveContinuation: ((response: Response) => void) | undefined;
+  const continuation = new Promise<Response>((resolve) => {
+    resolveContinuation = resolve;
+  });
+  const first = makeFrameResponse({
+    view: "activity",
+    columns: [
+      makeFrameColumn({ code: "xact", type: "i64" }),
+      makeFrameColumn({ code: "query", type: "text" }),
+    ],
+    rows: [makeFrameRow({ entity: "db:1", cells: [5, "select 1"] })],
+    page: { matched: 2, returned: 1, next: "cursor-1" },
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href;
+      return url.includes("cursor=cursor-1")
+        ? continuation
+        : Promise.resolve(
+            new Response(JSON.stringify(first), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+    }),
+  );
+  renderTable();
+  const table = await screen.findByRole("table", { name: "activity" });
+  await waitFor(() => expect(screen.getByText("select 1")).toBeDefined());
+  expect(table.getAttribute("aria-rowcount")).toBe("3");
+
+  fireEvent.click(screen.getByRole("button", { name: /table.more/ }));
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("button", { name: /table.more/ }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true),
+  );
+  expect(screen.getByText("select 1")).toBeDefined();
+  expect(screen.getByRole("button", { name: "xact" })).toBeDefined();
+  expect(table.getAttribute("aria-rowcount")).toBe("3");
+
+  resolveContinuation?.(
+    new Response(
+      JSON.stringify(
+        makeFrameResponse({
+          view: "activity",
+          columns: first.columns,
+          rows: [makeFrameRow({ entity: "db:2", cells: [6, "select 2"] })],
+          page: { matched: 2, returned: 1 },
+        }),
+      ),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+  );
+  await waitFor(() => expect(screen.getByText("select 2")).toBeDefined());
+});
+
 test("sort header click cycles desc, asc, cleared", async () => {
   const onSort = vi.fn();
   stubFrame(frameBody());

@@ -702,3 +702,72 @@ test("switching view keeps a preset both views share", async () => {
     "memory",
   );
 });
+
+test("switching a statement lens drops the prior explicit sort", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=statements&preset=time&sort=rows&order=desc`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const statements = availableCatalog.views.find(
+    (view) => view.code === "statements",
+  );
+  if (statements !== undefined) {
+    statements.availability = "available";
+    statements.presets = [
+      {
+        code: "time",
+        columns: ["total", "rows"],
+        sort: { column: "total", order: "desc" },
+      },
+      {
+        code: "io",
+        columns: ["blks_read"],
+        sort: { column: "blks_read", order: "desc" },
+      },
+    ];
+    statements.columns = [
+      {
+        availability: "available",
+        code: "total",
+        lazy: false,
+        requires: [],
+        type: "f64",
+      },
+      {
+        availability: "available",
+        code: "rows",
+        lazy: false,
+        requires: [],
+        type: "u64",
+      },
+      {
+        availability: "available",
+        code: "blks_read",
+        lazy: false,
+        requires: [],
+        type: "u64",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href;
+    return new URL(url).pathname === "/v1/ui/catalog"
+      ? Promise.resolve(jsonResponse(availableCatalog))
+      : baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  fireEvent.click(await screen.findByRole("button", { name: /buffers/i }));
+  const params = new URLSearchParams(location.hash.slice(1));
+  expect(params.get("preset")).toBe("io");
+  expect(params.get("sort")).toBeNull();
+  expect(params.get("order")).toBeNull();
+});

@@ -227,6 +227,10 @@ function Shell() {
         },
       ]
     : undefined;
+  // A preset owns its default ranking. Carrying an explicit sort from the
+  // previous lens can leave the matrix invisibly ranked by a hidden column.
+  const selectPreset = (preset: string | null) =>
+    patch({ preset, sort: null, order: null });
 
   const globalContext = (
     <Header
@@ -391,7 +395,7 @@ function Shell() {
                 preset={effectivePreset}
                 q={state.q}
                 matched={matched}
-                onSelectPreset={(preset) => patch({ preset })}
+                onSelectPreset={selectPreset}
                 onFilter={(q) => patch({ q })}
                 lenses={statementLenses}
                 contextNote={t("statements.evidenceNote")}
@@ -516,7 +520,7 @@ function Shell() {
                   preset={effectivePreset}
                   q={state.q}
                   matched={matched}
-                  onSelectPreset={(preset) => patch({ preset })}
+                  onSelectPreset={selectPreset}
                   onFilter={(q) => patch({ q })}
                   lenses={statementLenses}
                   contextNote={

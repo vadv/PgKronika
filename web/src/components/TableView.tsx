@@ -50,6 +50,8 @@ interface Pages {
   key: string;
   rows: FrameRowDto[];
   next: string | null;
+  columns: FrameColumnDto[];
+  matched: number;
 }
 
 /** Column types the backend accepts as frame sort keys. */
@@ -213,6 +215,8 @@ function TableViewImpl(props: TableViewProps) {
         data.page.matched,
       ),
       next: data.page.next ?? null,
+      columns: p !== null && p.key === frameKey ? p.columns : data.columns,
+      matched: data.page.matched,
     }));
     setCursorState(null);
   }, [frame.data, cursor, frameKey]);
@@ -230,6 +234,8 @@ function TableViewImpl(props: TableViewProps) {
             key: frameKey,
             rows: boundedUniqueRows([], data.rows, data.page.matched),
             next: data.page.next ?? null,
+            columns: data.columns,
+            matched: data.page.matched,
           },
     );
     // The fresh first page after a cursor expiry replaces the dead one.
@@ -267,9 +273,12 @@ function TableViewImpl(props: TableViewProps) {
   );
   const columnSpec = new Map(props.view.columns.map((c) => [c.code, c]));
 
+  const accumulated = pages !== null && pages.key === frameKey ? pages : null;
+  const responseColumns = frame.data?.columns ?? accumulated?.columns ?? [];
+  const matched = frame.data?.page.matched ?? accumulated?.matched ?? 0;
   const columns: DisplayColumn[] = [];
-  if (frame.data !== undefined) {
-    frame.data.columns.forEach((column, cellIndex) => {
+  if (responseColumns.length > 0) {
+    responseColumns.forEach((column, cellIndex) => {
       // `hidden` columns are materialized only for sort/filter — never shown.
       // Unavailable (gated/not_collected) columns stay visible as honest
       // nulls with their availability reason instead of being dropped.
@@ -392,7 +401,7 @@ function TableViewImpl(props: TableViewProps) {
       >
         <table
           aria-label={props.view.code}
-          aria-rowcount={(frame.data?.page.matched ?? rows.length) + 1}
+          aria-rowcount={(matched || rows.length) + 1}
           style={{ borderCollapse: "collapse", width: "100%" }}
         >
           <thead>
