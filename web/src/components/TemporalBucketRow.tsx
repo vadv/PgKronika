@@ -69,7 +69,7 @@ export function TemporalBucketRow(props: {
   baselineUs: string | null;
   metricLabel: string;
   max?: number;
-  mode?: "range" | "point_samples" | "interval_estimates";
+  mode?: "range" | "point_samples" | "interval_estimates" | "plan_intervals";
 }) {
   const { t } = useTranslation();
   const mode = props.mode ?? "range";
@@ -103,7 +103,12 @@ export function TemporalBucketRow(props: {
             entity: props.row?.label,
             metric: props.metricLabel,
           })
-        : `${props.row?.label} · ${props.metricLabel}`;
+        : mode === "plan_intervals"
+          ? t("plans.matrix.intervalRowLabel", {
+              entity: props.row?.label,
+              metric: props.metricLabel,
+            })
+          : `${props.row?.label} · ${props.metricLabel}`;
 
   return (
     <div
@@ -113,7 +118,9 @@ export function TemporalBucketRow(props: {
           ? "activity-sample-row"
           : mode === "interval_estimates"
             ? "activity-interval-row"
-            : "temporal-row"
+            : mode === "plan_intervals"
+              ? "plans-interval-row"
+              : "temporal-row"
       }
       data-mode={mode}
       data-evidence={props.row === null ? "unavailable" : "available"}
@@ -124,7 +131,9 @@ export function TemporalBucketRow(props: {
                 ? mode === "interval_estimates"
                   ? "activity.matrix.intervalUnavailable"
                   : "activity.matrix.seriesUnavailable"
-                : "statements.matrix.seriesUnavailable",
+                : mode === "plan_intervals"
+                  ? "plans.matrix.seriesUnavailable"
+                  : "statements.matrix.seriesUnavailable",
             )
           : availableLabel
       }
@@ -160,7 +169,9 @@ export function TemporalBucketRow(props: {
                 ? "activity.matrix.bucketValue"
                 : mode === "interval_estimates"
                   ? "activity.matrix.intervalValue"
-                  : "statements.matrix.bucketValue",
+                  : mode === "plan_intervals"
+                    ? "plans.matrix.bucketValue"
+                    : "statements.matrix.bucketValue",
               {
                 time,
                 metric: props.metricLabel,

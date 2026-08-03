@@ -169,7 +169,11 @@ const planFrame = makeFrameResponse({
 });
 
 const heatmap: HeatmapResponse = {
-  grid: { from_us: "1722390000000000", to_us: "1722400000000000", bucket_count: 96 },
+  grid: {
+    from_us: "1722390000000000",
+    to_us: "1722400000000000",
+    bucket_count: 96,
+  },
   ranking: { exact: true, unseen_upper: 0 },
   quality: makeHeatmapQuality({ snapshots: 88 }),
   rows: [
@@ -240,9 +244,9 @@ test("builds one dense Plans matrix with bounded regression evidence", async () 
   expect(provenance.textContent).toContain(
     "vadv_queryid_stat_statements_dbid_userid_attribution",
   );
-  expect(await screen.findAllByTestId("plan-observation-envelope")).toHaveLength(
-    3,
-  );
+  expect(
+    await screen.findAllByTestId("plan-observation-envelope"),
+  ).toHaveLength(3);
   expect(screen.getByTestId("plan-change-evidence").dataset.provenance).toBe(
     "first_last_observed_only",
   );

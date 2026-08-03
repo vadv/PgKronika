@@ -1122,17 +1122,13 @@ test("Plans owns one row-coupled workspace, change evidence and gated Compare", 
   const availableCatalog = structuredClone(catalogBody);
   const plans = availableCatalog.views.find((view) => view.code === "plans");
   if (plans !== undefined) {
-    plans.presets = [
-      "regression",
-      "time",
-      "io",
-      "rows",
-      "change_timeline",
-    ].map((code) => ({
-      code,
-      columns: [],
-      sort: { column: "metric", order: "desc" as const },
-    }));
+    plans.presets = ["regression", "time", "io", "rows", "change_timeline"].map(
+      (code) => ({
+        code,
+        columns: [],
+        sort: { column: "metric", order: "desc" as const },
+      }),
+    );
     plans.joins = [
       {
         left: "plans",
@@ -1168,9 +1164,9 @@ test("Plans owns one row-coupled workspace, change evidence and gated Compare", 
 
   expect(await screen.findByTestId("plans-workspace")).toBeDefined();
   expect(screen.queryByTestId("workload-analytical-center")).toBeNull();
-  expect(screen.getByTestId("plans-attribution-provenance").textContent).toContain(
-    "ossc_queryid_dbid_userid_attribution",
-  );
+  expect(
+    screen.getByTestId("plans-attribution-provenance").textContent,
+  ).toContain("ossc_queryid_dbid_userid_attribution");
   expect(new URLSearchParams(location.hash.slice(1)).get("preset")).toBeNull();
   expect(screen.getByTestId("plans-workspace").dataset.lens).toBe("regression");
   expect(

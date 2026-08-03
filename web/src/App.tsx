@@ -27,10 +27,10 @@ import { ShellLayout } from "./components/ShellLayout";
 import { HealthLine } from "./components/HealthLine";
 import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
+import { PlansWorkspace } from "./components/PlansWorkspace";
 import { StatementsWorkspace } from "./components/StatementsWorkspace";
 import { TableView } from "./components/TableView";
 import { Toolbar, type PreparedLens } from "./components/Toolbar";
-import { WorkloadEvidencePanel } from "./components/WorkloadEvidencePanel";
 import {
   availableDestinations,
   buildNavigationGroups,
@@ -86,6 +86,7 @@ function activityMetricForPreset(preset: string | null): string {
   }
 }
 const PLAN_LENSES = [
+  ["planRegressionEvidence", "regression"],
   ["planExecution", "time"],
   ["planBuffers", "io"],
   ["planRows", "rows"],
@@ -349,22 +350,17 @@ function Shell() {
   const indexesScreen = activeView?.code === "indexes";
   const vacuumScreen = activeView?.code === "vacuum";
   const eventsScreen = activeView?.code === "events";
-  const workloadEvidenceScreen = plansScreen;
   const infrastructureEvidenceScreen =
     processesScreen || tablesScreen || indexesScreen || vacuumScreen;
-  const evidencePanelScreen =
-    workloadEvidenceScreen || infrastructureEvidenceScreen || eventsScreen;
+  const evidencePanelScreen = infrastructureEvidenceScreen || eventsScreen;
   const denseHeatmapScreen =
-    activityScreen ||
-    plansScreen ||
-    infrastructureEvidenceScreen ||
-    eventsScreen;
+    activityScreen || infrastructureEvidenceScreen || eventsScreen;
   const effectivePreset = statementsScreen
     ? (state.preset ?? "time")
     : activityScreen
       ? (state.preset ?? "overview")
       : plansScreen
-        ? (state.preset ?? "time")
+        ? (state.preset ?? "regression")
         : processesScreen
           ? (state.preset ?? "pressure")
           : tablesScreen
@@ -895,6 +891,80 @@ function Shell() {
               </div>
             </section>
           )}
+          {plansScreen && heatmapReady && (
+            <section
+              data-testid="mobile-plans-workspace"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "var(--space-2)",
+                minWidth: 0,
+              }}
+            >
+              <HealthLine />
+              <PageHeader
+                view={activeView}
+                summary={summary.data?.views.find(
+                  (view) => view.view === state.view,
+                )}
+                matched={matched}
+                live={state.at === null}
+                onOpenIncidents={() => patch({ dock: "incidents" })}
+              />
+              <Toolbar
+                view={activeView}
+                preset={effectivePreset}
+                q={state.q}
+                matched={matched}
+                onSelectPreset={selectPreset}
+                onFilter={(q) => patch({ q })}
+                lenses={preparedLenses}
+                contextNote={evidenceNote}
+                filterHint={filterHint}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  height: "70dvh",
+                  minHeight: "520px",
+                  minWidth: 0,
+                }}
+              >
+                <PlansWorkspace
+                  view={activeView}
+                  at={at}
+                  span={state.span}
+                  from={heatmapRange.from}
+                  to={heatmapRange.to}
+                  metric={selectedMetric}
+                  baselineUs={state.baseline}
+                  preset={effectivePreset}
+                  q={state.q}
+                  sort={state.sort}
+                  order={state.order}
+                  entity={state.entity}
+                  matched={matched}
+                  mobile
+                  onMetricChange={selectMetric}
+                  onSort={onTableSort}
+                  onSelectRow={onSelectRow}
+                  onOpenEntity={(view, entity) =>
+                    patch({
+                      view,
+                      entity,
+                      dock: "row",
+                      preset: null,
+                      q: null,
+                      sort: null,
+                      order: null,
+                    })
+                  }
+                  onMatched={setMatched}
+                />
+              </div>
+            </section>
+          )}
         </div>
       ) : (
         <div
@@ -996,116 +1066,94 @@ function Shell() {
               )}
             </section>
           )}
-          {heatmapReady && !statementsScreen && !activityScreen && (
-            <div
-              data-shell-region="analytical-center"
-              data-testid={
-                workloadEvidenceScreen
-                  ? "workload-analytical-center"
-                  : infrastructureEvidenceScreen
+          {heatmapReady &&
+            !statementsScreen &&
+            !activityScreen &&
+            !plansScreen && (
+              <div
+                data-shell-region="analytical-center"
+                data-testid={
+                  infrastructureEvidenceScreen
                     ? "infrastructure-analytical-center"
                     : eventsScreen
                       ? "events-analytical-center"
                       : undefined
-              }
-              style={{
-                display: "grid",
-                gridTemplateColumns: evidencePanelScreen
-                  ? "minmax(0, 1fr) minmax(320px, 0.32fr)"
-                  : "minmax(0, 1fr)",
-                gap: "var(--space-2)",
-                flex: "0 0 156px",
-                height: "156px",
-                minHeight: 0,
-                overflow: "hidden",
-              }}
-            >
-              <div style={{ minWidth: 0, overflow: "hidden" }}>
-                <HeatmapStrip
-                  view={activeView}
-                  metric={selectedMetric}
-                  from={heatmapRange.from}
-                  to={heatmapRange.to}
-                  selectedRange={range}
-                  cursorUs={at}
-                  hoverUs={hoverUs}
-                  brushDraft={brushDraft}
-                  baselineUs={state.baseline}
-                  buckets={denseHeatmapScreen ? 96 : undefined}
-                  onMetricChange={selectMetric}
-                  onSelectEntity={(entity) => patch({ entity, dock: "row" })}
-                />
+                }
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: evidencePanelScreen
+                    ? "minmax(0, 1fr) minmax(320px, 0.32fr)"
+                    : "minmax(0, 1fr)",
+                  gap: "var(--space-2)",
+                  flex: "0 0 156px",
+                  height: "156px",
+                  minHeight: 0,
+                  overflow: "hidden",
+                }}
+              >
+                <div style={{ minWidth: 0, overflow: "hidden" }}>
+                  <HeatmapStrip
+                    view={activeView}
+                    metric={selectedMetric}
+                    from={heatmapRange.from}
+                    to={heatmapRange.to}
+                    selectedRange={range}
+                    cursorUs={at}
+                    hoverUs={hoverUs}
+                    brushDraft={brushDraft}
+                    baselineUs={state.baseline}
+                    buckets={denseHeatmapScreen ? 96 : undefined}
+                    onMetricChange={selectMetric}
+                    onSelectEntity={(entity) => patch({ entity, dock: "row" })}
+                  />
+                </div>
+                {infrastructureEvidenceScreen && (
+                  <InfrastructureEvidencePanel
+                    view={activeView}
+                    preset={effectivePreset}
+                    at={at}
+                    span={state.span}
+                    from={range.fromUs}
+                    to={range.toUs}
+                    context={context.data}
+                    onOpenEntity={(view, entity) =>
+                      patch({
+                        view,
+                        entity,
+                        dock: "row",
+                        ...(view === state.view
+                          ? {}
+                          : {
+                              preset: null,
+                              q: null,
+                              sort: null,
+                              order: null,
+                            }),
+                      })
+                    }
+                  />
+                )}
+                {eventsScreen && (
+                  <EventsSignalPanel
+                    from={range.fromUs}
+                    to={range.toUs}
+                    preset={effectivePreset}
+                    onInvestigate={(view, atUs) =>
+                      patch({
+                        view,
+                        at: atUs,
+                        preset: null,
+                        sort: null,
+                        order: null,
+                        q: null,
+                        entity: null,
+                        dock: null,
+                      })
+                    }
+                  />
+                )}
               </div>
-              {workloadEvidenceScreen && (
-                <WorkloadEvidencePanel
-                  view={activeView}
-                  preset={effectivePreset}
-                  at={at}
-                  span={state.span}
-                  onOpenEntity={(view, entity) =>
-                    patch({
-                      view,
-                      entity,
-                      dock: "row",
-                      ...(view === state.view
-                        ? {}
-                        : {
-                            preset: null,
-                            q: null,
-                            sort: null,
-                            order: null,
-                          }),
-                    })
-                  }
-                />
-              )}
-              {infrastructureEvidenceScreen && (
-                <InfrastructureEvidencePanel
-                  view={activeView}
-                  preset={effectivePreset}
-                  at={at}
-                  span={state.span}
-                  from={range.fromUs}
-                  to={range.toUs}
-                  context={context.data}
-                  onOpenEntity={(view, entity) =>
-                    patch({
-                      view,
-                      entity,
-                      dock: "row",
-                      ...(view === state.view
-                        ? {}
-                        : {
-                            preset: null,
-                            q: null,
-                            sort: null,
-                            order: null,
-                          }),
-                    })
-                  }
-                />
-              )}
-              {eventsScreen && (
-                <EventsSignalPanel
-                  from={range.fromUs}
-                  to={range.toUs}
-                  preset={effectivePreset}
-                  onInvestigate={(view, atUs) =>
-                    patch({
-                      view,
-                      at: atUs,
-                      preset: null,
-                      sort: null,
-                      order: null,
-                      q: null,
-                      entity: null,
-                      dock: null,
-                    })
-                  }
-                />
-              )}
-            </div>
-          )}
+            )}
           {heatmapReady &&
             (statementsScreen ? (
               <StatementsWorkspace
@@ -1130,6 +1178,42 @@ function Shell() {
               />
             ) : activityScreen ? (
               <ActivityWorkspace
+                view={activeView}
+                at={at}
+                span={state.span}
+                from={heatmapRange.from}
+                to={heatmapRange.to}
+                metric={selectedMetric}
+                baselineUs={state.baseline}
+                preset={effectivePreset}
+                q={frameQuery}
+                sort={state.sort}
+                order={state.order}
+                entity={state.entity}
+                matched={matched}
+                mobile={false}
+                onMetricChange={selectMetric}
+                onSort={onTableSort}
+                onSelectRow={onSelectRow}
+                onOpenEntity={(view, entity) =>
+                  patch({
+                    view,
+                    entity,
+                    dock: "row",
+                    ...(view === state.view
+                      ? {}
+                      : {
+                          preset: null,
+                          q: null,
+                          sort: null,
+                          order: null,
+                        }),
+                  })
+                }
+                onMatched={setMatched}
+              />
+            ) : plansScreen ? (
+              <PlansWorkspace
                 view={activeView}
                 at={at}
                 span={state.span}

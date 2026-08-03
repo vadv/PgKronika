@@ -363,8 +363,11 @@ test("couples plan identity to its exact 96-bucket interval evidence", async () 
       ?.querySelector('[data-evidence="unavailable"]'),
   ).not.toBeNull();
   expect(screen.getAllByTestId("time-matrix-bucket")).toHaveLength(2 * 96);
-  expect(matrix.textContent).toContain("77");
-  expect(matrix.textContent).toContain("42");
+  expect(
+    matrix
+      .querySelector('[data-entity="plan:77"] .plans-time-matrix__identity')
+      ?.getAttribute("title"),
+  ).toBe("77 · 42");
 });
 
 test("five server pages stay deduplicated and DOM-bounded", async () => {
