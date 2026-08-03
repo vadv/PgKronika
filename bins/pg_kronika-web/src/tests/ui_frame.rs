@@ -23,7 +23,7 @@ use crate::ui::frame::cursor::{FrameCursor, SortKey};
 use crate::ui::frame::dto::{ClassificationResultDto, FrameResponse, FrameValue as DtoFrameValue};
 use crate::ui::frame::projection::{
     DeltaOperand, FrameLimits, ProjectedRow, RowOperands, StatementOperands, TableOperands,
-    project_frame,
+    activity_process_relations, project_frame,
 };
 use crate::ui::frame::projection::{ProjectionInput, project_input};
 use crate::ui::frame::spark::attach_sparks;
@@ -760,6 +760,59 @@ fn activity_uses_a_unique_same_snapshot_pid_as_best_effort_process_evidence() {
             DtoFrameValue::Number(60.0),
             DtoFrameValue::Number(40.0),
         ]
+    );
+}
+
+#[test]
+fn activity_process_relation_keeps_unique_pid_evidence_best_effort() {
+    let activity = out_row(&[
+        ("ts", Value::Ts(20_000_000)),
+        ("pid", Value::I64(7)),
+        ("backend_start", Value::Ts(1_000_000)),
+    ]);
+    let mut input = ProjectionInput::single(20_000_000, "pg_stat_activity", activity.clone());
+    input.push(
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(2_000_000)),
+        ]),
+    );
+
+    let relations = activity_process_relations(&activity, &input).expect("relation");
+    assert_eq!(relations.len(), 1);
+    assert_eq!(relations[0].relation, "activity_process");
+    assert_eq!(relations[0].view, "processes");
+    assert_eq!(
+        relations[0].kind,
+        crate::ui::catalog::RelationKind::BestEffort
+    );
+    assert_eq!(relations[0].method, "same_snapshot_unique_pid");
+    assert_eq!(relations[0].fields, vec!["pid", "ts"]);
+    assert!(!relations[0].entity.is_empty());
+
+    let absent = ProjectionInput::single(20_000_000, "pg_stat_activity", activity.clone());
+    assert!(
+        activity_process_relations(&activity, &absent)
+            .expect("absent relation")
+            .is_empty(),
+        "missing process evidence must not produce a relation"
+    );
+
+    input.push(
+        "os_process",
+        out_row(&[
+            ("ts", Value::Ts(20_000_000)),
+            ("pid", Value::I64(7)),
+            ("starttime", Value::Ts(3_000_000)),
+        ]),
+    );
+    assert!(
+        activity_process_relations(&activity, &input)
+            .expect("ambiguous relation")
+            .is_empty(),
+        "a same-snapshot PID collision must not choose a process lifetime"
     );
 }
 

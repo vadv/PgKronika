@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 
-use kronika_analytics::web_projection::WebView;
+use kronika_analytics::web_projection::{WebView, web_view_by_name};
 use kronika_reader::{
     Gap, LocalDirSnapshot, OutRow, QueryError, QueryLimits, SealedQuerySession, SectionPage,
     SnapshotNeighbors, Value, WebIndexReadError, logical_section,
@@ -596,6 +596,7 @@ pub(crate) fn project_entity_at(
         source,
         resolved.current_descriptor.as_ref(),
     ) {
+        (true, "activity", Some((_section, row)), _) => activity_process_relations(row, &input)?,
         (true, "statements", Some((_section, row)), Some(descriptor)) => {
             statement_plan_relations(snapshot, descriptor, input.snapshot_ts_us, row, limits)?
         }
@@ -667,8 +668,7 @@ fn statement_plan_relations(
     else {
         return Ok(Vec::new());
     };
-    let plan_view = kronika_analytics::web_projection::web_view_by_name("plans")
-        .ok_or(ProjectionError::MissingCatalogView)?;
+    let plan_view = web_view_by_name("plans").ok_or(ProjectionError::MissingCatalogView)?;
     let mut query = SealedQuerySession::new(
         snapshot,
         QueryLimits::with_bytes(limits.rows, limits.cells, limits.bytes),
@@ -1243,6 +1243,25 @@ fn activity_process_candidate<'a>(
     });
     let candidate = candidates.next()?;
     candidates.next().is_none().then_some(candidate)
+}
+
+pub(crate) fn activity_process_relations(
+    activity: &OutRow,
+    input: &ProjectionInput,
+) -> Result<Vec<ProjectedRelation>, ProjectionError> {
+    let Some(process) = activity_process_candidate(activity, &input.current, input.snapshot_ts_us)
+    else {
+        return Ok(Vec::new());
+    };
+    let process_view = web_view_by_name("processes").ok_or(ProjectionError::MissingCatalogView)?;
+    Ok(vec![ProjectedRelation {
+        relation: "activity_process",
+        view: "processes",
+        entity: entity_for(process_view, "os_process", process, input.snapshot_ts_us)?,
+        kind: RelationKind::BestEffort,
+        method: "same_snapshot_unique_pid",
+        fields: vec!["pid", "ts"],
+    }])
 }
 
 fn activity_process_predecessor<'a>(

@@ -159,6 +159,40 @@ fn catalog_serializes_relation_quality_without_promoting_pid_only_evidence() {
 }
 
 #[test]
+fn workload_views_publish_distinct_prepared_lenses_and_fork_provenance() {
+    let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
+        .expect("serialize catalog");
+    let activity = serialized_view(&catalog, "activity");
+    let plans = serialized_view(&catalog, "plans");
+
+    assert_eq!(activity["capabilities"]["related"], true);
+    for preset in [
+        "overview",
+        "waits_locks",
+        "duration",
+        "cpu",
+        "disk_io",
+        "replication",
+        "sampling",
+    ] {
+        assert_serialized_preset(&catalog, "activity", preset);
+    }
+    assert_serialized_preset(&catalog, "plans", "change_timeline");
+
+    let plan_joins = plans["joins"].as_array().expect("plan joins");
+    assert!(plan_joins.iter().any(|join| {
+        join["kind"] == "best_effort"
+            && join["provenance"] == "ossc_queryid_dbid_userid_attribution"
+            && join["fields"] == json!(["queryid", "dbid", "userid"])
+    }));
+    assert!(plan_joins.iter().any(|join| {
+        join["kind"] == "best_effort"
+            && join["provenance"] == "vadv_queryid_stat_statements_dbid_userid_attribution"
+            && join["fields"] == json!(["queryid_stat_statements", "dbid", "userid"])
+    }));
+}
+
+#[test]
 fn catalog_contains_every_v5_column_preset_capability_and_reason() {
     let catalog = serde_json::to_value(ProjectionCatalog::for_type_ids(&all_type_ids()))
         .expect("serialize catalog");
