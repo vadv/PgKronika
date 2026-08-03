@@ -207,6 +207,64 @@ test("five server pages stay deduplicated and DOM-bounded", async () => {
   expect(screen.queryByRole("button", { name: /table.more/ })).toBeNull();
 });
 
+test("a selected row does not yank the viewport when a later page loads", async () => {
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(280);
+  const allRows = Array.from({ length: 1_000 }, (_, index) =>
+    makeFrameRow({ entity: `stmt:${index}`, cells: [index] }),
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(
+        typeof input === "string"
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href,
+        "http://localhost",
+      );
+      const cursor = url.searchParams.get("cursor");
+      const offset = cursor === null ? 0 : Number(cursor.slice(2));
+      const pageRows = allRows.slice(offset, offset + 200);
+      const next = offset + 200 < allRows.length ? `o:${offset + 200}` : null;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify(
+            makeFrameResponse({
+              view: "statements",
+              columns: [makeFrameColumn({ code: "xact", type: "i64" })],
+              rows: pageRows,
+              page: {
+                matched: 1_000,
+                returned: pageRows.length,
+                ...(next === null ? {} : { next }),
+              },
+            }),
+          ),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }),
+  );
+  // The selected row sits in the first page and starts in view.
+  renderTable({
+    view: makeViewSpec({ code: "statements", columns }),
+    entity: "stmt:5",
+  });
+  const body = await screen.findByTestId("ranked-matrix-body");
+  await waitFor(() => expect(body.dataset.loadedRows).toBe("200"));
+
+  // The reader scrolls down, leaving the selected row above the window.
+  fireEvent.scroll(body, { target: { scrollTop: 4_000 } });
+  await waitFor(() =>
+    expect(body.querySelector('[data-entity="stmt:5"]')).toBeNull(),
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: /table.more/ }));
+  await waitFor(() => expect(body.dataset.loadedRows).toBe("400"));
+  expect(body.scrollTop).toBe(4_000);
+});
+
 test("keeps first-page columns and total while a continuation is pending", async () => {
   let resolveContinuation: ((response: Response) => void) | undefined;
   const continuation = new Promise<Response>((resolve) => {

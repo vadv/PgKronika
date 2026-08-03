@@ -151,6 +151,9 @@ function TableViewImpl(props: TableViewProps) {
   );
   const scrollBody = useRef<HTMLDivElement | null>(null);
   const lastMatched = useRef<number | null>(null);
+  // Which selection this frame has already brought into view. Appended
+  // cursor pages must not re-scroll to it and yank the reader off the tail.
+  const scrolledEntity = useRef<string | null>(null);
 
   const frameKey = [
     props.view.code,
@@ -189,6 +192,7 @@ function TableViewImpl(props: TableViewProps) {
     setScrollTop(0);
     if (scrollBody.current !== null) scrollBody.current.scrollTop = 0;
     lastMatched.current = null;
+    scrolledEntity.current = null;
   }, [frameKey]);
 
   useLayoutEffect(() => {
@@ -331,9 +335,16 @@ function TableViewImpl(props: TableViewProps) {
 
   useEffect(() => {
     const body = scrollBody.current;
-    if (body === null || props.entity === null) return;
+    if (body === null || props.entity === null) {
+      scrolledEntity.current = null;
+      return;
+    }
+    // Bring a selection into view once; later cursor pages grow `rows` but
+    // must not re-run the scroll on an already-handled selection.
+    if (scrolledEntity.current === props.entity) return;
     const index = rows.findIndex((row) => row.entity === props.entity);
     if (index < 0) return;
+    scrolledEntity.current = props.entity;
     const rowTop = index * ROW_HEIGHT;
     const rowBottom = rowTop + ROW_HEIGHT;
     if (
