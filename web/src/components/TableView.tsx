@@ -420,6 +420,10 @@ function TableViewImpl(props: TableViewProps) {
   const displayColumns = timeMatrixMode
     ? columns.filter(({ column }) => !identityCodes.has(column.code))
     : columns;
+  const processLinkCellIndex = activityMatrixMode
+    ? (columns.find(({ column }) => column.code === "process_link")
+        ?.cellIndex ?? null)
+    : null;
   const activityColumnGroups = displayColumns.reduce<
     { code: ActivityEvidenceGroup; span: number }[]
   >((groups, { column }) => {
@@ -924,6 +928,64 @@ function TableViewImpl(props: TableViewProps) {
                       !("level" in classificationResult)
                         ? classificationResult
                         : undefined;
+                    if (activityMatrixMode && column.code === "process_link") {
+                      const linked = value !== null;
+                      return (
+                        <td
+                          key={column.code}
+                          data-testid="process-link-cell"
+                          data-linked={linked}
+                          title={
+                            linked
+                              ? t("activity.processEvidence")
+                              : t("activity.processLink.none")
+                          }
+                          style={{
+                            padding: "2px 10px",
+                            borderBottom: "1px solid var(--border)",
+                            borderInlineStart: "1px solid var(--border)",
+                            textAlign: "center",
+                          }}
+                        >
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              display: "inline-block",
+                              width: "6px",
+                              height: "6px",
+                              borderRadius: "50%",
+                              background: linked
+                                ? "var(--sev-ok)"
+                                : "var(--sev-crit)",
+                            }}
+                          />
+                        </td>
+                      );
+                    }
+                    if (
+                      column.code === "command" &&
+                      processLinkCellIndex !== null &&
+                      (row.cells[processLinkCellIndex] ?? null) === null
+                    ) {
+                      return (
+                        <td
+                          key={column.code}
+                          data-testid="process-link-command-empty"
+                          style={{
+                            padding: "2px 10px",
+                            borderBottom: "1px solid var(--border)",
+                            fontSize: "var(--text-md)",
+                            fontStyle: "italic",
+                            color: "var(--sev-crit-fg)",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {t("activity.processLink.noneCommand")}
+                        </td>
+                      );
+                    }
                     return (
                       <td
                         key={column.code}

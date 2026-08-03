@@ -98,7 +98,7 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
           scrollbarWidth: "none",
         }}
       >
-        {props.groups.map((group) => (
+        {props.groups.map((group, groupIndex) => (
           <span
             key={group.id}
             role="group"
@@ -118,6 +118,15 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
                 whiteSpace: "nowrap",
               }}
             >
+              <span
+                style={{
+                  fontFamily: "var(--mono-font)",
+                  opacity: 0.6,
+                  marginInlineEnd: "4px",
+                }}
+              >
+                {groupIndex + 1}
+              </span>
               {t(group.labelKey)}
             </span>
             {group.destinations.map((destination) => {

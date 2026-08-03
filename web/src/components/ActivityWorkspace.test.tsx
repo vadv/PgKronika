@@ -115,6 +115,13 @@ const activityView = makeViewSpec({
       requires: ["activity", "process"],
       type: "f64",
     },
+    {
+      availability: "available",
+      code: "command",
+      lazy: false,
+      requires: ["activity", "process"],
+      type: "text",
+    },
   ],
   presets: [
     {
@@ -127,6 +134,7 @@ const activityView = makeViewSpec({
         "state",
         "process_link",
         "cpu",
+        "command",
       ],
       sort: { column: "cpu", order: "desc" },
     },
@@ -148,12 +156,22 @@ const activityFrame = makeFrameResponse({
     makeFrameColumn({ code: "state", type: "text" }),
     makeFrameColumn({ code: "process_link", type: "text" }),
     makeFrameColumn({ code: "cpu", type: "f64" }),
+    makeFrameColumn({ code: "command", type: "text" }),
   ],
   rows: [
     makeFrameRow({
       entity: "pid:18422",
       label: "api / erp_prod",
-      cells: [18422, "erp_prod", "api", "web", "active", "pid", 0.82],
+      cells: [
+        18422,
+        "erp_prod",
+        "api",
+        "web",
+        "active",
+        "pid",
+        0.82,
+        "postgres: api erp_prod",
+      ],
     }),
     makeFrameRow({
       entity: "pid:19041",
@@ -164,6 +182,7 @@ const activityFrame = makeFrameResponse({
         "web",
         "psql",
         "idle in transaction",
+        null,
         null,
         null,
       ],
@@ -314,6 +333,26 @@ test("builds one dense Activity matrix with a positive PID relation", async () =
   expect(heatmapCall?.searchParams.get("view")).toBe("activity");
   expect(heatmapCall?.searchParams.get("buckets")).toBe("96");
   expect(heatmapCall?.searchParams.get("top")).toBe("64");
+});
+
+test("shows a same-PID OS join per row, honest when no OS process matched", async () => {
+  stubRequests();
+  renderWorkspace("overview");
+
+  await waitFor(() =>
+    expect(screen.getAllByTestId("process-link-cell")).toHaveLength(2),
+  );
+  const cells = screen.getAllByTestId("process-link-cell");
+  const linked = cells.find((cell) => cell.dataset.linked === "true");
+  const unlinked = cells.find((cell) => cell.dataset.linked === "false");
+  expect(linked?.title).toBe("activity.processEvidence");
+  expect(unlinked?.title).toBe("activity.processLink.none");
+
+  expect(screen.queryByTestId("process-link-command-empty")).not.toBeNull();
+  expect(screen.getByTestId("process-link-command-empty").textContent).toBe(
+    "activity.processLink.noneCommand",
+  );
+  expect(screen.getByText("postgres: api erp_prod")).toBeDefined();
 });
 
 test("adds compact waiter to blocker relations only to Waits & Locks", async () => {
