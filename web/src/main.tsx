@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import "./components/ActivityWorkspace.css";
+import "./components/OsWorkspace.css";
 import "./components/PlansWorkspace.css";
 import "./components/StatementsTimeMatrix.css";
 import "./design/tokens.css";

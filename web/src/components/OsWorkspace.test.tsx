@@ -243,7 +243,7 @@ function Harness(props: { matched?: number; preset?: "pressure" | "disk_io" }) {
       context={makeContextResponse({
         host: { logical_cpu_count: 32, kernel_version: "6.8.0" },
       })}
-      onMetricChange={setMetric}
+      onMetricChange={(next) => setMetric(next as "cpu" | "io")}
       onSort={() => {}}
       onSelectRow={() => {}}
       onMatched={() => {}}
@@ -274,11 +274,14 @@ test("builds one dense OS workspace from independently scoped evidence", async (
   expect(screen.queryByTestId("infrastructure-analytical-center")).toBeNull();
   expect(screen.getByTestId("host-pressure-evidence")).toBeDefined();
   expect(screen.getByTestId("host-scope-guard").dataset.cpus).toBe("32");
-  expect(screen.getByTestId("host-quality").dataset.limited).toBe("1");
+  await waitFor(() =>
+    expect(screen.getByTestId("host-quality").dataset.limited).toBe("1"),
+  );
   expect(screen.getByTestId("processes-time-matrix")).toBeDefined();
-  expect(screen.getAllByTestId("process-interval-row")[0]).toHaveAttribute(
-    "data-mode",
-    "process_intervals",
+  await waitFor(() =>
+    expect(screen.getAllByTestId("process-interval-row")[0]?.dataset.mode).toBe(
+      "process_intervals",
+    ),
   );
   expect(screen.getAllByTestId("time-matrix-bucket")).toHaveLength(24 * 96);
   expect(screen.getByTestId("os-frame-population").dataset.matched).toBe("218");
@@ -302,7 +305,7 @@ test("switches the exact process matrix metric without changing host scope", asy
   render(<Harness />, { wrapper: Wrapper });
 
   await screen.findByTestId("os-workspace");
-  fireEvent.click(screen.getByRole("button", { name: /I\/O/i }));
+  fireEvent.click(screen.getByRole("button", { name: /^(io|I\/O)$/i }));
   await waitFor(() => {
     const heatmapCalls = vi
       .mocked(fetch)
@@ -325,7 +328,7 @@ test("announces host and process request failures without turning them into zero
   expect(await screen.findByTestId("os-workspace")).toBeDefined();
   const alerts = await screen.findAllByRole("alert");
   expect(alerts.length).toBeGreaterThanOrEqual(2);
-  expect(screen.getAllByTestId("process-interval-row")[0].ariaLabel).toContain(
+  expect(screen.getAllByTestId("process-interval-row")[0]?.ariaLabel).toContain(
     "host.matrix.loadError",
   );
 });
