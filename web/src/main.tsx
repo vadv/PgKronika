@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import "./components/StatementsTimeMatrix.css";
 import "./design/tokens.css";
 import { applyTheme, resolveTheme } from "./design/theme";
 import "./i18n";

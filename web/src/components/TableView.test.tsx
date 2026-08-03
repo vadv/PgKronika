@@ -2,11 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
-import type { ColumnSpec } from "../api/types";
+import type { ColumnSpec, HeatmapResponse } from "../api/types";
 import {
   makeFrameColumn,
   makeFrameResponse,
   makeFrameRow,
+  makeHeatmapQuality,
   makeViewSpec,
 } from "../testkit/apiFixtures";
 import { TableView, type TableViewProps } from "./TableView";
@@ -153,6 +154,116 @@ test("virtualizes a thousand loaded rows and moves the DOM window on scroll", as
     expect(body.querySelector('[data-entity="stmt:0"]')).toBeNull(),
   );
   expect(body.querySelector('[data-entity="stmt:50"]')).not.toBeNull();
+});
+
+test("couples each virtualized statement row to its exact temporal evidence", async () => {
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(280);
+  const statementColumns: ColumnSpec[] = [
+    {
+      availability: "available",
+      code: "queryid",
+      lazy: false,
+      requires: [],
+      type: "i64",
+    },
+    {
+      availability: "available",
+      code: "database",
+      lazy: false,
+      requires: [],
+      type: "text",
+    },
+    {
+      availability: "available",
+      code: "user",
+      lazy: false,
+      requires: [],
+      type: "text",
+    },
+    {
+      availability: "available",
+      code: "total",
+      lazy: false,
+      requires: [],
+      type: "f64",
+      unit: "duration_ms",
+    },
+  ];
+  stubFrame(
+    makeFrameResponse({
+      view: "statements",
+      columns: [
+        makeFrameColumn({ code: "queryid", type: "i64" }),
+        makeFrameColumn({ code: "database", type: "text" }),
+        makeFrameColumn({ code: "user", type: "text" }),
+        makeFrameColumn({
+          code: "total",
+          type: "f64",
+          unit: "duration_ms",
+        }),
+      ],
+      rows: Array.from({ length: 1_000 }, (_, index) =>
+        makeFrameRow({
+          entity: `stmt:${index}`,
+          label: `statement ${index}`,
+          cells: [String(10_000 + index), "orders", "app_rw", index + 1],
+        }),
+      ),
+      page: { matched: 1_000, returned: 1_000 },
+    }),
+  );
+  const heatmap: HeatmapResponse = {
+    grid: { from_us: "100", to_us: "200", bucket_count: 96 },
+    ranking: { exact: true, unseen_upper: 0 },
+    quality: makeHeatmapQuality({ snapshots: 96 }),
+    rows: [
+      {
+        entity: "stmt:0",
+        label: "statement 0",
+        unit: "ms",
+        score: { lower: 0, upper: 95 },
+        values: Array.from({ length: 96 }, (_, index) => index),
+      },
+    ],
+  };
+
+  renderTable({
+    view: makeViewSpec({ code: "statements", columns: statementColumns }),
+    timeMatrix: {
+      data: heatmap,
+      pending: false,
+      error: false,
+      metricLabel: "total time",
+      cursorUs: "150",
+      baselineUs: null,
+      onRetry: () => {},
+    },
+  });
+
+  const body = await screen.findByTestId("ranked-matrix-body");
+  await waitFor(() =>
+    expect(body.querySelectorAll("tr[data-entity]").length).toBeGreaterThan(1),
+  );
+  const renderedRows = body.querySelectorAll("tr[data-entity]").length;
+  expect(screen.getAllByTestId("temporal-row")).toHaveLength(renderedRows);
+  expect(renderedRows).toBeLessThanOrEqual(24);
+  expect(
+    body
+      .querySelector('[data-entity="stmt:0"]')
+      ?.querySelector('[data-evidence="available"]'),
+  ).not.toBeNull();
+  expect(
+    body
+      .querySelector('[data-entity="stmt:1"]')
+      ?.querySelector('[data-evidence="unavailable"]'),
+  ).not.toBeNull();
+  expect(
+    screen.getAllByTestId("time-matrix-bucket").length,
+  ).toBeLessThanOrEqual(24 * 96);
+  expect(screen.queryByText("table.spark")).toBeNull();
+  expect(
+    body.querySelector('[data-entity="stmt:0"]')?.getAttribute("style"),
+  ).toContain("height: 34px");
 });
 
 test("five server pages stay deduplicated and DOM-bounded", async () => {

@@ -14,13 +14,7 @@ export function bucketPosition(
     const time = BigInt(timeUs);
     const from = BigInt(fromUs);
     const to = BigInt(toUs);
-    if (
-      bucketCount <= 0 ||
-      to <= from ||
-      time < from ||
-      time > to
-    )
-      return null;
+    if (bucketCount <= 0 || to <= from || time < from || time > to) return null;
     return Math.min(
       bucketCount - 1,
       Number(((time - from) * BigInt(bucketCount)) / (to - from)),

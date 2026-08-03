@@ -1,0 +1,116 @@
+.statements-time-matrix {
+  min-width: var(--statement-matrix-min-width);
+  table-layout: fixed;
+}
+
+.statements-time-matrix__identity {
+  width: var(--statement-identity-width);
+}
+
+td.statements-time-matrix__identity {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  padding: var(--space-1) var(--space-3);
+  overflow: hidden;
+  color: var(--fg);
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+
+tr:hover > td.statements-time-matrix__identity {
+  background: var(--hover-bg);
+}
+
+tr[aria-selected="true"] > td.statements-time-matrix__identity {
+  background: var(--active-bg);
+}
+
+.statements-time-matrix__identity-primary,
+.statements-time-matrix__identity-meta {
+  display: block;
+  overflow: hidden;
+  text-wrap: nowrap;
+  text-overflow: ellipsis;
+}
+
+.statements-time-matrix__identity-primary {
+  color: var(--fg-strong);
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+
+.statements-time-matrix__identity-meta {
+  color: var(--fg-dim);
+  font-family: var(--ui-font);
+  font-size: var(--text-xs);
+}
+
+.statements-time-matrix__timeline {
+  width: 50%;
+  min-width: var(--statement-timeline-min-width);
+}
+
+.statements-time-matrix__metric,
+.statements-time-matrix__status {
+  margin-inline-start: var(--space-2);
+  color: var(--fg-dim);
+  font-weight: 400;
+}
+
+.statements-time-matrix__retry {
+  margin-inline-start: var(--space-2);
+  padding: 0;
+  color: var(--sev-crit-fg);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.statements-time-matrix__timeline-cell {
+  min-width: var(--statement-timeline-min-width);
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.temporal-bucket-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(
+    var(--time-matrix-buckets),
+    minmax(var(--time-bucket-min-width), 1fr)
+  );
+  gap: 1px;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+}
+
+.temporal-bucket-row__bucket {
+  height: var(--time-bucket-height);
+  min-width: var(--time-bucket-min-width);
+  border-radius: 2px;
+}
+
+.temporal-bucket-row__bucket[data-empty="true"] {
+  background: var(--state-muted-bg) !important;
+}
+
+.temporal-bucket-row__baseline,
+.temporal-bucket-row__cursor {
+  position: absolute;
+  inset-block: var(--space-1);
+  z-index: 1;
+  width: 1px;
+  pointer-events: none;
+}
+
+.temporal-bucket-row__baseline {
+  border-inline-start: 1px dashed var(--fg-dim);
+}
+
+.temporal-bucket-row__cursor {
+  background: var(--accent-strong);
+  box-shadow: 0 0 0 1px var(--bg-raised);
+}
