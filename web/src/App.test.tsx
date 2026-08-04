@@ -1632,6 +1632,102 @@ test("selected statement owns the desktop canvas below Health Line", async () =>
   });
 });
 
+test("selected Activity observation owns the desktop canvas and preserves its population", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=activity&at=1722400000000000&span=3600&dock=row&entity=activity%3AAQACKwAAAAgZ5adgJlgGAA`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const activity = availableCatalog.views.find(
+    (view) => view.code === "activity",
+  );
+  if (activity !== undefined) {
+    activity.availability = "available";
+    activity.capabilities = { detail: true, history: true, related: true };
+    activity.columns = [
+      {
+        availability: "available",
+        code: "pid",
+        lazy: false,
+        requires: [],
+        type: "i64",
+      },
+      {
+        availability: "available",
+        code: "state",
+        lazy: false,
+        requires: [],
+        type: "text",
+      },
+      {
+        availability: "available",
+        code: "query_duration_us",
+        lazy: false,
+        requires: [],
+        type: "f64",
+        unit: "us",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href,
+    );
+    if (url.pathname === "/v1/ui/catalog") {
+      return Promise.resolve(jsonResponse(availableCatalog));
+    }
+    if (url.pathname.startsWith("/v1/entity/activity/")) {
+      return Promise.resolve(
+        jsonResponse(
+          url.searchParams.has("at")
+            ? makeEntityPointResponse({
+                view: "activity",
+                entity: "activity:AQACKwAAAAgZ5adgJlgGAA",
+                label: "pid 18422",
+                fields: [
+                  { code: "pid", value: 18422 },
+                  { code: "state", value: "active" },
+                  { code: "query_duration_us", value: 4_200_000 },
+                ],
+              })
+            : makeEntityHistoryResponse({
+                view: "activity",
+                entity: "activity:AQACKwAAAAgZ5adgJlgGAA",
+                label: "pid 18422",
+                columns: ["state", "query_duration_us"],
+                snapshots: [
+                  {
+                    ts_us: "1722400000000000",
+                    values: ["active", 4_200_000],
+                  },
+                ],
+              }),
+        ),
+      );
+    }
+    return baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("activity-detail")).toBeDefined();
+  expect(screen.getByTestId("health-line")).toBeDefined();
+  expect(document.querySelector('aside[data-dock="row"]')).toBeNull();
+  expect(screen.getByTestId("activity-overview-preserved").hidden).toBe(true);
+
+  fireEvent.keyDown(document, { key: "Escape" });
+  await waitFor(() => {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    expect(hash.get("dock")).toBeNull();
+    expect(hash.get("entity")).toBe("activity:AQACKwAAAAgZ5adgJlgGAA");
+  });
+});
+
 test("Vacuum defaults to point progress and keeps linked table context calm", async () => {
   history.replaceState(
     null,

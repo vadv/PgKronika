@@ -1981,12 +1981,63 @@ function entityResponse(viewCode, entity, params) {
     ],
     temp_written: [0, 0, 0, 0.12, 0, 0.85, 0.35, 0, 1.6, 0.65, 0.2, 1],
   };
+  const activityShapes = {
+    state: [
+      "active",
+      "active",
+      "active",
+      "active",
+      "active",
+      "active",
+      "active",
+      "active",
+      "active",
+      "active",
+      "active",
+      row.data.state,
+    ],
+    wait_event: [
+      null,
+      null,
+      "Client:ClientRead",
+      null,
+      "IO:DataFileRead",
+      "IO:DataFileRead",
+      null,
+      "Lock:relation",
+      "Lock:relation",
+      null,
+      null,
+      row.data.wait_event,
+    ],
+    query_duration_us: [
+      0.18, 0.24, 0.32, 0.41, 0.55, 0.72, 0.81, 0.94, 1.08, 0.9, 0.96, 1,
+    ],
+    transaction_duration_us: [
+      0.12, 0.18, 0.25, 0.34, 0.46, 0.59, 0.68, 0.82, 0.93, 0.9, 0.96, 1,
+    ],
+    cpu: [0.25, 0.31, 0.42, 0.58, 0.7, 0.88, 0.76, 0.95, 1.12, 0.89, 1.04, 1],
+    rss: [0.82, 0.84, 0.86, 0.89, 0.91, 0.93, 0.94, 0.96, 0.98, 0.99, 1, 1],
+    read_bytes_per_second: [
+      0.18, 0.22, 0.28, 0.35, 0.58, 0.92, 0.66, 1.18, 1.42, 0.74, 1.08, 1,
+    ],
+    write_bytes_per_second: [
+      0.24, 0.3, 0.26, 0.4, 0.5, 0.62, 0.74, 0.85, 1.1, 0.9, 1.04, 1,
+    ],
+  };
   for (let i = 0; i < pageSize; i++) {
     const sampleIndex = pageIndex * pageSize + i;
     snapshots.push({
       ts_us: String(from + sampleIndex * step),
       values: columns.map((code) => {
         const value = row.data[code] ?? null;
+        const activityShape =
+          viewCode === "activity" ? activityShapes[code] : undefined;
+        if (activityShape !== undefined) {
+          const shaped = activityShape[sampleIndex];
+          if (code === "state" || code === "wait_event") return shaped;
+          if (value === null || shaped === null) return null;
+        }
         if (typeof value === "number") {
           const column = view.columns.find(
             (candidate) => candidate.code === code,
@@ -1996,8 +2047,13 @@ function entityResponse(viewCode, entity, params) {
           const gauge = column?.unit === "percent" || code === "progress";
           const statementShape =
             viewCode === "statements" ? statementShapes[code] : undefined;
+          const activityFactor =
+            viewCode === "activity"
+              ? activityShapes[code]?.[sampleIndex]
+              : undefined;
           const factor =
             statementShape?.[sampleIndex] ??
+            (typeof activityFactor === "number" ? activityFactor : undefined) ??
             (gauge
               ? 0.97 + progress * 0.03 + noise / 3
               : 0.72 + progress * 0.28 + noise);

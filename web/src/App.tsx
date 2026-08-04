@@ -13,6 +13,7 @@ import { useUiContext } from "./api/context";
 import { useIncidents } from "./api/incidents";
 import { useSummary } from "./api/summary";
 import type { ViewSpec } from "./api/types";
+import { ActivityDetail } from "./components/ActivityDetail";
 import { ActivityWorkspace } from "./components/ActivityWorkspace";
 import { AlertBar } from "./components/AlertBar";
 import { DataMaintenanceDetail } from "./components/DataMaintenanceDetail";
@@ -350,8 +351,14 @@ function Shell() {
     state.dock === "row" &&
     state.entity !== null &&
     activeView !== undefined;
+  const inlineActivityDetail =
+    !mobile &&
+    activityScreen &&
+    state.dock === "row" &&
+    state.entity !== null &&
+    activeView !== undefined;
   const inlineEntityDetail =
-    inlineInfrastructureDetail || inlineStatementDetail;
+    inlineInfrastructureDetail || inlineStatementDetail || inlineActivityDetail;
   const evidencePanelScreen = infrastructureEvidenceScreen;
   const denseHeatmapScreen = activityScreen || infrastructureEvidenceScreen;
   const effectivePreset = statementsScreen
@@ -1053,6 +1060,53 @@ function Shell() {
           }}
         >
           <HealthLine />
+          {inlineActivityDetail && state.entity !== null && (
+            <ActivityDetail
+              view={activeView}
+              entity={state.entity}
+              at={at}
+              span={state.span}
+              onClose={() => patch({ dock: null })}
+              onOpenEntity={(view, entity, relationAt) =>
+                patch({
+                  view,
+                  entity,
+                  at: relationAt,
+                  dock: "row",
+                  ...(view === state.view
+                    ? {}
+                    : {
+                        preset: null,
+                        q: null,
+                        sort: null,
+                        order: null,
+                      }),
+                })
+              }
+              onFindStatements={(queryId) =>
+                patch({
+                  view: "statements",
+                  preset: "time",
+                  q: `queryid=${queryId}`,
+                  entity: null,
+                  dock: null,
+                  sort: null,
+                  order: null,
+                })
+              }
+              onOpenWaits={(pid) =>
+                patch({
+                  view: "activity",
+                  preset: "waits_locks",
+                  q: `pid=${pid}`,
+                  entity: null,
+                  dock: null,
+                  sort: null,
+                  order: null,
+                })
+              }
+            />
+          )}
           {inlineStatementDetail && state.entity !== null && (
             <StatementDetail
               view={activeView}
@@ -1289,10 +1343,12 @@ function Shell() {
               />
             </div>
           )}
-          {!inlineEntityDetail &&
-            heatmapReady &&
-            !statementsScreen &&
-            (activityScreen ? (
+          {heatmapReady && activityScreen && (
+            <div
+              data-testid="activity-overview-preserved"
+              hidden={inlineActivityDetail}
+              style={{ display: inlineActivityDetail ? "none" : "contents" }}
+            >
               <ActivityWorkspace
                 view={activeView}
                 at={at}
@@ -1328,7 +1384,13 @@ function Shell() {
                 }
                 onMatched={setMatched}
               />
-            ) : plansScreen ? (
+            </div>
+          )}
+          {!inlineEntityDetail &&
+            heatmapReady &&
+            !statementsScreen &&
+            !activityScreen &&
+            (plansScreen ? (
               <PlansWorkspace
                 view={activeView}
                 at={at}
