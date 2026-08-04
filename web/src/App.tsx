@@ -26,6 +26,7 @@ import { InfrastructureEvidencePanel } from "./components/InfrastructureEvidence
 import { OsWorkspace, osMetricForPreset } from "./components/OsWorkspace";
 import { PrimaryNavigation } from "./components/PrimaryNavigation";
 import { ShellLayout } from "./components/ShellLayout";
+import { StatementDetail } from "./components/StatementDetail";
 import { HealthLine } from "./components/HealthLine";
 import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
@@ -343,6 +344,14 @@ function Shell() {
     state.dock === "row" &&
     state.entity !== null &&
     activeView !== undefined;
+  const inlineStatementDetail =
+    !mobile &&
+    statementsScreen &&
+    state.dock === "row" &&
+    state.entity !== null &&
+    activeView !== undefined;
+  const inlineEntityDetail =
+    inlineInfrastructureDetail || inlineStatementDetail;
   const evidencePanelScreen = infrastructureEvidenceScreen;
   const denseHeatmapScreen = activityScreen || infrastructureEvidenceScreen;
   const effectivePreset = statementsScreen
@@ -629,7 +638,7 @@ function Shell() {
       status={<StatusBar embedded state={state} summary={summary.data} />}
       overlay={
         <>
-          {!inlineInfrastructureDetail && (
+          {!inlineEntityDetail && (
             <DockOverlay
               state={state}
               view={activeView}
@@ -1044,6 +1053,31 @@ function Shell() {
           }}
         >
           <HealthLine />
+          {inlineStatementDetail && state.entity !== null && (
+            <StatementDetail
+              view={activeView}
+              entity={state.entity}
+              at={at}
+              span={state.span}
+              onClose={() => patch({ dock: null })}
+              onOpenEntity={(view, entity, relationAt) =>
+                patch({
+                  view,
+                  entity,
+                  at: relationAt,
+                  dock: "row",
+                  ...(view === state.view
+                    ? {}
+                    : {
+                        preset: null,
+                        q: null,
+                        sort: null,
+                        order: null,
+                      }),
+                })
+              }
+            />
+          )}
           {inlineInfrastructureDetail && state.entity !== null && (
             <DataMaintenanceDetail
               view={activeView}
@@ -1069,7 +1103,7 @@ function Shell() {
               }
             />
           )}
-          {!inlineInfrastructureDetail && state.view === "locks" && (
+          {!inlineEntityDetail && state.view === "locks" && (
             <aside
               data-testid="contextual-deep-link"
               role="status"
@@ -1086,13 +1120,13 @@ function Shell() {
               {t(`navigation.deepLink.${state.view}`)}
             </aside>
           )}
-          {!inlineInfrastructureDetail && focusedIncident !== undefined && (
+          {!inlineEntityDetail && focusedIncident !== undefined && (
             <FocusBar
               incident={focusedIncident}
               onExit={() => patch({ focus: null })}
             />
           )}
-          {!inlineInfrastructureDetail && tableReady && (
+          {!inlineEntityDetail && tableReady && (
             <section
               data-shell-region="screen-context"
               style={{
@@ -1155,7 +1189,7 @@ function Shell() {
               )}
             </section>
           )}
-          {!inlineInfrastructureDetail &&
+          {!inlineEntityDetail &&
             heatmapReady &&
             !statementsScreen &&
             !activityScreen &&
@@ -1227,9 +1261,12 @@ function Shell() {
                 )}
               </div>
             )}
-          {!inlineInfrastructureDetail &&
-            heatmapReady &&
-            (statementsScreen ? (
+          {heatmapReady && statementsScreen && (
+            <div
+              data-testid="statement-overview-preserved"
+              hidden={inlineStatementDetail}
+              style={{ display: inlineStatementDetail ? "none" : "contents" }}
+            >
               <StatementsWorkspace
                 view={activeView}
                 at={at}
@@ -1250,7 +1287,12 @@ function Shell() {
                 onSelectRow={onSelectRow}
                 onMatched={setMatched}
               />
-            ) : activityScreen ? (
+            </div>
+          )}
+          {!inlineEntityDetail &&
+            heatmapReady &&
+            !statementsScreen &&
+            (activityScreen ? (
               <ActivityWorkspace
                 view={activeView}
                 at={at}

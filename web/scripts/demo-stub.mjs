@@ -1969,6 +1969,18 @@ function entityResponse(viewCode, entity, params) {
     Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
   );
   const step = Math.max(1, Math.floor((to - from) / totalSamples));
+  const statementShapes = {
+    total: [0.42, 0.48, 0.63, 0.55, 0.72, 1.38, 1.12, 0.89, 1.6, 1.34, 1.18, 1],
+    calls: [0.72, 0.77, 0.8, 0.75, 0.83, 0.9, 0.87, 0.92, 0.98, 1.02, 0.97, 1],
+    mean: [0.58, 0.62, 0.78, 0.7, 0.87, 1.42, 1.21, 0.96, 1.68, 1.31, 1.18, 1],
+    blks_read: [
+      0.35, 0.4, 0.38, 0.51, 0.7, 1.1, 0.86, 0.73, 1.48, 1.23, 1.1, 1,
+    ],
+    wal_bytes: [
+      0.62, 0.7, 0.82, 0.65, 0.75, 0.92, 1.15, 0.88, 0.72, 1.08, 0.95, 1,
+    ],
+    temp_written: [0, 0, 0, 0.12, 0, 0.85, 0.35, 0, 1.6, 0.65, 0.2, 1],
+  };
   for (let i = 0; i < pageSize; i++) {
     const sampleIndex = pageIndex * pageSize + i;
     snapshots.push({
@@ -1982,9 +1994,13 @@ function entityResponse(viewCode, entity, params) {
           const progress = sampleIndex / Math.max(1, totalSamples - 1);
           const noise = (rand() - 0.5) * 0.035;
           const gauge = column?.unit === "percent" || code === "progress";
-          const factor = gauge
-            ? 0.97 + progress * 0.03 + noise / 3
-            : 0.72 + progress * 0.28 + noise;
+          const statementShape =
+            viewCode === "statements" ? statementShapes[code] : undefined;
+          const factor =
+            statementShape?.[sampleIndex] ??
+            (gauge
+              ? 0.97 + progress * 0.03 + noise / 3
+              : 0.72 + progress * 0.28 + noise);
           const sample = r2(value * factor);
           if (column?.unit === "percent")
             return Math.max(0, Math.min(100, sample));

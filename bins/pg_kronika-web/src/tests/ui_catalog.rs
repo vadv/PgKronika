@@ -899,6 +899,31 @@ fn statements_hit_percentage_uses_window_deltas() {
 }
 
 #[test]
+fn statements_pressure_columns_publish_human_units() {
+    let observed = BTreeSet::from([first_type_id("pg_stat_statements")]);
+    let catalog = ProjectionCatalog::for_type_ids(&observed);
+    let statements = catalog
+        .views()
+        .iter()
+        .find(|view| view.code == "statements")
+        .expect("statements view");
+
+    for (code, unit) in [
+        ("hit_pct", "percent"),
+        ("blks_read", "blocks"),
+        ("temp_written", "blocks"),
+        ("wal_bytes", "bytes"),
+    ] {
+        let column = statements
+            .columns
+            .iter()
+            .find(|column| column.code == code)
+            .unwrap_or_else(|| panic!("statements.{code}"));
+        assert_eq!(column.unit, Some(unit), "statements.{code} unit");
+    }
+}
+
+#[test]
 fn statements_query_text_is_available_but_detail_only() {
     // The collector server-truncates and stores query text. The frame keeps it
     // lazy for response bounds, while entity detail can project it.

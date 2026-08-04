@@ -982,28 +982,28 @@ fn statements_view() -> ViewSpec {
             ValueType::F64,
             "100 * positive_delta(shared_blks_hit) / max(positive_delta(shared_blks_hit + shared_blks_read), 1)",
             &["statements"],
-            None,
+            Some("percent"),
         ),
         derived_column(
             "blks_read",
             ValueType::F64,
             "positive_delta(shared_blks_read + local_blks_read)",
             &["statements"],
-            None,
+            Some("blocks"),
         ),
         derived_column(
             "temp_written",
             ValueType::F64,
             "positive_delta(temp_blks_written)",
             &["statements"],
-            None,
+            Some("blocks"),
         ),
         derived_column(
             "wal_bytes",
             ValueType::F64,
             "positive_delta(wal_bytes)",
             &["statements"],
-            None,
+            Some("bytes"),
         ),
     ];
     let presets = vec![
