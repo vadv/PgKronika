@@ -549,7 +549,6 @@ function TableViewImpl(props: TableViewProps) {
         background: "var(--bg-raised)",
         border: "1px solid var(--border)",
         borderRadius: "var(--radius-md)",
-        boxShadow: "var(--shadow-raised)",
       }}
     >
       <div
@@ -962,7 +961,7 @@ function TableViewImpl(props: TableViewProps) {
                         ? classificationResult
                         : undefined;
                     if (
-                      activityMatrixMode &&
+                      activityGroupedMode &&
                       column.code === "command" &&
                       (row.cells[
                         columns.find(

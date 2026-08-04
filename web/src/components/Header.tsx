@@ -233,7 +233,6 @@ export function Header(props: HeaderProps) {
         overflow: compact ? "hidden" : undefined,
         background: "var(--bg)",
         borderBottom: "1px solid var(--border)",
-        boxShadow: "var(--shadow-raised)",
         color: "var(--fg)",
         fontFamily: "var(--ui-font)",
       }}

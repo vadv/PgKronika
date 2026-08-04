@@ -22,7 +22,6 @@
   border: 1px solid var(--border);
   border-block-end: 0;
   border-radius: var(--radius-md) var(--radius-md) 0 0;
-  box-shadow: var(--shadow-raised);
 }
 
 .statements-workspace__title {
