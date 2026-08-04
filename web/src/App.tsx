@@ -15,6 +15,7 @@ import { useSummary } from "./api/summary";
 import type { ViewSpec } from "./api/types";
 import { ActivityWorkspace } from "./components/ActivityWorkspace";
 import { AlertBar } from "./components/AlertBar";
+import { DataMaintenanceDetail } from "./components/DataMaintenanceDetail";
 import { DockOverlay } from "./components/DockOverlay";
 import { EventsWorkspace } from "./components/EventsWorkspace";
 import { FocusBar } from "./components/FocusBar";
@@ -336,6 +337,12 @@ function Shell() {
   const eventsScreen = activeView?.code === "events";
   const infrastructureEvidenceScreen =
     tablesScreen || indexesScreen || vacuumScreen;
+  const inlineInfrastructureDetail =
+    !mobile &&
+    infrastructureEvidenceScreen &&
+    state.dock === "row" &&
+    state.entity !== null &&
+    activeView !== undefined;
   const evidencePanelScreen = infrastructureEvidenceScreen;
   const denseHeatmapScreen = activityScreen || infrastructureEvidenceScreen;
   const effectivePreset = statementsScreen
@@ -622,15 +629,17 @@ function Shell() {
       status={<StatusBar embedded state={state} summary={summary.data} />}
       overlay={
         <>
-          <DockOverlay
-            state={state}
-            view={activeView}
-            at={at}
-            mobile={mobile}
-            onClose={() => patch({ dock: null })}
-            onSelectIncident={(focus) => patch({ focus })}
-            onPatch={patch}
-          />
+          {!inlineInfrastructureDetail && (
+            <DockOverlay
+              state={state}
+              view={activeView}
+              at={at}
+              mobile={mobile}
+              onClose={() => patch({ dock: null })}
+              onSelectIncident={(focus) => patch({ focus })}
+              onPatch={patch}
+            />
+          )}
           <ForensicSearch
             open={searchOpen}
             views={views}
@@ -1035,7 +1044,32 @@ function Shell() {
           }}
         >
           <HealthLine />
-          {state.view === "locks" && (
+          {inlineInfrastructureDetail && state.entity !== null && (
+            <DataMaintenanceDetail
+              view={activeView}
+              entity={state.entity}
+              at={at}
+              span={state.span}
+              onClose={() => patch({ dock: null })}
+              onOpenEntity={(view, entity, relationAt) =>
+                patch({
+                  view,
+                  entity,
+                  at: relationAt,
+                  dock: "row",
+                  ...(view === state.view
+                    ? {}
+                    : {
+                        preset: null,
+                        q: null,
+                        sort: null,
+                        order: null,
+                      }),
+                })
+              }
+            />
+          )}
+          {!inlineInfrastructureDetail && state.view === "locks" && (
             <aside
               data-testid="contextual-deep-link"
               role="status"
@@ -1052,13 +1086,13 @@ function Shell() {
               {t(`navigation.deepLink.${state.view}`)}
             </aside>
           )}
-          {focusedIncident !== undefined && (
+          {!inlineInfrastructureDetail && focusedIncident !== undefined && (
             <FocusBar
               incident={focusedIncident}
               onExit={() => patch({ focus: null })}
             />
           )}
-          {tableReady && (
+          {!inlineInfrastructureDetail && tableReady && (
             <section
               data-shell-region="screen-context"
               style={{
@@ -1121,7 +1155,8 @@ function Shell() {
               )}
             </section>
           )}
-          {heatmapReady &&
+          {!inlineInfrastructureDetail &&
+            heatmapReady &&
             !statementsScreen &&
             !activityScreen &&
             !plansScreen &&
@@ -1192,7 +1227,8 @@ function Shell() {
                 )}
               </div>
             )}
-          {heatmapReady &&
+          {!inlineInfrastructureDetail &&
+            heatmapReady &&
             (statementsScreen ? (
               <StatementsWorkspace
                 view={activeView}
