@@ -220,7 +220,7 @@ Review DevOps packaging, DBA load, SRE failure behavior, PostgreSQL semantics,
 Rust/frontend performance, memory bounds, and comment quality. Fix every high
 severity finding.
 
-- [ ] **Step 7: Commit and open the PR**
+- [x] **Step 7: Commit and open the PR**
 
 ```bash
 git add docs/superpowers web/src web/scripts bins/pg_kronika-web/static.tar.gz
