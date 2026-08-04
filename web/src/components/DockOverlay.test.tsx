@@ -587,6 +587,103 @@ test("history trend charts only numeric columns and tracks the latest observed v
   ).toBeGreaterThan(0);
 });
 
+test("process history keeps identifiers out of metric trends and history requests", async () => {
+  const point = makeEntityPointResponse({
+    view: "processes",
+    entity: "process:45",
+    fields: [
+      { code: "pid", value: 45 },
+      { code: "cpu", value: 0.2 },
+      { code: "parent_pid", value: 1 },
+    ],
+  });
+  const history = makeEntityHistoryResponse({
+    view: "processes",
+    entity: "process:45",
+    columns: ["pid", "cpu", "parent_pid"],
+    snapshots: [
+      {
+        ts_us: "1722400000000000",
+        present: true,
+        values: [45, 0.2, 1],
+      },
+      {
+        ts_us: "1722400060000000",
+        present: true,
+        values: [45, 0.4, 1],
+      },
+    ],
+  });
+  const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const body = url.searchParams.has("at") ? point : history;
+    return Promise.resolve(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  renderDock({
+    state: {
+      ...baseState,
+      view: "processes",
+      dock: "row",
+      entity: "process:45",
+    },
+    view: makeViewSpec({
+      code: "processes",
+      capabilities: { detail: true, history: true, related: true },
+      columns: [
+        {
+          code: "pid",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+        {
+          code: "cpu",
+          type: "f64",
+          unit: "percent",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+        {
+          code: "parent_pid",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+      ],
+    }),
+  });
+  await waitFor(() => expect(screen.getByText("0.2%")).toBeDefined());
+  fireEvent.click(screen.getByRole("tab", { name: "dock.detail.history" }));
+  await waitFor(() =>
+    expect(
+      document.querySelector(".entity-detail__history-trend"),
+    ).not.toBeNull(),
+  );
+
+  const historyRequest = fetchMock.mock.calls
+    .map(
+      ([input]) =>
+        new URL(input instanceof Request ? input.url : String(input)),
+    )
+    .find((url) => !url.searchParams.has("at"));
+  expect(historyRequest?.searchParams.get("columns")).toBe("cpu");
+  expect(
+    document.querySelectorAll(".entity-detail__history-lane"),
+  ).toHaveLength(1);
+  expect(
+    document.querySelector(".entity-detail__history-lane-label")?.textContent,
+  ).toBe("cpu");
+});
+
 test("history trend stays absent with fewer than two snapshots", async () => {
   const point = makeEntityPointResponse({
     fields: [{ code: "tup", value: 12 }],

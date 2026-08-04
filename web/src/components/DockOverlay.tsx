@@ -804,6 +804,18 @@ function EntityPointView(props: {
 }
 
 const HISTORY_TREND_TYPES = new Set(["i64", "u64", "f64"]);
+const HISTORY_IDENTIFIER_COLUMNS: Readonly<
+  Partial<Record<string, ReadonlySet<string>>>
+> = {
+  processes: new Set(["pid", "parent_pid"]),
+};
+
+function isHistoryIdentifierColumn(viewCode: string, column: string): boolean {
+  return (
+    isIdentityColumn(column) ||
+    HISTORY_IDENTIFIER_COLUMNS[viewCode]?.has(column) === true
+  );
+}
 
 export function historyColumnSeries(
   data: EntityHistoryResponse,
@@ -839,7 +851,10 @@ function EntityHistoryTrend(props: {
       spec: props.columns.get(column),
     }))
     .filter(
-      ({ spec }) => spec !== undefined && HISTORY_TREND_TYPES.has(spec.type),
+      ({ column, spec }) =>
+        spec !== undefined &&
+        HISTORY_TREND_TYPES.has(spec.type) &&
+        !isHistoryIdentifierColumn(props.viewCode, column),
     );
   if (lanes.length === 0 || data.snapshots.length < 2) return null;
   return (
@@ -1008,7 +1023,7 @@ function detailHistoryColumns(view: ViewSpec | undefined): string[] {
     (column) =>
       !column.lazy &&
       column.availability === "available" &&
-      !isIdentityColumn(column.code),
+      !isHistoryIdentifierColumn(view.code, column.code),
   );
   const metricLike = useful.filter((column) => column.type !== "text");
   return (metricLike.length > 0 ? metricLike : useful)
