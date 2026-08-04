@@ -31,6 +31,7 @@ import { StatementDetail } from "./components/StatementDetail";
 import { HealthLine } from "./components/HealthLine";
 import { StatusBar } from "./components/StatusBar";
 import { PageHeader } from "./components/PageHeader";
+import { PlanDetail } from "./components/PlanDetail";
 import { PlansWorkspace } from "./components/PlansWorkspace";
 import { StatementsWorkspace } from "./components/StatementsWorkspace";
 import { TableView } from "./components/TableView";
@@ -357,8 +358,17 @@ function Shell() {
     state.dock === "row" &&
     state.entity !== null &&
     activeView !== undefined;
+  const inlinePlanDetail =
+    !mobile &&
+    plansScreen &&
+    state.dock === "row" &&
+    state.entity !== null &&
+    activeView !== undefined;
   const inlineEntityDetail =
-    inlineInfrastructureDetail || inlineStatementDetail || inlineActivityDetail;
+    inlineInfrastructureDetail ||
+    inlineStatementDetail ||
+    inlineActivityDetail ||
+    inlinePlanDetail;
   const evidencePanelScreen = infrastructureEvidenceScreen;
   const denseHeatmapScreen = activityScreen || infrastructureEvidenceScreen;
   const effectivePreset = statementsScreen
@@ -1132,6 +1142,53 @@ function Shell() {
               }
             />
           )}
+          {inlinePlanDetail && state.entity !== null && (
+            <PlanDetail
+              view={activeView}
+              entity={state.entity}
+              at={at}
+              span={state.span}
+              onClose={() => patch({ dock: null })}
+              onOpenEntity={(view, entity, relationAt) =>
+                patch({
+                  view,
+                  entity,
+                  at: relationAt,
+                  dock: "row",
+                  ...(view === state.view
+                    ? {}
+                    : {
+                        preset: null,
+                        q: null,
+                        sort: null,
+                        order: null,
+                      }),
+                })
+              }
+              onFindStatements={(queryId) =>
+                patch({
+                  view: "statements",
+                  preset: "time",
+                  q: `queryid=${queryId}`,
+                  entity: null,
+                  dock: null,
+                  sort: null,
+                  order: null,
+                })
+              }
+              onFindPlans={(queryId) =>
+                patch({
+                  view: "plans",
+                  preset: "change_timeline",
+                  q: `queryid=${queryId}`,
+                  entity: null,
+                  dock: null,
+                  sort: null,
+                  order: null,
+                })
+              }
+            />
+          )}
           {inlineInfrastructureDetail && state.entity !== null && (
             <DataMaintenanceDetail
               view={activeView}
@@ -1386,11 +1443,12 @@ function Shell() {
               />
             </div>
           )}
-          {!inlineEntityDetail &&
-            heatmapReady &&
-            !statementsScreen &&
-            !activityScreen &&
-            (plansScreen ? (
+          {heatmapReady && plansScreen && (
+            <div
+              data-testid="plans-overview-preserved"
+              hidden={inlinePlanDetail}
+              style={{ display: inlinePlanDetail ? "none" : "contents" }}
+            >
               <PlansWorkspace
                 view={activeView}
                 at={at}
@@ -1426,7 +1484,14 @@ function Shell() {
                 }
                 onMatched={setMatched}
               />
-            ) : processesScreen ? (
+            </div>
+          )}
+          {!inlineEntityDetail &&
+            heatmapReady &&
+            !statementsScreen &&
+            !activityScreen &&
+            !plansScreen &&
+            (processesScreen ? (
               <OsWorkspace
                 view={activeView}
                 at={at}

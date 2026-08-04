@@ -5,7 +5,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_format::DictLimits;
 use kronika_reader::{FactStore, LIMIT, LocalDirSnapshot};
 use kronika_registry::pg_log::PgLogLifecycleV1;
-use kronika_registry::pg_stat_statements::PgStatStatementsV2;
+use kronika_registry::pg_stat_statements::PgStatStatementsV3;
 use kronika_registry::pg_store_plans::{PgStorePlansOsscV1, PgStorePlansVadvV1};
 use kronika_writer::{Interner, dict};
 
@@ -25,13 +25,14 @@ fn token(revision: u16) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn statement_row(ts: i64, calls: i64, query: StrId) -> PgStatStatementsV2 {
+fn statement_row(ts: i64, calls: i64, query: StrId, toplevel: bool) -> PgStatStatementsV3 {
     let calls_f64 = f64::from(i32::try_from(calls).expect("fixture calls fit i32"));
-    PgStatStatementsV2 {
+    PgStatStatementsV3 {
         ts: Ts(ts),
         queryid: Some(7),
         userid: 10,
         dbid: 20,
+        toplevel,
         datname: None,
         usename: None,
         query: Some(query),
@@ -162,8 +163,9 @@ fn entity_fixture(plan_fork: PlanFork) -> tempfile::TempDir {
         .map(|id| StrId(id.get()))
         .expect("intern plan");
     let rows = [
-        statement_row(1_000, 10, query),
-        statement_row(2_000, 25, query),
+        statement_row(1_000, 10, query, true),
+        statement_row(2_000, 25, query, true),
+        statement_row(2_000, 7, query, false),
     ];
     let mut coincident_plan = plan_row(2_000, 5, plan);
     coincident_plan.queryid = 8;
@@ -172,13 +174,13 @@ fn entity_fixture(plan_fork: PlanFork) -> tempfile::TempDir {
         plan_row(2_000, 3, plan),
         coincident_plan,
     ];
-    let statements = PgStatStatementsV2::encode(&rows).expect("encode statements");
+    let statements = PgStatStatementsV3::encode(&rows).expect("encode statements");
     let plans_body = PgStorePlansOsscV1::encode(&plans).expect("encode plans");
     let vadv_plans_body =
         PgStorePlansVadvV1::encode(&[vadv_plan_row(2_000, 4, plan)]).expect("encode vadv plans");
     let dictionary = dict::encode(interner.window()).expect("encode dictionary");
     let mut sections = vec![SectionInput {
-        type_id: 1_002_002,
+        type_id: 1_002_003,
         rows: u32::try_from(rows.len()).expect("statement rows"),
         body: &statements,
     }];
@@ -268,6 +270,16 @@ async fn frame_entity_token(directory: &std::path::Path) -> String {
         .to_owned()
 }
 
+async fn frame_plan_entity_token(directory: &std::path::Path, queryid: i64) -> String {
+    let uri = format!("/v1/frame/plans?at=2000&preset=time&q=queryid%3D{queryid}&limit=1");
+    let (status, body) = serve(directory, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["rows"][0]["entity"]
+        .as_str()
+        .expect("plan frame entity token")
+        .to_owned()
+}
+
 #[test]
 fn entity_request_requires_exactly_one_point_or_history_mode() {
     let catalog = catalog();
@@ -281,17 +293,25 @@ fn entity_request_requires_exactly_one_point_or_history_mode() {
     let history = EntityRequest::parse(
         "statements",
         &statements,
-        Some("from=1&to=2&columns=queryid"),
+        Some("from=1&to=2&columns=queryid&buckets=96"),
         &catalog,
     )
     .expect("history request");
-    assert!(matches!(history.mode, EntityMode::History { .. }));
+    assert!(matches!(
+        history.mode,
+        EntityMode::History {
+            buckets: Some(96),
+            ..
+        }
+    ));
 
     for raw in [
         "",
         "at=1&from=1&to=2&columns=queryid",
         "from=1&to=2",
         "at=1&columns=queryid",
+        "from=1&to=2&columns=queryid&limit=1&buckets=1",
+        "from=1&to=2&columns=queryid&cursor=bad&buckets=1",
     ] {
         let error =
             EntityRequest::parse("statements", &statements, Some(raw), &catalog).expect_err(raw);
@@ -374,6 +394,40 @@ async fn entity_point_returns_lazy_fields_and_fork_specific_best_effort_relation
     );
 }
 
+#[tokio::test]
+async fn plan_entity_returns_all_fork_specific_statement_candidates() {
+    for (fork, method) in [
+        (PlanFork::Ossc, "ossc_queryid_dbid_userid_attribution"),
+        (
+            PlanFork::Vadv,
+            "vadv_queryid_stat_statements_dbid_userid_attribution",
+        ),
+    ] {
+        let directory = entity_fixture(fork);
+        let entity = frame_plan_entity_token(directory.path(), 7).await;
+        let uri = format!("/v1/entity/plans/{entity}?at=2000&include=related");
+
+        let (status, body) = serve(directory.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let related = body["related"].as_array().expect("related statements");
+        assert_eq!(related.len(), 2, "{body}");
+        assert!(related.iter().all(|relation| {
+            relation["relation"] == "plan_statement"
+                && relation["view"] == "statements"
+                && relation["snapshot_ts_us"] == "2000"
+                && relation["provenance"]["method"] == method
+        }));
+        assert_ne!(related[0]["entity"], related[1]["entity"]);
+    }
+
+    let directory = entity_fixture(PlanFork::Ossc);
+    let entity = frame_plan_entity_token(directory.path(), 8).await;
+    let uri = format!("/v1/entity/plans/{entity}?at=2000&include=related");
+    let (status, body) = serve(directory.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["related"], serde_json::json!([]));
+}
+
 #[test]
 fn entity_request_rejects_unknown_and_duplicate_parameters_before_io() {
     let catalog = catalog();
@@ -433,6 +487,22 @@ async fn entity_history_tiles_view_snapshots_without_duplicates() {
 }
 
 #[tokio::test]
+async fn entity_history_buckets_cover_the_full_window_without_a_continuation() {
+    let directory = entity_fixture(PlanFork::Ossc);
+    let entity = frame_entity_token(directory.path()).await;
+    let uri =
+        format!("/v1/entity/statements/{entity}?from=1000&to=2001&columns=queryid,calls&buckets=1");
+
+    let (status, body) = serve(directory.path(), &uri).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["snapshots"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["snapshots"][0]["ts_us"], "2000");
+    assert_eq!(body["snapshots"][0]["present"], true);
+    assert_eq!(body["page"]["next"], serde_json::Value::Null);
+}
+
+#[tokio::test]
 async fn entity_history_marks_absent_entity_as_null_without_status_fields() {
     let directory = entity_fixture(PlanFork::Ossc);
     let uri = format!(
@@ -451,6 +521,8 @@ async fn entity_history_marks_absent_entity_as_null_without_status_fields() {
         ["1000", "2000"]
     );
     assert_eq!(body["snapshots"][0]["values"][0], serde_json::Value::Null);
+    assert_eq!(body["snapshots"][0]["present"], false);
+    assert_eq!(body["snapshots"][1]["present"], false);
     assert!(body["snapshots"][0].get("statuses").is_none());
     assert!(body["snapshots"][0].get("reasons").is_none());
     assert_eq!(body["quality"]["gaps"], serde_json::json!([]));

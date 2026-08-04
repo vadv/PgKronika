@@ -1510,6 +1510,7 @@ test("data maintenance row detail owns the desktop canvas instead of the generic
                 snapshots: [
                   {
                     ts_us: "1722400000000000",
+                    present: true,
                     values: [12.4, 97.3],
                   },
                 ],
@@ -1606,7 +1607,13 @@ test("selected statement owns the desktop canvas below Health Line", async () =>
                 entity: "stmt:7101",
                 label: "9180220441127101",
                 columns: ["total"],
-                snapshots: [{ ts_us: "1722400000000000", values: [4_200] }],
+                snapshots: [
+                  {
+                    ts_us: "1722400000000000",
+                    present: true,
+                    values: [4_200],
+                  },
+                ],
               }),
         ),
       );
@@ -1704,6 +1711,7 @@ test("selected Activity observation owns the desktop canvas and preserves its po
                 snapshots: [
                   {
                     ts_us: "1722400000000000",
+                    present: true,
                     values: ["active", 4_200_000],
                   },
                 ],
@@ -1725,6 +1733,109 @@ test("selected Activity observation owns the desktop canvas and preserves its po
     const hash = new URLSearchParams(location.hash.slice(1));
     expect(hash.get("dock")).toBeNull();
     expect(hash.get("entity")).toBe("activity:AQACKwAAAAgZ5adgJlgGAA");
+  });
+});
+
+test("selected Plan owns the desktop canvas and preserves the Plans population", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=plans&at=1722400000000000&span=3600&dock=row&entity=plan%3A84102200`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const plans = availableCatalog.views.find((view) => view.code === "plans");
+  if (plans !== undefined) {
+    plans.availability = "available";
+    plans.capabilities = { detail: true, history: true, related: true };
+    plans.columns = [
+      {
+        availability: "available",
+        code: "planid",
+        lazy: false,
+        requires: [],
+        type: "i64",
+      },
+      {
+        availability: "available",
+        code: "queryid",
+        lazy: false,
+        requires: [],
+        type: "i64",
+      },
+      {
+        availability: "available",
+        code: "plan",
+        lazy: true,
+        requires: [],
+        type: "text",
+      },
+      {
+        availability: "available",
+        code: "mean",
+        lazy: false,
+        requires: [],
+        type: "f64",
+        unit: "ms",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href,
+    );
+    if (url.pathname === "/v1/ui/catalog") {
+      return Promise.resolve(jsonResponse(availableCatalog));
+    }
+    if (url.pathname.startsWith("/v1/entity/plans/")) {
+      return Promise.resolve(
+        jsonResponse(
+          url.searchParams.has("at")
+            ? makeEntityPointResponse({
+                view: "plans",
+                entity: "plan:84102200",
+                label: "84102200",
+                fields: [
+                  { code: "planid", value: "84102200" },
+                  { code: "queryid", value: "9180220441127101" },
+                  { code: "plan", value: "Index Scan using orders_pkey" },
+                  { code: "mean", value: 6.8 },
+                ],
+              })
+            : makeEntityHistoryResponse({
+                view: "plans",
+                entity: "plan:84102200",
+                label: "84102200",
+                columns: ["mean"],
+                snapshots: [
+                  {
+                    ts_us: "1722400000000000",
+                    present: true,
+                    values: [6.8],
+                  },
+                ],
+              }),
+        ),
+      );
+    }
+    return baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("plan-detail")).toBeDefined();
+  expect(screen.getByTestId("health-line")).toBeDefined();
+  expect(document.querySelector('aside[data-dock="row"]')).toBeNull();
+  expect(screen.getByTestId("plans-overview-preserved").hidden).toBe(true);
+
+  fireEvent.keyDown(document, { key: "Escape" });
+  await waitFor(() => {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    expect(hash.get("dock")).toBeNull();
+    expect(hash.get("entity")).toBe("plan:84102200");
   });
 });
 

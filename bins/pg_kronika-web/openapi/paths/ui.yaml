@@ -98,6 +98,13 @@
         minimum: 1
         type: integer
     - in: query
+      name: buckets
+      required: false
+      schema:
+        maximum: 96
+        minimum: 1
+        type: integer
+    - in: query
       name: cursor
       required: false
       schema:

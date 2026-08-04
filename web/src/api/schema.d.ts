@@ -825,6 +825,11 @@ export interface components {
         };
         EntityResponse: components["schemas"]["EntityPointResponse"] | components["schemas"]["EntityHistoryResponse"];
         EntitySnapshotDto: {
+            /**
+             * @description Whether this entity exists in the view snapshot. Values remain aligned
+             *     with requested columns and are null when the entity is absent.
+             */
+            present: boolean;
             ts_us: string;
             values: components["schemas"]["FrameValue"][];
         };
@@ -1862,6 +1867,7 @@ export interface operations {
                 to?: number;
                 columns?: string;
                 limit?: number;
+                buckets?: number;
                 cursor?: string;
             };
             header?: never;

@@ -231,6 +231,7 @@ if (activityCatalog !== undefined) {
 
 const plansCatalog = catalog.views.find((view) => view.code === "plans");
 if (plansCatalog !== undefined) {
+  plansCatalog.capabilities.related = true;
   plansCatalog.joins.push(
     {
       left: "plans",
@@ -1136,22 +1137,73 @@ function rowsStatements() {
 function rowsPlans() {
   const now = nowUs();
   const shapes = [
-    "Index Scan using orders_pkey on orders",
-    "Bitmap Heap Scan on sessions",
-    "Seq Scan on events",
-    "Nested Loop -> Index Scan on order_items",
-    "Hash Join -> Seq Scan on ledger",
-    "Index Only Scan using sessions_sid_idx",
-    "Sort -> Gather Merge on payments",
-    "Append -> Seq Scan on audit_log",
-    "Merge Join -> Index Scan on users",
-    "GroupAggregate -> Index Scan on inventory",
+    [
+      "Update on orders  (cost=0.43..8.45 rows=0 width=0)",
+      "  ->  Index Scan using orders_pkey on orders  (cost=0.43..8.45 rows=1 width=38)",
+      "        Index Cond: (id = $2)",
+      "        Filter: (status IS DISTINCT FROM $1)",
+    ],
+    [
+      "Bitmap Heap Scan on sessions  (cost=12.84..284.11 rows=420 width=96)",
+      "  Recheck Cond: (account_id = $1)",
+      "  ->  Bitmap Index Scan on sessions_account_idx  (cost=0.00..12.73 rows=420 width=0)",
+      "        Index Cond: (account_id = $1)",
+    ],
+    [
+      "Seq Scan on events  (cost=0.00..18422.40 rows=812 width=144)",
+      "  Filter: ((created_at >= $1) AND (tenant_id = $2))",
+      "  Rows Removed by Filter: 482104",
+    ],
+    [
+      "Nested Loop  (cost=0.86..912.44 rows=120 width=64)",
+      "  ->  Index Scan using orders_customer_idx on orders  (cost=0.43..126.20 rows=120 width=40)",
+      "        Index Cond: (customer_id = $1)",
+      "  ->  Index Scan using order_items_order_idx on order_items  (cost=0.43..6.48 rows=8 width=24)",
+      "        Index Cond: (order_id = orders.id)",
+    ],
+    [
+      "Hash Join  (cost=4102.12..22418.66 rows=18120 width=88)",
+      "  Hash Cond: (ledger.account_id = accounts.id)",
+      "  ->  Seq Scan on ledger  (cost=0.00..16208.31 rows=802131 width=56)",
+      "  ->  Hash  (cost=3288.18..3288.18 rows=65115 width=32)",
+      "        ->  Seq Scan on accounts  (cost=0.00..3288.18 rows=65115 width=32)",
+    ],
+    [
+      "Index Only Scan using sessions_sid_idx on sessions  (cost=0.43..4.45 rows=1 width=32)",
+      "  Index Cond: (sid = $1)",
+      "  Heap Fetches: 0",
+    ],
+    [
+      "Gather Merge  (cost=18244.72..20118.25 rows=16058 width=72)",
+      "  Workers Planned: 2",
+      "  ->  Sort  (cost=17244.69..17264.77 rows=8029 width=72)",
+      "        Sort Key: payments.created_at DESC",
+      "        ->  Parallel Seq Scan on payments  (cost=0.00..16724.12 rows=8029 width=72)",
+    ],
+    [
+      "Append  (cost=0.00..11880.44 rows=221400 width=48)",
+      "  ->  Seq Scan on audit_log_2026_07  (cost=0.00..5822.10 rows=108210 width=48)",
+      "  ->  Seq Scan on audit_log_2026_08  (cost=0.00..5951.34 rows=113190 width=48)",
+    ],
+    [
+      "Merge Join  (cost=0.86..9142.18 rows=42118 width=80)",
+      "  Merge Cond: (users.id = memberships.user_id)",
+      "  ->  Index Scan using users_pkey on users  (cost=0.43..4224.18 rows=88110 width=48)",
+      "  ->  Index Scan using memberships_user_idx on memberships  (cost=0.43..3922.11 rows=118220 width=32)",
+    ],
+    [
+      "GroupAggregate  (cost=0.43..12842.22 rows=884 width=48)",
+      "  Group Key: inventory.warehouse_id",
+      "  ->  Index Scan using inventory_warehouse_idx on inventory  (cost=0.43..11802.18 rows=206400 width=24)",
+    ],
   ];
   // Real pg_store_plans populations can be as dense as statements. Keep a
   // thousand deterministic rows so the Plans workspace proves paging and
   // virtualization instead of looking correct only for a ten-row toy.
   return Array.from({ length: 1_000 }, (_, i) => {
-    const plan = `${shapes[i % shapes.length]} · v${Math.floor(i / shapes.length) + 1}`;
+    const shape = shapes[i % shapes.length];
+    const version = (i % 4) + 1;
+    const plan = `${shape.join("\n")}\nPlanning variant: v${version}`;
     const planid = 84_102_200 + i * 17_311;
     const cls =
       i === 2
@@ -1165,16 +1217,18 @@ function rowsPlans() {
     );
     return {
       entity: `plan:${planid}`,
-      label: plan,
+      label: `${shape[0]} · v${version}`,
       data: {
         planid: String(planid),
         plan,
-        queryid: String(9_180_220_441_120_000n + BigInt(7101 + i)),
+        queryid: String(
+          9_180_220_441_120_000n + BigInt(7101 + Math.floor(i / 4)),
+        ),
         calls,
         mean,
         rows: Math.max(1, Math.round(calls * (0.8 + (i % 7) * 0.6))),
         shared_hit: Math.round(sharedRead * (18 + (i % 5) * 6)),
-        shared_read: i % 19 === 0 ? null : sharedRead,
+        shared_read: i % 19 === 18 ? null : sharedRead,
         first_call: String(now - (48 + (i % 240)) * 60 * US),
         last_call: String(now - (i % 360) * 10 * US),
       },
@@ -1837,6 +1891,23 @@ function entityResponse(viewCode, entity, params) {
         });
       }
     }
+    if (params.get("include") === "related" && viewCode === "plans") {
+      for (const statement of rowsStatements().filter(
+        (candidate) => candidate.data.queryid === row.data.queryid,
+      )) {
+        related.push({
+          view: "statements",
+          entity: statement.entity,
+          relation: "plan_statement",
+          snapshot_ts_us: at,
+          provenance: {
+            kind: "best_effort",
+            method: "ossc_queryid_dbid_userid_attribution",
+            fields: ["queryid", "dbid", "userid"],
+          },
+        });
+      }
+    }
     if (
       params.get("include") === "related" &&
       viewCode === "activity" &&
@@ -1963,11 +2034,15 @@ function entityResponse(viewCode, entity, params) {
   const rand = mulberry32(hashCode(entity));
   const snapshots = [];
   const totalSamples = 12;
-  const pageSize = Number(params.get("limit") ?? "4") === 96 ? 12 : 4;
-  const pageIndex = Math.max(
-    0,
-    Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
-  );
+  const sampled = params.get("buckets") !== null;
+  const pageSize =
+    sampled || Number(params.get("limit") ?? "4") === 96 ? 12 : 4;
+  const pageIndex = sampled
+    ? 0
+    : Math.max(
+        0,
+        Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
+      );
   const step = Math.max(1, Math.floor((to - from) / totalSamples));
   const statementShapes = {
     total: [0.42, 0.48, 0.63, 0.55, 0.72, 1.38, 1.12, 0.89, 1.6, 1.34, 1.18, 1],
@@ -2025,10 +2100,22 @@ function entityResponse(viewCode, entity, params) {
       0.24, 0.3, 0.26, 0.4, 0.5, 0.62, 0.74, 0.85, 1.1, 0.9, 1.04, 1,
     ],
   };
+  const planShapes = {
+    calls: [0.42, 0.48, 0.55, 0.51, 0.63, 0.72, 0.69, 0.81, 0.9, 0.94, 0.98, 1],
+    mean: [0.52, 0.56, 0.61, 0.58, 0.68, 0.84, 0.78, 1.08, 0.96, 1.16, 1.08, 1],
+    rows: [0.44, 0.5, 0.57, 0.54, 0.65, 0.73, 0.76, 0.83, 0.88, 0.93, 0.97, 1],
+    shared_hit: [
+      0.38, 0.45, 0.52, 0.49, 0.61, 0.7, 0.74, 0.82, 0.9, 0.94, 0.98, 1,
+    ],
+    shared_read: [
+      0.24, 0.29, 0.34, 0.31, 0.42, 0.58, 0.49, 0.82, 0.71, 1.18, 1.06, 1,
+    ],
+  };
   for (let i = 0; i < pageSize; i++) {
     const sampleIndex = pageIndex * pageSize + i;
     snapshots.push({
       ts_us: String(from + sampleIndex * step),
+      present: true,
       values: columns.map((code) => {
         const value = row.data[code] ?? null;
         const activityShape =
@@ -2051,9 +2138,12 @@ function entityResponse(viewCode, entity, params) {
             viewCode === "activity"
               ? activityShapes[code]?.[sampleIndex]
               : undefined;
+          const planFactor =
+            viewCode === "plans" ? planShapes[code]?.[sampleIndex] : undefined;
           const factor =
             statementShape?.[sampleIndex] ??
             (typeof activityFactor === "number" ? activityFactor : undefined) ??
+            (typeof planFactor === "number" ? planFactor : undefined) ??
             (gauge
               ? 0.97 + progress * 0.03 + noise / 3
               : 0.72 + progress * 0.28 + noise);
@@ -2077,7 +2167,7 @@ function entityResponse(viewCode, entity, params) {
     snapshots,
     page: {
       next:
-        (pageIndex + 1) * pageSize < totalSamples
+        !sampled && (pageIndex + 1) * pageSize < totalSamples
           ? `page-${pageIndex + 2}`
           : null,
     },

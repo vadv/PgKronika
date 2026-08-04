@@ -526,7 +526,13 @@ fn view(
             ),
             related: matches!(
                 projection.name.as_bytes(),
-                b"activity" | b"statements" | b"tables" | b"indexes" | b"vacuum" | b"processes"
+                b"activity"
+                    | b"statements"
+                    | b"plans"
+                    | b"tables"
+                    | b"indexes"
+                    | b"vacuum"
+                    | b"processes"
             ),
         },
         inputs: projection_inputs(projection),
@@ -1101,7 +1107,7 @@ fn plans_view() -> ViewSpec {
                 right: "statements",
                 kind: RelationKind::BestEffort,
                 fields: vec!["queryid", "dbid", "userid"],
-                cardinality: "many_to_one",
+                cardinality: "zero_or_many",
                 provenance: "ossc_queryid_dbid_userid_attribution",
             },
             JoinSpec {
@@ -1109,7 +1115,7 @@ fn plans_view() -> ViewSpec {
                 right: "statements",
                 kind: RelationKind::BestEffort,
                 fields: vec!["queryid_stat_statements", "dbid", "userid"],
-                cardinality: "many_to_one",
+                cardinality: "zero_or_many",
                 provenance: "vadv_queryid_stat_statements_dbid_userid_attribution",
             },
         ],
