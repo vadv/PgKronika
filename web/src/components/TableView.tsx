@@ -183,8 +183,22 @@ function ProcessLinkGlyph(props: { linked: boolean }) {
       aria-hidden="true"
       style={{ flex: "none" }}
     >
-      <circle cx={cx1} cy={6} r={2.5} fill="none" stroke={color} strokeWidth={1.4} />
-      <circle cx={cx2} cy={6} r={2.5} fill="none" stroke={color} strokeWidth={1.4} />
+      <circle
+        cx={cx1}
+        cy={6}
+        r={2.5}
+        fill="none"
+        stroke={color}
+        strokeWidth={1.4}
+      />
+      <circle
+        cx={cx2}
+        cy={6}
+        r={2.5}
+        fill="none"
+        stroke={color}
+        strokeWidth={1.4}
+      />
     </svg>
   );
 }
