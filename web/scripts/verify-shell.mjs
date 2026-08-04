@@ -14,6 +14,7 @@ const SUCCESS_SHOT = `${OUT_DIR}forensic-shell-1920x1080.png`;
 const ACTIVITY_SHOT = `${OUT_DIR}forensic-activity-1920x1080.png`;
 const ACTIVITY_CPU_SHOT = `${OUT_DIR}forensic-activity-cpu-1920x1080.png`;
 const ACTIVITY_WAITS_SHOT = `${OUT_DIR}forensic-activity-waits-1920x1080.png`;
+const ACTIVITY_DETAIL_SHOT = `${OUT_DIR}forensic-activity-detail-1920x1080.png`;
 const PROCESS_DETAIL_SHOT = `${OUT_DIR}forensic-process-detail-1920x1080.png`;
 const PLANS_SHOT = `${OUT_DIR}forensic-plans-1920x1080.png`;
 const OS_SHOT = `${OUT_DIR}forensic-os-1920x1080.png`;
@@ -1209,6 +1210,231 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
   }
   await page.screenshot({ path: PROCESS_DETAIL_SHOT });
 
+  await page.goto(
+    `${base}/#source=local&view=activity&at=${at}&span=21600&preset=overview&dock=row&entity=${encodeURIComponent("pid:12041")}`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector('[data-testid="activity-detail"]', {
+    timeout: 15_000,
+  });
+  await page.waitForSelector(
+    '[data-testid="activity-observation-cell"][data-tone="critical"]',
+    { timeout: 10_000 },
+  );
+  await page.waitForSelector(".activity-detail__lane-trace", {
+    timeout: 10_000,
+  });
+  const activityDetail = await page.evaluate(() => {
+    const detail = document.querySelector('[data-testid="activity-detail"]');
+    const health = document.querySelector('[data-shell-region="health-line"]');
+    const status = document.querySelector('[data-shell-region="status"]');
+    if (
+      !(detail instanceof HTMLElement) ||
+      !(health instanceof HTMLElement) ||
+      !(status instanceof HTMLElement)
+    ) {
+      throw new Error("Activity detail shell is incomplete");
+    }
+    const detailRect = detail.getBoundingClientRect();
+    const healthRect = health.getBoundingClientRect();
+    const statusRect = status.getBoundingClientRect();
+    const historyRequest = performance
+      .getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .find((name) => {
+        if (!name.includes("/v1/entity/activity/")) return false;
+        return new URL(name).searchParams.has("from");
+      });
+    const historyUrl =
+      historyRequest === undefined ? null : new URL(historyRequest);
+    const from = historyUrl?.searchParams.get("from") ?? null;
+    const to = historyUrl?.searchParams.get("to") ?? null;
+    const columns = historyUrl?.searchParams.get("columns") ?? "";
+    const params = new URLSearchParams(location.hash.slice(1));
+    const text = detail.textContent ?? "";
+    return {
+      rootHeight: document.documentElement.scrollHeight,
+      rootWidth: document.documentElement.scrollWidth,
+      scrollY: window.scrollY,
+      detail: {
+        top: detailRect.top,
+        bottom: detailRect.bottom,
+        width: detailRect.width,
+      },
+      healthBottom: healthRect.bottom,
+      statusTop: statusRect.top,
+      lanes: detail.querySelectorAll('[data-testid="activity-temporal-lane"]')
+        .length,
+      traces: detail.querySelectorAll(".activity-detail__lane-trace").length,
+      observations: detail.querySelectorAll(
+        '[data-testid="activity-observation-cell"]',
+      ).length,
+      criticalObservations: detail.querySelectorAll(
+        '[data-testid="activity-observation-cell"][data-tone="critical"]',
+      ).length,
+      analyses: detail.querySelectorAll(
+        ".activity-detail__analysis-grid > section",
+      ).length,
+      processCandidates: detail.querySelectorAll(
+        '[data-testid="activity-related-evidence"] button[aria-label^="Open related process"]',
+      ).length,
+      statementsAction:
+        detail.querySelector(
+          '[data-testid="activity-related-evidence"] button[aria-label="Find this query in Statements"]',
+        ) !== null,
+      waitsAction:
+        detail.querySelector(
+          '[data-testid="activity-related-evidence"] button[aria-label="Open this PID in waits & locks"]',
+        ) !== null,
+      genericDock: document.querySelector('aside[data-dock="row"]') !== null,
+      overviewPreserved:
+        document.querySelector(
+          '[data-testid="activity-overview-preserved"]',
+        ) !== null,
+      overviewVisible:
+        document.querySelector(
+          '[data-testid="activity-overview-preserved"]:not([hidden])',
+        ) !== null,
+      rawEntity: text.includes(params.get("entity") ?? ""),
+      forbiddenCopy:
+        /\/v1\/|best[_ -]?effort|pid_neighbor|exact match|proof|provenance|\bgaps?\b|\bgated\b/i.test(
+          text,
+        ),
+      history: {
+        request: historyRequest ?? null,
+        limit: historyUrl?.searchParams.get("limit") ?? null,
+        columns: columns === "" ? [] : columns.split(","),
+        width: from === null || to === null ? null : Number(to) - Number(from),
+        pointAt: historyUrl?.searchParams.has("at") ?? null,
+      },
+    };
+  });
+  const activityHistoryColumns = [
+    "state",
+    "wait_event",
+    "query_duration_us",
+    "transaction_duration_us",
+    "cpu",
+    "rss",
+    "read_bytes_per_second",
+    "write_bytes_per_second",
+  ];
+  const activityDetailFailures = [];
+  if (activityDetail.rootHeight > 1080)
+    activityDetailFailures.push(`root height ${activityDetail.rootHeight}`);
+  if (activityDetail.rootWidth > 1920)
+    activityDetailFailures.push(`root width ${activityDetail.rootWidth}`);
+  if (activityDetail.scrollY !== 0)
+    activityDetailFailures.push(
+      `shell scroll offset ${activityDetail.scrollY}`,
+    );
+  if (
+    Math.abs(activityDetail.detail.top - activityDetail.healthBottom) > 1 ||
+    Math.abs(activityDetail.detail.bottom - activityDetail.statusTop) > 1 ||
+    Math.abs(activityDetail.detail.width - 1920) > 1
+  ) {
+    activityDetailFailures.push(
+      `full-canvas geometry ${JSON.stringify(activityDetail.detail)}`,
+    );
+  }
+  if (activityDetail.lanes !== 4)
+    activityDetailFailures.push(`temporal lanes ${activityDetail.lanes}`);
+  if (activityDetail.traces < 5)
+    activityDetailFailures.push(`numeric traces ${activityDetail.traces}`);
+  if (
+    activityDetail.observations !== 12 ||
+    activityDetail.criticalObservations < 1
+  ) {
+    activityDetailFailures.push(
+      `observation history ${activityDetail.observations}/${activityDetail.criticalObservations}`,
+    );
+  }
+  if (activityDetail.analyses !== 3)
+    activityDetailFailures.push(`analysis columns ${activityDetail.analyses}`);
+  if (
+    activityDetail.processCandidates < 1 ||
+    !activityDetail.statementsAction ||
+    !activityDetail.waitsAction
+  ) {
+    activityDetailFailures.push("forensic continuations are incomplete");
+  }
+  if (
+    activityDetail.genericDock ||
+    !activityDetail.overviewPreserved ||
+    activityDetail.overviewVisible
+  ) {
+    activityDetailFailures.push("full-canvas Activity detail routing failed");
+  }
+  if (activityDetail.rawEntity)
+    activityDetailFailures.push("raw entity token leaked into Activity detail");
+  if (activityDetail.forbiddenCopy)
+    activityDetailFailures.push(
+      "technical linkage jargon escaped into Activity detail",
+    );
+  if (
+    activityDetail.history.request === null ||
+    activityDetail.history.limit !== "96" ||
+    activityDetail.history.columns.join(",") !==
+      activityHistoryColumns.join(",") ||
+    activityDetail.history.width === null ||
+    activityDetail.history.width > 21_600_000_000 ||
+    activityDetail.history.pointAt !== false
+  ) {
+    activityDetailFailures.push(
+      `bounded history contract ${JSON.stringify(activityDetail.history)}`,
+    );
+  }
+  if (activityDetailFailures.length > 0) {
+    throw new Error(`Activity detail: ${activityDetailFailures.join("; ")}`);
+  }
+  await page.screenshot({ path: ACTIVITY_DETAIL_SHOT });
+
+  await page.click(
+    '[data-testid="activity-related-evidence"] button[aria-label="Find this query in Statements"]',
+  );
+  await page.waitForFunction(
+    () => {
+      const params = new URLSearchParams(location.hash.slice(1));
+      const filter = document.querySelector('input[name="view-filter"]');
+      return (
+        params.get("view") === "statements" &&
+        params.get("preset") === "time" &&
+        params.get("dock") === null &&
+        params.get("entity") === null &&
+        filter instanceof HTMLInputElement &&
+        /^queryid=/.test(filter.value)
+      );
+    },
+    { timeout: 10_000 },
+  );
+  await page.goto(
+    `${base}/#source=local&view=activity&at=${at}&span=21600&preset=overview&dock=row&entity=${encodeURIComponent("pid:12041")}`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector(
+    '[data-testid="activity-related-evidence"] button[aria-label="Open this PID in waits & locks"]',
+    { timeout: 10_000 },
+  );
+  await page.click(
+    '[data-testid="activity-related-evidence"] button[aria-label="Open this PID in waits & locks"]',
+  );
+  await page.waitForFunction(
+    () => {
+      const params = new URLSearchParams(location.hash.slice(1));
+      const filter = document.querySelector('input[name="view-filter"]');
+      return (
+        params.get("view") === "activity" &&
+        params.get("preset") === "waits_locks" &&
+        params.get("dock") === null &&
+        params.get("entity") === null &&
+        filter instanceof HTMLInputElement &&
+        filter.value === "pid=12041"
+      );
+    },
+    { timeout: 10_000 },
+  );
+  activityDetail.continuationsVerified = true;
+
   await page.goto(`${base}/#source=local&view=plans&at=${at}&span=3600`, {
     waitUntil: "networkidle0",
   });
@@ -1382,6 +1608,7 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       waits,
       processRelationVerified: true,
       processDetailVerified: true,
+      detail: activityDetail,
     },
     plans,
   };
@@ -2354,6 +2581,7 @@ try {
   console.log(`approved screenshot: ${ACTIVITY_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_CPU_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_WAITS_SHOT}`);
+  console.log(`approved screenshot: ${ACTIVITY_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${PROCESS_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${PLANS_SHOT}`);
   console.log(`approved screenshot: ${OS_SHOT}`);
