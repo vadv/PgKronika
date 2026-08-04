@@ -40,8 +40,10 @@ export function PageHeader(props: {
       <span
         style={{
           fontFamily: "var(--ui-font)",
-          fontSize: "var(--text-md)",
-          fontWeight: 600,
+          fontSize: "var(--text-lg)",
+          fontWeight: 700,
+          letterSpacing: "var(--tracking-caps)",
+          textTransform: "uppercase",
           color: "var(--fg-strong)",
         }}
       >
