@@ -444,11 +444,13 @@ function TableViewImpl(props: TableViewProps) {
     else groups.push({ code, span: 1 });
     return groups;
   }, []);
+  const hasTrailingCell = timeMatrixMode || !activitySnapshotMode;
   const renderedColumnCount =
     displayColumns.length +
     ((timeMatrixMode || activitySnapshotMode) && identityColumns.length > 0
       ? 1
-      : 0);
+      : 0) +
+    (hasTrailingCell ? 1 : 0);
   const heatmapRows = new Map(
     (timeMatrix?.data?.rows ?? []).map((row) => [row.entity, row]),
   );
@@ -817,7 +819,7 @@ function TableViewImpl(props: TableViewProps) {
             {topSpacerHeight > 0 && (
               <tr aria-hidden="true" data-virtual-spacer="top">
                 <td
-                  colSpan={renderedColumnCount + 1}
+                  colSpan={renderedColumnCount}
                   style={{ height: `${topSpacerHeight}px`, padding: 0 }}
                 />
               </tr>
@@ -1123,7 +1125,7 @@ function TableViewImpl(props: TableViewProps) {
             {bottomSpacerHeight > 0 && (
               <tr aria-hidden="true" data-virtual-spacer="bottom">
                 <td
-                  colSpan={renderedColumnCount + 1}
+                  colSpan={renderedColumnCount}
                   style={{ height: `${bottomSpacerHeight}px`, padding: 0 }}
                 />
               </tr>
