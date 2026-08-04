@@ -140,3 +140,42 @@ export function shortIdToken(raw: string): string {
 export function breakableCode(code: string): string {
   return code.replaceAll(".", ".\u200B");
 }
+
+export const AREA_CHART_WIDTH = 240;
+export const AREA_CHART_HEIGHT = 32;
+
+/** Each contiguous run of samples becomes its own filled polygon \u2014 a missing
+ * bucket stays a visible gap in the shape, never bridged into a false
+ * continuous trend. */
+export function areaChartSegments(
+  values: (number | null)[],
+  max: number,
+): string[] {
+  const step = values.length > 1 ? AREA_CHART_WIDTH / (values.length - 1) : 0;
+  const segments: string[] = [];
+  let points: string[] = [];
+  let firstX = 0;
+  let lastX = 0;
+  const flush = () => {
+    if (points.length >= 2) {
+      segments.push(
+        `${points.join(" ")} L${lastX},${AREA_CHART_HEIGHT} L${firstX},${AREA_CHART_HEIGHT} Z`,
+      );
+    }
+    points = [];
+  };
+  values.forEach((value, index) => {
+    if (value === null || !Number.isFinite(value)) {
+      flush();
+      return;
+    }
+    const x = index * step;
+    const ratio = Math.max(0, Math.min(value, max)) / max;
+    const y = AREA_CHART_HEIGHT - ratio * AREA_CHART_HEIGHT;
+    if (points.length === 0) firstX = x;
+    lastX = x;
+    points.push(`${points.length === 0 ? "M" : "L"}${x},${y}`);
+  });
+  flush();
+  return segments;
+}

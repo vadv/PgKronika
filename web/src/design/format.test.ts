@@ -1,5 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
+  AREA_CHART_HEIGHT,
+  AREA_CHART_WIDTH,
+  areaChartSegments,
   breakableCode,
   formatByUnit,
   formatCompactNumber,
@@ -82,4 +85,40 @@ test("breakableCode breaks at segment bounds only", () => {
   expect(breakableCode("pg.log.error_group_observed")).toBe(
     "pg.\u200Blog.\u200Berror_group_observed",
   );
+});
+
+describe("areaChartSegments", () => {
+  test("fills one polygon per contiguous run of samples", () => {
+    const w = AREA_CHART_WIDTH;
+    const h = AREA_CHART_HEIGHT;
+    expect(areaChartSegments([0, 4], 4)).toEqual([
+      `M0,${h} L${w},0 L${w},${h} L0,${h} Z`,
+    ]);
+  });
+
+  test("breaks the shape at a gap instead of bridging it", () => {
+    const h = AREA_CHART_HEIGHT;
+    expect(areaChartSegments([1, 2, null, 3, 4], 4)).toEqual([
+      `M0,24 L60,16 L60,${h} L0,${h} Z`,
+      `M180,8 L240,0 L240,${h} L180,${h} Z`,
+    ]);
+  });
+
+  test("draws nothing for an all-missing series", () => {
+    expect(areaChartSegments([null, null, null], 4)).toEqual([]);
+  });
+
+  test("drops an isolated single sample instead of faking a shape for it", () => {
+    const h = AREA_CHART_HEIGHT;
+    expect(areaChartSegments([1, 2, null, 5], 4)).toEqual([
+      `M0,24 L80,16 L80,${h} L0,${h} Z`,
+    ]);
+  });
+
+  test("clamps out-of-range samples instead of drawing past the baseline", () => {
+    const h = AREA_CHART_HEIGHT;
+    expect(areaChartSegments([-3, 2], 4)).toEqual([
+      `M0,${h} L240,16 L240,${h} L0,${h} Z`,
+    ]);
+  });
 });
