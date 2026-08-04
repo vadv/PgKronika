@@ -155,7 +155,7 @@ test("tab switches the dock kind and close calls onClose", () => {
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
-test("row dock keeps the technical id out of the human heading", async () => {
+test("desktop row detail is a full forensic workspace and keeps the token in Raw", async () => {
   stubFetch(
     makeEntityPointResponse({ view: "activity", entity: "AQAEBQAAx9" }),
   );
@@ -165,16 +165,22 @@ test("row dock keeps the technical id out of the human heading", async () => {
     configurable: true,
   });
   renderDock({ state: { ...baseState, dock: "row", entity: "AQAEBQAAx9" } });
-  await waitFor(() =>
-    expect(screen.getByTestId("dock-copy-token")).toBeDefined(),
-  );
-  // The raw token never renders as its own line or native tooltip.
+  await waitFor(() => expect(screen.getByRole("tabpanel")).toBeDefined());
+  const aside = screen.getByLabelText("dock.title");
+  expect(aside.classList.contains("dock-overlay--row-workspace")).toBe(true);
+  expect(aside.style.insetBlockStart).toBe("136px");
+  expect(aside.style.insetBlockEnd).toBe("24px");
+  expect(aside.style.insetInline).toBe("0");
+  // The raw token never renders in the normal summary or native tooltip.
   expect(screen.queryByText("AQAEBQAA…")).toBeNull();
   expect(
     screen.getByTestId("dock-entity-heading").getAttribute("title"),
   ).toBeNull();
-  const copy = screen.getByTestId("dock-copy-token");
-  expect(copy.getAttribute("aria-label")).toBe("dock.row.copyTechnicalId");
+  expect(screen.queryByTestId("dock-copy-token")).toBeNull();
+  fireEvent.click(screen.getByRole("tab", { name: "dock.detail.raw" }));
+  const copy = screen.getByRole("button", {
+    name: "dock.row.copyTechnicalId",
+  });
   fireEvent.click(copy);
   expect(writeText).toHaveBeenCalledWith("AQAEBQAAx9");
 });
@@ -187,23 +193,256 @@ test("row dock renders point fields from the entity endpoint", async () => {
       fields: [
         { code: "tup", value: 42 },
         { code: "locks", value: null },
+        { code: "rss", value: null },
       ],
       quality: { status: "partial", gaps: [], gated: [] },
     }),
   );
   renderDock({
     state: { ...baseState, dock: "row", entity: "db:1" },
+    view: makeViewSpec({
+      code: "activity",
+      columns: [
+        {
+          code: "tup",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+        {
+          code: "locks",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+        {
+          code: "rss",
+          type: "i64",
+          lazy: false,
+          requires: ["os_process"],
+          availability: "gated",
+        },
+      ],
+    }),
   });
   await waitFor(() => expect(screen.getByText("42")).toBeDefined());
   expect(screen.getByText("tup")).toBeDefined();
+  expect(screen.queryByText("locks")).toBeNull();
+  expect(screen.getByText("rss")).toBeDefined();
+  expect(screen.getByText("not collected")).toBeDefined();
+  expect(document.querySelector("[data-forensic-summary]")).not.toBeNull();
   const summary = screen.getByRole("tabpanel");
   expect(summary.textContent).not.toMatch(
     /partial|complete|gaps|gated|point projection|\/v1\/entity/i,
   );
   expect(document.querySelector("[data-detail-provenance]")).toBeNull();
-  const missing = screen.getByText("—");
-  expect(missing.dataset.status).toBeUndefined();
-  expect(missing.title).toBe("");
+  expect(summary.textContent).not.toContain("—");
+});
+
+test("process detail orders real Linux evidence into a dense forensic workspace", async () => {
+  const fields = [
+    { code: "command", value: "postgres: api-worker erp_prod" },
+    { code: "read_bytes_per_second", value: 2_000_000 },
+    { code: "cache_served_read_bytes_per_second", value: 8_000_000 },
+    { code: "logical_read_bytes_per_second", value: 10_000_000 },
+    { code: "logical_write_bytes_per_second", value: 1_400_000 },
+    { code: "write_bytes_per_second", value: null },
+    { code: "cpu_system", value: 0.2 },
+    { code: "cpu_user", value: 0.3 },
+    { code: "cpu", value: 0.5 },
+    { code: "run_delay", value: 0.4 },
+    { code: "rss", value: 412_884 },
+    { code: "virtual_memory", value: 1_048_576 },
+    { code: "voluntary_context_switches_per_second", value: 10 },
+    { code: "minor_faults_per_second", value: 100 },
+    { code: "parent_pid", value: 1 },
+    { code: "uid", value: 999 },
+    { code: "effective_uid", value: 998 },
+    { code: "started_at", value: "1722400000000000" },
+    { code: "pid", value: 12496 },
+    { code: "type", value: "postgres: backend" },
+    { code: "state", value: "R" },
+    { code: "cgroup", value: "/system.slice/postgresql.service" },
+  ];
+  const unitByCode: Record<string, string | null> = {
+    cpu: "ratio",
+    cpu_user: "ratio",
+    cpu_system: "ratio",
+    run_delay: "ratio",
+    rss: "kib",
+    virtual_memory: "kib",
+    voluntary_context_switches_per_second: "per_second",
+    minor_faults_per_second: "per_second",
+    logical_read_bytes_per_second: "bytes_per_second",
+    logical_write_bytes_per_second: "bytes_per_second",
+    cache_served_read_bytes_per_second: "bytes_per_second",
+    read_bytes_per_second: "bytes_per_second",
+    write_bytes_per_second: "bytes_per_second",
+  };
+  const relatedAt = "1722399990000000";
+  const processPoint = makeEntityPointResponse({
+    view: "processes",
+    entity: "process:12496",
+    label: "postgres: backend api-worker",
+    fields,
+    related: [
+      {
+        view: "activity",
+        entity: "pid:12496",
+        relation: "activity_process",
+        snapshot_ts_us: relatedAt,
+        provenance: {
+          kind: "best_effort",
+          method: "pid",
+          fields: ["pid"],
+        },
+      },
+    ],
+  });
+  const activityPoint = makeEntityPointResponse({
+    view: "activity",
+    entity: "pid:12496",
+    label: "app/api-worker (active)",
+    fields: [
+      { code: "database", value: "erp_prod" },
+      { code: "user", value: "app" },
+      { code: "application", value: "api-worker" },
+      { code: "state", value: "active" },
+      { code: "wait_event", value: "IO:DataFileRead" },
+      { code: "query_duration_us", value: 1_240_000 },
+      { code: "query", value: "select * from orders where id = $1" },
+    ],
+  });
+  const requestUrls: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input instanceof Request ? input.url : input);
+      requestUrls.push(url);
+      const body = url.includes("/entity/activity/")
+        ? activityPoint
+        : processPoint;
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }),
+  );
+  const onPatch = vi.fn();
+  renderDock({
+    state: {
+      ...baseState,
+      view: "processes",
+      dock: "row",
+      entity: "process:12496",
+    },
+    view: makeViewSpec({
+      code: "processes",
+      columns: fields.map((field) => ({
+        code: field.code,
+        type:
+          field.code === "started_at"
+            ? "timestamp"
+            : typeof field.value === "number"
+              ? "f64"
+              : "text",
+        unit: unitByCode[field.code] ?? null,
+        lazy: false,
+        requires: ["process"],
+        availability: "available",
+      })),
+    }),
+    onPatch,
+  });
+
+  await waitFor(() => expect(screen.getByText("12496")).toBeDefined());
+  const groupCodes = Array.from(
+    document.querySelectorAll<HTMLElement>("[data-forensic-group]"),
+  ).map((group) => group.dataset.forensicGroup);
+  expect(groupCodes).toEqual(["compute", "ioCache", "context"]);
+  expect(screen.getByText("dock.detail.source.process.compute")).toBeDefined();
+  expect(screen.getByText("dock.detail.source.process.ioCache")).toBeDefined();
+  expect(screen.getByText("dock.detail.source.process.context")).toBeDefined();
+  expect(screen.getByText("dock.detail.subgroup.memory")).toBeDefined();
+  expect(screen.getByText("dock.detail.subgroup.readPath")).toBeDefined();
+  expect(screen.getByText("dock.detail.subgroup.ioRates")).toBeDefined();
+  expect(screen.getByText("dock.detail.subgroup.execution")).toBeDefined();
+  expect(
+    await screen.findByText("dock.detail.relatedActivity.title"),
+  ).toBeDefined();
+  expect(screen.getByText("select * from orders where id = $1")).toBeDefined();
+  expect(screen.getByText("1.24 s")).toBeDefined();
+  expect(
+    document.querySelector(
+      '[data-field="write_bytes_per_second"] .entity-detail__value',
+    )?.textContent,
+  ).toBe("not collected");
+  expect(
+    requestUrls.some((url) => {
+      const request = new URL(url);
+      return (
+        request.pathname.includes("/entity/activity/") &&
+        request.searchParams.get("at") === relatedAt
+      );
+    }),
+  ).toBe(true);
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: /dock\.detail\.relatedActivity\.open/,
+    }),
+  );
+  expect(onPatch).toHaveBeenCalledWith({
+    view: "activity",
+    entity: "pid:12496",
+    dock: "row",
+    preset: null,
+    q: null,
+    sort: null,
+    order: null,
+    at: relatedAt,
+  });
+  const fieldCodes = (group: string) =>
+    Array.from(
+      document.querySelectorAll<HTMLElement>(
+        `[data-forensic-group="${group}"] [data-field]`,
+      ),
+    ).map((field) => field.dataset.field);
+  expect(fieldCodes("compute").slice(0, 4)).toEqual([
+    "cpu",
+    "cpu_user",
+    "cpu_system",
+    "run_delay",
+  ]);
+  expect(fieldCodes("ioCache").slice(0, 3)).toEqual([
+    "logical_read_bytes_per_second",
+    "cache_served_read_bytes_per_second",
+    "read_bytes_per_second",
+  ]);
+  expect(fieldCodes("context").slice(0, 4)).toEqual([
+    "parent_pid",
+    "uid",
+    "effective_uid",
+    "started_at",
+  ]);
+  expect(
+    document.querySelector(
+      '[data-field="cache_served_read_bytes_per_second"][data-semantic="estimate"]',
+    ),
+  ).not.toBeNull();
+  expect(screen.getByText("EST").getAttribute("title")).toBe(
+    "semantic.kind.EST.label: semantic.kind.EST.explanation",
+  );
+  expect(screen.getAllByText("R").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("G").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("S").length).toBeGreaterThan(0);
+  expect(screen.getByText("10/s")).toBeDefined();
+  expect(screen.getByRole("tabpanel").textContent).not.toMatch(
+    /page-cache hits|proof|confidence|exact match|gaps|gated/i,
+  );
 });
 
 test("row dock fetches bounded history only after selecting the History tab", async () => {
@@ -454,6 +693,7 @@ test("row dock drills down via server related provenance and clears", async () =
           view: "plans",
           entity: "plan:9",
           relation: "statement_plan",
+          snapshot_ts_us: "1722400000000000",
           provenance: {
             kind: "best_effort",
             method: "ossc_queryid_dbid_userid_attribution",
@@ -496,6 +736,7 @@ test("row dock drills down via server related provenance and clears", async () =
     q: null,
     sort: null,
     order: null,
+    at: "1722400000000000",
   });
   fireEvent.click(screen.getByRole("button", { name: "dock.row.clear" }));
   expect(onPatch).toHaveBeenCalledWith({ entity: null, dock: null });
@@ -516,6 +757,7 @@ test("activity-process relationship stays positive across partial collection", a
           view: "processes",
           entity: "process:44",
           relation: "activity_process",
+          snapshot_ts_us: "1722400000000000",
           provenance: {
             kind: "best_effort",
             method: "pid",

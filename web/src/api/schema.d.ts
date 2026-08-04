@@ -1392,6 +1392,7 @@ export interface components {
             entity: string;
             provenance: components["schemas"]["RelationProvenanceDto"];
             relation: string;
+            snapshot_ts_us: string;
             view: string;
         };
         /**

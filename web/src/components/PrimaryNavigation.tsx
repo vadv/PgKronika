@@ -77,7 +77,7 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
         display: "flex",
         alignItems: "stretch",
         gap: "8px",
-        paddingInline: "12px",
+        paddingInline: "var(--space-4)",
         overflow: "hidden",
         background: "var(--bg)",
         color: "var(--fg)",

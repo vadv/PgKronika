@@ -4,6 +4,7 @@ import { type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { HeatmapResponse } from "../api/types";
 import {
+  makeEntityPointResponse,
   makeFrameColumn,
   makeFrameResponse,
   makeFrameRow,
@@ -265,6 +266,29 @@ function stubRequests() {
           ),
         );
       }
+      if (url.pathname.startsWith("/v1/entity/activity/")) {
+        return Promise.resolve(
+          json(
+            makeEntityPointResponse({
+              view: "activity",
+              entity: "pid:18422",
+              related: [
+                {
+                  view: "processes",
+                  entity: "proc:18422",
+                  relation: "activity_process",
+                  snapshot_ts_us: "1722400000000000",
+                  provenance: {
+                    kind: "best_effort",
+                    method: "pid",
+                    fields: ["pid"],
+                  },
+                },
+              ],
+            }),
+          ),
+        );
+      }
       return Promise.resolve(json(activityFrame));
     }),
   );
@@ -300,11 +324,12 @@ function renderWorkspace(
   );
 }
 
-test("builds one dense Activity matrix with a positive PID relation", async () => {
+test("builds the joined Activity snapshot by default and keeps PID links calm", async () => {
   stubRequests();
-  renderWorkspace("overview");
+  const onOpenEntity = vi.fn();
+  renderWorkspace("overview", onOpenEntity);
 
-  expect(await screen.findByTestId("activity-time-matrix")).toBeDefined();
+  expect(await screen.findByTestId("activity-snapshot-table")).toBeDefined();
   expect(screen.getByTestId("activity-point-evidence")).toBeDefined();
   expect(screen.getByTestId("activity-process-link").textContent).toContain(
     "relation.activityProcess.pid",
@@ -314,45 +339,48 @@ test("builds one dense Activity matrix with a positive PID relation", async () =
     /best_effort|edge.only|point.snapshot|series \d+ \/|gaps|gated/i,
   );
   expect(screen.queryByTestId("activity-detached-heatmap")).toBeNull();
-  await waitFor(() =>
-    expect(screen.getAllByTestId("activity-sample-row")).toHaveLength(2),
-  );
-  expect(screen.getAllByTestId("time-matrix-bucket")).toHaveLength(2 * 96);
+  expect(screen.queryByTestId("activity-sample-row")).toBeNull();
+  expect(screen.queryByTestId("time-matrix-bucket")).toBeNull();
   const table = screen.getByRole("table", { name: "activity" });
-  expect(table.getAttribute("aria-rowcount")).toBe("30");
+  await waitFor(() => expect(table.getAttribute("aria-rowcount")).toBe("30"));
   expect(
     table
       .querySelector('[data-entity="pid:18422"]')
       ?.getAttribute("aria-rowindex"),
   ).toBe("3");
+  expect(
+    table.querySelector('[data-evidence-group="relation"]'),
+  ).not.toBeNull();
+  expect(table.querySelector('[data-evidence-group="os"]')).not.toBeNull();
+
+  screen.getByTestId("activity-process-link-cell").click();
+  await waitFor(() =>
+    expect(onOpenEntity).toHaveBeenCalledWith("processes", "proc:18422"),
+  );
+  const relationCall = vi
+    .mocked(fetch)
+    .mock.calls.map(([input]) => requestUrl(input))
+    .find((url) => url.pathname.startsWith("/v1/entity/activity/"));
+  expect(relationCall?.searchParams.get("include")).toBe("related");
 
   const heatmapCall = vi
     .mocked(fetch)
     .mock.calls.map(([input]) => requestUrl(input))
     .find((url) => url.pathname === "/v1/timeline/heatmap");
-  expect(heatmapCall?.searchParams.get("view")).toBe("activity");
-  expect(heatmapCall?.searchParams.get("buckets")).toBe("96");
-  expect(heatmapCall?.searchParams.get("top")).toBe("64");
+  expect(heatmapCall).toBeUndefined();
 });
 
-test("shows a same-PID OS join per row, honest when no OS process matched", async () => {
+test("command column states no OS process matched, honestly, instead of a bare dash", async () => {
   stubRequests();
   renderWorkspace("overview");
 
   await waitFor(() =>
-    expect(screen.getAllByTestId("process-link-cell")).toHaveLength(2),
+    expect(screen.getByText("postgres: api erp_prod")).toBeDefined(),
   );
-  const cells = screen.getAllByTestId("process-link-cell");
-  const linked = cells.find((cell) => cell.dataset.linked === "true");
-  const unlinked = cells.find((cell) => cell.dataset.linked === "false");
-  expect(linked?.title).toBe("activity.processEvidence");
-  expect(unlinked?.title).toBe("activity.processLink.none");
-
   expect(screen.queryByTestId("process-link-command-empty")).not.toBeNull();
   expect(screen.getByTestId("process-link-command-empty").textContent).toBe(
     "activity.processLink.noneCommand",
   );
-  expect(screen.getByText("postgres: api erp_prod")).toBeDefined();
 });
 
 test("adds compact waiter to blocker relations only to Waits & Locks", async () => {
@@ -361,6 +389,10 @@ test("adds compact waiter to blocker relations only to Waits & Locks", async () 
   renderWorkspace("waits_locks", onOpenEntity);
 
   const strip = await screen.findByTestId("activity-lock-evidence");
+  expect(screen.getByTestId("activity-time-matrix")).toBeDefined();
+  await waitFor(() =>
+    expect(screen.getAllByTestId("time-matrix-bucket")).toHaveLength(2 * 96),
+  );
   expect(strip.getAttribute("data-provenance")).toBeNull();
   expect(strip.querySelector(".activity-lock-evidence__badge")).toBeNull();
   expect(

@@ -39,6 +39,7 @@ describe("formatByUnit", () => {
     expect(formatByUnit(9_814_220, "B")).toContain("MiB");
     expect(formatByUnit(412_884, "kib")).toContain("MiB");
     expect(formatByUnit(88_220_000, "bytes_per_second")).toContain("/s");
+    expect(formatByUnit(10, "per_second")).toBe("10/s");
     expect(formatByUnit(12_400_000, "count")).toBe(
       new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(
         12_400_000,

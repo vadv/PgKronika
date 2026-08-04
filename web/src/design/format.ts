@@ -84,6 +84,8 @@ export function formatByUnit(
       return formatBytes(value * 1024);
     case "bytes_per_second":
       return `${formatBytes(value)}/s`;
+    case "per_second":
+      return `${trim(value)}/s`;
     default:
       return numberFormat.format(value);
   }

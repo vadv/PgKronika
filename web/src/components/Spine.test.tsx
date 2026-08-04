@@ -262,6 +262,12 @@ test("renders verdict ribbon, score chip, event density, sparkline and summary",
   expect(screen.getAllByTestId("spine-ribbon-warn").length).toBeGreaterThan(0);
   expect(screen.getAllByTestId("spine-ribbon-crit").length).toBeGreaterThan(0);
   expect(screen.queryByTestId("spine-ribbon-gap")).toBeNull();
+  expect(screen.getByRole("slider").getAttribute("data-health-render")).toBe(
+    "signal-line",
+  );
+  expect(
+    screen.getAllByTestId("spine-ribbon-crit")[0]?.querySelector("path"),
+  ).not.toBeNull();
   // Bucket tooltip: time range, localized verdict and the API reason.
   const critCell = screen.getAllByTestId("spine-ribbon-crit")[0];
   expect(critCell?.querySelector("title")?.textContent).toContain(
@@ -276,6 +282,11 @@ test("renders verdict ribbon, score chip, event density, sparkline and summary",
   expect(screen.getByTestId("spine-score-delta").textContent).toContain("▼57");
   // Event facts are aggregated into bounded density cells, never piled up.
   expect(screen.getAllByTestId("spine-event-density")).toHaveLength(3);
+  expect(
+    Number(
+      screen.getAllByTestId("spine-event-density")[0]?.getAttribute("width"),
+    ),
+  ).toBeLessThanOrEqual(4);
   // Load sparkline skips the null bucket (one 2-point segment).
   const spark = screen.getByTestId("spine-load-line");
   expect(spark.getAttribute("points")?.split(" ")).toHaveLength(2);

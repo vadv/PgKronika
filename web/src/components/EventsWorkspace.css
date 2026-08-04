@@ -328,7 +328,7 @@
   gap: var(--space-2);
   align-items: center;
   min-width: 0;
-  min-height: 24px;
+  height: 24px;
   padding: 2px var(--space-2);
   color: var(--fg);
   background: transparent;
@@ -336,6 +336,7 @@
   border-block-end: 1px solid var(--border);
   font-family: var(--mono-font);
   font-size: var(--text-xs);
+  line-height: 1.05;
   text-align: start;
   cursor: pointer;
 }

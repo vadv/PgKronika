@@ -55,8 +55,11 @@ export interface TableViewProps {
   entity: string | null;
   onSort: (sort: string | null, order: "asc" | "desc" | null) => void;
   onSelectRow: (entity: string) => void;
+  onOpenActivityProcess?: (entity: string) => void;
   onMatched?: (matched: number) => void;
   timeMatrix?: TimeMatrixColumn | null;
+  /** Dense joined PG/backend + Linux process snapshot used by Activity overview. */
+  activitySnapshot?: boolean;
 }
 
 interface DisplayColumn {
@@ -80,7 +83,7 @@ const NUMERIC_TYPES = new Set(["i64", "u64", "f64"]);
 const ROW_HEIGHT = 28;
 const TIME_MATRIX_ROW_HEIGHT = 27;
 const ACTIVITY_MATRIX_ROW_HEIGHT = 34;
-const ROW_OVERSCAN = 5;
+const ROW_OVERSCAN = 4;
 const FALLBACK_VIEWPORT_HEIGHT = 650;
 const STATEMENT_IDENTITY_COLUMNS = new Set(["queryid", "database", "user"]);
 const PLAN_IDENTITY_COLUMNS = new Set(["planid", "queryid"]);
@@ -392,38 +395,46 @@ function TableViewImpl(props: TableViewProps) {
   const timeMatrixMode = timeMatrix !== null;
   const matrixKind = timeMatrix?.kind ?? "statements";
   const activityMatrixMode = timeMatrixMode && matrixKind === "activity";
+  const activitySnapshotMode = props.activitySnapshot === true;
+  const activityGroupedMode = activityMatrixMode || activitySnapshotMode;
   const plansMatrixMode = timeMatrixMode && matrixKind === "plans";
   const processesMatrixMode = timeMatrixMode && matrixKind === "processes";
-  const matrixClass = `${matrixKind}-time-matrix`;
-  const matrixNamespace = processesMatrixMode ? "host" : matrixKind;
+  const matrixClass = activitySnapshotMode
+    ? "activity-time-matrix"
+    : `${matrixKind}-time-matrix`;
+  const matrixNamespace = activitySnapshotMode
+    ? "activity"
+    : processesMatrixMode
+      ? "host"
+      : matrixKind;
   const matrixLoadError = timeMatrix?.error
     ? t(`${matrixNamespace}.matrix.loadError`)
     : null;
   const matrixIdentityClass = `${matrixClass}__identity`;
   const matrixTimelineClass = `${matrixClass}__timeline`;
   const matrixTimelineCellClass = `${matrixClass}__timeline-cell`;
-  const identityCodes = activityMatrixMode
-    ? ACTIVITY_IDENTITY_COLUMNS
-    : plansMatrixMode
-      ? PLAN_IDENTITY_COLUMNS
-      : processesMatrixMode
-        ? PROCESS_IDENTITY_COLUMNS
-        : STATEMENT_IDENTITY_COLUMNS;
-  const rowHeight = activityMatrixMode
+  const identityCodes = activitySnapshotMode
+    ? new Set(["pid"])
+    : activityMatrixMode
+      ? ACTIVITY_IDENTITY_COLUMNS
+      : plansMatrixMode
+        ? PLAN_IDENTITY_COLUMNS
+        : processesMatrixMode
+          ? PROCESS_IDENTITY_COLUMNS
+          : STATEMENT_IDENTITY_COLUMNS;
+  const rowHeight = activityGroupedMode
     ? ACTIVITY_MATRIX_ROW_HEIGHT
     : timeMatrixMode
       ? TIME_MATRIX_ROW_HEIGHT
       : ROW_HEIGHT;
-  const identityColumns = timeMatrixMode
-    ? columns.filter(({ column }) => identityCodes.has(column.code))
-    : [];
-  const displayColumns = timeMatrixMode
-    ? columns.filter(({ column }) => !identityCodes.has(column.code))
-    : columns;
-  const processLinkCellIndex = activityMatrixMode
-    ? (columns.find(({ column }) => column.code === "process_link")
-        ?.cellIndex ?? null)
-    : null;
+  const identityColumns =
+    timeMatrixMode || activitySnapshotMode
+      ? columns.filter(({ column }) => identityCodes.has(column.code))
+      : [];
+  const displayColumns =
+    timeMatrixMode || activitySnapshotMode
+      ? columns.filter(({ column }) => !identityCodes.has(column.code))
+      : columns;
   const activityColumnGroups = displayColumns.reduce<
     { code: ActivityEvidenceGroup; span: number }[]
   >((groups, { column }) => {
@@ -435,7 +446,9 @@ function TableViewImpl(props: TableViewProps) {
   }, []);
   const renderedColumnCount =
     displayColumns.length +
-    (timeMatrixMode && identityColumns.length > 0 ? 1 : 0);
+    ((timeMatrixMode || activitySnapshotMode) && identityColumns.length > 0
+      ? 1
+      : 0);
   const heatmapRows = new Map(
     (timeMatrix?.data?.rows ?? []).map((row) => [row.entity, row]),
   );
@@ -550,14 +563,26 @@ function TableViewImpl(props: TableViewProps) {
         <table
           aria-label={props.view.code}
           aria-rowcount={
-            (matched || rows.length) + (activityMatrixMode ? 2 : 1)
+            (matched || rows.length) + (activityGroupedMode ? 2 : 1)
           }
-          className={timeMatrixMode ? matrixClass : undefined}
-          data-testid={timeMatrixMode ? matrixClass : undefined}
+          className={
+            activitySnapshotMode
+              ? `${matrixClass} activity-snapshot-table`
+              : timeMatrixMode
+                ? matrixClass
+                : undefined
+          }
+          data-testid={
+            activitySnapshotMode
+              ? "activity-snapshot-table"
+              : timeMatrixMode
+                ? matrixClass
+                : undefined
+          }
           style={{ borderCollapse: "collapse", width: "100%" }}
         >
           <thead>
-            {activityMatrixMode && (
+            {activityGroupedMode && (
               <tr className="activity-time-matrix__groups">
                 <th className={matrixIdentityClass}>
                   {t("activity.matrix.group.pg")}
@@ -575,62 +600,67 @@ function TableViewImpl(props: TableViewProps) {
                         : t("activity.matrix.group.pgContext")}
                   </th>
                 ))}
-                <th className={matrixTimelineClass}>
-                  {t("activity.matrix.group.samples")}
-                </th>
+                {timeMatrix !== null && (
+                  <th className={matrixTimelineClass}>
+                    {t("activity.matrix.group.samples")}
+                  </th>
+                )}
               </tr>
             )}
             <tr>
-              {timeMatrixMode && identityColumns.length > 0 && (
-                <th
-                  className={matrixIdentityClass}
-                  style={{
-                    ...headerCellStyle("queryid"),
-                    left: 0,
-                    top: activityMatrixMode ? "18px" : 0,
-                    zIndex: 3,
-                  }}
-                >
-                  <button
-                    type="button"
-                    onClick={() =>
-                      cycleSort(
-                        activityMatrixMode
+              {(timeMatrixMode || activitySnapshotMode) &&
+                identityColumns.length > 0 && (
+                  <th
+                    className={matrixIdentityClass}
+                    style={{
+                      ...headerCellStyle("queryid"),
+                      left: 0,
+                      top: activityGroupedMode ? "18px" : 0,
+                      zIndex: 3,
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() =>
+                        cycleSort(
+                          activityGroupedMode
+                            ? "pid"
+                            : plansMatrixMode
+                              ? "planid"
+                              : processesMatrixMode
+                                ? "pid"
+                                : "queryid",
+                        )
+                      }
+                      style={{
+                        color: "inherit",
+                        background: "none",
+                        border: "none",
+                        padding: 0,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {activitySnapshotMode
+                        ? colLabel(t, props.view.code, "pid")
+                        : activityMatrixMode
+                          ? t("activity.matrix.identity")
+                          : plansMatrixMode
+                            ? t("plans.matrix.identity")
+                            : processesMatrixMode
+                              ? t("host.matrix.identity")
+                              : t("statements.matrix.identity")}
+                      {sortArrow(
+                        activityGroupedMode
                           ? "pid"
                           : plansMatrixMode
                             ? "planid"
                             : processesMatrixMode
                               ? "pid"
                               : "queryid",
-                      )
-                    }
-                    style={{
-                      color: "inherit",
-                      background: "none",
-                      border: "none",
-                      padding: 0,
-                      cursor: "pointer",
-                    }}
-                  >
-                    {activityMatrixMode
-                      ? t("activity.matrix.identity")
-                      : plansMatrixMode
-                        ? t("plans.matrix.identity")
-                        : processesMatrixMode
-                          ? t("host.matrix.identity")
-                          : t("statements.matrix.identity")}
-                    {sortArrow(
-                      activityMatrixMode
-                        ? "pid"
-                        : plansMatrixMode
-                          ? "planid"
-                          : processesMatrixMode
-                            ? "pid"
-                            : "queryid",
-                    )}
-                  </button>
-                </th>
-              )}
+                      )}
+                    </button>
+                  </th>
+                )}
               {displayColumns.map(({ column }, columnIndex) => {
                 const meta = columnMeta.get(column.code);
                 const unavailable =
@@ -686,19 +716,21 @@ function TableViewImpl(props: TableViewProps) {
                   <th
                     key={column.code}
                     data-evidence-group={
-                      activityMatrixMode
+                      activityGroupedMode
                         ? activityEvidenceGroup(column.code)
                         : undefined
                     }
                     style={{
                       ...headerCellStyle(column.code),
-                      ...(activityMatrixMode
+                      ...(activityGroupedMode
                         ? {
                             top: "18px",
                             width: activityColumnWidth(column.code),
                           }
                         : undefined),
-                      ...(!timeMatrixMode && columnIndex === 0
+                      ...(!timeMatrixMode &&
+                      !activitySnapshotMode &&
+                      columnIndex === 0
                         ? { left: 0, zIndex: 3 }
                         : undefined),
                       color: unavailable
@@ -734,7 +766,7 @@ function TableViewImpl(props: TableViewProps) {
                   className={matrixTimelineClass}
                   style={{
                     ...headerCellStyle(""),
-                    ...(activityMatrixMode ? { top: "18px" } : undefined),
+                    ...(activityGroupedMode ? { top: "18px" } : undefined),
                   }}
                 >
                   <span>
@@ -777,9 +809,9 @@ function TableViewImpl(props: TableViewProps) {
                     </button>
                   )}
                 </th>
-              ) : (
+              ) : !activitySnapshotMode ? (
                 <th style={headerCellStyle("")}>{t("table.spark")}</th>
-              )}
+              ) : null}
             </tr>
           </thead>
           <tbody>
@@ -800,7 +832,7 @@ function TableViewImpl(props: TableViewProps) {
                   key={row.entity}
                   tabIndex={0}
                   aria-rowindex={
-                    startIndex + visibleIndex + (activityMatrixMode ? 3 : 2)
+                    startIndex + visibleIndex + (activityGroupedMode ? 3 : 2)
                   }
                   aria-selected={selected}
                   data-entity={row.entity}
@@ -849,14 +881,14 @@ function TableViewImpl(props: TableViewProps) {
                     transition: "background var(--transition-fast)",
                   }}
                 >
-                  {timeMatrixMode &&
+                  {(timeMatrixMode || activitySnapshotMode) &&
                     identityColumns.length > 0 &&
                     (() => {
                       const primary =
                         identityColumns.find(
                           ({ column }) =>
                             column.code ===
-                            (activityMatrixMode
+                            (activityGroupedMode
                               ? "pid"
                               : plansMatrixMode
                                 ? "planid"
@@ -929,44 +961,14 @@ function TableViewImpl(props: TableViewProps) {
                       !("level" in classificationResult)
                         ? classificationResult
                         : undefined;
-                    if (activityMatrixMode && column.code === "process_link") {
-                      const linked = value !== null;
-                      return (
-                        <td
-                          key={column.code}
-                          data-testid="process-link-cell"
-                          data-linked={linked}
-                          title={
-                            linked
-                              ? t("activity.processEvidence")
-                              : t("activity.processLink.none")
-                          }
-                          style={{
-                            padding: "2px 10px",
-                            borderBottom: "1px solid var(--border)",
-                            borderInlineStart: "1px solid var(--border)",
-                            textAlign: "center",
-                          }}
-                        >
-                          <span
-                            aria-hidden="true"
-                            style={{
-                              display: "inline-block",
-                              width: "6px",
-                              height: "6px",
-                              borderRadius: "50%",
-                              background: linked
-                                ? "var(--sev-ok)"
-                                : "var(--sev-crit)",
-                            }}
-                          />
-                        </td>
-                      );
-                    }
                     if (
+                      activityMatrixMode &&
                       column.code === "command" &&
-                      processLinkCellIndex !== null &&
-                      (row.cells[processLinkCellIndex] ?? null) === null
+                      (row.cells[
+                        columns.find(
+                          ({ column: c }) => c.code === "process_link",
+                        )?.cellIndex ?? -1
+                      ] ?? null) === null
                     ) {
                       return (
                         <td
@@ -991,17 +993,21 @@ function TableViewImpl(props: TableViewProps) {
                       <td
                         key={column.code}
                         title={
-                          value === null && notClassified !== undefined
-                            ? nullReasonTitle(
-                                notClassified.status,
-                                notClassified.reason,
-                                t,
-                              )
-                            : (full ?? whyTitle(classification?.result, t))
+                          column.code === "process_link" && value !== null
+                            ? (colDesc(t, props.view.code, column.code) ??
+                              full ??
+                              undefined)
+                            : value === null && notClassified !== undefined
+                              ? nullReasonTitle(
+                                  notClassified.status,
+                                  notClassified.reason,
+                                  t,
+                                )
+                              : (full ?? whyTitle(classification?.result, t))
                         }
                         style={{
                           padding: "2px 10px",
-                          ...(activityMatrixMode
+                          ...(activityGroupedMode
                             ? { width: activityColumnWidth(column.code) }
                             : undefined),
                           borderBottom: "1px solid var(--border)",
@@ -1011,7 +1017,17 @@ function TableViewImpl(props: TableViewProps) {
                             color:
                               value === null ? "var(--fg-dim)" : "var(--fg)",
                           }),
-                          ...(!timeMatrixMode && columnIndex === 0
+                          ...(activityGroupedMode &&
+                          column.code === "process_link" &&
+                          value !== null
+                            ? {
+                                color: "var(--accent-strong)",
+                                fontWeight: 600,
+                              }
+                            : undefined),
+                          ...(!timeMatrixMode &&
+                          !activitySnapshotMode &&
+                          columnIndex === 0
                             ? {
                                 position: "sticky",
                                 left: 0,
@@ -1031,7 +1047,41 @@ function TableViewImpl(props: TableViewProps) {
                           maxWidth: "320px",
                         }}
                       >
-                        {formatCellValue(value, column, t)}
+                        {activityGroupedMode &&
+                        column.code === "process_link" &&
+                        value !== null &&
+                        props.onOpenActivityProcess !== undefined ? (
+                          <button
+                            type="button"
+                            data-testid="activity-process-link-cell"
+                            aria-label={t("activity.openLinkedProcess", {
+                              backend: row.label,
+                            })}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              props.onOpenActivityProcess?.(row.entity);
+                            }}
+                            onKeyDown={(event) => event.stopPropagation()}
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              width: "100%",
+                              minHeight: "24px",
+                              padding: 0,
+                              border: 0,
+                              color: "inherit",
+                              background: "transparent",
+                              cursor: "pointer",
+                              font: "inherit",
+                              fontWeight: "inherit",
+                              textAlign: "start",
+                            }}
+                          >
+                            {formatCellValue(value, column, t)}
+                          </button>
+                        ) : (
+                          formatCellValue(value, column, t)
+                        )}
                       </td>
                     );
                   })}
@@ -1058,7 +1108,7 @@ function TableViewImpl(props: TableViewProps) {
                         }
                       />
                     </td>
-                  ) : (
+                  ) : !activitySnapshotMode ? (
                     <td
                       style={{
                         padding: "2px 8px",
@@ -1067,7 +1117,7 @@ function TableViewImpl(props: TableViewProps) {
                     >
                       <Sparkline spark={row.spark} />
                     </td>
-                  )}
+                  ) : null}
                 </tr>
               );
             })}

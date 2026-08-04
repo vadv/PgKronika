@@ -13,7 +13,7 @@ interface EventsSignalPanelProps {
   onInvestigate: (view: string, atUs: string, eventInstance: string) => void;
 }
 
-const MAX_SIGNAL_LANES = 6;
+const MAX_SIGNAL_LANES = 5;
 const EVENT_REQUEST_LIMIT = 50;
 
 export function eventMatchesPreset(
