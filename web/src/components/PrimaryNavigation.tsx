@@ -103,16 +103,26 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
             key={group.id}
             role="group"
             aria-label={t(group.labelKey)}
-            style={{ display: "inline-flex", alignItems: "stretch" }}
+            style={{
+              display: "inline-flex",
+              alignItems: "stretch",
+              paddingInlineStart: groupIndex > 0 ? "12px" : 0,
+              marginInlineStart: groupIndex > 0 ? "4px" : 0,
+              borderInlineStart:
+                groupIndex > 0 ? "1px solid var(--border)" : "none",
+            }}
           >
             <span
               aria-hidden="true"
               style={{
+                display: "inline-flex",
+                alignItems: "center",
                 alignSelf: "center",
-                marginInline: "4px 2px",
+                gap: "5px",
+                marginInline: "4px 6px",
                 color: "var(--fg-dim)",
                 fontSize: "var(--text-xs)",
-                fontWeight: 600,
+                fontWeight: 700,
                 letterSpacing: "var(--tracking-caps)",
                 textTransform: "uppercase",
                 whiteSpace: "nowrap",
@@ -120,9 +130,17 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
             >
               <span
                 style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: "15px",
+                  height: "15px",
+                  color: "var(--fg)",
+                  background: "var(--bg-overlay)",
+                  border: "1px solid var(--border-strong)",
+                  borderRadius: "50%",
                   fontFamily: "var(--mono-font)",
-                  opacity: 0.6,
-                  marginInlineEnd: "4px",
+                  fontSize: "9px",
                 }}
               >
                 {groupIndex + 1}

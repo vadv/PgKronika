@@ -173,31 +173,31 @@ function verdictTintOf(
  * glyph, no color-only signal. */
 function ProcessLinkGlyph(props: { linked: boolean }) {
   const color = props.linked ? "var(--sev-ok-fg)" : "var(--fg-dim)";
-  const cx1 = props.linked ? 4 : 3;
-  const cx2 = props.linked ? 7.5 : 9;
+  const cx1 = props.linked ? 5 : 4;
+  const cx2 = props.linked ? 10 : 12;
   return (
     <svg
-      width={12}
-      height={12}
-      viewBox="0 0 12 12"
+      width={16}
+      height={16}
+      viewBox="0 0 16 16"
       aria-hidden="true"
       style={{ flex: "none" }}
     >
       <circle
         cx={cx1}
-        cy={6}
-        r={2.5}
+        cy={8}
+        r={3.2}
         fill="none"
         stroke={color}
-        strokeWidth={1.4}
+        strokeWidth={1.6}
       />
       <circle
         cx={cx2}
-        cy={6}
-        r={2.5}
+        cy={8}
+        r={3.2}
         fill="none"
         stroke={color}
-        strokeWidth={1.4}
+        strokeWidth={1.6}
       />
     </svg>
   );

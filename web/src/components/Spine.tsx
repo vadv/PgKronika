@@ -566,8 +566,9 @@ export function Spine(props: SpineProps) {
                 style={{
                   display: "block",
                   fontFamily: "var(--mono-font)",
-                  fontSize: 20,
-                  fontWeight: 600,
+                  fontSize: 32,
+                  fontWeight: 700,
+                  lineHeight: 1,
                   color: scoreDisplayable ? CHIP_FG[tone] : "var(--fg-dim)",
                 }}
               >
