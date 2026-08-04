@@ -62,7 +62,10 @@ afterEach(() => {
 
 test("instance chip falls back to local, shows the context hostname", () => {
   const { unmount } = renderHeader();
-  expect(screen.getByTestId("instance-chip").textContent).toContain("local");
+  const instance = screen.getByTestId("instance-chip");
+  expect(instance.textContent).toContain("local");
+  expect(instance.style.borderRadius).toBe("var(--radius-sm)");
+  expect(instance.style.padding).toBe("2px 8px");
   unmount();
   renderHeader({
     context: makeContextResponse({ instance: { hostname: "prod-1" } }),
@@ -90,7 +93,10 @@ test("fits the fixed desktop Global context region when embedded", () => {
 test("global context exposes the forensic search trigger", () => {
   const onOpenSearch = vi.fn();
   renderHeader({ onOpenSearch });
-  fireEvent.click(screen.getByRole("button", { name: "search.open" }));
+  const search = screen.getByRole("button", { name: "search.open" });
+  expect(search.style.borderRadius).toBe("var(--radius-sm)");
+  expect(search.style.padding).toBe("2px 8px");
+  fireEvent.click(search);
   expect(onOpenSearch).toHaveBeenCalledTimes(1);
 });
 

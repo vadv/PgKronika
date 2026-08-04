@@ -103,26 +103,38 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
             key={group.id}
             role="group"
             aria-label={t(group.labelKey)}
-            style={{ display: "inline-flex", alignItems: "stretch" }}
+            style={{
+              display: "inline-flex",
+              alignItems: "stretch",
+              paddingInlineStart: groupIndex > 0 ? "var(--space-3)" : 0,
+              marginInlineStart: groupIndex > 0 ? "var(--space-1)" : 0,
+              borderInlineStart:
+                groupIndex > 0 ? "1px solid var(--border)" : "none",
+            }}
           >
             <span
               aria-hidden="true"
               style={{
+                display: "inline-flex",
+                alignItems: "center",
                 alignSelf: "center",
-                marginInline: "4px 2px",
+                gap: "var(--space-1)",
+                marginInline: "var(--space-1)",
                 color: "var(--fg-dim)",
                 fontSize: "var(--text-xs)",
-                fontWeight: 600,
+                fontWeight: 700,
                 letterSpacing: "var(--tracking-caps)",
                 textTransform: "uppercase",
                 whiteSpace: "nowrap",
               }}
             >
               <span
+                data-testid={`navigation-group-ordinal-${group.id}`}
                 style={{
+                  color: "var(--fg-dim)",
                   fontFamily: "var(--mono-font)",
-                  opacity: 0.6,
-                  marginInlineEnd: "4px",
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 500,
                 }}
               >
                 {groupIndex + 1}

@@ -563,15 +563,34 @@ export function Spine(props: SpineProps) {
           >
             <span style={{ textAlign: "center" }}>
               <span
+                data-testid="spine-score-value"
                 style={{
-                  display: "block",
+                  display: "inline-flex",
+                  alignItems: "baseline",
+                  justifyContent: "center",
                   fontFamily: "var(--mono-font)",
-                  fontSize: 20,
-                  fontWeight: 600,
+                  fontSize: "var(--text-lg)",
+                  fontWeight: 700,
+                  lineHeight: 1,
                   color: scoreDisplayable ? CHIP_FG[tone] : "var(--fg-dim)",
                 }}
               >
-                {scoreDisplayable ? score.score : "—"}
+                {scoreDisplayable ? (
+                  <>
+                    {score.score}
+                    <span
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        fontWeight: 500,
+                        color: "var(--fg-dim)",
+                      }}
+                    >
+                      /100
+                    </span>
+                  </>
+                ) : (
+                  "—"
+                )}
               </span>
               <span
                 style={{
