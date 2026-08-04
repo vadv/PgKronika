@@ -1728,6 +1728,103 @@ test("selected Activity observation owns the desktop canvas and preserves its po
   });
 });
 
+test("selected Plan owns the desktop canvas and preserves the Plans population", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=plans&at=1722400000000000&span=3600&dock=row&entity=plan%3A84102200`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const plans = availableCatalog.views.find((view) => view.code === "plans");
+  if (plans !== undefined) {
+    plans.availability = "available";
+    plans.capabilities = { detail: true, history: true, related: true };
+    plans.columns = [
+      {
+        availability: "available",
+        code: "planid",
+        lazy: false,
+        requires: [],
+        type: "i64",
+      },
+      {
+        availability: "available",
+        code: "queryid",
+        lazy: false,
+        requires: [],
+        type: "i64",
+      },
+      {
+        availability: "available",
+        code: "plan",
+        lazy: true,
+        requires: [],
+        type: "text",
+      },
+      {
+        availability: "available",
+        code: "mean",
+        lazy: false,
+        requires: [],
+        type: "f64",
+        unit: "ms",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href,
+    );
+    if (url.pathname === "/v1/ui/catalog") {
+      return Promise.resolve(jsonResponse(availableCatalog));
+    }
+    if (url.pathname.startsWith("/v1/entity/plans/")) {
+      return Promise.resolve(
+        jsonResponse(
+          url.searchParams.has("at")
+            ? makeEntityPointResponse({
+                view: "plans",
+                entity: "plan:84102200",
+                label: "84102200",
+                fields: [
+                  { code: "planid", value: "84102200" },
+                  { code: "queryid", value: "9180220441127101" },
+                  { code: "plan", value: "Index Scan using orders_pkey" },
+                  { code: "mean", value: 6.8 },
+                ],
+              })
+            : makeEntityHistoryResponse({
+                view: "plans",
+                entity: "plan:84102200",
+                label: "84102200",
+                columns: ["mean"],
+                snapshots: [{ ts_us: "1722400000000000", values: [6.8] }],
+              }),
+        ),
+      );
+    }
+    return baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("plan-detail")).toBeDefined();
+  expect(screen.getByTestId("health-line")).toBeDefined();
+  expect(document.querySelector('aside[data-dock="row"]')).toBeNull();
+  expect(screen.getByTestId("plans-overview-preserved").hidden).toBe(true);
+
+  fireEvent.keyDown(document, { key: "Escape" });
+  await waitFor(() => {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    expect(hash.get("dock")).toBeNull();
+    expect(hash.get("entity")).toBe("plan:84102200");
+  });
+});
+
 test("Vacuum defaults to point progress and keeps linked table context calm", async () => {
   history.replaceState(
     null,
