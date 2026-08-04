@@ -29,6 +29,7 @@ const MAX_HISTORY_COLUMNS: usize = 32;
 const MAX_HISTORY_SPAN_US: i64 = 6 * 60 * 60 * 1_000_000;
 const DEFAULT_HISTORY_LIMIT: usize = 500;
 const MAX_HISTORY_LIMIT: usize = 2_000;
+const MAX_HISTORY_BUCKETS: usize = 96;
 pub(crate) const MAX_HISTORY_SEGMENTS: usize = 32;
 const ENTITY_PARAMETERS: &[QueryParameter] = &[
     QueryParameter::At,
@@ -38,6 +39,7 @@ const ENTITY_PARAMETERS: &[QueryParameter] = &[
     QueryParameter::Include,
     QueryParameter::Limit,
     QueryParameter::Cursor,
+    QueryParameter::Buckets,
 ];
 
 #[derive(Debug)]
@@ -59,6 +61,7 @@ pub(crate) enum EntityMode {
         to_us: i64,
         columns: Vec<&'static str>,
         limit: usize,
+        buckets: Option<usize>,
         cursor: Option<EntityHistoryCursor>,
         fingerprint: [u8; 32],
     },
@@ -108,6 +111,9 @@ struct EntityFieldDto {
 #[derive(Debug, Serialize, ToSchema)]
 struct EntitySnapshotDto {
     ts_us: String,
+    /// Whether this entity exists in the view snapshot. Values remain aligned
+    /// with requested columns and are null when the entity is absent.
+    present: bool,
     values: Vec<FrameValue>,
 }
 
@@ -223,10 +229,18 @@ impl EntityRequest {
         let has_include = params.get(QueryParameter::Include).is_some();
         let has_limit = params.get(QueryParameter::Limit).is_some();
         let has_cursor = params.get(QueryParameter::Cursor).is_some();
-        let point_shape =
-            has_at && !has_from && !has_to && !has_columns && !has_limit && !has_cursor;
+        let has_buckets = params.get(QueryParameter::Buckets).is_some();
+        let point_shape = has_at
+            && !has_from
+            && !has_to
+            && !has_columns
+            && !has_limit
+            && !has_cursor
+            && !has_buckets;
         let history_shape = !has_at && !has_include && has_from && has_to && has_columns;
-        if !point_shape && !history_shape {
+        if !point_shape && !history_shape
+            || history_shape && has_buckets && (has_limit || has_cursor)
+        {
             return Err(ApiError::invalid_query_constraint(
                 QueryConstraint::PointOrHistory,
             ));
@@ -299,6 +313,30 @@ impl EntityRequest {
                     Some(count_u64(limit)),
                 ));
             }
+            let buckets = params
+                .get(QueryParameter::Buckets)
+                .map(|raw| {
+                    raw.parse::<usize>().map_err(|_error| {
+                        ApiError::invalid_query_parameter(
+                            QueryParameter::Buckets,
+                            ExpectedValue::PositiveInteger,
+                        )
+                    })
+                })
+                .transpose()?;
+            if buckets.is_some_and(|buckets| buckets == 0) {
+                return Err(ApiError::invalid_query_parameter(
+                    QueryParameter::Buckets,
+                    ExpectedValue::PositiveInteger,
+                ));
+            }
+            if buckets.is_some_and(|buckets| buckets > MAX_HISTORY_BUCKETS) {
+                return Err(ApiError::query_shape_limit_exceeded(
+                    LimitResource::Rows,
+                    count_u64(MAX_HISTORY_BUCKETS),
+                    buckets.map(count_u64),
+                ));
+            }
             let fingerprint = history_fingerprint(view, &entity, from_us, to_us, &columns);
             let cursor = params
                 .get(QueryParameter::Cursor)
@@ -319,6 +357,7 @@ impl EntityRequest {
                 to_us,
                 columns,
                 limit,
+                buckets,
                 cursor,
                 fingerprint,
             }
@@ -348,6 +387,7 @@ pub(crate) fn entity(
             to_us,
             columns,
             limit,
+            buckets,
             cursor,
             fingerprint,
         } => entity_history(
@@ -359,6 +399,7 @@ pub(crate) fn entity(
                 to_us: *to_us,
                 columns,
                 limit: *limit,
+                buckets: *buckets,
                 cursor: *cursor,
                 fingerprint: *fingerprint,
             },
@@ -428,6 +469,7 @@ struct HistoryArgs<'a> {
     to_us: i64,
     columns: &'a [&'static str],
     limit: usize,
+    buckets: Option<usize>,
     cursor: Option<EntityHistoryCursor>,
     fingerprint: [u8; 32],
 }
@@ -506,14 +548,18 @@ fn entity_history(
         args.to_us,
         request.view.max_rate_gap_us,
     ));
-    if let Some(cursor) = args.cursor {
-        timestamps.retain(|timestamp| *timestamp > cursor.last_ts_us());
-    }
-    let selected = timestamps
-        .into_iter()
-        .take(args.limit.saturating_add(1))
-        .collect::<Vec<_>>();
-    let has_more = selected.len() > args.limit;
+    let selected = if let Some(buckets) = args.buckets {
+        sample_timestamps(timestamps, args.from_us, args.to_us, buckets)
+    } else {
+        if let Some(cursor) = args.cursor {
+            timestamps.retain(|timestamp| *timestamp > cursor.last_ts_us());
+        }
+        timestamps
+            .into_iter()
+            .take(args.limit.saturating_add(1))
+            .collect::<Vec<_>>()
+    };
+    let has_more = args.buckets.is_none() && selected.len() > args.limit;
     let mut label = String::new();
     let mut snapshots = Vec::with_capacity(selected.len().min(args.limit));
     for timestamp in selected.iter().take(args.limit).copied() {
@@ -536,21 +582,26 @@ fn entity_history(
             });
             snapshots.push(EntitySnapshotDto {
                 ts_us: timestamp.to_string(),
+                present: false,
                 values: vec![FrameValue::Null; columns.len()],
             });
             continue;
         }
-        let row_values = projected.row.map_or_else(
-            || vec![FrameValue::Null; columns.len()],
+        let (present, row_values) = projected.row.map_or_else(
+            || (false, vec![FrameValue::Null; columns.len()]),
             |row| {
                 if label.is_empty() {
                     label.clone_from(&row.label);
                 }
-                row.values.into_iter().map(|(_code, value)| value).collect()
+                (
+                    true,
+                    row.values.into_iter().map(|(_code, value)| value).collect(),
+                )
             },
         );
         snapshots.push(EntitySnapshotDto {
             ts_us: timestamp.to_string(),
+            present,
             values: row_values,
         });
     }
@@ -587,6 +638,28 @@ fn entity_history(
         page: EntityPageDto { next },
         quality: quality_dto(&combined_quality),
     })
+}
+
+/// Keep the latest view snapshot in each equal-width time bucket. The output
+/// is bounded by `buckets`, spans the whole requested window, and retains real
+/// timestamps so clients can position irregular observations honestly.
+fn sample_timestamps(
+    timestamps: BTreeSet<i64>,
+    from_us: i64,
+    to_us: i64,
+    buckets: usize,
+) -> Vec<i64> {
+    let span = i128::from(to_us) - i128::from(from_us);
+    let bucket_count = i128::try_from(buckets).expect("history bucket limit fits i128");
+    let mut sampled = vec![None; buckets];
+    for timestamp in timestamps {
+        let offset = i128::from(timestamp) - i128::from(from_us);
+        let index = usize::try_from((offset * bucket_count) / span)
+            .expect("in-window history bucket fits usize")
+            .min(buckets - 1);
+        sampled[index] = Some(timestamp);
+    }
+    sampled.into_iter().flatten().collect()
 }
 
 /// Producer gaps are coverage holes in the admitted sealed span, wider than
@@ -752,4 +825,31 @@ fn history_fingerprint(
         hasher.update(column.as_bytes());
     }
     hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::sample_timestamps;
+
+    #[test]
+    fn sampled_history_spans_the_full_irregular_window_without_continuation() {
+        let timestamps = (0_i64..240)
+            .map(|index| {
+                if index < 180 {
+                    1_000 + index * 3
+                } else {
+                    8_000 + (index - 180) * 31
+                }
+            })
+            .collect::<BTreeSet<_>>();
+
+        let sampled = sample_timestamps(timestamps, 1_000, 10_000, 96);
+
+        assert!(sampled.len() <= 96);
+        assert_eq!(sampled.first(), Some(&1_093));
+        assert_eq!(sampled.last(), Some(&9_829));
+        assert!(sampled.windows(2).all(|pair| pair[0] < pair[1]));
+    }
 }

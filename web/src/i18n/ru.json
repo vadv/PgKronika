@@ -1219,6 +1219,7 @@
   "planDetail.observationCount_many": "{{count}} снимков",
   "planDetail.observationCount_other": "{{count}} снимка",
   "planDetail.observedAt": "наблюдалось в {{time}}",
+  "planDetail.notObservedAt": "не наблюдалось в {{time}}",
   "planDetail.loadingHistory": "загружаем историю",
   "planDetail.historyUnavailable": "история недоступна",
   "planDetail.relatedLane": "Продолжить расследование",

@@ -1510,6 +1510,7 @@ test("data maintenance row detail owns the desktop canvas instead of the generic
                 snapshots: [
                   {
                     ts_us: "1722400000000000",
+                    present: true,
                     values: [12.4, 97.3],
                   },
                 ],
@@ -1606,7 +1607,13 @@ test("selected statement owns the desktop canvas below Health Line", async () =>
                 entity: "stmt:7101",
                 label: "9180220441127101",
                 columns: ["total"],
-                snapshots: [{ ts_us: "1722400000000000", values: [4_200] }],
+                snapshots: [
+                  {
+                    ts_us: "1722400000000000",
+                    present: true,
+                    values: [4_200],
+                  },
+                ],
               }),
         ),
       );
@@ -1704,6 +1711,7 @@ test("selected Activity observation owns the desktop canvas and preserves its po
                 snapshots: [
                   {
                     ts_us: "1722400000000000",
+                    present: true,
                     values: ["active", 4_200_000],
                   },
                 ],
@@ -1803,7 +1811,13 @@ test("selected Plan owns the desktop canvas and preserves the Plans population",
                 entity: "plan:84102200",
                 label: "84102200",
                 columns: ["mean"],
-                snapshots: [{ ts_us: "1722400000000000", values: [6.8] }],
+                snapshots: [
+                  {
+                    ts_us: "1722400000000000",
+                    present: true,
+                    values: [6.8],
+                  },
+                ],
               }),
         ),
       );

@@ -81,6 +81,7 @@ const STORAGE_PARAMS: &[QueryParameter] = &[];
         ("to" = Option<i64>, Query),
         ("columns" = Option<String>, Query),
         ("limit" = Option<usize>, Query, minimum = 1, maximum = 2000),
+        ("buckets" = Option<usize>, Query, minimum = 1, maximum = 96),
         ("cursor" = Option<String>, Query),
     ),
     responses(

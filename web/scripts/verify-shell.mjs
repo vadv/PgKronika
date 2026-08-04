@@ -1304,6 +1304,7 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       history: {
         request: historyRequest ?? null,
         limit: historyUrl?.searchParams.get("limit") ?? null,
+        buckets: historyUrl?.searchParams.get("buckets") ?? null,
         columns: columns === "" ? [] : columns.split(","),
         width: from === null || to === null ? null : Number(to) - Number(from),
         pointAt: historyUrl?.searchParams.has("at") ?? null,
@@ -1683,6 +1684,7 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
       history: {
         request: historyRequest ?? null,
         limit: historyUrl?.searchParams.get("limit") ?? null,
+        buckets: historyUrl?.searchParams.get("buckets") ?? null,
         columns: columns === "" ? [] : columns.split(","),
         width: from === null || to === null ? null : Number(to) - Number(from),
         pointAt: historyUrl?.searchParams.has("at") ?? null,
@@ -1739,8 +1741,10 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     planDetailFailures.push(
       "technical relation chrome escaped into Plan detail",
     );
-  if (planDetail.history.limit !== "96")
-    planDetailFailures.push(`history limit ${planDetail.history.limit}`);
+  if (planDetail.history.buckets !== "96" || planDetail.history.limit !== null)
+    planDetailFailures.push(
+      `history buckets ${planDetail.history.buckets}, limit ${planDetail.history.limit}`,
+    );
   if (
     JSON.stringify(planDetail.history.columns) !==
     JSON.stringify(planHistoryColumns)

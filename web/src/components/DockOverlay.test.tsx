@@ -464,10 +464,12 @@ test("row dock fetches bounded history only after selecting the History tab", as
     snapshots: [
       {
         ts_us: "1722400000000000",
+        present: true,
         values: [10, 0],
       },
       {
         ts_us: "1722400060000000",
+        present: true,
         values: [12, null],
       },
     ],
@@ -509,13 +511,13 @@ test("historyColumnSeries coerces numbers and numeric strings, rejects everythin
   const data = makeEntityHistoryResponse({
     columns: ["metric"],
     snapshots: [
-      { ts_us: "1", values: [10] },
-      { ts_us: "2", values: ["14"] },
-      { ts_us: "3", values: [null] },
-      { ts_us: "4", values: ["abc"] },
-      { ts_us: "5", values: [""] },
-      { ts_us: "6", values: ["  "] },
-      { ts_us: "7", values: [true] },
+      { ts_us: "1", present: true, values: [10] },
+      { ts_us: "2", present: true, values: ["14"] },
+      { ts_us: "3", present: true, values: [null] },
+      { ts_us: "4", present: true, values: ["abc"] },
+      { ts_us: "5", present: true, values: [""] },
+      { ts_us: "6", present: true, values: ["  "] },
+      { ts_us: "7", present: true, values: [true] },
     ],
   });
   expect(historyColumnSeries(data, 0)).toEqual([
@@ -536,9 +538,9 @@ test("history trend charts only numeric columns and tracks the latest observed v
   const history = makeEntityHistoryResponse({
     columns: ["tup", "note"],
     snapshots: [
-      { ts_us: "1722400000000000", values: [10, "ok"] },
-      { ts_us: "1722400060000000", values: ["14", "ok"] },
-      { ts_us: "1722400120000000", values: [null, "ok"] },
+      { ts_us: "1722400000000000", present: true, values: [10, "ok"] },
+      { ts_us: "1722400060000000", present: true, values: ["14", "ok"] },
+      { ts_us: "1722400120000000", present: true, values: [null, "ok"] },
     ],
   });
   stubEntityModes(point, history);
@@ -591,7 +593,7 @@ test("history trend stays absent with fewer than two snapshots", async () => {
   });
   const history = makeEntityHistoryResponse({
     columns: ["tup"],
-    snapshots: [{ ts_us: "1722400000000000", values: [10] }],
+    snapshots: [{ ts_us: "1722400000000000", present: true, values: [10] }],
   });
   stubEntityModes(point, history);
   renderDock({
@@ -633,6 +635,7 @@ test("history follows every continuation without a window quality banner", async
           snapshots: [
             {
               ts_us: String(1722400000000000 + page * 1_000_000),
+              present: true,
               values: [page],
             },
           ],

@@ -119,15 +119,23 @@ function history() {
     columns: ["calls", "mean", "rows", "shared_hit", "shared_read"],
     snapshots: [
       {
-        ts_us: "1722396400000000",
+        ts_us: "1722378400000000",
+        present: true,
         values: [4_200, 4.4, 4_120, 420_000, 1_800],
       },
       {
-        ts_us: "1722398200000000",
-        values: [11_200, 5.1, 11_000, 710_000, 4_600],
+        ts_us: "1722378700000000",
+        present: true,
+        values: [4_500, 4.6, 4_430, 431_000, 1_920],
       },
       {
-        ts_us: "1722400000000000",
+        ts_us: "1722389200000000",
+        present: false,
+        values: [null, null, null, null, null],
+      },
+      {
+        ts_us: "1722399999999999",
+        present: true,
         values: [18_420, 6.8, 18_210, 982_400, 12_680],
       },
     ],
@@ -166,9 +174,20 @@ test("selected Plan becomes a bounded full-canvas forensic workspace", async () 
   expect(screen.getByTestId("plan-entity-strip")).toBeDefined();
   const temporal = await screen.findByTestId("plan-temporal-field");
   expect(within(temporal).getAllByTestId("plan-temporal-lane")).toHaveLength(4);
-  expect(within(temporal).getAllByTestId("plan-observation-cell")).toHaveLength(
-    3,
+  const observationCells = within(temporal).getAllByTestId(
+    "plan-observation-cell",
   );
+  expect(observationCells).toHaveLength(4);
+  expect(within(temporal).getByText("3 snapshots")).toBeDefined();
+  const missingCell = observationCells.at(2);
+  expect(missingCell).toBeDefined();
+  expect(missingCell?.getAttribute("data-tone")).toBe("missing");
+  const executionCharts = within(temporal).getAllByRole("img", {
+    name: /Execution/i,
+  });
+  expect(executionCharts).toHaveLength(1);
+  const executionTrace = executionCharts.at(0)?.querySelector("polyline");
+  expect(executionTrace?.getAttribute("points")).toMatch(/^0\.00,.* 1\.39,/);
   expect(screen.getByTestId("plan-body-evidence")).toBeDefined();
   expect(screen.getByTestId("plan-metric-matrix")).toBeDefined();
   expect(screen.getByTestId("plan-related-evidence")).toBeDefined();
@@ -176,7 +195,8 @@ test("selected Plan becomes a bounded full-canvas forensic workspace", async () 
 
   await waitFor(() => expect(requests).toHaveLength(2));
   const historyRequest = requests.find((url) => url.searchParams.has("from"));
-  expect(historyRequest?.searchParams.get("limit")).toBe("96");
+  expect(historyRequest?.searchParams.get("buckets")).toBe("96");
+  expect(historyRequest?.searchParams.has("limit")).toBe(false);
   expect(
     (historyRequest?.searchParams.get("columns") ?? "").split(","),
   ).toEqual(["calls", "mean", "rows", "shared_hit", "shared_read"]);
@@ -187,6 +207,44 @@ test("selected Plan becomes a bounded full-canvas forensic workspace", async () 
   expect(detail.textContent).not.toMatch(
     /plan:84102200|stmt:7101|\/v1\/|gaps|gated|proof|provenance|best_effort|attribution/i,
   );
+});
+
+test("non-JSON saved plan evidence preserves its original whitespace", async () => {
+  await i18n.changeLanguage("en");
+  const rawPlan = "  Plan:\n    Index Scan using orders_pkey\n\n  ";
+  const rawPoint = point();
+  rawPoint.fields = rawPoint.fields.map((field) =>
+    field.code === "plan" ? { ...field, value: rawPlan } : field,
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      return Promise.resolve(
+        response(url.searchParams.has("at") ? rawPoint : history()),
+      );
+    }),
+  );
+
+  render(
+    <PlanDetail
+      view={planView}
+      entity="plan:84102200"
+      at="1722400000000000"
+      span={21_600}
+      onClose={() => {}}
+      onOpenEntity={() => {}}
+      onFindStatements={() => {}}
+      onFindPlans={() => {}}
+    />,
+    { wrapper },
+  );
+
+  const planBody = await screen.findByTestId("plan-body-evidence");
+  const code = await within(planBody).findByText(
+    /Index Scan using orders_pkey/,
+  );
+  expect(code.textContent).toBe(rawPlan);
 });
 
 test("all Statement candidates and both query continuations stay actionable", async () => {

@@ -2034,11 +2034,15 @@ function entityResponse(viewCode, entity, params) {
   const rand = mulberry32(hashCode(entity));
   const snapshots = [];
   const totalSamples = 12;
-  const pageSize = Number(params.get("limit") ?? "4") === 96 ? 12 : 4;
-  const pageIndex = Math.max(
-    0,
-    Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
-  );
+  const sampled = params.get("buckets") !== null;
+  const pageSize =
+    sampled || Number(params.get("limit") ?? "4") === 96 ? 12 : 4;
+  const pageIndex = sampled
+    ? 0
+    : Math.max(
+        0,
+        Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
+      );
   const step = Math.max(1, Math.floor((to - from) / totalSamples));
   const statementShapes = {
     total: [0.42, 0.48, 0.63, 0.55, 0.72, 1.38, 1.12, 0.89, 1.6, 1.34, 1.18, 1],
@@ -2111,6 +2115,7 @@ function entityResponse(viewCode, entity, params) {
     const sampleIndex = pageIndex * pageSize + i;
     snapshots.push({
       ts_us: String(from + sampleIndex * step),
+      present: true,
       values: columns.map((code) => {
         const value = row.data[code] ?? null;
         const activityShape =
@@ -2162,7 +2167,7 @@ function entityResponse(viewCode, entity, params) {
     snapshots,
     page: {
       next:
-        (pageIndex + 1) * pageSize < totalSamples
+        !sampled && (pageIndex + 1) * pageSize < totalSamples
           ? `page-${pageIndex + 2}`
           : null,
     },

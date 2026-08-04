@@ -1107,7 +1107,7 @@ fn plans_view() -> ViewSpec {
                 right: "statements",
                 kind: RelationKind::BestEffort,
                 fields: vec!["queryid", "dbid", "userid"],
-                cardinality: "many_to_one",
+                cardinality: "zero_or_many",
                 provenance: "ossc_queryid_dbid_userid_attribution",
             },
             JoinSpec {
@@ -1115,7 +1115,7 @@ fn plans_view() -> ViewSpec {
                 right: "statements",
                 kind: RelationKind::BestEffort,
                 fields: vec!["queryid_stat_statements", "dbid", "userid"],
-                cardinality: "many_to_one",
+                cardinality: "zero_or_many",
                 provenance: "vadv_queryid_stat_statements_dbid_userid_attribution",
             },
         ],

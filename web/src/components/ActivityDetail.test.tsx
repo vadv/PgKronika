@@ -144,6 +144,7 @@ function history() {
     snapshots: [
       {
         ts_us: "1722396400000000",
+        present: true,
         values: [
           "active",
           null,
@@ -157,6 +158,7 @@ function history() {
       },
       {
         ts_us: "1722398200000000",
+        present: true,
         values: [
           "active",
           "Client:ClientRead",
@@ -170,6 +172,7 @@ function history() {
       },
       {
         ts_us: "1722400000000000",
+        present: true,
         values: [
           "active",
           "Lock:transactionid",

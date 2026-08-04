@@ -19,6 +19,8 @@ export interface EntityHistoryArgs {
   to: string;
   columns: string[];
   limit?: number;
+  /** Return at most this many representative buckets across the full window. */
+  buckets?: number;
   /** Opaque history continuation token (transient). */
   cursor?: string | null;
   enabled?: boolean;
@@ -64,6 +66,7 @@ export function useEntityHistory(args: EntityHistoryArgs) {
       args.to,
       args.columns.join(","),
       args.limit ?? null,
+      args.buckets ?? null,
       args.cursor ?? null,
     ],
     queryFn: async () => {
@@ -75,6 +78,7 @@ export function useEntityHistory(args: EntityHistoryArgs) {
             to: Number(args.to),
             columns: args.columns.join(","),
             ...(args.limit !== undefined ? { limit: args.limit } : {}),
+            ...(args.buckets !== undefined ? { buckets: args.buckets } : {}),
             ...(args.cursor != null ? { cursor: args.cursor } : {}),
           },
         },

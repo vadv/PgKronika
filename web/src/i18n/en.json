@@ -1219,6 +1219,7 @@
   "planDetail.observationCount_many": "{{count}} snapshots",
   "planDetail.observationCount_other": "{{count}} snapshots",
   "planDetail.observedAt": "observed at {{time}}",
+  "planDetail.notObservedAt": "not observed at {{time}}",
   "planDetail.loadingHistory": "loading history",
   "planDetail.historyUnavailable": "history unavailable",
   "planDetail.relatedLane": "Continue investigation",

@@ -210,11 +210,13 @@ fn workload_views_publish_distinct_prepared_lenses_and_fork_provenance() {
     let plan_joins = plans["joins"].as_array().expect("plan joins");
     assert!(plan_joins.iter().any(|join| {
         join["kind"] == "best_effort"
+            && join["cardinality"] == "zero_or_many"
             && join["provenance"] == "ossc_queryid_dbid_userid_attribution"
             && join["fields"] == json!(["queryid", "dbid", "userid"])
     }));
     assert!(plan_joins.iter().any(|join| {
         join["kind"] == "best_effort"
+            && join["cardinality"] == "zero_or_many"
             && join["provenance"] == "vadv_queryid_stat_statements_dbid_userid_attribution"
             && join["fields"] == json!(["queryid_stat_statements", "dbid", "userid"])
     }));

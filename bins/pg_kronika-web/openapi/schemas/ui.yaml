@@ -589,6 +589,11 @@ EntityResponse:
   - $ref: '#/EntityHistoryResponse'
 EntitySnapshotDto:
   properties:
+    present:
+      description: |-
+        Whether this entity exists in the view snapshot. Values remain aligned
+        with requested columns and are null when the entity is absent.
+      type: boolean
     ts_us:
       type: string
     values:
@@ -597,6 +602,7 @@ EntitySnapshotDto:
       type: array
   required:
   - ts_us
+  - present
   - values
   type: object
 EvidenceDto:

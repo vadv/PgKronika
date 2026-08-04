@@ -97,7 +97,9 @@ function series(
   if (history === undefined) return [];
   const index = history.columns.indexOf(code);
   if (index < 0) return history.snapshots.map(() => null);
-  return history.snapshots.map((snapshot) => snapshot.values[index] ?? null);
+  return history.snapshots.map((snapshot) =>
+    snapshot.present ? (snapshot.values[index] ?? null) : null,
+  );
 }
 
 function numericSeries(
@@ -107,7 +109,30 @@ function numericSeries(
   return series(history, code).map((value) => numericValue(value));
 }
 
-function lineSegments(values: (number | null)[]): string[] {
+function timelinePosition(
+  timestampUs: string,
+  fromUs: string,
+  toUs: string,
+  fallback: number,
+): number {
+  try {
+    const span = BigInt(toUs) - BigInt(fromUs);
+    if (span <= 0n) return fallback;
+    const offset = BigInt(timestampUs) - BigInt(fromUs);
+    const scaled = Number((offset * 100_000n) / span) / 1_000;
+    return Math.min(100, Math.max(0, scaled));
+  } catch {
+    return fallback;
+  }
+}
+
+function lineSegments(
+  history: EntityHistoryResponse | undefined,
+  code: string,
+  fromUs: string,
+  toUs: string,
+): string[] {
+  const values = numericSeries(history, code);
   const finite = values.filter((value): value is number => value !== null);
   if (finite.length === 0) return [];
   const min = Math.min(...finite);
@@ -124,7 +149,11 @@ function lineSegments(values: (number | null)[]): string[] {
       flush();
       return;
     }
-    const x = (index / width) * 100;
+    const timestamp = history?.snapshots[index]?.ts_us;
+    const x =
+      timestamp === undefined
+        ? (index / width) * 100
+        : timelinePosition(timestamp, fromUs, toUs, (index / width) * 100);
     const ratio = max === min ? 0.5 : (value - min) / (max - min);
     current.push(`${x.toFixed(2)},${(54 - ratio * 44).toFixed(2)}`);
   });
@@ -147,8 +176,9 @@ function snapshotTime(timestampUs: string): string {
 }
 
 function formattedPlan(value: FrameValue | undefined, missing: string): string {
-  const plan = textValue(value);
-  if (plan === null) return missing;
+  if (typeof value !== "string" && typeof value !== "number") return missing;
+  const plan = String(value);
+  if (plan.trim() === "") return missing;
   try {
     return JSON.stringify(JSON.parse(plan) as unknown, null, 2);
   } catch {
@@ -156,11 +186,28 @@ function formattedPlan(value: FrameValue | undefined, missing: string): string {
   }
 }
 
+function historyBucket(
+  timestampUs: string,
+  fromUs: string,
+  toUs: string,
+  fallback: number,
+): number {
+  const position = timelinePosition(timestampUs, fromUs, toUs, fallback);
+  return Math.min(96, Math.floor((position / 100) * 96) + 1);
+}
+
 function ObservationLane(props: {
   history: EntityHistoryResponse | undefined;
+  fromUs: string;
+  toUs: string;
 }) {
   const { t } = useTranslation();
   const snapshots = props.history?.snapshots ?? [];
+  const presentCount = snapshots.filter((snapshot) => snapshot.present).length;
+  let selectedIndex = -1;
+  snapshots.forEach((snapshot, index) => {
+    if (snapshot.present) selectedIndex = index;
+  });
   return (
     <div
       data-testid="plan-temporal-lane"
@@ -172,14 +219,11 @@ function ObservationLane(props: {
           {t("planDetail.temporal.observations")}
         </span>
         <strong className="plan-detail__observation-count">
-          {t("planDetail.observationCount", { count: snapshots.length })}
+          {t("planDetail.observationCount", { count: presentCount })}
         </strong>
       </div>
       <div
         className="plan-detail__observation-track"
-        style={{
-          gridTemplateColumns: `repeat(${Math.max(snapshots.length, 1)}, minmax(2px, 1fr))`,
-        }}
         role="img"
         aria-label={t("planDetail.observationAria")}
       >
@@ -192,11 +236,34 @@ function ObservationLane(props: {
           <span
             key={snapshot.ts_us}
             data-testid="plan-observation-cell"
-            data-tone={index === snapshots.length - 1 ? "selected" : "observed"}
+            data-bucket={historyBucket(
+              snapshot.ts_us,
+              props.fromUs,
+              props.toUs,
+              (index / Math.max(1, snapshots.length - 1)) * 100,
+            )}
+            style={{
+              gridColumn: historyBucket(
+                snapshot.ts_us,
+                props.fromUs,
+                props.toUs,
+                (index / Math.max(1, snapshots.length - 1)) * 100,
+              ),
+            }}
+            data-tone={
+              !snapshot.present
+                ? "missing"
+                : index === selectedIndex
+                  ? "selected"
+                  : "observed"
+            }
             className="plan-detail__observation-cell"
-            title={t("planDetail.observedAt", {
-              time: snapshotTime(snapshot.ts_us),
-            })}
+            title={t(
+              snapshot.present
+                ? "planDetail.observedAt"
+                : "planDetail.notObservedAt",
+              { time: snapshotTime(snapshot.ts_us) },
+            )}
           />
         ))}
       </div>
@@ -211,6 +278,8 @@ function NumericLane(props: {
   history: EntityHistoryResponse | undefined;
   fields: Map<string, FrameValue>;
   columns: Map<string, ColumnSpec>;
+  fromUs: string;
+  toUs: string;
 }) {
   const { t } = useTranslation();
   const missing = t("planDetail.notObserved");
@@ -256,7 +325,7 @@ function NumericLane(props: {
           y2="54"
         />
         {props.metrics.flatMap((code, metricIndex) =>
-          lineSegments(numericSeries(props.history, code)).map(
+          lineSegments(props.history, code, props.fromUs, props.toUs).map(
             (points, segmentIndex) => (
               <polyline
                 key={`${code}:${segmentIndex}`}
@@ -330,6 +399,7 @@ export function PlanDetail(props: PlanDetailProps) {
   const historyColumns = HISTORY_COLUMNS.filter((code) => columns.has(code));
   const historyEnabled =
     props.view.capabilities.history && historyColumns.length > 0;
+  const historyFrom = boundedFrom(props.at, props.span);
   const point = useEntityPoint({
     view: props.view.code,
     entity: props.entity,
@@ -339,10 +409,10 @@ export function PlanDetail(props: PlanDetailProps) {
   const history = useEntityHistory({
     view: props.view.code,
     entity: props.entity,
-    from: boundedFrom(props.at, props.span),
+    from: historyFrom,
     to: props.at,
     columns: historyColumns,
-    limit: 96,
+    buckets: 96,
     enabled: historyEnabled,
   });
   const data = point.data;
@@ -434,7 +504,11 @@ export function PlanDetail(props: PlanDetailProps) {
             data-testid="plan-temporal-field"
             className="plan-detail__temporal-field"
           >
-            <ObservationLane history={history.data} />
+            <ObservationLane
+              history={history.data}
+              fromUs={historyFrom}
+              toUs={props.at}
+            />
             {NUMERIC_LANES.map((lane) => (
               <NumericLane
                 key={lane.code}
@@ -444,6 +518,8 @@ export function PlanDetail(props: PlanDetailProps) {
                 history={history.data}
                 fields={fields}
                 columns={columns}
+                fromUs={historyFrom}
+                toUs={props.at}
               />
             ))}
             {historyEnabled && history.isPending && (

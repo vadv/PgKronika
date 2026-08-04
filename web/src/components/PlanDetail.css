@@ -240,6 +240,7 @@
 
 .plan-detail__observation-track {
   display: grid;
+  grid-template-columns: repeat(96, minmax(1px, 1fr));
   align-items: stretch;
   gap: 1px;
   padding: var(--space-3);
@@ -255,6 +256,12 @@
 .plan-detail__observation-cell[data-tone="selected"] {
   background: var(--sev-warn);
   border-color: var(--sev-warn-fg);
+}
+
+.plan-detail__observation-cell[data-tone="missing"] {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--fg-dim) 32%, transparent);
+  border-style: dashed;
 }
 
 .plan-detail__observation-empty {
