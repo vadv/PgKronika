@@ -34,6 +34,7 @@ const panel: CSSProperties = {
   background: "var(--bg-raised)",
   border: "1px solid var(--border)",
   borderRadius: "var(--radius-md)",
+  boxShadow: "var(--shadow-raised)",
   fontFamily: "var(--ui-font)",
   fontSize: "var(--text-xs)",
 };
