@@ -298,7 +298,7 @@
   "host.matrix.loadError": "Process interval evidence failed to load",
   "host.matrix.hostLoadError": "Host pressure evidence failed to load; values are unknown, not zero.",
   "host.matrix.hostUnavailable": "No retained host pressure series in this range.",
-  "host.matrix.hostBuckets": "Host timeline · {{count}} intervals",
+  "host.matrix.hostTrend": "{{latest}} now, {{peak}} peak over {{count}} intervals",
   "host.matrix.qualityPending": "Host evidence quality pending",
   "host.matrix.quality": "{{status}} · snapshots {{snapshots}} · gaps {{gaps}} · gated {{gated}} · resource_limited {{limited}}",
   "host.matrix.frame": "{{matched}} processes",
