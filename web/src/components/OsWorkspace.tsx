@@ -49,6 +49,46 @@ function maximum(values: (number | null)[]): number | null {
   return observed.length === 0 ? null : Math.max(...observed);
 }
 
+export const PRESSURE_CHART_WIDTH = 240;
+export const PRESSURE_CHART_HEIGHT = 32;
+
+/** Each contiguous run of samples becomes its own filled polygon — a missing
+ * bucket stays a visible gap in the shape, never bridged into a false
+ * continuous trend. */
+export function pressureAreaSegments(
+  values: (number | null)[],
+  max: number,
+): string[] {
+  const step =
+    values.length > 1 ? PRESSURE_CHART_WIDTH / (values.length - 1) : 0;
+  const segments: string[] = [];
+  let points: string[] = [];
+  let firstX = 0;
+  let lastX = 0;
+  const flush = () => {
+    if (points.length >= 2) {
+      segments.push(
+        `${points.join(" ")} L${lastX},${PRESSURE_CHART_HEIGHT} L${firstX},${PRESSURE_CHART_HEIGHT} Z`,
+      );
+    }
+    points = [];
+  };
+  values.forEach((value, index) => {
+    if (value === null || !Number.isFinite(value)) {
+      flush();
+      return;
+    }
+    const x = index * step;
+    const ratio = Math.max(0, Math.min(value, max)) / max;
+    const y = PRESSURE_CHART_HEIGHT - ratio * PRESSURE_CHART_HEIGHT;
+    if (points.length === 0) firstX = x;
+    lastX = x;
+    points.push(`${points.length === 0 ? "M" : "L"}${x},${y}`);
+  });
+  flush();
+  return segments;
+}
+
 function HostSignalLane(props: {
   series: SpineSeries | undefined;
   code: "loadPerCpu" | "psiIo";
@@ -63,6 +103,12 @@ function HostSignalLane(props: {
     props.series?.unit === "percent"
       ? 100
       : Math.max(1, ...observed.map((value) => Math.abs(value)));
+  const segments = pressureAreaSegments(values, scaleMax);
+  const tone = props.code === "psiIo" ? "var(--sev-warn)" : "var(--accent)";
+  const step =
+    values.length > 1 ? PRESSURE_CHART_WIDTH / (values.length - 1) : 0;
+  const hitWidth = step > 0 ? step : PRESSURE_CHART_WIDTH;
+  const peak = maximum(values);
   return (
     <section
       className="os-host-signal"
@@ -76,26 +122,49 @@ function HostSignalLane(props: {
           ? "—"
           : formatByUnit(props.headline, props.series?.unit)}
       </strong>
-      <ol
-        className="os-host-signal__buckets"
-        aria-label={t("host.matrix.hostBuckets", { count: values.length })}
+      <svg
+        className="os-host-signal__chart"
+        viewBox={`0 0 ${PRESSURE_CHART_WIDTH} ${PRESSURE_CHART_HEIGHT}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={t("host.matrix.hostTrend", {
+          latest:
+            props.headline === null
+              ? "—"
+              : formatByUnit(props.headline, props.series?.unit),
+          peak: peak === null ? "—" : formatByUnit(peak, props.series?.unit),
+          count: values.length,
+        })}
       >
-        {values.map((value, index) => (
-          <li key={index}>
-            <meter
-              min={0}
-              max={scaleMax}
-              value={value === null ? 0 : Math.max(0, value)}
-              data-missing={value === null ? "true" : undefined}
-              title={
-                value === null
-                  ? t("data.noSnapshotInterval")
-                  : formatByUnit(value, props.series?.unit)
-              }
-            />
-          </li>
+        {segments.map((d, index) => (
+          <path
+            key={index}
+            d={d}
+            fill={tone}
+            fillOpacity={0.32}
+            stroke={tone}
+            strokeWidth={1}
+            vectorEffect="non-scaling-stroke"
+          />
         ))}
-      </ol>
+        {values.map((value, index) => (
+          <rect
+            key={index}
+            x={step > 0 ? index * step - hitWidth / 2 : 0}
+            y={0}
+            width={hitWidth}
+            height={PRESSURE_CHART_HEIGHT}
+            fill="transparent"
+            data-missing={value === null ? "true" : undefined}
+          >
+            <title>
+              {value === null
+                ? t("data.noSnapshotInterval")
+                : formatByUnit(value, props.series?.unit)}
+            </title>
+          </rect>
+        ))}
+      </svg>
     </section>
   );
 }

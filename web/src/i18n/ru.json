@@ -298,7 +298,7 @@
   "host.matrix.loadError": "Не удалось загрузить интервальные свидетельства процессов",
   "host.matrix.hostLoadError": "Не удалось загрузить давление хоста; значения неизвестны, а не равны нулю.",
   "host.matrix.hostUnavailable": "В диапазоне нет retained-рядов давления хоста.",
-  "host.matrix.hostBuckets": "Шкала хоста · {{count}} интервалов",
+  "host.matrix.hostTrend": "{{latest}} сейчас, пик {{peak}} за {{count}} интервалов",
   "host.matrix.qualityPending": "Качество свидетельств хоста ещё определяется",
   "host.matrix.quality": "{{status}} · snapshots {{snapshots}} · gaps {{gaps}} · gated {{gated}} · resource_limited {{limited}}",
   "host.matrix.frame": "процессов: {{matched}}",
