@@ -1215,6 +1215,8 @@
   "planDetail.timelineAria": "{{metric}} over the selected window",
   "planDetail.observationAria": "Recorded observations of this plan over the selected window",
   "planDetail.observationCount_one": "{{count}} snapshot",
+  "planDetail.observationCount_few": "{{count}} snapshots",
+  "planDetail.observationCount_many": "{{count}} snapshots",
   "planDetail.observationCount_other": "{{count}} snapshots",
   "planDetail.observedAt": "observed at {{time}}",
   "planDetail.loadingHistory": "loading history",

@@ -17,6 +17,7 @@ const ACTIVITY_WAITS_SHOT = `${OUT_DIR}forensic-activity-waits-1920x1080.png`;
 const ACTIVITY_DETAIL_SHOT = `${OUT_DIR}forensic-activity-detail-1920x1080.png`;
 const PROCESS_DETAIL_SHOT = `${OUT_DIR}forensic-process-detail-1920x1080.png`;
 const PLANS_SHOT = `${OUT_DIR}forensic-plans-1920x1080.png`;
+const PLAN_DETAIL_SHOT = `${OUT_DIR}forensic-plan-detail-1920x1080.png`;
 const OS_SHOT = `${OUT_DIR}forensic-os-1920x1080.png`;
 const TABLES_SHOT = `${OUT_DIR}forensic-tables-1920x1080.png`;
 const INDEXES_SHOT = `${OUT_DIR}forensic-indexes-1920x1080.png`;
@@ -1585,6 +1586,244 @@ async function verifyActivityPlansWorkspaces(page, base, at) {
     throw new Error(`Plans workspace: ${plansFailures.join("; ")}`);
   }
   await page.screenshot({ path: PLANS_SHOT });
+
+  const planDetailUrl = `${base}/#source=local&view=plans&at=${at}&span=21600&preset=regression&dock=row&entity=${encodeURIComponent("plan:84102200")}`;
+  await page.goto(planDetailUrl, { waitUntil: "networkidle0" });
+  await page.waitForSelector('[data-testid="plan-detail"]', {
+    timeout: 15_000,
+  });
+  await page.waitForSelector(".plan-detail__lane-trace", {
+    timeout: 10_000,
+  });
+  await page.waitForSelector(
+    '[data-testid="plan-related-evidence"] button[aria-label^="Open related Statement"]',
+    { timeout: 10_000 },
+  );
+  const planDetail = await page.evaluate(() => {
+    const detail = document.querySelector('[data-testid="plan-detail"]');
+    const health = document.querySelector('[data-shell-region="health-line"]');
+    const status = document.querySelector('[data-shell-region="status"]');
+    const planBody = detail?.querySelector(
+      '[data-testid="plan-body-evidence"] pre',
+    );
+    if (
+      !(detail instanceof HTMLElement) ||
+      !(health instanceof HTMLElement) ||
+      !(status instanceof HTMLElement) ||
+      !(planBody instanceof HTMLElement)
+    ) {
+      throw new Error("Plan detail shell is incomplete");
+    }
+    const detailRect = detail.getBoundingClientRect();
+    const healthRect = health.getBoundingClientRect();
+    const statusRect = status.getBoundingClientRect();
+    const historyRequest = performance
+      .getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .find((name) => {
+        if (!name.includes("/v1/entity/plans/")) return false;
+        return new URL(name).searchParams.has("from");
+      });
+    const historyUrl =
+      historyRequest === undefined ? null : new URL(historyRequest);
+    const from = historyUrl?.searchParams.get("from") ?? null;
+    const to = historyUrl?.searchParams.get("to") ?? null;
+    const columns = historyUrl?.searchParams.get("columns") ?? "";
+    const params = new URLSearchParams(location.hash.slice(1));
+    const text = detail.textContent ?? "";
+    return {
+      rootHeight: document.documentElement.scrollHeight,
+      rootWidth: document.documentElement.scrollWidth,
+      scrollY: window.scrollY,
+      detail: {
+        top: detailRect.top,
+        bottom: detailRect.bottom,
+        width: detailRect.width,
+      },
+      healthBottom: healthRect.bottom,
+      statusTop: statusRect.top,
+      lanes: detail.querySelectorAll('[data-testid="plan-temporal-lane"]')
+        .length,
+      traces: detail.querySelectorAll(".plan-detail__lane-trace").length,
+      observations: detail.querySelectorAll(
+        '[data-testid="plan-observation-cell"]',
+      ).length,
+      analyses: detail.querySelectorAll(".plan-detail__analysis-grid > section")
+        .length,
+      statementCandidates: detail.querySelectorAll(
+        '[data-testid="plan-related-evidence"] button[aria-label^="Open related Statement"]',
+      ).length,
+      statementContinuation:
+        detail.querySelector(
+          '[data-testid="plan-related-evidence"] button[aria-label="Find this query in Statements"]',
+        ) !== null,
+      plansContinuation:
+        detail.querySelector(
+          '[data-testid="plan-related-evidence"] button[aria-label="Show other Plans for this query"]',
+        ) !== null,
+      planText: planBody.textContent ?? "",
+      planBodyScrollable:
+        planBody.parentElement !== null &&
+        ["auto", "scroll"].includes(
+          getComputedStyle(planBody.parentElement).overflowY,
+        ),
+      genericDock: document.querySelector('aside[data-dock="row"]') !== null,
+      overviewPreserved:
+        document.querySelector('[data-testid="plans-overview-preserved"]') !==
+        null,
+      overviewVisible:
+        document.querySelector(
+          '[data-testid="plans-overview-preserved"]:not([hidden])',
+        ) !== null,
+      rawEntity: text.includes(params.get("entity") ?? ""),
+      forbiddenCopy:
+        /\/v1\/|best[_ -]?effort|statement_plan|ossc_queryid|exact match|proof|provenance|\bgaps?\b|\bgated\b/i.test(
+          text,
+        ),
+      history: {
+        request: historyRequest ?? null,
+        limit: historyUrl?.searchParams.get("limit") ?? null,
+        columns: columns === "" ? [] : columns.split(","),
+        width: from === null || to === null ? null : Number(to) - Number(from),
+        pointAt: historyUrl?.searchParams.has("at") ?? null,
+      },
+    };
+  });
+  const planHistoryColumns = [
+    "calls",
+    "mean",
+    "rows",
+    "shared_hit",
+    "shared_read",
+  ];
+  const planDetailFailures = [];
+  if (planDetail.rootHeight > 1080)
+    planDetailFailures.push(`root height ${planDetail.rootHeight}`);
+  if (planDetail.rootWidth > 1920)
+    planDetailFailures.push(`root width ${planDetail.rootWidth}`);
+  if (planDetail.scrollY !== 0)
+    planDetailFailures.push(`shell scroll offset ${planDetail.scrollY}`);
+  if (
+    Math.abs(planDetail.detail.width - 1920) > 0.5 ||
+    Math.abs(planDetail.detail.top - planDetail.healthBottom) > 0.5 ||
+    Math.abs(planDetail.detail.bottom - planDetail.statusTop) > 0.5
+  ) {
+    planDetailFailures.push(
+      `detail geometry ${JSON.stringify(planDetail.detail)} health=${planDetail.healthBottom} status=${planDetail.statusTop}`,
+    );
+  }
+  if (planDetail.lanes !== 4)
+    planDetailFailures.push(`temporal lanes ${planDetail.lanes}`);
+  if (planDetail.traces !== 5)
+    planDetailFailures.push(`numeric traces ${planDetail.traces}`);
+  if (planDetail.observations !== 12)
+    planDetailFailures.push(`plan observations ${planDetail.observations}`);
+  if (planDetail.analyses !== 3)
+    planDetailFailures.push(`analysis columns ${planDetail.analyses}`);
+  if (planDetail.statementCandidates < 1)
+    planDetailFailures.push("no Statement continuation candidate");
+  if (!planDetail.statementContinuation || !planDetail.plansContinuation)
+    planDetailFailures.push("query continuation actions are incomplete");
+  if (!/Index Scan using orders_pkey/.test(planDetail.planText))
+    planDetailFailures.push("bounded multi-line plan is missing");
+  if (!planDetail.planBodyScrollable)
+    planDetailFailures.push("plan body is not independently scrollable");
+  if (
+    planDetail.genericDock ||
+    !planDetail.overviewPreserved ||
+    planDetail.overviewVisible
+  ) {
+    planDetailFailures.push("full-canvas detail ownership is broken");
+  }
+  if (planDetail.rawEntity || planDetail.forbiddenCopy)
+    planDetailFailures.push(
+      "technical relation chrome escaped into Plan detail",
+    );
+  if (planDetail.history.limit !== "96")
+    planDetailFailures.push(`history limit ${planDetail.history.limit}`);
+  if (
+    JSON.stringify(planDetail.history.columns) !==
+    JSON.stringify(planHistoryColumns)
+  ) {
+    planDetailFailures.push(
+      `history columns ${planDetail.history.columns.join(",")}`,
+    );
+  }
+  if (
+    planDetail.history.width !== 21_600_000_000 ||
+    planDetail.history.pointAt !== false
+  ) {
+    planDetailFailures.push(
+      `history window ${planDetail.history.width}, pointAt=${planDetail.history.pointAt}`,
+    );
+  }
+  if (planDetailFailures.length > 0) {
+    throw new Error(`Plan detail: ${planDetailFailures.join("; ")}`);
+  }
+  await page.screenshot({ path: PLAN_DETAIL_SHOT });
+
+  await page.click(
+    '[data-testid="plan-related-evidence"] button[aria-label^="Open related Statement"]',
+  );
+  await page.waitForFunction(
+    () => {
+      const params = new URLSearchParams(location.hash.slice(1));
+      return (
+        params.get("view") === "statements" && params.get("dock") === "row"
+      );
+    },
+    { timeout: 10_000 },
+  );
+  await page.goto(planDetailUrl, { waitUntil: "networkidle0" });
+  await page.waitForSelector('[data-testid="plan-related-evidence"]', {
+    timeout: 10_000,
+  });
+  await page.click(
+    '[data-testid="plan-related-evidence"] button[aria-label="Find this query in Statements"]',
+  );
+  await page.waitForFunction(
+    () => {
+      const params = new URLSearchParams(location.hash.slice(1));
+      const filter = document.querySelector('input[name="view-filter"]');
+      return (
+        params.get("view") === "statements" &&
+        params.get("preset") === "time" &&
+        params.get("dock") === null &&
+        params.get("entity") === null &&
+        filter instanceof HTMLInputElement &&
+        filter.value === "queryid=9180220441127101"
+      );
+    },
+    { timeout: 10_000 },
+  );
+  await page.goto(planDetailUrl, { waitUntil: "networkidle0" });
+  await page.waitForSelector('[data-testid="plan-related-evidence"]', {
+    timeout: 10_000,
+  });
+  await page.click(
+    '[data-testid="plan-related-evidence"] button[aria-label="Show other Plans for this query"]',
+  );
+  await page.waitForFunction(
+    () => {
+      const params = new URLSearchParams(location.hash.slice(1));
+      const filter = document.querySelector('input[name="view-filter"]');
+      return (
+        params.get("view") === "plans" &&
+        params.get("preset") === "change_timeline" &&
+        params.get("dock") === null &&
+        params.get("entity") === null &&
+        filter instanceof HTMLInputElement &&
+        filter.value === "queryid=9180220441127101"
+      );
+    },
+    { timeout: 10_000 },
+  );
+  planDetail.continuationsVerified = true;
+  plans.detail = planDetail;
+
+  await page.goto(`${base}/#source=local&view=plans&at=${at}&span=3600`, {
+    waitUntil: "networkidle0",
+  });
   await page.evaluate(() => {
     const changesButton = [...document.querySelectorAll("button")].find(
       (button) => button.textContent?.trim() === "Changes",
@@ -2584,6 +2823,7 @@ try {
   console.log(`approved screenshot: ${ACTIVITY_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${PROCESS_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${PLANS_SHOT}`);
+  console.log(`approved screenshot: ${PLAN_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${OS_SHOT}`);
   console.log(`approved screenshot: ${TABLES_SHOT}`);
   console.log(`approved screenshot: ${TABLE_DETAIL_SHOT}`);
