@@ -192,6 +192,28 @@ const activityFrame = makeFrameResponse({
   page: { matched: 28, returned: 2 },
 });
 
+const activitySnapshotVirtualizationFrame = makeFrameResponse({
+  view: "activity",
+  columns: activityFrame.columns,
+  rows: Array.from({ length: 30 }, (_, index) =>
+    makeFrameRow({
+      entity: `pid:${20000 + index}`,
+      label: "worker / erp_prod",
+      cells: [
+        20000 + index,
+        "erp_prod",
+        "worker",
+        "batch",
+        "active",
+        "pid",
+        0.1,
+        "postgres: worker erp_prod",
+      ],
+    }),
+  ),
+  page: { matched: 30, returned: 30 },
+});
+
 const heatmap: HeatmapResponse = {
   grid: { from_us: "100", to_us: "200", bucket_count: 96 },
   ranking: { exact: true, unseen_upper: 0 },
@@ -250,7 +272,7 @@ const locksEdgeFrame = makeFrameResponse({
   page: { matched: 6, returned: 2 },
 });
 
-function stubRequests() {
+function stubRequests(defaultFrame: typeof activityFrame = activityFrame) {
   vi.stubGlobal(
     "fetch",
     vi.fn((input: RequestInfo | URL) => {
@@ -289,7 +311,7 @@ function stubRequests() {
           ),
         );
       }
-      return Promise.resolve(json(activityFrame));
+      return Promise.resolve(json(defaultFrame));
     }),
   );
 }
@@ -381,6 +403,24 @@ test("command column states no OS process matched, honestly, instead of a bare d
   expect(screen.getByTestId("process-link-command-empty").textContent).toBe(
     "activity.processLink.noneCommand",
   );
+});
+
+test("bottom virtualization spacer spans exactly as many columns as a real row renders, in the default no-time-matrix Activity view", async () => {
+  stubRequests(activitySnapshotVirtualizationFrame);
+  renderWorkspace("overview");
+
+  const table = await screen.findByTestId("activity-snapshot-table");
+  await waitFor(() =>
+    expect(
+      screen.getByTestId("ranked-matrix-body").getAttribute("data-loaded-rows"),
+    ).toBe("30"),
+  );
+  const spacer = table.querySelector('[data-virtual-spacer="bottom"] td');
+  expect(spacer).not.toBeNull();
+  const dataRowCellCount = table.querySelectorAll(
+    '[data-entity="pid:20000"] td',
+  ).length;
+  expect(spacer?.getAttribute("colspan")).toBe(String(dataRowCellCount));
 });
 
 test("adds compact waiter to blocker relations only to Waits & Locks", async () => {
