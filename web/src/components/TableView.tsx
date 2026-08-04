@@ -967,6 +967,18 @@ function TableViewImpl(props: TableViewProps) {
                           }
                         >
                           <span className={`${matrixClass}__identity-primary`}>
+                            {timeMatrixMode && !activityMatrixMode && (
+                              <span
+                                style={{
+                                  color: "var(--fg-dim)",
+                                  fontFamily: "var(--mono-font)",
+                                  fontWeight: 400,
+                                  marginInlineEnd: "6px",
+                                }}
+                              >
+                                {startIndex + visibleIndex + 1}{" "}
+                              </span>
+                            )}
                             {formatCellValue(primaryValue, primary.column, t)}
                           </span>
                           {secondary.length > 0 && (

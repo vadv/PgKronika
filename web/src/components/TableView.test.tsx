@@ -265,6 +265,20 @@ test("couples each virtualized statement row to its exact temporal evidence", as
   expect(
     body.querySelector('[data-entity="stmt:0"]')?.getAttribute("style"),
   ).toContain("height: 27px");
+  expect(
+    body
+      .querySelector(
+        '[data-entity="stmt:0"] .statements-time-matrix__identity-primary',
+      )
+      ?.textContent?.trim(),
+  ).toMatch(/^1\D/);
+  expect(
+    body
+      .querySelector(
+        '[data-entity="stmt:1"] .statements-time-matrix__identity-primary',
+      )
+      ?.textContent?.trim(),
+  ).toMatch(/^2\D/);
 });
 
 test("couples plan identity to its exact 96-bucket interval evidence", async () => {
