@@ -47,6 +47,19 @@ test("renders grouped destinations without permanent Processes or Locks tabs", (
   ).toBeDefined();
 });
 
+test("renders calm inline group ordinals with ruled separators", () => {
+  renderNavigation();
+
+  const firstOrdinal = screen.getByTestId("navigation-group-ordinal-workload");
+  const dataOrdinal = screen.getByTestId("navigation-group-ordinal-data");
+  expect(firstOrdinal.textContent).toBe("1");
+  expect(firstOrdinal.style.borderRadius).toBe("");
+  expect(firstOrdinal.style.background).toBe("");
+  expect(
+    dataOrdinal.parentElement?.parentElement?.style.borderInlineStart,
+  ).toBe("1px solid var(--border)");
+});
+
 test("reports catalog availability and selects OS through its processes backing view", () => {
   const { props } = renderNavigation();
   const statements = screen.getByRole("tab", { name: /tabs\.statements/i });

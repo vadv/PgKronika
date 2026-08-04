@@ -106,8 +106,8 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
             style={{
               display: "inline-flex",
               alignItems: "stretch",
-              paddingInlineStart: groupIndex > 0 ? "12px" : 0,
-              marginInlineStart: groupIndex > 0 ? "4px" : 0,
+              paddingInlineStart: groupIndex > 0 ? "var(--space-3)" : 0,
+              marginInlineStart: groupIndex > 0 ? "var(--space-1)" : 0,
               borderInlineStart:
                 groupIndex > 0 ? "1px solid var(--border)" : "none",
             }}
@@ -118,8 +118,8 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
                 display: "inline-flex",
                 alignItems: "center",
                 alignSelf: "center",
-                gap: "5px",
-                marginInline: "4px 6px",
+                gap: "var(--space-1)",
+                marginInline: "var(--space-1)",
                 color: "var(--fg-dim)",
                 fontSize: "var(--text-xs)",
                 fontWeight: 700,
@@ -129,18 +129,12 @@ export function PrimaryNavigation(props: PrimaryNavigationProps) {
               }}
             >
               <span
+                data-testid={`navigation-group-ordinal-${group.id}`}
                 style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  width: "15px",
-                  height: "15px",
-                  color: "var(--fg)",
-                  background: "var(--bg-overlay)",
-                  border: "1px solid var(--border-strong)",
-                  borderRadius: "50%",
+                  color: "var(--fg-dim)",
                   fontFamily: "var(--mono-font)",
-                  fontSize: "9px",
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 500,
                 }}
               >
                 {groupIndex + 1}

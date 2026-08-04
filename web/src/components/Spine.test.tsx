@@ -278,7 +278,9 @@ test("renders verdict ribbon, score chip, event density, sparkline and summary",
   );
   // Score chip: 24 crit buckets (15 min), 24 warn (15 min), 1 incident.
   // 100 − 15×3 − 15×0.5 − 1×5 = 42.5 → 43; prev window is fully calm.
-  expect(screen.getByTestId("spine-score").textContent).toContain("43");
+  const scoreValue = screen.getByTestId("spine-score-value");
+  expect(scoreValue.textContent).toBe("43/100");
+  expect(scoreValue.style.fontSize).toBe("var(--text-lg)");
   expect(screen.getByTestId("spine-score-delta").textContent).toContain("▼57");
   // Event facts are aggregated into bounded density cells, never piled up.
   expect(screen.getAllByTestId("spine-event-density")).toHaveLength(3);

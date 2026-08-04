@@ -1492,7 +1492,7 @@ async function osWorkspaceGeometry(page) {
         hostRect.bottom <= workspaceRect.bottom,
       signalLanes: signalLanes.length,
       signalBuckets: signalLanes.map(
-        (lane) => lane.querySelectorAll("meter").length,
+        (lane) => lane.querySelectorAll(".os-host-signal__chart rect").length,
       ),
       matrixRows,
       hostText: host.textContent ?? "",

@@ -63,8 +63,8 @@ export const chip: CSSProperties = {
   color: "var(--fg)",
   background: "var(--bg-raised)",
   border: "1px solid var(--border)",
-  borderRadius: "999px",
-  padding: "3px 10px",
+  borderRadius: "var(--radius-sm)",
+  padding: "2px 8px",
   whiteSpace: "nowrap",
 };
 
@@ -85,8 +85,8 @@ export const button: CSSProperties = {
   color: "var(--fg)",
   background: "var(--bg-raised)",
   border: "1px solid var(--border)",
-  borderRadius: "999px",
-  padding: "3px 10px",
+  borderRadius: "var(--radius-sm)",
+  padding: "2px 8px",
   cursor: "pointer",
   transition: `border-color var(--transition-fast), background var(--transition-fast)`,
 };
