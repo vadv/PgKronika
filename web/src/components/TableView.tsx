@@ -169,6 +169,26 @@ function verdictTintOf(
   return undefined;
 }
 
+/** Overlapping rings read as linked; parted rings read as unlinked — same
+ * glyph, no color-only signal. */
+function ProcessLinkGlyph(props: { linked: boolean }) {
+  const color = props.linked ? "var(--sev-ok-fg)" : "var(--fg-dim)";
+  const cx1 = props.linked ? 4 : 3;
+  const cx2 = props.linked ? 7.5 : 9;
+  return (
+    <svg
+      width={12}
+      height={12}
+      viewBox="0 0 12 12"
+      aria-hidden="true"
+      style={{ flex: "none" }}
+    >
+      <circle cx={cx1} cy={6} r={2.5} fill="none" stroke={color} strokeWidth={1.4} />
+      <circle cx={cx2} cy={6} r={2.5} fill="none" stroke={color} strokeWidth={1.4} />
+    </svg>
+  );
+}
+
 const SPARK_WIDTH = 60;
 const SPARK_HEIGHT = 14;
 
@@ -1066,6 +1086,7 @@ function TableViewImpl(props: TableViewProps) {
                             style={{
                               display: "inline-flex",
                               alignItems: "center",
+                              gap: "4px",
                               width: "100%",
                               minHeight: "24px",
                               padding: 0,
@@ -1078,8 +1099,20 @@ function TableViewImpl(props: TableViewProps) {
                               textAlign: "start",
                             }}
                           >
+                            <ProcessLinkGlyph linked />
                             {formatCellValue(value, column, t)}
                           </button>
+                        ) : column.code === "process_link" ? (
+                          <span
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: "4px",
+                            }}
+                          >
+                            <ProcessLinkGlyph linked={value !== null} />
+                            {formatCellValue(value, column, t)}
+                          </span>
                         ) : (
                           formatCellValue(value, column, t)
                         )}
