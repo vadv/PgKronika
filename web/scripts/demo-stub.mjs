@@ -990,7 +990,7 @@ const BACKENDS = [
 
 const TABLES = [
   // name, seq, idx, dead_pct, dead_tuples, mod_since_analyze, ins_since_vac, av_age_h (null = never)
-  ["orders", 412, 9_814_220, 2.1, 41_208, 182_331, 920_112, 3.2],
+  ["orders", 42, 14_200, 12.4, 1_040_000, 422_000, 12_000, 1.5],
   ["order_items", 288, 12_404_118, 1.6, 55_014, 220_814, 1_240_551, 3.4],
   ["users", 18, 2_140_502, 0.4, 3_112, 12_410, 48_201, 5.1],
   ["sessions", 96, 18_220_441, 6.8, 412_884, 1_804_112, 3_140_220, 1.2],
@@ -1204,7 +1204,10 @@ function rowsTables() {
         label: `public.${name}`,
         data: {
           relation: `public.${name}`,
-          size: 48_000_000 + i * 384_000_000 + idx * 24,
+          size:
+            name === "orders"
+              ? 1_503_238_144
+              : 48_000_000 + i * 384_000_000 + idx * 24,
           seq_scan: seq,
           idx_scan: idx,
           dead_pct: deadPct,
@@ -1262,7 +1265,7 @@ function rowsIndexes() {
 
 function rowsVacuum() {
   return [
-    ["public.events", "vacuuming heap", true, 0.62, 1_840_220],
+    ["public.orders", "vacuuming heap", true, 0.62, 1_840_220],
     ["public.job_queue", "truncating heap", true, 0.94, 88_441],
     ["public.sessions", "vacuuming indexes", false, 0.41, 412_884],
     ["public.audit_log", "scanning heap", false, 0.18, 0],
@@ -1960,7 +1963,7 @@ function entityResponse(viewCode, entity, params) {
   const rand = mulberry32(hashCode(entity));
   const snapshots = [];
   const totalSamples = 12;
-  const pageSize = 4;
+  const pageSize = Number(params.get("limit") ?? "4") === 96 ? 12 : 4;
   const pageIndex = Math.max(
     0,
     Number((params.get("cursor") ?? "page-1").replace("page-", "")) - 1,
@@ -1972,7 +1975,23 @@ function entityResponse(viewCode, entity, params) {
       ts_us: String(from + sampleIndex * step),
       values: columns.map((code) => {
         const value = row.data[code] ?? null;
-        if (typeof value === "number") return r2(value * (0.8 + rand() * 0.4));
+        if (typeof value === "number") {
+          const column = view.columns.find(
+            (candidate) => candidate.code === code,
+          );
+          const progress = sampleIndex / Math.max(1, totalSamples - 1);
+          const noise = (rand() - 0.5) * 0.035;
+          const gauge = column?.unit === "percent" || code === "progress";
+          const factor = gauge
+            ? 0.97 + progress * 0.03 + noise / 3
+            : 0.72 + progress * 0.28 + noise;
+          const sample = r2(value * factor);
+          if (column?.unit === "percent")
+            return Math.max(0, Math.min(100, sample));
+          if (code === "progress") return Math.max(0, Math.min(1, sample));
+          if (/^(i|u)\d+$/.test(column?.type ?? "")) return Math.round(sample);
+          return sample;
+        }
         return value;
       }),
     });
@@ -1984,7 +2003,12 @@ function entityResponse(viewCode, entity, params) {
     mode: "history",
     columns,
     snapshots,
-    page: { next: pageIndex < 2 ? `page-${pageIndex + 2}` : null },
+    page: {
+      next:
+        (pageIndex + 1) * pageSize < totalSamples
+          ? `page-${pageIndex + 2}`
+          : null,
+    },
     quality:
       pageIndex === 0
         ? { status: "complete", gaps: [], gated: [] }

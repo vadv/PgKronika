@@ -20,6 +20,9 @@ const OS_SHOT = `${OUT_DIR}forensic-os-1920x1080.png`;
 const TABLES_SHOT = `${OUT_DIR}forensic-tables-1920x1080.png`;
 const INDEXES_SHOT = `${OUT_DIR}forensic-indexes-1920x1080.png`;
 const VACUUM_SHOT = `${OUT_DIR}forensic-vacuum-1920x1080.png`;
+const TABLE_DETAIL_SHOT = `${OUT_DIR}forensic-table-detail-1920x1080.png`;
+const INDEX_DETAIL_SHOT = `${OUT_DIR}forensic-index-detail-1920x1080.png`;
+const VACUUM_DETAIL_SHOT = `${OUT_DIR}forensic-vacuum-detail-1920x1080.png`;
 const EVENTS_SHOT = `${OUT_DIR}forensic-events-1920x1080.png`;
 const STATEMENTS_COMPACT_SHOT = `${OUT_DIR}forensic-statements-1440x900.png`;
 const EVENTS_COMPACT_SHOT = `${OUT_DIR}forensic-events-1440x900.png`;
@@ -1458,6 +1461,157 @@ function assertInfrastructureGeometry(name, geometry) {
   }
 }
 
+async function verifyDataMaintenanceDetail(
+  page,
+  base,
+  at,
+  { view, entity, shot, historyExpected },
+) {
+  await page.goto(
+    `${base}/#source=local&view=${view}&at=${at}&span=86400&dock=row&entity=${encodeURIComponent(entity)}`,
+    { waitUntil: "networkidle0" },
+  );
+  await page.waitForSelector(
+    `[data-testid="data-maintenance-detail"][data-view="${view}"]`,
+    { timeout: 15_000 },
+  );
+  if (historyExpected) {
+    await page.waitForSelector('[data-testid="maintenance-lane-trace"]', {
+      timeout: 10_000,
+    });
+  } else {
+    await page.waitForSelector(
+      '[data-testid="maintenance-history-not-collected"]',
+      { timeout: 10_000 },
+    );
+  }
+  const geometry = await page.evaluate(
+    ({ expectedView, expectsHistory }) => {
+      const detail = document.querySelector(
+        `[data-testid="data-maintenance-detail"][data-view="${expectedView}"]`,
+      );
+      const health = document.querySelector(
+        '[data-shell-region="health-line"]',
+      );
+      const status = document.querySelector('[data-shell-region="status"]');
+      if (
+        !(detail instanceof HTMLElement) ||
+        !(health instanceof HTMLElement) ||
+        !(status instanceof HTMLElement)
+      ) {
+        throw new Error(`${expectedView} detail shell is incomplete`);
+      }
+      const detailRect = detail.getBoundingClientRect();
+      const healthRect = health.getBoundingClientRect();
+      const statusRect = status.getBoundingClientRect();
+      const historyRequest = performance
+        .getEntriesByType("resource")
+        .map((entry) => entry.name)
+        .find((name) => {
+          if (!name.includes(`/v1/entity/${expectedView}/`)) return false;
+          const url = new URL(name);
+          return url.searchParams.has("from");
+        });
+      const historyUrl =
+        historyRequest === undefined ? null : new URL(historyRequest);
+      const from = historyUrl?.searchParams.get("from") ?? null;
+      const to = historyUrl?.searchParams.get("to") ?? null;
+      const columns = historyUrl?.searchParams.get("columns") ?? "";
+      const text = detail.textContent ?? "";
+      return {
+        rootHeight: document.documentElement.scrollHeight,
+        rootWidth: document.documentElement.scrollWidth,
+        scrollY: window.scrollY,
+        detailTop: detailRect.top,
+        detailBottom: detailRect.bottom,
+        detailWidth: detailRect.width,
+        healthBottom: healthRect.bottom,
+        statusTop: statusRect.top,
+        lanes: detail.querySelectorAll(
+          '[data-testid="maintenance-temporal-lane"]',
+        ).length,
+        traces: detail.querySelectorAll(
+          '[data-testid="maintenance-lane-trace"]',
+        ).length,
+        analyses: detail.querySelectorAll(
+          ".maintenance-detail__analysis-grid > section",
+        ).length,
+        genericDock: document.querySelector('aside[data-dock="row"]') !== null,
+        overview:
+          document.querySelector(
+            '[data-testid="infrastructure-analytical-center"]',
+          ) !== null,
+        forbiddenCopy:
+          /\/v1\/|gaps|gated|proof|provenance|same_snapshot_database_relation_oid/i.test(
+            text,
+          ),
+        rawEntity: text.includes(
+          new URLSearchParams(location.hash.slice(1)).get("entity") ?? "",
+        ),
+        history: {
+          expected: expectsHistory,
+          request: historyRequest ?? null,
+          limit: historyUrl?.searchParams.get("limit") ?? null,
+          columns: columns === "" ? 0 : columns.split(",").length,
+          width:
+            from === null || to === null ? null : Number(to) - Number(from),
+          notCollected:
+            detail.querySelector(
+              '[data-testid="maintenance-history-not-collected"]',
+            ) !== null,
+        },
+      };
+    },
+    { expectedView: view, expectsHistory: historyExpected },
+  );
+  const failures = [];
+  if (geometry.rootHeight > 1080)
+    failures.push(`root height ${geometry.rootHeight}`);
+  if (geometry.rootWidth > 1920)
+    failures.push(`root width ${geometry.rootWidth}`);
+  if (geometry.scrollY !== 0)
+    failures.push(`shell scroll offset ${geometry.scrollY}`);
+  if (Math.abs(geometry.detailTop - geometry.healthBottom) > 1)
+    failures.push(
+      `detail starts at ${geometry.detailTop}, health ends at ${geometry.healthBottom}`,
+    );
+  if (geometry.detailBottom > geometry.statusTop + 1)
+    failures.push(
+      `detail ends at ${geometry.detailBottom}, status starts at ${geometry.statusTop}`,
+    );
+  if (geometry.detailWidth !== 1920)
+    failures.push(`detail width ${geometry.detailWidth}`);
+  if (geometry.lanes !== 3) failures.push(`temporal lanes ${geometry.lanes}`);
+  if (geometry.analyses !== 3)
+    failures.push(`analysis columns ${geometry.analyses}`);
+  if (geometry.genericDock) failures.push("generic row dock is still mounted");
+  if (geometry.overview) failures.push("overview remains behind entity detail");
+  if (geometry.forbiddenCopy)
+    failures.push("technical diagnostics leaked into UI");
+  if (geometry.rawEntity) failures.push("raw entity token leaked into UI");
+  if (historyExpected) {
+    if (geometry.history.request === null)
+      failures.push("bounded history request is missing");
+    if (geometry.history.limit !== "96")
+      failures.push(`history limit ${geometry.history.limit}`);
+    if (geometry.history.columns < 1 || geometry.history.columns > 6)
+      failures.push(`history columns ${geometry.history.columns}`);
+    if (
+      geometry.history.width === null ||
+      geometry.history.width > 21_600_000_000
+    )
+      failures.push(`history width ${geometry.history.width}`);
+    if (geometry.traces < 3) failures.push(`history traces ${geometry.traces}`);
+  } else if (!geometry.history.notCollected) {
+    failures.push("missing-history boundary is not visible");
+  }
+  if (failures.length > 0) {
+    throw new Error(`${view} detail: ${failures.join("; ")}`);
+  }
+  await page.screenshot({ path: shot });
+  return geometry;
+}
+
 async function osWorkspaceGeometry(page) {
   const geometry = await page.evaluate(() => {
     const workspace = document.querySelector('[data-testid="os-workspace"]');
@@ -1579,13 +1733,12 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
   }
   await page.screenshot({ path: TABLES_SHOT });
   await page.click('[data-testid="table-vacuum-lanes"] button');
-  await page.waitForSelector('[data-dock="row"]', { timeout: 10_000 });
-  await page.click('[data-detail-tab-trigger="relationships"]');
-  await page.waitForSelector('[data-dock="row"] [role="tabpanel"] button', {
-    timeout: 5_000,
-  });
+  await page.waitForSelector(
+    '[data-testid="data-maintenance-detail"][data-view="vacuum"]',
+    { timeout: 10_000 },
+  );
   const vacuumRelation = await page.$eval(
-    '[data-dock="row"] [role="tabpanel"]',
+    '[data-testid="data-maintenance-detail"][data-view="vacuum"]',
     (element) => element.textContent ?? "",
   );
   if (
@@ -1595,6 +1748,12 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
     )
   )
     throw new Error(`Vacuum/table human relation: ${vacuumRelation}`);
+  const tableDetail = await verifyDataMaintenanceDetail(page, base, at, {
+    view: "tables",
+    entity: "table:public.orders",
+    shot: TABLE_DETAIL_SHOT,
+    historyExpected: true,
+  });
 
   await page.goto(
     `${base}/#source=local&view=indexes&at=${at}&span=3600&preset=table_context`,
@@ -1621,6 +1780,12 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
     );
   }
   await page.screenshot({ path: INDEXES_SHOT });
+  const indexDetail = await verifyDataMaintenanceDetail(page, base, at, {
+    view: "indexes",
+    entity: "index:orders_pkey",
+    shot: INDEX_DETAIL_SHOT,
+    historyExpected: true,
+  });
 
   await page.goto(
     `${base}/#source=local&view=vacuum&at=${at}&span=3600&preset=progress`,
@@ -1642,7 +1807,22 @@ async function verifyInfrastructureWorkspaces(page, base, at) {
     throw new Error(`Vacuum compact context: ${JSON.stringify(vacuum)}`);
   }
   await page.screenshot({ path: VACUUM_SHOT });
-  return { os, tables, indexes, vacuum, vacuumRelationVerified: true };
+  const vacuumDetail = await verifyDataMaintenanceDetail(page, base, at, {
+    view: "vacuum",
+    entity: "pid:12188",
+    shot: VACUUM_DETAIL_SHOT,
+    historyExpected: false,
+  });
+  return {
+    os,
+    tables,
+    indexes,
+    vacuum,
+    tableDetail,
+    indexDetail,
+    vacuumDetail,
+    vacuumRelationVerified: true,
+  };
 }
 
 async function eventGeometry(page) {
@@ -1772,7 +1952,12 @@ async function verifyEventsWorkspace(page, base, at) {
     if (document.activeElement instanceof HTMLElement)
       document.activeElement.blur();
   });
-  await page.keyboard.press("Tab");
+  // The verifier visits several entity-detail routes first. Chromium keeps a
+  // sequential-focus starting point across same-document SPA navigations, so
+  // blurring alone does not reliably restart Tab traversal at the skip link.
+  // Focus the link explicitly here; the earlier shell-wide keyboard walk still
+  // verifies sequential reachability.
+  await page.focus(".skip-link");
   const skipFocused = await page.evaluate(
     () => document.activeElement?.classList.contains("skip-link") === true,
   );
@@ -2176,8 +2361,11 @@ try {
   console.log(`approved screenshot: ${PLANS_SHOT}`);
   console.log(`approved screenshot: ${OS_SHOT}`);
   console.log(`approved screenshot: ${TABLES_SHOT}`);
+  console.log(`approved screenshot: ${TABLE_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${INDEXES_SHOT}`);
+  console.log(`approved screenshot: ${INDEX_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${VACUUM_SHOT}`);
+  console.log(`approved screenshot: ${VACUUM_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${EVENTS_SHOT}`);
   console.log(`approved screenshot: ${EVENTS_COMPACT_SHOT}`);
 } catch (error) {

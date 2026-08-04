@@ -12,6 +12,7 @@ import {
   makeContextResponse,
   makeDataQualityResponse,
   makeEntityHistoryResponse,
+  makeEntityPointResponse,
   makeEventFact,
   makeEventsResponse,
   makeFrameResponse,
@@ -1437,6 +1438,103 @@ test("Tables and Indexes expose same-snapshot context while unsupported analysis
       screen.getByRole("button", { name }).getAttribute("aria-disabled"),
     ).toBe("true");
   }
+});
+
+test("data maintenance row detail owns the desktop canvas instead of the generic dock", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=tables&at=1722400000000000&span=3600&dock=row&entity=table%3Aorders`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const tables = availableCatalog.views.find((view) => view.code === "tables");
+  if (tables !== undefined) {
+    tables.capabilities = { detail: true, history: true, related: true };
+    tables.columns = [
+      {
+        availability: "available",
+        code: "relation",
+        lazy: false,
+        requires: [],
+        type: "text",
+      },
+      {
+        availability: "available",
+        code: "dead_pct",
+        lazy: false,
+        requires: [],
+        type: "f64",
+        unit: "percent",
+      },
+      {
+        availability: "available",
+        code: "io_hit_pct",
+        lazy: false,
+        requires: [],
+        type: "f64",
+        unit: "percent",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href,
+    );
+    if (url.pathname === "/v1/ui/catalog") {
+      return Promise.resolve(jsonResponse(availableCatalog));
+    }
+    if (url.pathname.startsWith("/v1/entity/tables/")) {
+      return Promise.resolve(
+        jsonResponse(
+          url.searchParams.has("at")
+            ? makeEntityPointResponse({
+                view: "tables",
+                entity: "table:orders",
+                label: "public.orders",
+                fields: [
+                  { code: "relation", value: "public.orders" },
+                  { code: "dead_pct", value: 12.4 },
+                  { code: "io_hit_pct", value: 97.3 },
+                ],
+              })
+            : makeEntityHistoryResponse({
+                view: "tables",
+                entity: "table:orders",
+                label: "public.orders",
+                columns: ["dead_pct", "io_hit_pct"],
+                snapshots: [
+                  {
+                    ts_us: "1722400000000000",
+                    values: [12.4, 97.3],
+                  },
+                ],
+              }),
+        ),
+      );
+    }
+    return baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("data-maintenance-detail")).toBeDefined();
+  expect(document.querySelector('aside[data-dock="row"]')).toBeNull();
+  expect(screen.queryByTestId("infrastructure-analytical-center")).toBeNull();
+
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: /maintenanceDetail\.close|close entity detail|закрыть детали/i,
+    }),
+  );
+  await waitFor(() => {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    expect(hash.get("dock")).toBeNull();
+    expect(hash.get("entity")).toBe("table:orders");
+  });
 });
 
 test("Vacuum defaults to point progress and keeps linked table context calm", async () => {
