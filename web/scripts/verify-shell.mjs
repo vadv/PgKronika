@@ -24,6 +24,7 @@ const TABLE_DETAIL_SHOT = `${OUT_DIR}forensic-table-detail-1920x1080.png`;
 const INDEX_DETAIL_SHOT = `${OUT_DIR}forensic-index-detail-1920x1080.png`;
 const VACUUM_DETAIL_SHOT = `${OUT_DIR}forensic-vacuum-detail-1920x1080.png`;
 const EVENTS_SHOT = `${OUT_DIR}forensic-events-1920x1080.png`;
+const STATEMENT_DETAIL_SHOT = `${OUT_DIR}forensic-statement-detail-1920x1080.png`;
 const STATEMENTS_COMPACT_SHOT = `${OUT_DIR}forensic-statements-1440x900.png`;
 const EVENTS_COMPACT_SHOT = `${OUT_DIR}forensic-events-1440x900.png`;
 const FAILURE_SHOT = `${OUT_DIR}forensic-shell-1920x1080-failure.png`;
@@ -543,24 +544,30 @@ async function verifyStatementsWorkspace(page) {
     document.activeElement?.getAttribute("data-entity"),
   );
   await page.keyboard.press("Enter");
-  await page.waitForSelector('[data-dock="row"] [data-field="query"]', {
-    timeout: 10_000,
-  });
+  await page.waitForSelector(
+    '[data-testid="statement-detail"] .statement-detail__sql code',
+    {
+      timeout: 10_000,
+    },
+  );
   const detail = await page.$eval(
-    '[data-dock="row"] [data-field="query"]',
+    '[data-testid="statement-detail"] .statement-detail__sql code',
     (field) => ({
       text: field.textContent?.trim() ?? "",
-      visible:
-        field.getBoundingClientRect().height > 0 ||
-        [...field.children].some(
-          (child) => child.getBoundingClientRect().height > 0,
-        ),
+      visible: field.getBoundingClientRect().height > 0,
     }),
   );
+  const detailOwnsCanvas = await page.evaluate(
+    () =>
+      document.querySelector('aside[data-dock="row"]') === null &&
+      document.querySelector(
+        '[data-testid="statement-overview-preserved"]:not([hidden])',
+      ) === null,
+  );
   await page.keyboard.press("Escape");
-  await page.waitForSelector('[data-dock="row"]', {
+  await page.waitForSelector('[data-testid="statement-detail"]', {
     hidden: true,
-    timeout: 5_000,
+    timeout: 10_000,
   });
 
   const final = await read();
@@ -637,6 +644,9 @@ async function verifyStatementsWorkspace(page) {
       `statement detail did not expose bounded SQL: ${detail.text}`,
     );
   }
+  if (!detailOwnsCanvas) {
+    failures.push("statement detail did not replace the ranked matrix");
+  }
   if (failures.length > 0) throw new Error(failures.join("\n"));
   return {
     pages,
@@ -647,21 +657,11 @@ async function verifyStatementsWorkspace(page) {
     bufferHitRange,
     keyboard: { firstEntity, arrowEntity },
     detail,
+    detailOwnsCanvas,
   };
 }
 
 async function verifyGlobalSearchDetail(page) {
-  const matrixSelector = '[data-testid="ranked-matrix-body"]';
-  const matrixBefore = await page.$eval(matrixSelector, (element) => {
-    const rect = element.getBoundingClientRect();
-    return {
-      left: rect.left,
-      top: rect.top,
-      width: rect.width,
-      height: rect.height,
-    };
-  });
-
   await page.keyboard.press("/");
   await page.waitForSelector('[role="dialog"] input[type="search"]', {
     timeout: 5_000,
@@ -711,62 +711,85 @@ async function verifyGlobalSearchDetail(page) {
 
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
-  await page.waitForSelector('[data-dock="row"] [data-forensic-summary]', {
+  await page.waitForSelector('[data-testid="statement-detail"]', {
     timeout: 10_000,
   });
-  const pointState = await page.evaluate((selector) => {
-    const dock = document.querySelector('[data-dock="row"]');
-    const matrix = document.querySelector(selector);
-    if (!(dock instanceof HTMLElement) || !(matrix instanceof HTMLElement)) {
-      throw new Error("detail dock or ranked matrix is missing");
+  await page.waitForSelector(".statement-detail__lane-trace", {
+    timeout: 10_000,
+  });
+  await page.waitForFunction(
+    () =>
+      performance
+        .getEntriesByType("resource")
+        .map((entry) => entry.name)
+        .some(
+          (name) =>
+            name.includes("/v1/entity/statements/") &&
+            name.includes("from=") &&
+            name.includes("columns="),
+        ),
+    { timeout: 10_000 },
+  );
+  const pointState = await page.evaluate(() => {
+    const detail = document.querySelector('[data-testid="statement-detail"]');
+    const health = document.querySelector('[data-shell-region="health-line"]');
+    const status = document.querySelector('[data-shell-region="status"]');
+    if (
+      !(detail instanceof HTMLElement) ||
+      !(health instanceof HTMLElement) ||
+      !(status instanceof HTMLElement)
+    ) {
+      throw new Error("statement detail shell is incomplete");
     }
-    const dockRect = dock.getBoundingClientRect();
-    const matrixRect = matrix.getBoundingClientRect();
+    const detailRect = detail.getBoundingClientRect();
+    const healthRect = health.getBoundingClientRect();
+    const statusRect = status.getBoundingClientRect();
     const params = new URLSearchParams(location.hash.slice(1));
+    const text = detail.textContent ?? "";
     return {
-      dock: {
-        left: dockRect.left,
-        top: dockRect.top,
-        right: dockRect.right,
-        bottom: dockRect.bottom,
-        width: dockRect.width,
-        height: dockRect.height,
+      detail: {
+        left: detailRect.left,
+        top: detailRect.top,
+        right: detailRect.right,
+        bottom: detailRect.bottom,
+        width: detailRect.width,
+        height: detailRect.height,
       },
-      matrix: {
-        left: matrixRect.left,
-        top: matrixRect.top,
-        width: matrixRect.width,
-        height: matrixRect.height,
-      },
+      healthBottom: healthRect.bottom,
+      statusTop: statusRect.top,
       hashView: params.get("view"),
       hashHasQuery: params.has("q"),
-      summary: dock.querySelector('[data-detail-tab="summary"]')?.textContent,
-      tokenInSummary:
-        dock
-          .querySelector('[data-detail-tab="summary"]')
-          ?.textContent?.includes(params.get("entity") ?? "") ?? false,
-      grouped: dock.querySelectorAll("[data-forensic-group]").length,
+      rootHeight: document.documentElement.scrollHeight,
+      rootWidth: document.documentElement.scrollWidth,
+      lanes: detail.querySelectorAll('[data-testid="statement-temporal-lane"]')
+        .length,
+      analyses: detail.querySelectorAll(
+        ".statement-detail__analysis-grid > section",
+      ).length,
+      traces: detail.querySelectorAll(".statement-detail__lane-trace").length,
+      impactCenter:
+        detail.querySelector('[data-testid="statement-impact-center"]') !==
+        null,
+      historyMatrix:
+        detail.querySelector('[data-testid="statement-history-matrix"]') !==
+        null,
+      related:
+        detail.querySelector('[data-testid="statement-related-evidence"]') !==
+        null,
+      genericDock: document.querySelector('aside[data-dock="row"]') !== null,
+      overviewVisible:
+        document.querySelector(
+          '[data-testid="statement-overview-preserved"]:not([hidden])',
+        ) !== null,
+      tokenInDetail: text.includes(params.get("entity") ?? ""),
+      forbiddenCopy:
+        /\/v1\/|best[_ ]effort|statement_plan|ossc_queryid|gaps|gated|proof|provenance/i.test(
+          text,
+        ),
+      text,
     };
-  }, matrixSelector);
+  });
 
-  await page.click('[data-detail-tab-trigger="history"]');
-  await page.waitForSelector(
-    '[data-dock="row"] [data-detail-history] tbody tr',
-    {
-      timeout: 10_000,
-    },
-  );
-  for (const expectedRows of [8, 12]) {
-    await page.click('[data-dock="row"] [data-testid="history-load-more"]');
-    await page.waitForFunction(
-      (rows) =>
-        document.querySelectorAll(
-          '[data-dock="row"] [data-detail-history] tbody tr',
-        ).length === rows,
-      { timeout: 10_000 },
-      expectedRows,
-    );
-  }
   const historyState = await page.evaluate(() => {
     const requests = performance
       .getEntriesByType("resource")
@@ -779,18 +802,14 @@ async function verifyGlobalSearchDetail(page) {
       );
     const request = requests[0];
     const url = request === undefined ? null : new URL(request);
+    const from = url?.searchParams.get("from") ?? null;
+    const to = url?.searchParams.get("to") ?? null;
+    const columns = url?.searchParams.get("columns") ?? "";
     return {
-      rows: document.querySelectorAll(
-        '[data-dock="row"] [data-detail-history] tbody tr',
-      ).length,
       request,
-      cursors: requests.map((name) => new URL(name).searchParams.get("cursor")),
-      normalChrome:
-        document.querySelector('[data-dock="row"] [role="tabpanel"]')
-          ?.textContent ?? "",
-      qualityBanner:
-        document.querySelector('[data-dock="row"] [data-history-quality]') !==
-        null,
+      limit: url?.searchParams.get("limit") ?? null,
+      columns: columns === "" ? 0 : columns.split(",").length,
+      width: from === null || to === null ? null : Number(to) - Number(from),
       hasPointAt: url?.searchParams.has("at") ?? null,
       hasRange:
         url?.searchParams.has("from") === true &&
@@ -798,25 +817,6 @@ async function verifyGlobalSearchDetail(page) {
         url.searchParams.has("columns"),
     };
   });
-
-  await page.click('[data-detail-tab-trigger="relationships"]');
-  await page.waitForSelector(
-    '[data-dock="row"] [data-detail-tab="relationships"] .entity-detail__relation',
-    { timeout: 5_000 },
-  );
-  const relationship = await page.$eval(
-    '[data-dock="row"] [role="tabpanel"]',
-    (element) => element.textContent ?? "",
-  );
-
-  await page.click('[data-detail-tab-trigger="raw"]');
-  await page.waitForSelector('[data-dock="row"] [data-raw-evidence]', {
-    timeout: 5_000,
-  });
-  const rawProjection = await page.$eval(
-    '[data-dock="row"] [data-raw-evidence]',
-    (element) => element.textContent ?? "",
-  );
 
   const failures = [];
   if (searchState.resultCount < 1)
@@ -834,53 +834,49 @@ async function verifyGlobalSearchDetail(page) {
     failures.push(`search opened ${pointState.hashView}, expected statements`);
   }
   if (
-    Math.abs(pointState.dock.width - 1920) > 0.5 ||
-    Math.abs(pointState.dock.top - 136) > 0.5 ||
-    Math.abs(pointState.dock.bottom - 1056) > 0.5
+    Math.abs(pointState.detail.width - 1920) > 0.5 ||
+    Math.abs(pointState.detail.top - pointState.healthBottom) > 0.5 ||
+    Math.abs(pointState.detail.bottom - pointState.statusTop) > 0.5
   ) {
     failures.push(
-      `desktop detail workspace ${JSON.stringify(pointState.dock)}`,
+      `desktop detail workspace ${JSON.stringify(pointState.detail)}`,
     );
   }
-  for (const key of ["left", "top", "width", "height"]) {
-    if (Math.abs(pointState.matrix[key] - matrixBefore[key]) > 0.5) {
-      failures.push(
-        `detail reflowed matrix ${key}: ${matrixBefore[key]} -> ${pointState.matrix[key]}`,
-      );
-    }
-  }
   if (
-    pointState.grouped < 1 ||
-    pointState.tokenInSummary ||
-    /point projection|best[_ ]effort|gaps|gated/i.test(pointState.summary ?? "")
+    pointState.rootHeight > 1080 ||
+    pointState.rootWidth > 1920 ||
+    pointState.lanes !== 4 ||
+    pointState.analyses !== 3 ||
+    pointState.traces < 6 ||
+    !pointState.impactCenter ||
+    !pointState.historyMatrix ||
+    !pointState.related ||
+    pointState.genericDock ||
+    pointState.overviewVisible ||
+    pointState.tokenInDetail ||
+    pointState.forbiddenCopy
   ) {
-    failures.push(`summary chrome is noisy: ${JSON.stringify(pointState)}`);
+    failures.push(`statement detail contract: ${JSON.stringify(pointState)}`);
   }
   if (
-    historyState.rows !== 12 ||
     historyState.hasRange !== true ||
-    historyState.cursors.join(",") !== ",page-2,page-3" ||
-    historyState.qualityBanner ||
-    /partial|gaps|gated/i.test(historyState.normalChrome)
+    historyState.limit !== "96" ||
+    historyState.columns < 1 ||
+    historyState.columns > 6 ||
+    historyState.width === null ||
+    historyState.width > 21_600_000_000
   ) {
     failures.push(`history contract failed: ${JSON.stringify(historyState)}`);
   }
   if (historyState.hasPointAt !== false) {
     failures.push("history request incorrectly mixed point at with range mode");
   }
-  if (
-    !/plans/i.test(relationship) ||
-    /best[_ ]effort|statement_plan|ossc_queryid|proof|exact/i.test(relationship)
-  ) {
-    failures.push(`relationship chrome is noisy: ${relationship}`);
-  }
-  if (!rawProjection.includes('"mode": "point"')) {
-    failures.push("raw tab did not expose the bounded point projection");
-  }
   if (failures.length > 0) throw new Error(failures.join("\n"));
 
+  await page.screenshot({ path: STATEMENT_DETAIL_SHOT });
+
   await page.keyboard.press("Escape");
-  await page.waitForSelector('[data-dock="row"]', {
+  await page.waitForSelector('[data-testid="statement-detail"]', {
     hidden: true,
     timeout: 5_000,
   });
@@ -889,7 +885,7 @@ async function verifyGlobalSearchDetail(page) {
     pointState,
     historyState,
     relationshipVerified: true,
-    rawProjectionVerified: true,
+    technicalChromeAbsent: true,
   };
 }
 
@@ -2354,6 +2350,7 @@ try {
   );
   console.log(`approved screenshot: ${SUCCESS_SHOT}`);
   console.log(`approved screenshot: ${STATEMENTS_COMPACT_SHOT}`);
+  console.log(`approved screenshot: ${STATEMENT_DETAIL_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_CPU_SHOT}`);
   console.log(`approved screenshot: ${ACTIVITY_WAITS_SHOT}`);

@@ -1537,6 +1537,101 @@ test("data maintenance row detail owns the desktop canvas instead of the generic
   });
 });
 
+test("selected statement owns the desktop canvas below Health Line", async () => {
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}#view=statements&at=1722400000000000&span=3600&dock=row&entity=stmt%3A7101`,
+  );
+  const availableCatalog = structuredClone(catalogBody);
+  const statements = availableCatalog.views.find(
+    (view) => view.code === "statements",
+  );
+  if (statements !== undefined) {
+    statements.availability = "available";
+    statements.capabilities = { detail: true, history: true, related: true };
+    statements.columns = [
+      {
+        availability: "available",
+        code: "queryid",
+        lazy: false,
+        requires: [],
+        type: "i64",
+      },
+      {
+        availability: "available",
+        code: "query",
+        lazy: true,
+        requires: [],
+        type: "text",
+      },
+      {
+        availability: "available",
+        code: "total",
+        lazy: false,
+        requires: [],
+        type: "f64",
+        unit: "duration_ms",
+      },
+    ];
+  }
+  const baseFetch = stubFetch();
+  const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+    const url = new URL(
+      typeof input === "string"
+        ? input
+        : input instanceof Request
+          ? input.url
+          : input.href,
+    );
+    if (url.pathname === "/v1/ui/catalog") {
+      return Promise.resolve(jsonResponse(availableCatalog));
+    }
+    if (url.pathname.startsWith("/v1/entity/statements/")) {
+      return Promise.resolve(
+        jsonResponse(
+          url.searchParams.has("at")
+            ? makeEntityPointResponse({
+                view: "statements",
+                entity: "stmt:7101",
+                label: "9180220441127101",
+                fields: [
+                  { code: "queryid", value: "9180220441127101" },
+                  { code: "query", value: "select 1" },
+                  { code: "total", value: 4_200 },
+                ],
+              })
+            : makeEntityHistoryResponse({
+                view: "statements",
+                entity: "stmt:7101",
+                label: "9180220441127101",
+                columns: ["total"],
+                snapshots: [{ ts_us: "1722400000000000", values: [4_200] }],
+              }),
+        ),
+      );
+    }
+    return baseFetch(input);
+  });
+  renderApp(fetchImpl);
+
+  expect(await screen.findByTestId("statement-detail")).toBeDefined();
+  expect(screen.getByTestId("health-line")).toBeDefined();
+  expect(document.querySelector('aside[data-dock="row"]')).toBeNull();
+  expect(screen.getByTestId("statement-overview-preserved").hidden).toBe(true);
+
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: /statementDetail\.close|close statement detail|закрыть детали/i,
+    }),
+  );
+  await waitFor(() => {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    expect(hash.get("dock")).toBeNull();
+    expect(hash.get("entity")).toBe("stmt:7101");
+  });
+});
+
 test("Vacuum defaults to point progress and keeps linked table context calm", async () => {
   history.replaceState(
     null,
