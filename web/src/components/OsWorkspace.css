@@ -21,6 +21,7 @@
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  box-shadow: var(--shadow-raised);
   font-family: var(--ui-font);
   font-size: var(--text-xs);
 }
