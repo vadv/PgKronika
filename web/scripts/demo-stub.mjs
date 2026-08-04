@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const STATIC_DIR = normalize(join(HERE, "../../bins/pg_kronika-web/static"));
 const PORT = Number(process.env.PGK_DEMO_PORT ?? 18444);
+const HOST = process.env.PGK_DEMO_HOST ?? "127.0.0.1";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -2297,12 +2298,12 @@ const server = createServer((req, res) => {
   return sendStatic(res, normalize(path));
 });
 
-server.listen(PORT, "127.0.0.1", () => {
+server.listen(PORT, HOST, () => {
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("demo stub did not expose a TCP address");
   }
   console.log(
-    `demo stub: http://127.0.0.1:${address.port} (static: ${STATIC_DIR})`,
+    `demo stub: http://${HOST}:${address.port} (static: ${STATIC_DIR})`,
   );
 });

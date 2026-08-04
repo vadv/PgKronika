@@ -288,6 +288,27 @@ test("copy link writes the canonical share URL and shows a toast for 1.7s", () =
   expect(screen.queryByTestId("toast")).toBeNull();
 });
 
+test("database chip states what exists, read-only — scoping stays a per-workspace filter", () => {
+  const { unmount } = renderHeader();
+  expect(screen.getByTestId("database-chip").textContent).toContain(
+    "header.databaseAll",
+  );
+  unmount();
+
+  renderHeader({
+    context: makeContextResponse({
+      databases: [
+        { entity: "db:1", name: "orders", oid: 1, visibility: "full" },
+        { entity: "db:2", name: "billing", oid: 2, visibility: "full" },
+      ],
+    }),
+  });
+  const chip = screen.getByTestId("database-chip");
+  expect(chip.textContent).toContain("header.databaseCount");
+  expect(chip.getAttribute("title")).toBe("orders, billing");
+  expect(chip.tagName).not.toBe("BUTTON");
+});
+
 test("instance chip tooltip shows host, pg version and cpu from context", async () => {
   renderHeader({
     context: makeContextResponse({

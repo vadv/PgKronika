@@ -63,6 +63,34 @@ alongside bugs, spec, tests, and memory bounds.
 - Crate READMEs are the contract documentation: English `README.md` with a
   Russian `README.ru.md` mirror, kept in sync.
 
+## Standing Review Rule: Pre-merge Review Panel
+
+Before merging any PR — once per PR, at PR creation/before merge, never on
+every commit — run a review panel and fix every **high**-severity finding
+before merging:
+
+1. **DevOps** — CI/CD correctness, build/deploy artifacts (Docker images,
+   the committed `static.tar.gz`, bundle budget), config/env var changes are
+   documented, release and rollback path.
+2. **DBA** — safe against the real, monitored PostgreSQL: query cost and
+   locking behavior, whether anything this PR adds could add load or block
+   on the target instance, schema/migration safety.
+3. **SRE** — operational reliability: failure mode when this breaks in
+   production (does it take down the collector or the web viewer, does it
+   degrade gracefully), the new surface's own observability, rollback/blast
+   radius.
+4. **PostgreSQL developer** — semantic correctness of what's being measured
+   or interpreted: version behavior across PG 10-18, catalog/statistics
+   quirks, correct modeling of PostgreSQL's actual behavior (not just SQL
+   syntax safety).
+5. **Rust performance** — hot paths, allocations, needless clones, per-row
+   work, async overhead.
+
+This runs alongside, not instead of, the standing memory-bounds and
+comment-quality reviews. Metric-adding PRs (see the playbook below) keep
+their own more detailed 4-role panel in addition — that one is scoped
+specifically to the collector's OOM/perf risk profile.
+
 ## Playbook: adding a `pg_stat_*` snapshot metric (Step 7)
 
 Reverse-engineering the pattern is what costs time, not the change itself. Copy

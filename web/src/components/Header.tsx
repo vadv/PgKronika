@@ -144,6 +144,29 @@ function Dot(props: { color: string; square?: boolean }) {
   );
 }
 
+/** Read-only, like RoleChip: database scoping already happens per-workspace
+ * via the `database=<name>` filter term, so this states what exists rather
+ * than offering a second, disconnected way to select one. */
+function DatabaseChip(props: { context: ContextResponse | undefined }) {
+  const { t } = useTranslation();
+  const databases = props.context?.databases ?? [];
+  const names = databases.map((db) => db.name);
+  return (
+    <span
+      style={chip}
+      data-testid="database-chip"
+      title={names.length > 0 ? names.join(", ") : undefined}
+    >
+      {t("header.database")}{" "}
+      <span style={{ color: "var(--fg-strong)", fontWeight: 600 }}>
+        {names.length > 0
+          ? t("header.databaseCount", { count: names.length })
+          : t("header.databaseAll")}
+      </span>
+    </span>
+  );
+}
+
 function RoleChip(props: { context: ContextResponse | undefined }) {
   const { t } = useTranslation();
   const instance = props.context?.instance;
@@ -246,6 +269,8 @@ export function Header(props: HeaderProps) {
           </span>
         </span>
       </Tooltip>
+
+      <DatabaseChip context={props.context} />
 
       <RoleChip context={props.context} />
 

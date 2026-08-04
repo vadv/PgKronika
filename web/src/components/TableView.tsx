@@ -960,6 +960,34 @@ function TableViewImpl(props: TableViewProps) {
                       !("level" in classificationResult)
                         ? classificationResult
                         : undefined;
+                    if (
+                      activityGroupedMode &&
+                      column.code === "command" &&
+                      (row.cells[
+                        columns.find(
+                          ({ column: c }) => c.code === "process_link",
+                        )?.cellIndex ?? -1
+                      ] ?? null) === null
+                    ) {
+                      return (
+                        <td
+                          key={column.code}
+                          data-testid="process-link-command-empty"
+                          style={{
+                            padding: "2px 10px",
+                            borderBottom: "1px solid var(--border)",
+                            fontSize: "var(--text-md)",
+                            fontStyle: "italic",
+                            color: "var(--sev-crit-fg)",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {t("activity.processLink.noneCommand")}
+                        </td>
+                      );
+                    }
                     return (
                       <td
                         key={column.code}

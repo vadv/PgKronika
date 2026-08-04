@@ -146,13 +146,25 @@ export type VerdictLevel = "ok" | "warning" | "critical";
 
 export const verdictTint = (
   level: VerdictLevel,
-): { background: string; color: string } => {
+): { background: string; color: string; borderColor: string } => {
   switch (level) {
     case "ok":
-      return { background: "var(--sev-ok-bg)", color: "var(--sev-ok-fg)" };
+      return {
+        background: "var(--sev-ok-bg)",
+        color: "var(--sev-ok-fg)",
+        borderColor: "var(--sev-ok)",
+      };
     case "warning":
-      return { background: "var(--sev-warn-bg)", color: "var(--sev-warn-fg)" };
+      return {
+        background: "var(--sev-warn-bg)",
+        color: "var(--sev-warn-fg)",
+        borderColor: "var(--sev-warn)",
+      };
     case "critical":
-      return { background: "var(--sev-crit-bg)", color: "var(--sev-crit-fg)" };
+      return {
+        background: "var(--sev-crit-bg)",
+        color: "var(--sev-crit-fg)",
+        borderColor: "var(--sev-crit)",
+      };
   }
 };
