@@ -268,6 +268,16 @@ async fn frame_entity_token(directory: &std::path::Path) -> String {
         .to_owned()
 }
 
+async fn frame_plan_entity_token(directory: &std::path::Path, queryid: i64) -> String {
+    let uri = format!("/v1/frame/plans?at=2000&preset=time&q=queryid%3D{queryid}&limit=1");
+    let (status, body) = serve(directory, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["rows"][0]["entity"]
+        .as_str()
+        .expect("plan frame entity token")
+        .to_owned()
+}
+
 #[test]
 fn entity_request_requires_exactly_one_point_or_history_mode() {
     let catalog = catalog();
@@ -372,6 +382,37 @@ async fn entity_point_returns_lazy_fields_and_fork_specific_best_effort_relation
             "fields": ["queryid_stat_statements", "dbid", "userid"]
         })
     );
+}
+
+#[tokio::test]
+async fn plan_entity_returns_all_fork_specific_statement_candidates() {
+    for (fork, method) in [
+        (PlanFork::Ossc, "ossc_queryid_dbid_userid_attribution"),
+        (
+            PlanFork::Vadv,
+            "vadv_queryid_stat_statements_dbid_userid_attribution",
+        ),
+    ] {
+        let directory = entity_fixture(fork);
+        let entity = frame_plan_entity_token(directory.path(), 7).await;
+        let uri = format!("/v1/entity/plans/{entity}?at=2000&include=related");
+
+        let (status, body) = serve(directory.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let related = body["related"].as_array().expect("related statements");
+        assert_eq!(related.len(), 1, "{body}");
+        assert_eq!(related[0]["relation"], "plan_statement");
+        assert_eq!(related[0]["view"], "statements");
+        assert_eq!(related[0]["snapshot_ts_us"], "2000");
+        assert_eq!(related[0]["provenance"]["method"], method);
+    }
+
+    let directory = entity_fixture(PlanFork::Ossc);
+    let entity = frame_plan_entity_token(directory.path(), 8).await;
+    let uri = format!("/v1/entity/plans/{entity}?at=2000&include=related");
+    let (status, body) = serve(directory.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["related"], serde_json::json!([]));
 }
 
 #[test]

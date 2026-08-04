@@ -526,7 +526,13 @@ fn view(
             ),
             related: matches!(
                 projection.name.as_bytes(),
-                b"activity" | b"statements" | b"tables" | b"indexes" | b"vacuum" | b"processes"
+                b"activity"
+                    | b"statements"
+                    | b"plans"
+                    | b"tables"
+                    | b"indexes"
+                    | b"vacuum"
+                    | b"processes"
             ),
         },
         inputs: projection_inputs(projection),

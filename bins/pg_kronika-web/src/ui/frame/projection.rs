@@ -783,6 +783,14 @@ pub(crate) fn project_entity_at(
         (true, "statements", Some((_section, row)), Some(descriptor)) => {
             statement_plan_relations(snapshot, descriptor, input.snapshot_ts_us, row, limits)?
         }
+        (true, "plans", Some((section, row)), Some(descriptor)) => plan_statement_relations(
+            snapshot,
+            descriptor,
+            input.snapshot_ts_us,
+            section,
+            row,
+            limits,
+        )?,
         _ => Vec::new(),
     };
     let mut quality = FrameQuality {
@@ -900,6 +908,82 @@ fn statement_plan_relations(
                 fields: fields.to_vec(),
             });
         }
+    }
+    relations.sort_by(|left, right| left.entity.cmp(&right.entity));
+    relations.dedup_by(|left, right| left.entity == right.entity);
+    Ok(relations)
+}
+
+fn plan_statement_relations(
+    snapshot: &LocalDirSnapshot,
+    descriptor: &kronika_reader::SegmentDescriptor,
+    snapshot_ts_us: i64,
+    plan_section: &str,
+    plan: &OutRow,
+    limits: FrameLimits,
+) -> Result<Vec<ProjectedRelation>, FrameError> {
+    let (queryid_column, method, fields): (&str, &'static str, [&'static str; 3]) =
+        match plan_section {
+            "pg_store_plans_ossc" => (
+                "queryid",
+                "ossc_queryid_dbid_userid_attribution",
+                ["queryid", "dbid", "userid"],
+            ),
+            "pg_store_plans_vadv" => (
+                "queryid_stat_statements",
+                "vadv_queryid_stat_statements_dbid_userid_attribution",
+                ["queryid_stat_statements", "dbid", "userid"],
+            ),
+            _ => return Ok(Vec::new()),
+        };
+    let Some(plan_queryid) = value(plan, queryid_column).filter(|value| **value != Value::Null)
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(plan_dbid) = value(plan, "dbid").filter(|value| **value != Value::Null) else {
+        return Ok(Vec::new());
+    };
+    let Some(plan_userid) = value(plan, "userid").filter(|value| **value != Value::Null) else {
+        return Ok(Vec::new());
+    };
+
+    let statement_view =
+        web_view_by_name("statements").ok_or(ProjectionError::MissingCatalogView)?;
+    let mut query = SealedQuerySession::new(
+        snapshot,
+        QueryLimits::with_bytes(limits.rows, limits.cells, limits.bytes),
+    );
+    let pages = query.sections(
+        descriptor,
+        snapshot_ts_us,
+        snapshot_ts_us,
+        &["pg_stat_statements"],
+        &BTreeMap::new(),
+    )?;
+    reject_internal_continuation(&pages, limits.rows)?;
+
+    let mut relations = Vec::new();
+    for row in pages
+        .get("pg_stat_statements")
+        .into_iter()
+        .flat_map(|page| &page.rows)
+    {
+        if timestamp(row, "ts")? != Some(snapshot_ts_us)
+            || value(row, "queryid") != Some(plan_queryid)
+            || value(row, "dbid") != Some(plan_dbid)
+            || value(row, "userid") != Some(plan_userid)
+        {
+            continue;
+        }
+        relations.push(ProjectedRelation {
+            relation: "plan_statement",
+            view: "statements",
+            entity: entity_for(statement_view, "pg_stat_statements", row, snapshot_ts_us)?,
+            snapshot_ts_us,
+            kind: RelationKind::BestEffort,
+            method,
+            fields: fields.to_vec(),
+        });
     }
     relations.sort_by(|left, right| left.entity.cmp(&right.entity));
     relations.dedup_by(|left, right| left.entity == right.entity);
