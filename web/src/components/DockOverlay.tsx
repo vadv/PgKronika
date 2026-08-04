@@ -15,6 +15,10 @@ import type {
 } from "../api/types";
 import type { DockKind, UiState } from "../state/url";
 import {
+  AREA_CHART_HEIGHT,
+  AREA_CHART_WIDTH,
+  areaChartSegments,
+  formatByUnit,
   formatDurationUs,
   isIdentityColumn,
   shortIdToken,
@@ -799,6 +803,96 @@ function EntityPointView(props: {
   );
 }
 
+const HISTORY_TREND_TYPES = new Set(["i64", "u64", "f64"]);
+
+export function historyColumnSeries(
+  data: EntityHistoryResponse,
+  columnIndex: number,
+): (number | null)[] {
+  return data.snapshots.map((snapshot) => {
+    const raw = snapshot.values[columnIndex] ?? null;
+    if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+    if (
+      typeof raw === "string" &&
+      raw.trim() !== "" &&
+      !Number.isNaN(Number(raw))
+    ) {
+      return Number(raw);
+    }
+    return null;
+  });
+}
+
+/** Snapshots read chronologically left to right — the same numbers the
+ * table below lists, shown as a shape instead of a column to scan. */
+function EntityHistoryTrend(props: {
+  data: EntityHistoryResponse;
+  columns: Map<string, ColumnSpec>;
+  viewCode: string;
+}) {
+  const { t } = useTranslation();
+  const { data } = props;
+  const lanes = data.columns
+    .map((column, index) => ({
+      column,
+      index,
+      spec: props.columns.get(column),
+    }))
+    .filter(
+      ({ spec }) => spec !== undefined && HISTORY_TREND_TYPES.has(spec.type),
+    );
+  if (lanes.length === 0 || data.snapshots.length < 2) return null;
+  return (
+    <div className="entity-detail__history-trend">
+      {lanes.map(({ column, index, spec }) => {
+        const values = historyColumnSeries(data, index);
+        const observed = values.filter(
+          (value): value is number => value !== null,
+        );
+        const scaleMax =
+          spec?.unit === "percent"
+            ? 100
+            : spec?.unit === "ratio"
+              ? 1
+              : Math.max(1, ...observed.map((value) => Math.abs(value)));
+        const segments = areaChartSegments(values, scaleMax);
+        const latest = observed.at(-1) ?? null;
+        return (
+          <section key={column} className="entity-detail__history-lane">
+            <span
+              className="entity-detail__history-lane-label"
+              title={colDesc(t, props.viewCode, column) ?? undefined}
+            >
+              {colLabel(t, props.viewCode, column)}
+            </span>
+            <strong className="entity-detail__history-lane-value">
+              {latest === null ? "—" : formatByUnit(latest, spec?.unit)}
+            </strong>
+            <svg
+              className="entity-detail__history-lane-chart"
+              viewBox={`0 0 ${AREA_CHART_WIDTH} ${AREA_CHART_HEIGHT}`}
+              preserveAspectRatio="none"
+              aria-hidden="true"
+            >
+              {segments.map((d, segmentIndex) => (
+                <path
+                  key={segmentIndex}
+                  d={d}
+                  fill="var(--accent)"
+                  fillOpacity={0.32}
+                  stroke="var(--accent)"
+                  strokeWidth={1}
+                  vectorEffect="non-scaling-stroke"
+                />
+              ))}
+            </svg>
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
 function EntityHistoryView(props: {
   data: EntityHistoryResponse;
   columns: Map<string, ColumnSpec>;
@@ -810,6 +904,11 @@ function EntityHistoryView(props: {
   const { data } = props;
   return (
     <div className="entity-detail__history-scroll">
+      <EntityHistoryTrend
+        data={data}
+        columns={props.columns}
+        viewCode={props.viewCode}
+      />
       <table data-detail-history className="entity-detail__history-table">
         <thead>
           <tr>

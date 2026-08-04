@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { UiState } from "../state/url";
@@ -11,7 +17,11 @@ import {
   makeIncidentsResponse,
   makeViewSpec,
 } from "../testkit/apiFixtures";
-import { DockOverlay, type DockOverlayProps } from "./DockOverlay";
+import {
+  DockOverlay,
+  historyColumnSeries,
+  type DockOverlayProps,
+} from "./DockOverlay";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -489,9 +499,121 @@ test("row dock fetches bounded history only after selecting the History tab", as
   await waitFor(() => expect(screen.getByText("12")).toBeDefined());
   fireEvent.click(screen.getByRole("tab", { name: "dock.detail.history" }));
   await waitFor(() => expect(screen.getByText("10")).toBeDefined());
-  expect(screen.getByText("tup")).toBeDefined();
-  expect(screen.getByText("locks")).toBeDefined();
+  const historyTable = within(screen.getByRole("table"));
+  expect(historyTable.getByText("tup")).toBeDefined();
+  expect(historyTable.getByText("locks")).toBeDefined();
   expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+});
+
+test("historyColumnSeries coerces numbers and numeric strings, rejects everything else honestly", () => {
+  const data = makeEntityHistoryResponse({
+    columns: ["metric"],
+    snapshots: [
+      { ts_us: "1", values: [10] },
+      { ts_us: "2", values: ["14"] },
+      { ts_us: "3", values: [null] },
+      { ts_us: "4", values: ["abc"] },
+      { ts_us: "5", values: [""] },
+      { ts_us: "6", values: ["  "] },
+      { ts_us: "7", values: [true] },
+    ],
+  });
+  expect(historyColumnSeries(data, 0)).toEqual([
+    10,
+    14,
+    null,
+    null,
+    null,
+    null,
+    null,
+  ]);
+});
+
+test("history trend charts only numeric columns and tracks the latest observed value", async () => {
+  const point = makeEntityPointResponse({
+    fields: [{ code: "tup", value: 12 }],
+  });
+  const history = makeEntityHistoryResponse({
+    columns: ["tup", "note"],
+    snapshots: [
+      { ts_us: "1722400000000000", values: [10, "ok"] },
+      { ts_us: "1722400060000000", values: ["14", "ok"] },
+      { ts_us: "1722400120000000", values: [null, "ok"] },
+    ],
+  });
+  stubEntityModes(point, history);
+  renderDock({
+    state: { ...baseState, dock: "row", entity: "db:1" },
+    view: makeViewSpec({
+      code: "activity",
+      capabilities: { detail: true, history: true, related: false },
+      columns: [
+        {
+          code: "tup",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+        {
+          code: "note",
+          type: "text",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+      ],
+    }),
+  });
+  await waitFor(() => expect(screen.getByText("12")).toBeDefined());
+  fireEvent.click(screen.getByRole("tab", { name: "dock.detail.history" }));
+  await waitFor(() =>
+    expect(
+      document.querySelector(".entity-detail__history-trend"),
+    ).not.toBeNull(),
+  );
+  const lanes = document.querySelectorAll(".entity-detail__history-lane");
+  expect(lanes).toHaveLength(1);
+  expect(
+    document.querySelector(".entity-detail__history-lane-label")?.textContent,
+  ).toBe("tup");
+  expect(
+    document.querySelector(".entity-detail__history-lane-value")?.textContent,
+  ).toBe("14");
+  expect(
+    document.querySelectorAll(".entity-detail__history-lane-chart path").length,
+  ).toBeGreaterThan(0);
+});
+
+test("history trend stays absent with fewer than two snapshots", async () => {
+  const point = makeEntityPointResponse({
+    fields: [{ code: "tup", value: 12 }],
+  });
+  const history = makeEntityHistoryResponse({
+    columns: ["tup"],
+    snapshots: [{ ts_us: "1722400000000000", values: [10] }],
+  });
+  stubEntityModes(point, history);
+  renderDock({
+    state: { ...baseState, dock: "row", entity: "db:1" },
+    view: makeViewSpec({
+      code: "activity",
+      capabilities: { detail: true, history: true, related: false },
+      columns: [
+        {
+          code: "tup",
+          type: "i64",
+          lazy: false,
+          requires: [],
+          availability: "available",
+        },
+      ],
+    }),
+  });
+  await waitFor(() => expect(screen.getByText("12")).toBeDefined());
+  fireEvent.click(screen.getByRole("tab", { name: "dock.detail.history" }));
+  await waitFor(() => expect(screen.getByRole("table")).toBeDefined());
+  expect(document.querySelector(".entity-detail__history-trend")).toBeNull();
 });
 
 test("history follows every continuation without a window quality banner", async () => {
@@ -563,11 +685,15 @@ test("history follows every continuation without a window quality banner", async
   });
   expect(screen.queryByText("dock.detail.historyQuality")).toBeNull();
   fireEvent.click(firstLoadMore);
-  await waitFor(() => expect(screen.getByText("2")).toBeDefined());
+  await waitFor(() =>
+    expect(within(screen.getByRole("table")).getByText("2")).toBeDefined(),
+  );
   expect(document.querySelector("[data-history-quality]")).toBeNull();
   expect(screen.getAllByTestId("history-snapshot")).toHaveLength(2);
   fireEvent.click(screen.getByRole("button", { name: "dock.row.loadMore" }));
-  await waitFor(() => expect(screen.getByText("3")).toBeDefined());
+  await waitFor(() =>
+    expect(within(screen.getByRole("table")).getByText("3")).toBeDefined(),
+  );
   expect(document.querySelector("[data-history-quality]")).toBeNull();
   expect(screen.getAllByTestId("history-snapshot")).toHaveLength(3);
   expect(

@@ -13,13 +13,7 @@ import {
   makeSpineResponse,
   makeViewSpec,
 } from "../testkit/apiFixtures";
-import {
-  OsWorkspace,
-  osMetricForPreset,
-  PRESSURE_CHART_HEIGHT,
-  PRESSURE_CHART_WIDTH,
-  pressureAreaSegments,
-} from "./OsWorkspace";
+import { OsWorkspace, osMetricForPreset } from "./OsWorkspace";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -272,40 +266,6 @@ test("maps Storage I/O to I/O and keeps other prepared OS lenses on CPU", () => 
   ]) {
     expect(osMetricForPreset(preset)).toBe("cpu");
   }
-});
-
-test("pressureAreaSegments fills one polygon per contiguous run of samples", () => {
-  const w = PRESSURE_CHART_WIDTH;
-  const h = PRESSURE_CHART_HEIGHT;
-  expect(pressureAreaSegments([0, 4], 4)).toEqual([
-    `M0,${h} L${w},0 L${w},${h} L0,${h} Z`,
-  ]);
-});
-
-test("pressureAreaSegments breaks the shape at a gap instead of bridging it", () => {
-  const h = PRESSURE_CHART_HEIGHT;
-  expect(pressureAreaSegments([1, 2, null, 3, 4], 4)).toEqual([
-    `M0,24 L60,16 L60,${h} L0,${h} Z`,
-    `M180,8 L240,0 L240,${h} L180,${h} Z`,
-  ]);
-});
-
-test("pressureAreaSegments draws nothing for an all-missing series", () => {
-  expect(pressureAreaSegments([null, null, null], 4)).toEqual([]);
-});
-
-test("pressureAreaSegments drops an isolated single sample instead of faking a shape for it", () => {
-  const h = PRESSURE_CHART_HEIGHT;
-  expect(pressureAreaSegments([1, 2, null, 5], 4)).toEqual([
-    `M0,24 L80,16 L80,${h} L0,${h} Z`,
-  ]);
-});
-
-test("pressureAreaSegments clamps out-of-range samples instead of drawing past the baseline", () => {
-  const h = PRESSURE_CHART_HEIGHT;
-  expect(pressureAreaSegments([-3, 2], 4)).toEqual([
-    `M0,${h} L240,16 L240,${h} L0,${h} Z`,
-  ]);
 });
 
 test("builds one dense OS workspace with host measurements and local missing cells", async () => {
